@@ -555,6 +555,10 @@ class Client:
         """Get one variable by name. GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/variables/{urllib.parse.quote(name)}", query, None)
 
+    def grant_token_hook_secret(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Grant a hook permission to read an environment secret. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/secrets", query, None)
+
     def lift_ban(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Lift a credential-abuse ban. POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/abuse/bans/lift", query, body)
@@ -727,6 +731,14 @@ class Client:
         """List tenants (cursor paginated). GET /v1/tenants."""
         return self._do("GET", f"/v1/tenants", query, None)
 
+    def list_token_hook_chain(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List a client's hook chain, in the order it runs. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/chain", query, None)
+
+    def list_token_hook_secrets(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the environment secrets a hook may read. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/secrets", query, None)
+
     def list_token_hook_versions(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List a client's most recent token-hook deploys, newest first. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/versions", query, None)
@@ -823,6 +835,10 @@ class Client:
         """Remove a login identifier from a user. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/identifiers/{identifier_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/identifiers/{urllib.parse.quote(identifier_id)}", query, None)
 
+    def reorder_token_hooks(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Set the order a client's hooks run in. POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/order", query, body)
+
     def replay_flow_target_dead_letters(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Replay a target's dead-lettered async deliveries. POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}/replay", query, body)
@@ -874,6 +890,10 @@ class Client:
     def revoke_session(self, tenant_id: str, environment_id: str, session_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Revoke ONE session. It stops resolving immediately and its session-bound refresh families are revoked with it; the `offline_access` families survive unless `hard_kill` is set. POST /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}/revoke."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sessions/{urllib.parse.quote(session_id)}/revoke", query, body)
+
+    def revoke_token_hook_secret(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Withdraw a hook's permission to read an environment secret. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/secrets", query, None)
 
     def revoke_user_consent(self, tenant_id: str, environment_id: str, user_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Revoke a user's remembered consent to one client (issue #88). Stamps the consent revoked and cascades to the (subject, client) refresh families in the store's single transaction, so the connected app's live long-lived tokens die with the consent. A security mutation, so it is sudo-gated. Idempotent: revoking an already-revoked or absent grant is a no-op success (`revoked = false`). POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke."""

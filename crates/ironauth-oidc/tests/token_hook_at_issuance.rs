@@ -1667,3 +1667,160 @@ async fn a_grant_to_one_hook_is_not_readable_by_another_in_the_same_chain() {
          CLIENT rather than the hook would hand it the first hook's key: {claims:?}"
     );
 }
+
+/// AN UNGRANTED HOOK CANNOT FETCH AT ISSUANCE, AND A GRANTED ONE ON A DEPLOYMENT WITH NO
+/// FETCHER IS TOLD WHY.
+///
+/// Issue #114 criterion 2, through a real token exchange. The sandbox suite proves the budget
+/// arithmetic against a fake transport; this proves the whole path -- the column, the record, and
+/// the dispatch that builds a transport only for a granted hook -- reaches a token an ordinary
+/// client is issued.
+///
+/// # The two refusals are different facts and the test separates them
+///
+/// A hook deployed with a budget of ZERO gets "not granted", built by the sandbox with no
+/// transport constructed at all. A hook deployed WITH a budget on a deployment that has wired no
+/// outbound fetcher gets a message saying THAT -- because those are different problems: the
+/// first needs an operator to grant the capability, the second needs them to wire a fetcher, and
+/// showing either message for the other sends them to the wrong place.
+///
+/// This harness wires no fetcher, which is what makes the second half assertable here. The
+/// hardened path itself is `ironauth-fetch`'s to prove, and it has its own suite.
+#[tokio::test]
+async fn an_ungranted_hook_cannot_fetch_and_a_granted_one_is_told_what_is_missing() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    // UNGRANTED: budget zero, which is the default every hook has.
+    harness
+        .deploy_token_hook_with_budget(&client, "caller", 0, ironauth_hooks::fixtures::FETCHER, 0)
+        .await;
+    let (access, _) = exchange(&harness).await.expect("the ungranted exchange");
+    let ungranted = claims(&access);
+    let first = ungranted
+        .get("fetch_1")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        first.contains("not granted"),
+        "a hook deployed with a budget of zero is refused as UNGRANTED, and no transport is \
+         built for it at all: {first}"
+    );
+
+    // GRANTED, on a deployment with no fetcher wired.
+    harness
+        .deploy_token_hook_with_budget(&client, "caller", 0, ironauth_hooks::fixtures::FETCHER, 2)
+        .await;
+    let (access, _) = exchange(&harness).await.expect("the granted exchange");
+    let granted = claims(&access);
+    let first = granted
+        .get("fetch_1")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        first.contains("no outbound fetcher"),
+        "a GRANTED hook on a deployment with no hardened path is told that, rather than being \
+         told it was never granted -- the two need different things from an operator: {first}"
+    );
+
+    // AND THE BUDGET STILL BOUNDS IT. The third attempt is past the grant of two, so it is
+    // refused for the budget rather than for the missing fetcher: a deployment that wired one
+    // later would find the bound already enforced.
+    let third = granted
+        .get("fetch_3")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        third.contains("request budget exhausted"),
+        "the budget is enforced before the transport is consulted, so it bounds a hook even \
+         where the transport itself cannot run: {third}"
+    );
+}
+
+/// The host the hook guest fetches and the certificate is minted for.
+///
+/// NOT the address dialed. The resolver answers a public address so destination validation does
+/// real work against a real-looking target, while the dialer lands the socket on the in-process
+/// listener -- the same arrangement `flow_target_answer.rs` uses, and for the same reason: a
+/// test that pointed the hook at loopback would be refused by the SSRF policy, which is the
+/// policy this test wants left standing rather than relaxed.
+const UPSTREAM_HOST: &str = "upstream.test";
+
+/// A GRANTED HOOK REACHES A REAL UPSTREAM, AND THE BUDGET CUTS IT OFF AT THE GRANT.
+///
+/// Issue #114 criterion 2's exit condition: "with the capability granted, exceeding the request
+/// budget fails deterministically". Everything up to here proves the REFUSALS -- an ungranted
+/// hook, and a granted one with no path wired. This is the half that proves the capability
+/// actually works, which is what makes the refusals mean something: a transport that refused
+/// every request would pass every other test in this file.
+///
+/// # Through the hardened fetcher, doing real work
+///
+/// `from_parts_trusting` relaxes exactly one thing, who the TLS client believes, so the leaf a
+/// throwaway root signed can complete a handshake with an in-process server. Resolution,
+/// destination validation, the deny policy, the caps and address pinning all still run. The
+/// hook's URL is `https://upstream.test/claims`, resolved to a public address and dialed to the
+/// listener.
+///
+/// # Two granted, three asked for
+///
+/// The guest asks three times and reports each attempt as its own claim, so the BOUNDARY is
+/// visible rather than inferred: the first two carry the upstream's body, the third carries the
+/// host's refusal. A guest that asked once could only show granted-or-not.
+///
+/// The third refusal also proves the budget is spent by the REQUEST, not by the response: a
+/// counter that only charged successful calls would leave a hook against a failing upstream
+/// with an unbounded number of attempts.
+#[tokio::test]
+async fn a_granted_hook_reaches_an_upstream_until_its_budget_runs_out() {
+    let identity = ironauth_fetch::TestTlsIdentity::generate(UPSTREAM_HOST);
+    let upstream =
+        ironauth_fetch::TestTlsTarget::start(&identity, 200, r#"{"tier":"platinum"}"#).await;
+    let fetcher = Arc::new(ironauth_fetch::Fetcher::from_parts_trusting(
+        ironauth_fetch::FetchLimits::default(),
+        Arc::new(ironauth_fetch::StaticResolver::new(vec![
+            std::net::IpAddr::from(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+        ])),
+        Arc::new(ironauth_fetch::RecordingDialer::new(upstream.addr)),
+        &identity.root_der,
+    ));
+
+    let harness = Harness::start_with_hook_engine_and_fetcher(
+        Arc::new(ironauth_hooks::HookEngine::new().expect("build the engine")),
+        fetcher,
+    )
+    .await;
+    let client = *harness.client_id();
+    harness
+        .deploy_token_hook_with_budget(&client, "caller", 0, ironauth_hooks::fixtures::FETCHER, 2)
+        .await;
+
+    let (access, _) = exchange(&harness).await.expect("the exchange");
+    let claims = claims(&access);
+    for attempt in ["fetch_1", "fetch_2"] {
+        let reported = claims
+            .get(attempt)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            reported, r#"ok:200:{"tier":"platinum"}"#,
+            "{attempt} must carry the upstream's real status and body -- a transport that \
+             refused everything would satisfy every OTHER assertion in this file: {claims:?}"
+        );
+    }
+    let third = claims
+        .get("fetch_3")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        third.contains("request budget exhausted"),
+        "the third attempt is past a grant of two and is refused for the BUDGET, naming it, so \
+         a hook author can tell an exhausted grant from an upstream that failed: {third}"
+    );
+    assert!(
+        !third.contains("platinum"),
+        "and it carries no response at all: a refusal past the budget must not reach the \
+         upstream, or the bound would be on what a hook SEES rather than on what it sends: \
+         {third}"
+    );
+}

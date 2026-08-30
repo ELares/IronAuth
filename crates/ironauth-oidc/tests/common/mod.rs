@@ -311,6 +311,26 @@ impl Harness {
         Self::start_inner(config, None, None, None, Some(runtime)).await
     }
 
+    /// As [`Harness::start_with_hook_engine`], with the outbound path a granted hook's requests
+    /// take (issue #114 criterion 2).
+    ///
+    /// SEPARATE CONSTRUCTOR rather than a setter, because the runtime is behind an `Arc` the
+    /// moment the epoch driver holds it and the fetcher is not something a deployment changes
+    /// while running. It is also what makes `start_with_hook_engine` a real control: that one
+    /// wires NO fetcher, which is the state a deployment is in before an operator configures
+    /// outbound access, and a granted hook there is refused for the missing path rather than
+    /// for the missing grant.
+    #[cfg(feature = "wasm-hooks")]
+    pub async fn start_with_hook_engine_and_fetcher(
+        engine: Arc<ironauth_hooks::HookEngine>,
+        fetcher: Arc<ironauth_fetch::Fetcher>,
+    ) -> Self {
+        let runtime =
+            Arc::new(ironauth_oidc::token_hook::HookRuntime::new(engine).with_fetcher(fetcher));
+        Self::spawn_epoch_driver(&runtime);
+        Self::start_inner(OidcConfig::default(), None, None, None, Some(runtime)).await
+    }
+
     /// Advance the hook engine's epoch, as the boot path does.
     ///
     /// WITHOUT THIS THE DEADLINE NEVER ARRIVES. A hook's `epoch_deadline` counts ticks, so a
@@ -961,6 +981,7 @@ impl Harness {
                     payload_version: 1,
                     failure_policy: ironauth_store::HookFailurePolicy::FailClosed,
                     placement: ironauth_store::HookPlacement { name, ordinal },
+                    fetch_budget: 0,
                 },
                 None,
             )
@@ -984,6 +1005,37 @@ impl Harness {
             .put_under_platform_key(&env, name, value.as_bytes(), None)
             .await
             .expect("store the secret");
+    }
+
+    /// Deploy a hook with an outbound request BUDGET (issue #114 criterion 2).
+    pub async fn deploy_token_hook_with_budget(
+        &self,
+        client: &ClientId,
+        name: &str,
+        ordinal: i32,
+        component: &[u8],
+        fetch_budget: i32,
+    ) {
+        let env = self.env().clone();
+        self.db()
+            .control_store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .token_hooks()
+            .set_with_event(
+                &env,
+                client,
+                ironauth_store::HookDeployment {
+                    component,
+                    payload_version: 1,
+                    failure_policy: ironauth_store::HookFailurePolicy::FailClosed,
+                    placement: ironauth_store::HookPlacement { name, ordinal },
+                    fetch_budget,
+                },
+                None,
+            )
+            .await
+            .expect("deploy the hook with a budget");
     }
 
     /// Grant a hook permission to read an environment secret (issue #114 criterion 5).
@@ -1075,6 +1127,7 @@ impl Harness {
                     payload_version,
                     failure_policy,
                     placement: ironauth_store::HookPlacement::default_hook(),
+                    fetch_budget: 0,
                 },
                 None,
             )

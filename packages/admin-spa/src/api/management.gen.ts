@@ -8059,6 +8059,15 @@ export interface components {
             component_bytes: number;
             /** @description What the dispatch does when this hook does not complete. */
             failure_policy: string;
+            /**
+             * Format: int32
+             * @description How many outbound requests this hook may make per invocation. Zero means it may not.
+             *
+             *     REPORTED PER HOOK RATHER THAN PER CLIENT, because it is granted per hook: an operator
+             *     auditing what a client's code can reach needs the whole chain's grants in one place, and
+             *     a client-level number could not say WHICH hook holds one.
+             */
+            fetch_budget: number;
             /** @description The hook's name: the handle every other route addresses it by. */
             name: string;
             /**
@@ -8155,6 +8164,11 @@ export interface components {
             component_bytes: number;
             /** @description What the dispatch does when this hook does not complete. */
             failure_policy: string;
+            /**
+             * Format: int32
+             * @description How many outbound requests this hook may make per invocation. Zero means it may not.
+             */
+            fetch_budget: number;
             /**
              * Format: int32
              * @description The token-customize payload version the guest was built against.
@@ -10472,6 +10486,8 @@ export interface operations {
                 name?: string;
                 /** @description Where a NEW hook runs in the chain, ascending; absent means last. IGNORED when the hook already exists, so a redeploy replaces code without moving it */
                 ordinal?: number;
+                /** @description How many outbound requests this hook may make per invocation, 0 to 16. Absent means ZERO, which is not granted. Unlike the ordinal this IS applied on a redeploy: a redeploy replaces a hook's code and its declared capabilities together */
+                fetch_budget?: number;
             };
             header?: never;
             path: {
@@ -10500,7 +10516,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenHookView"];
                 };
             };
-            /** @description An unknown or absent payload version, an unknown failure policy, an invalid hook name, or bytes that are not a WebAssembly component */
+            /** @description An unknown or absent payload version, an unknown failure policy, an invalid hook name, an out-of-range fetch budget, or bytes that are not a WebAssembly component */
             400: {
                 headers: {
                     [name: string]: unknown;

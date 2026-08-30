@@ -621,6 +621,28 @@ fn claims_mapping_cases(base: &str, ids: &Ids) -> Vec<Case> {
                 &serde_json::json!({ "grant_type": "authorization_code" }),
             )),
         },
+        Case {
+            label: "token_hooks.reorderTokenHooks",
+            method: "POST",
+            path: format!("{base}/applications/{client}/token-hook/order"),
+            body: Some(body_of(&serde_json::json!({ "order": ["default"] }))),
+        },
+        // THE GRANT AND THE REVOKE. Both are writes to a decommissioned environment's grant
+        // table, and the grant is the one that matters most: it is the door that WIDENS what
+        // code can read, so a fence it slipped past would let an operator hand a hook in a
+        // decommissioned environment a secret it could not read before.
+        Case {
+            label: "token_hooks.grantTokenHookSecret",
+            method: "PUT",
+            path: format!("{base}/applications/{client}/token-hook/secrets?secret_name=api_key"),
+            body: None,
+        },
+        Case {
+            label: "token_hooks.revokeTokenHookSecret",
+            method: "DELETE",
+            path: format!("{base}/applications/{client}/token-hook/secrets?secret_name=api_key"),
+            body: None,
+        },
     ]
 }
 

@@ -1349,6 +1349,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0169_token_hook_secrets.sql"),
         },
+        Migration {
+            version: 170,
+            name: "token_hook_fetch_budget",
+            // EXPAND: one column with a default the old binary never writes and never reads.
+            // `DEFAULT 0` is deny-by-default, so every hook that exists when this runs is
+            // ungranted without a backfill.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0170_token_hook_fetch_budget.sql"),
+        },
     ]
 }
 

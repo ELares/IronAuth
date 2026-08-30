@@ -131,6 +131,15 @@ pub enum FetchPurpose {
     SectorIdentifier,
     /// Fetching a client-metadata document (CIMD).
     ClientMetadata,
+    /// An outbound request made by an operator's WASM token hook (issue #114 criterion 2).
+    ///
+    /// Its own purpose rather than borrowing `ClaimsEnrichment`, and the difference is who chose
+    /// the URL. Enrichment calls an operator-configured endpoint fixed at boot; a hook computes
+    /// its URL AT RUNTIME, in code the operator uploaded, from a claim set an end user
+    /// influenced. That is the most attacker-adjacent outbound caller this product has, so it is
+    /// the one whose rate limits, failure budgets and metrics an operator most needs to be able
+    /// to read on their own -- which a shared purpose would deny them.
+    HookFetch,
     /// Delivering a webhook to a tenant-configured target.
     WebhookDelivery,
     /// Handing one outbound MESSAGE to a generic HTTP email or SMS provider (issue #111).
@@ -235,6 +244,7 @@ impl FetchPurpose {
             FetchPurpose::ClaimsEnrichment => "claims_enrichment",
             FetchPurpose::SectorIdentifier => "sector_identifier",
             FetchPurpose::ClientMetadata => "client_metadata",
+            FetchPurpose::HookFetch => "hook_fetch",
             FetchPurpose::WebhookDelivery => "webhook_delivery",
             FetchPurpose::MessageDelivery => "message_delivery",
             FetchPurpose::LogStreamDelivery => "log_stream_delivery",

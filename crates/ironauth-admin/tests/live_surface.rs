@@ -1839,6 +1839,41 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{base}/applications/{client}/token-hook/test"),
             &serde_json::json!({ "grant_type": "authorization_code" }),
         ),
+        // The CHAIN and the ORDER (issue #114 criterion 5). The listing answers for a client
+        // with one hook exactly as it does for a client with eight, so it needs no seeding of
+        // its own; the reorder names the seeded hook, because a reorder that named a hook the
+        // client does not have is a refusal rather than a drive of the door.
+        Case::empty(
+            "token_hooks.listTokenHookChain",
+            "GET",
+            format!("{base}/applications/{client}/token-hook/chain"),
+        ),
+        Case::json(
+            "token_hooks.reorderTokenHooks",
+            "POST",
+            format!("{base}/applications/{client}/token-hook/order"),
+            &serde_json::json!({ "order": ["default"] }),
+        ),
+        // Per-hook SECRET GRANTS (issue #114 criterion 5). The grant records that a hook may
+        // read a NAME; it deliberately does not require the secret to exist, so this case
+        // needs no seeded secret. The revoke follows it and takes the grant back, leaving the
+        // fixture as it found it -- which matters because these cases run in order against one
+        // environment and a grant left standing would be visible to every case after it.
+        Case::empty(
+            "token_hooks.listTokenHookSecrets",
+            "GET",
+            format!("{base}/applications/{client}/token-hook/secrets"),
+        ),
+        Case::empty(
+            "token_hooks.grantTokenHookSecret",
+            "PUT",
+            format!("{base}/applications/{client}/token-hook/secrets?secret_name=live_surface_probe"),
+        ),
+        Case::empty(
+            "token_hooks.revokeTokenHookSecret",
+            "DELETE",
+            format!("{base}/applications/{client}/token-hook/secrets?secret_name=live_surface_probe"),
+        ),
         Case::empty(
             "token_hooks.deleteTokenHook",
             "DELETE",
