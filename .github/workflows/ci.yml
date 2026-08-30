@@ -743,8 +743,7 @@ jobs:
       # to find, and cancelling the others would hide whether it broke on the rest too.
       fail-fast: false
       matrix:
-        # Linux is ABSENT and that is a known gap, not an oversight. See the note below.
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -752,6 +751,51 @@ jobs:
 
       # Linux has no keychain until something provides the Secret Service over D-Bus. macOS
       # and Windows have one built in, so only this platform needs setting up.
+      #
+      # WHAT WENT WRONG BEFORE, so this is not retried blindly: `dbus-run-session` plus
+      # `gnome-keyring-daemon --unlock`, and separately pre-creating
+      # `~/.local/share/keyrings` with a default collection, both left the STORE answering
+      # "Secret Service: no result found" -- the daemon was up, but no collection existed
+      # that it would write into.
+      #
+      # TWO THINGS ARE DIFFERENT HERE, and they are the two the earlier attempt lacked.
+      #
+      # 1. The daemon's environment is EXPORTED. `gnome-keyring-daemon` prints
+      #    `GNOME_KEYRING_CONTROL=...` on stdout, and a client that never sees that variable
+      #    talks to no daemon at all. Sourcing the output under `set -a` is what puts it in
+      #    this step's shell, and the two `echo`s at the end are what carry it to the next
+      #    step -- a `run:` block's environment does not outlive the block.
+      # 2. The default collection is created by `secret-tool store`, which makes one as a
+      #    side effect of a first write. Creating it through the D-Bus CreateCollection call
+      #    is what raises a prompt on a headless box; letting the tool do it does not.
+      #
+      # The password on stdin is a NEWLINE and not an empty string: the daemon reads a line,
+      # so an empty stdin is a closed pipe rather than an empty password.
+      - name: Provide a Secret Service
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring libsecret-tools dbus-x11
+          # A D-Bus session for the daemon and every later step in this job.
+          dbus-launch --sh-syntax > "$RUNNER_TEMP/dbus.env"
+          set -a; . "$RUNNER_TEMP/dbus.env"; set +a
+          printf '\n' | gnome-keyring-daemon --unlock --components=secrets \
+            > "$RUNNER_TEMP/keyring.env"
+          set -a; . "$RUNNER_TEMP/keyring.env"; set +a
+          # The first write is what creates the default collection.
+          printf 'seed' | secret-tool store --label='ci seed' service ironauth-ci key seed
+          # PROVE the store works before the test runs, so a failure here is attributed to the
+          # environment rather than to the credential code the next step exercises.
+          secret-tool lookup service ironauth-ci key seed
+          # Carry the session into the remaining steps, NAMING the two variables rather than
+          # transforming the files. `dbus-launch --sh-syntax` emits shell -- quoted values and
+          # bare `export NAME;` lines -- and piping that through sed produces `NAME` with no
+          # value and values with their quotes still attached, neither of which `$GITHUB_ENV`
+          # accepts. Writing the two expanded values is the only form that round-trips.
+          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}" >> "$GITHUB_ENV"
+          echo "GNOME_KEYRING_CONTROL=${GNOME_KEYRING_CONTROL}" >> "$GITHUB_ENV"
+
 
       # macOS runners start with the login keychain LOCKED, and a locked keychain refuses
       # every write with an error that reads like a backend fault rather than a locked one.
@@ -762,24 +806,17 @@ jobs:
       # The test is #[ignore]d because it writes to a developer's own keychain. Here that is
       # the point, so it runs with --ignored.
       - name: Round-trip a credential through the platform keychain
-        if: matrix.os != 'ubuntu-latest'
         run: cargo test -p ironauth --bin ironauth -- --ignored a_credential_survives_the_real_platform_keychain
 
-      # LINUX IS NOT COVERED HERE, and the criterion names it. Recorded rather than
-      # quietly dropped, because a matrix that used to have three entries and now has two
-      # reads as complete unless something says otherwise.
+      # LINUX IS COVERED BY THE STEP ABOVE, and this note stays because the coverage is new
+      # and its history is the useful part: two earlier setups left the daemon running with no
+      # collection to write into, and the fix is the two lines the earlier ones did not have
+      # (exporting the daemon's environment, and letting `secret-tool` create the default
+      # collection rather than calling CreateCollection directly).
       #
-      # What is known, measured on this branch: the build problem is solved (libdbus is
-      # vendored, so the crate compiles on a runner with no dbus headers), and the remaining
-      # failure is environmental. Under `dbus-run-session` with gnome-keyring unlocked, and
-      # again after pre-creating ~/.local/share/keyrings with a default collection, BOTH the
-      # read and the STORE answer "Secret Service: no result found" -- so the daemon is
-      # running but no usable collection exists for it to write into.
-      #
-      # One dead end worth not repeating: mapping that message to "no entry" in
-      # KeyringStore::get. It makes the read succeed and the store then fails the same way,
-      # which is the tell that this is an unusable store rather than an absent item. Shipping
-      # that mapping would have made a genuinely broken keychain report "not signed in".
+      # If this job goes red on ubuntu, the `secret-tool lookup` in the setup step is the
+      # discriminator: it failing means the environment is still wrong, and it passing while
+      # the cargo test fails means the credential code is.
 
   invariants:
     name: invariant lints, dash scan, compat matrix
