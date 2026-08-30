@@ -5,6 +5,15 @@
 // Cognito's custom auth challenge model -- DefineAuthChallenge, CreateAuthChallenge,
 // VerifyAuthChallengeResponse -- as one component exporting three functions.
 //
+// A SECOND WORLD IN THE SAME PACKAGE, AT THE SAME VERSION, and that is not an oversight.
+// `token-customize.wit` states that the package version IS the interface version, so adding to
+// the package without a bump needs the same argument adding an IMPORT needed there: a guest
+// compiled against `token-customize-hook@0.1.0` sees that world unchanged, byte for byte. It
+// gains nothing and loses nothing, because a world names exactly what it imports and exports and
+// this file adds neither to it. What WOULD force a bump is changing a record, a function
+// signature or a world already published -- which is the decade-ABI commitment, and it is about
+// what an existing guest was compiled against rather than about what the package now contains.
+//
 // ONE COMPONENT, NOT THREE. Cognito splits the triad across three lambdas because that is
 // what its deployment unit is; here they are three exports of one component, because the
 // three halves of a factor share its logic and an operator adding a factor should deploy

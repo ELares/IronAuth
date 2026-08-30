@@ -15,6 +15,18 @@
 //! a call that decides nothing. Each call gets its own store, so each is bounded on its own and
 //! one cannot starve another.
 //!
+//! # These three do NOT return `Observed`, and that is deliberate
+//!
+//! [`crate::Customization`] carries an [`crate::Observed`] -- the longest wait a guest ASKED
+//! for, and how many host resources it created -- and the triad drops it. That asymmetry is
+//! recorded here rather than left silent, because it looks like an oversight and is not.
+//!
+//! Nothing outside this crate reads `Observed` today: `customize` fills it, the tests assert it,
+//! and no dispatch consults it. Adding a second unread channel would be building another layer
+//! with no caller, which is worse than the asymmetry. When a consumer arrives -- a metric on
+//! hooks that try to sleep, say -- it needs BOTH worlds, and this note is where the second one
+//! is written down so it is not forgotten.
+//!
 //! It also means no state survives between them. That is deliberate: everything `verify` needs
 //! is what `create` put in `private-params`, which the host held, so the component is a pure
 //! function of what it is handed. A component that stashed the expected answer in a global
