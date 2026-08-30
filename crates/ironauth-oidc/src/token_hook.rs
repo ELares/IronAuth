@@ -286,6 +286,36 @@ impl HookRuntime {
         self
     }
 
+    /// Load a component through THIS runtime's cache, for a caller in another module.
+    ///
+    /// `discriminator` is the per-scope name that separates one component from another in the
+    /// cache key: a client id for a token hook, a component name for a custom factor. The key
+    /// also carries the component's DIGEST, so two callers that use the same discriminator for
+    /// different bytes get different entries and neither can serve the other's code.
+    ///
+    /// EXPOSED RATHER THAN DUPLICATED (issue #114 criterion 6). A custom factor is compiled by
+    /// the same cranelift, at the same ~34 ms, as a token hook, and a second cache would be a
+    /// second place that cost is paid and a second bound to reason about. It would also be a
+    /// second place the REFUSAL memo lives, and forgetting that half is how a broken component
+    /// gets recompiled on every login.
+    ///
+    /// # Errors
+    ///
+    /// [`HookError`] when the bytes do not load, do not link, or the cache is at its bound.
+    pub(crate) async fn loaded(
+        &self,
+        scope: Scope,
+        discriminator: &str,
+        component: &[u8],
+    ) -> Result<Arc<LoadedHook>, HookError> {
+        loaded_hook(&self.engine, &self.cache, scope, discriminator, component).await
+    }
+
+    /// The outbound path a granted component's requests take, when one is wired.
+    pub(crate) fn fetcher(&self) -> Option<&Arc<ironauth_fetch::Fetcher>> {
+        self.fetcher.as_ref()
+    }
+
     /// The engine, for the epoch driver.
     ///
     /// A deployment must advance the epoch or the deadline never arrives, which is the backstop
@@ -430,7 +460,9 @@ pub struct Invocation<'a> {
 /// whoever supplies the transport, and this is that supplier. A hook parsing JSON would
 /// otherwise be handed replacement characters and decide something about them.
 #[cfg(feature = "wasm-hooks")]
-fn hook_transport(fetcher: Option<Arc<ironauth_fetch::Fetcher>>) -> ironauth_hooks::FetchTransport {
+pub(crate) fn hook_transport(
+    fetcher: Option<Arc<ironauth_fetch::Fetcher>>,
+) -> ironauth_hooks::FetchTransport {
     let handle = tokio::runtime::Handle::current();
     Box::new(move |url: &str| {
         let Some(fetcher) = fetcher.as_ref() else {
@@ -1200,7 +1232,7 @@ const EPOCH_TICKS_PER_HOOK: u64 = 101;
 /// `Limits::claim_shaping`'s own doc says a limit that trips during ordinary work teaches
 /// operators to raise it without reading it. A limit that trips at random is worse: there is
 /// nothing to read.
-fn limits() -> Limits {
+pub(crate) fn limits() -> Limits {
     Limits {
         epoch_deadline: EPOCH_TICKS_PER_HOOK,
         ..Limits::claim_shaping()

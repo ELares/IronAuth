@@ -74,6 +74,7 @@ fn mfa_step_up() -> Subflow {
             node_group: Some("totp".to_owned()),
             subflow: None,
             decision: None,
+            factor: None,
             comment: Some("Present the enrolled second factor.".to_owned()),
         }],
         transitions: vec![],
@@ -562,6 +563,7 @@ mod tests {
             node_group: node_group.map(str::to_owned),
             subflow: None,
             decision: None,
+            factor: None,
             comment: None,
         }
     }

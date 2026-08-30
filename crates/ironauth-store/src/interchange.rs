@@ -1719,6 +1719,7 @@ mod tests {
             node_group: node_group.map(str::to_owned),
             subflow: None,
             decision: None,
+            factor: None,
             comment: None,
         }
     }

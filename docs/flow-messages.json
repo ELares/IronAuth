@@ -380,6 +380,45 @@
       "text": "Create organization"
     },
     {
+      "context_keys": [
+        "prompt"
+      ],
+      "id": 1100001,
+      "kind": "info",
+      "name": "custom_factor.prompt",
+      "text": "Complete the additional verification step."
+    },
+    {
+      "context_keys": [
+        "label"
+      ],
+      "id": 1100002,
+      "kind": "info",
+      "name": "custom_factor.field.label",
+      "text": "Your answer"
+    },
+    {
+      "context_keys": [],
+      "id": 1100003,
+      "kind": "info",
+      "name": "custom_factor.submit",
+      "text": "Continue"
+    },
+    {
+      "context_keys": [],
+      "id": 1100004,
+      "kind": "error",
+      "name": "custom_factor.refused",
+      "text": "We could not verify you. Contact your administrator."
+    },
+    {
+      "context_keys": [],
+      "id": 1100005,
+      "kind": "error",
+      "name": "custom_factor.incorrect",
+      "text": "That answer was not accepted."
+    },
+    {
       "context_keys": [],
       "id": 1500001,
       "kind": "success",

@@ -754,6 +754,11 @@ fn route_hop(compiled: &CompiledJourney, start: &str, base: &EvalContext) -> Hop
             StepKind::IdentifierPassword
             | StepKind::MfaChallenge
             | StepKind::MfaEnroll
+            // A CUSTOM FACTOR renders (issue #114 criterion 6), so it settles the walk exactly as
+            // the built-in factor kinds do. What it renders comes from a component rather than
+            // from the engine, and that changes nothing here: routing cares whether control
+            // LANDS, not what the form is made of.
+            | StepKind::CustomChallenge
             | StepKind::ProgressiveProfiling
             | StepKind::OrgPicker
             | StepKind::Registration
@@ -790,6 +795,7 @@ mod tests {
             node_group: node_group.map(str::to_owned),
             subflow: None,
             decision: None,
+            factor: None,
             comment: None,
         }
     }

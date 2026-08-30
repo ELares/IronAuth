@@ -296,6 +296,15 @@ name = "flow_custom"
 path = "tests/flow_custom.rs"
 required-features = ["testing"]
 
+# A CUSTOM FACTOR in a real login (issue #114 criterion 6): a tenant deploys a challenge
+# component, pins a journey that names it, and the shipped flow API drives the define/create/
+# verify triad against a real wasmtime sandbox. Needs `wasm-hooks` because a factor IS WASM: with
+# the feature off there is no runtime to run one and the step is a uniform not-found.
+[[test]]
+name = "flow_custom_factor"
+path = "tests/flow_custom_factor.rs"
+required-features = ["testing", "wasm-hooks"]
+
 # The byte-equivalence gate for the login journey flip onto the compiled-table engine (issue #92,
 # PR 8b): the flipped login journey (subsuming its MFA challenge / enroll and progressive-profiling
 # substates) drives through BOTH transports and its rendered flow byte-equals the committed goldens,

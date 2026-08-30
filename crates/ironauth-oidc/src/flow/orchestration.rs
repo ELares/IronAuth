@@ -49,6 +49,8 @@ use ironauth_journey::{
 use ironauth_store::{FlowId, FlowRecord, NewFlow, Scope, Store, UserId};
 
 use super::builtin_artifacts::builtin_compiled;
+#[cfg(feature = "wasm-hooks")]
+use super::custom_challenge;
 use super::eval_ctx::{assemble_eval_context, risk_view_from_level};
 use super::message::{self, Message};
 use super::model::{CONTRACT_VERSION, Flow, FlowStateTag, Journey, Node, Transport};
@@ -733,7 +735,11 @@ pub(super) async fn drive_via_table(
             // the picker's single unguarded edge to the terminal (like a decision hop, with no render
             // and no client round trip), keeping a single-org / no-membership / parameter login
             // byte-identical to before this step existed.
-            StepKind::OrgPicker => {
+            // A CUSTOM FACTOR (issue #114 criterion 6) shares the picker's plan-or-skip
+            // contract: an EMPTY render means the factor is satisfied and the walk advances
+            // through this step's own edges in-call, with no render and no client round trip; a
+            // non-empty render (a challenge, or the uniform refusal) HOLDS the flow here.
+            StepKind::CustomChallenge | StepKind::OrgPicker => {
                 let nodes = enter_step_nodes(
                     state,
                     scope,
@@ -838,6 +844,133 @@ pub(super) async fn drive_custom(
     .await
 }
 
+/// Ask a custom factor what to put on screen next, or [`None`] when it is satisfied.
+///
+/// THE FACTOR'S WHOLE STATE MACHINE, in one place, called from BOTH the entry hop and the
+/// submission. That is not tidiness: the first version had the entry hop run `define` and the
+/// submission `Advance` straight to the next step, so a WRONG ANSWER COMPLETED THE LOGIN --
+/// `define` never got to rule on the verdict it was handed. The two callers must reach the same
+/// decision procedure, so there is one.
+///
+/// `define` decides; `create` builds. A component that says CHALLENGE and then cannot build one
+/// has decided nothing, so it refuses rather than rendering a blank form.
+#[cfg(feature = "wasm-hooks")]
+async fn next_challenge_render(
+    state: &OidcState,
+    scope: Scope,
+    step: &CompiledStep,
+    transport: Transport,
+    flow_id: &str,
+    scratch: &mut PersistedState,
+) -> Result<Option<Vec<Node>>, FlowError> {
+    let factor = step.factor.as_deref().ok_or(FlowError::NotFound)?;
+    let context = challenge_context(scratch);
+    let decided = custom_challenge::drive(
+        state,
+        scope,
+        factor,
+        transport,
+        flow_id,
+        context.clone(),
+        custom_challenge::Call::Define,
+    )
+    .await?;
+    match decided {
+        custom_challenge::FactorStep::Satisfied => {
+            reset_challenge(scratch);
+            Ok(None)
+        }
+        custom_challenge::FactorStep::Refused => {
+            reset_challenge(scratch);
+            Ok(Some(custom_challenge::refused_nodes(transport, flow_id)))
+        }
+        custom_challenge::FactorStep::Render { .. } => {
+            match custom_challenge::drive(
+                state,
+                scope,
+                factor,
+                transport,
+                flow_id,
+                context,
+                custom_challenge::Call::Create,
+            )
+            .await?
+            {
+                custom_challenge::FactorStep::Render {
+                    nodes,
+                    private_params,
+                } => {
+                    // THE PARAMETERS ARE STAMPED BEFORE THE RENDER, so the round on screen and
+                    // the round `verify` will check against are the same one.
+                    scratch.challenge_params = Some(private_params);
+                    Ok(Some(nodes))
+                }
+                custom_challenge::FactorStep::Satisfied | custom_challenge::FactorStep::Refused => {
+                    reset_challenge(scratch);
+                    Ok(Some(custom_challenge::refused_nodes(transport, flow_id)))
+                }
+            }
+        }
+    }
+}
+
+/// The transport a flow is on, from the row rather than assumed (issue #114 criterion 6).
+///
+/// `run_step_executor` is not handed a transport, and the first version of the custom-factor arm
+/// passed `Transport::Browser` for want of one. That is not cosmetic: `push_flow_hidden` emits
+/// the hidden `flow` node ONLY for a browser flow, so an API flow would have been rendered a node
+/// its client never posts back and the envelope would have disagreed with every other API render.
+/// `mfa.rs` and `profiling.rs` each derive it from the record the same way.
+#[cfg(feature = "wasm-hooks")]
+fn challenge_transport(record: &FlowRecord) -> Transport {
+    if record.transport == Transport::Api.as_str() {
+        Transport::Api
+    } else {
+        Transport::Browser
+    }
+}
+
+/// The context a custom factor is told about the flow it is running in (issue #114 criterion 6).
+///
+/// NO SESSION, NO TOKENS, NO CREDENTIALS, which is the WIT contract's own posture: a factor
+/// decides whether a user can prove something and is never given the means to act as them. The
+/// subject is the pseudonymous id the flow has already established, and it is `None` when the
+/// factor runs before one exists -- which a custom factor is allowed to do, because nothing about
+/// a challenge requires the primary factor to have named anyone yet.
+#[cfg(feature = "wasm-hooks")]
+fn challenge_context(scratch: &PersistedState) -> ironauth_hooks::ChallengeContext {
+    ironauth_hooks::ChallengeContext {
+        payload_version: 1,
+        subject: scratch.subject.clone(),
+        // ALWAYS EMPTY TODAY, and said plainly rather than left to look populated.
+        //
+        // `FlowRecord` carries no client id -- a flow is per journey, not per client -- so there
+        // is nothing here to put in it. A component MUST NOT branch on this field: it will read
+        // the empty string for every login, so a factor that meant to serve two clients
+        // differently would silently treat them the same.
+        //
+        // The field stays in the context because removing it would be a breaking change to a
+        // published world, and because the flow is the only thing that cannot supply it: an
+        // issuance-time world could. A factor that needs to vary by client reads a granted secret
+        // instead, which is per component and per environment.
+        client_id: String::new(),
+        round: scratch.challenge_round,
+        previous_passed: scratch.challenge_passed,
+    }
+}
+
+/// Clear a custom factor's per-round scratch (issue #114 criterion 6).
+///
+/// Called when a factor SETTLES, either way. Leaving the round counter behind would make the next
+/// custom factor in the same journey start mid-way through its own count, which is a cross-factor
+/// leak of state that only shows up in a journey with two of them.
+#[cfg(feature = "wasm-hooks")]
+fn reset_challenge(scratch: &mut PersistedState) {
+    scratch.challenge_params = None;
+    scratch.challenge_round = 0;
+    scratch.challenge_passed = None;
+}
+
 /// Run one custom step's executor on a submission (issue #92, PR 4), reusing the SAME already
 /// factored built-in cores. Updates `scratch` (subject, method tokens, enroll credential) on an
 /// advance and returns the routing signals; a render leaves the flow on the current step.
@@ -856,6 +989,95 @@ async fn run_step_executor(
     scratch: &mut PersistedState,
 ) -> Result<StepOutcome, FlowError> {
     match &step.kind {
+        // A CUSTOM FACTOR's submission (issue #114 criterion 6): hand the answers and THIS
+        // round's parameters to `verify`, then let `define` rule on the verdict.
+        //
+        // THE ROUND COUNTER ADVANCES ONLY ON A PASS. It counts rounds COMPLETED, which is what
+        // the WIT contract says a component may reason about -- advancing it on a wrong answer
+        // would let a caller walk a two-round factor to `succeed` by submitting garbage twice.
+        //
+        // THE PARAMETERS ARE CONSUMED. Whatever happens next, this round's are cleared: the next
+        // `create` mints new ones, and leaving the old ones would let a replayed answer satisfy
+        // a round it was not issued for.
+        #[cfg(feature = "wasm-hooks")]
+        StepKind::CustomChallenge => {
+            let factor = step.factor.as_deref().ok_or(FlowError::NotFound)?;
+            let Some(private_params) = scratch.challenge_params.take() else {
+                // A SUBMISSION WITH NO ROUND ON SCREEN. Either the flow was resumed onto this
+                // step without entering it, or a second submission raced the first. Neither
+                // proves anything, and re-rendering would need a round this flow does not have.
+                return Ok(StepOutcome::Render {
+                    nodes: custom_challenge::refused_nodes(challenge_transport(record), &record.id),
+                    messages: Vec::new(),
+                    state_override: None,
+                });
+            };
+            // STRINGS ONLY, and a non-string value is DROPPED rather than stringified. The WIT
+            // answer is a string, and a submitted `{"a":1}` rendered as its JSON text would hand
+            // a component something no field of its own asked for. A component sees the fields it
+            // named or it sees nothing for them.
+            let answers: Vec<ironauth_hooks::ChallengeAnswer> = submission
+                .node_values
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.as_str().map(|value| ironauth_hooks::ChallengeAnswer {
+                        name: name.clone(),
+                        value: value.to_owned(),
+                    })
+                })
+                .collect();
+            let passed = matches!(
+                custom_challenge::drive(
+                    state,
+                    scope,
+                    factor,
+                    challenge_transport(record),
+                    &record.id,
+                    challenge_context(scratch),
+                    custom_challenge::Call::Verify {
+                        private_params: &private_params,
+                        answers: &answers,
+                    },
+                )
+                .await?,
+                custom_challenge::FactorStep::Satisfied
+            );
+            if passed {
+                scratch.challenge_round = scratch.challenge_round.saturating_add(1);
+            }
+            scratch.challenge_passed = Some(passed);
+            // BACK TO `define`, which owns what a verdict MEANS: another round, done, or over.
+            // The host does not decide that a wrong answer ends a factor -- a component that
+            // allows retries is equally valid, and this arm must not encode either policy.
+            //
+            // ADVANCING ON THE VERDICT ALONE WAS THE FIRST VERSION AND IT WAS A BYPASS: a wrong
+            // answer returned `Advance`, the walk took this step's outgoing edge, and the login
+            // completed. `define` must see every verdict, which is why this re-enters the same
+            // decision procedure the entry hop uses rather than routing onward.
+            match next_challenge_render(
+                state,
+                scope,
+                step,
+                challenge_transport(record),
+                &record.id,
+                scratch,
+            )
+            .await?
+            {
+                None => Ok(StepOutcome::Advance {
+                    signals: SignalSet::new(),
+                    risk: RiskView::default(),
+                    post_reset: None,
+                }),
+                Some(nodes) => Ok(StepOutcome::Render {
+                    nodes,
+                    messages: Vec::new(),
+                    state_override: None,
+                }),
+            }
+        }
+        #[cfg(not(feature = "wasm-hooks"))]
+        StepKind::CustomChallenge => Err(FlowError::NotFound),
         StepKind::IdentifierPassword => {
             match login::advance_login(state, scope, record, submission, headers).await? {
                 login::LoginStep::Render { nodes } => Ok(StepOutcome::Render {
@@ -1271,6 +1493,30 @@ async fn enter_step_nodes(
             let subject_id = scratch_subject(scope, scratch)?;
             org_picker::enter_nodes(state, scope, &subject_id, return_to, transport, flow_id).await
         }
+        // A CUSTOM FACTOR (issue #114 criterion 6): ask the component what happens next, and
+        // build the challenge only if it wants one.
+        //
+        // TWO CALLS, IN THIS ORDER, and the order is the factor's state machine rather than an
+        // optimization. `define` is the only thing that can say the factor is SATISFIED, and a
+        // satisfied factor must render nothing so the walk auto-advances -- which is the
+        // `OrgPicker` skip contract this arm deliberately reuses rather than inventing a second
+        // way for a step to mean "nothing to do here".
+        //
+        // A REFUSAL RENDERS TOO, and it renders the uniform refusal rather than an empty set. An
+        // empty render is a SKIP, so returning one for a refused factor would advance the flow
+        // past the factor that just refused it -- the exact inversion this arm must not make.
+        #[cfg(feature = "wasm-hooks")]
+        StepKind::CustomChallenge => Ok(next_challenge_render(
+            state, scope, step, transport, flow_id, scratch,
+        )
+        .await?
+        // EMPTY MEANS SATISFIED, which is the picker's skip contract: the walk auto-advances on
+        // an empty render, so a factor that is done renders nothing and control moves on.
+        .unwrap_or_default()),
+        // Without the `wasm-hooks` feature there is no runtime to run a factor with, so a journey
+        // that names one is a uniform not found rather than a step that silently passes.
+        #[cfg(not(feature = "wasm-hooks"))]
+        StepKind::CustomChallenge => Err(FlowError::NotFound),
         // The mint-family kinds (issue #92, PR 8a) render their entry nodes (registration's details
         // form, recovery's start / ack forms) once the per-journey convergence PRs (8c, 8d) wire
         // them; until then no live table routes into one. A decision, terminal, or subflow_call step

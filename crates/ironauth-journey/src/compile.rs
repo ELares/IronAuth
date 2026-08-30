@@ -40,6 +40,13 @@ pub struct CompiledStep {
     pub node_group: Option<String>,
     /// The decision this step evaluates, for a [`StepKind::Decision`] step.
     pub decision: Option<DecisionSpec>,
+    /// The CUSTOM FACTOR component this step runs, by name, for a
+    /// [`StepKind::CustomChallenge`] step (issue #114 criterion 6).
+    ///
+    /// Carried through compilation because the executor needs it at every hop, and looking it up
+    /// from the source artifact per hop would mean the compiled table was not sufficient to run
+    /// a journey -- which is the property that makes the table the thing the engine executes.
+    pub factor: Option<String>,
 }
 
 /// One guarded outgoing edge (issue #92, PR 4): the target step id and the guard predicate that
@@ -183,6 +190,7 @@ fn compile_inner(
                 kind: step.kind.clone(),
                 node_group: step.node_group.clone(),
                 decision: step.decision.clone(),
+                factor: step.factor.clone(),
             },
         );
     }
@@ -242,6 +250,7 @@ mod tests {
             node_group: node_group.map(str::to_owned),
             subflow: None,
             decision: None,
+            factor: None,
             comment: None,
         }
     }

@@ -208,6 +208,11 @@ fn projected_state(journey: Journey, kind: &StepKind) -> Option<FlowStateTag> {
         StepKind::IdentifierPassword
         | StepKind::MfaChallenge
         | StepKind::MfaEnroll
+        // A CUSTOM FACTOR renders (issue #114 criterion 6), so it projects a plan state like any
+        // other renderable kind. `wire_state_for` folds it to the FLAT `Custom` wire state, which
+        // is correct: a client renders it from `ui.nodes` alone, exactly as it renders any custom
+        // step, and telling the client which factor it is would leak the tenant's topology.
+        | StepKind::CustomChallenge
         | StepKind::ProgressiveProfiling
         | StepKind::OrgPicker
         | StepKind::Registration
@@ -895,6 +900,7 @@ mod tests {
                 node_group: group.map(str::to_owned),
                 subflow: None,
                 decision: None,
+                factor: None,
                 comment: None,
             })
             .collect();
@@ -904,6 +910,7 @@ mod tests {
             node_group: None,
             subflow: None,
             decision: None,
+            factor: None,
             comment: None,
         });
         let mut transitions: Vec<ironauth_journey::Transition> = Vec::new();
@@ -1284,6 +1291,9 @@ mod tests {
             connector: Some("acme-oidc".to_owned()),
             custom_step: None,
             org_context: None,
+            challenge_params: None,
+            challenge_round: 0,
+            challenge_passed: None,
         };
         let context = FlowContextView::from_state(&persisted);
         write!(
@@ -1508,6 +1518,9 @@ mod tests {
             connector: None,
             custom_step: None,
             org_context: None,
+            challenge_params: None,
+            challenge_round: 0,
+            challenge_passed: None,
         };
         let context = FlowContextView::from_state(&leaky);
         assert_no_sentinel_leaked(&serde_json::to_string(&context).expect("serialize context"));

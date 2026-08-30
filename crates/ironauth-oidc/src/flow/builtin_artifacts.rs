@@ -72,6 +72,10 @@ fn step(id: &str, kind: StepKind, node_group: Option<&str>) -> Step {
         node_group: node_group.map(str::to_owned),
         subflow: None,
         decision: None,
+        // NO BUILT-IN JOURNEY NAMES A CUSTOM FACTOR. The embedded artifacts are the shipped
+        // login, registration and recovery topologies; a custom factor is by construction
+        // something a tenant adds.
+        factor: None,
         comment: None,
     }
 }

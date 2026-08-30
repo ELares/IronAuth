@@ -153,6 +153,7 @@ fn named_step(id: &str, kind: StepKind, node_group: Option<&str>) -> Step {
         node_group: node_group.map(str::to_owned),
         subflow: None,
         decision: None,
+        factor: None,
         comment: None,
     }
 }
