@@ -646,6 +646,45 @@ impl Harness {
         Self::build_store_backed_kind(config, key, "dev", None, None, None).await
     }
 
+    /// A store-backed harness carrying a WASM hook runtime (issue #114 criterion 6).
+    ///
+    /// A custom factor needs BOTH: the store, because a journey is pinned in the flow-version
+    /// registry and the component is a row; and the runtime, because the factor is WASM. No
+    /// existing constructor gives both -- `start_with_hook_engine` is not store-backed, and the
+    /// store-backed builders install no runtime -- so a test of a factor in a real login could
+    /// not be written without this.
+    #[cfg(feature = "wasm-hooks")]
+    pub async fn start_store_backed_with_hooks(
+        runtime: Arc<ironauth_oidc::token_hook::HookRuntime>,
+    ) -> Self {
+        Self::build_store_backed_kind(
+            OidcConfig {
+                require_pkce_for_confidential_clients: false,
+                ..OidcConfig::default()
+            },
+            HarnessKey::Ed25519,
+            "dev",
+            None,
+            None,
+            None,
+        )
+        .await
+        .with_hook_runtime(runtime)
+    }
+
+    /// Install a hook runtime on an already-built harness (issue #114 criterion 6).
+    #[cfg(feature = "wasm-hooks")]
+    #[must_use]
+    fn with_hook_runtime(mut self, runtime: Arc<ironauth_oidc::token_hook::HookRuntime>) -> Self {
+        // THE ROUTER IS REBUILT, matching `install_hashing_pool`: the router captures the state
+        // it was built from, so installing anything on the state after the fact and not
+        // rebuilding leaves every request served by the state as it was.
+        let state = self.state.clone().with_hook_engine(runtime);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+        self
+    }
+
     /// Like [`Harness::start_store_backed_with`] but installs an inbound lazy-migration
     /// hook (issue #56) on the login path, so a test can drive an unknown-identifier
     /// first login against a stub legacy verifier. Provisions an Ed25519 environment key.

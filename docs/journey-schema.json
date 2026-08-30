@@ -365,6 +365,13 @@
           ],
           "description": "The OPTIONAL decision predicate a [`StepKind::Decision`] step may carry (issue #351). It is a\nreserved slot for a future outcome-based routing mode (the M11 sandbox seam): when ABSENT the\ndecision step is a pure routing hub whose guarded transitions carry the branching, and when\nPRESENT it is validated and type checked at load but not yet consulted by the built-in\nedge-guard routing. Only a decision step may carry it: a `decision` on any other kind is a\nload-time [`crate::JourneyError::UnexpectedStepAttachment`]."
         },
+        "factor": {
+          "description": "The CUSTOM FACTOR component a [`StepKind::CustomChallenge`] step runs, by the name it was\ndeployed under (issue #114 criterion 6).\n\nA NAME, NOT A COMPONENT. The artifact is configuration and travels through the config\nsnapshot; embedding sixteen mebibytes of WASM in it would make every promotion carry every\nfactor's bytes. The component is deployed separately and this names it, which also means\nredeploying a factor's code changes nothing about the journeys that use it.\n\nTHE REFERENCE IS NOT RESOLVED AT LOAD, deliberately. A journey validates against its own\ndocument; whether a component of this name is deployed is a fact about the ENVIRONMENT,\nand the same artifact is meant to be promoted into an environment where it is not yet.\nRefusing to load would make a journey unpromotable until its components arrived, which\ninverts the order operators actually work in. A step whose component is missing fails at\nthe login that reaches it, under the failure policy, and the admin surface warns.\n\nOnly a custom-challenge step may carry it: a `factor` on any other kind is a load-time\n[`crate::JourneyError::UnexpectedStepAttachment`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "description": "The document-local step id (unique across the journey's steps).",
           "type": "string"
@@ -407,7 +414,8 @@
         "terminal",
         "registration",
         "recovery_start",
-        "recovery_verify"
+        "recovery_verify",
+        "custom_challenge"
       ],
       "type": "string"
     },

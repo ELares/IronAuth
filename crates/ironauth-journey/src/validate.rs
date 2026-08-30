@@ -905,6 +905,17 @@ pub(crate) fn check_attachment_coherence(
                 kind: "subflow_call".to_owned(),
             });
         }
+        // A CUSTOM FACTOR MUST NAME ITS COMPONENT (issue #114 criterion 6). Unlike a decision's
+        // optional spec, this attachment is REQUIRED: a challenge step with no component names
+        // nothing to run, so it could only fail at the login that reached it. That is a load-time
+        // fact about the document, which is exactly what this validator is for.
+        StepKind::CustomChallenge if step.factor.is_none() => {
+            errors.push(JourneyError::MissingStepAttachment {
+                pointer: step_ptr.to_owned(),
+                step: step.id.clone(),
+                kind: "custom_challenge".to_owned(),
+            });
+        }
         // A `decision` step with no `DecisionSpec` is VALID (issue #351): the attachment is optional
         // (a reserved M11 outcome-routing slot), so a spec-less decision is a pure edge-guard routing
         // hub. An edge-less spec-less decision is still caught as a `DeadEndStep`.
@@ -922,6 +933,19 @@ pub(crate) fn check_attachment_coherence(
     if step.decision.is_some() && !matches!(step.kind, StepKind::Decision) && step.kind.is_known() {
         errors.push(JourneyError::UnexpectedStepAttachment {
             pointer: format!("{step_ptr}/decision"),
+            step: step.id.clone(),
+        });
+    }
+    // A stray `factor` on a step that is not a `custom_challenge`. Refused rather than ignored,
+    // for the reason every stray attachment here is: an author who put it on the wrong step
+    // believes their factor runs, and a silently-dropped attachment is a journey that behaves
+    // differently from the one they wrote.
+    if step.factor.is_some()
+        && !matches!(step.kind, StepKind::CustomChallenge)
+        && step.kind.is_known()
+    {
+        errors.push(JourneyError::UnexpectedStepAttachment {
+            pointer: format!("{step_ptr}/factor"),
             step: step.id.clone(),
         });
     }
@@ -943,6 +967,7 @@ mod tests {
             node_group: node_group.map(str::to_owned),
             subflow: None,
             decision: None,
+            factor: None,
             comment: None,
         }
     }
@@ -1176,6 +1201,94 @@ mod tests {
                 kind: "subflow_call".to_owned(),
             }])
         );
+    }
+
+    /// A CUSTOM FACTOR MUST NAME ITS COMPONENT (issue #114 criterion 6).
+    ///
+    /// Unlike a decision's optional spec, this attachment is REQUIRED: a challenge step naming no
+    /// component could only fail at the login that reached it, and "this document is incomplete"
+    /// is exactly the class of fact a load-time validator exists to catch.
+    #[test]
+    fn a_custom_challenge_with_no_factor_is_rejected() {
+        let doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("factor", StepKind::CustomChallenge, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "factor"), unguarded("factor", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::MissingStepAttachment {
+                pointer: "/steps/1".to_owned(),
+                step: "factor".to_owned(),
+                kind: "custom_challenge".to_owned(),
+            }])
+        );
+    }
+
+    /// A `factor` ON THE WRONG KIND IS REFUSED, NOT IGNORED (issue #114 criterion 6).
+    ///
+    /// An author who put it on the login step believes their factor runs. A silently dropped
+    /// attachment is a journey that behaves differently from the one they wrote, and the
+    /// difference is whether a second factor happens at all.
+    #[test]
+    fn a_factor_on_a_step_that_is_not_a_custom_challenge_is_rejected() {
+        let mut doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        doc.steps[0].factor = Some("wordmark".to_owned());
+        assert_eq!(
+            validate(&doc),
+            Err(vec![JourneyError::UnexpectedStepAttachment {
+                pointer: "/steps/0/factor".to_owned(),
+                step: "primary".to_owned(),
+            }])
+        );
+    }
+
+    /// A COMPLETE CUSTOM FACTOR STEP VALIDATES (issue #114 criterion 6).
+    ///
+    /// The control for the two refusals above: without it, a validator that rejected EVERY
+    /// custom-challenge step would pass both of them.
+    #[test]
+    fn a_custom_challenge_naming_its_factor_validates() {
+        let mut doc = Journey {
+            schema_version: JOURNEY_SCHEMA_VERSION.to_owned(),
+            id: "j".to_owned(),
+            engine_version: JOURNEY_ENGINE_VERSION,
+            entry: "primary".to_owned(),
+            comment: None,
+            steps: vec![
+                step("primary", StepKind::IdentifierPassword, Some("password")),
+                step("factor", StepKind::CustomChallenge, None),
+                step("done", StepKind::Terminal, None),
+            ],
+            transitions: vec![unguarded("primary", "factor"), unguarded("factor", "done")],
+            subflows: None,
+            subflow_definitions: None,
+        };
+        doc.steps[1].factor = Some("wordmark".to_owned());
+        assert_eq!(validate(&doc), Ok(()));
     }
 
     #[test]

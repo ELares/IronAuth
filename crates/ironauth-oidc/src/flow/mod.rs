@@ -44,6 +44,9 @@ pub mod schema;
 
 mod builtin_artifacts;
 mod consent;
+/// A CUSTOM FACTOR driven by a tenant's own WASM component (issue #114 criterion 6).
+#[cfg(feature = "wasm-hooks")]
+mod custom_challenge;
 mod eval_ctx;
 mod federation;
 mod flow_target;
@@ -331,6 +334,49 @@ struct PersistedState {
     /// serialized `state` BYTE-IDENTICAL, so the flow goldens for the skip path are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     org_context: Option<String>,
+    /// The OPAQUE parameters a [`StepKind::CustomChallenge`](ironauth_journey::StepKind::CustomChallenge)
+    /// step's component produced for the round now on screen (issue #114 criterion 6).
+    ///
+    /// SERVER SIDE AND NEVER RENDERED, which is the whole reason the triad can be stateless
+    /// across its three invocations: `create` puts what `verify` will need in here, the host
+    /// holds it, and the component is a pure function of what it is handed. A component that
+    /// stashed the expected answer in a global would find it gone on the next call, and two
+    /// concurrent logins in one process cannot see each other's challenge.
+    ///
+    /// EXACTLY ONE ROUND'S WORTH. A replay has to beat the parameters rather than the component:
+    /// an answer is checked against the round it was issued for, and this field holds only the
+    /// current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    challenge_params: Option<String>,
+    /// How many rounds of the current custom factor have COMPLETED (issue #114 criterion 6).
+    ///
+    /// What lets a component end a factor: it returns `challenge` while this is below whatever
+    /// it wants and `succeed` after. Counts COMPLETED rounds rather than attempts, so a wrong
+    /// answer the host re-renders does not advance it.
+    ///
+    /// `skip_serializing_if` on zero keeps a built-in row's serialized `state` BYTE-IDENTICAL
+    /// (a built-in never sets it), so the flow goldens are unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    challenge_round: u32,
+    /// Whether the previous round's answer was accepted (issue #114 criterion 6), absent on the
+    /// first round. A component that ends the factor on a wrong answer reads it; one that allows
+    /// retries ignores it and counts rounds instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    challenge_passed: Option<bool>,
+}
+
+/// Whether a count is zero, for `skip_serializing_if`.
+///
+/// A named function rather than a closure because `skip_serializing_if` takes a path. It exists
+/// so a flow that never ran a custom factor serializes byte-identically to one from before the
+/// field existed, which the flow goldens assert.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` calls this with a reference; a by-value signature \
+              does not satisfy it."
+)]
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 impl PersistedState {
@@ -345,6 +391,9 @@ impl PersistedState {
             connector: None,
             custom_step: None,
             org_context: None,
+            challenge_params: None,
+            challenge_round: 0,
+            challenge_passed: None,
         }
     }
 }

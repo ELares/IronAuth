@@ -285,6 +285,30 @@ pub const ORG_PICKER_CREATE_NAME_LABEL: MessageId = MessageId(1_090_003);
 /// The organization-creation submit label (issue #96, criterion 5).
 pub const ORG_PICKER_CREATE_LABEL: MessageId = MessageId(1_090_004);
 
+/// A CUSTOM FACTOR's prompt (issue #114 criterion 6): the leading copy a tenant's own challenge
+/// component asked to be shown, riding the `prompt` context key.
+///
+/// ONE REGISTERED ID FOR EVERY CUSTOM FACTOR, and the key carries the component's own string.
+/// The alternative -- letting a component mint message IDs -- would make the numeric registry
+/// infinite and let a component collide with a built-in id, so the id stays finite and the
+/// variable part is context. This is the [`ORG_PICKER_OPTION_LABEL`] pattern, for the same reason.
+pub const CUSTOM_FACTOR_PROMPT: MessageId = MessageId(1_100_001);
+/// A CUSTOM FACTOR's field label (issue #114 criterion 6), carrying the component's `label` on
+/// the `label` context key. One id for every field of every custom factor, as above.
+pub const CUSTOM_FACTOR_FIELD_LABEL: MessageId = MessageId(1_100_002);
+/// The submit control for a custom factor's challenge (issue #114 criterion 6).
+pub const CUSTOM_FACTOR_SUBMIT_LABEL: MessageId = MessageId(1_100_003);
+/// A CUSTOM FACTOR refused the login (issue #114 criterion 6).
+///
+/// UNIFORM AND CONTEXT-FREE, unlike the prompt above. The component's own `fail` reason is for
+/// the operator reading the audit trail; showing it to whoever is at the keyboard would let a
+/// component turn its private decision into an oracle. This message says a factor refused and
+/// nothing about why.
+pub const CUSTOM_FACTOR_REFUSED: MessageId = MessageId(1_100_004);
+/// A CUSTOM FACTOR's answer was not accepted (issue #114 criterion 6), rendered on the field
+/// when the component said the answer was wrong and its `define` chose to challenge again.
+pub const CUSTOM_FACTOR_INCORRECT: MessageId = MessageId(1_100_005);
+
 /// The login success note.
 pub const LOGIN_SUCCESS: MessageId = MessageId(1_500_001);
 /// The registration success note (a new account was created and signed in).
@@ -903,6 +927,41 @@ pub const REGISTRY: &[MessageSpec] = &[
         name: "register.already_registered",
         kind: MessageKind::Error,
         text: "That identifier is already registered.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CUSTOM_FACTOR_PROMPT,
+        name: "custom_factor.prompt",
+        kind: MessageKind::Info,
+        text: "Complete the additional verification step.",
+        context_keys: &["prompt"],
+    },
+    MessageSpec {
+        id: CUSTOM_FACTOR_FIELD_LABEL,
+        name: "custom_factor.field.label",
+        kind: MessageKind::Info,
+        text: "Your answer",
+        context_keys: &["label"],
+    },
+    MessageSpec {
+        id: CUSTOM_FACTOR_SUBMIT_LABEL,
+        name: "custom_factor.submit",
+        kind: MessageKind::Info,
+        text: "Continue",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CUSTOM_FACTOR_REFUSED,
+        name: "custom_factor.refused",
+        kind: MessageKind::Error,
+        text: "We could not verify you. Contact your administrator.",
+        context_keys: &[],
+    },
+    MessageSpec {
+        id: CUSTOM_FACTOR_INCORRECT,
+        name: "custom_factor.incorrect",
+        kind: MessageKind::Error,
+        text: "That answer was not accepted.",
         context_keys: &[],
     },
     MessageSpec {

@@ -152,6 +152,25 @@ pub struct Step {
     /// load-time [`crate::JourneyError::UnexpectedStepAttachment`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionSpec>,
+    /// The CUSTOM FACTOR component a [`StepKind::CustomChallenge`] step runs, by the name it was
+    /// deployed under (issue #114 criterion 6).
+    ///
+    /// A NAME, NOT A COMPONENT. The artifact is configuration and travels through the config
+    /// snapshot; embedding sixteen mebibytes of WASM in it would make every promotion carry every
+    /// factor's bytes. The component is deployed separately and this names it, which also means
+    /// redeploying a factor's code changes nothing about the journeys that use it.
+    ///
+    /// THE REFERENCE IS NOT RESOLVED AT LOAD, deliberately. A journey validates against its own
+    /// document; whether a component of this name is deployed is a fact about the ENVIRONMENT,
+    /// and the same artifact is meant to be promoted into an environment where it is not yet.
+    /// Refusing to load would make a journey unpromotable until its components arrived, which
+    /// inverts the order operators actually work in. A step whose component is missing fails at
+    /// the login that reaches it, under the failure policy, and the admin surface warns.
+    ///
+    /// Only a custom-challenge step may carry it: a `factor` on any other kind is a load-time
+    /// [`crate::JourneyError::UnexpectedStepAttachment`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<String>,
     /// An optional human-readable comment about the step (data, round-trip-safe).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
@@ -283,6 +302,18 @@ step_kinds! {
         /// #92, PR 8a): the uniform acknowledgment plus code entry. A BUILT-IN-ONLY kind (it mints a
         /// session and runs the post-mint counter reset), it wraps `recovery::advance_verify`.
         RecoveryVerify => "recovery_verify";
+        /// A CUSTOM FACTOR: a challenge a tenant's own WASM component defines, creates and
+        /// verifies (issue #114 criterion 6).
+        ///
+        /// The step names a component by `factor`; the engine asks it what happens next, renders
+        /// the fields it names, holds its opaque parameters and asks it whether the answer was
+        /// right. The engine learns nothing about what the challenge IS, which is what makes
+        /// adding a SECOND custom factor a component and a journey rather than a code change.
+        ///
+        /// NOT BUILT-IN-ONLY: a custom journey may name one, which is the entire point. It
+        /// authenticates a subject the primary factor already established and never creates an
+        /// account or mints a session, so it sits with the MFA kinds rather than the mint family.
+        CustomChallenge => "custom_challenge";
 }
 
 impl StepKind {
@@ -611,6 +642,7 @@ mod tests {
                     node_group: Some("password".to_owned()),
                     subflow: None,
                     decision: None,
+                    factor: None,
                     comment: Some("The first factor.".to_owned()),
                 },
                 Step {
@@ -619,6 +651,7 @@ mod tests {
                     node_group: Some("totp".to_owned()),
                     subflow: None,
                     decision: None,
+                    factor: None,
                     comment: None,
                 },
                 Step {
@@ -627,6 +660,7 @@ mod tests {
                     node_group: None,
                     subflow: None,
                     decision: None,
+                    factor: None,
                     comment: Some("Session minted.".to_owned()),
                 },
             ],
@@ -733,17 +767,23 @@ mod tests {
             "decision",
             "subflow_call",
             "terminal",
+            // A CUSTOM FACTOR is custom-usable by construction (issue #114 criterion 6): a
+            // tenant naming their own challenge component in their own journey is the entire
+            // point of the kind, and gating it built-in-only would leave a vocabulary nobody can
+            // reach.
+            "custom_challenge",
         ] {
             assert!(
                 !StepKind::from_wire(wire).is_builtin_only(),
                 "{wire} stays custom-usable"
             );
         }
-        // The closed built-in set grew from seven to ten, then to eleven with org_picker. This
-        // used to be a list compared to its own declared length and could not fail; `BUILT_IN` is
-        // now COUNTED from the `step_kinds!` declaration, so it is a real pin on the vocabulary
-        // size and a twelfth kind is a deliberate, visible edit rather than an accident.
-        assert_eq!(StepKind::BUILT_IN.len(), 11);
+        // The closed built-in set grew from seven to ten, to eleven with org_picker, and to
+        // twelve with the custom factor (issue #114 criterion 6). This used to be a list compared
+        // to its own declared length and could not fail; `BUILT_IN` is now COUNTED from the
+        // `step_kinds!` declaration, so it is a real pin on the vocabulary size and a thirteenth
+        // kind is a deliberate, visible edit rather than an accident.
+        assert_eq!(StepKind::BUILT_IN.len(), 12);
     }
 
     /// The vocabulary the load-time validator gates on and the vocabulary everything downstream
