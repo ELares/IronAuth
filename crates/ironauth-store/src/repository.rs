@@ -32563,6 +32563,12 @@ impl TokenHookRepo<'_> {
     /// Issue #114 criterion 5's "explicit ordering of multiple hooks on one event". The
     /// issuance path folds these in sequence, each hook seeing what the one before it produced.
     ///
+    /// BOUNDED BY [`MAX_HOOKS_PER_CLIENT`], and the bound is on this read rather than only on
+    /// the write because this is the path that spends the work: every hook here is compiled on
+    /// a cache miss and invoked on every token. The `LIMIT` rides the same `ORDER BY`, so what
+    /// it drops is the TAIL of the chain -- the hooks the operator put last -- which is the only
+    /// truncation that leaves a prefix meaning what the operator wrote.
+    ///
     /// ORDER BY ordinal, and it is the reason the column is UNIQUE per client rather than
     /// merely present. Without an order the rows come back however Postgres finds them, and a
     /// chain is a fold: a different order is a different token. Without the uniqueness the
@@ -32579,11 +32585,13 @@ impl TokenHookRepo<'_> {
             "SELECT client_id, name, ordinal, component, payload_version, failure_policy \
              FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-             ORDER BY ordinal",
+             ORDER BY ordinal \
+             LIMIT $4",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
+        .bind(MAX_HOOKS_PER_CLIENT)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -33284,6 +33292,31 @@ impl ActingTokenHookRepo<'_> {
         .await
     }
 }
+
+/// The most hooks one client may have in its chain.
+///
+/// A BOUND ON THE ISSUANCE PATH, and it exists because the schema stopped providing one. Before
+/// migration 0168 the primary key was `(scope, client)`, so "how many hooks run per login" was
+/// answered by the schema and the answer was one. Widening the identity to admit a chain
+/// removed that answer, and what replaced it was nothing: every hook in the chain is compiled
+/// on a miss and invoked on every token, so an unbounded chain is an unbounded amount of work
+/// on the hot path for a client who can be picked by whoever can start a login.
+///
+/// EIGHT, which is a policy number rather than a derived one, so here is the reasoning. The use
+/// this criterion names is composing a few concerns -- an enricher, a filter, a marker -- and
+/// past a handful the honest answer is one hook that does the work, since a chain of twenty
+/// pays twenty invocations to save writing one guest. It is deliberately far below anything a
+/// real arrangement needs, because the cost of being wrong in the generous direction is paid
+/// per login and the cost of being wrong in the strict direction is an operator filing an
+/// issue.
+///
+/// ENFORCED AT THE READ, not only at the write. A write-time refusal is the better message and
+/// belongs on the admin route that names a hook -- this module's own rule, that a refusal an
+/// operator reads beats one nobody sees. But a cap that lives only at the write is a cap the
+/// issuance path trusts rather than one it has: a hand-inserted row set, a restore from a
+/// backup taken under a different limit, or a future writer that forgets would each hand the
+/// dispatch an unbounded chain. The read takes the first [`MAX_HOOKS_PER_CLIENT`] in order.
+pub const MAX_HOOKS_PER_CLIENT: i64 = 8;
 
 /// The name a hook carries when nobody chose one.
 ///
