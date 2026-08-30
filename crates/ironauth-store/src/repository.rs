@@ -32727,6 +32727,8 @@ impl ActingChallengeComponentRepo<'_> {
         let bytes = deployment.component.to_vec();
         let payload_version = deployment.payload_version;
         let fetch_budget = deployment.fetch_budget;
+        let aot_artifact = deployment.aot.map(|aot| aot.artifact.clone());
+        let aot_engine_key = deployment.aot.map(|aot| aot.engine_key.clone());
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -32739,12 +32741,15 @@ impl ActingChallengeComponentRepo<'_> {
             async move |tx| {
                 sqlx::query(
                     "INSERT INTO challenge_components \
-                     (tenant_id, environment_id, name, component, payload_version, fetch_budget) \
-                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     (tenant_id, environment_id, name, component, payload_version, \
+                      fetch_budget, aot_artifact, aot_engine_key) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                      ON CONFLICT (tenant_id, environment_id, name) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
                          fetch_budget = EXCLUDED.fetch_budget, \
+                         aot_artifact = EXCLUDED.aot_artifact, \
+                         aot_engine_key = EXCLUDED.aot_engine_key, \
                          updated_at = now()",
                 )
                 .bind(scope.tenant().to_string())
@@ -32753,6 +32758,12 @@ impl ActingChallengeComponentRepo<'_> {
                 .bind(&bytes)
                 .bind(payload_version)
                 .bind(fetch_budget)
+                // REPLACED ON EVERY REDEPLOY, with the component. An artifact left from a
+                // previous deploy is machine code for a component that is no longer there: the
+                // key would still match, so it would LOAD, and the factor that ran would be the
+                // old one.
+                .bind(aot_artifact)
+                .bind(aot_engine_key)
                 .execute(&mut **tx)
                 .await?;
                 Ok(())
@@ -32934,6 +32945,26 @@ impl ActingChallengeComponentRepo<'_> {
     }
 }
 
+/// Rebuild an [`AotArtifact`] from a row, or [`None`] when the row carries none.
+///
+/// ONE PLACE, because the pairing is the invariant: the database's `both or neither` CHECK makes
+/// a half-populated row impossible, and this is where that guarantee is turned into a type that
+/// cannot express one. A caller that read the two columns separately could hold an artifact with
+/// no key, which is an artifact nothing can decide whether to execute.
+fn aot_from_row(row: &sqlx::postgres::PgRow) -> Option<crate::token_hook_store::AotArtifact> {
+    let artifact: Option<Vec<u8>> = row.get("aot_artifact");
+    let engine_key: Option<String> = row.get("aot_engine_key");
+    match (artifact, engine_key) {
+        (Some(artifact), Some(engine_key)) => Some(crate::token_hook_store::AotArtifact {
+            artifact,
+            engine_key,
+        }),
+        // The CHECK makes the mixed cases unreachable; treating them as "no artifact" rather than
+        // panicking keeps a hand-edited database a slow login instead of a crash loop.
+        _ => None,
+    }
+}
+
 /// The read-only CUSTOM FACTOR component repository for one scope (issue #114 criterion 6).
 ///
 /// Read by the LOGIN path when a journey step names a component, which is why the data plane
@@ -32964,6 +32995,7 @@ impl ChallengeComponentRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
             "SELECT c.name, c.component, c.payload_version, c.fetch_budget, \
+                    c.aot_artifact, c.aot_engine_key, \
                     COALESCE(( \
                         SELECT array_agg(g.secret_name ORDER BY g.secret_name) \
                         FROM challenge_component_secrets g \
@@ -32982,6 +33014,7 @@ impl ChallengeComponentRepo<'_> {
         tx.commit().await?;
         Ok(
             row.map(|row| crate::token_hook_store::ChallengeComponentRecord {
+                aot: aot_from_row(&row),
                 name: row.get("name"),
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
@@ -33130,7 +33163,7 @@ impl TokenHookRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT h.client_id, h.name, h.ordinal, h.component, h.payload_version, \
-                    h.failure_policy, h.fetch_budget, \
+                    h.failure_policy, h.fetch_budget, h.aot_artifact, h.aot_engine_key, \
                     COALESCE(( \
                         SELECT array_agg(s.secret_name ORDER BY s.secret_name) \
                         FROM token_hook_secrets s \
@@ -33154,6 +33187,7 @@ impl TokenHookRepo<'_> {
         rows.into_iter()
             .map(|row| {
                 Ok(TokenHookRecord {
+                    aot: aot_from_row(&row),
                     client_id: row.get("client_id"),
                     name: row.get("name"),
                     ordinal: Some(row.get("ordinal")),
@@ -33203,6 +33237,12 @@ impl TokenHookRepo<'_> {
                 // a read that did not ask, and zero is for the budget: both are deny.
                 granted_secrets: Vec::new(),
                 fetch_budget: 0,
+                // NOT PROJECTED BY THIS READ, exactly as `granted_secrets` is not: the
+                // artifact reaches the dispatch through `chain`, in the same statement. A caller
+                // that built a record here and tried to run it would compile rather than load,
+                // which is correct-but-slow rather than wrong -- and it is what this read has
+                // always done.
+                aot: None,
             })
         })
         .transpose()
@@ -33261,6 +33301,12 @@ impl TokenHookRepo<'_> {
                 // a read that did not ask, and zero is for the budget: both are deny.
                 granted_secrets: Vec::new(),
                 fetch_budget: 0,
+                // NOT PROJECTED BY THIS READ, exactly as `granted_secrets` is not: the
+                // artifact reaches the dispatch through `chain`, in the same statement. A caller
+                // that built a record here and tried to run it would compile rather than load,
+                // which is correct-but-slow rather than wrong -- and it is what this read has
+                // always done.
+                aot: None,
             })
         })
         .transpose()
@@ -33324,6 +33370,12 @@ impl TokenHookRepo<'_> {
                     // See `get` above: grants reach the dispatch through `chain`.
                     granted_secrets: Vec::new(),
                     fetch_budget: 0,
+                    // NOT PROJECTED BY THIS READ, exactly as `granted_secrets` is not: the
+                    // artifact reaches the dispatch through `chain`, in the same statement. A caller
+                    // that built a record here and tried to run it would compile rather than load,
+                    // which is correct-but-slow rather than wrong -- and it is what this read has
+                    // always done.
+                    aot: None,
                 },
                 row.get::<Option<i32>, _>("version"),
             ))
@@ -33780,6 +33832,9 @@ impl ActingTokenHookRepo<'_> {
                 placement: HookPlacement::default_hook(),
                 // NOT GRANTED. This path is the pre-ordering deploy, which names no capability.
                 fetch_budget: 0,
+                // NO ARTIFACT: this path has no engine to precompile with. The row then carries
+                // none and the dispatch compiles, which is what it did before artifacts existed.
+                aot: None,
             },
             None,
         )
@@ -33813,6 +33868,8 @@ impl ActingTokenHookRepo<'_> {
         let hook_name = deployment.placement.name.to_owned();
         let hook_ordinal = deployment.placement.ordinal;
         let fetch_budget = deployment.fetch_budget;
+        let aot_artifact = deployment.aot.map(|aot| aot.artifact.clone());
+        let aot_engine_key = deployment.aot.map(|aot| aot.engine_key.clone());
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -33857,13 +33914,16 @@ impl ActingTokenHookRepo<'_> {
                     // every existing row to.
                     "INSERT INTO token_hooks \
                      (tenant_id, environment_id, client_id, name, ordinal, component, \
-                      payload_version, failure_policy, fetch_budget) \
-                     VALUES ($1, $2, $3, $7, $8, $4, $5, $6, $9) \
+                      payload_version, failure_policy, fetch_budget, aot_artifact, \
+                      aot_engine_key) \
+                     VALUES ($1, $2, $3, $7, $8, $4, $5, $6, $9, $10, $11) \
                      ON CONFLICT (tenant_id, environment_id, client_id, name) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
                          failure_policy = EXCLUDED.failure_policy, \
                          fetch_budget = EXCLUDED.fetch_budget, \
+                         aot_artifact = EXCLUDED.aot_artifact, \
+                         aot_engine_key = EXCLUDED.aot_engine_key, \
                          updated_at = now()",
                 )
                 .bind(scope.tenant().to_string())
@@ -33875,6 +33935,12 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&hook_name)
                 .bind(hook_ordinal)
                 .bind(fetch_budget)
+                // THE ARTIFACT TRAVELS WITH THE CODE, replaced on every redeploy exactly as the
+                // component is. One left from a previous deploy is machine code for a component
+                // that is no longer in the row -- and the key would still match, so it would
+                // LOAD, and the hook that ran would be the old one.
+                .bind(aot_artifact)
+                .bind(aot_engine_key)
                 .execute(&mut **tx)
                 .await?;
                 // THE HISTORY ROW AND THE PRUNE, in the SAME transaction as the active one
@@ -34130,6 +34196,18 @@ impl ActingTokenHookRepo<'_> {
                     name,
                     ordinal: next_ordinal,
                 },
+                // NO ARTIFACT ON A ROLLBACK, and this is the conservative half of the design.
+                //
+                // A rollback restores an OLDER COMPONENT, and `token_hook_versions` stores no
+                // artifact for it -- storing one would mean holding machine code for every
+                // retained version, at several times its size, for versions nobody may ever run
+                // again. So the restored row carries none and the next login COMPILES it once,
+                // paying the cold cost exactly where an operator is already accepting a change.
+                //
+                // Passing the ACTIVE row's artifact here would be the dangerous alternative: the
+                // key would match this build, so it would load -- and the code that ran would be
+                // the component the rollback just replaced.
+                aot: None,
                 // THE CAPABILITY IS CARRIED FORWARD, and the read above is why it can be.
                 //
                 // A rollback restores CODE, so a grant an operator made to this hook has to

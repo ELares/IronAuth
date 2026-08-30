@@ -206,6 +206,7 @@ async fn setup() -> Harness {
                 component: ironauth_hooks::fixtures::WORDMARK_CHALLENGE,
                 payload_version: 1,
                 fetch_budget: 0,
+                aot: None,
             },
         )
         .await
@@ -565,4 +566,104 @@ async fn revoking_a_factors_secret_closes_it_rather_than_opening_it() {
         !set_cookie.contains(SESSION_COOKIE),
         "and no session was minted: {set_cookie}"
     );
+}
+
+/// THE STORED ARTIFACT IS WHAT RUNS, AND A FOREIGN KEY MEANS THE COMPONENT DOES (issue #114
+/// criterion 4).
+///
+/// # How this test discriminates, which the first version did not
+///
+/// The obvious test -- deploy the real component with its own artifact and check the login still
+/// works -- passes for a build that IGNORES every artifact. Both paths produce the same factor,
+/// so the assertion says nothing about which one ran.
+///
+/// So the row is deliberately built with an artifact that does NOT match its component: the
+/// component is the wordmark factor, and the artifact is `runaway-challenge`, which spins in
+/// every export and is stopped by fuel. That is not a state a deploy can produce -- the admin
+/// path compiles the bytes it stores -- and it is constructed here precisely because it makes the
+/// two paths OBSERVABLY different:
+///
+/// - key MATCHES this build -> the ARTIFACT runs -> the factor spins, is fuel-aborted, and
+///   fails closed with the uniform refusal.
+/// - key is FOREIGN -> the artifact is not executed -> the COMPONENT runs -> the challenge
+///   renders normally.
+///
+/// A build that ignored artifacts would render the challenge in both cases and fail the first
+/// assertion. A build that executed a foreign artifact would refuse in both and fail the second.
+#[tokio::test]
+async fn the_stored_artifact_is_what_runs_and_a_foreign_key_falls_back_to_the_component() {
+    let engine = ironauth_hooks::HookEngine::new().expect("engine");
+    // The artifact of a DIFFERENT factor: one that never returns.
+    let runaway = engine
+        .compile(ironauth_hooks::fixtures::RUNAWAY_CHALLENGE)
+        .expect("precompile the runaway factor");
+
+    for (label, engine_key, expect_challenge) in [
+        ("this build's key", engine.compatibility_key(), false),
+        // A well-formed key that is not this build's: sixty-four hex characters, because the
+        // column refuses anything else. The point is a MISMATCH, not a malformed row.
+        ("a foreign key", "f".repeat(64), true),
+    ] {
+        let harness = setup().await;
+        harness.seed_user("aot-user@example.test", PASSWORD).await;
+        let env = harness.env().clone();
+        let scope = harness.scope();
+
+        harness
+            .db()
+            .control_store()
+            .scoped(scope)
+            .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+            .challenge_components()
+            .deploy(
+                &env,
+                ChallengeDeployment {
+                    name: FACTOR,
+                    // THE WORDMARK COMPONENT, with the RUNAWAY artifact beside it.
+                    component: ironauth_hooks::fixtures::WORDMARK_CHALLENGE,
+                    payload_version: 1,
+                    fetch_budget: 0,
+                    aot: Some(&ironauth_store::AotArtifact {
+                        artifact: runaway.clone(),
+                        engine_key,
+                    }),
+                },
+            )
+            .await
+            .expect("deploy");
+
+        let (flow_id, token, _) = create(&harness).await;
+        let (_, headers, after_password) = post_json(
+            &harness,
+            &submit_path(&harness),
+            &json!({
+                "id": flow_id,
+                "submit_token": token,
+                "nodes": { "identifier": "aot-user@example.test", "password": PASSWORD },
+            }),
+        )
+        .await;
+
+        let rendered = node_names(&after_password["flow"]);
+        assert_eq!(
+            rendered.iter().any(|name| name == "wordmark"),
+            expect_challenge,
+            "{label}: whether the CHALLENGE rendered is what says which of the two ran -- the              artifact spins and fails closed, the component asks for a word: {after_password}"
+        );
+        // EITHER WAY THE LOGIN IS NOT COMPLETE, and that half matters on its own: the factor
+        // holding is what makes the assertion above about the factor rather than about a login
+        // that skipped it.
+        assert_ne!(
+            after_password["state"], "completed",
+            "{label}: the factor must hold the login: {after_password}"
+        );
+        assert!(
+            !headers
+                .get(header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .contains(SESSION_COOKIE),
+            "{label}: and mint no session"
+        );
+    }
 }

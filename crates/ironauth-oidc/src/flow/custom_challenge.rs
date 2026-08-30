@@ -120,7 +120,13 @@ pub(super) async fn drive(
     };
 
     let secrets = resolve_secrets(state.store(), scope, &record).await;
-    let loaded = match runtime.loaded(scope, factor, &record.component).await {
+    // THE ARTIFACT TRAVELS WITH THE RECORD (issue #114 criterion 4). The runtime compares its
+    // key against this engine's before deserializing anything, so a row written by another build
+    // simply compiles.
+    let loaded = match runtime
+        .loaded(scope, factor, &record.component, record.aot.clone())
+        .await
+    {
         Ok(loaded) => loaded,
         Err(error) => {
             tracing::error!(

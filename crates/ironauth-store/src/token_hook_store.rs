@@ -115,6 +115,41 @@ pub struct TokenHookRecord {
     /// one: a `granted` flag with a budget of zero, or a budget of five with the flag false, are
     /// states somebody would have to decide the meaning of.
     pub fetch_budget: i32,
+    /// The PRECOMPILED artifact and the engine key that says which build produced it (issue #114
+    /// criterion 4), or [`None`] when this row has none.
+    ///
+    /// [`None`] IS NOT A DEGRADED STATE: it means compile the component, which is what every row
+    /// did before artifacts existed. A caller must compare the key against its own engine's
+    /// before deserializing, because the artifact is machine code and the key is what decides
+    /// whether this build may execute it.
+    pub aot: Option<AotArtifact>,
+}
+
+/// A precompiled component and the engine key that says which build produced it (issue #114
+/// criterion 4).
+///
+/// The two travel TOGETHER, in one type, because neither is usable alone: an artifact with no key
+/// cannot be checked and a key with no artifact describes nothing. The database enforces the same
+/// pairing with a `both or neither` CHECK, and this type is why a caller cannot hold one half.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AotArtifact {
+    /// The precompiled component. MACHINE CODE: never execute it without checking `engine_key`.
+    pub artifact: Vec<u8>,
+    /// The `HookEngine::compatibility_key` of the build that produced it.
+    pub engine_key: String,
+}
+
+/// Hand-written: the artifact is machine code and a derived `Debug` would print megabytes of it.
+///
+/// The LENGTH and the KEY are the facts worth having -- together they answer "is there one, and
+/// can this build use it", which is the only question a reader of a log line is asking.
+impl std::fmt::Debug for AotArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AotArtifact")
+            .field("artifact_bytes", &self.artifact.len())
+            .field("engine_key", &self.engine_key)
+            .finish()
+    }
 }
 
 /// WHERE a deploy puts a hook in its client's chain: which hook it is, and in what position.
@@ -164,6 +199,14 @@ pub struct HookDeployment<'a> {
     pub failure_policy: HookFailurePolicy,
     /// Which hook this is and where in the chain it runs.
     pub placement: HookPlacement<'a>,
+    /// The PRECOMPILED artifact and its engine key (issue #114 criterion 4), or [`None`] to
+    /// store none.
+    ///
+    /// [`None`] IS A VALID DEPLOY, not a failure: the row then carries no artifact and the
+    /// dispatch compiles, which is what every deploy did before artifacts existed. A caller
+    /// without an engine -- and there are real ones, since a build can exclude the hook runtime
+    /// entirely -- passes `None` rather than being unable to deploy.
+    pub aot: Option<&'a AotArtifact>,
     /// How many outbound requests this hook may make per invocation. Zero means it may not.
     pub fetch_budget: i32,
 }
@@ -193,6 +236,7 @@ impl std::fmt::Debug for TokenHookRecord {
             // allowed rather than leaving a reader to guess whether the grant or the code was
             // the surprise.
             .field("fetch_budget", &self.fetch_budget)
+            .field("aot", &self.aot)
             .finish()
     }
 }
@@ -258,6 +302,8 @@ pub struct ChallengeComponentRecord {
     /// The environment secret NAMES this component may read. Never the values: those are
     /// resolved just before the guest runs, by the caller that has the secret store.
     pub granted_secrets: Vec<String>,
+    /// The PRECOMPILED artifact and its engine key (issue #114 criterion 4), or [`None`].
+    pub aot: Option<AotArtifact>,
 }
 
 /// Hand-written, and the component is rendered as a LENGTH.
@@ -273,6 +319,7 @@ impl std::fmt::Debug for ChallengeComponentRecord {
             .field("fetch_budget", &self.fetch_budget)
             // THE GRANTED NAMES, never a value: the values are not on this type at all.
             .field("granted_secrets", &self.granted_secrets)
+            .field("aot", &self.aot)
             .finish()
     }
 }
@@ -305,4 +352,6 @@ pub struct ChallengeDeployment<'a> {
     pub payload_version: i32,
     /// How many outbound requests ONE call of the triad may make. Zero is not granted.
     pub fetch_budget: i32,
+    /// The PRECOMPILED artifact and its engine key (issue #114 criterion 4), or [`None`].
+    pub aot: Option<&'a AotArtifact>,
 }

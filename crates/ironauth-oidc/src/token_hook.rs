@@ -307,8 +307,17 @@ impl HookRuntime {
         scope: Scope,
         discriminator: &str,
         component: &[u8],
+        aot: Option<ironauth_store::AotArtifact>,
     ) -> Result<Arc<LoadedHook>, HookError> {
-        loaded_hook(&self.engine, &self.cache, scope, discriminator, component).await
+        loaded_hook(
+            &self.engine,
+            &self.cache,
+            scope,
+            discriminator,
+            component,
+            aot,
+        )
+        .await
     }
 
     /// The outbound path a granted component's requests take, when one is wired.
@@ -929,18 +938,25 @@ async fn run_deployed_hook(
         return Err(HookFault::PayloadVersion);
     }
 
-    let loaded = loaded_hook(engine, cache, scope, client_id, &record.component)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                target: "ironauth.hooks",
-                tenant = %scope.tenant(),
-                client_id,
-                ?error,
-                "the deployed hook component could not be compiled"
-            );
-            HookFault::Unloadable
-        })?;
+    let loaded = loaded_hook(
+        engine,
+        cache,
+        scope,
+        client_id,
+        &record.component,
+        record.aot.clone(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            target: "ironauth.hooks",
+            tenant = %scope.tenant(),
+            client_id,
+            ?error,
+            "the deployed hook component could not be compiled"
+        );
+        HookFault::Unloadable
+    })?;
 
     let request = Request {
         payload_version: PAYLOAD_VERSION,
@@ -1016,6 +1032,7 @@ async fn loaded_hook(
     scope: Scope,
     client_id: &str,
     component: &[u8],
+    aot: Option<ironauth_store::AotArtifact>,
 ) -> Result<Arc<LoadedHook>, HookError> {
     let key: HookKey = (
         scope.tenant().to_string(),
@@ -1038,13 +1055,52 @@ async fn loaded_hook(
 
     let compiling = Arc::clone(engine);
     let bytes = component.to_vec();
-    let outcome = tokio::task::spawn_blocking(move || compiling.load(&bytes))
-        .await
-        .unwrap_or_else(|join| {
-            Err(HookError::Declined(format!(
-                "the compile task did not complete: {join}"
-            )))
-        });
+    // THE ARTIFACT, ONLY IF THIS BUILD MADE IT (issue #114 criterion 4).
+    //
+    // The key comparison happens HERE, before anything is deserialized, because the artifact is
+    // machine code and `Component::deserialize`'s header check is not evidence that it is ours.
+    // A mismatch -- a wasmtime upgrade, a config change, a row written by another deployment --
+    // falls through to compiling, which is correct and is what every load did before artifacts
+    // existed.
+    let usable_artifact = aot.filter(|aot| aot.engine_key == compiling.compatibility_key());
+    let outcome = tokio::task::spawn_blocking(move || match usable_artifact {
+        Some(aot) => {
+            // SAFETY: `engine_key` matched this engine's `compatibility_key`, whose contract is
+            // that artifacts from an engine with the same key are guaranteed to deserialize
+            // here. The bytes came from this deployment's own control plane, which is the only
+            // writer of the column, and were produced by `HookEngine::compile`.
+            //
+            // A FALLBACK ON FAILURE, not a refusal: a corrupt row must not make a hook
+            // permanently unrunnable when the component beside it is still good.
+            #[expect(
+                unsafe_code,
+                reason = "the AOT load is inherently unsafe; the key comparison above is what \
+                          establishes that this build produced the artifact, which is the \
+                          provenance `load_precompiled` requires its caller to state."
+            )]
+            // SAFETY: see the comment above -- key-matched, control-plane-written, produced by
+            // `HookEngine::compile`.
+            let loaded = unsafe { compiling.load_precompiled(&aot.artifact) };
+            match loaded {
+                Ok(hook) => Ok(hook),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "ironauth.hooks",
+                        error = %error,
+                        "a stored artifact whose key matched did not load; compiling instead",
+                    );
+                    compiling.load(&bytes)
+                }
+            }
+        }
+        None => compiling.load(&bytes),
+    })
+    .await
+    .unwrap_or_else(|join| {
+        Err(HookError::Declined(format!(
+            "the compile task did not complete: {join}"
+        )))
+    });
 
     let loaded = match outcome {
         Ok(hook) => Arc::new(hook),
@@ -1542,6 +1598,9 @@ mod tests {
                 scope,
                 "a-client",
                 ironauth_hooks::fixtures::GOOD,
+                // NO ARTIFACT: these cover the COMPILE-and-cache path, which is what a row
+                // with no artifact takes and what this cache exists for.
+                None,
             )
             .await
             .expect("the shipped fixture compiles");
@@ -1612,6 +1671,9 @@ mod tests {
                 scope,
                 "a-client",
                 ironauth_hooks::fixtures::NET_ESCAPE,
+                // NO ARTIFACT: these cover the COMPILE-and-cache path, which is what a row
+                // with no artifact takes and what this cache exists for.
+                None,
             )
             .await
             .expect_err("an unlinkable component cannot load");
@@ -1628,6 +1690,9 @@ mod tests {
                 scope,
                 "a-client",
                 ironauth_hooks::fixtures::NET_ESCAPE,
+                // NO ARTIFACT: these cover the COMPILE-and-cache path, which is what a row
+                // with no artifact takes and what this cache exists for.
+                None,
             )
             .await
             .expect_err("still refused");
@@ -1729,7 +1794,7 @@ mod tests {
                 ironauth_store::EnvironmentId::from_seed_bytes([6_u8; 16]),
             );
 
-            let error = loaded_hook(&engine, &cache, scope, "a-client", b"not a component")
+            let error = loaded_hook(&engine, &cache, scope, "a-client", b"not a component", None)
                 .await
                 .expect_err("garbage is not a component");
             assert_eq!(

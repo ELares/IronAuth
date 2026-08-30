@@ -253,6 +253,11 @@ pub async fn deploy_challenge_component(
         .deploy(
             state.env(),
             ChallengeDeployment {
+                // PRECOMPILED HERE, at deploy, so a login deserializes machine code rather than
+                // generating it. `None` when this build has no runtime to compile with, which
+                // stores no artifact and leaves the dispatch compiling -- the behaviour before
+                // criterion 4.
+                aot: crate::token_hooks::precompile(&state, &body).as_ref(),
                 name,
                 component: &body,
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
