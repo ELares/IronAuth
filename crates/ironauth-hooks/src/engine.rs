@@ -294,6 +294,17 @@ pub struct Customization {
 }
 
 impl LoadedHook {
+    /// The resolved imports, for the sibling module that binds the OTHER world.
+    ///
+    /// `pub(crate)` rather than public: a `LoadedHook` is the same resolved component whichever
+    /// world's exports a caller reaches for, and `challenge.rs` needs to instantiate it against
+    /// `custom-challenge-hook`. Handing an `InstancePre` to a caller outside this crate would
+    /// hand them instantiation with no store setup, which is where every resource bound is
+    /// applied.
+    pub(crate) fn pre(&self) -> &wasmtime::component::InstancePre<Sandbox> {
+        &self.pre
+    }
+
     /// Run the hook's `customize` export under `limits`.
     ///
     /// # This is SYNCHRONOUS and must not be called from an async runtime worker thread

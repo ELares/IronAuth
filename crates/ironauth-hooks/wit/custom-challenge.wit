@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// The custom challenge triad, issue #114 criterion 6.
+//
+// Cognito's custom auth challenge model -- DefineAuthChallenge, CreateAuthChallenge,
+// VerifyAuthChallengeResponse -- as one component exporting three functions.
+//
+// ONE COMPONENT, NOT THREE. Cognito splits the triad across three lambdas because that is
+// what its deployment unit is; here they are three exports of one component, because the
+// three halves of a factor share its logic and an operator adding a factor should deploy
+// ONE artifact. Splitting them would also make "which define goes with which verify" a
+// question an operator has to answer correctly on every deploy.
+//
+// WHAT MAKES IT A CUSTOM FACTOR RATHER THAN A SCRIPTED FORM: the host never learns what the
+// challenge IS. It carries opaque parameters, renders the fields the guest names, and asks
+// the guest whether the answer was right. Adding a second factor is another component and a
+// journey that references it -- no host change, which is what criterion 6 asks for.
+
+/// One input the challenge asks the user for.
+///
+/// Deliberately NOT the flow engine's node model. That model carries rendering concerns this
+/// interface has no business fixing (groups, ordering ranks, autocomplete hints), and pinning
+/// it here would make every change to how IronAuth renders a form a breaking change to every
+/// deployed challenge component. A guest names WHAT it needs; the host decides how to draw it.
+interface challenge-types {
+  record field {
+    /// The submission key this input's answer arrives under.
+    name: string,
+    /// The label to render. Localization is the host's, from the label as a key.
+    label: string,
+    /// Whether the value must be masked on screen and kept out of logs.
+    ///
+    /// A HINT THE HOST HONOURS, not a promise the guest enforces: the guest never sees the
+    /// rendered form. It is here because the guest is the only party that knows whether the
+    /// thing it is asking for is a secret.
+    secret: bool,
+  }
+
+  /// One answer coming back from the user.
+  record answer {
+    /// The field name this answers.
+    name: string,
+    /// What the user typed.
+    value: string,
+  }
+
+  /// What every call in the triad is told about the flow it is running in.
+  ///
+  /// NO SESSION, NO TOKENS, NO CREDENTIALS. A challenge component decides whether a user can
+  /// prove something; it is not given the means to act as them. The subject is the pseudonymous
+  /// id the flow has already established, and it is an `option` because a factor may run before
+  /// one exists.
+  record context {
+    /// The payload version, explicit in every invocation, moving on its own schedule exactly
+    /// as `token.customize`'s does.
+    payload-version: u32,
+    /// The pseudonymous subject this factor is challenging, when the flow has one.
+    subject: option<string>,
+    /// The client the login is for, so one component can serve several with different rules.
+    client-id: string,
+    /// How many challenges of this factor the flow has ALREADY completed, starting at zero.
+    ///
+    /// This is what lets `define` end a factor: a component that wants three rounds returns
+    /// `challenge` while this is below three and `succeed` after. It counts COMPLETED rounds,
+    /// not attempts at one round, so a wrong answer that the host re-renders does not advance it.
+    round: u32,
+    /// Whether the previous round's answer was accepted, absent on the first round.
+    ///
+    /// A component that ends the factor on a wrong answer reads this; one that allows retries
+    /// ignores it and counts rounds instead.
+    previous-passed: option<bool>,
+  }
+}
+
+/// The three functions a custom factor implements.
+interface custom-challenge {
+  use challenge-types.{field, answer, context};
+
+  /// What `define` decides happens next.
+  ///
+  /// The three outcomes are the whole state machine, and the host owns no other: it asks, and
+  /// it does what it is told. That is what keeps a new factor out of the flow engine.
+  variant decision {
+    /// Issue (another) challenge: the host calls `create` next.
+    challenge,
+    /// The factor is satisfied. The host advances the flow.
+    succeed,
+    /// The factor has failed for good, with a reason for the audit trail.
+    ///
+    /// The reason is NOT rendered to the user. A factor that fails for a reason the user should
+    /// see says so through `create`'s prompt on a further round; this string is for the operator
+    /// reading why a login was refused.
+    fail(string),
+  }
+
+  /// One challenge to put in front of the user.
+  record challenge-spec {
+    /// What to tell the user, as a localization key or literal prompt.
+    prompt: string,
+    /// The inputs to render, in the order given.
+    fields: list<field>,
+    /// What `verify` will need in order to check the answer, JSON-encoded.
+    ///
+    /// NEVER RENDERED AND NEVER SENT. The host holds it for the life of the round and hands it
+    /// back to `verify`. This is where a one-time code, a nonce or an expected answer lives --
+    /// putting it in `public-params` would publish the answer with the question.
+    private-params: string,
+    /// What the client may see alongside the fields, JSON-encoded.
+    ///
+    /// Rendered, so it is the half a component must assume an attacker reads.
+    public-params: string,
+  }
+
+  /// Decide what happens next for this factor.
+  define: func(ctx: context) -> result<decision, string>;
+
+  /// Build the challenge to render.
+  create: func(ctx: context) -> result<challenge-spec, string>;
+
+  /// Check an answer against what `create` put aside.
+  ///
+  /// Returns whether the answer was RIGHT. The error case is the component failing to decide at
+  /// all -- malformed parameters, an upstream it needed and could not reach -- which is a
+  /// different fact from a wrong answer and gets the per-hook failure policy rather than another
+  /// round.
+  verify: func(
+    ctx: context,
+    private-params: string,
+    answers: list<answer>,
+  ) -> result<bool, string>;
+}
+
+/// The world a custom challenge component implements.
+///
+/// Imports the SAME capabilities `token-customize-hook` does, and for the same reasons: a
+/// factor that checks a code against an upstream needs `fetch`, and one that signs or compares
+/// against a shared key needs `secrets`. Both stay deny-by-default and per-hook.
+world custom-challenge-hook {
+  import secrets;
+  import fetch;
+  export custom-challenge;
+}

@@ -9,7 +9,8 @@
 [workspace]
 resolver = "2"
 members = ["good", "fuel-bomb", "memory-bomb", "net-escape", "random-escape", "fs-escape", "wall-clock-escape", "monotonic-reader", "sleeper", "decliner", "echo-request", "pollable-leak", "poll-bomb", "instant-waiter", "chain-observer", "secret-reader", "fetcher",
-    "claim-forger", "claim-stripper", "echo-only", "echo-access-only", "claim-flood"]
+    "claim-forger", "claim-stripper", "echo-only", "echo-access-only", "claim-flood",
+    "wordmark-challenge", "runaway-challenge"]
 
 [workspace.package]
 version = "0.0.0"

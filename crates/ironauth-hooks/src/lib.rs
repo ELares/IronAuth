@@ -38,11 +38,16 @@
 //! the fence is a step visible in the caller rather than a thing this crate is trusted to have
 //! remembered.
 
+mod challenge;
 mod engine;
 mod error;
 mod limits;
 mod sandbox;
 
+pub use challenge::{
+    ChallengeAnswer, ChallengeContext, ChallengeDecision, ChallengeField, ChallengeGrants,
+    ChallengeSpec,
+};
 pub use engine::{Customization, HookEngine, LoadedHook, Request};
 pub use error::{AbortKind, HookError};
 pub use limits::Limits;
@@ -106,6 +111,20 @@ pub mod fixtures {
     /// as its own claim is what makes the BOUNDARY visible: "the first two succeeded and the
     /// third did not" is a different observation from "it did not work".
     pub const FETCHER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_FETCHER"));
+
+    /// A CUSTOM FACTOR: the define/create/verify triad, as one component (issue #114
+    /// criterion 6).
+    ///
+    /// The only fixture here that implements `custom-challenge-hook` rather than
+    /// `token-customize-hook`, which is what makes it the test of the second world. A
+    /// shared-wordmark challenge over two rounds: `define` ends the factor on a wrong answer and
+    /// succeeds after two, `create` puts the expected word in the private parameters and the
+    /// position in the public ones, and `verify` compares them.
+    ///
+    /// It reads its word list from a GRANTED SECRET, so a test that grants nothing sees the
+    /// deny-by-default path (the component declines) rather than a factor that works by
+    /// accident.
+    pub const WORDMARK_CHALLENGE: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_WORDMARK_CHALLENGE"));
 
     /// A hook that reads a GRANTED secret and one it was never granted.
     ///
