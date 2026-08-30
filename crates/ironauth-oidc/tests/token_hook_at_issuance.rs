@@ -43,8 +43,12 @@ async fn deploy(harness: &Harness, component: &[u8], payload_version: i32) {
 ///
 /// `client_credentials` authenticates a CONFIDENTIAL client the test creates, not the harness's
 /// default one -- the seeded default is PUBLIC -- so that door's hook has to be deployed
-/// against the id the test made. An earlier version of this sentence also named `jwt:bearer`;
-/// that door's test is in `tests/jwt_bearer.rs` and has never called this helper.
+/// against the id the test made. An earlier version of this sentence also named `jwt:bearer`,
+/// and it was wrong about the CLIENT rather than about the file: that door presents the seeded
+/// PUBLIC default in the form body, so its hook is deployed against `harness.client_id()`.
+/// Saying instead that the helper lives in a different file from that door's test would have
+/// been a reason no state of the code could falsify -- `deploy_for` is private to this
+/// integration-test crate, so nothing outside it could ever call it.
 async fn deploy_for(
     harness: &Harness,
     client: &ironauth_store::ClientId,
@@ -700,32 +704,52 @@ async fn an_echoing_hook_does_not_lose_claims_past_the_contribution_cap() {
 // THE JWT BEARER DOOR'S TEST IS NOT IN THIS FILE. It is
 // `tests/jwt_bearer.rs::the_jwt_bearer_grant_runs_the_hook`, which deploys `ECHO_REQUEST`
 // through this same seam and asserts `echo_grant_type` against the `jwt:bearer` grant URN and
-// `echo_access_subject` against the mapped principal -- the door identity and the subject, which
-// are the two properties this seam carries.
+// `echo_access_subject` against the mapped principal: the door identity and the subject.
+//
+// TWO OF THE FOUR SCALARS THE SEAM CARRIES, not all of them. The request record holds
+// `payload-version`, `grant-type`, `client-id` and `subject` -- `ECHO_REQUEST` exists precisely
+// because "four of the six fields cross the boundary unobserved" otherwise -- and the two this
+// door's test does not assert are the two `the_client_credentials_grant_runs_the_hook` covers
+// on its own door. So a seam mutation that swapped the grant string for the client id would go
+// red there and stay green here. Named rather than papered over: adding the two assertions to
+// `tests/jwt_bearer.rs` is the fix, and it belongs to whoever next touches that door.
 //
 // This is a POINTER and not a test, deliberately. A copy of it was written here, and review
-// measured that it caught nothing: five mutants of the seam call at `src/jwt_bearer.rs` --
-// dropping the engine, hard-coding the grant string, and three variations on the subject
-// argument -- each failed BOTH binaries, and both run in the same lane
-// (`cargo test --workspace --all-features`). The reason it measured nothing is that it was the
-// same test: same door, same client, same shared `register_external_issuer` /
-// `create_subject_mapping` scaffolding, and one extra fixture that measures less.
+// measured no detection delta AT THIS DOOR'S SEAM CALL: five mutants of it in
+// `src/jwt_bearer.rs` -- dropping the engine, hard-coding the grant string, and three
+// variations on the subject argument -- each failed BOTH binaries, and both run in the same
+// lane (`cargo test --workspace --all-features`). On that axis it was the same test: same door,
+// same client, same shared `register_external_issuer` / `create_subject_mapping` scaffolding.
 //
 // NOT A SUBSET OF THE ASSERTIONS, which an earlier version of this comment claimed. The copy
 // deployed `GOOD` before `ECHO_REQUEST` and asserted its `tier` claim, which no test on this
 // door makes; `tests/jwt_bearer.rs` asserts a `sub` its own comment there records as unfailable.
-// Neither assertion set contains the other. A subset of the DETECTION, which is the relation
-// that justifies deleting it: `GOOD` reads no field of the request and adds one fence-allowed
-// claim, where `ECHO_REQUEST` reports the seam's scalars as four claims in the access list this
-// door mints, so every mutant here that hides `tier` hides the echoes too.
+// Neither assertion set contains the other, and NEITHER DOES THE DETECTION -- so the deletion
+// is not justified by the test this points at, which is what the previous version of this
+// paragraph claimed. Deploying two fixtures over one client made the copy a redeploy test by
+// accident: it deployed `GOOD`, exchanged, then redeployed `ECHO_REQUEST` over that same client
+// and exchanged again, where `tests/jwt_bearer.rs` deploys once in the whole file. Measured:
+// replacing the component digest with a constant in the hook cache key, so a redeploy wrongly
+// reuses the loaded component, fails the copy on its second exchange and leaves every test in
+// `tests/jwt_bearer.rs` green.
+//
+// What justifies deleting it is that this file asserts that property DIRECTLY, in
+// `a_second_issuance_reuses_the_compiled_component` above, which the same mutant also fails.
+// The copy reached it as a side effect of needing a second fixture to tell the grant apart.
 //
 // What the copy added was a second export of that function name for the door table on
 // `MappedAccessClaims` to resolve to, which is the drift the device-grant doc below refuses to
 // create.
 //
-// It lives there because the trusted-issuer and subject-mapping setup a `jwt:bearer` exchange
-// needs is built up in that file. Renaming a duplicate would not fix this: a distinct name for
-// an identical test buys a distinct table row and still measures nothing.
+// IT DOES NOT LIVE THERE BECAUSE IT HAS TO. An earlier version of this comment said the
+// trusted-issuer and subject-mapping setup a `jwt:bearer` exchange needs is built up in that
+// file, which contradicts the sentence four paragraphs up calling that scaffolding SHARED --
+// `register_external_issuer` and `create_subject_mapping` are both methods on the common
+// harness, and `tests/lifecycle_fence.rs` stands the whole trust setup up without
+// `tests/jwt_bearer.rs`. The same false sentence is on the surviving test's own doc. It lives
+// there because that is where it was written and there is no reason to move it, which is a
+// weaker claim and the true one. Renaming a duplicate would not fix any of this: a distinct
+// name for an identical test buys a distinct table row and still measures nothing.
 
 /// THE DEVICE GRANT RUNS THE HOOK, which is a door the token endpoint does not cover.
 ///

@@ -3692,9 +3692,14 @@ async fn an_issuer_that_rotated_past_the_resolved_jwks_is_diagnosed_as_an_unknow
 /// neither the client's declarative mapping nor its deployed hook. The `MappedAccessClaims`
 /// fence lives on `MintRequest`'s field and could not ask this door the question.
 ///
-/// The test is HERE rather than in `token_hook_at_issuance.rs` because the trusted-issuer and
-/// subject-mapping scaffolding this grant needs exists only in this file, and a hook test that
-/// reimplemented it would be measuring its own copy.
+/// The test is HERE rather than in `token_hook_at_issuance.rs` because that is where it was
+/// written, and there is no reason to move it. NOT because the scaffolding is local: an earlier
+/// version of this sentence said so, and it is false. `register_external_issuer` and
+/// `create_subject_mapping` are methods on the shared harness, and `tests/lifecycle_fence.rs`
+/// stands the whole trusted-issuer and subject-mapping setup up without this file. What IS local
+/// is the four assertion helpers at the top of this file, and a copy that reimplemented those
+/// would be measuring its own copy of them -- which is a smaller claim than the one that stood
+/// here, and the one that survived being checked.
 #[cfg(feature = "wasm-hooks")]
 #[tokio::test]
 async fn the_jwt_bearer_grant_runs_the_hook() {
