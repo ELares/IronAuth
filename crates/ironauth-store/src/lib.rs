@@ -390,5 +390,6 @@ pub use trait_schema::{
 };
 
 pub use token_hook_store::{
-    HookDeployment, HookFailurePolicy, HookPlacement, TokenHookMetadata, TokenHookVersion,
+    ChallengeComponentMetadata, ChallengeComponentRecord, ChallengeDeployment, HookDeployment,
+    HookFailurePolicy, HookPlacement, TokenHookMetadata, TokenHookVersion,
 };

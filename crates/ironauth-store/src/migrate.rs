@@ -1358,6 +1358,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0170_token_hook_fetch_budget.sql"),
         },
+        Migration {
+            version: 171,
+            name: "challenge_components",
+            // EXPAND: two new tables the old binary never reads or writes. Nothing existing
+            // changes shape, so a rollback to the previous binary leaves them inert.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0171_challenge_components.sql"),
+        },
     ]
 }
 

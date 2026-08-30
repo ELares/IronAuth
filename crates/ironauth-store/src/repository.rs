@@ -811,6 +811,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The deployed CUSTOM FACTOR components for this scope (issue #114 criterion 6), read-only.
+    ///
+    /// Read by the LOGIN path when a journey step names one. Read-only by design: deploying a
+    /// factor is a control-plane action, and the plane that runs one must not be able to change
+    /// which code decides whether a login succeeds.
+    #[must_use]
+    pub fn challenge_components(&self) -> ChallengeComponentRepo<'a> {
+        ChallengeComponentRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The deployed WASM token hooks for this scope (issue #114), read-only.
     #[must_use]
     pub fn token_hooks(&self) -> TokenHookRepo<'a> {
@@ -1921,6 +1934,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn claims_mappings(&self) -> ActingClaimsMappingRepo<'a> {
         ActingClaimsMappingRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The deployed CUSTOM FACTOR components for this scope and actor (issue #114 criterion 6).
+    ///
+    /// The control plane's grants on `challenge_components` exist for THIS and nothing else:
+    /// deploying one is deploying code that decides whether a login succeeds.
+    #[must_use]
+    pub fn challenge_components(&self) -> ActingChallengeComponentRepo<'a> {
+        ActingChallengeComponentRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -32643,6 +32669,385 @@ impl ClaimsMappingRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(rows.iter().map(claims_mapping_from_row).collect())
+    }
+}
+
+/// The audit target for a custom factor component (issue #114 criterion 6).
+///
+/// The component NAME, not the scope. Unlike a token hook -- whose table has no id of its own,
+/// so its audit rows name the client -- a component IS identified by its name, and that name is
+/// what a journey step references. An operator reading why a factor changed needs to know which
+/// component, because the answer tells them which journeys are affected.
+struct ChallengeComponentTarget<'a>(&'a str);
+
+impl AuditTarget for ChallengeComponentTarget<'_> {
+    fn audit_target_kind(&self) -> &'static str {
+        "challenge_component"
+    }
+
+    fn audit_target_id(&self) -> String {
+        self.0.to_owned()
+    }
+}
+
+/// The mutating CUSTOM FACTOR component repository for one scope and actor (issue #114
+/// criterion 6).
+pub struct ActingChallengeComponentRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingChallengeComponentRepo<'_> {
+    /// Deploy a custom factor component, or replace one of the same name.
+    ///
+    /// REPLACE IN PLACE, keyed on the name a journey references. A redeploy under an existing
+    /// name is how a factor's code is updated, and the journeys that reference it keep working
+    /// without being touched -- which is the whole point of the name being the contract.
+    ///
+    /// THE FETCH BUDGET IS APPLIED ON A REDEPLOY, matching a token hook's: capabilities travel
+    /// with the code, so shipping a version that no longer calls out must not leave the grant
+    /// standing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, which includes the table's own bounds on
+    /// the name, the bytes, the payload version and the budget.
+    pub async fn deploy(
+        &self,
+        env: &Env,
+        deployment: crate::token_hook_store::ChallengeDeployment<'_>,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
+        // the name for the whole call, while the mutation closure is `async move` and takes
+        // ownership of what it captures. One binding cannot be both.
+        let name = deployment.name.to_owned();
+        let bound = name.clone();
+        let bytes = deployment.component.to_vec();
+        let payload_version = deployment.payload_version;
+        let fetch_budget = deployment.fetch_budget;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ChallengeComponentSet,
+                target: &ChallengeComponentTarget(&bound),
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO challenge_components \
+                     (tenant_id, environment_id, name, component, payload_version, fetch_budget) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (tenant_id, environment_id, name) DO UPDATE \
+                     SET component = EXCLUDED.component, \
+                         payload_version = EXCLUDED.payload_version, \
+                         fetch_budget = EXCLUDED.fetch_budget, \
+                         updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(&bytes)
+                .bind(payload_version)
+                .bind(fetch_budget)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Remove a component, and with it every grant it held.
+    ///
+    /// The grants go by CASCADE rather than by a second statement here, which is what makes them
+    /// impossible to orphan: a grant that outlived its component would be re-attached silently by
+    /// a later deploy of the same name, and that is a capability nobody granted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no component of that name exists, so a removal that matched
+    /// nothing is not reported as success; [`StoreError::Database`] on a persistence fault.
+    pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
+        // the name for the whole call, while the mutation closure is `async move` and takes
+        // ownership of what it captures. One binding cannot be both.
+        let name = name.to_owned();
+        let bound = name.clone();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ChallengeComponentDelete,
+                target: &ChallengeComponentTarget(&bound),
+            },
+            async move |tx| {
+                let result = sqlx::query(
+                    "DELETE FROM challenge_components \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .execute(&mut **tx)
+                .await?;
+                // NOT FOUND rather than a silent success, matching every other delete here:
+                // reporting success for a component that never existed tells an operator their
+                // removal took effect, and turns the endpoint into a probe for which factors a
+                // tenant runs.
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Grant a component permission to read one environment secret, by NAME.
+    ///
+    /// IDEMPOTENT: granting a name already granted is a no-op that still audits, because an
+    /// operator re-running a configuration script should not get a 409 and the audit row is
+    /// evidence of intent rather than of change.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no component of that name exists -- a grant to a component
+    /// that is not deployed would be a capability waiting for whoever deploys that name next;
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn grant_secret(
+        &self,
+        env: &Env,
+        name: &str,
+        secret_name: &str,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
+        // the name for the whole call, while the mutation closure is `async move` and takes
+        // ownership of what it captures. One binding cannot be both.
+        let name = name.to_owned();
+        let bound = name.clone();
+        let secret_name = secret_name.to_owned();
+        let detail = serde_json::json!({ "component": name, "secret": secret_name }).to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ChallengeComponentSecretGranted,
+                target: &ChallengeComponentTarget(&bound),
+            },
+            async move |tx| {
+                // THE COMPONENT MUST EXIST. The foreign key would refuse this anyway, but a
+                // constraint violation reaches an operator as a 500; this reaches them as a
+                // not-found naming what is missing.
+                let exists: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM challenge_components \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .fetch_one(&mut **tx)
+                .await?;
+                if exists == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                sqlx::query(
+                    "INSERT INTO challenge_component_secrets \
+                     (tenant_id, environment_id, name, secret_name) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(&secret_name)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// Withdraw a component's permission to read one environment secret.
+    ///
+    /// IDEMPOTENT in the same direction as the grant, and deliberately so: revoking a name that
+    /// was never granted leaves the component unable to read it, which is what the caller asked
+    /// for. A not-found here would make a cleanup script fail on the second run.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn revoke_secret(
+        &self,
+        env: &Env,
+        name: &str,
+        secret_name: &str,
+    ) -> Result<(), StoreError> {
+        let scope = self.scope;
+        // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
+        // the name for the whole call, while the mutation closure is `async move` and takes
+        // ownership of what it captures. One binding cannot be both.
+        let name = name.to_owned();
+        let bound = name.clone();
+        let secret_name = secret_name.to_owned();
+        let detail = serde_json::json!({ "component": name, "secret": secret_name }).to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ChallengeComponentSecretRevoked,
+                target: &ChallengeComponentTarget(&bound),
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM challenge_component_secrets \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND name = $3 \
+                       AND secret_name = $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(&secret_name)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// The read-only CUSTOM FACTOR component repository for one scope (issue #114 criterion 6).
+///
+/// Read by the LOGIN path when a journey step names a component, which is why the data plane
+/// holds SELECT here and nothing else: the plane that runs a factor must not be able to change
+/// the code that decides whether a login succeeds.
+pub struct ChallengeComponentRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ChallengeComponentRepo<'_> {
+    /// One component by the name a journey step references it by, with its grants.
+    ///
+    /// ONE STATEMENT, not two. The grants are read in the same query as the component, through a
+    /// subselect, for the reason the token-hook chain gives: a login that ran a factor would
+    /// otherwise pay a second round trip, and the two reads could disagree if a grant were
+    /// revoked between them -- a component would run with a capability an operator had just
+    /// taken away.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn get(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::token_hook_store::ChallengeComponentRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT c.name, c.component, c.payload_version, c.fetch_budget, \
+                    COALESCE(( \
+                        SELECT array_agg(g.secret_name ORDER BY g.secret_name) \
+                        FROM challenge_component_secrets g \
+                        WHERE g.tenant_id = c.tenant_id \
+                          AND g.environment_id = c.environment_id \
+                          AND g.name = c.name \
+                    ), ARRAY[]::text[]) AS granted_secrets \
+             FROM challenge_components c \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.name = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(
+            row.map(|row| crate::token_hook_store::ChallengeComponentRecord {
+                name: row.get("name"),
+                component: row.get("component"),
+                payload_version: row.get("payload_version"),
+                fetch_budget: row.get("fetch_budget"),
+                granted_secrets: row.get("granted_secrets"),
+            }),
+        )
+    }
+
+    /// Every component in this scope, as METADATA.
+    ///
+    /// Never the components: a listing exists so an operator can see WHICH factors are deployed,
+    /// and a scope with eight eight-megabyte components would be sixty-four megabytes of response
+    /// to answer that.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn list(
+        &self,
+    ) -> Result<Vec<crate::token_hook_store::ChallengeComponentMetadata>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT name, octet_length(component) AS component_bytes, payload_version, \
+                    fetch_budget \
+             FROM challenge_components \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY name",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::token_hook_store::ChallengeComponentMetadata {
+                name: row.get("name"),
+                component_bytes: row.get::<i32, _>("component_bytes"),
+                payload_version: row.get("payload_version"),
+                fetch_budget: row.get("fetch_budget"),
+            })
+            .collect())
+    }
+
+    /// The environment secrets one component has been GRANTED, by name.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn granted_secrets(&self, name: &str) -> Result<Vec<String>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT secret_name FROM challenge_component_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3 \
+             ORDER BY secret_name",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(name)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 }
 

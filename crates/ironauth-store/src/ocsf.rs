@@ -249,6 +249,12 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "signing_key",
     // A claim mapping shapes what a client's tokens carry, which is configuration of an
     // entity rather than a change to an account or an access grant (issue #113).
+    // A CUSTOM FACTOR component is CODE an operator installs to decide whether a login succeeds
+    // (issue #114 criterion 6). Entity management alongside `token_hook` and for the same
+    // reason: it configures what an environment's journeys can do rather than changing an
+    // account or an access grant. Deliberately NOT `authentication` -- that stream carries what
+    // happened to a login attempt, and this is the configuration a later login will run.
+    "challenge_component",
     "claims_mapping",
     "signup_form",
     // A deployed WASM token hook is CODE an operator installs to shape a client's tokens
