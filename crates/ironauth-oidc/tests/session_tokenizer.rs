@@ -586,8 +586,11 @@ async fn session_expiring_at(
 }
 
 #[tokio::test]
-async fn a_stolen_EXPIRED_session_cookie_mints_nothing() {
-    // The issue's own adversarial list, by name: "tokenize with a stolen expired session cookie".
+async fn a_stolen_expired_session_cookie_mints_nothing() {
+    // The issue's own adversarial list, by name: "tokenize with a stolen EXPIRED session cookie".
+    //
+    // (The emphasis is in the comment and not in the function name: an upper-case word in an
+    // identifier is a `non_snake_case` warning, and CI runs clippy with `-D warnings`.)
     //
     // The cookie is WELL FORMED and names a session that really existed -- which is what makes
     // this different from `an_unauthenticated_request_mints_nothing`. An implementation that
