@@ -2498,6 +2498,18 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "fetch_budget",
+            "in": "query",
+            "description": "How many outbound requests this hook may make per invocation, 0 to 16. Absent means ZERO, which is not granted. Unlike the ordinal this IS applied on a redeploy: a redeploy replaces a hook's code and its declared capabilities together",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 16,
+              "minimum": 0
+            }
           }
         ],
         "requestBody": {
@@ -2523,7 +2535,7 @@
             }
           },
           "400": {
-            "description": "An unknown or absent payload version, an unknown failure policy, an invalid hook name, or bytes that are not a WebAssembly component",
+            "description": "An unknown or absent payload version, an unknown failure policy, an invalid hook name, an out-of-range fetch budget, or bytes that are not a WebAssembly component",
             "content": {
               "application/json": {
                 "schema": {
@@ -32659,7 +32671,8 @@
           "ordinal",
           "component_bytes",
           "payload_version",
-          "failure_policy"
+          "failure_policy",
+          "fetch_budget"
         ],
         "properties": {
           "component_bytes": {
@@ -32671,6 +32684,12 @@
           "failure_policy": {
             "type": "string",
             "description": "What the dispatch does when this hook does not complete."
+          },
+          "fetch_budget": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many outbound requests this hook may make per invocation. Zero means it may not.\n\nREPORTED PER HOOK RATHER THAN PER CLIENT, because it is granted per hook: an operator\nauditing what a client's code can reach needs the whole chain's grants in one place, and\na client-level number could not say WHICH hook holds one.",
+            "minimum": 0
           },
           "name": {
             "type": "string",
@@ -32780,7 +32799,8 @@
           "client_id",
           "component_bytes",
           "payload_version",
-          "failure_policy"
+          "failure_policy",
+          "fetch_budget"
         ],
         "properties": {
           "client_id": {
@@ -32795,6 +32815,12 @@
           "failure_policy": {
             "type": "string",
             "description": "What the dispatch does when this hook does not complete."
+          },
+          "fetch_budget": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many outbound requests this hook may make per invocation. Zero means it may not.",
+            "minimum": 0
           },
           "payload_version": {
             "type": "integer",

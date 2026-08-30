@@ -1667,3 +1667,72 @@ async fn a_grant_to_one_hook_is_not_readable_by_another_in_the_same_chain() {
          CLIENT rather than the hook would hand it the first hook's key: {claims:?}"
     );
 }
+
+/// AN UNGRANTED HOOK CANNOT FETCH AT ISSUANCE, AND A GRANTED ONE ON A DEPLOYMENT WITH NO
+/// FETCHER IS TOLD WHY.
+///
+/// Issue #114 criterion 2, through a real token exchange. The sandbox suite proves the budget
+/// arithmetic against a fake transport; this proves the whole path -- the column, the record, and
+/// the dispatch that builds a transport only for a granted hook -- reaches a token an ordinary
+/// client is issued.
+///
+/// # The two refusals are different facts and the test separates them
+///
+/// A hook deployed with a budget of ZERO gets "not granted", built by the sandbox with no
+/// transport constructed at all. A hook deployed WITH a budget on a deployment that has wired no
+/// outbound fetcher gets a message saying THAT -- because those are different problems: the
+/// first needs an operator to grant the capability, the second needs them to wire a fetcher, and
+/// showing either message for the other sends them to the wrong place.
+///
+/// This harness wires no fetcher, which is what makes the second half assertable here. The
+/// hardened path itself is `ironauth-fetch`'s to prove, and it has its own suite.
+#[tokio::test]
+async fn an_ungranted_hook_cannot_fetch_and_a_granted_one_is_told_what_is_missing() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    // UNGRANTED: budget zero, which is the default every hook has.
+    harness
+        .deploy_token_hook_with_budget(&client, "caller", 0, ironauth_hooks::fixtures::FETCHER, 0)
+        .await;
+    let (access, _) = exchange(&harness).await.expect("the ungranted exchange");
+    let ungranted = claims(&access);
+    let first = ungranted
+        .get("fetch_1")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        first.contains("not granted"),
+        "a hook deployed with a budget of zero is refused as UNGRANTED, and no transport is \
+         built for it at all: {first}"
+    );
+
+    // GRANTED, on a deployment with no fetcher wired.
+    harness
+        .deploy_token_hook_with_budget(&client, "caller", 0, ironauth_hooks::fixtures::FETCHER, 2)
+        .await;
+    let (access, _) = exchange(&harness).await.expect("the granted exchange");
+    let granted = claims(&access);
+    let first = granted
+        .get("fetch_1")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        first.contains("no outbound fetcher"),
+        "a GRANTED hook on a deployment with no hardened path is told that, rather than being \
+         told it was never granted -- the two need different things from an operator: {first}"
+    );
+
+    // AND THE BUDGET STILL BOUNDS IT. The third attempt is past the grant of two, so it is
+    // refused for the budget rather than for the missing fetcher: a deployment that wired one
+    // later would find the bound already enforced.
+    let third = granted
+        .get("fetch_3")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        third.contains("request budget exhausted"),
+        "the budget is enforced before the transport is consulted, so it bounds a hook even \
+         where the transport itself cannot run: {third}"
+    );
+}

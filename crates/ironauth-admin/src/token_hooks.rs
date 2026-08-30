@@ -243,12 +243,13 @@ fn hook_name(raw: Option<&str>) -> Result<&str, ApiError> {
         ("payload_version" = u32, Query, description = "The token-customize payload version the guest was built against"),
         ("failure_policy" = Option<String>, Query, description = "What the dispatch does when this hook does not complete: `fail_closed` (the default) or `fail_open`"),
         ("name" = Option<String>, Query, description = "Which of the client's hooks this deploys; absent means `default`"),
-        ("ordinal" = Option<u32>, Query, description = "Where a NEW hook runs in the chain, ascending; absent means last. IGNORED when the hook already exists, so a redeploy replaces code without moving it")
+        ("ordinal" = Option<u32>, Query, description = "Where a NEW hook runs in the chain, ascending; absent means last. IGNORED when the hook already exists, so a redeploy replaces code without moving it"),
+        ("fetch_budget" = Option<u32>, Query, maximum = 16, description = "How many outbound requests this hook may make per invocation, 0 to 16. Absent means ZERO, which is not granted. Unlike the ordinal this IS applied on a redeploy: a redeploy replaces a hook's code and its declared capabilities together")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Deployed", body = TokenHookView),
-        (status = 400, description = "An unknown or absent payload version, an unknown failure policy, an invalid hook name, or bytes that are not a WebAssembly component", body = ErrorBody),
+        (status = 400, description = "An unknown or absent payload version, an unknown failure policy, an invalid hook name, an out-of-range fetch budget, or bytes that are not a WebAssembly component", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Environment not found or malformed client id", body = ErrorBody),
@@ -292,6 +293,26 @@ pub async fn deploy_token_hook(
         return Err(ApiError::BadRequest("unknown_payload_version: this build cannot honour that token-customize payload version".to_owned()));
     }
     let name = hook_name(query.name.as_deref())?;
+    // ABSENT MEANS ZERO, which is not granted. Parsed here rather than by the extractor so an
+    // unparseable one is this API's 400 with an `ErrorBody`, and bounded here as well as by the
+    // column's CHECK so the refusal names the limit rather than surfacing as a 23514.
+    //
+    // APPLIED ON A REDEPLOY, unlike the ordinal below: a redeploy replaces a hook's code, and
+    // the capabilities that code is granted travel with it. An operator shipping a version that
+    // no longer calls out should not have to remember a second call to withdraw the grant.
+    let fetch_budget = match query.fetch_budget.as_deref() {
+        Some(raw) => raw
+            .parse::<i32>()
+            .ok()
+            .filter(|budget| (0..=MAX_FETCH_BUDGET).contains(budget))
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "invalid_fetch_budget: fetch_budget must be an integer between 0 and \
+                     {MAX_FETCH_BUDGET}"
+                ))
+            })?,
+        None => 0,
+    };
     // ABSENT MEANS LAST, which is the only default that cannot surprise: appending changes
     // nothing about what the hooks already deployed are handed, while inserting at the front
     // silently changes the input of every one of them. An operator who wants a different
@@ -340,6 +361,7 @@ pub async fn deploy_token_hook(
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
                 failure_policy,
                 placement: ironauth_store::HookPlacement { name, ordinal },
+                fetch_budget,
             },
             deployed_event(
                 &state,
@@ -359,6 +381,7 @@ pub async fn deploy_token_hook(
         component_bytes: body.len(),
         payload_version,
         failure_policy: failure_policy.as_str().to_owned(),
+        fetch_budget: u32::try_from(fetch_budget).map_err(|_| ApiError::Internal)?,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -411,6 +434,7 @@ pub async fn get_token_hook(
         component_bytes: usize::try_from(record.component_bytes).map_err(|_| ApiError::Internal)?,
         payload_version: u32::try_from(record.payload_version).map_err(|_| ApiError::Internal)?,
         failure_policy: record.failure_policy.as_str().to_owned(),
+        fetch_budget: u32::try_from(record.fetch_budget).map_err(|_| ApiError::Internal)?,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -542,6 +566,8 @@ pub async fn list_token_hook_chain(
                     payload_version: u32::try_from(hook.payload_version)
                         .map_err(|_| ApiError::Internal)?,
                     failure_policy: hook.failure_policy.as_str().to_owned(),
+                    fetch_budget: u32::try_from(hook.fetch_budget)
+                        .map_err(|_| ApiError::Internal)?,
                 })
             })
             .collect::<Result<Vec<_>, ApiError>>()?,
@@ -575,7 +601,13 @@ pub async fn reorder_token_hooks(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
-    body: axum::extract::Json<ReorderTokenHooksRequest>,
+    // BYTES, NOT `Json<...>`, and the difference is not stylistic. An extractor runs BEFORE the
+    // handler body, so a `Json` parameter would answer a malformed body with a 400 without ever
+    // reaching `require_live_environment` below -- and a door that validates a body before it
+    // resolves the environment tells a caller their JSON is wrong about an environment that is
+    // decommissioned. `live_surface`'s soft-deleted sweep drives every write with a malformed
+    // body for exactly this, and it caught this route.
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`, with the
@@ -589,10 +621,12 @@ pub async fn reorder_token_hooks(
     let client = parse_client_id(&client_id, scope)?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
+    let request: ReorderTokenHooksRequest = crate::input::parse_json(&body)?;
+
     // NAMES VALIDATED AT THE DOOR, so an untrimmed or over-long entry is this API's 400 rather
     // than a 404 that reads as "no such hook" -- the caller needs to tell "I typed the name
     // wrong" from "that hook is not deployed".
-    for name in &body.order {
+    for name in &request.order {
         hook_name(Some(name.as_str()))?;
     }
 
@@ -601,7 +635,7 @@ pub async fn reorder_token_hooks(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .reorder(state.env(), &client, &body.order)
+        .reorder(state.env(), &client, &request.order)
         .await?;
 
     // READ BACK, not echo. The request says what the caller asked for; the response says what
@@ -625,6 +659,8 @@ pub async fn reorder_token_hooks(
                     payload_version: u32::try_from(hook.payload_version)
                         .map_err(|_| ApiError::Internal)?,
                     failure_policy: hook.failure_policy.as_str().to_owned(),
+                    fetch_budget: u32::try_from(hook.fetch_budget)
+                        .map_err(|_| ApiError::Internal)?,
                 })
             })
             .collect::<Result<Vec<_>, ApiError>>()?,
@@ -661,6 +697,24 @@ fn secret_name(raw: Option<&str>) -> Result<&str, ApiError> {
 
 /// The most CHARACTERS an environment secret name may carry, matching its column's CHECK.
 const MAX_SECRET_NAME_CHARS: usize = 128;
+
+/// The largest outbound request budget a hook may be granted, matching its column's CHECK.
+///
+/// The bound exists because a fetch is the one host call a hook makes that can BLOCK, and none
+/// of fuel, the memory cap or the epoch deadline sees time spent inside one -- so the worst case
+/// a hook can hold its worker for is this number times whatever timeout the transport enforces.
+/// Refusing here rather than only in the column is what turns a `23514` into a message naming
+/// the limit.
+const MAX_FETCH_BUDGET: i32 = 16;
+
+/// The annotation on `deployTokenHook` spells this bound as a LITERAL, twice: once as the
+/// parameter's `maximum` and once in its prose. `#[utoipa::path]` takes attribute literals and
+/// cannot read a constant, so nothing but this line stops a raised cap from leaving a spec that
+/// promises sixteen while the handler accepts more -- and a generated client believes the spec.
+const _: () = assert!(
+    MAX_FETCH_BUDGET == 16,
+    "update the deployTokenHook annotation too"
+);
 
 /// List the environment secrets a hook may read.
 #[utoipa::path(
@@ -1227,6 +1281,7 @@ pub async fn rollback_token_hook(
         component_bytes: usize::try_from(record.component_bytes).map_err(|_| ApiError::Internal)?,
         payload_version: u32::try_from(record.payload_version).map_err(|_| ApiError::Internal)?,
         failure_policy: record.failure_policy.as_str().to_owned(),
+        fetch_budget: u32::try_from(record.fetch_budget).map_err(|_| ApiError::Internal)?,
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))

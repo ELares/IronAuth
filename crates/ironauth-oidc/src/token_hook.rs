@@ -238,6 +238,15 @@ enum Cached {
 pub struct HookRuntime {
     engine: Arc<HookEngine>,
     cache: Arc<HookCache>,
+    /// The SSRF-hardened path a granted hook's outbound requests take, when one is wired.
+    ///
+    /// [`None`] is a real deployment state, not an oversight: outbound fetching is centralized
+    /// in `ironauth-fetch` precisely so the SSRF class is closed in one place, and a deployment
+    /// that has not wired one has no hardened path for a hook to use. A hook granted a budget on
+    /// such a deployment is refused with a message SAYING SO, rather than being silently told it
+    /// was never granted -- those are different problems and an operator debugging one must not
+    /// be shown the other.
+    fetcher: Option<Arc<ironauth_fetch::Fetcher>>,
 }
 
 /// Hand-written because `HookEngine` has no `Debug`, and because the CACHE SIZE is the field
@@ -260,7 +269,21 @@ impl HookRuntime {
         Self {
             engine,
             cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            fetcher: None,
         }
+    }
+
+    /// Wire the outbound path a granted hook's requests take (issue #114 criterion 2).
+    ///
+    /// THE HARDENED ONE, always. `ironauth-fetch` is described by its own header as "the ONE way
+    /// IronAuth code performs a server-side HTTP request, so the SSRF class is closed
+    /// structurally rather than re-litigated in every feature that learns to fetch". A hook is
+    /// the most attacker-adjacent caller this product has -- it is operator code holding a URL
+    /// it may compute from claims -- so it is the last place to open a second path.
+    #[must_use]
+    pub fn with_fetcher(mut self, fetcher: Arc<ironauth_fetch::Fetcher>) -> Self {
+        self.fetcher = Some(fetcher);
+        self
     }
 
     /// The engine, for the epoch driver.
@@ -378,6 +401,70 @@ pub struct Invocation<'a> {
     /// The access-token claims as the mint has them so far.
     pub access_token_claims: &'a serde_json::Map<String, serde_json::Value>,
 }
+
+/// The outbound transport a granted hook's `fetch.get` runs through.
+///
+/// # Sync guest, async fetcher, and where the bridge is safe
+///
+/// The WIT call is synchronous and `Fetcher::fetch` is not, so this blocks on a runtime handle.
+/// That is only sound because of WHERE it happens: the whole invocation already runs inside
+/// `spawn_blocking`, on a pool thread whose entire purpose is to be blocked on. Doing this on a
+/// reactor thread would stall every other request on it, which is why `HookEngine` panics rather
+/// than working when called from a worker.
+///
+/// # This is the one host call that can block, and what bounds it
+///
+/// Fuel, the memory cap and the epoch deadline are all measured against a guest that is RUNNING,
+/// so none of them sees time spent in here. Two things bound it and they multiply: the request
+/// BUDGET, which the sandbox enforces before this is ever reached, and the per-request TIMEOUT
+/// set below. The worst case a hook can hold its pool thread is the product.
+///
+/// # Through the hardened fetcher, always
+///
+/// `ironauth-fetch` is "the ONE way IronAuth code performs a server-side HTTP request, so the
+/// SSRF class is closed structurally". A hook is the most attacker-adjacent caller this product
+/// has -- operator code holding a URL it may compute from a claim set an end user influenced --
+/// so it is the last place to open a second path.
+///
+/// A NON-UTF-8 BODY IS AN ERROR, not a lossy string: the WIT names that as an obligation on
+/// whoever supplies the transport, and this is that supplier. A hook parsing JSON would
+/// otherwise be handed replacement characters and decide something about them.
+#[cfg(feature = "wasm-hooks")]
+fn hook_transport(fetcher: Option<Arc<ironauth_fetch::Fetcher>>) -> ironauth_hooks::FetchTransport {
+    let handle = tokio::runtime::Handle::current();
+    Box::new(move |url: &str| {
+        let Some(fetcher) = fetcher.as_ref() else {
+            return Err(
+                "this deployment has no outbound fetcher wired for hooks, so a granted budget \
+                 cannot be spent"
+                    .to_owned(),
+            );
+        };
+        let request =
+            ironauth_fetch::FetchRequest::get(ironauth_fetch::FetchPurpose::HookFetch, url)
+                .timeout(HOOK_FETCH_TIMEOUT);
+        let response = handle
+            .block_on(fetcher.fetch(request))
+            .map_err(|error| format!("the request did not complete: {error}"))?;
+        let status = response.status().as_u16();
+        let body = String::from_utf8(response.body().to_vec())
+            .map_err(|_| "the response body is not valid UTF-8".to_owned())?;
+        Ok(ironauth_hooks::FetchOutcome { status, body })
+    })
+}
+
+/// How long one hook-initiated request may take.
+///
+/// HALF THE PRODUCT'S DEFAULT EPOCH BUDGET would be arbitrary; this is chosen against what the
+/// bound is FOR. A hook's fetch is on the token path, so the number that matters is the worst
+/// case a hook can hold a pool thread: this times its request budget, which the schema caps at
+/// sixteen. Two seconds puts that worst case at thirty-two -- long for one login and short
+/// enough that a wedged upstream cannot hold a pool thread for minutes.
+///
+/// It is not an operator setting, for the reason `hook-bench-gate.sh` gives about its own
+/// numbers: a bound that lives where the thing it bounds is configured is decoration.
+#[cfg(feature = "wasm-hooks")]
+const HOOK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve the VALUES of the secrets a hook was granted, just before it runs.
 ///
@@ -568,6 +655,7 @@ pub async fn run(
     invocation: &Invocation<'_>,
 ) -> Result<Option<HookClaims>, HookFault> {
     let (engine, cache) = (&runtime.engine, &runtime.cache);
+    let runtime_fetcher = runtime.fetcher.clone();
     // ONLY what this half needs. The claim lists and the grant belong to
     // `run_deployed_hook`, which is where the hook is actually invoked; naming them here as
     // well would be two destructures of one struct that have to agree about nothing.
@@ -638,7 +726,13 @@ pub async fn run(
         // because a chain's members are separate code with separate permissions: hook A holding
         // a signing key must not make it readable by hook B running after it.
         let secrets = resolve_secrets(store, scope, client_id, record).await;
-        match run_deployed_hook(engine, cache, &step, record, secrets).await {
+        // ZERO IS NOT GRANTED, so an ordinary hook is handed no transport at all and its
+        // `fetch.get` answers "not granted" without this layer building one.
+        let fetch = u32::try_from(record.fetch_budget)
+            .ok()
+            .filter(|budget| *budget > 0)
+            .map(|budget| (budget, hook_transport(runtime_fetcher.clone())));
+        match run_deployed_hook(engine, cache, &step, record, secrets, fetch).await {
             Ok(Some(produced)) => {
                 id_map = Some(
                     produced
@@ -751,12 +845,16 @@ pub async fn run_record(
     // secret's VALUE through a hook the caller supplied the event for. What the operator learns
     // instead is what their hook does when it cannot read one, which is the honest answer to a
     // question asked outside an issuance.
+    // AND NO OUTBOUND BUDGET, for the same reason it is granted no secrets: a draft run is an
+    // operator asking what a hook would do, and spending real requests against real upstreams to
+    // answer it makes a `management.read` question a way to make the server call out.
     run_deployed_hook(
         &runtime.engine,
         &runtime.cache,
         invocation,
         record,
         BTreeMap::new(),
+        None,
     )
     .await
 }
@@ -772,6 +870,7 @@ async fn run_deployed_hook(
     invocation: &Invocation<'_>,
     record: &ironauth_store::token_hook_store::TokenHookRecord,
     secrets: BTreeMap<String, String>,
+    fetch: Option<(u32, ironauth_hooks::FetchTransport)>,
 ) -> Result<Option<HookClaims>, HookFault> {
     let Invocation {
         scope,
@@ -820,7 +919,7 @@ async fn run_deployed_hook(
         access_token_claims: as_pairs(access_token_claims),
     };
 
-    let customization = invoke(Arc::clone(engine), loaded, request, secrets)
+    let customization = invoke(Arc::clone(engine), loaded, request, secrets, fetch)
         .await
         .map_err(|error| {
             tracing::error!(
@@ -989,9 +1088,10 @@ async fn invoke(
     hook: Arc<LoadedHook>,
     request: Request,
     secrets: BTreeMap<String, String>,
+    fetch: Option<(u32, ironauth_hooks::FetchTransport)>,
 ) -> Result<ironauth_hooks::Customization, HookError> {
     tokio::task::spawn_blocking(move || {
-        hook.customize_with_secrets(&engine, &limits(), &request, secrets)
+        hook.customize_with_grants(&engine, &limits(), &request, secrets, fetch)
     })
     .await
     .unwrap_or_else(|join| {

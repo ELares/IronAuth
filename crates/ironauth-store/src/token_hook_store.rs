@@ -109,6 +109,12 @@ pub struct TokenHookRecord {
     /// with a query per hook would add a database round trip to every issuance that runs a
     /// hook, including the overwhelming majority that are granted nothing.
     pub granted_secrets: Vec<String>,
+    /// How many outbound requests this hook may make per invocation. Zero means it may not.
+    ///
+    /// THE GRANT AND THE BOUND AT ONCE, which is why it is one number rather than a flag beside
+    /// one: a `granted` flag with a budget of zero, or a budget of five with the flag false, are
+    /// states somebody would have to decide the meaning of.
+    pub fetch_budget: i32,
 }
 
 /// WHERE a deploy puts a hook in its client's chain: which hook it is, and in what position.
@@ -158,6 +164,8 @@ pub struct HookDeployment<'a> {
     pub failure_policy: HookFailurePolicy,
     /// Which hook this is and where in the chain it runs.
     pub placement: HookPlacement<'a>,
+    /// How many outbound requests this hook may make per invocation. Zero means it may not.
+    pub fetch_budget: i32,
 }
 
 /// Hand-written, and the component is rendered as a LENGTH.
@@ -180,6 +188,11 @@ impl std::fmt::Debug for TokenHookRecord {
             .field("component_bytes", &self.component.len())
             .field("payload_version", &self.payload_version)
             .field("failure_policy", &self.failure_policy)
+            // THE BUDGET, not a transport or a URL: this is how many outbound requests the hook
+            // may make, and a log line about a hook that called out needs to say what it was
+            // allowed rather than leaving a reader to guess whether the grant or the code was
+            // the surprise.
+            .field("fetch_budget", &self.fetch_budget)
             .finish()
     }
 }
@@ -203,6 +216,8 @@ pub struct TokenHookMetadata {
     pub payload_version: i32,
     /// What the dispatch does when this hook does not complete.
     pub failure_policy: HookFailurePolicy,
+    /// How many outbound requests this hook may make per invocation. Zero means it may not.
+    pub fetch_budget: i32,
 }
 
 /// One historical deploy of a client's hook (issue #114 criterion 5).

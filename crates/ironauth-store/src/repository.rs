@@ -21924,6 +21924,105 @@ fn outbox_message_from_row(row: &PgRow) -> OutboxMessage {
     }
 }
 
+/// Append this deploy to the hook's version history, and prune the history to its retention.
+///
+/// Lifted out of [`TokenHookRepo::set_with_event`] rather than written inline, which that
+/// function's length forced; it is the same transaction and the same statements.
+///
+/// # It must run AFTER that function's upsert
+///
+/// The version number is `MAX(version) + 1` read inside the transaction, and what serialises two
+/// concurrent deploys of one hook is the row lock the UPSERT takes -- not anything here. Calling
+/// this first would leave the `MAX` racing. See the caller for the race and how it was measured.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault.
+async fn append_hook_version(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: Scope,
+    client_id: &str,
+    hook_name: &str,
+    component: &[u8],
+    payload_version: i32,
+    failure_policy: HookFailurePolicy,
+) -> Result<(), StoreError> {
+    // THE HISTORY ROW, in the SAME transaction as the active one. A deploy that
+    // landed without its version, or a version without its deploy, is a rollback
+    // target that never ran or a running hook nobody can roll back from.
+    //
+    // The number is `MAX(version) + 1` for this client, read inside the
+    // transaction, and what serialises it is the UPSERT ABOVE.
+    //
+    // That upsert takes the row lock on (tenant, environment, client), so a second
+    // deploy of the same client blocks there; `begin_scoped` pins READ COMMITTED,
+    // so when it proceeds its next statement takes a fresh snapshot that already
+    // sees the winner's committed history row and computes the next number.
+    // Review ran the race on a real cluster: two staggered deploys produced 1 and
+    // 2, then 3 and 4, with no duplicate-key error in either round.
+    //
+    // SO THE INVARIANT IS THAT THE UPSERT STAYS FIRST IN THIS CLOSURE. An earlier
+    // version of this comment credited a per-scope append lock -- which
+    // `write_audited` does not take; that term means the advisory lock, and only
+    // `publish_snapshot_inner` and `append_event` take it -- and credited the
+    // PRIMARY KEY, which is a backstop the race never reaches. Naming the wrong
+    // mechanism is how a later reorder ships believing it is covered.
+    sqlx::query(
+        // PER HOOK, not per client. A version belongs to the code it is a version
+        // OF: with two hooks sharing one sequence, deploying B would advance A's
+        // numbering and rolling A back would restore B's bytes. 0168 moved the
+        // history's identity for this reason and the `MAX` has to move with it.
+        "INSERT INTO token_hook_versions \
+         (tenant_id, environment_id, client_id, name, version, component, \
+          payload_version, failure_policy) \
+         SELECT $1, $2, $3, $7, \
+                COALESCE(MAX(version), 0) + 1, $4, $5, $6 \
+         FROM token_hook_versions \
+         WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+           AND name = $7",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(client_id)
+    .bind(component)
+    .bind(payload_version)
+    .bind(failure_policy.as_str())
+    .bind(hook_name)
+    .execute(&mut **tx)
+    .await?;
+    // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
+    //
+    // A component may be sixteen megabytes and nothing else deletes these rows, so a
+    // client redeployed a thousand times would hold sixteen gigabytes of history --
+    // and a rollback target a hundred deploys back is not one anybody reaches for.
+    //
+    // Keyed on the VERSION NUMBER rather than on age: "the last twenty deploys" is
+    // what an operator rolling back is thinking about, and a time window would
+    // discard the whole history of a client that had not deployed in a while,
+    // which is exactly the client whose last-known-good matters most.
+    sqlx::query(
+        // PER HOOK for the same reason the numbering is: a client-wide prune
+        // would let one hook's deploys evict another hook's rollback targets, so a
+        // busy hook would silently empty the history of a quiet one beside it.
+        "DELETE FROM token_hook_versions \
+         WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+           AND name = $5 \
+           AND version <= ( \
+               SELECT MAX(version) FROM token_hook_versions \
+               WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                 AND name = $5 \
+           ) - $4",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(client_id)
+    .bind(TOKEN_HOOK_VERSION_RETENTION)
+    .bind(hook_name)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Enqueue ONE message onto the generic outbox inside an OPEN domain transaction
 /// (issue #104). This is the transactional-outbox guarantee itself: the message row and
 /// the domain write commit together or neither does, so a rolled-back domain write emits
@@ -32620,7 +32719,7 @@ impl TokenHookRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT h.client_id, h.name, h.ordinal, h.component, h.payload_version, \
-                    h.failure_policy, \
+                    h.failure_policy, h.fetch_budget, \
                     COALESCE(( \
                         SELECT array_agg(s.secret_name ORDER BY s.secret_name) \
                         FROM token_hook_secrets s \
@@ -32651,6 +32750,7 @@ impl TokenHookRepo<'_> {
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
                     granted_secrets: row.get("granted_secrets"),
+                    fetch_budget: row.get("fetch_budget"),
                 })
             })
             .collect()
@@ -32689,8 +32789,9 @@ impl TokenHookRepo<'_> {
                 // NOT PROJECTED BY THIS READ. Grants reach the dispatch through `chain`, in the
                 // same statement, so a caller that resolved them from a record built here would
                 // be reading an empty list rather than the truth. Empty is the honest value for
-                // a read that did not ask.
+                // a read that did not ask, and zero is for the budget: both are deny.
                 granted_secrets: Vec::new(),
+                fetch_budget: 0,
             })
         })
         .transpose()
@@ -32746,8 +32847,9 @@ impl TokenHookRepo<'_> {
                 // NOT PROJECTED BY THIS READ. Grants reach the dispatch through `chain`, in the
                 // same statement, so a caller that resolved them from a record built here would
                 // be reading an empty list rather than the truth. Empty is the honest value for
-                // a read that did not ask.
+                // a read that did not ask, and zero is for the budget: both are deny.
                 granted_secrets: Vec::new(),
+                fetch_budget: 0,
             })
         })
         .transpose()
@@ -32810,6 +32912,7 @@ impl TokenHookRepo<'_> {
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
                     // See `get` above: grants reach the dispatch through `chain`.
                     granted_secrets: Vec::new(),
+                    fetch_budget: 0,
                 },
                 row.get::<Option<i32>, _>("version"),
             ))
@@ -32836,7 +32939,7 @@ impl TokenHookRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
             "SELECT client_id, name, ordinal, octet_length(component) AS component_bytes, \
-             payload_version, failure_policy \
+             payload_version, failure_policy, fetch_budget \
              FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
@@ -32855,6 +32958,7 @@ impl TokenHookRepo<'_> {
                 component_bytes: row.get::<i32, _>("component_bytes"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                fetch_budget: row.get("fetch_budget"),
             })
         })
         .transpose()
@@ -32883,7 +32987,7 @@ impl TokenHookRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
             "SELECT client_id, name, ordinal, octet_length(component) AS component_bytes, \
-             payload_version, failure_policy \
+             payload_version, failure_policy, fetch_budget \
              FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
              ORDER BY ordinal",
@@ -32903,6 +33007,7 @@ impl TokenHookRepo<'_> {
                     component_bytes: row.get::<i32, _>("component_bytes"),
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    fetch_budget: row.get("fetch_budget"),
                 })
             })
             .collect()
@@ -33262,6 +33367,8 @@ impl ActingTokenHookRepo<'_> {
                 payload_version,
                 failure_policy: HookFailurePolicy::FailClosed,
                 placement: HookPlacement::default_hook(),
+                // NOT GRANTED. This path is the pre-ordering deploy, which names no capability.
+                fetch_budget: 0,
             },
             None,
         )
@@ -33294,6 +33401,7 @@ impl ActingTokenHookRepo<'_> {
         let failure_policy = deployment.failure_policy;
         let hook_name = deployment.placement.name.to_owned();
         let hook_ordinal = deployment.placement.ordinal;
+        let fetch_budget = deployment.fetch_budget;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -33338,12 +33446,13 @@ impl ActingTokenHookRepo<'_> {
                     // every existing row to.
                     "INSERT INTO token_hooks \
                      (tenant_id, environment_id, client_id, name, ordinal, component, \
-                      payload_version, failure_policy) \
-                     VALUES ($1, $2, $3, $7, $8, $4, $5, $6) \
+                      payload_version, failure_policy, fetch_budget) \
+                     VALUES ($1, $2, $3, $7, $8, $4, $5, $6, $9) \
                      ON CONFLICT (tenant_id, environment_id, client_id, name) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
                          failure_policy = EXCLUDED.failure_policy, \
+                         fetch_budget = EXCLUDED.fetch_budget, \
                          updated_at = now()",
                 )
                 .bind(scope.tenant().to_string())
@@ -33354,21 +33463,23 @@ impl ActingTokenHookRepo<'_> {
                 .bind(failure_policy.as_str())
                 .bind(&hook_name)
                 .bind(hook_ordinal)
+                .bind(fetch_budget)
                 .execute(&mut **tx)
                 .await?;
-                // THE HISTORY ROW, in the SAME transaction as the active one. A deploy that
-                // landed without its version, or a version without its deploy, is a rollback
-                // target that never ran or a running hook nobody can roll back from.
+                // THE HISTORY ROW AND THE PRUNE, in the SAME transaction as the active one
+                // and AFTER the upsert above. A deploy that landed without its version, or a
+                // version without its deploy, is a rollback target that never ran or a running
+                // hook nobody can roll back from.
                 //
-                // The number is `MAX(version) + 1` for this client, read inside the
+                // The version number is `MAX(version) + 1` for this hook, read inside the
                 // transaction, and what serialises it is the UPSERT ABOVE.
                 //
-                // That upsert takes the row lock on (tenant, environment, client), so a second
-                // deploy of the same client blocks there; `begin_scoped` pins READ COMMITTED,
-                // so when it proceeds its next statement takes a fresh snapshot that already
-                // sees the winner's committed history row and computes the next number.
-                // Review ran the race on a real cluster: two staggered deploys produced 1 and
-                // 2, then 3 and 4, with no duplicate-key error in either round.
+                // That upsert takes the row lock on (tenant, environment, client, name), so a
+                // second deploy of the same hook blocks there; `begin_scoped` pins READ
+                // COMMITTED, so when it proceeds its next statement takes a fresh snapshot that
+                // already sees the winner's committed history row and computes the next number.
+                // Review ran the race on a real cluster: two staggered deploys produced 1 and 2,
+                // then 3 and 4, with no duplicate-key error in either round.
                 //
                 // SO THE INVARIANT IS THAT THE UPSERT STAYS FIRST IN THIS CLOSURE. An earlier
                 // version of this comment credited a per-scope append lock -- which
@@ -33376,58 +33487,15 @@ impl ActingTokenHookRepo<'_> {
                 // `publish_snapshot_inner` and `append_event` take it -- and credited the
                 // PRIMARY KEY, which is a backstop the race never reaches. Naming the wrong
                 // mechanism is how a later reorder ships believing it is covered.
-                sqlx::query(
-                    // PER HOOK, not per client. A version belongs to the code it is a version
-                    // OF: with two hooks sharing one sequence, deploying B would advance A's
-                    // numbering and rolling A back would restore B's bytes. 0168 moved the
-                    // history's identity for this reason and the `MAX` has to move with it.
-                    "INSERT INTO token_hook_versions \
-                     (tenant_id, environment_id, client_id, name, version, component, \
-                      payload_version, failure_policy) \
-                     SELECT $1, $2, $3, $7, \
-                            COALESCE(MAX(version), 0) + 1, $4, $5, $6 \
-                     FROM token_hook_versions \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-                       AND name = $7",
+                append_hook_version(
+                    tx,
+                    scope,
+                    &client_id,
+                    &hook_name,
+                    &bytes,
+                    payload_version,
+                    failure_policy,
                 )
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(&client_id)
-                .bind(&bytes)
-                .bind(payload_version)
-                .bind(failure_policy.as_str())
-                .bind(&hook_name)
-                .execute(&mut **tx)
-                .await?;
-                // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
-                //
-                // A component may be sixteen megabytes and nothing else deletes these rows, so a
-                // client redeployed a thousand times would hold sixteen gigabytes of history --
-                // and a rollback target a hundred deploys back is not one anybody reaches for.
-                //
-                // Keyed on the VERSION NUMBER rather than on age: "the last twenty deploys" is
-                // what an operator rolling back is thinking about, and a time window would
-                // discard the whole history of a client that had not deployed in a while,
-                // which is exactly the client whose last-known-good matters most.
-                sqlx::query(
-                    // PER HOOK for the same reason the numbering is: a client-wide prune
-                    // would let one hook's deploys evict another hook's rollback targets, so a
-                    // busy hook would silently empty the history of a quiet one beside it.
-                    "DELETE FROM token_hook_versions \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-                       AND name = $5 \
-                       AND version <= ( \
-                           SELECT MAX(version) FROM token_hook_versions \
-                           WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-                             AND name = $5 \
-                       ) - $4",
-                )
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(&client_id)
-                .bind(TOKEN_HOOK_VERSION_RETENTION)
-                .bind(&hook_name)
-                .execute(&mut **tx)
                 .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
@@ -33554,7 +33622,7 @@ impl ActingTokenHookRepo<'_> {
         // is against one consistent picture rather than two reads a concurrent deploy can slip
         // between.
         let active = sqlx::query(
-            "SELECT component, payload_version, failure_policy FROM token_hooks \
+            "SELECT component, payload_version, failure_policy, fetch_budget FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
         .bind(scope.tenant().to_string())
@@ -33587,6 +33655,13 @@ impl ActingTokenHookRepo<'_> {
         //
         // Compared on the FULL COMPONENT, not on its length: two different hooks of equal size
         // are the case a byte count cannot tell apart, and it is the case that matters.
+        // THE ACTIVE BUDGET, read before the inertness check so it is available to the write
+        // below whichever way that check goes. Zero when there is no active row -- but a
+        // rollback with no active row cannot reach the write, because the upsert would be
+        // creating a hook rather than restoring one.
+        let active_budget: i32 = active
+            .as_ref()
+            .map_or(0, |row| row.get::<i32, _>("fetch_budget"));
         if let Some(active) = active {
             let active_component: Vec<u8> = active.get("component");
             let active_payload_version: i32 = active.get("payload_version");
@@ -33612,6 +33687,14 @@ impl ActingTokenHookRepo<'_> {
                 payload_version,
                 failure_policy,
                 placement: HookPlacement { name, ordinal: 0 },
+                // THE CAPABILITY IS CARRIED FORWARD, not restored and not revoked. A rollback
+                // restores CODE; the fetch budget is a GRANT an operator made to a hook, and
+                // neither answer from the version history is right -- restoring an older budget
+                // would silently re-grant a capability that was withdrawn, and passing zero
+                // would silently withdraw one that stands. So the ACTIVE row's budget is read
+                // above and written back unchanged, which is the same thing the upsert does for
+                // the ordinal and for the same reason.
+                fetch_budget: active_budget,
             },
             event,
         )

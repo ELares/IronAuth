@@ -953,6 +953,13 @@ func (c *Client) GetVariable(tenant_id string, environment_id string, name strin
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/variables/" + escape(name), query, nil)
 }
 
+// GrantTokenHookSecret performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets.
+//
+// Grant a hook permission to read an environment secret.
+func (c *Client) GrantTokenHookSecret(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/secrets", query, nil)
+}
+
 // LiftBan performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans/lift.
 //
 // Lift a credential-abuse ban.
@@ -1254,6 +1261,20 @@ func (c *Client) ListTenants(query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants", query, nil)
 }
 
+// ListTokenHookChain performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain.
+//
+// List a client's hook chain, in the order it runs.
+func (c *Client) ListTokenHookChain(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/chain", query, nil)
+}
+
+// ListTokenHookSecrets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets.
+//
+// List the environment secrets a hook may read.
+func (c *Client) ListTokenHookSecrets(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/secrets", query, nil)
+}
+
 // ListTokenHookVersions performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions.
 //
 // List a client's most recent token-hook deploys, newest first.
@@ -1422,6 +1443,13 @@ func (c *Client) RemoveUserIdentifier(tenant_id string, environment_id string, u
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/identifiers/" + escape(identifier_id), query, nil)
 }
 
+// ReorderTokenHooks performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order.
+//
+// Set the order a client's hooks run in.
+func (c *Client) ReorderTokenHooks(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/order", query, body)
+}
+
 // ReplayFlowTargetDeadLetters performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}/replay.
 //
 // Replay a target's dead-lettered async deliveries.
@@ -1511,6 +1539,13 @@ func (c *Client) RevokeServiceAccountApiKey(tenant_id string, environment_id str
 // Revoke ONE session. It stops resolving immediately and its session-bound refresh families are revoked with it; the `offline_access` families survive unless `hard_kill` is set.
 func (c *Client) RevokeSession(tenant_id string, environment_id string, session_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/sessions/" + escape(session_id) + "/revoke", query, body)
+}
+
+// RevokeTokenHookSecret performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets.
+//
+// Withdraw a hook's permission to read an environment secret.
+func (c *Client) RevokeTokenHookSecret(tenant_id string, environment_id string, client_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/applications/" + escape(client_id) + "/token-hook/secrets", query, nil)
 }
 
 // RevokeUserConsent performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/consents/{client_id}/revoke.

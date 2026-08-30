@@ -1734,3 +1734,98 @@ async fn deleting_a_hook_takes_its_secret_grants_so_a_replacement_inherits_nothi
          that same key, without anyone granting it: {body}"
     );
 }
+
+/// THE FETCH GRANT IS BOUNDED, READ BACK FROM THE ROW, AND WITHDRAWN BY A REDEPLOY THAT DOES
+/// NOT RENEW IT.
+///
+/// Issue #114 criterion 2's grant, through the management surface. The sandbox suite proves the
+/// budget bounds a running hook; this proves an operator can set one, see what is actually
+/// granted, and take it away.
+///
+/// # A redeploy applies the budget, unlike the ordinal, and the test asserts the asymmetry
+///
+/// The two query parameters behave differently on a redeploy and that is deliberate, so it is
+/// asserted rather than left to the handler comment: `ordinal` is IGNORED (a rollback is a
+/// redeploy, and one that moved a hook would change what every later hook is handed), while
+/// `fetch_budget` is APPLIED (capabilities travel with the code, so shipping a version that no
+/// longer calls out must not leave the grant standing).
+///
+/// A test that only deployed WITH a budget would pass against a handler that ignored the
+/// parameter on conflict exactly as the ordinal is ignored, because the first deploy's INSERT
+/// writes it either way.
+#[tokio::test]
+async fn the_fetch_grant_is_bounded_read_back_and_withdrawn_by_a_redeploy() {
+    let harness = Harness::start(60).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // OUT OF RANGE IS THIS API'S 400, naming the limit, rather than the column CHECK's 23514
+    // surfacing as a 500 an operator cannot act on.
+    for bad in ["17", "-1", "two", ""] {
+        let (status, _, body) = harness
+            .put_bytes(
+                &format!("{base}?payload_version=1&name=caller&fetch_budget={bad}"),
+                COMPONENT,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a fetch budget of {bad:?} is refused by the API: {body}"
+        );
+        assert!(
+            body.contains("invalid_fetch_budget"),
+            "and the refusal names the parameter and its range: {body}"
+        );
+    }
+
+    // ABSENT MEANS ZERO. A hook nobody granted anything to may not call out.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=caller"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy with no grant: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["fetch_budget"], 0,
+        "absent means NOT GRANTED, and the response says so rather than omitting the field -- \
+         an operator reading a deploy response has to be able to see what it granted: {body}"
+    );
+
+    // GRANTED, and read back from the row by the describe route rather than echoed.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name=caller&fetch_budget=3"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant a budget: {body}");
+    let (_, _, body) = harness.get(&format!("{base}?name=caller")).await;
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["fetch_budget"], 3,
+        "the describe route reports what the ROW holds: {body}"
+    );
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        chain["hooks"][0]["fetch_budget"], 3,
+        "and so does the chain listing, which is where an operator auditing a whole client's \
+         capabilities looks: {body}"
+    );
+
+    // AND A REDEPLOY THAT NAMES NO BUDGET WITHDRAWS IT. This is the half that distinguishes an
+    // applied parameter from one ignored on conflict the way the ordinal is.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=caller"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "redeploy without a grant: {body}");
+    let (_, _, body) = harness.get(&format!("{base}?name=caller")).await;
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["fetch_budget"], 0,
+        "capabilities travel with the code: a redeploy that does not renew the grant withdraws \
+         it, so shipping a version that no longer calls out does not leave one standing: {body}"
+    );
+}

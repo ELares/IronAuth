@@ -1980,6 +1980,8 @@ pub struct TokenHookView {
     pub payload_version: u32,
     /// What the dispatch does when this hook does not complete.
     pub failure_policy: String,
+    /// How many outbound requests this hook may make per invocation. Zero means it may not.
+    pub fetch_budget: u32,
 }
 
 /// One historical deploy of a client's hook (issue #114 criterion 5).
@@ -2211,6 +2213,19 @@ pub struct DeployTokenHookQuery {
     /// third would silently make it run first. Moving a hook is the reorder route's job, and it
     /// moves the whole chain at once.
     pub ordinal: Option<String>,
+    /// How many outbound requests this hook may make per invocation. Absent means ZERO, which is
+    /// not granted.
+    ///
+    /// THE GRANT AND THE BOUND IN ONE NUMBER, so the two can never disagree. Absent meaning
+    /// zero is deny-by-default and it is what every other capability here does; a deploy that
+    /// says nothing about fetching does not get it.
+    ///
+    /// UNLIKE THE ORDINAL, THIS IS APPLIED ON A REDEPLOY. A redeploy replaces the hook's code
+    /// and its declared capabilities together, so a hook that was granted a budget and is
+    /// redeployed without one loses it -- which is the safe direction, and the one an operator
+    /// re-uploading a component would expect. The ordinal is different because position is not
+    /// something a component declares about itself.
+    pub fetch_budget: Option<String>,
 }
 
 /// Which of a client's hooks a read or a delete addresses.
@@ -2290,6 +2305,12 @@ pub struct TokenHookChainEntryView {
     pub payload_version: u32,
     /// What the dispatch does when this hook does not complete.
     pub failure_policy: String,
+    /// How many outbound requests this hook may make per invocation. Zero means it may not.
+    ///
+    /// REPORTED PER HOOK RATHER THAN PER CLIENT, because it is granted per hook: an operator
+    /// auditing what a client's code can reach needs the whole chain's grants in one place, and
+    /// a client-level number could not say WHICH hook holds one.
+    pub fetch_budget: u32,
 }
 
 /// A client's hook chain, in the order it runs.
