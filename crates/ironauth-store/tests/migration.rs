@@ -76,7 +76,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      message sending state, message suppressions, message resend count, \
      declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions, \
      token hook component bound, token hook ordering, token hook named identity, \
-     token hook secrets, token hook fetch budget.";
+     token hook secrets, token hook fetch budget, challenge components.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -707,7 +707,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        170,
+        171,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -747,7 +747,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
-            160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170
+            160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171
         ]
     );
     let phase_of = |version: i64| async move {

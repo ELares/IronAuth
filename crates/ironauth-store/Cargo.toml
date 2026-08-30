@@ -189,6 +189,15 @@ required-features = ["testing"]
 # invariant, the promotable snapshot round-trip (export then validate, byte-identical re-export),
 # cross-scope isolation, and the scope foreign key refusing a write into an environment that
 # does not exist.
+# Custom factor components (issue #114 criterion 6): the control-plane deploy / data-plane read
+# grant split, the CASCADE that makes a secret grant impossible to inherit across a delete and a
+# redeploy of the same name, cross-scope isolation through the RLS policy, and the table's own
+# bounds refused at the write rather than only at the admin door.
+[[test]]
+name = "challenge_components"
+path = "tests/challenge_components.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "claims_mappings"
 path = "tests/claims_mappings.rs"

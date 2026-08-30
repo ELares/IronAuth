@@ -238,3 +238,71 @@ pub struct TokenHookVersion {
     /// When it was deployed, as epoch microseconds.
     pub created_at_unix_micros: i64,
 }
+
+/// A deployed CUSTOM FACTOR component, with everything one invocation of the triad needs
+/// (issue #114 criterion 6).
+///
+/// Read on the LOGIN path when a journey step names it, so it carries the grants alongside the
+/// bytes: resolving them separately would be a second round trip per login, and two reads that
+/// could disagree if a grant were revoked between them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChallengeComponentRecord {
+    /// The name a journey step references this component by.
+    pub name: String,
+    /// The WASM component.
+    pub component: Vec<u8>,
+    /// The payload version the guest was built against.
+    pub payload_version: i32,
+    /// How many outbound requests ONE call of the triad may make. Zero means it may not.
+    pub fetch_budget: i32,
+    /// The environment secret NAMES this component may read. Never the values: those are
+    /// resolved just before the guest runs, by the caller that has the secret store.
+    pub granted_secrets: Vec<String>,
+}
+
+/// Hand-written, and the component is rendered as a LENGTH.
+///
+/// The same reason [`TokenHookRecord`]'s is: a derived `Debug` on eight megabytes of WASM makes
+/// any log line that formats one unreadable, and the fact worth having is how big it is.
+impl std::fmt::Debug for ChallengeComponentRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChallengeComponentRecord")
+            .field("name", &self.name)
+            .field("component_bytes", &self.component.len())
+            .field("payload_version", &self.payload_version)
+            .field("fetch_budget", &self.fetch_budget)
+            // THE GRANTED NAMES, never a value: the values are not on this type at all.
+            .field("granted_secrets", &self.granted_secrets)
+            .finish()
+    }
+}
+
+/// A deployed component's metadata, without the bytes (issue #114 criterion 6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChallengeComponentMetadata {
+    /// The name a journey step references this component by.
+    pub name: String,
+    /// How many bytes the deployed component is.
+    pub component_bytes: i32,
+    /// The payload version the guest was built against.
+    pub payload_version: i32,
+    /// How many outbound requests ONE call of the triad may make.
+    pub fetch_budget: i32,
+}
+
+/// What a deploy of a custom factor component says (issue #114 criterion 6).
+///
+/// A struct rather than four positional arguments, for the reason [`HookDeployment`] is one: a
+/// call taking a name, some bytes, a version and a budget in a row is a call where two of them
+/// can be swapped silently.
+#[derive(Clone, Copy, Debug)]
+pub struct ChallengeDeployment<'a> {
+    /// The name a journey step will reference this component by.
+    pub name: &'a str,
+    /// The WASM component.
+    pub component: &'a [u8],
+    /// The payload version the guest was built against.
+    pub payload_version: i32,
+    /// How many outbound requests ONE call of the triad may make. Zero is not granted.
+    pub fetch_budget: i32,
+}

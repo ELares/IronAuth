@@ -922,6 +922,24 @@ pub enum Action {
     /// installs here. The component itself is not recorded: an audit stream is not a binary
     /// store, and the bytes are already durable in the row the audit points at.
     TokenHookSet,
+    /// A CUSTOM FACTOR COMPONENT was deployed or replaced (issue #114 criterion 6). The audit row
+    /// names the COMPONENT, because unlike a token hook this one has an identity of its own: it
+    /// is deployed against the environment and referenced BY NAME from a journey step, so the
+    /// name is what an operator reading the trail needs in order to find which journeys it
+    /// affects. Deploying one is deploying code that decides whether a login succeeds.
+    ChallengeComponentSet,
+    /// A CUSTOM FACTOR COMPONENT was removed (issue #114 criterion 6). Audited separately from
+    /// the deploy because it is a separate operator decision with a different blast radius: a
+    /// journey step that references a component which no longer exists cannot run, so this is
+    /// the row that explains a factor that stopped working.
+    ChallengeComponentDelete,
+    /// A CUSTOM FACTOR COMPONENT was granted a secret NAME (issue #114 criterion 6). A grant is
+    /// a capability change, so it is audited on its own rather than folded into the deploy that
+    /// happened to accompany it -- an operator reading why a component could suddenly read a
+    /// signing key must find the grant, not infer it from a redeploy.
+    ChallengeComponentSecretGranted,
+    /// A CUSTOM FACTOR COMPONENT's secret grant was withdrawn (issue #114 criterion 6).
+    ChallengeComponentSecretRevoked,
     /// A DEPLOYED TOKEN HOOK TRIED TO WRITE A CLAIM IT MAY NOT, and the fence refused it
     /// (issue #113 criterion 5: protected claims "cannot be overridden by any mapping or hook;
     /// attempts are rejected AND AUDITED").
@@ -1634,6 +1652,10 @@ impl Action {
             Action::FlowTargetDelete => "flow_target.delete",
             Action::FlowTargetReplayDeadLetters => "flow_target.replay_dead_letters",
             Action::MessageTemplateDelete => "message_template.delete",
+            Action::ChallengeComponentSet => "challenge_component.set",
+            Action::ChallengeComponentDelete => "challenge_component.delete",
+            Action::ChallengeComponentSecretGranted => "challenge_component.secret.granted",
+            Action::ChallengeComponentSecretRevoked => "challenge_component.secret.revoked",
             Action::TokenHookSet => "token_hook.set",
             Action::TokenHookDelete => "token_hook.delete",
             Action::ClaimsMappingSet => "claims_mapping.set",
