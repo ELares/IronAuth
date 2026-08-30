@@ -2143,7 +2143,9 @@ pub struct TestTokenHookResponse {
     /// hook that predates the history, and the prune deletes only
     /// `version <= MAX(version) - TOKEN_HOOK_VERSION_RETENTION` -- so no write this server
     /// performs leaves that state behind. Measured: reaching it took a hand-run
-    /// `DELETE FROM token_hook_versions` under a live hook. The field stays optional because
+    /// `DELETE FROM token_hook_versions` under a live hook (query-audit-allow: PROSE, not a
+    /// query -- this sentence describes a hand-run statement that reached a state no shipped
+    /// write path can, and the scan reads comments as well as code). The field stays optional because
     /// the database can hold that row set, not because a client can produce it.
     pub version_run: Option<i32>,
 }

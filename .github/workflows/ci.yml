@@ -760,11 +760,18 @@ jobs:
       #
       # TWO THINGS ARE DIFFERENT HERE, and they are the two the earlier attempt lacked.
       #
-      # 1. The daemon's environment is EXPORTED. `gnome-keyring-daemon` prints
-      #    `GNOME_KEYRING_CONTROL=...` on stdout, and a client that never sees that variable
-      #    talks to no daemon at all. Sourcing the output under `set -a` is what puts it in
-      #    this step's shell, and the two `echo`s at the end are what carry it to the next
-      #    step -- a `run:` block's environment does not outlive the block.
+      # 1. The D-Bus SESSION ADDRESS is exported to the LATER STEPS. A `run:` block's
+      #    environment does not outlive the block, so a daemon started in one step is
+      #    unreachable from the next unless its address is written to `$GITHUB_ENV`. That was
+      #    the missing half: the earlier attempts started a daemon that the test could not then
+      #    find, which presents exactly as "no result found".
+      #
+      #    `DBUS_SESSION_BUS_ADDRESS` is the whole of it. An earlier version of this step also
+      #    carried `GNOME_KEYRING_CONTROL` and asserted the client needs it; measured on the
+      #    runner, `gnome-keyring-daemon --components=secrets` does not print that variable at
+      #    all, and under `set -u` reading it aborted the step AFTER the seed had already
+      #    round-tripped. The Secret Service is reached over D-Bus, and the control socket is
+      #    not part of that path.
       # 2. The default collection is created by `secret-tool store`, which makes one as a
       #    side effect of a first write. Creating it through the D-Bus CreateCollection call
       #    is what raises a prompt on a headless box; letting the tool do it does not.
@@ -780,21 +787,22 @@ jobs:
           # A D-Bus session for the daemon and every later step in this job.
           dbus-launch --sh-syntax > "$RUNNER_TEMP/dbus.env"
           set -a; . "$RUNNER_TEMP/dbus.env"; set +a
+          # Sourced under `set +u`: what this prints varies by version and by which components
+          # were asked for, and a variable it does not print must not abort the step.
           printf '\n' | gnome-keyring-daemon --unlock --components=secrets \
             > "$RUNNER_TEMP/keyring.env"
-          set -a; . "$RUNNER_TEMP/keyring.env"; set +a
+          set +u; set -a; . "$RUNNER_TEMP/keyring.env"; set +a; set -u
           # The first write is what creates the default collection.
           printf 'seed' | secret-tool store --label='ci seed' service ironauth-ci key seed
           # PROVE the store works before the test runs, so a failure here is attributed to the
           # environment rather than to the credential code the next step exercises.
           secret-tool lookup service ironauth-ci key seed
-          # Carry the session into the remaining steps, NAMING the two variables rather than
-          # transforming the files. `dbus-launch --sh-syntax` emits shell -- quoted values and
+          # Carry the session into the remaining steps, NAMING the variable rather than
+          # transforming the file. `dbus-launch --sh-syntax` emits shell -- quoted values and
           # bare `export NAME;` lines -- and piping that through sed produces `NAME` with no
           # value and values with their quotes still attached, neither of which `$GITHUB_ENV`
-          # accepts. Writing the two expanded values is the only form that round-trips.
+          # accepts. Writing the one expanded value is the form that round-trips.
           echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}" >> "$GITHUB_ENV"
-          echo "GNOME_KEYRING_CONTROL=${GNOME_KEYRING_CONTROL}" >> "$GITHUB_ENV"
 
 
       # macOS runners start with the login keychain LOCKED, and a locked keychain refuses
