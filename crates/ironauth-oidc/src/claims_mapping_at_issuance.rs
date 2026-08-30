@@ -334,7 +334,7 @@ pub async fn apply_to_with_hook(
         // which this build does not compile; underscore-prefixing the PARAMETERS instead would
         // silence the warning in the build that does compile it, which is the build where an
         // unused hook input would be a real defect worth hearing about.
-        let _ = (grant_type, subject, &mut access);
+        let _ = (env, grant_type, subject, &mut access);
         runtime.unreachable()
     }
 
@@ -519,7 +519,7 @@ pub async fn apply_to_machine_token(
 
     #[cfg(not(feature = "wasm-hooks"))]
     {
-        let _ = (grant_type, subject, &mut single);
+        let _ = (env, grant_type, subject, &mut single);
         runtime.unreachable()
     }
 

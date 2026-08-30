@@ -32661,6 +32661,7 @@ impl TokenHookRepo<'_> {
     pub async fn version(
         &self,
         client_id: &str,
+        name: &str,
         version: i32,
     ) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
@@ -32674,7 +32675,7 @@ impl TokenHookRepo<'_> {
         .bind(self.scope.environment().to_string())
         .bind(client_id)
         .bind(version)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32720,6 +32721,7 @@ impl TokenHookRepo<'_> {
     pub async fn active_with_version(
         &self,
         client_id: &str,
+        name: &str,
     ) -> Result<Option<(TokenHookRecord, Option<i32>)>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
@@ -32736,7 +32738,7 @@ impl TokenHookRepo<'_> {
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32766,31 +32768,85 @@ impl TokenHookRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence fault.
-    pub async fn metadata(&self, client_id: &str) -> Result<Option<TokenHookMetadata>, StoreError> {
+    pub async fn metadata(
+        &self,
+        client_id: &str,
+        name: &str,
+    ) -> Result<Option<TokenHookMetadata>, StoreError> {
         let scope = self.scope;
         let mut tx = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, octet_length(component) AS component_bytes, payload_version, \
-             failure_policy \
+            "SELECT client_id, name, ordinal, octet_length(component) AS component_bytes, \
+             payload_version, failure_policy \
              FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client_id)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
         row.map(|row| {
             Ok(TokenHookMetadata {
                 client_id: row.get("client_id"),
+                name: row.get("name"),
+                ordinal: row.get("ordinal"),
                 component_bytes: row.get::<i32, _>("component_bytes"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
             })
         })
         .transpose()
+    }
+
+    /// Every hook this client has, in the order they run, as METADATA.
+    ///
+    /// What an operator arranging a chain needs to see: which hooks there are, in what order,
+    /// and how big each is. Never the components -- a chain of eight sixteen-megabyte hooks is
+    /// a hundred and twenty-eight megabytes of response to answer "what is my order".
+    ///
+    /// UNBOUNDED, unlike [`TokenHookRepo::chain`], and the asymmetry is deliberate: this read
+    /// is a management call that returns a length per row, while that one is on the issuance
+    /// path and returns components. If a client somehow holds more hooks than
+    /// [`MAX_HOOKS_PER_CLIENT`], an operator has to be able to SEE that in order to fix it, and
+    /// a listing that truncated to the cap would hide exactly the rows they need to delete.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn chain_metadata(
+        &self,
+        client_id: &str,
+    ) -> Result<Vec<TokenHookMetadata>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT client_id, name, ordinal, octet_length(component) AS component_bytes, \
+             payload_version, failure_policy \
+             FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+             ORDER BY ordinal",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TokenHookMetadata {
+                    client_id: row.get("client_id"),
+                    name: row.get("name"),
+                    ordinal: row.get("ordinal"),
+                    component_bytes: row.get::<i32, _>("component_bytes"),
+                    payload_version: row.get("payload_version"),
+                    failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -32810,6 +32866,108 @@ impl ActingTokenHookRepo<'_> {
     // on returning A row -- silently, non-deterministically -- the moment a second one does.
     // Naming it makes each of these a deliberate single-hook operation, and makes the ones that
     // should become multi-hook a diff a reviewer sees rather than a behaviour that drifts.
+
+    /// Set the order of a client's hooks, audited as `token_hook.reordered`.
+    ///
+    /// Issue #114 criterion 5's ordering, through the admin surface. `order` is the complete
+    /// list of the client's hook names, first to last.
+    ///
+    /// COMPLETE, not a patch, and that is the contract rather than a convenience. A partial
+    /// reorder ("put `audit` third") has to say what happens to everything it did not name, and
+    /// every answer is a surprise: shifting the others silently renumbers hooks the caller did
+    /// not mention, and leaving them makes a collision the caller cannot see. Naming the whole
+    /// order means the request IS the arrangement, and a caller who reads the chain, moves one
+    /// entry and writes it back cannot produce a state they did not intend.
+    ///
+    /// REFUSED if `order` is not exactly the set of names this client has. A name that is not
+    /// deployed and a deployed hook that is missing from the list are both
+    /// [`StoreError::NotFound`]: one would order a hook that does not exist, the other would
+    /// leave a hook at a position the caller never chose while believing they had arranged
+    /// everything.
+    ///
+    /// ONE STATEMENT, so the permutation never exposes the duplicate ordinals it passes
+    /// through. The unique constraint is deferrable precisely because a two-update swap does
+    /// expose them, and a single `UPDATE ... FROM` is the form that does not need the deferral
+    /// at all.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope, or `order` is not exactly this
+    /// client's hook names; [`StoreError::Database`] on a persistence failure.
+    pub async fn reorder(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        order: &[String],
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // DUPLICATES ARE REFUSED HERE rather than by the database, because the collision a
+        // repeated name causes is a `NOT NULL` violation on the join below -- a message about
+        // an internal column, for a caller who wrote one name twice.
+        let mut unique: Vec<&String> = order.iter().collect();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != order.len() {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let names: Vec<String> = order.to_vec();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenHookReordered,
+                target: client,
+            },
+            async move |tx| {
+                // THE SET MUST MATCH, checked before the write rather than inferred from its
+                // row count. An `UPDATE` that touched fewer rows than the client has would
+                // leave the unnamed ones where they were -- which is the silent half-arrangement
+                // this method's doc refuses.
+                let deployed: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM token_hooks \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .fetch_one(&mut **tx)
+                .await?;
+                if deployed != i64::try_from(names.len()).unwrap_or(i64::MAX) {
+                    return Err(StoreError::NotFound);
+                }
+                let updated = sqlx::query(
+                    "UPDATE token_hooks AS h \
+                     SET ordinal = position.ordinal \
+                     FROM (SELECT name, (ordinality - 1)::integer AS ordinal \
+                           FROM unnest($4::text[]) WITH ORDINALITY AS t(name, ordinality)) \
+                          AS position \
+                     WHERE h.tenant_id = $1 AND h.environment_id = $2 AND h.client_id = $3 \
+                       AND h.name = position.name",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&names)
+                .execute(&mut **tx)
+                .await?;
+                // A NAME THAT IS NOT DEPLOYED updates nothing, so the count is short even
+                // though the two lengths matched: the caller named a hook this client does not
+                // have and omitted one it does.
+                if updated.rows_affected() != names.len() as u64 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
 
     /// Audit `token_hook.claim_refused` for a deployed hook the fence refused at ISSUANCE.
     ///
@@ -32937,6 +33095,29 @@ impl ActingTokenHookRepo<'_> {
                 target: client,
             },
             async move |tx| {
+                // THE CAP, AT THE WRITE, which is where the message is useful: an operator who
+                // has reached the limit learns it from the refusal to their deploy rather than
+                // from a hook that silently never runs. `MAX_HOOKS_PER_CLIENT` is also enforced
+                // at the READ, and that is not redundant -- see its own doc for why a cap the
+                // issuance path trusts is not a cap it has.
+                //
+                // The count EXCLUDES this name, so redeploying an existing hook at the cap is
+                // not refused: it adds no row. Only a genuinely new hook is measured against
+                // the limit.
+                let existing: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM token_hooks \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND name <> $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&hook_name)
+                .fetch_one(&mut **tx)
+                .await?;
+                if existing >= MAX_HOOKS_PER_CLIENT {
+                    return Err(StoreError::Conflict);
+                }
                 sqlx::query(
                     // THE NAME IS SPELLED, and `DEFAULT_HOOK_NAME` is what it is spelled as.
                     // 0168 moved the identity to (scope, client, name), so the conflict target
@@ -33066,6 +33247,7 @@ impl ActingTokenHookRepo<'_> {
         &self,
         env: &Env,
         client: &ClientId,
+        name: &str,
     ) -> Result<Vec<TokenHookVersion>, StoreError> {
         let _ = env;
         if client.scope() != self.scope {
@@ -33083,7 +33265,7 @@ impl ActingTokenHookRepo<'_> {
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -33138,6 +33320,7 @@ impl ActingTokenHookRepo<'_> {
         &self,
         env: &Env,
         client: &ClientId,
+        name: &str,
         version: i32,
         event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
@@ -33155,7 +33338,7 @@ impl ActingTokenHookRepo<'_> {
         .bind(scope.environment().to_string())
         .bind(client.to_string())
         .bind(version)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *read)
         .await?;
         // THE ACTIVE ROW, read in the SAME transaction as the target, so the comparison below
@@ -33168,7 +33351,7 @@ impl ActingTokenHookRepo<'_> {
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *read)
         .await?;
         read.commit().await?;
@@ -33207,10 +33390,11 @@ impl ActingTokenHookRepo<'_> {
             }
         }
 
-        // THE PLACEMENT IS THE DEFAULT HOOK'S, because a rollback restores CODE and must not
-        // move anything: the upsert below leaves `ordinal` alone on conflict, so a rollback of
-        // a hook that sits third leaves it third. Once the admin surface rolls a NAMED hook
-        // back, this is where its name arrives.
+        // THE PLACEMENT NAMES THE HOOK BEING ROLLED BACK, and its ordinal is ignored: a
+        // rollback restores CODE and must not move anything, and the upsert leaves `ordinal`
+        // alone on conflict, so a rollback of a hook that sits third leaves it third. The zero
+        // here is the value a hook that does not exist would take, and a rollback of a hook
+        // that does not exist has already failed above.
         self.set_with_event(
             env,
             client,
@@ -33218,7 +33402,7 @@ impl ActingTokenHookRepo<'_> {
                 component: &component,
                 payload_version,
                 failure_policy,
-                placement: HookPlacement::default_hook(),
+                placement: HookPlacement { name, ordinal: 0 },
             },
             event,
         )
@@ -33237,10 +33421,18 @@ impl ActingTokenHookRepo<'_> {
     /// [`StoreError::NotFound`] if `client` is out of scope or has no hook;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn delete(&self, env: &Env, client: &ClientId) -> Result<(), StoreError> {
-        self.delete_with_event(env, client, None).await
+        self.delete_with_event(env, client, DEFAULT_HOOK_NAME, None)
+            .await
     }
 
-    /// [`Self::delete`], additionally emitting `token_hook.deleted` (issue #108).
+    /// [`Self::delete`], for a NAMED hook and additionally emitting `token_hook.deleted`
+    /// (issue #108).
+    ///
+    /// THE REST OF THE CHAIN KEEPS ITS POSITIONS, deliberately. Removing the hook at position
+    /// one leaves a gap rather than shifting two down to one, because the ordinal is an
+    /// ordering key and not an index: closing the gap would renumber hooks the operator did not
+    /// touch, and the order the gap leaves behind is the same order. The reorder route is where
+    /// positions change, and it changes all of them at once.
     ///
     /// # Errors
     ///
@@ -33249,6 +33441,7 @@ impl ActingTokenHookRepo<'_> {
         &self,
         env: &Env,
         client: &ClientId,
+        name: &str,
         event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
@@ -33256,6 +33449,7 @@ impl ActingTokenHookRepo<'_> {
         }
         let scope = self.scope;
         let client_id = client.to_string();
+        let hook_name = name.to_owned();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -33274,7 +33468,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&client_id)
-                .bind(DEFAULT_HOOK_NAME)
+                .bind(&hook_name)
                 .execute(&mut **tx)
                 .await?;
                 // NOT FOUND rather than a silent success, the same reasoning the claim-mapping

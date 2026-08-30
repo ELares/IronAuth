@@ -1177,3 +1177,356 @@ async fn the_version_history_is_pruned_to_the_retention_bound() {
         neighbour_component.len()
     );
 }
+
+/// SEVERAL NAMED HOOKS, READ BACK IN ORDER, AND REARRANGED THROUGH THE API.
+///
+/// Issue #114 criterion 5 asks that ordering "work through the admin surface", which is three
+/// separate things: a deploy has to be able to ADDRESS a hook other than the default, a read has
+/// to report the arrangement, and a caller has to be able to CHANGE it without redeploying.
+///
+/// # What each assertion rules out
+///
+/// The default position is LAST, and asserting the ordinals rather than only the sequence is
+/// what catches an "append" that actually inserts: a chain read back as `[a, b, c]` is the same
+/// whether the positions are 0,1,2 or 0,0,0, and the second is a schema violation the unique
+/// constraint would have refused -- so seeing the numbers is what says the API and the database
+/// agree about what "last" means.
+///
+/// The REDEPLOY assertion is the one that protects rollback: redeploying `second` with an
+/// explicit ordinal of zero must leave it where it is, because a redeploy replaces code and a
+/// rollback is a redeploy. Without this a rollback of the hook that runs last would silently
+/// make it run first, changing what every other hook is handed.
+///
+/// The REORDER asserts both halves of what the route returns: the new sequence, and the new
+/// ordinals. A response that echoed the request would show the sequence and not the positions.
+#[tokio::test]
+async fn hooks_are_named_ordered_and_rearranged_through_the_admin_surface() {
+    let harness = Harness::start(60).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // THREE HOOKS, none of them naming a position: each must land after the last.
+    for name in ["first", "second", "third"] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1&name={name}"), COMPONENT)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {name}: {body}");
+    }
+
+    let (status, _, body) = harness.get(&format!("{base}/chain")).await;
+    assert_eq!(status, StatusCode::OK, "read the chain: {body}");
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let names: Vec<&str> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["first", "second", "third"],
+        "absent means LAST, so three deploys run in the order they were made: {body}"
+    );
+    let ordinals: Vec<i64> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["ordinal"].as_i64().expect("an ordinal"))
+        .collect();
+    assert_eq!(
+        ordinals,
+        vec![0, 1, 2],
+        "and the POSITIONS are distinct and ascending -- a sequence alone cannot tell 0,1,2 \
+         from three hooks piled at one position: {body}"
+    );
+
+    // A REDEPLOY MUST NOT MOVE A HOOK, which is what a rollback depends on.
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name=second&ordinal=0"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "redeploy second: {body}");
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let names: Vec<&str> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["first", "second", "third"],
+        "a redeploy replaces CODE and must not move a hook, even when it names a position -- \
+         a rollback is a redeploy, and one that reordered would change what every later hook \
+         is handed: {body}"
+    );
+
+    // AND THE REORDER MOVES IT, which is the route that exists for exactly that.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/order"),
+            "k-order",
+            r#"{"order":["third","first","second"]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "reorder: {body}");
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let names: Vec<&str> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["third", "first", "second"],
+        "the route READS BACK what the chain is, not what was asked for: {body}"
+    );
+    let ordinals: Vec<i64> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["ordinal"].as_i64().expect("an ordinal"))
+        .collect();
+    assert_eq!(
+        ordinals,
+        vec![0, 1, 2],
+        "and the positions are rewritten, not just the sequence reported: {body}"
+    );
+}
+
+/// A REORDER MUST NAME THE WHOLE ARRANGEMENT, and a partial one is refused.
+///
+/// The contract is that the request IS the order. A partial reorder has to say what happens to
+/// what it did not name, and every answer surprises someone: shifting the others silently
+/// renumbers hooks the caller never mentioned, and leaving them makes a collision the caller
+/// cannot see. So a list that is not exactly this client's hook names is refused, and BOTH
+/// directions are asserted -- a short list and a list naming a hook that is not deployed --
+/// because a check that only counted would pass the second.
+#[tokio::test]
+async fn a_reorder_that_is_not_the_whole_arrangement_is_refused() {
+    let harness = Harness::start(61).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    for name in ["alpha", "beta"] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1&name={name}"), COMPONENT)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {name}: {body}");
+    }
+
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/order"),
+            "k-short",
+            r#"{"order":["alpha"]}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a SHORT list would leave `beta` at a position the caller never chose while they \
+         believed they had arranged everything: {body}"
+    );
+
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/order"),
+            "k-unknown",
+            r#"{"order":["alpha","gamma"]}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "and a list the right LENGTH naming a hook that is not deployed is refused too, or a \
+         count would be the whole check: {body}"
+    );
+
+    // THE ARRANGEMENT IS UNCHANGED. A refusal that had already written half the order would be
+    // worse than the partial reorder it refuses.
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let names: Vec<&str> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "beta"],
+        "a refused reorder writes nothing: {body}"
+    );
+}
+
+/// THE NAME BOUND AT THE DOOR IS THE COLUMN'S BOUND, IN THE COLUMN'S UNIT.
+///
+/// `MAX_HOOK_NAME_CHARS` and the CHECK on `token_hooks.name` are two copies of one number, and
+/// two copies is how they stop agreeing. The API's copy exists because a database CHECK cannot
+/// produce an `ErrorBody`: a constraint violation is a 500 with `23514` in a log, where a
+/// refusal at the door is a message the operator reads.
+///
+/// # The unit is the point
+///
+/// Postgres `length()` counts CHARACTERS. An earlier version of the handler counted BYTES while
+/// its comment claimed to match the column, so the two disagreed on every non-ASCII name -- a
+/// forty-character name of three-byte characters is a hundred and twenty bytes, which the
+/// column admits and a byte count refuses. This drives a name of exactly the limit in
+/// MULTI-BYTE characters, which is the only input that can tell the two units apart: 64
+/// characters and 192 bytes. Under a byte bound it is refused; under the column's bound it is
+/// deployed.
+///
+/// One over the limit is refused with this API's 400, which is the other half: a bound nothing
+/// exceeds is not observably a bound.
+#[tokio::test]
+async fn a_hook_name_at_the_column_bound_is_accepted_and_one_past_it_is_refused() {
+    let harness = Harness::start(62).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // 64 CHARACTERS, 192 BYTES. The only shape that distinguishes the two units.
+    let at_limit: String = std::iter::repeat_n('\u{4e16}', 64).collect();
+    assert_eq!(at_limit.chars().count(), 64);
+    assert_eq!(at_limit.len(), 192);
+
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name={at_limit}"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a name at exactly the column's bound must deploy, or the door is stricter than the \
+         column it says it matches: {body}"
+    );
+
+    let past_limit: String = std::iter::repeat_n('\u{4e16}', 65).collect();
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name={past_limit}"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "and one past it is this API's 400 rather than a constraint violation surfacing as a \
+         500: {body}"
+    );
+}
+
+/// EVERY VERB REACHES A NAMED HOOK, not only the one a client had before ordering existed.
+///
+/// Criterion 5 asks that "versioned deploy, fixture-based draft testing, ordering, per-hook
+/// secrets, and rollback all work through the admin surface". Adding names made ordering work
+/// and left the other verbs addressing `default` only -- so a client with a second hook could
+/// deploy it and arrange it, and then could not list its versions, roll it back, or draft-test
+/// it. The criterion would have read as met while being met for one hook per client.
+///
+/// # Why the versions assertion is the sharp one
+///
+/// The version SEQUENCE is per hook. Deploying `beta` twice while `alpha` has one deploy must
+/// give beta versions 1 and 2 and leave alpha at 1 -- if the numbering were per CLIENT, beta's
+/// second deploy would be version 3, and rolling alpha back to "version 1" could restore beta's
+/// bytes. Asserting the COUNT and the NUMBERS is what separates those.
+#[tokio::test]
+async fn versions_rollback_and_draft_runs_all_address_the_named_hook() {
+    let harness = Harness::start(63).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // `alpha` once, `beta` twice.
+    for name in ["alpha", "beta", "beta"] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1&name={name}"), COMPONENT)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {name}: {body}");
+    }
+
+    let (status, _, body) = harness.get(&format!("{base}/versions?name=beta")).await;
+    assert_eq!(status, StatusCode::OK, "list beta's versions: {body}");
+    // A BARE LIST, not an envelope: the route returns `Vec<TokenHookVersionView>`.
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let numbers: Vec<i64> = listed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|v| v["version"].as_i64().expect("a version"))
+        .collect();
+    assert_eq!(
+        numbers,
+        vec![2, 1],
+        "beta has TWO versions, numbered from one: a per-CLIENT sequence would have made its \
+         second deploy version 3, and rolling `alpha` back to version 1 could then restore \
+         beta's bytes: {body}"
+    );
+
+    let (status, _, body) = harness.get(&format!("{base}/versions?name=alpha")).await;
+    assert_eq!(status, StatusCode::OK, "list alpha's versions: {body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        listed.as_array().expect("a list").len(),
+        1,
+        "and alpha's history is its own -- beta's two deploys did not advance it: {body}"
+    );
+
+    // A ROLLBACK ADDRESSES THE NAMED HOOK, and does not move it.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/rollback?name=beta"),
+            "k-roll-beta",
+            r#"{"version":1}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "roll beta back: {body}");
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let names: Vec<&str> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "beta"],
+        "a rollback restores CODE and must not move a hook: {body}"
+    );
+
+    // AND A DRAFT RUN NAMES ONE TOO. The component here is a bare preamble rather than a
+    // loadable guest, so the run ABORTS -- which is still the answer to "what would this hook
+    // do", and it proves the route resolved the named hook rather than 404ing on it.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/test?name=beta"),
+            "k-draft-beta",
+            &serde_json::json!({ "grant_type": "authorization_code" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a draft run of a NAMED hook must resolve it: a 404 here is the route addressing \
+         `default` and not finding this client's beta: {body}"
+    );
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["outcome"], "aborted",
+        "and it reports what that component does, which for a bare preamble is an abort: {body}"
+    );
+}

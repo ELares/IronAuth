@@ -2366,6 +2366,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to describe; absent means `default`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2469,6 +2478,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks this deploys; absent means `default`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ordinal",
+            "in": "query",
+            "description": "Where a NEW hook runs in the chain, ascending; absent means last. IGNORED when the hook already exists, so a redeploy replaces code without moving it",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
           }
         ],
         "requestBody": {
@@ -2494,7 +2523,7 @@
             }
           },
           "400": {
-            "description": "An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component",
+            "description": "An unknown or absent payload version, an unknown failure policy, an invalid hook name, or bytes that are not a WebAssembly component",
             "content": {
               "application/json": {
                 "schema": {
@@ -2525,6 +2554,16 @@
           },
           "404": {
             "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This client already holds the maximum number of hooks",
             "content": {
               "application/json": {
                 "schema": {
@@ -2618,6 +2657,196 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain": {
+      "get": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "List a client's hook chain, in the order it runs.",
+        "operationId": "listTokenHookChain",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hooks shape",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The chain, first to last. Empty when the client has no hooks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookChainView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order": {
+      "post": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Set the order a client's hooks run in.",
+        "operationId": "reorderTokenHooks",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hooks shape",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderTokenHooksRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The chain in its new order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookChainView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed body or a repeated name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or the order is not exactly this client's hook names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback": {
       "post": {
         "tags": [
@@ -2650,6 +2879,15 @@
             "in": "path",
             "description": "The authorize client identifier whose tokens the hook shapes",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to roll back; absent means `default`",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2756,6 +2994,15 @@
             "in": "path",
             "description": "The authorize client identifier whose tokens the hook shapes",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to run; absent means `default`",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2872,6 +3119,15 @@
             "in": "path",
             "description": "The authorize client identifier whose tokens the hook shapes",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to list versions of; absent means `default`",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -30273,6 +30529,22 @@
           }
         }
       },
+      "ReorderTokenHooksRequest": {
+        "type": "object",
+        "description": "The body of a reorder: the client's complete hook order, first to last.",
+        "required": [
+          "order"
+        ],
+        "properties": {
+          "order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every one of this client's hook names, in the order they should run.\n\nCOMPLETE, not a patch, and that is the contract rather than a convenience. A partial\nreorder (\"put `audit` third\") has to say what happens to everything it did not name, and\nevery answer is a surprise: shifting the others silently renumbers hooks the caller did\nnot mention, and leaving them makes a collision the caller cannot see. Naming the whole\norder means the request IS the arrangement, so a caller who reads the chain, moves one\nentry and writes it back cannot produce a state they did not intend.\n\nA list that is not exactly this client's hook names is a 404 -- a name that is not\ndeployed would order a hook that does not exist, and a deployed hook missing from the\nlist would be left at a position the caller never chose while believing they had\narranged everything."
+          }
+        }
+      },
       "ReplayAccepted": {
         "type": "object",
         "description": "The acknowledgement that a replay was QUEUED.\n\nDeliberately not a count. The management plane enqueues a command and the delivery\nworker executes it, so no number this response could carry would be true by the time a\ncaller read it. What the caller can rely on is that the request is durable: it is a\nqueue row committed in the same transaction as its audit row.",
@@ -32050,6 +32322,65 @@
             ],
             "format": "int32",
             "description": "Which version ran.\n\nRESOLVED, not echoed. A run that named a version gets that number back; a run that named\nnone gets the version of the hook that is currently deployed, which is the newest row in\nthe history.\n\nNOT `null` on any path this API offers, and the sentence that stood here said the\nopposite: it named \"a hook deployed and then deleted\", which is the one case that\ncertainly does not produce one. The delete removes the `token_hooks` row and leaves\n`token_hook_versions` alone -- that table has no foreign key to it and no trigger -- so a\ndeleted hook keeps its history, and asking this endpoint about it answers 404, an\n`ErrorBody` with no version in it at all.\n\nA `null` needs the reverse: an ACTIVE hook whose history is EMPTY. A deploy writes both\nrows in one transaction, `0165_token_hook_versions.sql` backfills version 1 for every\nhook that predates the history, and the prune deletes only\n`version <= MAX(version) - TOKEN_HOOK_VERSION_RETENTION` -- so no write this server\nperforms leaves that state behind. Measured: reaching it took a hand-run\n`DELETE FROM token_hook_versions` under a live hook. The field stays optional because\nthe database can hold that row set, not because a client can produce it."
+          }
+        }
+      },
+      "TokenHookChainEntryView": {
+        "type": "object",
+        "description": "One hook in a client's chain, as the management API reports it.",
+        "required": [
+          "name",
+          "ordinal",
+          "component_bytes",
+          "payload_version",
+          "failure_policy"
+        ],
+        "properties": {
+          "component_bytes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many bytes the deployed component is. Never the component: a chain of eight\nsixteen-megabyte hooks would be a hundred and twenty-eight megabytes of response to\nanswer \"what is my order\".",
+            "minimum": 0
+          },
+          "failure_policy": {
+            "type": "string",
+            "description": "What the dispatch does when this hook does not complete."
+          },
+          "name": {
+            "type": "string",
+            "description": "The hook's name: the handle every other route addresses it by."
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Its position in the chain, ascending. Positions may have GAPS -- deleting the hook at\nposition one leaves two at two, because the ordinal orders rather than indexes, and\nclosing the gap would renumber hooks nobody touched."
+          },
+          "payload_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The payload version the guest was built against.",
+            "minimum": 0
+          }
+        }
+      },
+      "TokenHookChainView": {
+        "type": "object",
+        "description": "A client's hook chain, in the order it runs.",
+        "required": [
+          "client_id",
+          "hooks"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client whose chain this is."
+          },
+          "hooks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TokenHookChainEntryView"
+            },
+            "description": "The hooks, first to last. Empty when the client has none.\n\nEACH HOOK IS HANDED WHAT THE ONE BEFORE IT PRODUCED, which is what makes this order\nload-bearing rather than cosmetic: a hook's claim set REPLACES what it was given, so\nmoving a hook changes what every hook after it sees."
           }
         }
       },

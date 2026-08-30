@@ -3770,3 +3770,85 @@ async fn write_config_is_required_and_sufficient_for_a_token_hook_rollback() {
          {response}"
     );
 }
+
+/// `management.read` is required AND sufficient for LISTING a token-hook chain (#114).
+///
+/// Classified with the reads: it reports a byte LENGTH per hook and never a component, so it
+/// discloses exactly what `getTokenHook` already does, once per hook.
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_listing_the_token_hook_chain() {
+    let h = Harness::start(227).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-chain").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/chain"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential must not read a client's hook arrangement: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.get_as(&path, &secret).await;
+    // THE 404 IS THE MALFORMED CLIENT ID, raised by `parse_client_id` AFTER the permission
+    // gate, which is what separates the gate from the handler. An empty chain for a REAL client
+    // is a 200, asserted in the chain suite -- so this 404 cannot be that.
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then refuses the malformed client id. \
+         403 versus 404 is what distinguishes the permission gate from the handler: {response}"
+    );
+}
+
+/// `management.write_config` is required AND sufficient for REORDERING token hooks (#114).
+///
+/// Classified with the DEPLOY rather than the reads, and the reason is worth pinning: a reorder
+/// changes what every later hook is HANDED, since each is given what the one before it
+/// produced. Moving a hook that strips a claim to run before the one that adds it puts the
+/// claim back in every token this client is issued, without any component changing.
+#[tokio::test]
+async fn write_config_is_required_and_sufficient_for_a_token_hook_reorder() {
+    let h = Harness::start(228).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-order").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/order"
+    );
+    let body = r#"{"order":["default"]}"#;
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-order-denied", body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must not rearrange what runs on every token: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-order-allowed", body).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write_config credential reaches the handler, which reports the absent client: \
+         {response}"
+    );
+}

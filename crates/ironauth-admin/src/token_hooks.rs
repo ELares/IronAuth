@@ -63,7 +63,8 @@ use crate::error::{ApiError, ErrorBody};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
-    DeployTokenHookQuery, RollbackTokenHookRequest, TestTokenHookRequest, TestTokenHookResponse,
+    DeployTokenHookQuery, NamedTokenHookQuery, ReorderTokenHooksRequest, RollbackTokenHookRequest,
+    TestTokenHookRequest, TestTokenHookResponse, TokenHookChainEntryView, TokenHookChainView,
     TokenHookVersionView, TokenHookView,
 };
 
@@ -186,6 +187,48 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
     ))
 }
 
+/// The most CHARACTERS a hook name may carry, matching the CHECK on the column.
+///
+/// Two copies of one number, and the reason is the one `MAX_COMPONENT_BYTES` gives for its own
+/// pair: a database CHECK cannot produce this API's `ErrorBody`, so refusing here is what turns
+/// a constraint violation into a message an operator can read.
+///
+/// CHARACTERS AND NOT BYTES, and an earlier version of this counted bytes while claiming to
+/// match the column. Postgres `length()` counts characters, so the two bounds disagreed on
+/// every non-ASCII name: a forty-character name of three-byte characters is a hundred and
+/// twenty bytes, which the column admits and a byte count refuses. That direction is safe --
+/// the API was strictly stricter, so no constraint violation could escape it -- but "matching
+/// the CHECK" was false, and the next person to move one of the two numbers would have moved it
+/// against a comment that lied about the other.
+const MAX_HOOK_NAME_CHARS: usize = 64;
+
+/// Which hook a request addresses, and where a NEW one goes.
+///
+/// Absent name means `default`, which is what every hook deployed before ordering existed was
+/// backfilled to, so a caller that says nothing keeps addressing the hook it always did.
+///
+/// REFUSED AT THE DOOR rather than by the column's CHECK, for the reason above: an untrimmed or
+/// over-long name is an operator mistake with an actionable message, and `23514` is not it.
+fn hook_name(raw: Option<&str>) -> Result<&str, ApiError> {
+    let name = raw.unwrap_or(ironauth_store::DEFAULT_HOOK_NAME);
+    if name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "invalid_hook_name: name must not be empty".to_owned(),
+        ));
+    }
+    if name.trim() != name {
+        return Err(ApiError::BadRequest(
+            "invalid_hook_name: name must not begin or end with whitespace".to_owned(),
+        ));
+    }
+    if name.chars().count() > MAX_HOOK_NAME_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "invalid_hook_name: name must be at most {MAX_HOOK_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name)
+}
+
 /// Deploy (create or replace) a client's WASM token hook.
 #[utoipa::path(
     put,
@@ -198,15 +241,18 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
         ("environment_id" = String, Path, description = "The environment identifier"),
         ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
         ("payload_version" = u32, Query, description = "The token-customize payload version the guest was built against"),
-        ("failure_policy" = Option<String>, Query, description = "What the dispatch does when this hook does not complete: `fail_closed` (the default) or `fail_open`")
+        ("failure_policy" = Option<String>, Query, description = "What the dispatch does when this hook does not complete: `fail_closed` (the default) or `fail_open`"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks this deploys; absent means `default`"),
+        ("ordinal" = Option<u32>, Query, description = "Where a NEW hook runs in the chain, ascending; absent means last. IGNORED when the hook already exists, so a redeploy replaces code without moving it")
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Deployed", body = TokenHookView),
-        (status = 400, description = "An unknown or absent payload version, an unknown failure policy, or bytes that are not a WebAssembly component", body = ErrorBody),
+        (status = 400, description = "An unknown or absent payload version, an unknown failure policy, an invalid hook name, or bytes that are not a WebAssembly component", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
+        (status = 404, description = "Environment not found or malformed client id", body = ErrorBody),
+        (status = 409, description = "This client already holds the maximum number of hooks", body = ErrorBody)
     )
 )]
 pub async fn deploy_token_hook(
@@ -245,6 +291,27 @@ pub async fn deploy_token_hook(
     if payload_version != ironauth_store::token_customize::TOKEN_CUSTOMIZE_VERSION {
         return Err(ApiError::BadRequest("unknown_payload_version: this build cannot honour that token-customize payload version".to_owned()));
     }
+    let name = hook_name(query.name.as_deref())?;
+    // ABSENT MEANS LAST, which is the only default that cannot surprise: appending changes
+    // nothing about what the hooks already deployed are handed, while inserting at the front
+    // silently changes the input of every one of them. An operator who wants a different
+    // position says so, or reorders afterwards.
+    //
+    // IGNORED WHEN THE HOOK ALREADY EXISTS -- the upsert leaves `ordinal` alone on conflict --
+    // and that is what a rollback depends on: restoring the code of the hook that runs third
+    // must not make it run first.
+    let ordinal = match query.ordinal.as_deref() {
+        Some(raw) => raw
+            .parse::<i32>()
+            .ok()
+            .filter(|at| *at >= 0)
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "invalid_ordinal: ordinal must be a non-negative integer".to_owned(),
+                )
+            })?,
+        None => next_free_ordinal(&state, scope, &client).await?,
+    };
     // ABSENT MEANS FAIL-CLOSED. The dangerous setting is the one an operator has to type, and
     // an unrecognised spelling is refused rather than read as the default -- a typo that
     // silently selected the safe answer would be indistinguishable from asking for it, and the
@@ -272,12 +339,7 @@ pub async fn deploy_token_hook(
                 component: &body,
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
                 failure_policy,
-                // THE DEFAULT HOOK, until this surface takes a name from the caller. Issue
-                // #114 criterion 5 gives a client several hooks and this route addresses the
-                // one it had before ordering existed -- which is what migration 0167
-                // backfilled every deployed hook to, so a deploy through here keeps hitting
-                // the row it always hit.
-                placement: ironauth_store::HookPlacement::default_hook(),
+                placement: ironauth_store::HookPlacement { name, ordinal },
             },
             deployed_event(
                 &state,
@@ -311,7 +373,8 @@ pub async fn deploy_token_hook(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to describe; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -325,11 +388,13 @@ pub async fn get_token_hook(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
 
     // `metadata`, not `get`: the component runs to tens of megabytes and this reports its
     // LENGTH, so the length is computed where the bytes already are rather than by hauling
@@ -338,7 +403,7 @@ pub async fn get_token_hook(
         .store()
         .scoped(scope)
         .token_hooks()
-        .metadata(&client.to_string())
+        .metadata(&client.to_string(), hook)
         .await?
         .ok_or(ApiError::NotFound)?;
     let view = TokenHookView {
@@ -391,6 +456,7 @@ pub async fn delete_token_hook(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.write_config`.
@@ -402,6 +468,7 @@ pub async fn delete_token_hook(
     // can strip a security-relevant claim from every token.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     state
@@ -412,6 +479,7 @@ pub async fn delete_token_hook(
         .delete_with_event(
             state.env(),
             &client,
+            hook,
             deleted_event(&state, scope, &client.to_string())
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
@@ -419,6 +487,178 @@ pub async fn delete_token_hook(
         )
         .await?;
     Ok(no_content())
+}
+
+/// List a client's hook chain, in the order it runs.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/chain",
+    operation_id = "listTokenHookChain",
+    tag = "token-hooks",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hooks shape")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The chain, first to last. Empty when the client has no hooks", body = TokenHookChainView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found or malformed client id", body = ErrorBody)
+    )
+)]
+pub async fn list_token_hook_chain(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`. It reports byte
+    // LENGTHS and never components, so it discloses exactly what `getTokenHook` already does,
+    // once per hook.
+    principal.require_permission(ManagementPermission::Read)?;
+    let client = parse_client_id(&client_id, scope)?;
+
+    let chain = state
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .chain_metadata(&client.to_string())
+        .await?;
+    // AN EMPTY CHAIN IS A 200, not a 404. "This client has no hooks" is an answer to the
+    // question asked, and the caller reordering a chain needs to tell it from "this client does
+    // not exist" -- which is the 404 above, raised by `parse_client_id`.
+    let view = TokenHookChainView {
+        client_id: client.to_string(),
+        hooks: chain
+            .into_iter()
+            .map(|hook| {
+                Ok(TokenHookChainEntryView {
+                    name: hook.name,
+                    ordinal: hook.ordinal,
+                    component_bytes: u32::try_from(hook.component_bytes)
+                        .map_err(|_| ApiError::Internal)?,
+                    payload_version: u32::try_from(hook.payload_version)
+                        .map_err(|_| ApiError::Internal)?,
+                    failure_policy: hook.failure_policy.as_str().to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Set the order a client's hooks run in.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/order",
+    operation_id = "reorderTokenHooks",
+    tag = "token-hooks",
+    request_body = ReorderTokenHooksRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hooks shape")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The chain in its new order", body = TokenHookChainView),
+        (status = 400, description = "A malformed body or a repeated name", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found, malformed client id, or the order is not exactly this client's hook names", body = ErrorBody)
+    )
+)]
+pub async fn reorder_token_hooks(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    body: axum::extract::Json<ReorderTokenHooksRequest>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`, with the
+    // DEPLOY rather than the reads, because a reorder changes what every later hook is handed
+    // and so can change every claim in a token while every component stays byte-identical.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // FRESH PRIVILEGE, for the same reason a deploy demands it. Reordering is not a smaller
+    // act than deploying: moving a hook that strips a claim to run before the one that adds it
+    // puts the claim back in every token, without any code changing.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let client = parse_client_id(&client_id, scope)?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    // NAMES VALIDATED AT THE DOOR, so an untrimmed or over-long entry is this API's 400 rather
+    // than a 404 that reads as "no such hook" -- the caller needs to tell "I typed the name
+    // wrong" from "that hook is not deployed".
+    for name in &body.order {
+        hook_name(Some(name.as_str()))?;
+    }
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .token_hooks()
+        .reorder(state.env(), &client, &body.order)
+        .await?;
+
+    // READ BACK, not echo. The request says what the caller asked for; the response says what
+    // the chain IS, which is what they need to see to know the arrangement took.
+    let chain = state
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .chain_metadata(&client.to_string())
+        .await?;
+    let view = TokenHookChainView {
+        client_id: client.to_string(),
+        hooks: chain
+            .into_iter()
+            .map(|hook| {
+                Ok(TokenHookChainEntryView {
+                    name: hook.name,
+                    ordinal: hook.ordinal,
+                    component_bytes: u32::try_from(hook.component_bytes)
+                        .map_err(|_| ApiError::Internal)?,
+                    payload_version: u32::try_from(hook.payload_version)
+                        .map_err(|_| ApiError::Internal)?,
+                    failure_policy: hook.failure_policy.as_str().to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// One past the last position this client's chain occupies, or zero when it has none.
+///
+/// What "absent means last" resolves to. Reading it rather than counting the hooks matters
+/// because positions may have GAPS: deleting the hook at position one leaves two at two, and a
+/// count would return two and collide.
+///
+/// A RACE IS POSSIBLE and it is a 409 rather than a corruption: two concurrent deploys of two
+/// NEW hooks can read the same free position, and the second one violates the unique constraint.
+/// That is the right failure -- the alternative is picking a position for a caller who did not
+/// choose one, silently, while another deploy did the same.
+async fn next_free_ordinal(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client: &ironauth_store::ClientId,
+) -> Result<i32, ApiError> {
+    let chain = state
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .chain_metadata(&client.to_string())
+        .await?;
+    Ok(chain
+        .iter()
+        .map(|hook| hook.ordinal)
+        .max()
+        .map_or(0, |last| last.saturating_add(1)))
 }
 
 /// The event a hook deploy emits (issue #108).
@@ -613,7 +853,8 @@ mod tests {
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to list versions of; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -627,11 +868,13 @@ pub async fn list_token_hook_versions(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
 
     // AN EMPTY LIST, not a 404, when the client has never had a hook. "No versions" is a
     // complete and common answer to "what have I deployed", unlike `getTokenHook`, where
@@ -644,7 +887,7 @@ pub async fn list_token_hook_versions(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .versions(state.env(), &client)
+        .versions(state.env(), &client, hook)
         .await?;
     let view: Vec<TokenHookVersionView> = versions
         .into_iter()
@@ -682,7 +925,8 @@ pub async fn list_token_hook_versions(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to roll back; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -697,6 +941,7 @@ pub async fn rollback_token_hook(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
@@ -709,6 +954,7 @@ pub async fn rollback_token_hook(
     // stripped it from every token that client is issued.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: RollbackTokenHookRequest = crate::input::parse_json(&body)?;
@@ -725,7 +971,7 @@ pub async fn rollback_token_hook(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .versions(state.env(), &client)
+        .versions(state.env(), &client, hook)
         .await?
         .into_iter()
         .find(|candidate| candidate.version == request.version)
@@ -746,6 +992,7 @@ pub async fn rollback_token_hook(
         .rollback_to(
             state.env(),
             &client,
+            hook,
             request.version,
             announced
                 .as_ref()
@@ -761,7 +1008,10 @@ pub async fn rollback_token_hook(
         .store()
         .scoped(scope)
         .token_hooks()
-        .metadata(&client.to_string())
+        // THE DEFAULT HOOK, matching the rollback above: `rollback_to` restores the default
+        // hook's code, so the row it wrote is the row read back. When rollback takes a name,
+        // both halves take the same one.
+        .metadata(&client.to_string(), hook)
         .await?
         .ok_or(ApiError::Internal)?;
     let view = TokenHookView {
@@ -844,7 +1094,8 @@ pub async fn rollback_token_hook(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to run; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -860,6 +1111,7 @@ pub async fn test_token_hook(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // NO ACTOR, and that is the tell: `resolve_scope` returns one for writing onto an audit
@@ -873,6 +1125,7 @@ pub async fn test_token_hook(
     // by a guest world that imports nothing. See the note on the handler.
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: TestTokenHookRequest = crate::input::parse_json(&body)?;
@@ -898,11 +1151,11 @@ pub async fn test_token_hook(
     // `active_with_version` resolves the pair in a single statement.
     let (record, version_run) = if let Some(version) = request.version {
         (
-            hooks.version(&client.to_string(), version).await?,
+            hooks.version(&client.to_string(), hook, version).await?,
             Some(version),
         )
     } else {
-        match hooks.active_with_version(&client.to_string()).await? {
+        match hooks.active_with_version(&client.to_string(), hook).await? {
             Some((record, newest)) => (Some(record), newest),
             None => (None, None),
         }

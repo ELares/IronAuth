@@ -943,6 +943,16 @@ pub enum Action {
     /// TARGET is the client too, for the reason `TokenHookSet` gives: the hook table has no id
     /// of its own and the client is the thing whose tokens the code shapes.
     TokenHookClaimRefused,
+    /// A client's WASM TOKEN HOOKS were REORDERED (issue #114 criterion 5): the chain now runs
+    /// in a different sequence, without any hook's code changing.
+    ///
+    /// A SEPARATE ACTION FROM `TokenHookSet`, because it is a separate operator decision with a
+    /// different blast radius. A deploy changes what one hook does; a reorder changes what
+    /// EVERY later hook is handed, since each is given what the one before it produced -- so a
+    /// reorder can change every claim in a token while every component stays byte-identical.
+    /// An auditor asking "why did this client's tokens change shape" needs to see that as its
+    /// own event rather than infer it from an absence of deploys.
+    TokenHookReordered,
     /// A WASM TOKEN HOOK was REMOVED (issue #114), restoring the unshaped token for that
     /// client. The audit row names the CLIENT, for the same reason `TokenHookSet` does.
     ///
@@ -1615,6 +1625,7 @@ impl Action {
             Action::ClaimsMappingSet => "claims_mapping.set",
             Action::ClaimsMappingRefused => "claims_mapping.refused",
             Action::TokenHookClaimRefused => "token_hook.claim_refused",
+            Action::TokenHookReordered => "token_hook.reordered",
             Action::ClaimsMappingDelete => "claims_mapping.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",
