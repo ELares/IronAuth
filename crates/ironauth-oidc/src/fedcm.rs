@@ -679,8 +679,7 @@ async fn mint_assertion(
     //
     // This function returns `Option<String>`, so a fault is `None` and the assertion is refused.
     let access_extra_claims = crate::claims_mapping_at_issuance::apply_to_with_hook(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         &client_id_str,
         "urn:ietf:params:oauth:grant-type:fedcm",

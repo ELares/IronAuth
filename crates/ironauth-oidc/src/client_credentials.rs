@@ -207,8 +207,7 @@ async fn mint_and_persist(
     // mapping or hook that will not run means the operator's shaping did not happen, and a
     // shaped claim is as likely to REMOVE an entitlement as add one.
     let custom_claims = crate::claims_mapping_at_issuance::apply_to_machine_token(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         &client_id_str,
         // The wire value, from the registry, not a literal beside it. Issue #113 asks the

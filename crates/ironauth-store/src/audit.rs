@@ -922,6 +922,27 @@ pub enum Action {
     /// installs here. The component itself is not recorded: an audit stream is not a binary
     /// store, and the bytes are already durable in the row the audit points at.
     TokenHookSet,
+    /// A DEPLOYED TOKEN HOOK TRIED TO WRITE A CLAIM IT MAY NOT, and the fence refused it
+    /// (issue #113 criterion 5: protected claims "cannot be overridden by any mapping or hook;
+    /// attempts are rejected AND AUDITED").
+    ///
+    /// The HOOK half of that criterion. [`Action::ClaimsMappingRefused`] covers the mapping
+    /// half and is decided at CONFIGURATION time, in a 400 the operator reads. A hook's attempt
+    /// is only knowable when the hook RUNS, which is a login -- so this is the one refusal in
+    /// the pair that nobody is standing in front of, and a `tracing::warn!` on a server log was
+    /// the whole of it before. A log is not an audit stream: it is not per-tenant, not
+    /// retained to the audit policy, and not what a SIEM subscribes to.
+    ///
+    /// ONE ROW PER ISSUANCE, not per claim. A hook that returns a hundred reserved names is
+    /// making one mistake on one login, and the row carries the COUNTS rather than a hundred
+    /// rows. The claim NAMES are not recorded: they are attacker-chosen strings from operator
+    /// code, and an audit stream is the wrong place to echo one.
+    ///
+    /// The ACTOR is the client whose hook ran, as a service actor -- the same shape
+    /// `client_service_actor` builds elsewhere -- because the hook is that client's code. The
+    /// TARGET is the client too, for the reason `TokenHookSet` gives: the hook table has no id
+    /// of its own and the client is the thing whose tokens the code shapes.
+    TokenHookClaimRefused,
     /// A WASM TOKEN HOOK was REMOVED (issue #114), restoring the unshaped token for that
     /// client. The audit row names the CLIENT, for the same reason `TokenHookSet` does.
     ///
@@ -1593,6 +1614,7 @@ impl Action {
             Action::TokenHookDelete => "token_hook.delete",
             Action::ClaimsMappingSet => "claims_mapping.set",
             Action::ClaimsMappingRefused => "claims_mapping.refused",
+            Action::TokenHookClaimRefused => "token_hook.claim_refused",
             Action::ClaimsMappingDelete => "claims_mapping.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",

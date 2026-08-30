@@ -271,8 +271,7 @@ async fn shaped_claims(
     subject: &str,
 ) -> Result<crate::claims_mapping_at_issuance::MappedAccessClaims, TokenError> {
     crate::claims_mapping_at_issuance::apply_to_machine_token(
-        state.store(),
-        state.hook_engine(),
+        crate::claims_mapping_at_issuance::Issuance::for_state(state),
         scope,
         client_id,
         // The wire value, from the registry, not a literal beside it. Issue #113 asks the

@@ -32727,6 +32727,65 @@ pub struct ActingTokenHookRepo<'a> {
 }
 
 impl ActingTokenHookRepo<'_> {
+    /// Audit `token_hook.claim_refused` for a deployed hook the fence refused at ISSUANCE.
+    ///
+    /// Issue #113 criterion 5's HOOK half. The mapping half is refused at configuration time
+    /// and audited by [`ActingClaimsMappingRepo::record_refusal`]; a hook's attempt is only
+    /// knowable when the hook runs, which is a login, so this is the refusal nobody is standing
+    /// in front of. Before this it was a `tracing::warn!` and nothing else, and a server log is
+    /// not per-tenant, not held to the audit retention policy, and not what a SIEM subscribes
+    /// to.
+    ///
+    /// ONE ROW PER ISSUANCE. `refused` is how many names the fence reported and `not_reported`
+    /// is its upper bound on what it could not name, so the two together say "at least this
+    /// many, possibly more" without writing a hundred rows for one bad hook on one login.
+    ///
+    /// COUNTS AND NOT NAMES, and not reasons either. The names are operator-code strings and an
+    /// audit stream is the wrong place to echo an unbounded attacker-chosen value. The REASONS
+    /// would be worth having -- an auditor grouping by them could tell a hook reaching for
+    /// `sub` from one that merely returns too many claims, which is the distinction
+    /// `claims_mapping.refused` does draw -- but the fence discards the reason when it builds
+    /// the name list, and widening the seam struct to carry it would mean widening the
+    /// no-feature stub in lockstep, which is where this feature has already drifted once. Named
+    /// as a gap rather than papered over: the server log beside this row does carry the reason
+    /// per claim.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure. The issuance caller does NOT fail a login on this -- see the note
+    /// at the call site for why, and for what that costs.
+    pub async fn record_claim_refusal(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        refused: usize,
+        not_reported: usize,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let detail = serde_json::json!({
+            "refused": refused,
+            "refusals_not_reported": not_reported,
+        })
+        .to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenHookClaimRefused,
+                target: client,
+            },
+            async move |_tx| Ok(()),
+            false,
+            Some(detail.as_str()),
+        )
+        .await
+    }
+
     /// Deploy a client's hook (a first deploy or a replacement), audited as `token_hook.set`.
     ///
     /// One row per (scope, client), so a redeploy replaces in place. The audit TARGET is the

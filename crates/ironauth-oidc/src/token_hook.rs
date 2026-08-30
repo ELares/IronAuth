@@ -379,6 +379,101 @@ pub struct Invocation<'a> {
     pub access_token_claims: &'a serde_json::Map<String, serde_json::Value>,
 }
 
+/// Audit that this client's deployed hook tried to write a claim the fence refused.
+///
+/// ISSUE #113 CRITERION 5's HOOK HALF. The criterion says protected claims "cannot be
+/// overridden by any mapping or hook; attempts are rejected AND AUDITED". Both halves rejected
+/// from the start; only the mapping half was audited, by `claims_mapping.refused` at
+/// configuration time. A hook's attempt is knowable only when the hook RUNS, which is a login,
+/// so a `tracing::warn!` in `fence` was the whole record -- and a server log is not per-tenant,
+/// not held to the audit retention policy, and not what a SIEM subscribes to.
+///
+/// NOTHING TO AUDIT IS THE COMMON CASE, and this returns before touching the database for it.
+/// A well-behaved hook refuses nothing, so an ordinary login pays one `is_empty` check and no
+/// query: this is not a write on the hot path, it is a write on the path where a hook
+/// misbehaved.
+///
+/// NO ORGANIZATION ON THE ROW, which is a fact rather than a gap. `ActingContext`'s own doc
+/// says [`None`] there means "not an organization's event" and that attributing one wrongly
+/// delivers a row to the wrong customer's SIEM, silently. This seam holds a scope and a client
+/// and no organization, so there is nothing here to attribute from -- and the mapping half of
+/// this same criterion writes its refusal the same way. If a per-organization stream should
+/// carry these, the organization has to reach this seam first; guessing it here is the failure
+/// that doc warns about.
+///
+/// ITS OWN TRANSACTION, so the row outlives an issuance that fails afterwards. That is the
+/// right way round: the hook DID reach for the claim, and whether the request it was shaping
+/// went on to succeed is a different fact. An auditor reading a refusal has learned something
+/// true either way.
+///
+/// COUNTS AND NOT NAMES is also what keeps this inside the repo's own rule for the `detail`
+/// column -- `write_audited_detailed`'s doc says detail "is never attacker-controlled free
+/// text", and a hook's claim names are exactly that: strings chosen by operator code.
+///
+/// IT DOES NOT FAIL THE LOGIN, and that is a real cost stated rather than hidden. The
+/// alternative is a transient database error turning a successful issuance into a 500 because
+/// the operator's hook misbehaved, which punishes the end user for the operator's bug and
+/// converts a degraded audit into an outage. So a failed write is logged at `error` and the
+/// token is issued. What that costs: the criterion's "audited" is best-effort at exactly the
+/// moment the store is unhealthy. The rejection itself is not best-effort -- `fence` has
+/// already dropped the claim before this runs, and no failure here can put it back.
+///
+/// NOT CALLED BY THE DRAFT PATH. `run_record` deliberately does not reach this: a draft run is
+/// an operator asking a question, nothing was issued, and no claim was refused anywhere except
+/// in the answer they are reading. Auditing it would fill the stream with a reviewer's typing.
+#[cfg(feature = "wasm-hooks")]
+async fn audit_refusals(
+    store: &Store,
+    env: &ironauth_env::Env,
+    scope: Scope,
+    client_id: &str,
+    claims: &HookClaims,
+) {
+    // `refused` ALONE is the whole test, and an earlier version of this guard also required
+    // `refusals_not_reported == 0`. That conjunct could not change the outcome:
+    // `MAX_REFUSALS_REPORTED` is a positive constant, so nothing is counted-but-unreported
+    // until sixty-four names have been reported first, and an empty list with a non-zero
+    // remainder is unreachable. A condition that cannot be false is not defence in depth, it is
+    // a reader being told something is checked when it is not.
+    if claims.refused.is_empty() {
+        return;
+    }
+    let Ok(client) = ironauth_store::ClientId::parse_in_scope(client_id, &scope) else {
+        // UNREACHABLE in practice and not worth failing over: the hook was read from a row
+        // keyed by this very id, so it parsed when it was stored. Logged rather than ignored
+        // because if it ever does happen the audit row is the thing that went missing.
+        tracing::error!(
+            target: "ironauth.hooks",
+            tenant = %scope.tenant(),
+            client_id,
+            "a hook's claim refusals could not be audited: the client id does not parse in scope"
+        );
+        return;
+    };
+    let actor =
+        crate::util::client_service_actor(ironauth_store::StoredClientId::Registered(&client));
+    if let Err(error) = store
+        .scoped(scope)
+        .acting(actor, ironauth_store::CorrelationId::generate(env))
+        .token_hooks()
+        .record_claim_refusal(
+            env,
+            &client,
+            claims.refused.len(),
+            claims.refusals_not_reported,
+        )
+        .await
+    {
+        tracing::error!(
+            target: "ironauth.hooks",
+            tenant = %scope.tenant(),
+            client_id,
+            ?error,
+            "the hook's claim refusals were rejected but NOT audited; the token was still issued"
+        );
+    }
+}
+
 /// Read, compile and run this client's hook, returning what it contributed.
 ///
 /// [`None`] carries THREE meanings, and a caller that needs to tell them apart cannot:
@@ -401,6 +496,7 @@ pub struct Invocation<'a> {
 /// did not load.
 pub async fn run(
     store: &Store,
+    env: &ironauth_env::Env,
     runtime: &HookRuntime,
     invocation: &Invocation<'_>,
 ) -> Result<Option<HookClaims>, HookFault> {
@@ -435,7 +531,12 @@ pub async fn run(
     // there is no policy to consult when the thing carrying it is what did not load.
     let failure_policy = record.failure_policy;
     match run_deployed_hook(engine, cache, invocation, &record).await {
-        Ok(claims) => Ok(claims),
+        Ok(claims) => {
+            if let Some(contributed) = claims.as_ref() {
+                audit_refusals(store, env, scope, client_id, contributed).await;
+            }
+            Ok(claims)
+        }
         Err(fault) => match failure_policy {
             ironauth_store::HookFailurePolicy::FailClosed => Err(fault),
             ironauth_store::HookFailurePolicy::FailOpen => {

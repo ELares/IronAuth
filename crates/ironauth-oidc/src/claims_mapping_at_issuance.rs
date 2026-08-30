@@ -209,6 +209,48 @@ pub fn as_claims(
     mapped.into_iter().collect()
 }
 
+/// WHERE the issuance is running: the store, the environment, and the hook runtime if one is
+/// configured.
+///
+/// A struct rather than three more parameters, and the arity lint is the symptom rather than
+/// the reason. These three are the only arguments that do NOT vary per issuance -- every door
+/// reads all three off the same `state` -- while `scope`, `client_id`, `grant_type`, `subject`
+/// and the claim maps are the event. Separating them means a door cannot pass one issuance's
+/// store with another's runtime, and it is the same argument `Invocation`'s own doc makes one
+/// layer down: two `&str` parameters in a row compile when swapped, and so do two `&Store`s.
+///
+/// `env` is here because the hook path AUDITS (issue #113 criterion 5): a claim the fence
+/// refuses is written to the audit stream, and every audited write in this codebase takes the
+/// environment that stamps it. Before that this seam needed no clock and no id, which is why
+/// it had neither.
+#[derive(Clone, Copy)]
+pub struct Issuance<'a> {
+    /// The store the mint reads its mapping and hook from, and writes the refusal audit to.
+    pub store: &'a Store,
+    /// The environment that stamps the audit row: its clock and its id generator.
+    pub env: &'a ironauth_env::Env,
+    /// The WASM hook runtime, absent when the server is built or configured without hooks.
+    pub runtime: Option<&'a std::sync::Arc<crate::token_hook::HookRuntime>>,
+}
+
+impl<'a> Issuance<'a> {
+    /// Read all three off the server state, which is where every door has them.
+    ///
+    /// A constructor rather than a struct literal at each of the eight doors, for the reason
+    /// the struct exists at all: three fields spelled out eight times is eight places to get
+    /// one of them wrong, and the one that would be silent is `runtime` -- a door passing
+    /// `None` there does not fail to compile, it issues a token the operator's hook never
+    /// shaped. Review has already measured that exact defect on this seam once.
+    #[must_use]
+    pub fn for_state(state: &'a crate::state::OidcState) -> Self {
+        Self {
+            store: state.store(),
+            env: state.env(),
+            runtime: state.hook_engine(),
+        }
+    }
+}
+
 /// Resolve and apply this client's mapping, then run its deployed WASM hook (issue #114).
 ///
 /// The one entry point every mint site calls. A thin `apply_to`, WITHOUT the hook parameters,
@@ -246,14 +288,18 @@ pub fn as_claims(
 /// configurable. It is the seam every mint door reads, which is why the staleness is recorded
 /// rather than quietly overwritten.
 pub async fn apply_to_with_hook(
-    store: &Store,
-    runtime: Option<&std::sync::Arc<crate::token_hook::HookRuntime>>,
+    issuance: Issuance<'_>,
     scope: Scope,
     client_id: &str,
     grant_type: &str,
     subject: Option<&str>,
     extra_claims: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<MappedAccessClaims, MappingFault> {
+    let Issuance {
+        store,
+        env,
+        runtime,
+    } = issuance;
     let source = as_source(extra_claims);
     let mut access = match resolve_for(
         store,
@@ -296,6 +342,7 @@ pub async fn apply_to_with_hook(
     {
         let contributed = crate::token_hook::run(
             store,
+            env,
             runtime,
             &crate::token_hook::Invocation {
                 scope,
@@ -431,8 +478,7 @@ pub fn grant_mints_id_token(grant_type: &str) -> bool {
 /// under-claims, while shaping that did not run means an entitlement the operator meant to
 /// REMOVE is still in the token.
 pub async fn apply_to_machine_token(
-    store: &Store,
-    runtime: Option<&std::sync::Arc<crate::token_hook::HookRuntime>>,
+    issuance: Issuance<'_>,
     scope: Scope,
     client_id: &str,
     grant_type: &str,
@@ -447,6 +493,11 @@ pub async fn apply_to_machine_token(
         "a grant reaching apply_to_machine_token mints no ID token, so grant_mints_id_token \
          must agree: {grant_type}"
     );
+    let Issuance {
+        store,
+        env,
+        runtime,
+    } = issuance;
     let source = as_source(static_claims);
     let mut single = match resolve_for(
         store,
@@ -479,6 +530,7 @@ pub async fn apply_to_machine_token(
         let no_id_token = serde_json::Map::new();
         let contributed = crate::token_hook::run(
             store,
+            env,
             runtime,
             &crate::token_hook::Invocation {
                 scope,

@@ -1336,3 +1336,108 @@ async fn a_row_written_without_the_column_reads_back_fail_closed() {
          opts every pre-existing hook into fail-open"
     );
 }
+
+/// A REFUSED HOOK CLAIM REACHES THE AUDIT STREAM, which is criterion 5's second verb.
+///
+/// #113 criterion 5 says protected claims "cannot be overridden by any mapping or hook;
+/// attempts are rejected AND AUDITED". Both halves rejected from the start and only the MAPPING
+/// half was audited -- `claims_mapping.refused`, written at configuration time in a 400 the
+/// operator reads. A hook's attempt is knowable only when the hook runs, so the whole record of
+/// it was a `tracing::warn!` on a server log: not per-tenant, not held to the audit retention
+/// policy, and not what a SIEM subscribes to.
+///
+/// THE CONTROL IS THE OTHER HALF OF THE SAME TEST, and it is what stops this passing on a
+/// dispatch that audits every issuance. `GOOD` adds one claim the fence allows, so it refuses
+/// nothing and must write NO row; `CLAIM_FORGER` reaches for `sub` and `iss` and must write
+/// exactly one. Asserting only the second is satisfied by a handler that audits unconditionally,
+/// which would put a row on every login in the product.
+///
+/// EXACTLY ONE ROW, not one per refused claim. `CLAIM_FORGER` is refused on both tokens and
+/// several names, and a stream that carried a row for each would report an operator's single
+/// bad deploy as a flood.
+#[tokio::test]
+async fn a_hook_refused_a_protected_claim_is_audited_and_a_well_behaved_one_is_not() {
+    const ACTION: &str = "token_hook.claim_refused";
+
+    let harness = harness_with_hooks().await;
+
+    // THE CONTROL FIRST, so a non-zero count below cannot be something this harness did before
+    // the hook was deployed.
+    deploy(&harness, ironauth_hooks::fixtures::GOOD, 1).await;
+    let (access, _) = exchange(&harness).await.expect("the control exchange");
+    assert_eq!(
+        claims(&access).get("tier"),
+        Some(&Value::from("gold")),
+        "the control hook ran, or its silence below is a hook that never executed"
+    );
+    assert_eq!(
+        harness.count_audit_action(ACTION).await,
+        0,
+        "a hook that writes only what it may refuses nothing, so it must put NOTHING on the \
+         audit stream -- otherwise this row is on every login in the product"
+    );
+
+    // AND THEN THE FORGERY.
+    deploy(&harness, ironauth_hooks::fixtures::CLAIM_FORGER, 1).await;
+    let (access, _) = exchange(&harness).await.expect("the forging exchange");
+    assert_eq!(
+        claims(&access).get("forger_ran"),
+        Some(&Value::from(true)),
+        "the forging hook ran, or the row below is about nothing"
+    );
+    let rows: Vec<_> = harness
+        .audit_rows_for_action(ACTION)
+        .await
+        .into_iter()
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "ONE row: the hook reached for a claim it may not and an auditor can see it happened. \
+         One and not several, because a hook refused several names on two tokens is still one \
+         operator mistake on one login"
+    );
+
+    // AND THE ROW SAYS SOMETHING. A count cannot see whether the row an auditor opens names
+    // the right client or carries a number they can act on -- which is the shape of the defect
+    // review found in this feature's draft-test sibling, where an entry count passed while the
+    // entry said nothing.
+    let row = &rows[0];
+    assert_eq!(
+        row.target_id,
+        harness.client_id().to_string(),
+        "the row names the CLIENT whose deployed code did this, which is who an operator has \
+         to go and talk to: {row:?}"
+    );
+    let detail: Value = serde_json::from_str(
+        row.detail
+            .as_deref()
+            .expect("the row carries its counts, or it says only that something happened"),
+    )
+    .expect("the detail is JSON");
+    assert_eq!(
+        detail["refused"], 5,
+        "EVERY refused name is counted, not just the protected two. `CLAIM_FORGER` returns \
+         `sub`, `iss`, an untrimmed name, an empty one and a 4096-character one -- and the \
+         count is the DEDUPLICATED union across the two tokens, so it is five rather than ten: \
+         {detail}"
+    );
+    assert_eq!(
+        detail["refusals_not_reported"], 0,
+        "and nothing was truncated at this size, so the count above is exact rather than a \
+         floor: {detail}"
+    );
+    // ZERO IS THE ONLY VALUE THIS TEST SEES for that field, and that is a stated limit rather
+    // than a claim. Making it non-zero needs a hook returning more than sixty-four refusals in
+    // one token, which is what `CLAIM_FLOOD` is for -- and that fixture is driven through the
+    // draft endpoint, where the same number is asserted non-zero. What is pinned HERE is that
+    // the audit row carries the field at all and that it reads exact when nothing was dropped.
+    // NO CLAIM NAMES. They are strings chosen by operator code, and `write_audited_detailed`'s
+    // own contract is that detail "is never attacker-controlled free text".
+    for name in ["sub", "iss", "forged_untrimmed"] {
+        assert!(
+            !row.detail.as_deref().unwrap_or_default().contains(name),
+            "the row must not echo `{name}` or any other claim NAME a hook chose: {row:?}"
+        );
+    }
+}
