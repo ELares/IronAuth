@@ -108,11 +108,19 @@ async fn redeem_one_token(db: &TestDatabase, env: &Env, scope: Scope, subject: &
         .expect("the redemption commits");
 }
 
-/// The event types this file's activity produces, and the ones `UsageTally` folds.
+/// The event types THIS FILE'S ACTIVITY PRODUCES: a sign-in and a redemption.
 ///
-/// The wait below counts these rather than every row on the feed, so a producer that starts
-/// emitting some unrelated envelope cannot satisfy the wait on this test's behalf.
-const METERABLE: &[&str] = &["user.signed_in", "token.issued", "connection.opened"];
+/// NOT the three `UsageTally` folds, and an earlier version listed all three. The third is
+/// `connection.opened`, this file opens no connection, and the `connections` assertion below
+/// pins that at zero -- so listing it here admitted a row this test never writes into the
+/// wait's own count, which is the one place the count has to be this test's own. MEASURED,
+/// with the token producer rewired to emit `connection.opened` so that NOTHING produces
+/// `token.issued` -- this file's motivating defect shape: the two stray rows carried the count
+/// to the threshold, the wait returned at once, and the run died on `tokens_issued` reading 0.
+/// A wrong number, which is exactly what the paragraph below promises this wait converts into
+/// a watermark panic. With the third type gone that mutant never converges and panics naming
+/// the watermark, as promised.
+const METERABLE: &[&str] = &["user.signed_in", "token.issued"];
 
 /// Fold the whole feed for a scope, waiting for the events this test's own activity produced.
 ///
@@ -173,14 +181,26 @@ async fn meter(db: &TestDatabase, scope: Scope, want_meterable: usize) -> UsageT
 
 /// Fold a scope's feed as it stands, for a scope that is expected to have written nothing.
 ///
-/// NOT `meter(db, scope, 0)`, and the difference is what makes this a control. A scope that
-/// never wrote has nothing to wait for -- the watermark can withhold rows, never invent them --
-/// so one read is the whole truth, and the fold has to actually RUN for the three zero
-/// assertions to be about the fold rather than about `UsageTally::new()`. The earlier version
-/// of this file called `meter` here, whose settle criterion an empty feed can never meet, so it
-/// spent 100 reads falling through to the default tally: review replaced the body of
-/// `UsageTally::absorb` with a `panic!` and both quiet sites stayed green.
+/// A scope that never wrote has nothing to wait for -- the watermark can withhold rows, never
+/// invent them -- so one read is the whole truth, and the fold has to actually RUN for the
+/// three zero assertions to be about the fold rather than about `UsageTally::new()`. The FIRST
+/// version of this file called `meter` here, whose settle criterion an empty feed could never
+/// meet, so it spent 100 reads falling through to the default tally: review replaced the body
+/// of `UsageTally::absorb` with a `panic!` and both quiet sites stayed green.
+///
+/// NOT a different behaviour from `meter(db, scope, 0)`, which the version of this doc written
+/// alongside the `meter` rewrite claimed. That rewrite made the settle test
+/// `meterable >= want_meterable`, which a zero want satisfies on the first read -- so the two
+/// are one read and one fold either way, and review measured them identical to the
+/// millisecond. What this function is, is a body with no loop in it, which is a real
+/// structural property and the whole reason to read it: a control that cannot silently spend
+/// a hundred reads deciding nothing.
 async fn meter_quiet(db: &TestDatabase, scope: Scope) -> UsageTally {
+    // `Page` UNCONDITIONALLY, and this is an `expect` rather than a guard because the other
+    // arm cannot occur: `events_page_after` returns `Gone` only when `after_sequence > 0`, and
+    // `EventCursor::beginning()` is zero. An earlier version panicked here with a message about
+    // a prune reaching a scope that never wrote -- an arm that cannot fire, describing a state
+    // that cannot exist.
     let EventPage::Page(events) = db
         .store()
         .scoped(scope)
@@ -189,7 +209,7 @@ async fn meter_quiet(db: &TestDatabase, scope: Scope) -> UsageTally {
         .await
         .expect("read the feed")
     else {
-        panic!("the feed was pruned out from under a scope that never wrote to it")
+        unreachable!("a beginning cursor is never told about a prune")
     };
     let mut tally = UsageTally::new();
     tally.absorb(&events);
@@ -235,11 +255,19 @@ async fn metering_counts_activity_the_system_actually_performed() {
     // cost two wrong versions of this comment, one in each direction. It does NOT catch a
     // fold that confuses this test's two event types with each other's counters: either
     // confusion moves a number the `monthly_active_users` or `tokens_issued` assertion above
-    // checks, the test dies up there, and this line never runs. What dies HERE and nowhere
-    // else is a fold that touches `connections` while leaving both counters above correct --
+    // checks, the test dies up there, and this line never runs. What REACHES this line is a
+    // fold that touches `connections` while leaving both counters above correct --
     // `token.issued` incrementing tokens AND connections, or a repeat sign-in counted here
-    // rather than deduplicated. Both of those were run against this test, and so were the two
-    // confusions; neither confusion reached this line.
+    // rather than deduplicated. Both were run and both die here. The two confusions were run
+    // too; both died at `monthly_active_users` above.
+    //
+    // NEITHER DIES ONLY HERE, and the two previous versions of this comment each claimed an
+    // exclusivity of their own. `events_cursor_ordering.rs`'s
+    // `metering_matches_seeded_activity_exactly` pins the same counter at ONE and kills both --
+    // and being a pin of one rather than zero, it also kills what this assertion cannot see: a
+    // fold that never counts a connection at all leaves a zero green. So this line is a
+    // cross-check on a counter the file's own activity does not touch, not the sole guard on
+    // anything.
     assert_eq!(
         tally.connections(),
         0,
@@ -277,15 +305,26 @@ async fn a_scope_with_no_activity_meters_nothing() {
 /// `WHERE tenant_id = $1 AND environment_id = $2` -- `events_page_after`'s MIN probe and
 /// `events_after` itself.
 ///
-/// SO THIS TEST IS A CANARY FOR NEITHER LAYER, and an earlier version of this paragraph
-/// nominated it as the one that would go red if RLS were dropped. MEASURED, on this file:
-/// drop the policy and leave the predicate -> 3 passed; delete the predicate from both
-/// queries and leave the policy -> 3 passed; remove both -> this test alone goes red, on the
-/// `quiet` assertion below. Either layer on its own is sufficient, so losing one is invisible
-/// here. What holds the RLS half is `migration.rs`'s
-/// `outbox_messages_carries_its_isolation_and_its_structural_state_constraints`, which asserts
-/// `relrowsecurity AND relforcerowsecurity` and the named policy out of the catalogue. What
-/// THIS test adds is that the two layers together actually produce a scoped tally.
+/// SO WHAT IS THIS TEST A CANARY FOR? Measured, and the answer is not the one the previous two
+/// versions of this paragraph gave. The RLS side is TWO different mutants with opposite
+/// answers, and the version before this one ran neither of the ones it printed.
+///
+/// Drop the POLICY while `ENABLE` and `FORCE` stay and this is the LOUDEST failure in the
+/// file: RLS with no policy is deny-all, the store connects as the low-privilege
+/// `ironauth_app` role, and the outbox insert the sign-in enqueues is refused with SQLSTATE
+/// 42501 -- both signing-in tests die at `the sign-in commits`, before any feed read. Remove
+/// `ENABLE` and `FORCE` and leave the policy and all three pass, because the query predicate
+/// carries it: both halves of the feed read have `WHERE tenant_id = $1 AND environment_id =
+/// $2`. Remove the predicate too and this test alone goes red, on the `quiet` assertion below.
+///
+/// What holds the RLS half is NOT `migration.rs`'s
+/// `outbox_messages_carries_its_isolation_and_its_structural_state_constraints`, which the
+/// previous version credited: that reads `relrowsecurity AND relforcerowsecurity` out of
+/// `pg_class` and a policy NAME out of `pg_policies`, so a policy that keeps the name and
+/// grants every row satisfies it. What holds the isolation is
+/// `session_ended_fanout.rs::the_outbox_is_isolated_across_tenants`, which opens a B-scoped
+/// connection and asserts a raw `SELECT count(*)` over A's rows returns zero. What THIS test
+/// adds is that the layers together produce a scoped TALLY.
 #[tokio::test]
 async fn activity_is_metered_to_the_scope_that_performed_it() {
     let db = TestDatabase::start().await;
