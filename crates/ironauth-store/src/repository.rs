@@ -33631,6 +33631,19 @@ impl ActingTokenHookRepo<'_> {
         .bind(name)
         .fetch_optional(&mut *read)
         .await?;
+        // THE NEXT FREE POSITION, read in the same transaction, for the RE-CREATE case below.
+        // Unused when the hook still exists, because the upsert leaves `ordinal` alone on
+        // conflict; the alternative to reading it is inserting a re-created hook at zero, which
+        // is a UNIQUE violation against whatever already sits there and surfaces as a 500.
+        let next_ordinal: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(client.to_string())
+        .fetch_one(&mut *read)
+        .await?;
         read.commit().await?;
         // NOT FOUND rather than a silent no-op, for the reason the delete gives: reporting
         // success for a version this client never had tells an operator their rollback took
@@ -33656,9 +33669,17 @@ impl ActingTokenHookRepo<'_> {
         // Compared on the FULL COMPONENT, not on its length: two different hooks of equal size
         // are the case a byte count cannot tell apart, and it is the case that matters.
         // THE ACTIVE BUDGET, read before the inertness check so it is available to the write
-        // below whichever way that check goes. Zero when there is no active row -- but a
-        // rollback with no active row cannot reach the write, because the upsert would be
-        // creating a hook rather than restoring one.
+        // below whichever way that check goes.
+        //
+        // ZERO WHEN THERE IS NO ACTIVE ROW, and that state is REACHABLE rather than
+        // hypothetical: `delete_with_event` removes the `token_hooks` row and leaves
+        // `token_hook_versions` alone, so a rollback after a delete finds its target, finds no
+        // active row, and RE-CREATES the hook. Zero is the right answer there -- a hook being
+        // brought back is ungranted until an operator grants it again -- and
+        // `a_rollback_after_a_delete_recreates_an_ungranted_hook` is what holds that.
+        //
+        // An earlier version of this comment said the write could not be reached at all. It
+        // can.
         let active_budget: i32 = active
             .as_ref()
             .map_or(0, |row| row.get::<i32, _>("fetch_budget"));
@@ -33674,11 +33695,19 @@ impl ActingTokenHookRepo<'_> {
             }
         }
 
-        // THE PLACEMENT NAMES THE HOOK BEING ROLLED BACK, and its ordinal is ignored: a
-        // rollback restores CODE and must not move anything, and the upsert leaves `ordinal`
-        // alone on conflict, so a rollback of a hook that sits third leaves it third. The zero
-        // here is the value a hook that does not exist would take, and a rollback of a hook
-        // that does not exist has already failed above.
+        // THE PLACEMENT NAMES THE HOOK BEING ROLLED BACK, and its ordinal is ignored WHEN THE
+        // HOOK EXISTS: a rollback restores CODE and must not move anything, and the upsert
+        // leaves `ordinal` alone on conflict, so a rollback of a hook that sits third leaves it
+        // third.
+        //
+        // `next_ordinal` is what a RE-CREATED hook takes, which is the case above: a rollback
+        // after a delete inserts rather than conflicts, so this value is the one that lands.
+        // LAST, not first, and not zero. Position is not recorded in the history and should not
+        // be -- an archived component ran at whatever position the chain had then, which
+        // nothing stores -- so appending is the only answer available that changes nothing for
+        // the hooks already there. Zero was the previous answer and it was a 500: the ordinal
+        // is UNIQUE per client, so a re-created hook inserted at zero collides with whatever
+        // already runs first.
         self.set_with_event(
             env,
             client,
@@ -33686,14 +33715,23 @@ impl ActingTokenHookRepo<'_> {
                 component: &component,
                 payload_version,
                 failure_policy,
-                placement: HookPlacement { name, ordinal: 0 },
-                // THE CAPABILITY IS CARRIED FORWARD, not restored and not revoked. A rollback
-                // restores CODE; the fetch budget is a GRANT an operator made to a hook, and
-                // neither answer from the version history is right -- restoring an older budget
-                // would silently re-grant a capability that was withdrawn, and passing zero
-                // would silently withdraw one that stands. So the ACTIVE row's budget is read
-                // above and written back unchanged, which is the same thing the upsert does for
-                // the ordinal and for the same reason.
+                placement: HookPlacement {
+                    name,
+                    ordinal: next_ordinal,
+                },
+                // THE CAPABILITY IS CARRIED FORWARD, and the read above is why it can be.
+                //
+                // A rollback restores CODE, so a grant an operator made to this hook has to
+                // survive it. What makes that take work is that the upsert does NOT leave
+                // `fetch_budget` alone the way it leaves `ordinal` alone: it writes
+                // `EXCLUDED.fetch_budget`, because a redeploy DOES apply a budget. So the
+                // ordinal is preserved by never being written and the budget has to be
+                // preserved by being read and written back unchanged. Passing the struct's
+                // other obvious value, zero, would silently withdraw a standing grant.
+                //
+                // The version history is not where to get it from and does not record it: a
+                // grant belongs to the HOOK rather than to a component, so restoring bytes says
+                // nothing about what that code should be allowed to reach.
                 fetch_budget: active_budget,
             },
             event,

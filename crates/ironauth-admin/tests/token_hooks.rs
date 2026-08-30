@@ -1829,3 +1829,157 @@ async fn the_fetch_grant_is_bounded_read_back_and_withdrawn_by_a_redeploy() {
          it, so shipping a version that no longer calls out does not leave one standing: {body}"
     );
 }
+
+/// A ROLLBACK NEITHER GRANTS NOR WITHDRAWS THE FETCH CAPABILITY.
+///
+/// Issue #114 criterion 2. A rollback restores CODE, and the grant an operator made is a
+/// property of the hook rather than of the bytes -- so the running budget has to survive one.
+///
+/// # Why this needs a test rather than a comment
+///
+/// The store's upsert writes `EXCLUDED.fetch_budget` on conflict, deliberately: a redeploy DOES
+/// apply a budget, so capabilities travel with the code. A rollback goes through that same
+/// upsert. Passing the struct's other obvious value, zero, would therefore SILENTLY WITHDRAW a
+/// standing grant on every rollback -- a hook rolled back to recover from a bad deploy would
+/// come back unable to reach the upstream it was granted, and nothing else in the suite would
+/// notice. Confirmed by mutation: writing zero here fails this test and nothing else.
+#[tokio::test]
+async fn a_rollback_carries_the_active_fetch_grant_forward() {
+    let harness = Harness::start(60).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // VERSION 1: the code an operator will roll BACK to, deployed before the grant existed.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy version 1: {body}");
+
+    // VERSION 2: different bytes, and the grant. The bytes must differ or the rollback below is
+    // INERT -- `rollback_to` returns early when the target already runs, and an early return
+    // would leave the budget untouched for a reason that has nothing to do with what this test
+    // is about.
+    let mut second = COMPONENT.to_vec();
+    second.push(0x00);
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&fetch_budget=3"), &second)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy version 2: {body}");
+
+    let (status, _, body) = harness
+        .post(&format!("{base}/rollback"), "k-roll", r#"{"version":1}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "roll back to version 1: {body}");
+
+    let (_, _, body) = harness.get(&base).await;
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["component_bytes"],
+        COMPONENT.len(),
+        "the rollback restored version 1's CODE, which is what makes the budget assertion \
+         below about a rollback that actually happened: {body}"
+    );
+    assert_eq!(
+        view["fetch_budget"], 3,
+        "and the ACTIVE grant survived it. A rollback restores code; withdrawing the \
+         capability as a side effect would leave a hook rolled back to recover from a bad \
+         deploy unable to reach the upstream it was granted: {body}"
+    );
+}
+
+/// A ROLLBACK AFTER A DELETE RE-CREATES THE HOOK, UNGRANTED AND FIRST IN THE CHAIN.
+///
+/// The state the delete leaves is not the one it looks like: `delete_with_event` removes the
+/// `token_hooks` row and leaves `token_hook_versions` alone, so every version of a deleted
+/// hook is still a rollback target. A rollback there finds no active row and INSERTS rather
+/// than conflicts.
+///
+/// # It answered 500 before this test existed
+///
+/// The insert passed ordinal ZERO, and the ordinal is UNIQUE per client -- so re-creating a hook
+/// for a client that still has another one collided, and the whole rollback surfaced as an
+/// internal error. It only worked for a client whose entire chain had been deleted, which is why
+/// nothing caught it: every other rollback test uses a single hook. `rollback_to` now appends.
+///
+/// Two consequences of that insert are asserted here because both are surprising and neither was
+/// measured: the re-created hook is UNGRANTED whatever it held before, and it lands LAST rather
+/// than wherever it used to sit, because position is not recorded in the history.
+///
+/// Documented rather than changed, for those two. Being brought back ungranted is the
+/// deny-by-default answer and appending is the only position that changes nothing for the hooks
+/// still there -- but an operator restoring a hook that ran second needs to know it comes back
+/// at the end, and a comment in the store claimed this path was unreachable until this test
+/// showed it is not.
+#[tokio::test]
+async fn a_rollback_after_a_delete_recreates_an_ungranted_hook() {
+    let harness = Harness::start(60).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // A FIRST hook, so the one under test is not at position zero to begin with -- otherwise
+    // "it comes back first" would be true of a hook that never moved.
+    let (status, _, body) = harness
+        .put_bytes(&format!("{base}?payload_version=1&name=first"), COMPONENT)
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy the first hook: {body}");
+
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name=caller&fetch_budget=4"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "deploy the granted hook: {body}");
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        chain["hooks"][1]["name"], "caller",
+        "the hook under test runs SECOND before the delete: {body}"
+    );
+
+    let (status, _, body) = harness.delete(&format!("{base}?name=caller")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete it: {body}");
+
+    // ITS HISTORY SURVIVED THE DELETE, which is what makes the rollback below reach anything.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/rollback?name=caller"),
+            "k-roll-deleted",
+            r#"{"version":1}"#,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rollback after a delete RE-CREATES the hook rather than answering not-found: the \
+         version rows outlive the row that pointed at them: {body}"
+    );
+
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let entry = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|hook| hook["name"] == "caller")
+        .expect("the re-created hook");
+    assert_eq!(
+        entry["fetch_budget"], 0,
+        "and it comes back UNGRANTED. There is no active row to carry a grant forward from, \
+         and the history does not record one, so deny-by-default is the only honest answer -- \
+         a hook restored with the capability it held before would be a grant nobody made: \
+         {body}"
+    );
+    assert_eq!(
+        entry["ordinal"], 1,
+        "and it comes back LAST rather than at its old position. Position is not recorded in \
+         the history, so appending is the only answer that changes nothing for the hooks still \
+         there -- and it must not be ZERO, which is what this path used to pass: the ordinal is \
+         UNIQUE per client, so a re-created hook inserted at zero collides with whatever \
+         already runs first and the whole rollback answers 500: {body}"
+    );
+}
