@@ -40,6 +40,7 @@ const GUESTS: &[(&str, &str)] = &[
     // hook RETURNS had no guest that exercised it, so deleting it left every test green.
     ("chain_observer", "IRONAUTH_GUEST_CHAIN_OBSERVER"),
     ("secret_reader", "IRONAUTH_GUEST_SECRET_READER"),
+    ("fetcher", "IRONAUTH_GUEST_FETCHER"),
     ("claim_forger", "IRONAUTH_GUEST_CLAIM_FORGER"),
     // REMOVES a claim (issue #114). The WIT contract is a replace, and the first dispatch merged
     // -- so a hook deployed to strip a claim produced a token that still carried it, and nothing
