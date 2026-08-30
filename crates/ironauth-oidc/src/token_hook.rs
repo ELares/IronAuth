@@ -393,6 +393,14 @@ pub struct Invocation<'a> {
 /// query: this is not a write on the hot path, it is a write on the path where a hook
 /// misbehaved.
 ///
+/// NO ORGANIZATION ON THE ROW, which is a fact rather than a gap. `ActingContext`'s own doc
+/// says [`None`] there means "not an organization's event" and that attributing one wrongly
+/// delivers a row to the wrong customer's SIEM, silently. This seam holds a scope and a client
+/// and no organization, so there is nothing here to attribute from -- and the mapping half of
+/// this same criterion writes its refusal the same way. If a per-organization stream should
+/// carry these, the organization has to reach this seam first; guessing it here is the failure
+/// that doc warns about.
+///
 /// ITS OWN TRANSACTION, so the row outlives an issuance that fails afterwards. That is the
 /// right way round: the hook DID reach for the claim, and whether the request it was shaping
 /// went on to succeed is a different fact. An auditor reading a refusal has learned something
