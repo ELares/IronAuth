@@ -144,3 +144,81 @@ different prefixes (`stk_` against `sik_`), and no query that reads one table ca
 Deleting a template deletes its keys. Its JWKS URL stops answering, and every consumer verifying
 against it starts failing, which is the intended blast radius of removing a template that
 something still depends on.
+
+## The opt-in JWT session mode
+
+Everything above is a capability you call when you want it. This is the switch that makes an SDK
+call it for you, on every page, in the background.
+
+**It is off by default, and it stays off until somebody names a template.** A fresh environment
+has no row in `session_jwt_mode` at all, and nothing creates one but the endpoint whose job it is:
+
+```
+PUT /v1/tenants/{tenant}/environments/{environment}/session-jwt-mode
+{ "template": "orders" }
+```
+
+Enabling it is naming a template rather than setting a boolean, because a JWT has to say who it
+is for and how long it lives. A boolean would leave the audience, the TTL and the claim set to be
+invented by something, which is how a feature acquires an audience nobody chose.
+
+SDKs read the mode from a public endpoint, before they have a session to present:
+
+```
+GET /t/{tenant}/e/{environment}/session/token-mode
+-> {"enabled": false}
+-> {"enabled": true, "template": "orders", "ttl_seconds": 60,
+    "audience": "https://orders.example",
+    "jwks_uri": ".../session-tokens/orders/jwks.json"}
+```
+
+### What you are accepting when you turn it on
+
+Every session check in the environment moves off the database and onto a token. The **revocation
+window** section above stops being a property of one endpoint and becomes a property of your whole
+application: ending a session takes effect at the next re-mint, bounded by the template's TTL.
+
+That is a real trade and it is why this is opt-in forever. If you cannot accept a window, do not
+turn it on; the stateful check has none.
+
+### A failed re-mint is not a signed-out user
+
+This is the rule the SDK implements, and the one thing to check if you write your own client.
+
+Re-minting is a plain authenticated call against the session API using the existing session
+cookie. There is no dual-cookie handshake, no nonce exchange, and no redirect: those mechanisms
+are where this pattern has historically gone wrong, and the failure they produce is a valid user
+being silently reported as signed out.
+
+So the client separates two answers that are easy to conflate:
+
+| what happened | what the SDK reports |
+|---|---|
+| a token was minted | `active` |
+| the mint threw, timed out, 5xx'd, or returned a body the SDK cannot use | `degraded` |
+| the mint returned `401`, but the stateful check says you are signed in | `degraded` |
+| the mint failed **and** the stateful check could not be reached either | `degraded` |
+| the stateful check returned `401` or `403` | `signed-out` |
+
+**Only the last row signs anybody out.** Two failed requests are evidence of a network problem,
+not of a session ending, and a client that reports "signed out" because it could not find out is
+a client that logs people out of a flaky train.
+
+`degraded` obliges the caller to do exactly one thing: fall back to the stateful session check,
+which the SDK has already confirmed succeeds. That is how the application behaved before anyone
+turned this mode on, so `degraded` is not an error to render. It is the ordinary state of an
+application whose token minting is briefly unavailable.
+
+The same principle governs reading the mode itself: `readSessionTokenMode` **fails to disabled**
+on every fault. An SDK that cannot read its configuration should do the correct slow thing rather
+than guess at the fast one.
+
+### One thing to know before you rely on the idle timeout
+
+A tokenize call is a successful session resolve, so it **slides the session's idle window**. For a
+user clicking around an app that is correct: minting a token is activity. For a background re-mint
+loop it is not, and an SDK re-minting every sixty seconds in a tab nobody is looking at will hold
+that session open indefinitely.
+
+If your environment relies on the idle timeout to end abandoned sessions, weigh that before
+enabling this mode. The absolute session lifetime still applies and is unaffected.

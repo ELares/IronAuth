@@ -585,6 +585,13 @@ pub fn oidc_router(state: OidcState) -> Router {
             "/t/{tenant_id}/e/{environment_id}/session/tokenize",
             post(session_tokenizer::tokenize),
         )
+        // Which session mode this environment runs (issue #119 criterion 4). Unauthenticated,
+        // like discovery: an SDK reads it before it has a session to present. A fresh
+        // environment answers `{"enabled": false}`, which is the opt-in default.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/session/token-mode",
+            get(session_tokenizer::token_mode),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/sessions",
             get(account::list_sessions),

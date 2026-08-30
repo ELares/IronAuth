@@ -148,6 +148,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteOutboundVerification",
             "deletePermission",
             "deleteSecret",
+            "deleteSessionJwtMode",
             "deleteSessionTokenTemplate",
             "deleteSignupForm",
             "deleteSubjectMapping",
@@ -203,6 +204,7 @@ fn operation_ids_are_the_stable_set() {
             "getRiskDecision",
             "getSecret",
             "getSession",
+            "getSessionJwtMode",
             "getSigningRecommendations",
             "getSignupForm",
             "getSmsOtpConfig",
@@ -327,6 +329,7 @@ fn operation_ids_are_the_stable_set() {
             "setOrgGroupParent",
             "setOutboundVerification",
             "setSecret",
+            "setSessionJwtMode",
             "setSessionTokenTemplate",
             "setSignupForm",
             "setSmsOtpConfig",
@@ -555,6 +558,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/step-up-policies/{scope_token}",
@@ -648,6 +652,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}",
@@ -783,6 +788,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/config",
@@ -880,7 +886,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        267,
+        270,
         "the documented route count is pinned"
     );
 

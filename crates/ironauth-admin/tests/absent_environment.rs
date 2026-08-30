@@ -970,6 +970,18 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
             }))),
         },
         Case {
+            label: "session_token_templates.setSessionJwtMode",
+            method: "PUT",
+            path: format!("{base}/session-jwt-mode"),
+            body: Some(body_of(&serde_json::json!({ "template": "orders" }))),
+        },
+        Case {
+            label: "session_token_templates.deleteSessionJwtMode",
+            method: "DELETE",
+            path: format!("{base}/session-jwt-mode"),
+            body: None,
+        },
+        Case {
             label: "session_token_templates.deleteSessionTokenTemplate",
             method: "DELETE",
             path: format!("{base}/session-token-templates?name=orders"),

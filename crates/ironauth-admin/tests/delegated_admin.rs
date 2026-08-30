@@ -4237,3 +4237,104 @@ async fn the_session_tokenizer_surface_splits_writing_a_template_from_reading_th
         "the refusal must name the permission it wanted: {refused}"
     );
 }
+
+/// The JWT session mode switch splits FLIPPING it from READING it (issue #119 criterion 4).
+///
+/// The most consequential configuration write this feature has: turning it on moves every
+/// session check in the environment off the database and onto a token that keeps verifying until
+/// it expires. A credential that may only read must not be able to flip it, in EITHER direction
+/// -- the disable is not a de-escalation, it moves every request back onto the database, which is
+/// a load characteristic somebody sized for.
+#[tokio::test]
+async fn the_jwt_session_mode_switch_splits_flipping_it_from_reading_it() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "sjm-perm-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "sjm-perm-mint").await;
+    let templates = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/session-token-templates?name=orders"
+    );
+    let mode = format!("/v1/tenants/{tenant}/environments/{environment}/session-jwt-mode");
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    // A template to point the mode at. Enabling the mode NAMES one, so without this the enable
+    // would 404 and the 403s below could not be attributed to the permission.
+    let (status, _, served) = h
+        .put_as(
+            &templates,
+            &secret,
+            &serde_json::json!({
+                "audience": "https://orders.example",
+                "ttl_seconds": 60,
+                "rules": [],
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "write a template first: {served}");
+
+    // The ENABLE under write_config is served, asserted before any refusal.
+    let (status, _, served) = h
+        .put_as(
+            &mode,
+            &secret,
+            &serde_json::json!({"template": "orders"}).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "write_config must be able to enable the mode: {served}"
+    );
+
+    // Reading it is read-classified, so write_config alone is refused.
+    let (status, _, refused) = h.get_as(&mode, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the mode answered a credential without management.read: {refused}"
+    );
+    assert!(
+        refused.contains("management.read"),
+        "the refusal must name the permission it wanted: {refused}"
+    );
+
+    // And the other direction: read may look, and may not flip it either way.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, reported) = h.get_as(&mode, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read must be able to look: {reported}"
+    );
+    assert!(reported.contains("\"enabled\":true"), "{reported}");
+
+    let (status, _, refused) = h
+        .put_as(
+            &mode,
+            &secret,
+            &serde_json::json!({"template": "orders"}).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential enabled the mode: {refused}"
+    );
+    assert!(refused.contains("management.write_config"), "{refused}");
+
+    // THE DISABLE TOO. It is the safe direction and it is still not a de-escalation.
+    let (status, _, refused) = h.delete_as(&mode, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential disabled the mode: {refused}"
+    );
+    assert!(refused.contains("management.write_config"), "{refused}");
+}

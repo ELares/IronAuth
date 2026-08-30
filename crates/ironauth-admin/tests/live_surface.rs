@@ -2219,6 +2219,26 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/session-token-templates"),
         ),
+        // The MODE switch, driven between the template write and the template delete: enabling
+        // it requires a template that exists, and the cascade would take the mode with the
+        // template if the order were reversed -- which would leave the disable case driving a
+        // row that was already gone.
+        Case::json(
+            "session_token_templates.setSessionJwtMode",
+            "PUT",
+            format!("{base}/session-jwt-mode"),
+            &serde_json::json!({ "template": "live-surface-probe" }),
+        ),
+        Case::empty(
+            "session_token_templates.getSessionJwtMode",
+            "GET",
+            format!("{base}/session-jwt-mode"),
+        ),
+        Case::empty(
+            "session_token_templates.deleteSessionJwtMode",
+            "DELETE",
+            format!("{base}/session-jwt-mode"),
+        ),
         Case::empty(
             "session_token_templates.deleteSessionTokenTemplate",
             "DELETE",

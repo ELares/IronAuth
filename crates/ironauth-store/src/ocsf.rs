@@ -265,6 +265,10 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     // NOT `authorize_session`, despite the word "session" in the name. That stream carries what
     // happened to a session; this is the configuration a later tokenize call will run against.
     "session_token_template",
+    // The OPT-IN JWT SESSION MODE switch (issue #119 criterion 4). Entity management with the
+    // template it names, and for the same reason: it configures how a later request is judged
+    // rather than recording what happened to one.
+    "session_jwt_mode",
     "signup_form",
     // A deployed WASM token hook is CODE an operator installs to shape a client's tokens
     // (issue #114). Entity management for the same reason a claim mapping is: it configures
