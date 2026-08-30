@@ -1309,6 +1309,37 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0166_token_hook_component_bound.sql"),
         },
+        Migration {
+            version: 167,
+            name: "token_hook_ordering",
+            // EXPAND, and it is a real expand rather than a label. Every column added is
+            // `NOT NULL DEFAULT`, so an existing row is rewritten in place and no reader sees a
+            // row without a name; the default STAYS afterwards so the current deploy path,
+            // which names no hook, keeps working across both halves of the rollout. The
+            // identity widens from (scope, client) to (scope, client, name), and the old key is
+            // a strict prefix of the new one, so every lookup the shipped code performs still
+            // hits an index.
+            // A TRUE EXPAND: every column added is `NOT NULL DEFAULT`, so an existing row is
+            // rewritten in place and no reader sees a row without a name, and the default STAYS
+            // so the previously deployed writer -- which names no hook and whose upsert
+            // conflicts on the intact primary key -- keeps working across it. The identity move
+            // that is NOT old-binary-safe is 0168, deliberately separate.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0167_token_hook_ordering.sql"),
+        },
+        Migration {
+            version: 168,
+            name: "token_hook_named_identity",
+            // CONTRACT, and the first one in this chain. It drops the old identity, which the
+            // previously deployed deploy-path DOES read: its `ON CONFLICT (tenant_id,
+            // environment_id, client_id)` stops naming a unique constraint. Issuance is
+            // unaffected (a plain SELECT, no conflict target) and a deployment with `wasm-hooks`
+            // off never reads the table at all, so the exposure is an install that has enabled
+            // an experimental feature and deploys a hook mid-rolling-upgrade. Splitting 0167
+            // from this is what lets such an operator take the two halves in separate releases.
+            phase: Phase::Contract,
+            sql: include_str!("../migrations/0168_token_hook_named_identity.sql"),
+        },
     ]
 }
 

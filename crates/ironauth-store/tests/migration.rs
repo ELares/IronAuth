@@ -75,7 +75,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      external issuer control grants, outbound messages, sealed message recipient, \
      message sending state, message suppressions, message resend count, \
      declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions, \
-     token hook component bound.";
+     token hook component bound, token hook ordering, token hook named identity.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -706,7 +706,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        166,
+        168,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -746,7 +746,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
-            160, 161, 162, 163, 164, 165, 166
+            160, 161, 162, 163, 164, 165, 166, 167, 168
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8546,4 +8546,142 @@ async fn every_component_bound_admits_the_shipped_typescript_hook() {
              bounds nothing and the check above proved nothing about it: `{expression}`"
         );
     }
+}
+
+/// A CLIENT CAN HOLD MORE THAN ONE HOOK, AND THEIR ORDER IS TOTAL.
+///
+/// Migration 0167, issue #114 criterion 5's "explicit ordering of multiple hooks on one event".
+/// Before it the primary key was `(tenant_id, environment_id, client_id)`: there was no second
+/// hook for an ordering to be an ordering OF, so the criterion could not be met by an admin
+/// surface alone.
+///
+/// # What this asserts that a column list would not
+///
+/// Four properties, each of which a schema that merely GREW two columns would fail:
+///
+/// 1. A second hook under a different NAME is accepted. That is the widened identity working.
+/// 2. A second hook under the SAME name is refused. That is the identity still being an
+///    identity -- a schema that added `name` without moving the primary key would accept both
+///    and leave two rows a lookup cannot tell apart.
+/// 3. Two hooks at the same ORDINAL are refused. A partial order is not an order: a dispatch
+///    chaining them would produce a token that depends on which row Postgres returned first,
+///    which is the unordered-cascade defect this repository has already fixed once.
+/// 4. A permutation COMMITS. Swapping two hooks passes through an intermediate state with a
+///    duplicate ordinal in it, so a non-deferrable constraint would force the caller to
+///    sequence its updates through a free slot. Asserting the swap is what pins the constraint
+///    as DEFERRABLE rather than merely present.
+///
+/// The backfill is asserted too, and it is the property an upgrade depends on: the row a client
+/// already had is RENAMED in place to `('default', 0)` rather than joined by a new one, so the
+/// count of deployed hooks does not change and no client's tokens change shape.
+#[tokio::test]
+async fn a_client_can_hold_several_named_hooks_whose_order_is_total_and_permutable() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    let insert = |name: &'static str, ordinal: i32| {
+        let (tenant, environment) = (tenant.clone(), environment.clone());
+        async move {
+            sqlx::query(
+                "INSERT INTO token_hooks \
+                 (tenant_id, environment_id, client_id, component, payload_version, name, ordinal) \
+                 VALUES ($1, $2, 'cli_ordered', '\\x00'::bytea, 1, $3, $4)",
+            )
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(name)
+            .bind(ordinal)
+            .execute(pool)
+            .await
+        }
+    };
+
+    // THE BACKFILL, first: a row written the way the pre-0167 deploy path writes one takes the
+    // defaults, so an upgraded install has exactly the hook it had before, under a name.
+    sqlx::query(
+        "INSERT INTO token_hooks \
+         (tenant_id, environment_id, client_id, component, payload_version) \
+         VALUES ($1, $2, 'cli_upgraded', '\\x00'::bytea, 1)",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .execute(pool)
+    .await
+    .expect("a writer that names no hook still works, or the rollout is a single atomic release");
+    let (name, ordinal): (String, i32) = sqlx::query_as(
+        "SELECT name, ordinal FROM token_hooks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND client_id = 'cli_upgraded'",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_one(pool)
+    .await
+    .expect("read the backfilled row");
+    assert_eq!(
+        (name.as_str(), ordinal),
+        ("default", 0),
+        "an existing hook is RENAMED in place, not joined by a new one"
+    );
+
+    insert("first", 0).await.expect("the first named hook");
+    insert("second", 1)
+        .await
+        .expect("a SECOND hook on one client, which is the whole point of 0167");
+
+    let duplicate_name = insert("second", 2).await;
+    assert!(
+        duplicate_name.is_err(),
+        "the identity is (scope, client, NAME), so a repeat name is a key collision rather \
+         than a second row a lookup cannot tell apart"
+    );
+
+    let duplicate_ordinal = insert("third", 1).await;
+    assert!(
+        duplicate_ordinal.is_err(),
+        "two hooks at one position have no order between them, and a partial order is not an \
+         order: the database must refuse it rather than let a dispatch pick"
+    );
+
+    // AND A PERMUTATION COMMITS. The intermediate state has both hooks at ordinal 0.
+    let mut tx = pool.begin().await.expect("begin the swap");
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx)
+        .await
+        .expect("defer");
+    for (name, ordinal) in [("first", 1), ("second", 0)] {
+        sqlx::query(
+            "UPDATE token_hooks SET ordinal = $4 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = 'cli_ordered' \
+               AND name = $3",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(name)
+        .bind(ordinal)
+        .execute(&mut *tx)
+        .await
+        .expect("one half of the swap");
+    }
+    tx.commit()
+        .await
+        .expect("a reorder is a permutation, so the check has to happen at COMMIT");
+
+    let order: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM token_hooks \
+         WHERE tenant_id = $1 AND environment_id = $2 AND client_id = 'cli_ordered' \
+         ORDER BY ordinal",
+    )
+    .bind(&tenant)
+    .bind(&environment)
+    .fetch_all(pool)
+    .await
+    .expect("read the order back");
+    assert_eq!(
+        order,
+        vec!["second".to_owned(), "first".to_owned()],
+        "and the swap is what the feed reads back, or the reorder wrote nothing"
+    );
 }
