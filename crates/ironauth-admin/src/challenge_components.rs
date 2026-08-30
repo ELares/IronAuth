@@ -31,6 +31,18 @@
 //! component, bytes that are not a WebAssembly COMPONENT, an invalid name, and an out-of-range
 //! fetch budget.
 //!
+//! # What joins this surface to the login path, and what tests it
+//!
+//! This module writes a row; `ironauth-oidc`'s `custom_challenge` reads it. Nothing here loads a
+//! component, so the tests in this crate deploy an eight-byte preamble -- enough to pass the
+//! structural check and prove the route, and not a component wasmtime could run.
+//!
+//! The other side is tested on its own side: `flow_custom_factor.rs` deploys the REAL sample
+//! through the store and drives a login through it. What no single test crosses is the seam
+//! between them, and that is stated rather than papered over -- the two halves write and read the
+//! same `ChallengeDeployment` through the same repository, so the seam is a store contract that
+//! `ironauth-store`'s own suite covers, not a translation either side could get wrong alone.
+//!
 //! NOT validated here: whether the component exports the custom-challenge world. That is decided
 //! by wasmtime when the component is LINKED, and this crate has no engine -- a deployment can be
 //! built without the `wasm-hooks` feature entirely. Refusing to deploy a component this build
@@ -62,6 +74,13 @@ const MAX_NAME_CHARS: usize = 64;
 
 /// The most CHARACTERS an environment secret name may carry, matching its column's CHECK.
 const MAX_SECRET_NAME_CHARS: usize = 128;
+
+/// The custom-challenge payload version this build honours.
+///
+/// ITS OWN CONSTANT, not the token-customize one. The two worlds carry independent payload
+/// versions that move on independent schedules, and sharing a number would make a bump to one
+/// silently refuse every component of the other.
+pub(crate) const CHALLENGE_PAYLOAD_VERSION: u32 = 1;
 
 /// The largest outbound request budget a component may be granted, matching the column's CHECK.
 const MAX_FETCH_BUDGET: i32 = 16;
@@ -251,13 +270,6 @@ pub async fn deploy_challenge_component(
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
 }
-
-/// The custom-challenge payload version this build honours.
-///
-/// ITS OWN CONSTANT, not the token-customize one. The two worlds carry independent payload
-/// versions that move on independent schedules, and sharing a number would make a bump to one
-/// silently refuse every component of the other.
-pub(crate) const CHALLENGE_PAYLOAD_VERSION: u32 = 1;
 
 /// List the custom factor components deployed in this environment.
 #[utoipa::path(
