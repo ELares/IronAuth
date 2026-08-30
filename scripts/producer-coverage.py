@@ -120,6 +120,12 @@ EXEMPT = {
     "password_hashing::probe_password_hashing": "hashing probe: measures cost parameters, stores nothing",
     "promotion::plan_config_promotion": "promotion PLAN: computes the diff; applying it is a separate route",
     "migration::verify_credential": "credential verification: checks a secret, changes no state",
+    # A DRY RUN, exactly like `post_flow_dry_run` above. It runs a deployed hook against an event
+    # the caller supplied and returns what the hook did; it stores nothing, and it is classified
+    # `management.read` rather than `write_config` for that reason. The handler says so where it
+    # resolves the scope: "NO ACTOR, and that is the tell: `resolve_scope` returns one for writing
+    # onto an audit row, and this handler writes none."
+    "token_hooks::test_token_hook": "token hook draft run: executes a hook without committing anything",
 }
 
 

@@ -83,6 +83,9 @@
 /t/{tenant_id}/e/{environment_id}/recover/idv/initiate
 /t/{tenant_id}/e/{environment_id}/recover/trusted-contact/confirm
 /t/{tenant_id}/e/{environment_id}/risk/signals
+/t/{tenant_id}/e/{environment_id}/session-tokens/{template}/jwks.json
+/t/{tenant_id}/e/{environment_id}/session/token-mode
+/t/{tenant_id}/e/{environment_id}/session/tokenize
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify
 /t/{tenant_id}/e/{environment_id}/webauthn/credentials
