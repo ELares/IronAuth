@@ -1520,3 +1520,150 @@ async fn a_clients_hooks_run_in_order_and_each_sees_the_previous_ones_output() {
          skipped: {ahead:?}"
     );
 }
+
+/// A HOOK READS A GRANTED SECRET AT ISSUANCE, AND STOPS WHEN IT IS REVOKED.
+///
+/// Issue #114 criterion 5's per-hook secrets, end to end through a real token exchange. The
+/// sandbox suite proves the capability in isolation; this proves the whole path -- the grant
+/// table, the resolution from the sealed secret store, and the import the guest calls -- reaches
+/// a token an ordinary client is issued.
+///
+/// # Why the revoke half is not optional
+///
+/// A grant that never stops being honoured is not a permission, it is a property of the hook.
+/// Revoking must take effect on the NEXT issuance with no re-deploy and no restart, because that
+/// is what makes it the remediation for a hook misusing a secret. The same hook is exchanged
+/// twice, so the difference cannot be the hook changing.
+///
+/// The withheld name is asserted throughout: a host that answered every name would satisfy the
+/// granted half alone, and the grant would be decoration.
+#[tokio::test]
+async fn a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    harness.put_secret("granted", "sk_live_value").await;
+    harness
+        .deploy_token_hook_at(
+            &client,
+            "reader",
+            0,
+            ironauth_hooks::fixtures::SECRET_READER,
+        )
+        .await;
+
+    // BEFORE THE GRANT: the hook is deployed and the secret exists, and it still reads nothing.
+    // Without this the assertion after the grant is satisfied by a dispatch that hands every
+    // hook every secret in the environment.
+    let (access, _) = exchange(&harness).await.expect("the ungranted exchange");
+    let before = claims(&access);
+    assert!(
+        before.get("secret_granted").is_none_or(Value::is_null),
+        "a deployed hook reads NOTHING until it is granted, even a secret that exists: \
+         {before:?}"
+    );
+
+    harness
+        .grant_hook_secret(&client, "reader", "granted")
+        .await;
+    // THE GRANT IS AUDITED, and the row SAYS WHICH PAIR. A grant of access to a secret is
+    // exactly what an auditor reviewing "who can read what" has to be able to find without
+    // reading the hook -- and the target is the CLIENT, which may hold several hooks and
+    // reference several secrets, so a row naming only the client answers nothing.
+    let rows = harness
+        .audit_rows_for_action("token_hook.secret_granted")
+        .await;
+    assert_eq!(rows.len(), 1, "one grant, one row: {rows:?}");
+    let detail: Value = serde_json::from_str(
+        rows[0]
+            .detail
+            .as_deref()
+            .expect("the row carries the pair it granted"),
+    )
+    .expect("the detail is JSON");
+    assert_eq!(detail["hook"], Value::from("reader"), "{detail}");
+    assert_eq!(detail["secret"], Value::from("granted"), "{detail}");
+
+    let (access, _) = exchange(&harness).await.expect("the granted exchange");
+    let granted = claims(&access);
+    assert_eq!(
+        granted.get("secret_granted"),
+        Some(&Value::from("sk_live_value")),
+        "the granted secret's VALUE reaches the hook -- not merely something, because a hook \
+         handed an empty string and one handed the operator's key are otherwise the same \
+         observation: {granted:?}"
+    );
+    assert!(
+        granted.get("secret_withheld").is_none_or(Value::is_null),
+        "and a name it was not granted stays absent, or the grant is decoration: {granted:?}"
+    );
+
+    // AND THE REVOKE TAKES EFFECT ON THE NEXT ISSUANCE, with no re-deploy.
+    harness
+        .revoke_hook_secret(&client, "reader", "granted")
+        .await;
+    // AND SO IS THE REVOKE, as its own action. A burst of revocations is a story, and an
+    // auditor grouping by action cannot see one if a withdrawal is a variant of a grant.
+    let rows = harness
+        .audit_rows_for_action("token_hook.secret_revoked")
+        .await;
+    assert_eq!(rows.len(), 1, "one revoke, one row: {rows:?}");
+
+    let (access, _) = exchange(&harness).await.expect("the revoked exchange");
+    let revoked = claims(&access);
+    assert!(
+        revoked.get("secret_granted").is_none_or(Value::is_null),
+        "a revoke stops the next issuance from resolving the value, with no re-deploy and no \
+         restart -- which is what makes it the remediation for a hook misusing a secret: \
+         {revoked:?}"
+    );
+}
+
+/// ONE HOOK'S SECRET IS NOT ANOTHER HOOK'S, even in the same chain.
+///
+/// The grant is per HOOK, not per client, and the reason is the chain: its members are separate
+/// code deployed for separate purposes, so a hook holding a signing key must not make that key
+/// readable by whatever runs after it. A grant scoped to the client would do exactly that.
+///
+/// # Why the sibling test cannot see this
+///
+/// `a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it` deploys ONE hook, so
+/// scoping the grant to the hook and scoping it to the client produce the same answer -- the
+/// client's only grant is that hook's. Measured: replacing the join's `s.hook_name = h.name`
+/// with a predicate that matches every grant leaves that test green. Two hooks is the smallest
+/// arrangement in which the two scopings differ.
+///
+/// The two hooks are the SAME COMPONENT, deliberately. Deploying different guests would leave
+/// "the second hook reads nothing" explainable by the second hook being different code; the
+/// same bytes under two names isolate the grant as the only thing that differs.
+#[tokio::test]
+async fn a_grant_to_one_hook_is_not_readable_by_another_in_the_same_chain() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    harness.put_secret("granted", "sk_live_value").await;
+    // THE SAME COMPONENT UNDER TWO NAMES. `SECRET_READER` echoes the claims it is handed and
+    // appends its own, so the second hook overwrites the first's answer with its own -- which
+    // is what makes the token report the LAST hook's view of the secret.
+    harness
+        .deploy_token_hook_at(&client, "first", 0, ironauth_hooks::fixtures::SECRET_READER)
+        .await;
+    harness
+        .deploy_token_hook_at(
+            &client,
+            "second",
+            1,
+            ironauth_hooks::fixtures::SECRET_READER,
+        )
+        .await;
+    harness.grant_hook_secret(&client, "first", "granted").await;
+
+    let (access, _) = exchange(&harness).await.expect("exchange");
+    let claims = claims(&access);
+    // THE LAST HOOK'S ANSWER is what the token carries, and the last hook was granted nothing.
+    assert!(
+        claims.get("secret_granted").is_none_or(Value::is_null),
+        "the second hook was granted nothing, so it must read nothing -- a grant scoped to the \
+         CLIENT rather than the hook would hand it the first hook's key: {claims:?}"
+    );
+}

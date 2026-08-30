@@ -379,6 +379,73 @@ pub struct Invocation<'a> {
     pub access_token_claims: &'a serde_json::Map<String, serde_json::Value>,
 }
 
+/// Resolve the VALUES of the secrets a hook was granted, just before it runs.
+///
+/// Issue #114 criterion 5's per-hook secrets. Two steps, deliberately two: the GRANTS say which
+/// names this hook may read and arrive on the record from the chain read, and the VALUES come
+/// from the environment secret store where the secret machinery already keeps them sealed.
+/// Nothing here is a second place a secret lives.
+///
+/// THE GRANTS COST NO QUERY. They ride the chain read that the dispatch already performs, in
+/// the same statement. A first version asked for them separately and so added a database round
+/// trip to every issuance that runs a hook -- including the overwhelming majority granted
+/// nothing, who paid it to learn there was nothing to pay for.
+///
+/// AND A HOOK GRANTED NOTHING TOUCHES THE SECRET STORE NOT AT ALL: the loop below has no
+/// iterations, so the common case is one `is_empty` and no read.
+///
+/// BEFORE THE GUEST STARTS, which is a safety property rather than a convenience. Every bound a
+/// hook runs under -- fuel, the memory cap, the epoch deadline -- is measured against a guest
+/// that is RUNNING, so a host function that resolved a secret on demand would sit outside all
+/// three, and a hook could hold a request thread open through it while executing no
+/// instructions. The `secrets.get` import answers from this map and performs no I/O.
+///
+/// A GRANT THAT DOES NOT RESOLVE IS SKIPPED, not an error. The grant table deliberately has no
+/// foreign key to the secret, so an operator may arrange a hook before the secret exists or
+/// promote a configuration into an environment where it is provisioned separately. The hook
+/// then reads `none` for that name -- exactly what it reads for a name it was never granted,
+/// and what its code has to handle either way.
+#[cfg(feature = "wasm-hooks")]
+async fn resolve_secrets(
+    store: &Store,
+    scope: Scope,
+    client_id: &str,
+    record: &ironauth_store::token_hook_store::TokenHookRecord,
+) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::new();
+    if record.granted_secrets.is_empty() {
+        return resolved;
+    }
+    let scoped = store.scoped(scope);
+    for name in &record.granted_secrets {
+        // THE VALUE IS BYTES and a hook's import hands back a string, so a secret that is not
+        // valid UTF-8 is skipped rather than lossily converted: a signing key mangled by
+        // replacement characters is worse than an absent one, because the hook would use it.
+        match scoped
+            .environment_secrets()
+            .open_value_under_platform_key_at_uniform_cost(name)
+            .await
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(value) => {
+                resolved.insert(name.clone(), value);
+            }
+            None => {
+                tracing::warn!(
+                    target: "ironauth.hooks",
+                    tenant = %scope.tenant(),
+                    client_id,
+                    hook = %record.name,
+                    secret = %name,
+                    "a granted secret could not be resolved; the hook reads it as absent"
+                );
+            }
+        }
+    }
+    resolved
+}
+
 /// Audit that this client's deployed hook tried to write a claim the fence refused.
 ///
 /// ISSUE #113 CRITERION 5's HOOK HALF. The criterion says protected claims "cannot be
@@ -566,7 +633,12 @@ pub async fn run(
                 .unwrap_or(invocation.access_token_claims),
             ..*invocation
         };
-        match run_deployed_hook(engine, cache, &step, record).await {
+        // THE GRANTS ARE RESOLVED PER HOOK AND PER ISSUANCE, which is what makes a revoke take
+        // effect on the next login with no re-deploy and no cache to invalidate. Per HOOK
+        // because a chain's members are separate code with separate permissions: hook A holding
+        // a signing key must not make it readable by hook B running after it.
+        let secrets = resolve_secrets(store, scope, client_id, record).await;
+        match run_deployed_hook(engine, cache, &step, record, secrets).await {
             Ok(Some(produced)) => {
                 id_map = Some(
                     produced
@@ -674,7 +746,19 @@ pub async fn run_record(
     invocation: &Invocation<'_>,
     record: &ironauth_store::token_hook_store::TokenHookRecord,
 ) -> Result<Option<HookClaims>, HookFault> {
-    run_deployed_hook(&runtime.engine, &runtime.cache, invocation, record).await
+    // NOTHING GRANTED. A draft run is an operator asking what a hook would do, and answering
+    // it with the real secrets would turn a `management.read` question into a way to read a
+    // secret's VALUE through a hook the caller supplied the event for. What the operator learns
+    // instead is what their hook does when it cannot read one, which is the honest answer to a
+    // question asked outside an issuance.
+    run_deployed_hook(
+        &runtime.engine,
+        &runtime.cache,
+        invocation,
+        record,
+        BTreeMap::new(),
+    )
+    .await
 }
 
 /// Run the deployed hook, with every fault reported as one.
@@ -687,6 +771,7 @@ async fn run_deployed_hook(
     cache: &Arc<HookCache>,
     invocation: &Invocation<'_>,
     record: &ironauth_store::token_hook_store::TokenHookRecord,
+    secrets: BTreeMap<String, String>,
 ) -> Result<Option<HookClaims>, HookFault> {
     let Invocation {
         scope,
@@ -735,7 +820,7 @@ async fn run_deployed_hook(
         access_token_claims: as_pairs(access_token_claims),
     };
 
-    let customization = invoke(Arc::clone(engine), loaded, request)
+    let customization = invoke(Arc::clone(engine), loaded, request, secrets)
         .await
         .map_err(|error| {
             tracing::error!(
@@ -903,19 +988,22 @@ async fn invoke(
     engine: Arc<HookEngine>,
     hook: Arc<LoadedHook>,
     request: Request,
+    secrets: BTreeMap<String, String>,
 ) -> Result<ironauth_hooks::Customization, HookError> {
-    tokio::task::spawn_blocking(move || hook.customize(&engine, &limits(), &request))
-        .await
-        .unwrap_or_else(|join| {
-            // A panic INSIDE the guest cannot reach here -- wasmtime turns a guest trap into an
-            // error -- so a join failure is the host panicking or the task being cancelled. Both
-            // are aborts as far as the issuance is concerned, so both are faults the client's
-            // failure policy decides the meaning of -- not unconditional refusals, which is
-            // what this said before that policy existed.
-            Err(HookError::Declined(format!(
-                "the hook task did not complete: {join}"
-            )))
-        })
+    tokio::task::spawn_blocking(move || {
+        hook.customize_with_secrets(&engine, &limits(), &request, secrets)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        // A panic INSIDE the guest cannot reach here -- wasmtime turns a guest trap into an
+        // error -- so a join failure is the host panicking or the task being cancelled. Both
+        // are aborts as far as the issuance is concerned, so both are faults the client's
+        // failure policy decides the meaning of -- not unconditional refusals, which is
+        // what this said before that policy existed.
+        Err(HookError::Declined(format!(
+            "the hook task did not complete: {join}"
+        )))
+    })
 }
 
 /// How often the epoch advances.

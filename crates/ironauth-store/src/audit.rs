@@ -953,6 +953,20 @@ pub enum Action {
     /// An auditor asking "why did this client's tokens change shape" needs to see that as its
     /// own event rather than infer it from an absence of deploys.
     TokenHookReordered,
+    /// A TOKEN HOOK WAS GRANTED permission to read an environment secret (issue #114
+    /// criterion 5).
+    ///
+    /// The row names the CLIENT and, in its detail, the hook and the secret. This is a grant of
+    /// access to a secret to code an operator deployed, so it is the kind of change an auditor
+    /// reviewing "who can read what" has to be able to find without reading the hook.
+    TokenHookSecretGranted,
+    /// A TOKEN HOOK's permission to read an environment secret was WITHDRAWN (issue #114
+    /// criterion 5).
+    ///
+    /// Its own action rather than a variant of the grant, because the two answer different
+    /// questions and an auditor grouping by action wants the withdrawals separable: a revoke is
+    /// usually a remediation, and a burst of them is a story.
+    TokenHookSecretRevoked,
     /// A WASM TOKEN HOOK was REMOVED (issue #114), restoring the unshaped token for that
     /// client. The audit row names the CLIENT, for the same reason `TokenHookSet` does.
     ///
@@ -1626,6 +1640,8 @@ impl Action {
             Action::ClaimsMappingRefused => "claims_mapping.refused",
             Action::TokenHookClaimRefused => "token_hook.claim_refused",
             Action::TokenHookReordered => "token_hook.reordered",
+            Action::TokenHookSecretGranted => "token_hook.secret_granted",
+            Action::TokenHookSecretRevoked => "token_hook.secret_revoked",
             Action::ClaimsMappingDelete => "claims_mapping.delete",
             Action::SignupFormSet => "signup_form.set",
             Action::SignupFormDelete => "signup_form.delete",

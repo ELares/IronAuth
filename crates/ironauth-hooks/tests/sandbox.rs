@@ -7,6 +7,14 @@
 
 use ironauth_hooks::{AbortKind, HookEngine, HookError, Limits, Request};
 
+/// One returned claim's raw JSON, by name.
+fn claim<'a>(claims: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    claims
+        .iter()
+        .find(|(claim, _)| claim == name)
+        .map(|(_, value)| value.as_str())
+}
+
 fn guest(bytes: &'static str) -> Vec<u8> {
     std::fs::read(bytes).unwrap_or_else(|error| panic!("reading guest {bytes}: {error}"))
 }
@@ -18,6 +26,7 @@ const NET_ESCAPE: &str = env!("IRONAUTH_GUEST_NET_ESCAPE");
 const WALL_CLOCK_ESCAPE: &str = env!("IRONAUTH_GUEST_WALL_CLOCK_ESCAPE");
 const MONOTONIC_READER: &str = env!("IRONAUTH_GUEST_MONOTONIC_READER");
 const DECLINER: &str = env!("IRONAUTH_GUEST_DECLINER");
+const SECRET_READER: &str = env!("IRONAUTH_GUEST_SECRET_READER");
 const SLEEPER: &str = env!("IRONAUTH_GUEST_SLEEPER");
 const RANDOM_ESCAPE: &str = env!("IRONAUTH_GUEST_RANDOM_ESCAPE");
 const FS_ESCAPE: &str = env!("IRONAUTH_GUEST_FS_ESCAPE");
@@ -816,5 +825,62 @@ fn a_precompiled_hook_behaves_the_same_as_a_compiled_one() {
     assert_eq!(
         compiled, precompiled,
         "AOT must change the latency and nothing else"
+    );
+}
+
+/// A HOOK READS THE SECRETS IT WAS GRANTED, AND ONLY THOSE.
+///
+/// Issue #114 criterion 5's per-hook secrets. The capability is an IMPORT rather than a field on
+/// the request, which is what let it be added without breaking every already-compiled guest: a
+/// component built before this interface existed simply declares fewer imports.
+///
+/// # Three assertions, and the middle one is the capability
+///
+/// A hook granted `granted` reads its VALUE -- not merely "something", because a hook handed an
+/// empty string and one handed the operator's key are the same observation otherwise, and the
+/// second is what a real hook signs with.
+///
+/// The same hook asking for `withheld` gets nothing. Without that half a host answering EVERY
+/// name would pass: the grant would be decoration.
+///
+/// And a hook granted NOTHING reads neither, which is the deny-by-default this sandbox applies
+/// to every other capability. It is a separate run rather than a third name, because "the map
+/// is empty" and "the name is absent" are different states and only one of them is what an
+/// ungranted hook actually meets.
+#[test]
+fn a_hook_reads_only_the_secrets_it_was_granted() {
+    let engine = HookEngine::new().expect("build the engine");
+    let hook = engine
+        .load(&guest(SECRET_READER))
+        .expect("the secret reader loads");
+
+    let mut granted = std::collections::BTreeMap::new();
+    granted.insert("granted".to_owned(), "sk_live_value".to_owned());
+    let customization = hook
+        .customize_with_secrets(&engine, &Limits::claim_shaping(), &request(), granted)
+        .expect("the hook runs");
+    let claims = &customization.access_token_claims;
+    assert_eq!(
+        claim(claims, "secret_granted"),
+        Some("\"sk_live_value\""),
+        "a granted secret's VALUE reaches the hook, or it cannot sign with it: {claims:?}"
+    );
+    assert_eq!(
+        claim(claims, "secret_withheld"),
+        Some("null"),
+        "and a name it was NOT granted answers none -- without this a host that answered every \
+         name would pass, and the grant would be decoration: {claims:?}"
+    );
+
+    // GRANTED NOTHING: the state an ordinary hook is in.
+    let customization = hook
+        .customize(&engine, &Limits::claim_shaping(), &request())
+        .expect("the hook runs");
+    let claims = &customization.access_token_claims;
+    assert_eq!(
+        claim(claims, "secret_granted"),
+        Some("null"),
+        "a hook granted nothing reads nothing, which is what every other capability here does \
+         by default: {claims:?}"
     );
 }

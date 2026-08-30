@@ -32582,10 +32582,19 @@ impl TokenHookRepo<'_> {
     pub async fn chain(&self, client_id: &str) -> Result<Vec<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT client_id, name, ordinal, component, payload_version, failure_policy \
-             FROM token_hooks \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
-             ORDER BY ordinal \
+            "SELECT h.client_id, h.name, h.ordinal, h.component, h.payload_version, \
+                    h.failure_policy, \
+                    COALESCE(( \
+                        SELECT array_agg(s.secret_name ORDER BY s.secret_name) \
+                        FROM token_hook_secrets s \
+                        WHERE s.tenant_id = h.tenant_id \
+                          AND s.environment_id = h.environment_id \
+                          AND s.client_id = h.client_id \
+                          AND s.hook_name = h.name \
+                    ), ARRAY[]::text[]) AS granted_secrets \
+             FROM token_hooks h \
+             WHERE h.tenant_id = $1 AND h.environment_id = $2 AND h.client_id = $3 \
+             ORDER BY h.ordinal \
              LIMIT $4",
         )
         .bind(self.scope.tenant().to_string())
@@ -32604,6 +32613,7 @@ impl TokenHookRepo<'_> {
                     component: row.get("component"),
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    granted_secrets: row.get("granted_secrets"),
                 })
             })
             .collect()
@@ -32639,6 +32649,11 @@ impl TokenHookRepo<'_> {
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                // NOT PROJECTED BY THIS READ. Grants reach the dispatch through `chain`, in the
+                // same statement, so a caller that resolved them from a record built here would
+                // be reading an empty list rather than the truth. Empty is the honest value for
+                // a read that did not ask.
+                granted_secrets: Vec::new(),
             })
         })
         .transpose()
@@ -32691,6 +32706,11 @@ impl TokenHookRepo<'_> {
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                // NOT PROJECTED BY THIS READ. Grants reach the dispatch through `chain`, in the
+                // same statement, so a caller that resolved them from a record built here would
+                // be reading an empty list rather than the truth. Empty is the honest value for
+                // a read that did not ask.
+                granted_secrets: Vec::new(),
             })
         })
         .transpose()
@@ -32751,6 +32771,8 @@ impl TokenHookRepo<'_> {
                     component: row.get("component"),
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                    // See `get` above: grants reach the dispatch through `chain`.
+                    granted_secrets: Vec::new(),
                 },
                 row.get::<Option<i32>, _>("version"),
             ))
@@ -32866,6 +32888,156 @@ impl ActingTokenHookRepo<'_> {
     // on returning A row -- silently, non-deterministically -- the moment a second one does.
     // Naming it makes each of these a deliberate single-hook operation, and makes the ones that
     // should become multi-hook a diff a reviewer sees rather than a behaviour that drifts.
+
+    /// Grant a hook permission to read one environment secret, audited as
+    /// `token_hook.secret_granted`.
+    ///
+    /// Issue #114 criterion 5's per-hook secrets. A GRANT, never a value: the secret stays
+    /// sealed where the secret machinery keeps it, and this records only that this hook may
+    /// read it. Revoking is deleting the row, which takes effect on the next issuance with no
+    /// re-deploy, because the dispatch resolves grants per invocation.
+    ///
+    /// IDEMPOTENT. Granting twice is one grant, not an error: the caller's intent is "this hook
+    /// may read this secret", which a repeat states again rather than contradicts.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope or the hook is not deployed;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn grant_secret(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        hook_name: &str,
+        secret_name: &str,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let hook = hook_name.to_owned();
+        let secret = secret_name.to_owned();
+        // WHICH HOOK AND WHICH SECRET, on the row. The target is the CLIENT, which may hold
+        // eight hooks and reference many secrets, so a row that named only the client would
+        // answer "something about this client's hooks changed" -- and an auditor reviewing who
+        // can read what needs the pair. Both are operator-chosen NAMES rather than values, and
+        // both are bounded by their columns' own CHECKs, which is what keeps this inside
+        // `write_audited_detailed`'s rule that detail is never attacker-controlled free text.
+        let detail = serde_json::json!({ "hook": hook, "secret": secret }).to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenHookSecretGranted,
+                target: client,
+            },
+            async move |tx| {
+                // THE FOREIGN KEY WOULD ANSWER THIS, and a 23503 is not the answer a caller
+                // needs: "that hook is not deployed" is a 404 they can act on, where a
+                // constraint violation is a 500 with a code in a log.
+                let deployed: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM token_hooks \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND name = $4)",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&hook)
+                .fetch_one(&mut **tx)
+                .await?;
+                if !deployed {
+                    return Err(StoreError::NotFound);
+                }
+                sqlx::query(
+                    "INSERT INTO token_hook_secrets \
+                     (tenant_id, environment_id, client_id, hook_name, secret_name) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&hook)
+                .bind(&secret)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(detail.as_str()),
+        )
+        .await
+    }
+
+    /// Withdraw a hook's permission to read one environment secret, audited as
+    /// `token_hook.secret_revoked`.
+    ///
+    /// TAKES EFFECT ON THE NEXT ISSUANCE, with no re-deploy and no cache to invalidate, because
+    /// the dispatch resolves grants per invocation. That is the property that makes this a
+    /// usable remediation for a hook that is misusing a secret.
+    ///
+    /// REVOKING A GRANT THAT DOES NOT EXIST SUCCEEDS. The caller's intent is "this hook must not
+    /// read this secret", and that is true afterwards either way. Refusing would make the
+    /// safe direction the one an operator has to retry.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `client` is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn revoke_secret(
+        &self,
+        env: &Env,
+        client: &ClientId,
+        hook_name: &str,
+        secret_name: &str,
+    ) -> Result<(), StoreError> {
+        if client.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client_id = client.to_string();
+        let hook = hook_name.to_owned();
+        let secret = secret_name.to_owned();
+        // WHICH HOOK AND WHICH SECRET, on the row. The target is the CLIENT, which may hold
+        // eight hooks and reference many secrets, so a row that named only the client would
+        // answer "something about this client's hooks changed" -- and an auditor reviewing who
+        // can read what needs the pair. Both are operator-chosen NAMES rather than values, and
+        // both are bounded by their columns' own CHECKs, which is what keeps this inside
+        // `write_audited_detailed`'s rule that detail is never attacker-controlled free text.
+        let detail = serde_json::json!({ "hook": hook, "secret": secret }).to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::TokenHookSecretRevoked,
+                target: client,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "DELETE FROM token_hook_secrets \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND hook_name = $4 AND secret_name = $5",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client_id)
+                .bind(&hook)
+                .bind(&secret)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+            Some(detail.as_str()),
+        )
+        .await
+    }
 
     /// Set the order of a client's hooks, audited as `token_hook.reordered`.
     ///

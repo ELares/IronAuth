@@ -84,6 +84,16 @@ impl HasData for HasTable {
     type Data<'a> = &'a mut ResourceTable;
 }
 
+/// The marker for the one interface this product defines itself.
+///
+/// `ironauth:hooks/secrets` is implemented on the store state directly rather than on a view of
+/// one field, because the whole implementation is a lookup in a map the state owns.
+pub struct HasSandbox;
+
+impl HasData for HasSandbox {
+    type Data<'a> = &'a mut Sandbox;
+}
+
 /// The resolution the frozen clock reports, in nanoseconds.
 ///
 /// One nanosecond, the finest the interface can express. Reporting a coarse resolution would be
@@ -245,6 +255,17 @@ pub struct Sandbox {
     limits: wasmtime::StoreLimits,
     max_host_resources: usize,
     observed: Observed,
+    /// The secrets this hook was GRANTED, resolved before it started.
+    ///
+    /// RESOLVED UP FRONT, and that is a safety property rather than a performance one. Every
+    /// resource limit here -- fuel, the memory cap, the epoch deadline -- is measured against a
+    /// guest that is RUNNING, so a host function that waited on a database would sit outside
+    /// all three and a hook could hold a request thread open through it. Answering from a map
+    /// filled before instantiation means `secrets.get` performs no I/O and cannot block.
+    ///
+    /// EMPTY IS THE DEFAULT and it is the common case: a hook granted nothing gets `none` for
+    /// every name, which is the deny-by-default this sandbox applies to everything else.
+    secrets: std::collections::BTreeMap<String, String>,
 }
 
 impl Sandbox {
@@ -278,6 +299,7 @@ impl Sandbox {
             table,
             max_host_resources: limits.max_host_resources,
             observed: Observed::default(),
+            secrets: std::collections::BTreeMap::new(),
             // The memory cap alone bounds one linear memory, and a guest can multiply what it
             // costs the HOST without ever exceeding it: many memories, a growing table, or a
             // resource handle per host call. A measured example drove 137 MB of host heap under
@@ -302,6 +324,26 @@ impl Sandbox {
     #[must_use]
     pub fn observed(&self) -> Observed {
         self.observed
+    }
+
+    /// Grant this sandbox the secrets its hook may read.
+    ///
+    /// Called with values the CALLER has already resolved, because resolving them is a database
+    /// read and this type must never perform one: see the field's own doc for why a blocking
+    /// host call would sit outside every resource limit the sandbox has.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: std::collections::BTreeMap<String, String>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// The value of a granted secret, or [`None`] when this hook may not read it.
+    ///
+    /// The whole of what the `secrets` import can do. A map lookup and nothing else -- see the
+    /// field's doc for why this must never become a read.
+    #[must_use]
+    pub fn secret(&self, name: &str) -> Option<String> {
+        self.secrets.get(name).cloned()
     }
 
     /// Access the store limiter, for `Store::limiter`.

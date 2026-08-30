@@ -93,6 +93,22 @@ pub struct TokenHookRecord {
     pub payload_version: i32,
     /// What the dispatch does when this hook does not complete.
     pub failure_policy: HookFailurePolicy,
+    /// The environment secrets this hook has been GRANTED, by name (issue #114 criterion 5).
+    ///
+    /// NAMES ONLY. The values stay sealed in `environment_secrets` and the dispatch resolves
+    /// them just before the guest runs; carrying them here would put a secret in every log line
+    /// that formats a record.
+    ///
+    /// EMPTY ON A HISTORICAL VERSION, and not because it is unknown: a grant belongs to the
+    /// deployed HOOK rather than to a version of its code, so version 3 of a hook has no grants
+    /// of its own to report. It is a `Vec` rather than an `Option` because the two cases a
+    /// caller must tell apart are "granted nothing" and "granted these", and both are lists --
+    /// an `Option` would add a third state nothing means.
+    ///
+    /// FILLED BY THE CHAIN READ, in the same statement, which is the point: resolving grants
+    /// with a query per hook would add a database round trip to every issuance that runs a
+    /// hook, including the overwhelming majority that are granted nothing.
+    pub granted_secrets: Vec<String>,
 }
 
 /// WHERE a deploy puts a hook in its client's chain: which hook it is, and in what position.
@@ -157,6 +173,10 @@ impl std::fmt::Debug for TokenHookRecord {
             // records for one client are otherwise indistinguishable in the output.
             .field("name", &self.name)
             .field("ordinal", &self.ordinal)
+            // THE GRANTED NAMES, never a value: the values are not on this type at all, and
+            // this field is the list of what the hook MAY read. A log line that formats a
+            // record therefore says which secrets are in play without saying what they hold.
+            .field("granted_secrets", &self.granted_secrets)
             .field("component_bytes", &self.component.len())
             .field("payload_version", &self.payload_version)
             .field("failure_policy", &self.failure_policy)
