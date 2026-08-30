@@ -340,10 +340,21 @@ mod tests {
     #[test]
     #[ignore = "writes to the real platform keychain; run with --ignored"]
     fn a_default_mode_login_leaves_no_plaintext_token_on_disk() {
+        // BOTH GUARDS DECLARED FIRST, before any statement: `clippy::items_after_statements`
+        // is a warning and CI builds with `-D warnings`, so an item introduced further down
+        // where it is first needed would fail the build.
         struct Cleanup(String);
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = KeyringStore.delete(&self.0);
+            }
+        }
+        /// Removes the decoy tree on the way out, INCLUDING on panic, so a failing assertion
+        /// leaves nothing behind in the temporary directory.
+        struct Tree(std::path::PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
             }
         }
 
@@ -413,12 +424,6 @@ mod tests {
         // finder is proved against a file that definitely contains the token before it is
         // trusted to report that nothing else does.
         let decoy_dir = std::env::temp_dir().join(format!("ironauth-decoy-{}", std::process::id()));
-        struct Tree(std::path::PathBuf);
-        impl Drop for Tree {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
         std::fs::create_dir_all(decoy_dir.join("nested")).expect("a decoy tree");
         let _decoy_tree = Tree(decoy_dir.clone());
         let decoy = decoy_dir.join("nested").join("credentials.bin");
@@ -428,7 +433,7 @@ mod tests {
         planted.extend_from_slice(token.as_bytes());
         std::fs::write(&decoy, &planted).expect("plant the decoy");
         assert_eq!(
-            find_token_on_disk(&[decoy_dir.clone()], &token).as_deref(),
+            find_token_on_disk(std::slice::from_ref(&decoy_dir), &token).as_deref(),
             Some(decoy.as_path()),
             "the finder must locate a token it is pointed straight at, or its silence below \
              means nothing"
