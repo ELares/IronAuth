@@ -45,26 +45,15 @@ consumer needs:
   read and across restarts. The order is the feed's sequence, and a sequence is never
   reassigned.
 
-One more guarantee, and it is worth being exact about because until recently the opposite was
-true and this document said so:
+One guarantee does NOT hold for most producers, and it is worth being exact about because it
+is easy to assume from the word "ordered":
 
-- **Commit-order equality (issue #107 criterion 2).** A sequence is allocated when a row is
-  written, not when its transaction commits, so two overlapping transactions could land on the
-  feed in the opposite order to the order they committed in. Closing that gap costs a per-scope
-  advisory lock held to commit, and **every production event producer now takes it**, taken at
-  the INSERT itself rather than at an entry point a producer could bypass. So within one
-  environment, feed order IS commit order.
-
-  The cost is what it always was and it is now being paid: writes that produce an event in one
-  environment serialise against each other, the authentication path included. It is scoped to
-  EVENT rows -- a webhook delivery row does not take it -- because interleaving a delivery row
-  between two events changes the sequences those events get and not their order relative to one
-  another, which is all the guarantee is about.
-
-  What this document said before was: "no production producer takes that lock through the
-  commit-ordered appender at all. Treat the feed as unordered BETWEEN concurrent writers." That
-  was accurate: the lock existed on `OutboxRepo::append_event`, which had ZERO production
-  callers, so the property was proven for a path nothing exercised.
+- **Commit-order equality.** A sequence is allocated when a row is written, not when its
+  transaction commits, so two transactions that overlap can land on the feed in the opposite
+  order to the order they committed in. Closing that gap costs a per-scope lock held to
+  commit, which on the authentication path would serialise sign-in per environment, so it is
+  not applied there, and in fact no production producer takes that lock through the
+  commit-ordered appender at all. Treat the feed as unordered BETWEEN concurrent writers.
 
   WHERE the feed is written is inventoried in `docs/design/event-ordering-sites.txt` and kept
   current by `scripts/event-ordering-audit.sh`, so a new producer cannot join the feed
