@@ -132,6 +132,13 @@ CREATE TABLE challenge_component_secrets (
     created_at      timestamptz NOT NULL DEFAULT now(),
 
     PRIMARY KEY (tenant_id, environment_id, name, secret_name),
+    -- THE SCOPE KEYS, DECLARED DIRECTLY, even though the composite key below already reaches a
+    -- row that has them. `every_scoped_table_declares_a_scope_foreign_key` requires it of every
+    -- table with forced RLS, and it is right to: transitive anchoring is a property of the WHOLE
+    -- graph, so it survives only as long as nobody relaxes an intermediate key, while these two
+    -- make "this row's scope exists" local to this table. 0169 declares both for the same reason.
+    FOREIGN KEY (tenant_id) REFERENCES tenants (id),
+    FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
     -- CASCADE, so deleting a component takes its grants with it. A grant that outlived its
     -- component would be re-attached silently by a later deploy of the same name, which is a
     -- capability nobody granted.
