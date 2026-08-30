@@ -1367,3 +1367,63 @@ async fn a_reorder_that_is_not_the_whole_arrangement_is_refused() {
         "a refused reorder writes nothing: {body}"
     );
 }
+
+/// THE NAME BOUND AT THE DOOR IS THE COLUMN'S BOUND, IN THE COLUMN'S UNIT.
+///
+/// `MAX_HOOK_NAME_CHARS` and the CHECK on `token_hooks.name` are two copies of one number, and
+/// two copies is how they stop agreeing. The API's copy exists because a database CHECK cannot
+/// produce an `ErrorBody`: a constraint violation is a 500 with `23514` in a log, where a
+/// refusal at the door is a message the operator reads.
+///
+/// # The unit is the point
+///
+/// Postgres `length()` counts CHARACTERS. An earlier version of the handler counted BYTES while
+/// its comment claimed to match the column, so the two disagreed on every non-ASCII name -- a
+/// forty-character name of three-byte characters is a hundred and twenty bytes, which the
+/// column admits and a byte count refuses. This drives a name of exactly the limit in
+/// MULTI-BYTE characters, which is the only input that can tell the two units apart: 64
+/// characters and 192 bytes. Under a byte bound it is refused; under the column's bound it is
+/// deployed.
+///
+/// One over the limit is refused with this API's 400, which is the other half: a bound nothing
+/// exceeds is not observably a bound.
+#[tokio::test]
+async fn a_hook_name_at_the_column_bound_is_accepted_and_one_past_it_is_refused() {
+    let harness = Harness::start(62).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // 64 CHARACTERS, 192 BYTES. The only shape that distinguishes the two units.
+    let at_limit: String = std::iter::repeat_n('\u{4e16}', 64).collect();
+    assert_eq!(at_limit.chars().count(), 64);
+    assert_eq!(at_limit.len(), 192);
+
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name={at_limit}"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a name at exactly the column's bound must deploy, or the door is stricter than the \
+         column it says it matches: {body}"
+    );
+
+    let past_limit: String = std::iter::repeat_n('\u{4e16}', 65).collect();
+    let (status, _, body) = harness
+        .put_bytes(
+            &format!("{base}?payload_version=1&name={past_limit}"),
+            COMPONENT,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "and one past it is this API's 400 rather than a constraint violation surfacing as a \
+         500: {body}"
+    );
+}

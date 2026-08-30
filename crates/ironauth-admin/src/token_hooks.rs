@@ -187,13 +187,20 @@ fn validate_component(component: &[u8]) -> Result<(), ApiError> {
     ))
 }
 
-/// The most characters a hook name may carry, matching the CHECK on the column.
+/// The most CHARACTERS a hook name may carry, matching the CHECK on the column.
 ///
 /// Two copies of one number, and the reason is the one `MAX_COMPONENT_BYTES` gives for its own
 /// pair: a database CHECK cannot produce this API's `ErrorBody`, so refusing here is what turns
-/// a constraint violation into a message an operator can read. They are held together by a test
-/// that writes a name of exactly this length through the real handler.
-const MAX_HOOK_NAME_BYTES: usize = 64;
+/// a constraint violation into a message an operator can read.
+///
+/// CHARACTERS AND NOT BYTES, and an earlier version of this counted bytes while claiming to
+/// match the column. Postgres `length()` counts characters, so the two bounds disagreed on
+/// every non-ASCII name: a forty-character name of three-byte characters is a hundred and
+/// twenty bytes, which the column admits and a byte count refuses. That direction is safe --
+/// the API was strictly stricter, so no constraint violation could escape it -- but "matching
+/// the CHECK" was false, and the next person to move one of the two numbers would have moved it
+/// against a comment that lied about the other.
+const MAX_HOOK_NAME_CHARS: usize = 64;
 
 /// Which hook a request addresses, and where a NEW one goes.
 ///
@@ -214,9 +221,9 @@ fn hook_name(raw: Option<&str>) -> Result<&str, ApiError> {
             "invalid_hook_name: name must not begin or end with whitespace".to_owned(),
         ));
     }
-    if name.len() > MAX_HOOK_NAME_BYTES {
+    if name.chars().count() > MAX_HOOK_NAME_CHARS {
         return Err(ApiError::BadRequest(format!(
-            "invalid_hook_name: name must be at most {MAX_HOOK_NAME_BYTES} bytes"
+            "invalid_hook_name: name must be at most {MAX_HOOK_NAME_CHARS} characters"
         )));
     }
     Ok(name)
