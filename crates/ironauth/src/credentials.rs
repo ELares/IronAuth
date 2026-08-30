@@ -309,6 +309,179 @@ mod tests {
     ///
     /// The account name is unique per run, so a leftover entry from an interrupted run
     /// cannot make a later one pass by being already present.
+    /// The OTHER HALF of criterion 4: "no plaintext token files exist after login in default
+    /// mode".
+    ///
+    /// The round trip below proves the credential reaches the keychain. It says nothing about
+    /// whether a copy was ALSO left on disk, and those are different claims -- a store that
+    /// wrote through to the keychain and cached to a file would satisfy every assertion in this
+    /// module and fail the criterion.
+    ///
+    /// The argument from structure is that `KeyringStore` is the only production implementation
+    /// of `CredentialStore` and it holds no path. That argument is worth exactly as much as the
+    /// next person who adds a cache to it, so this LOOKS.
+    ///
+    /// # What it walks, and why not the whole home directory
+    ///
+    /// The per-user configuration, data and cache roots this application could plausibly derive
+    /// a path from, on all three platforms, read from the environment (this crate forbids
+    /// `unsafe`, so the environment cannot be redirected here and is read rather than set). The
+    /// probe token is unique per run, so a pre-existing file cannot make the walk pass or fail
+    /// for the wrong reason, and nothing needs to be cleaned up.
+    ///
+    /// WHAT IT CANNOT SEE: a write to somewhere outside those roots. Nothing in this crate
+    /// constructs such a path, and a test that walked an entire filesystem would be a different
+    /// and much slower kind of test. What this rules out is the failure that would actually
+    /// happen -- a credential cache written next to the config -- rather than every failure
+    /// imaginable.
+    ///
+    /// Ignored for the same reason as the test below (it writes to a real keychain) and it runs
+    /// in the same CI job on all three platforms.
+    #[test]
+    #[ignore = "writes to the real platform keychain; run with --ignored"]
+    fn a_default_mode_login_leaves_no_plaintext_token_on_disk() {
+        // BOTH GUARDS DECLARED FIRST, before any statement: `clippy::items_after_statements`
+        // is a warning and CI builds with `-D warnings`, so an item introduced further down
+        // where it is first needed would fail the build.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = KeyringStore.delete(&self.0);
+            }
+        }
+        /// Removes the decoy tree on the way out, INCLUDING on panic, so a failing assertion
+        /// leaves nothing behind in the temporary directory.
+        struct Tree(std::path::PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // UNIQUE PER RUN, so a leftover file from an interrupted earlier run cannot fail this
+        // one, and a pre-existing file cannot contain it by coincidence.
+        let token = format!(
+            "plaintext-probe-{}-do-not-write-me-down",
+            std::process::id()
+        );
+        let account = format!("ironauth-nofile-{}", std::process::id());
+        let _cleanup = Cleanup(account.clone());
+
+        let credential = StoredCredential {
+            access_token: token.clone(),
+            refresh_token: Some(format!("{token}-refresh")),
+            expires_at_unix_secs: 1_767_225_600,
+            issuer: "https://issuer.example/t/ten_x/e/env_y".to_owned(),
+        };
+        KeyringStore.store(&account, &credential).expect("storing");
+
+        // IT REALLY STORED, asserted before the disk walk. Without this the walk would find
+        // nothing for the trivial reason that nothing was written anywhere, and the test would
+        // report the criterion as held while measuring a no-op.
+        assert_eq!(
+            KeyringStore
+                .get(&account)
+                .expect("reading back")
+                .expect("present")
+                .access_token,
+            token,
+            "the credential must be in the keychain for the disk walk to mean anything"
+        );
+
+        let roots: Vec<std::path::PathBuf> = [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ]
+        .iter()
+        .filter_map(|key| std::env::var_os(key).map(std::path::PathBuf::from))
+        .chain(
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .flat_map(|home| {
+                    [
+                        home.join(".ironauth"),
+                        home.join(".config").join("ironauth"),
+                        home.join(".local").join("share").join("ironauth"),
+                        home.join("Library")
+                            .join("Application Support")
+                            .join("ironauth"),
+                    ]
+                }),
+        )
+        .collect();
+        assert!(
+            !roots.is_empty(),
+            "no per-user root could be derived, so this test would walk nothing and pass vacuously"
+        );
+
+        // THE CONTROL, FIRST. The walk over the real roots below is expected to inspect ZERO
+        // files, because a machine with no IronAuth config directory has none -- and a check
+        // satisfied by an empty input is satisfied by a BROKEN walk just as readily. So the
+        // finder is proved against a file that definitely contains the token before it is
+        // trusted to report that nothing else does.
+        let decoy_dir = std::env::temp_dir().join(format!("ironauth-decoy-{}", std::process::id()));
+        std::fs::create_dir_all(decoy_dir.join("nested")).expect("a decoy tree");
+        let _decoy_tree = Tree(decoy_dir.clone());
+        let decoy = decoy_dir.join("nested").join("credentials.bin");
+        // NESTED and BINARY, so the control exercises both properties the real walk needs:
+        // recursion into subdirectories, and a byte scan rather than a UTF-8 read.
+        let mut planted = vec![0_u8, 159, 146, 150];
+        planted.extend_from_slice(token.as_bytes());
+        std::fs::write(&decoy, &planted).expect("plant the decoy");
+        assert_eq!(
+            find_token_on_disk(std::slice::from_ref(&decoy_dir), &token).as_deref(),
+            Some(decoy.as_path()),
+            "the finder must locate a token it is pointed straight at, or its silence below \
+             means nothing"
+        );
+
+        // AND NOW THE REAL CLAIM.
+        let found = find_token_on_disk(&roots, &token);
+        assert!(
+            found.is_none(),
+            "a default-mode credential store left the token in {}",
+            found
+                .as_ref()
+                .map_or_else(String::new, |p| p.display().to_string())
+        );
+    }
+
+    /// Walk `roots` and return the first file whose BYTES contain `token`.
+    ///
+    /// Bytes rather than a UTF-8 read: a token written into a binary cache file is still a token
+    /// on disk, and `read_to_string` would skip exactly those files. Unreadable entries are
+    /// skipped rather than failing the walk -- a permission error on some unrelated file in a
+    /// user's config tree is not evidence about this credential.
+    fn find_token_on_disk(roots: &[std::path::PathBuf], token: &str) -> Option<std::path::PathBuf> {
+        let mut stack: Vec<std::path::PathBuf> = roots.to_vec();
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                if bytes
+                    .windows(token.len())
+                    .any(|window| window == token.as_bytes())
+                {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     #[ignore = "writes to the real platform keychain; run with --ignored"]
     fn a_credential_survives_the_real_platform_keychain_with_its_expiry() {

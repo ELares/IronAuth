@@ -813,8 +813,14 @@ jobs:
 
       # The test is #[ignore]d because it writes to a developer's own keychain. Here that is
       # the point, so it runs with --ignored.
+      # THE FILTER IS THE MODULE, not a test name, and that is deliberate. Named individually,
+      # a keychain test added later runs nowhere until somebody remembers to edit this file --
+      # which is how `a_default_mode_login_leaves_no_plaintext_token_on_disk` was written,
+      # committed, and silently not run on any platform. `credentials::tests` is exactly the
+      # ignored tests that need a real keychain (`dev::tests` are the other ignored pair in this
+      # binary and they need Postgres, not a keychain).
       - name: Round-trip a credential through the platform keychain
-        run: cargo test -p ironauth --bin ironauth -- --ignored a_credential_survives_the_real_platform_keychain
+        run: cargo test -p ironauth --bin ironauth -- --ignored credentials::tests
 
       # LINUX IS COVERED BY THE STEP ABOVE, and this note stays because the coverage is new
       # and its history is the useful part: two earlier setups left the daemon running with no
