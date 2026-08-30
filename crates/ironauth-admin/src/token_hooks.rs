@@ -268,9 +268,17 @@ pub async fn deploy_token_hook(
         .set_with_event(
             state.env(),
             &client,
-            &body,
-            i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
-            failure_policy,
+            ironauth_store::HookDeployment {
+                component: &body,
+                payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
+                failure_policy,
+                // THE DEFAULT HOOK, until this surface takes a name from the caller. Issue
+                // #114 criterion 5 gives a client several hooks and this route addresses the
+                // one it had before ordering existed -- which is what migration 0167
+                // backfilled every deployed hook to, so a deploy through here keeps hitting
+                // the row it always hit.
+                placement: ironauth_store::HookPlacement::default_hook(),
+            },
             deployed_event(
                 &state,
                 scope,

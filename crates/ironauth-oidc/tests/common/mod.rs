@@ -935,6 +935,76 @@ impl Harness {
             .expect("deploy the hook");
     }
 
+    /// Deploy a hook at a NAMED position in the client's chain (issue #114 criterion 5).
+    ///
+    /// Separate from `deploy_token_hook` rather than a parameter on it, for the reason
+    /// `deploy_token_hook_with_policy` gives: the callers that want the one hook a client had
+    /// before ordering existed keep saying nothing about a position.
+    pub async fn deploy_token_hook_at(
+        &self,
+        client: &ClientId,
+        name: &str,
+        ordinal: i32,
+        component: &[u8],
+    ) {
+        let env = self.env().clone();
+        self.db()
+            .control_store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .token_hooks()
+            .set_with_event(
+                &env,
+                client,
+                ironauth_store::HookDeployment {
+                    component,
+                    payload_version: 1,
+                    failure_policy: ironauth_store::HookFailurePolicy::FailClosed,
+                    placement: ironauth_store::HookPlacement { name, ordinal },
+                },
+                None,
+            )
+            .await
+            .expect("deploy the hook at its position");
+    }
+
+    /// Swap two hooks' positions in a client's chain, by direct SQL.
+    ///
+    /// STANDS IN FOR THE REORDER ROUTE, which is not built yet. A redeploy deliberately does
+    /// NOT move a hook -- the upsert leaves `ordinal` alone on conflict, so rolling a hook back
+    /// restores its code without changing where it runs -- so redeploying the same two names in
+    /// the other order is a no-op, which is what the first version of the chain-order test
+    /// assumed and got wrong.
+    ///
+    /// ONE STATEMENT with a `CASE`, not two UPDATEs. The unique constraint on `ordinal` is
+    /// deferrable precisely because a permutation passes through a duplicate, but a single
+    /// statement never exposes that intermediate state at all, so this needs no
+    /// `SET CONSTRAINTS` and stays honest about what it is testing.
+    pub async fn swap_hook_positions(&self, client: &ClientId, first: &str, second: &str) {
+        sqlx::query(
+            "UPDATE token_hooks \
+             SET ordinal = CASE name WHEN $4 THEN \
+                     (SELECT ordinal FROM token_hooks \
+                      WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                        AND name = $5) \
+                 ELSE \
+                     (SELECT ordinal FROM token_hooks \
+                      WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                        AND name = $4) \
+                 END \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+               AND name IN ($4, $5)",
+        )
+        .bind(self.scope().tenant().to_string())
+        .bind(self.scope().environment().to_string())
+        .bind(client.to_string())
+        .bind(first)
+        .bind(second)
+        .execute(self.db().owner_pool())
+        .await
+        .expect("swap the two hooks' positions");
+    }
+
     /// Deploy a hook with an explicit FAILURE POLICY (issue #114 criterion 3).
     ///
     /// Separate from `deploy_token_hook` rather than a parameter on it, so the twenty callers
@@ -956,9 +1026,12 @@ impl Harness {
             .set_with_event(
                 &env,
                 client,
-                component,
-                payload_version,
-                failure_policy,
+                ironauth_store::HookDeployment {
+                    component,
+                    payload_version,
+                    failure_policy,
+                    placement: ironauth_store::HookPlacement::default_hook(),
+                },
                 None,
             )
             .await

@@ -291,13 +291,13 @@ pub use repository::{
     InitialAccessTokenRepo, InvariantEvaluation, InvariantKind, InvitationAdminRecord,
     InvitationCredentialType, InvitationListFilter, InvitationRepo, InvitationState,
     IssueClientCredentials, IssueCode, IssuedChallenge, IssuedTokenRecord, JtiOutcome, LoginMethod,
-    MANAGEMENT_LIST_HARD_CAP, MEMBERSHIP_DELTA_CAP, ManagementCredentialRecord,
-    ManagementCredentialRepo, ManagementStore, MembershipChange, MembershipPrincipal,
-    MessageTemplateRecord, MigrationKind, MigrationProgress, MigrationRecordOutcome, MigrationRun,
-    MigrationRunRepo, MigrationRunTallies, MigrationState, MintedInvitationToken, NewAccountLink,
-    NewAdminUser, NewApiKey, NewAssertionSubjectMapping, NewBackchannelRequest,
-    NewClientAuthDiagnostic, NewDcrPolicy, NewDeviceCode, NewDynamicClient, NewEnvironment,
-    NewExternalAssertionIssuer, NewFlowTarget, NewImpersonationAuthorization,
+    MANAGEMENT_LIST_HARD_CAP, MAX_HOOKS_PER_CLIENT, MEMBERSHIP_DELTA_CAP,
+    ManagementCredentialRecord, ManagementCredentialRepo, ManagementStore, MembershipChange,
+    MembershipPrincipal, MessageTemplateRecord, MigrationKind, MigrationProgress,
+    MigrationRecordOutcome, MigrationRun, MigrationRunRepo, MigrationRunTallies, MigrationState,
+    MintedInvitationToken, NewAccountLink, NewAdminUser, NewApiKey, NewAssertionSubjectMapping,
+    NewBackchannelRequest, NewClientAuthDiagnostic, NewDcrPolicy, NewDeviceCode, NewDynamicClient,
+    NewEnvironment, NewExternalAssertionIssuer, NewFlowTarget, NewImpersonationAuthorization,
     NewInitialAccessToken, NewInvitation, NewInvitedUser, NewJwtAuthClient, NewMembership,
     NewMessageTemplate, NewMigrationRun, NewOpaqueAccessToken, NewOrgConnection, NewOrgGroup,
     NewOrgGroupMember, NewOrgGroupRole, NewOrgMembershipRole, NewOrgRole, NewOrgRolePermission,
@@ -389,4 +389,6 @@ pub use trait_schema::{
     parse_transform,
 };
 
-pub use token_hook_store::{HookFailurePolicy, TokenHookMetadata, TokenHookVersion};
+pub use token_hook_store::{
+    HookDeployment, HookFailurePolicy, HookPlacement, TokenHookMetadata, TokenHookVersion,
+};

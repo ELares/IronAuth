@@ -8731,3 +8731,60 @@ async fn the_hook_identity_carries_exactly_one_index_after_the_move() {
         );
     }
 }
+
+/// THE CHAIN READ IS BOUNDED, AND THE BOUND DROPS THE TAIL.
+///
+/// Before migration 0168 the primary key answered "how many hooks run per login" and the answer
+/// was one. Widening the identity removed that answer and nothing replaced it: every hook in a
+/// chain is compiled on a cache miss and invoked on every token, so an unbounded chain is an
+/// unbounded amount of issuance-path work for a client anyone who can start a login may pick.
+///
+/// This inserts more hooks than the cap and asserts two things a `LIMIT` alone would not give:
+/// that the read stops at `MAX_HOOKS_PER_CLIENT`, and that what survives is the PREFIX in
+/// ordinal order. Truncating anywhere but the tail would leave a chain that means something
+/// other than what the operator wrote -- dropping the first hook silently changes what every
+/// later one is handed.
+#[tokio::test]
+async fn the_hook_chain_read_is_bounded_and_keeps_the_prefix() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+
+    let over = usize::try_from(ironauth_store::MAX_HOOKS_PER_CLIENT).expect("a small cap") + 3;
+    for position in 0..over {
+        sqlx::query(
+            "INSERT INTO token_hooks \
+             (tenant_id, environment_id, client_id, name, ordinal, component, payload_version) \
+             VALUES ($1, $2, 'cli_longchain', $3, $4, '\\x00'::bytea, 1)",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(format!("hook{position:02}"))
+        .bind(i32::try_from(position).expect("a small position"))
+        .execute(pool)
+        .await
+        .expect("insert a hook into a long chain");
+    }
+
+    let chain = db
+        .store()
+        .scoped(scope)
+        .token_hooks()
+        .chain("cli_longchain")
+        .await
+        .expect("read the chain");
+
+    assert_eq!(
+        i64::try_from(chain.len()).expect("a small chain"),
+        ironauth_store::MAX_HOOKS_PER_CLIENT,
+        "the issuance path must not be handed more hooks than it is willing to run"
+    );
+    let names: Vec<&str> = chain.iter().map(|hook| hook.name.as_str()).collect();
+    let expected: Vec<String> = (0..chain.len()).map(|n| format!("hook{n:02}")).collect();
+    assert_eq!(
+        names, expected,
+        "and what survives is the PREFIX in ordinal order: dropping anything but the tail \
+         changes what every later hook is handed"
+    );
+}

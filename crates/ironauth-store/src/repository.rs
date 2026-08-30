@@ -123,7 +123,9 @@ use crate::scope::Scope;
 use crate::signup_form::{NewSignupForm, SignupFormRecord};
 use crate::sms_otp::{ActiveSmsOtpCode, NewSmsOtpCode, SmsRouteStat, SmsTenantConfig};
 use crate::store::Store;
+use crate::token_hook_store::HookDeployment;
 use crate::token_hook_store::HookFailurePolicy;
+use crate::token_hook_store::HookPlacement;
 use crate::token_hook_store::TokenHookMetadata;
 use crate::token_hook_store::TokenHookRecord;
 use crate::token_hook_store::TokenHookVersion;
@@ -32556,7 +32558,61 @@ pub struct TokenHookRepo<'a> {
 }
 
 impl TokenHookRepo<'_> {
-    /// This client's deployed hook, or [`None`] when it has none.
+    /// This client's whole hook CHAIN, in the order it runs. Empty when it has none.
+    ///
+    /// Issue #114 criterion 5's "explicit ordering of multiple hooks on one event". The
+    /// issuance path folds these in sequence, each hook seeing what the one before it produced.
+    ///
+    /// BOUNDED BY [`MAX_HOOKS_PER_CLIENT`], and the bound is on this read rather than only on
+    /// the write because this is the path that spends the work: every hook here is compiled on
+    /// a cache miss and invoked on every token. The `LIMIT` rides the same `ORDER BY`, so what
+    /// it drops is the TAIL of the chain -- the hooks the operator put last -- which is the only
+    /// truncation that leaves a prefix meaning what the operator wrote.
+    ///
+    /// ORDER BY ordinal, and it is the reason the column is UNIQUE per client rather than
+    /// merely present. Without an order the rows come back however Postgres finds them, and a
+    /// chain is a fold: a different order is a different token. Without the uniqueness the
+    /// ORDER BY would still not fix it, because two rows at one position have no order between
+    /// them for it to impose -- which is why the database refuses that state rather than this
+    /// query papering over it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn chain(&self, client_id: &str) -> Result<Vec<TokenHookRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT client_id, name, ordinal, component, payload_version, failure_policy \
+             FROM token_hooks \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+             ORDER BY ordinal \
+             LIMIT $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .bind(MAX_HOOKS_PER_CLIENT)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TokenHookRecord {
+                    client_id: row.get("client_id"),
+                    name: row.get("name"),
+                    ordinal: Some(row.get("ordinal")),
+                    component: row.get("component"),
+                    payload_version: row.get("payload_version"),
+                    failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
+                })
+            })
+            .collect()
+    }
+
+    /// This client's DEFAULT hook, or [`None`] when it has none.
+    ///
+    /// One named hook rather than the chain, for the callers that address the hook a client had
+    /// before ordering existed. The issuance path uses [`Self::chain`].
     ///
     /// # Errors
     ///
@@ -32564,7 +32620,8 @@ impl TokenHookRepo<'_> {
     pub async fn get(&self, client_id: &str) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, component, payload_version, failure_policy FROM token_hooks \
+            "SELECT client_id, name, ordinal, component, payload_version, failure_policy \
+             FROM token_hooks \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
         .bind(self.scope.tenant().to_string())
@@ -32577,6 +32634,8 @@ impl TokenHookRepo<'_> {
         row.map(|row| {
             Ok(TokenHookRecord {
                 client_id: row.get("client_id"),
+                name: row.get("name"),
+                ordinal: Some(row.get("ordinal")),
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
@@ -32606,7 +32665,7 @@ impl TokenHookRepo<'_> {
     ) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT client_id, component, payload_version, failure_policy \
+            "SELECT client_id, name, component, payload_version, failure_policy \
              FROM token_hook_versions \
              WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4 \
                AND name = $5",
@@ -32622,6 +32681,12 @@ impl TokenHookRepo<'_> {
         row.map(|row| {
             Ok(TokenHookRecord {
                 client_id: row.get("client_id"),
+                name: row.get("name"),
+                // NO POSITION ON A HISTORICAL VERSION. `token_hook_versions` has no `ordinal`
+                // column and should not: position is a property of the CURRENT arrangement,
+                // not of an archived component. Version 3 ran at whatever position the hook
+                // occupied then, which nothing records and nothing needs.
+                ordinal: None,
                 component: row.get("component"),
                 payload_version: row.get("payload_version"),
                 failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
@@ -32658,7 +32723,8 @@ impl TokenHookRepo<'_> {
     ) -> Result<Option<(TokenHookRecord, Option<i32>)>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT h.client_id, h.component, h.payload_version, h.failure_policy, \
+            "SELECT h.client_id, h.name, h.ordinal, h.component, h.payload_version, \
+                    h.failure_policy, \
                     (SELECT MAX(v.version) FROM token_hook_versions v \
                       WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.client_id = $3 \
                         AND v.name = $4) \
@@ -32678,6 +32744,8 @@ impl TokenHookRepo<'_> {
             Ok((
                 TokenHookRecord {
                     client_id: row.get("client_id"),
+                    name: row.get("name"),
+                    ordinal: Some(row.get("ordinal")),
                     component: row.get("component"),
                     payload_version: row.get("payload_version"),
                     failure_policy: failure_policy_from_row(row.get("failure_policy"))?,
@@ -32822,9 +32890,12 @@ impl ActingTokenHookRepo<'_> {
         self.set_with_event(
             env,
             client,
-            component,
-            payload_version,
-            HookFailurePolicy::FailClosed,
+            HookDeployment {
+                component,
+                payload_version,
+                failure_policy: HookFailurePolicy::FailClosed,
+                placement: HookPlacement::default_hook(),
+            },
             None,
         )
         .await
@@ -32843,9 +32914,7 @@ impl ActingTokenHookRepo<'_> {
         &self,
         env: &Env,
         client: &ClientId,
-        component: &[u8],
-        payload_version: i32,
-        failure_policy: HookFailurePolicy,
+        deployment: HookDeployment<'_>,
         event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
@@ -32853,7 +32922,11 @@ impl ActingTokenHookRepo<'_> {
         }
         let scope = self.scope;
         let client_id = client.to_string();
-        let bytes = component.to_vec();
+        let bytes = deployment.component.to_vec();
+        let payload_version = deployment.payload_version;
+        let failure_policy = deployment.failure_policy;
+        let hook_name = deployment.placement.name.to_owned();
+        let hook_ordinal = deployment.placement.ordinal;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -32874,9 +32947,9 @@ impl ActingTokenHookRepo<'_> {
                     // hook a client had before ordering existed, which is what 0167 backfilled
                     // every existing row to.
                     "INSERT INTO token_hooks \
-                     (tenant_id, environment_id, client_id, name, component, payload_version, \
-                      failure_policy) \
-                     VALUES ($1, $2, $3, $7, $4, $5, $6) \
+                     (tenant_id, environment_id, client_id, name, ordinal, component, \
+                      payload_version, failure_policy) \
+                     VALUES ($1, $2, $3, $7, $8, $4, $5, $6) \
                      ON CONFLICT (tenant_id, environment_id, client_id, name) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
@@ -32889,7 +32962,8 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&bytes)
                 .bind(payload_version)
                 .bind(failure_policy.as_str())
-                .bind(DEFAULT_HOOK_NAME)
+                .bind(&hook_name)
+                .bind(hook_ordinal)
                 .execute(&mut **tx)
                 .await?;
                 // THE HISTORY ROW, in the SAME transaction as the active one. A deploy that
@@ -32932,7 +33006,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&bytes)
                 .bind(payload_version)
                 .bind(failure_policy.as_str())
-                .bind(DEFAULT_HOOK_NAME)
+                .bind(&hook_name)
                 .execute(&mut **tx)
                 .await?;
                 // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
@@ -32962,7 +33036,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(scope.environment().to_string())
                 .bind(&client_id)
                 .bind(TOKEN_HOOK_VERSION_RETENTION)
-                .bind(DEFAULT_HOOK_NAME)
+                .bind(&hook_name)
                 .execute(&mut **tx)
                 .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
@@ -33133,12 +33207,19 @@ impl ActingTokenHookRepo<'_> {
             }
         }
 
+        // THE PLACEMENT IS THE DEFAULT HOOK'S, because a rollback restores CODE and must not
+        // move anything: the upsert below leaves `ordinal` alone on conflict, so a rollback of
+        // a hook that sits third leaves it third. Once the admin surface rolls a NAMED hook
+        // back, this is where its name arrives.
         self.set_with_event(
             env,
             client,
-            &component,
-            payload_version,
-            failure_policy,
+            HookDeployment {
+                component: &component,
+                payload_version,
+                failure_policy,
+                placement: HookPlacement::default_hook(),
+            },
             event,
         )
         .await
@@ -33211,6 +33292,31 @@ impl ActingTokenHookRepo<'_> {
         .await
     }
 }
+
+/// The most hooks one client may have in its chain.
+///
+/// A BOUND ON THE ISSUANCE PATH, and it exists because the schema stopped providing one. Before
+/// migration 0168 the primary key was `(scope, client)`, so "how many hooks run per login" was
+/// answered by the schema and the answer was one. Widening the identity to admit a chain
+/// removed that answer, and what replaced it was nothing: every hook in the chain is compiled
+/// on a miss and invoked on every token, so an unbounded chain is an unbounded amount of work
+/// on the hot path for a client who can be picked by whoever can start a login.
+///
+/// EIGHT, which is a policy number rather than a derived one, so here is the reasoning. The use
+/// this criterion names is composing a few concerns -- an enricher, a filter, a marker -- and
+/// past a handful the honest answer is one hook that does the work, since a chain of twenty
+/// pays twenty invocations to save writing one guest. It is deliberately far below anything a
+/// real arrangement needs, because the cost of being wrong in the generous direction is paid
+/// per login and the cost of being wrong in the strict direction is an operator filing an
+/// issue.
+///
+/// ENFORCED AT THE READ, not only at the write. A write-time refusal is the better message and
+/// belongs on the admin route that names a hook -- this module's own rule, that a refusal an
+/// operator reads beats one nobody sees. But a cap that lives only at the write is a cap the
+/// issuance path trusts rather than one it has: a hand-inserted row set, a restore from a
+/// backup taken under a different limit, or a future writer that forgets would each hand the
+/// dispatch an unbounded chain. The read takes the first [`MAX_HOOKS_PER_CLIENT`] in order.
+pub const MAX_HOOKS_PER_CLIENT: i64 = 8;
 
 /// The name a hook carries when nobody chose one.
 ///
