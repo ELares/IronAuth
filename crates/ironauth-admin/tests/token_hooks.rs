@@ -2017,7 +2017,7 @@ async fn a_deploy_stores_a_precompiled_artifact_for_the_login_path() {
     )
     .bind(&tenant)
     .bind(&env)
-    .bind(client.to_string())
+    .bind(client.clone())
     .fetch_one(harness.db().owner_pool())
     .await
     .expect("the deployed row");

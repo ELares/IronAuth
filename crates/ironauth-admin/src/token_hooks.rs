@@ -170,23 +170,39 @@ fn parse_client_id(raw: &str, scope: Scope) -> Result<ClientId, ApiError> {
 /// already passed and this is not the authority on whether a component is loadable -- but the
 /// reason is recorded where somebody debugging that failure will find it.
 #[cfg(feature = "wasm-hooks")]
-pub(crate) fn precompile(
+pub(crate) async fn precompile(
     state: &AdminState,
     component: &[u8],
 ) -> Option<ironauth_store::AotArtifact> {
-    let runtime = state.hook_runtime()?;
-    let engine = runtime.engine();
-    match engine.compile(component) {
-        Ok(artifact) => Some(ironauth_store::AotArtifact {
+    let engine = std::sync::Arc::clone(state.hook_runtime()?.engine());
+    let bytes = component.to_vec();
+    let compiled = tokio::task::spawn_blocking(move || {
+        engine
+            .compile(&bytes)
+            .map(|artifact| (artifact, engine.compatibility_key()))
+    })
+    .await;
+    match compiled {
+        Ok(Ok((artifact, engine_key))) => Some(ironauth_store::AotArtifact {
             artifact,
-            engine_key: engine.compatibility_key(),
+            engine_key,
         }),
-        Err(error) => {
+        Ok(Err(error)) => {
             tracing::warn!(
                 target: "ironauth.hooks",
                 error = %error,
                 "a deployed component could not be precompiled; it will be compiled at first \
                  use, and if it cannot link there the hook will fail closed",
+            );
+            None
+        }
+        Err(join) => {
+            // A PANIC IN THE BLOCKING POOL is not a compile failure and must not be reported as
+            // one. The deploy still stores the component, so the hook works and compiles.
+            tracing::error!(
+                target: "ironauth.hooks",
+                error = %join,
+                "the precompile task did not complete; deploying without an artifact",
             );
             None
         }
@@ -196,7 +212,7 @@ pub(crate) fn precompile(
 /// Without the hook runtime there is nothing to precompile with, so every deploy stores no
 /// artifact and every dispatch compiles. That is the pre-criterion-4 behaviour, unchanged.
 #[cfg(not(feature = "wasm-hooks"))]
-pub(crate) fn precompile(
+pub(crate) async fn precompile(
     _state: &AdminState,
     _component: &[u8],
 ) -> Option<ironauth_store::AotArtifact> {
@@ -403,6 +419,11 @@ pub async fn deploy_token_hook(
     };
     validate_component(&body)?;
 
+    // PRECOMPILED OFF THE REACTOR (issue #114 criterion 4). Cranelift on a tokio worker
+    // stalls every other request on that thread; a deploy is rarer than an issuance,
+    // which makes the stall rarer and not smaller.
+    let aot = precompile(&state, &body).await;
+
     state
         .store()
         .scoped(scope)
@@ -412,7 +433,7 @@ pub async fn deploy_token_hook(
             state.env(),
             &client,
             ironauth_store::HookDeployment {
-                aot: precompile(&state, &body).as_ref(),
+                aot: aot.as_ref(),
                 component: &body,
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
                 failure_policy,
