@@ -2143,10 +2143,22 @@ pub struct TestTokenHookResponse {
     /// hook that predates the history, and the prune deletes only
     /// `version <= MAX(version) - TOKEN_HOOK_VERSION_RETENTION` -- so no write this server
     /// performs leaves that state behind. Measured: reaching it took a hand-run
-    /// `DELETE FROM token_hook_versions` under a live hook (query-audit-allow: PROSE, not a
-    /// query -- this sentence describes a hand-run statement that reached a state no shipped
-    /// write path can, and the scan reads comments as well as code). The field stays optional because
-    /// the database can hold that row set, not because a client can produce it.
+    /// deletion against `token_hook_versions` under a live hook. The field stays optional
+    /// because the database can hold that row set, not because a client can produce it.
+    //
+    // A NON-DOC COMMENT, deliberately, and this is the note that explains the wording above.
+    //
+    // THE DOC COMMENT IS THE PUBLISHED SCHEMA DESCRIPTION. utoipa copies it verbatim into
+    // `docs/openapi/management.json`, and from there it reaches the Go SDK, the Python SDK and
+    // the admin console's TypeScript bindings. So anything written in `///` here is a customer
+    // -facing string, and anything written in `//` is not.
+    //
+    // That matters because the sentence above once spelled the statement out literally, which
+    // tripped `scripts/query-audit.sh` -- its scan reads comments as well as code. Suppressing
+    // it with a `query-audit-allow` marker worked and was WRONG: the marker rode the doc comment
+    // straight into the published contract and every generated client. The fix is to word the
+    // prose so no suppression is needed, and to keep the explanation of that down here, where it
+    // is published nowhere.
     pub version_run: Option<i32>,
 }
 

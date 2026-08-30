@@ -8272,8 +8272,8 @@ export interface components {
              *     hook that predates the history, and the prune deletes only
              *     `version <= MAX(version) - TOKEN_HOOK_VERSION_RETENTION` -- so no write this server
              *     performs leaves that state behind. Measured: reaching it took a hand-run
-             *     `DELETE FROM token_hook_versions` under a live hook. The field stays optional because
-             *     the database can hold that row set, not because a client can produce it.
+             *     deletion against `token_hook_versions` under a live hook. The field stays optional
+             *     because the database can hold that row set, not because a client can produce it.
              */
             version_run?: number | null;
         };
