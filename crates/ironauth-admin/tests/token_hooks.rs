@@ -16,6 +16,7 @@ mod common;
 
 use axum::http::StatusCode;
 use common::Harness;
+use ironauth_env::Env;
 use ironauth_store::{EnvironmentId, Scope, TenantId};
 use sqlx::Row as _;
 
@@ -1552,6 +1553,8 @@ async fn versions_rollback_and_draft_runs_all_address_the_named_hook() {
 /// a key deployed for its neighbour.
 #[tokio::test]
 async fn hook_secret_grants_are_set_read_and_withdrawn_through_the_admin_surface() {
+    const VALUE: &str = "sk_live_do_not_disclose";
+
     let harness = Harness::start(64).await;
     let (tenant, env) = harness.create_tenant("Acme", "k1").await;
     let scope = scope_of(&tenant, &env);
@@ -1575,10 +1578,36 @@ async fn hook_secret_grants_are_set_read_and_withdrawn_through_the_admin_surface
         "a freshly deployed hook may read nothing: {body}"
     );
 
+    // A REAL VALUE, so the assertion below is about a secret that EXISTS rather than one
+    // nothing could have disclosed. Written through the store rather than the API because this
+    // harness has no data-plane connection, and `setSecret` refuses without one -- the
+    // management role is deliberately not permitted to write an ordinary secret.
+    {
+        let store_env = Env::system();
+        harness
+            .store()
+            .scoped(scope)
+            .acting(
+                harness.test_actor(&store_env),
+                ironauth_store::CorrelationId::generate(&store_env),
+            )
+            .environment_secrets()
+            .put_under_platform_key(&store_env, "stripe", VALUE.as_bytes(), None)
+            .await
+            .expect("provision the secret");
+    }
+
     let (status, _, body) = harness
         .put(&format!("{base}/secrets?name=signer&secret=stripe"), "")
         .await;
     assert_eq!(status, StatusCode::OK, "grant: {body}");
+    // AND THE VALUE IS NOWHERE IN THE BODY. Not merely absent from the `secrets` field: a
+    // handler that returned it under some other key, or an error path that echoed it, would
+    // pass a field-shaped assertion. This is the check that the route reports references.
+    assert!(
+        !body.contains(VALUE),
+        "the response must not carry the secret's VALUE anywhere: {body}"
+    );
     let (status, _, body) = harness
         .put(&format!("{base}/secrets?name=auditor&secret=siem"), "")
         .await;
@@ -1587,6 +1616,10 @@ async fn hook_secret_grants_are_set_read_and_withdrawn_through_the_admin_surface
     // EACH HOOK READS ONLY ITS OWN. A store keyed on the client would return both to both.
     for (hook, expected) in [("signer", "stripe"), ("auditor", "siem")] {
         let (_, _, body) = harness.get(&format!("{base}/secrets?name={hook}")).await;
+        assert!(
+            !body.contains(VALUE),
+            "nor may the LISTING carry it: {body}"
+        );
         let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
         let names: Vec<&str> = view["secrets"]
             .as_array()
