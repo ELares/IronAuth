@@ -2962,6 +2962,332 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets": {
+      "get": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "List the environment secrets a hook may read.",
+        "operationId": "listTokenHookSecrets",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks; absent means `default`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret NAMES this hook may read, never their values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookSecretsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid hook name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Grant a hook permission to read an environment secret.",
+        "operationId": "grantTokenHookSecret",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks; absent means `default`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "secret",
+            "in": "query",
+            "description": "The environment secret's name. REQUIRED: there is no meaningful default, and an omitted one would have to mean `all of them`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret NAMES this hook may now read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookSecretsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid or absent secret name, or an invalid hook name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, malformed client id, or that hook is not deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "token-hooks"
+        ],
+        "summary": "Withdraw a hook's permission to read an environment secret.",
+        "operationId": "revokeTokenHookSecret",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The authorize client identifier whose tokens the hook shapes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks; absent means `default`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "secret",
+            "in": "query",
+            "description": "The environment secret's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret NAMES this hook may still read. Revoking a grant that does not exist succeeds: the caller's intent holds either way",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenHookSecretsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid or absent secret name, or an invalid hook name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found or malformed client id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test": {
       "post": {
         "tags": [
@@ -32381,6 +32707,32 @@
               "$ref": "#/components/schemas/TokenHookChainEntryView"
             },
             "description": "The hooks, first to last. Empty when the client has none.\n\nEACH HOOK IS HANDED WHAT THE ONE BEFORE IT PRODUCED, which is what makes this order\nload-bearing rather than cosmetic: a hook's claim set REPLACES what it was given, so\nmoving a hook changes what every hook after it sees."
+          }
+        }
+      },
+      "TokenHookSecretsView": {
+        "type": "object",
+        "description": "The environment secrets one hook may read.",
+        "required": [
+          "client_id",
+          "hook",
+          "secrets"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The client whose hook this is."
+          },
+          "hook": {
+            "type": "string",
+            "description": "The hook."
+          },
+          "secrets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The secret NAMES this hook may read, sorted. Never the values.\n\nNAMES AND NOT VALUES, and the store could not return values here if this route asked:\na grant records a reference, and the value lives sealed in the environment secret store\nbehind a different repository and the platform key. That separation is what stops a\n\"what may this hook read\" route ever being one keystroke from disclosing it.\n\nA NAME HERE MAY NOT RESOLVE. The grant table deliberately has no foreign key to the\nsecret, so an operator may grant before provisioning or promote a configuration into an\nenvironment where the secret is created separately. The hook reads such a name as\nabsent, exactly as it reads one it was never granted."
           }
         }
       },

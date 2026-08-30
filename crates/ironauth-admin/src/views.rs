@@ -2243,6 +2243,36 @@ pub struct ReorderTokenHooksRequest {
     pub order: Vec<String>,
 }
 
+/// Which hook a secret grant addresses, and which secret.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HookSecretQuery {
+    /// The hook's name. Absent means `default`.
+    pub name: Option<String>,
+    /// The environment secret's name. Required on a grant and on a revoke; ignored on a read.
+    pub secret: Option<String>,
+}
+
+/// The environment secrets one hook may read.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TokenHookSecretsView {
+    /// The client whose hook this is.
+    pub client_id: String,
+    /// The hook.
+    pub hook: String,
+    /// The secret NAMES this hook may read, sorted. Never the values.
+    ///
+    /// NAMES AND NOT VALUES, and the store could not return values here if this route asked:
+    /// a grant records a reference, and the value lives sealed in the environment secret store
+    /// behind a different repository and the platform key. That separation is what stops a
+    /// "what may this hook read" route ever being one keystroke from disclosing it.
+    ///
+    /// A NAME HERE MAY NOT RESOLVE. The grant table deliberately has no foreign key to the
+    /// secret, so an operator may grant before provisioning or promote a configuration into an
+    /// environment where the secret is created separately. The hook reads such a name as
+    /// absent, exactly as it reads one it was never granted.
+    pub secrets: Vec<String>,
+}
+
 /// One hook in a client's chain, as the management API reports it.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct TokenHookChainEntryView {

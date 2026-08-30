@@ -32558,6 +32558,43 @@ pub struct TokenHookRepo<'a> {
 }
 
 impl TokenHookRepo<'_> {
+    /// The environment secrets one hook has been GRANTED, by name.
+    ///
+    /// For the management surface, which answers "what may this hook read". The ISSUANCE path
+    /// does not use this: it takes the same names off `TokenHookRecord`, filled by
+    /// [`Self::chain`] in the same statement, because a query per hook per issuance is a round
+    /// trip on the token path paid by every hook including the ones granted nothing.
+    ///
+    /// NAMES ONLY, and this repository could not return values if it wanted to -- they live in
+    /// `environment_secrets`, sealed, and are opened by a different repository under the
+    /// platform key. That separation is what stops a "list this hook's secrets" route ever
+    /// being one keystroke from disclosing them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn granted_secrets(
+        &self,
+        client_id: &str,
+        hook_name: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT secret_name FROM token_hook_secrets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+               AND hook_name = $4 \
+             ORDER BY secret_name",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id)
+        .bind(hook_name)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(names)
+    }
+
     /// This client's whole hook CHAIN, in the order it runs. Empty when it has none.
     ///
     /// Issue #114 criterion 5's "explicit ordering of multiple hooks on one event". The
