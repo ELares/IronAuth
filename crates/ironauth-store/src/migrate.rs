@@ -1340,6 +1340,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Contract,
             sql: include_str!("../migrations/0168_token_hook_named_identity.sql"),
         },
+        Migration {
+            version: 169,
+            name: "token_hook_secrets",
+            // EXPAND: a new table nothing older reads. The data plane gets SELECT and no write,
+            // because a write here grants access to a secret and the plane that mints tokens
+            // must not be able to widen what the code shaping them may read.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0169_token_hook_secrets.sql"),
+        },
     ]
 }
 

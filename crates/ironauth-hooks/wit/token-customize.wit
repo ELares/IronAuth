@@ -77,6 +77,31 @@ interface token-customize {
 /// It imports NOTHING. Every capability is opt-in and is added to the linker by the host
 /// per hook, so the default world is the deny-by-default sandbox criterion 2 asks for:
 /// what a guest never imports, it can never call.
+/// The secrets a hook has been GRANTED, by name.
+///
+/// An IMPORT rather than a field on `request`, and that choice is the whole compatibility
+/// story: adding a field to a record changes the world every existing guest was compiled
+/// against, so it would break every deployed hook and force a payload-version bump. Adding an
+/// import does not -- a component built before this interface existed simply declares fewer
+/// imports, and a host that offers one nobody asked for is providing an unused definition.
+///
+/// DENY BY DEFAULT, like every other capability here. `get` answers `none` for a name this
+/// hook has not been granted, and for every name at all when it has been granted nothing. A
+/// hook cannot enumerate what it holds: there is no `list`, deliberately, because a hook that
+/// can enumerate the secret NAMESPACE learns what an operator has configured even where it
+/// cannot read the values.
+///
+/// RESOLVED BEFORE THE GUEST RUNS. The host answers from a map it filled before instantiation,
+/// so this call performs no I/O and cannot block. That is not a performance note: every
+/// resource limit on a sandboxed guest -- fuel, the memory cap, the epoch deadline -- is
+/// measured against a guest that is RUNNING, so a host function that waited on a database would
+/// sit outside all three, and a hook could hold a request thread open through it.
+interface secrets {
+  /// The value of a granted secret, or `none` when this hook may not read it.
+  get: func(name: string) -> option<string>;
+}
+
 world token-customize-hook {
+  import secrets;
   export token-customize;
 }

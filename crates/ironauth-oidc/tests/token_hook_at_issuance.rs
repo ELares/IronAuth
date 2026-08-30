@@ -1520,3 +1520,76 @@ async fn a_clients_hooks_run_in_order_and_each_sees_the_previous_ones_output() {
          skipped: {ahead:?}"
     );
 }
+
+/// A HOOK READS A GRANTED SECRET AT ISSUANCE, AND STOPS WHEN IT IS REVOKED.
+///
+/// Issue #114 criterion 5's per-hook secrets, end to end through a real token exchange. The
+/// sandbox suite proves the capability in isolation; this proves the whole path -- the grant
+/// table, the resolution from the sealed secret store, and the import the guest calls -- reaches
+/// a token an ordinary client is issued.
+///
+/// # Why the revoke half is not optional
+///
+/// A grant that never stops being honoured is not a permission, it is a property of the hook.
+/// Revoking must take effect on the NEXT issuance with no re-deploy and no restart, because that
+/// is what makes it the remediation for a hook misusing a secret. The same hook is exchanged
+/// twice, so the difference cannot be the hook changing.
+///
+/// The withheld name is asserted throughout: a host that answered every name would satisfy the
+/// granted half alone, and the grant would be decoration.
+#[tokio::test]
+async fn a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    harness.put_secret("granted", "sk_live_value").await;
+    harness
+        .deploy_token_hook_at(
+            &client,
+            "reader",
+            0,
+            ironauth_hooks::fixtures::SECRET_READER,
+        )
+        .await;
+
+    // BEFORE THE GRANT: the hook is deployed and the secret exists, and it still reads nothing.
+    // Without this the assertion after the grant is satisfied by a dispatch that hands every
+    // hook every secret in the environment.
+    let (access, _) = exchange(&harness).await.expect("the ungranted exchange");
+    let before = claims(&access);
+    assert!(
+        before.get("secret_granted").is_none_or(Value::is_null),
+        "a deployed hook reads NOTHING until it is granted, even a secret that exists: \
+         {before:?}"
+    );
+
+    harness
+        .grant_hook_secret(&client, "reader", "granted")
+        .await;
+    let (access, _) = exchange(&harness).await.expect("the granted exchange");
+    let granted = claims(&access);
+    assert_eq!(
+        granted.get("secret_granted"),
+        Some(&Value::from("sk_live_value")),
+        "the granted secret's VALUE reaches the hook -- not merely something, because a hook \
+         handed an empty string and one handed the operator's key are otherwise the same \
+         observation: {granted:?}"
+    );
+    assert!(
+        granted.get("secret_withheld").is_none_or(Value::is_null),
+        "and a name it was not granted stays absent, or the grant is decoration: {granted:?}"
+    );
+
+    // AND THE REVOKE TAKES EFFECT ON THE NEXT ISSUANCE, with no re-deploy.
+    harness
+        .revoke_hook_secret(&client, "reader", "granted")
+        .await;
+    let (access, _) = exchange(&harness).await.expect("the revoked exchange");
+    let revoked = claims(&access);
+    assert!(
+        revoked.get("secret_granted").is_none_or(Value::is_null),
+        "a revoke stops the next issuance from resolving the value, with no re-deploy and no \
+         restart -- which is what makes it the remediation for a hook misusing a secret: \
+         {revoked:?}"
+    );
+}

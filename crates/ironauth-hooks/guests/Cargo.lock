@@ -348,6 +348,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "secret-reader"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

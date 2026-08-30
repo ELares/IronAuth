@@ -100,6 +100,13 @@ pub mod fixtures {
     /// passes with the chain read in reverse -- measured, it did.
     pub const CHAIN_OBSERVER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CHAIN_OBSERVER"));
 
+    /// A hook that reads a GRANTED secret and one it was never granted.
+    ///
+    /// The fixture for the `secrets` import. It reports both values as claims, and the second
+    /// name is what makes deny-by-default observable: a host that answered every name would
+    /// satisfy any test that only asked for the granted one.
+    pub const SECRET_READER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_SECRET_READER"));
+
     /// A hook that returns `sub` and `iss` -- the identity and the issuer.
     ///
     /// Issue #113 criterion 5's "or hook" half. It also returns one claim the fence ALLOWS, so

@@ -32,6 +32,7 @@
 use wasmtime::component::{Component, InstancePre, Linker};
 use wasmtime::{Config, Engine, Store};
 
+use crate::sandbox::HasSandbox;
 use crate::{HookError, Limits, Sandbox};
 
 wasmtime::component::bindgen!({
@@ -45,6 +46,26 @@ wasmtime::component::bindgen!({
 // site made `ironauth-store`'s unrelated `token_customize` module look wired. One alias keeps
 // the collision to a single line that a reader can see for what it is.
 use exports::ironauth::hooks::token_customize as wit_hook;
+
+/// The host side of the `secrets` import, answered from what the caller resolved.
+///
+/// NO I/O HERE, and the whole design of per-hook secrets rests on it: every resource limit a
+/// sandboxed guest runs under -- fuel, the memory cap, the epoch deadline -- is measured against
+/// a guest that is RUNNING, so a host function that waited on a database would sit outside all
+/// three. A hook could then hold a request thread open through this call while executing no
+/// instructions, which is precisely the shape a previous review found in `wasi:clocks`'
+/// subscription functions. The values are resolved before instantiation and this is a map
+/// lookup.
+///
+/// DENY BY DEFAULT: a name this hook was not granted answers `none`, and a hook granted nothing
+/// gets `none` for every name. There is no `list`, so a hook cannot enumerate the secret
+/// namespace -- knowing WHICH secrets an operator has configured is disclosure even where the
+/// values are refused.
+impl ironauth::hooks::secrets::Host for Sandbox {
+    fn get(&mut self, name: String) -> Option<String> {
+        self.secret(&name)
+    }
+}
 
 /// A compiled-code cache, the configuration every hook runs under, and the linked host surface.
 ///
@@ -92,6 +113,14 @@ impl HookEngine {
         // wasmtime version skew, and reporting it as a capability refusal would send an
         // operator looking at a hook that does not exist yet.
         Sandbox::link(&mut linker).map_err(HookError::from_engine)?;
+        // THE ONE INTERFACE THIS PRODUCT DEFINES, beside the fourteen WASI ones `link` adds.
+        // Registered here rather than inside `Sandbox::link` because that function's contract
+        // is "exactly the WASI host interfaces a hook may reach", and this is not WASI: it is
+        // `ironauth:hooks/secrets`, whose whole implementation is a lookup in this store's own
+        // state. Keeping the two lists apart is what makes the WASI surface auditable as a
+        // list of things NOT granted.
+        ironauth::hooks::secrets::add_to_linker::<Sandbox, HasSandbox>(&mut linker, |s| s)
+            .map_err(HookError::from_engine)?;
         Ok(Self {
             engine,
             linker: std::sync::Arc::new(linker),
@@ -284,11 +313,37 @@ impl LoadedHook {
         limits: &Limits,
         request: &Request,
     ) -> Result<Customization, HookError> {
+        self.customize_with_secrets(engine, limits, request, std::collections::BTreeMap::new())
+    }
+
+    /// [`Self::customize`], granting the hook the secrets it may read (issue #114 criterion 5).
+    ///
+    /// A SEPARATE ENTRY POINT rather than a parameter on `customize`, so that the callers who
+    /// grant nothing keep saying nothing about secrets -- which is most of them, and which is
+    /// the deny-by-default this sandbox applies to every other capability.
+    ///
+    /// `secrets` carries VALUES the caller has already resolved. This crate must not resolve
+    /// them: it has no store, and more importantly a host function that read one would sit
+    /// outside every bound a running guest is measured against. See `Sandbox::secrets`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::customize`].
+    pub fn customize_with_secrets(
+        &self,
+        engine: &HookEngine,
+        limits: &Limits,
+        request: &Request,
+        secrets: std::collections::BTreeMap<String, String>,
+    ) -> Result<Customization, HookError> {
         // A STORE and nothing else. The linker was built when the engine was, and this hook's
         // imports were resolved against it when the hook was loaded; what is left is the state
         // that genuinely cannot be shared between two concurrent invocations -- this call's
         // fuel, its epoch deadline, and its resource table.
-        let sandbox = Sandbox::new(limits);
+        // THE SECRETS ARE ALREADY RESOLVED, and they have to be: this call is where the guest
+        // starts running, and every bound it runs under is measured against a RUNNING guest, so
+        // a host function that fetched a value would sit outside all of them.
+        let sandbox = Sandbox::new(limits).with_secrets(secrets);
         let mut store = Store::new(engine.inner(), sandbox);
         store.limiter(|s: &mut Sandbox| s.limits());
         store.set_fuel(limits.fuel).map_err(HookError::from_call)?;

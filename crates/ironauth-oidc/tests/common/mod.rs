@@ -968,6 +968,50 @@ impl Harness {
             .expect("deploy the hook at its position");
     }
 
+    /// Store an environment secret under the platform key, for a hook to be granted.
+    ///
+    /// THE DATA-PLANE STORE, not the control one. A restrictive policy from
+    /// `0100_environment_secret_control_writes.sql` binds `ironauth_control` to exactly one
+    /// reserved name, so the control role cannot write an ordinary secret at all -- which is
+    /// what the management surface itself does here, through `data_plane_store`.
+    pub async fn put_secret(&self, name: &str, value: &str) {
+        let env = self.env().clone();
+        self.db()
+            .store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .environment_secrets()
+            .put_under_platform_key(&env, name, value.as_bytes(), None)
+            .await
+            .expect("store the secret");
+    }
+
+    /// Grant a hook permission to read an environment secret (issue #114 criterion 5).
+    pub async fn grant_hook_secret(&self, client: &ClientId, hook: &str, secret: &str) {
+        let env = self.env().clone();
+        self.db()
+            .control_store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .token_hooks()
+            .grant_secret(&env, client, hook, secret)
+            .await
+            .expect("grant the secret");
+    }
+
+    /// Withdraw a hook's permission to read an environment secret.
+    pub async fn revoke_hook_secret(&self, client: &ClientId, hook: &str, secret: &str) {
+        let env = self.env().clone();
+        self.db()
+            .control_store()
+            .scoped(self.scope())
+            .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
+            .token_hooks()
+            .revoke_secret(&env, client, hook, secret)
+            .await
+            .expect("revoke the secret");
+    }
+
     /// Swap two hooks' positions in a client's chain, by direct SQL.
     ///
     /// STANDS IN FOR THE REORDER ROUTE, which is not built yet. A redeploy deliberately does
