@@ -1385,6 +1385,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0173_session_token_templates.sql"),
         },
+        Migration {
+            version: 174,
+            name: "session_jwt_mode",
+            // EXPAND: one new table the old binary never reads or writes, and which is EMPTY
+            // until an operator enables the mode. A rollback to the previous binary leaves it
+            // inert, and an environment that had the mode on simply stops advertising it --
+            // which is the same state its SDKs degrade to when a re-mint fails.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0174_session_jwt_mode.sql"),
+        },
     ]
 }
 

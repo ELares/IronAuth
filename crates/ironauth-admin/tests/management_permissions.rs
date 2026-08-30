@@ -204,6 +204,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteConfig,
     ),
     ("listSessionTokenTemplates", ManagementPermission::Read),
+    // The OPT-IN JWT SESSION MODE switch (issue #119 criterion 4). `write_config` on BOTH
+    // directions, and the disable is not a de-escalation: turning it on moves every session
+    // check in the environment off the database, and turning it off moves them all back, which
+    // is a load characteristic somebody sized for. The read is `read` for the reason the
+    // template listing is.
+    ("setSessionJwtMode", ManagementPermission::WriteConfig),
+    ("deleteSessionJwtMode", ManagementPermission::WriteConfig),
+    ("getSessionJwtMode", ManagementPermission::Read),
     (
         "deployChallengeComponent",
         ManagementPermission::WriteConfig,
@@ -676,6 +684,13 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // The OPT-IN JWT session mode switch (issue #119 criterion 4), proven by
+    // `the_jwt_session_mode_switch_splits_flipping_it_from_reading_it`: both directions on all
+    // three routes, including the DISABLE, which is the safe direction and still not a
+    // de-escalation.
+    "setSessionJwtMode",
+    "deleteSessionJwtMode",
+    "getSessionJwtMode",
     // The session tokenizer template surface (issue #119), proven by
     // `the_session_tokenizer_surface_splits_writing_a_template_from_reading_the_list`: both
     // directions on all three routes, each refusal asserted to NAME the permission it wanted.
@@ -855,7 +870,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 192 operations declare a required permission and 48 have that permission proven. The other
+/// 195 operations declare a required permission and 51 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -870,7 +885,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 206 minus 62 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// its own: 209 minus 65 is always 144. (It read "166 minus 22", then "171 minus 27", while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
 /// pinned by the two `assert_eq!`s in the test below; if you change either, change this
@@ -888,12 +903,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        206,
+        209,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        62,
+        65,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

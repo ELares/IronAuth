@@ -2687,6 +2687,33 @@ pub struct SetSessionTokenTemplateRequest {
     pub rules: serde_json::Value,
 }
 
+/// Whether an environment runs the OPT-IN short-lived JWT session mode (issue #119 criterion 4).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SessionJwtModeView {
+    /// Whether the mode is on. A FRESH ENVIRONMENT REPORTS `false`, and that is the default the
+    /// issue asks for: nothing turns this on but the endpoint whose job it is.
+    pub enabled: bool,
+    /// The tokenizer template SDKs mint from, absent when the mode is off.
+    pub template: Option<String>,
+    /// The template's TTL in seconds, absent when the mode is off.
+    ///
+    /// Repeated here rather than left to a second lookup because it is the number an operator
+    /// enabling this is accepting: it is the re-mint cadence AND the window in which a revoked
+    /// session's already-minted token still verifies.
+    pub ttl_seconds: Option<i32>,
+}
+
+/// The request body for turning the JWT session mode on (issue #119 criterion 4).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SetSessionJwtModeRequest {
+    /// The tokenizer template SDKs mint session JWTs from.
+    ///
+    /// A NAME rather than a boolean, deliberately: a JWT has to say who it is for and what it
+    /// carries, and a boolean would leave the audience, the TTL and the claim set to be invented
+    /// by something. Naming a template makes all three the operator's choice.
+    pub template: String,
+}
+
 /// The environment secrets a custom factor component may read (issue #114 criterion 6).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ChallengeComponentSecretsView {

@@ -534,6 +534,78 @@ pub async fn tokenize(
     response
 }
 
+/// `GET /t/{tenant}/e/{environment}/session/token-mode`: whether this environment runs the
+/// OPT-IN short-lived JWT session mode, and if so, against which template (issue #119
+/// criterion 4).
+///
+/// An SDK reads this at start-up to learn which of two things it is doing:
+///
+/// - `{"enabled": false}` -- check the session statefully, which is what every environment does
+///   until somebody turns this on. THIS IS THE DEFAULT AND A FRESH ENVIRONMENT ANSWERS IT.
+/// - `{"enabled": true, "template": "...", "ttl_seconds": N, "jwks_uri": "..."}` -- mint a
+///   session JWT from that template and re-mint it every `ttl_seconds`.
+///
+/// # Public, and what that does and does not disclose
+///
+/// Unauthenticated, like discovery and like the JWKS routes, because an SDK has to read it
+/// BEFORE it has a session to present. What it discloses is one template name, its TTL, and its
+/// JWKS URL -- configuration a verifier needs and which the published key set already implies
+/// for anyone who knows the name. It discloses nothing about any session, any subject, or any
+/// other template: a template not named by the mode is not mentioned here.
+///
+/// # It answers `enabled: false` for a mode pointed at a template that is gone
+///
+/// The foreign key cascades a template delete into a mode delete, so this state should not
+/// arise. It is still answered fail-CLOSED rather than as an error, because "the mode is off"
+/// sends an SDK to the stateful check, which is exactly where it should be when the tokenizer
+/// cannot mint. An error would send it to its own failure handling for a condition that has a
+/// correct answer.
+pub async fn token_mode(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found_json();
+    };
+    let templates = state.store().scoped(scope).session_token_templates();
+    let Ok(mode) = state
+        .store()
+        .scoped(scope)
+        .session_jwt_mode()
+        .template()
+        .await
+    else {
+        return server_error();
+    };
+    let Some(template_name) = mode else {
+        return json_response(StatusCode::OK, json!({ "enabled": false }));
+    };
+    let record = match templates.get(&template_name).await {
+        Ok(Some(record)) => record,
+        // See the doc: fail CLOSED to "off" rather than erroring.
+        Ok(None) => return json_response(StatusCode::OK, json!({ "enabled": false })),
+        Err(_) => return server_error(),
+    };
+    json_response(
+        StatusCode::OK,
+        json!({
+            "enabled": true,
+            "template": record.name,
+            "ttl_seconds": record.ttl_seconds,
+            "audience": record.audience,
+            // BUILT FROM `issuer_for`, which is the one function that knows how a
+            // per-environment URL is spelled. Rebuilding the `/t/../e/..` prefix here would be a
+            // second place that has to agree with the router, and the first time they disagreed
+            // this endpoint would hand every SDK a URL that 404s.
+            "jwks_uri": format!(
+                "{}/session-tokens/{}/jwks.json",
+                state.issuer_for(&scope),
+                record.name
+            ),
+        }),
+    )
+}
+
 /// The `tokenize_as` query parameter: which template to mint from.
 #[derive(serde::Deserialize)]
 pub struct TokenizeQuery {

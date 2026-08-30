@@ -824,6 +824,18 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The OPT-IN JWT session mode for this scope (issue #119 criterion 4), read-only.
+    ///
+    /// Read by the endpoint that tells an SDK which mode it is in. Read-only by design: the
+    /// plane serving logins does not get to decide how its own sessions are checked.
+    #[must_use]
+    pub fn session_jwt_mode(&self) -> SessionJwtModeRepo<'a> {
+        SessionJwtModeRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The SESSION TOKENIZER templates for this scope (issue #119), read-only.
     ///
     /// Read by the tokenize endpoint on every mint and by the template's JWKS route on every
@@ -1960,6 +1972,19 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn challenge_components(&self) -> ActingChallengeComponentRepo<'a> {
         ActingChallengeComponentRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The OPT-IN JWT session mode for this scope and actor (issue #119 criterion 4).
+    ///
+    /// The control plane's grants on `session_jwt_mode` exist for THIS and nothing else:
+    /// enabling it changes how every SDK in the environment decides whether a user is signed in.
+    #[must_use]
+    pub fn session_jwt_mode(&self) -> ActingSessionJwtModeRepo<'a> {
+        ActingSessionJwtModeRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -33460,6 +33485,144 @@ impl SessionTokenTemplateRepo<'_> {
         tx.commit().await?;
         row.map(|row| session_token_key_from_row(&row, &scope))
             .transpose()
+    }
+}
+
+/// The audit target for the JWT session mode switch (issue #119 criterion 4).
+///
+/// The TEMPLATE the mode was pointed at, because that is the answer an auditor needs next: the
+/// template's TTL is how long a revoked session's token keeps verifying once the mode is on.
+/// A disable names the template it was pointed at, so the row still says what was turned off.
+struct SessionJwtModeTarget<'a>(&'a str);
+
+impl AuditTarget for SessionJwtModeTarget<'_> {
+    fn audit_target_kind(&self) -> &'static str {
+        "session_jwt_mode"
+    }
+
+    fn audit_target_id(&self) -> String {
+        self.0.to_owned()
+    }
+}
+
+/// The mutating JWT-session-mode repository for one scope and actor (issue #119 criterion 4).
+pub struct ActingSessionJwtModeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSessionJwtModeRepo<'_> {
+    /// Turn the mode ON for this environment, pointed at `template`, or repoint an existing one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, which includes the foreign key onto
+    /// `session_token_templates`: naming a template that does not exist is refused by the
+    /// database rather than stored, so the mode can never point at nothing.
+    pub async fn enable(&self, env: &Env, template: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let name = template.to_owned();
+        let bound = name.clone();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SessionJwtModeEnabled,
+                target: &SessionJwtModeTarget(&bound),
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO session_jwt_mode \
+                     (tenant_id, environment_id, template_name) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (tenant_id, environment_id) DO UPDATE \
+                     SET template_name = EXCLUDED.template_name, updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Turn the mode OFF. The row is DELETED rather than flagged, so "off" stays the absence of
+    /// a row and there is only ever one representation of it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the mode was not on;
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn disable(&self, env: &Env, template: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let bound = template.to_owned();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SessionJwtModeDisabled,
+                target: &SessionJwtModeTarget(&bound),
+            },
+            async move |tx| {
+                let done = sqlx::query(
+                    "DELETE FROM session_jwt_mode \
+                     WHERE tenant_id = $1 AND environment_id = $2",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?;
+                // A disable that matched nothing is NOT FOUND rather than a silent success, so an
+                // operator who believes they turned something off learns it was already off
+                // instead of assuming a change landed.
+                if done.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The read-only JWT-session-mode repository for one scope (issue #119 criterion 4).
+pub struct SessionJwtModeRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SessionJwtModeRepo<'_> {
+    /// The template this environment mints session JWTs from, or [`None`] when the mode is OFF.
+    ///
+    /// [`None`] IS the default and is what a fresh environment answers: there is no row, and no
+    /// code path creates one except the management endpoint that exists to.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn template(&self) -> Result<Option<String>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT template_name FROM session_jwt_mode \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
     }
 }
 

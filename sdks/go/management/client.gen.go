@@ -512,6 +512,13 @@ func (c *Client) DeleteSecret(tenant_id string, environment_id string, name stri
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/secrets/" + escape(name), query, nil)
 }
 
+// DeleteSessionJwtMode performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode.
+//
+// Turn the OPT-IN short-lived JWT session mode OFF.
+func (c *Client) DeleteSessionJwtMode(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/session-jwt-mode", query, nil)
+}
+
 // DeleteSessionTokenTemplate performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates.
 //
 // Remove a session tokenizer template.
@@ -895,6 +902,13 @@ func (c *Client) GetSecret(tenant_id string, environment_id string, name string,
 // Inspect one session, whatever its lifecycle state (live, revoked, or rotated away).
 func (c *Client) GetSession(tenant_id string, environment_id string, session_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/sessions/" + escape(session_id), query, nil)
+}
+
+// GetSessionJwtMode performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode.
+//
+// Report whether the OPT-IN short-lived JWT session mode is on.
+func (c *Client) GetSessionJwtMode(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/session-jwt-mode", query, nil)
 }
 
 // GetSigningRecommendations performs GET /v1/interop/signing-recommendations.
@@ -1763,6 +1777,13 @@ func (c *Client) SetOutboundVerification(tenant_id string, environment_id string
 // Set (create or replace) a secret by name.
 func (c *Client) SetSecret(tenant_id string, environment_id string, name string, query url.Values, body any) (*http.Response, error) {
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/secrets/" + escape(name), query, body)
+}
+
+// SetSessionJwtMode performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode.
+//
+// Turn the OPT-IN short-lived JWT session mode ON, pointed at a template.
+func (c *Client) SetSessionJwtMode(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/session-jwt-mode", query, body)
 }
 
 // SetSessionTokenTemplate performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates.

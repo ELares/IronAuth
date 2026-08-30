@@ -1288,6 +1288,21 @@ impl Harness {
         key_id
     }
 
+    /// Turn the OPT-IN JWT session mode ON for the harness scope, pointed at `template`
+    /// (issue #119 criterion 4), through the control-plane repository the management surface
+    /// uses.
+    pub async fn enable_session_jwt_mode(&self, template: &str) {
+        let (actor, corr) = self.seeding_actor();
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .session_jwt_mode()
+            .enable(&self.env, template)
+            .await
+            .expect("enable the jwt session mode");
+    }
+
     /// A fresh 32-byte Ed25519 seed drawn from the entropy seam, for provisioning a
     /// key with [`Harness::provision_signing_key`].
     #[must_use]

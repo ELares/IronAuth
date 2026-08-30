@@ -398,6 +398,112 @@ async fn the_tokenize_response_is_never_cached() {
     );
 }
 
+/// The token-mode endpoint for the harness scope.
+fn token_mode_path(harness: &Harness) -> String {
+    let scope = harness.scope();
+    format!(
+        "/t/{}/e/{}/session/token-mode",
+        scope.tenant(),
+        scope.environment()
+    )
+}
+
+#[tokio::test]
+async fn a_fresh_environment_reports_the_jwt_session_mode_disabled() {
+    // CRITERION 4, the default half. An environment nobody configured answers `enabled: false`,
+    // and it answers it without a template even existing -- there is no row, and nothing creates
+    // one but the endpoint whose job it is.
+    let harness = Harness::start_store_backed().await;
+    let (status, body) = fetch(&harness, &token_mode_path(&harness)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mode: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(mode["enabled"], false);
+    assert!(mode["template"].is_null(), "{mode}");
+}
+
+#[tokio::test]
+async fn installing_a_template_does_not_by_itself_enable_the_mode() {
+    // THE DISTINCTION THAT MAKES CRITERION 4 REAL, and the test that would fail if enabling were
+    // a side effect of configuring. A template is inert until something calls tokenize; the mode
+    // is what makes SDKs call it in the background, and it is a separate, explicit decision.
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template("orders", AUDIENCE, 60, "[]")
+        .await;
+    let (_status, body) = fetch(&harness, &token_mode_path(&harness)).await;
+    let mode: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(mode["enabled"], false, "a template is not a mode: {mode}");
+}
+
+#[tokio::test]
+async fn enabling_the_mode_advertises_a_jwks_uri_that_actually_answers() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template("orders", AUDIENCE, 90, "[]")
+        .await;
+    harness.enable_session_jwt_mode("orders").await;
+
+    let (status, body) = fetch(&harness, &token_mode_path(&harness)).await;
+    assert_eq!(status, StatusCode::OK);
+    let mode: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(mode["enabled"], true);
+    assert_eq!(mode["template"], "orders");
+    assert_eq!(mode["ttl_seconds"], 90);
+    assert_eq!(mode["audience"], AUDIENCE);
+
+    // THE ADVERTISED URL IS FETCHED, not merely compared to a string this test builds the same
+    // way the handler does. A URL assembled correctly by two pieces of code that agree with each
+    // other and not with the router is exactly the defect a string comparison cannot see.
+    let advertised = mode["jwks_uri"].as_str().expect("a jwks uri");
+    let path = advertised
+        .split_once("/t/")
+        .map(|(_, rest)| format!("/t/{rest}"))
+        .expect("the advertised uri carries the per-environment path");
+    let (jwks_status, jwks_body) = fetch(&harness, &path).await;
+    assert_eq!(
+        jwks_status,
+        StatusCode::OK,
+        "the advertised jwks uri must answer: {advertised}"
+    );
+    assert!(jwks_body.contains("\"kty\""), "{jwks_body}");
+}
+
+#[tokio::test]
+async fn deleting_the_template_turns_the_mode_off_rather_than_leaving_it_dangling() {
+    let harness = Harness::start_store_backed().await;
+    harness
+        .install_session_token_template("orders", AUDIENCE, 60, "[]")
+        .await;
+    harness.enable_session_jwt_mode("orders").await;
+    let (_status, body) = fetch(&harness, &token_mode_path(&harness)).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("json")["enabled"],
+        true
+    );
+
+    let (actor, corr) = harness.seeding_actor();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(actor, corr)
+        .session_token_templates()
+        .delete(harness.env(), "orders")
+        .await
+        .expect("delete the template");
+
+    // The cascade, MEASURED at the surface an SDK reads. An environment left pointed at a
+    // template that no longer exists would advertise a JWKS URL that 404s, and every SDK reading
+    // it would mint against nothing.
+    let (status, after) = fetch(&harness, &token_mode_path(&harness)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&after).expect("json")["enabled"],
+        false,
+        "{after}"
+    );
+}
+
 /// The documentation states the revocation window as a function of the configured TTL, and quotes
 /// three numbers (criterion 5). This asserts every one of them against the constants that actually
 /// bound a template, so the sentence an operator reads is DERIVED from the code rather than

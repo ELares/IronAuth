@@ -954,6 +954,19 @@ pub enum Action {
     /// its JWKS URL stops answering and every consumer verifying against it starts failing. This
     /// is the row that explains that outage.
     SessionTokenTemplateDelete,
+    /// The OPT-IN short-lived JWT SESSION MODE was turned on for an environment, or repointed at
+    /// a different template (issue #119 criterion 4).
+    ///
+    /// The highest-value configuration event this feature has. Turning it on changes how every
+    /// SDK in the environment decides whether a user is signed in: from a database-backed check
+    /// that honours revocation immediately to a token that keeps verifying until it expires. An
+    /// auditor reading this row wants the TEMPLATE, because the template's TTL is how long that
+    /// window is.
+    SessionJwtModeEnabled,
+    /// The OPT-IN short-lived JWT SESSION MODE was turned OFF (issue #119 criterion 4). Audited
+    /// separately because it is the safe direction and an operator investigating a latency
+    /// change needs to be able to find it: every SDK goes back to the stateful check.
+    SessionJwtModeDisabled,
     /// A DEPLOYED TOKEN HOOK TRIED TO WRITE A CLAIM IT MAY NOT, and the fence refused it
     /// (issue #113 criterion 5: protected claims "cannot be overridden by any mapping or hook;
     /// attempts are rejected AND AUDITED").
@@ -1672,6 +1685,8 @@ impl Action {
             Action::ChallengeComponentSecretRevoked => "challenge_component.secret.revoked",
             Action::SessionTokenTemplateSet => "session_token_template.set",
             Action::SessionTokenTemplateDelete => "session_token_template.delete",
+            Action::SessionJwtModeEnabled => "session_jwt_mode.enabled",
+            Action::SessionJwtModeDisabled => "session_jwt_mode.disabled",
             Action::TokenHookSet => "token_hook.set",
             Action::TokenHookDelete => "token_hook.delete",
             Action::ClaimsMappingSet => "claims_mapping.set",

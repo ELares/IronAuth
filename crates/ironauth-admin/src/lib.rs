@@ -812,6 +812,16 @@ pub fn management_router(state: AdminState) -> Router {
         // opaque session into a short-lived JWT. Keyed on a NAME rather than on a client,
         // because a template is an environment-level object a session tokenizes against and has
         // no client of its own.
+        // The OPT-IN short-lived JWT SESSION MODE switch (issue #119 criterion 4). Separate
+        // from the template routes because it is a different decision: a template is inert
+        // until something calls tokenize, and this is what makes every SDK in the environment
+        // do it in the background.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
+            put(session_token_templates::set_session_jwt_mode)
+                .get(session_token_templates::get_session_jwt_mode)
+                .delete(session_token_templates::delete_session_jwt_mode),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
             put(session_token_templates::set_session_token_template)

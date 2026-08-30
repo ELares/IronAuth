@@ -2554,6 +2554,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Report whether the OPT-IN short-lived JWT session mode is on. */
+        get: operations["getSessionJwtMode"];
+        /**
+         * Turn the OPT-IN short-lived JWT session mode ON, pointed at a template.
+         * @description # This is the one write in this module that changes how EVERY session in the environment is
+         *     checked
+         *
+         *     A tokenizer template on its own does nothing until somebody calls `tokenize`. This switch
+         *     makes the SDKs do it in the background, which moves the whole environment from a
+         *     database-backed session check that honours revocation immediately to a token that keeps
+         *     verifying until it expires. The template's TTL is the width of that window.
+         *
+         *     So it is classified and gated exactly like the template write, and the response repeats the
+         *     TTL and says what it means, because an operator turning this on should not have to look the
+         *     number up somewhere else to learn what they just accepted.
+         */
+        put: operations["setSessionJwtMode"];
+        post?: never;
+        /** Turn the OPT-IN short-lived JWT session mode OFF. */
+        delete: operations["deleteSessionJwtMode"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates": {
         parameters: {
             query?: never;
@@ -7247,6 +7279,25 @@ export interface components {
              */
             version: number;
         };
+        /** @description Whether an environment runs the OPT-IN short-lived JWT session mode (issue #119 criterion 4). */
+        SessionJwtModeView: {
+            /**
+             * @description Whether the mode is on. A FRESH ENVIRONMENT REPORTS `false`, and that is the default the
+             *     issue asks for: nothing turns this on but the endpoint whose job it is.
+             */
+            enabled: boolean;
+            /** @description The tokenizer template SDKs mint from, absent when the mode is off. */
+            template?: string | null;
+            /**
+             * Format: int32
+             * @description The template's TTL in seconds, absent when the mode is off.
+             *
+             *     Repeated here rather than left to a second lookup because it is the number an operator
+             *     enabling this is accepting: it is the re-mint cadence AND the window in which a revoked
+             *     session's already-minted token still verifies.
+             */
+            ttl_seconds?: number | null;
+        };
         /** @description A page of sessions. */
         SessionList: {
             /** @description The sessions in this page. */
@@ -7669,6 +7720,17 @@ export interface components {
              *     table and is never readable through this API afterwards.
              */
             value: string;
+        };
+        /** @description The request body for turning the JWT session mode on (issue #119 criterion 4). */
+        SetSessionJwtModeRequest: {
+            /**
+             * @description The tokenizer template SDKs mint session JWTs from.
+             *
+             *     A NAME rather than a boolean, deliberately: a JWT has to say who it is for and what it
+             *     carries, and a boolean would leave the audience, the TTL and the claim set to be invented
+             *     by something. Naming a template makes all three the operator's choice.
+             */
+            template: string;
         };
         /** @description The request body for creating or replacing a session tokenizer template (issue #119). */
         SetSessionTokenTemplateRequest: {
@@ -21619,6 +21681,173 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getSessionJwtMode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The mode. A fresh environment reports disabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionJwtModeView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setSessionJwtMode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionJwtModeRequest"];
+            };
+        };
+        responses: {
+            /** @description Enabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionJwtModeView"];
+                };
+            };
+            /** @description An absent template name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, or no template of that name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteSessionJwtMode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Disabled. Every SDK goes back to the stateful session check */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, or the mode was not on */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

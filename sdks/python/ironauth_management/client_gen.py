@@ -303,6 +303,10 @@ class Client:
         """Delete a secret by name. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets/{urllib.parse.quote(name)}", query, None)
 
+    def delete_session_jwt_mode(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Turn the OPT-IN short-lived JWT session mode OFF. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-jwt-mode", query, None)
+
     def delete_session_token_template(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Remove a session tokenizer template. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-token-templates", query, None)
@@ -522,6 +526,10 @@ class Client:
     def get_session(self, tenant_id: str, environment_id: str, session_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Inspect one session, whatever its lifecycle state (live, revoked, or rotated away). GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions/{session_id}."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sessions/{urllib.parse.quote(session_id)}", query, None)
+
+    def get_session_jwt_mode(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Report whether the OPT-IN short-lived JWT session mode is on. GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-jwt-mode", query, None)
 
     def get_signing_recommendations(self, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Surface the token-signing compatibility interop table (issue #93). GET /v1/interop/signing-recommendations."""
@@ -1018,6 +1026,10 @@ class Client:
     def set_secret(self, tenant_id: str, environment_id: str, name: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or replace) a secret by name. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets/{urllib.parse.quote(name)}", query, body)
+
+    def set_session_jwt_mode(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Turn the OPT-IN short-lived JWT session mode ON, pointed at a template. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-jwt-mode", query, body)
 
     def set_session_token_template(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Create or replace a session tokenizer template. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates."""

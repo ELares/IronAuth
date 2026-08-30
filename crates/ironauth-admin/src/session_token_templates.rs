@@ -49,7 +49,8 @@ use crate::input::parse_json;
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
-    SessionTokenTemplateView, SessionTokenTemplatesView, SetSessionTokenTemplateRequest,
+    SessionJwtModeView, SessionTokenTemplateView, SessionTokenTemplatesView,
+    SetSessionJwtModeRequest, SetSessionTokenTemplateRequest,
 };
 
 /// Now, in epoch microseconds, from the environment clock seam.
@@ -322,6 +323,200 @@ pub async fn delete_session_token_template(
         .acting(actor, CorrelationId::generate(state.env()))
         .session_token_templates()
         .delete(state.env(), name)
+        .await?;
+    Ok(no_content())
+}
+
+/// Turn the OPT-IN short-lived JWT session mode ON, pointed at a template.
+///
+/// # This is the one write in this module that changes how EVERY session in the environment is
+/// checked
+///
+/// A tokenizer template on its own does nothing until somebody calls `tokenize`. This switch
+/// makes the SDKs do it in the background, which moves the whole environment from a
+/// database-backed session check that honours revocation immediately to a token that keeps
+/// verifying until it expires. The template's TTL is the width of that window.
+///
+/// So it is classified and gated exactly like the template write, and the response repeats the
+/// TTL and says what it means, because an operator turning this on should not have to look the
+/// number up somewhere else to learn what they just accepted.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
+    operation_id = "setSessionJwtMode",
+    tag = "session-token-templates",
+    request_body = SetSessionJwtModeRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "Enabled", body = SessionJwtModeView),
+        (status = 400, description = "An absent template name", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found, or no template of that name", body = ErrorBody)
+    )
+)]
+pub async fn set_session_jwt_mode(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // FRESH PRIVILEGE, for a stronger reason than the template write: this is the switch that
+    // makes every SDK in the environment stop checking the database.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    let request: SetSessionJwtModeRequest = parse_json(&body)?;
+    if request.template.is_empty() {
+        return Err(ApiError::BadRequest(
+            "a template name is required: enabling this mode means naming the template SDKs \
+             mint from"
+                .to_owned(),
+        ));
+    }
+    // READ THE TEMPLATE FIRST, so naming one that does not exist is a 404 an operator can act on
+    // rather than the foreign key surfacing as a 500. The constraint stays behind this as the
+    // backstop that a concurrent delete cannot get past.
+    let template = state
+        .store()
+        .scoped(scope)
+        .session_token_templates()
+        .get(&request.template)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .session_jwt_mode()
+        .enable(state.env(), &template.name)
+        .await?;
+
+    let view = SessionJwtModeView {
+        enabled: true,
+        template: Some(template.name),
+        ttl_seconds: Some(template.ttl_seconds),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Report whether the OPT-IN short-lived JWT session mode is on.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
+    operation_id = "getSessionJwtMode",
+    tag = "session-token-templates",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The mode. A fresh environment reports disabled", body = SessionJwtModeView),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found", body = ErrorBody)
+    )
+)]
+pub async fn get_session_jwt_mode(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    principal.require_permission(ManagementPermission::Read)?;
+
+    let mode = state
+        .store()
+        .scoped(scope)
+        .session_jwt_mode()
+        .template()
+        .await?;
+    // A 200 REPORTING DISABLED, not a 404. "This environment does not run the mode" is an
+    // answer, and the only answer a fresh environment has; a 404 would make the caller
+    // distinguish "no such environment" from "the default", which are not the same thing.
+    let view = match mode {
+        None => SessionJwtModeView {
+            enabled: false,
+            template: None,
+            ttl_seconds: None,
+        },
+        Some(name) => {
+            let ttl = state
+                .store()
+                .scoped(scope)
+                .session_token_templates()
+                .get(&name)
+                .await?
+                .map(|record| record.ttl_seconds);
+            SessionJwtModeView {
+                enabled: true,
+                template: Some(name),
+                ttl_seconds: ttl,
+            }
+        }
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Turn the OPT-IN short-lived JWT session mode OFF.
+#[utoipa::path(
+    delete,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
+    operation_id = "deleteSessionJwtMode",
+    tag = "session-token-templates",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Disabled. Every SDK goes back to the stateful session check"),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found, or the mode was not on", body = ErrorBody)
+    )
+)]
+pub async fn delete_session_jwt_mode(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // FRESH PRIVILEGE ON THE DISABLE TOO. This one is the SAFE direction -- every SDK goes back
+    // to the database-backed check -- but it is still a change every request in the environment
+    // feels, and a load characteristic somebody sized for. It is not a de-escalation.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    // The template the mode WAS pointed at, read before the delete so the audit row can name it.
+    // A disable that names nothing would be a row an auditor cannot use.
+    let template = state
+        .store()
+        .scoped(scope)
+        .session_jwt_mode()
+        .template()
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .session_jwt_mode()
+        .disable(state.env(), &template)
         .await?;
     Ok(no_content())
 }

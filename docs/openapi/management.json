@@ -19377,6 +19377,244 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode": {
+      "get": {
+        "tags": [
+          "session-token-templates"
+        ],
+        "summary": "Report whether the OPT-IN short-lived JWT session mode is on.",
+        "operationId": "getSessionJwtMode",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mode. A fresh environment reports disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJwtModeView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "session-token-templates"
+        ],
+        "summary": "Turn the OPT-IN short-lived JWT session mode ON, pointed at a template.",
+        "description": "# This is the one write in this module that changes how EVERY session in the environment is\nchecked\n\nA tokenizer template on its own does nothing until somebody calls `tokenize`. This switch\nmakes the SDKs do it in the background, which moves the whole environment from a\ndatabase-backed session check that honours revocation immediately to a token that keeps\nverifying until it expires. The template's TTL is the width of that window.\n\nSo it is classified and gated exactly like the template write, and the response repeats the\nTTL and says what it means, because an operator turning this on should not have to look the\nnumber up somewhere else to learn what they just accepted.",
+        "operationId": "setSessionJwtMode",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionJwtModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJwtModeView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An absent template name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, or no template of that name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "session-token-templates"
+        ],
+        "summary": "Turn the OPT-IN short-lived JWT session mode OFF.",
+        "operationId": "deleteSessionJwtMode",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Disabled. Every SDK goes back to the stateful session check"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, or the mode was not on",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates": {
       "get": {
         "tags": [
@@ -32330,6 +32568,34 @@
           }
         }
       },
+      "SessionJwtModeView": {
+        "type": "object",
+        "description": "Whether an environment runs the OPT-IN short-lived JWT session mode (issue #119 criterion 4).",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the mode is on. A FRESH ENVIRONMENT REPORTS `false`, and that is the default the\nissue asks for: nothing turns this on but the endpoint whose job it is."
+          },
+          "template": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The tokenizer template SDKs mint from, absent when the mode is off."
+          },
+          "ttl_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The template's TTL in seconds, absent when the mode is off.\n\nRepeated here rather than left to a second lookup because it is the number an operator\nenabling this is accepting: it is the re-mint cadence AND the window in which a revoked\nsession's already-minted token still verifies."
+          }
+        }
+      },
       "SessionList": {
         "type": "object",
         "description": "A page of sessions.",
@@ -32830,6 +33096,19 @@
           "value": {
             "type": "string",
             "description": "The value to seal. It is sealed under the environment's DEK before it reaches the\ntable and is never readable through this API afterwards."
+          }
+        }
+      },
+      "SetSessionJwtModeRequest": {
+        "type": "object",
+        "description": "The request body for turning the JWT session mode on (issue #119 criterion 4).",
+        "required": [
+          "template"
+        ],
+        "properties": {
+          "template": {
+            "type": "string",
+            "description": "The tokenizer template SDKs mint session JWTs from.\n\nA NAME rather than a boolean, deliberately: a JWT has to say who it is for and what it\ncarries, and a boolean would leave the audience, the TTL and the claim set to be invented\nby something. Naming a template makes all three the operator's choice."
           }
         }
       },
