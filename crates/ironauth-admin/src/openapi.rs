@@ -43,10 +43,11 @@ use crate::views::{
     SetClientAdminConsentRequest, SetLocaleRequest, SetSignupFormRequest, SetUserStateRequest,
     SignupFormFieldView, SignupFormView, SignupQuarantineCaseView, SignupQuarantineDecisionView,
     SignupQuarantineList, SignupQuarantineReasonView, SignupQuarantineStateView, TenantCreated,
-    TenantList, TenantStatusView, TenantView, TokenHookVersionView, TokenHookView,
-    TraitAnnotationsView, TraitSchemaVersionView, UpdateUserRequest, UserConsentList,
-    UserConsentView, UserExternalIdView, UserList, UserRevocationView, UserStateChangeView,
-    UserStateView, UserTraitsView, UserView, VerificationAddressView,
+    TenantList, TenantStatusView, TenantView, TestTokenHookRequest, TestTokenHookResponse,
+    TokenHookVersionView, TokenHookView, TraitAnnotationsView, TraitSchemaVersionView,
+    UpdateUserRequest, UserConsentList, UserConsentView, UserExternalIdView, UserList,
+    UserRevocationView, UserStateChangeView, UserStateView, UserTraitsView, UserView,
+    VerificationAddressView,
 };
 
 /// The management API's OpenAPI document. The handlers listed in `paths(...)`
@@ -346,6 +347,7 @@ use crate::views::{
         crate::token_hooks::delete_token_hook,
         crate::token_hooks::list_token_hook_versions,
         crate::token_hooks::rollback_token_hook,
+        crate::token_hooks::test_token_hook,
         crate::signup_forms::set_signup_form,
         crate::signup_forms::get_signup_form,
         crate::signup_forms::delete_signup_form,
@@ -564,6 +566,8 @@ use crate::views::{
         TokenHookView,
         TokenHookVersionView,
         RollbackTokenHookRequest,
+        TestTokenHookRequest,
+        TestTokenHookResponse,
         SetSignupFormRequest,
         SignupFormFieldView,
         SignupFormView,

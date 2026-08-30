@@ -215,6 +215,81 @@ pub mod token_hook {
             match *self {}
         }
     }
+
+    /// The DRAFT-RUN seam's shape, with the feature off (issue #114 criterion 5).
+    ///
+    /// These four items exist so `ironauth-admin`'s draft endpoint compiles with NO `cfg` of
+    /// its own. That matters more than it looks: a `cfg` in a downstream crate keys on THAT
+    /// crate's feature flag, while the TYPE it guards comes from this one -- and the two can be
+    /// enabled independently. Measured: `cargo test -p ironauth-oidc --all-features` builds
+    /// `ironauth-admin` without its flag and with this crate's flag ON, so the downstream dead
+    /// arm called `unreachable` on the REAL `HookRuntime`, which has no such method. It failed
+    /// to compile in a combination nobody thought to try.
+    ///
+    /// One signature across both builds is what the paragraph above promises. Giving the stub
+    /// the whole seam rather than only the runtime is what delivers it.
+    pub struct Invocation<'a> {
+        /// The scope the tokens belong to.
+        pub scope: ironauth_store::Scope,
+        /// The client the tokens are for.
+        pub client_id: &'a str,
+        /// The wire `grant_type`.
+        pub grant_type: &'a str,
+        /// The subject, absent for a grant with no user.
+        pub subject: Option<&'a str>,
+        /// The ID-token claims as the mint has them so far.
+        pub id_token_claims: &'a serde_json::Map<String, serde_json::Value>,
+        /// The access-token claims as the mint has them so far.
+        pub access_token_claims: &'a serde_json::Map<String, serde_json::Value>,
+    }
+
+    /// What a hook contributed, with the feature off. Unreachable by construction.
+    ///
+    /// EVERY FIELD OF THE REAL ONE, and keeping that true is a build-time obligation rather
+    /// than a convention: `ironauth-admin` reads these fields with no `cfg` of its own, so a
+    /// field added to the real type and not to this one fails the no-feature build. It already
+    /// has -- `refusals_not_reported` was added to the real `HookClaims` and the OpenAPI
+    /// example, which builds without the feature, stopped compiling immediately. That is the
+    /// guard: not a lint, but the fact that a downstream crate compiles against both.
+    pub struct HookClaims {
+        /// Accepted ID-token claims.
+        pub id_token: std::collections::BTreeMap<String, serde_json::Value>,
+        /// Accepted access-token claims.
+        pub access_token: std::collections::BTreeMap<String, serde_json::Value>,
+        /// Claim names the protected-claim fence refused.
+        pub refused: Vec<String>,
+        /// How many refusals did not fit `refused`.
+        pub refusals_not_reported: usize,
+        /// How many returned claims had a value that is not JSON.
+        pub values_not_json: usize,
+    }
+
+    /// Why a hook did not contribute, with the feature off. Unreachable by construction.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HookFault {
+        /// The store could not answer.
+        Unavailable,
+        /// The stored component could not be compiled or instantiated.
+        Unloadable,
+        /// The hook ran and exhausted a bound, trapped, or declined.
+        Aborted,
+        /// The hook was built against a payload version this server does not emit.
+        PayloadVersion,
+    }
+
+    /// Run a hook record, with the feature off.
+    ///
+    /// # Errors
+    ///
+    /// Never: `HookRuntime` is uninhabited, so no caller can reach this body.
+    pub async fn run_record(
+        runtime: &HookRuntime,
+        invocation: &Invocation<'_>,
+        record: &ironauth_store::token_hook_store::TokenHookRecord,
+    ) -> Result<Option<HookClaims>, HookFault> {
+        let _ = (invocation, record);
+        runtime.unreachable()
+    }
 }
 mod tokens;
 mod totp;

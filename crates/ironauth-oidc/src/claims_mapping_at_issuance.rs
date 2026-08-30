@@ -348,6 +348,26 @@ pub async fn apply_to_with_hook(
     }
 }
 
+/// Whether a grant MINTS AN ID TOKEN, and so whether a hook's ID-token half can reach one.
+///
+/// The three grants that answer `false` are exactly the callers of [`apply_to_machine_token`],
+/// which hands the guest an EMPTY ID-token list and DROPS the one it returns. A caller running
+/// the dispatch OUTSIDE an issuance -- the admin draft-test endpoint, issue #114 criterion 5 --
+/// has to know that, or it runs the hook on an input no login on that grant produces and
+/// reports an ID half no token on that grant can carry.
+///
+/// Keyed on `registry::GrantType`, not on three string literals: the doors pass the registry's
+/// own wire value for exactly this reason, and a second copy of these names is how the two
+/// drift. The `debug_assert!` at the top of [`apply_to_machine_token`] is what holds them
+/// together -- a fourth machine door added without teaching this function fails the suite
+/// rather than shipping a draft report that disagrees with its own issuance.
+#[must_use]
+pub fn grant_mints_id_token(grant_type: &str) -> bool {
+    grant_type != crate::registry::GrantType::ClientCredentials.as_str()
+        && grant_type != crate::registry::GrantType::JwtBearer.as_str()
+        && grant_type != crate::registry::GrantType::TokenExchange.as_str()
+}
+
 /// Resolve and run the same mapping and hook for a token that has NO ID token.
 ///
 /// `client_credentials`, `jwt:bearer` and token exchange mint one access token and nothing else,
@@ -419,6 +439,14 @@ pub async fn apply_to_machine_token(
     subject: Option<&str>,
     static_claims: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<MappedAccessClaims, MappingFault> {
+    // THE PREDICATE AND THE DOORS AGREE, and this is what says so. Every caller of this
+    // function is a grant that mints no ID token; `grant_mints_id_token` names that set for the
+    // draft endpoint, which cannot call this function and has to ask.
+    debug_assert!(
+        !grant_mints_id_token(grant_type),
+        "a grant reaching apply_to_machine_token mints no ID token, so grant_mints_id_token \
+         must agree: {grant_type}"
+    );
     let source = as_source(static_claims);
     let mut single = match resolve_for(
         store,

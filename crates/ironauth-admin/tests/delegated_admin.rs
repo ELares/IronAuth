@@ -3680,6 +3680,56 @@ async fn read_is_required_and_sufficient_for_listing_token_hook_versions() {
     );
 }
 
+/// `management.read` is required AND sufficient for a token-hook DRAFT RUN (#114 criterion 5).
+///
+/// Classified with the READS rather than with its three write-shaped neighbours, and that is
+/// the classification this test exists to hold: a draft run stores nothing, and what it reads
+/// is a hook resource this credential may already read. It DOES disclose the hook's behaviour,
+/// which the metadata read does not -- no endpoint returns the component -- and that is what
+/// the endpoint is for, bounded by a guest world that imports nothing. Getting it wrong in the
+/// other direction would demand `write_config` and sudo freshness to ask a question.
+///
+/// Both directions, because a blanket refusal and a missing gate are indistinguishable from
+/// one of them.
+#[tokio::test]
+async fn read_is_required_and_sufficient_for_a_token_hook_draft_run() {
+    let h = Harness::start(226).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-hook-draft").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/applications/cli_absentclient/token-hook/test"
+    );
+    let body = serde_json::json!({ "grant_type": "authorization_code" }).to_string();
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-draft-forbidden", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential must not run a hook: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-draft-allowed", &body).await;
+    // THE 404 IS THE MALFORMED CLIENT ID, not an absent hook, and it is what lets this test
+    // separate the gate from the handler without deploying an eleven-megabyte component:
+    // `cli_absentclient` fails `parse_client_id`, which runs after the permission check.
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a read credential must reach the handler, which then refuses the malformed client \
+         id. 403 versus 404 is what distinguishes the permission gate from the handler: \
+         {response}"
+    );
+}
+
 /// `management.write_config` is required AND sufficient for a token-hook ROLLBACK (#114).
 ///
 /// Classified with the deploy rather than with the read, and pinned separately, because a

@@ -999,6 +999,10 @@ class Client:
         """Suspend a tenant (fence its data plane; reversible). POST /v1/tenants/{tenant_id}/suspend."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/suspend", query, None)
 
+    def test_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Run a client's token hook against a recorded event, without deploying anything. POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/test", query, body)
+
     def unassign_org_group_role(self, tenant_id: str, environment_id: str, organization_id: str, group_id: str, role_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Withdraw a role from a group. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/roles/{role_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/groups/{urllib.parse.quote(group_id)}/roles/{urllib.parse.quote(role_id)}", query, None)

@@ -378,6 +378,84 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a client's token hook against a recorded event, without deploying anything.
+         * @description Issue #114 criterion 5's fixture-based draft testing, and the half of the Auth0 Actions loop
+         *     this surface was missing: deploy, ROLL BACK and list already worked, so an operator could
+         *     recover from a bad hook but could not avoid shipping one.
+         *
+         *     # It runs the SHIPPED dispatch, not a copy of it
+         *
+         *     `ironauth_oidc::token_hook::run_record` is the same function an issuance calls, with the
+         *     same limits, the same payload-version check, the same fence and the same fault
+         *     classification. A second implementation built for this endpoint would answer about itself,
+         *     which is the one thing a draft run must not do.
+         *
+         *     Two deliberate departures, both because a draft run has no login to protect:
+         *
+         *     * THE FAILURE POLICY IS NOT APPLIED. `run` swallows a fault under `fail_open` so a broken
+         *       hook does not fail a login. Here the operator IS the audience, and hiding the fault is
+         *       hiding the answer, so the outcome reports `aborted` with the reason.
+         *
+         *     # A deliberate DECLINE is reported as `aborted`, and that is a real limitation
+         *
+         *     The WIT contract distinguishes them -- its own doc says the error arm "is NOT the same thing
+         *     as a trap" -- and `HookFault` does not: `Aborted` is documented as "exhausted a bound,
+         *     trapped, OR DECLINED", because at issuance the difference changes nothing a client may see.
+         *     It changes plenty for an operator testing a hook, and carrying it out means giving
+         *     `HookFault` a payload it deliberately does not have. Not done here. Said rather than papered
+         *     over with an outcome value nothing can produce.
+         *     * THE FENCE'S REFUSALS ARE REPORTED, and so is the count of claims whose VALUE was not
+         *       JSON. At issuance both are logged and dropped, because nobody can act on them
+         *       mid-request. An operator asking what a hook would do can act on "it tried to set `sub`"
+         *       immediately -- and on "one of your values is not JSON", which is the one class that
+         *       otherwise leaves no trace at all: the claim is missing from the maps and missing from
+         *       `refused`, exactly as it is for a hook that dropped it on purpose.
+         *
+         *     # The GRANT decides whether there is an ID half
+         *
+         *     `client_credentials`, `jwt:bearer` and token exchange mint no ID token, and their shipped
+         *     dispatch is `apply_to_machine_token`, which hands the guest an EMPTY ID-token list and drops
+         *     the one it returns. A draft run on those grants does the same and reports
+         *     `id_token_claims_discarded` instead, so the answer is the one that door would give rather
+         *     than the one the fixture asked for. That is not a third departure: it is the shipped
+         *     behaviour of the grant the request names.
+         *
+         *     # Nothing is written, and one thing IS disclosed
+         *
+         *     No deploy, no version row, no audit `token_hook.set`. It is a READ plus a computation, which
+         *     is why it is `management.read` rather than `write_config` -- and why it does not take the
+         *     sudo freshness a deploy does.
+         *
+         *     It does disclose the hook's BEHAVIOUR, which the metadata read does not, and an earlier
+         *     version of this paragraph said the opposite: that running a hook the operator can already
+         *     read the bytes of discloses nothing new. No endpoint returns the component. `TokenHookView`
+         *     and `TokenHookVersionView` carry a byte LENGTH, and `get_token_hook` calls `metadata` rather
+         *     than `get` precisely so the bytes stay in the database. So a `management.read` credential
+         *     that could previously learn a length, a payload version and a failure policy can now learn
+         *     what the hook EMITS for an event it chose, for the deployed hook and for every retained
+         *     version. That is what the endpoint is for, and it is bounded by the guest world importing
+         *     NOTHING: a run is a pure function of the component and the supplied event, reaching no user,
+         *     no stored row and no network. It sits with the reads on the same ground as
+         *     `getClaimsMapping`, which hands this same reader the complete declarative rule list shaping
+         *     the same tokens.
+         */
+        post: operations["testTokenHook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions": {
         parameters: {
             query?: never;
@@ -7727,6 +7805,178 @@ export interface components {
             status: string;
         };
         /**
+         * @description The body of a token-hook DRAFT RUN (issue #114 criterion 5, fixture-based draft testing).
+         *
+         *     A recorded event to run a hook against, so an operator can ask "what would this do to that
+         *     login" before an actual login finds out.
+         */
+        TestTokenHookRequest: {
+            /** @description The access-token claims the mint would have at the point the hook runs. */
+            access_token_claims?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description The `grant_type` to present, so a hook that shapes a refresh differently can be tested
+             *     on that door. Defaults to `authorization_code`.
+             */
+            grant_type?: string | null;
+            /** @description The ID-token claims the mint would have at the point the hook runs. */
+            id_token_claims?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description The subject to present. Omit to test a grant with no user, such as
+             *     `client_credentials` -- which is a DIFFERENT input, not a missing one.
+             */
+            subject?: string | null;
+            /**
+             * Format: int32
+             * @description Which version to run. Omit to run the one currently deployed.
+             *
+             *     A version still in the history, exactly as `rollbackTokenHook` means it: the history is
+             *     capped, so a number from an older listing may since have been pruned.
+             */
+            version?: number | null;
+        };
+        /**
+         * @description What a draft run produced (issue #114 criterion 5).
+         *
+         *     `completed` and `aborted` are distinguished because an operator acts on them differently: a
+         *     hook that completed shaped claims, and one that aborted did not finish and says why. The
+         *     reason string carries what the dispatch knows, which is less than the WIT contract expresses
+         *     -- see `outcome`.
+         */
+        TestTokenHookResponse: {
+            /** @description The access-token claims the hook contributed, after the fence. */
+            access_token_claims: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description The ID-token claims the hook contributed, AFTER the protected-claim fence.
+             *
+             *     After the fence, deliberately: what an operator wants to know is what would reach a
+             *     token, and a hook's own output is not that. A claim it tried to mint and the fence
+             *     refused appears in `refused` instead.
+             *
+             *     ALWAYS EMPTY on a grant that mints no ID token -- `client_credentials`, `jwt:bearer` and
+             *     token exchange. Those doors hand the guest an empty ID-token list and drop the one it
+             *     returns, so a draft run does the same rather than reporting a half no token on that
+             *     grant can carry. `id_token_claims_discarded` says how many the hook returned.
+             */
+            id_token_claims: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description How many ID-token claims the hook returned that this GRANT discards.
+             *
+             *     Zero on every grant that mints an ID token, and zero on a hook that filled nothing.
+             *     Non-zero says "your hook filled the ID list and this grant threw it away", which an
+             *     empty `id_token_claims` alone cannot distinguish from a hook that contributed nothing.
+             *     At issuance that discard is an `info` log line the operator has to go and find; here
+             *     they are the audience, which is the same reason `refused` is returned at all.
+             */
+            id_token_claims_discarded: number;
+            /**
+             * @description `completed` or `aborted`.
+             *
+             *     NOT `declined`, though the WIT contract distinguishes a deliberate decline from a trap.
+             *     `HookFault::Aborted` is documented as covering "exhausted a bound, trapped, or
+             *     declined", because at issuance the difference changes nothing a client may see. A draft
+             *     run would like it and cannot have it without giving that type a payload it does not
+             *     carry. Absent rather than present-and-unreachable.
+             */
+            outcome: string;
+            /**
+             * @description Why, for an `aborted` run. Absent for `completed`.
+             *
+             *     The retraction three lines above applies here too, and this copy was missed the first
+             *     time: there is no `declined` outcome, so there is no `declined` to carry a reason for.
+             *     One of four stable tokens -- `store_unavailable`, `component_unloadable`,
+             *     `aborted_or_declined`, `payload_version` -- and the third is what a decline reports,
+             *     because `HookFault::Aborted` covers a trap, an exhausted bound and a decline alike.
+             */
+            reason?: string | null;
+            /**
+             * @description An UPPER BOUND on how many refused names are missing from `refused`.
+             *
+             *     NOT a count of them, and `refused.len() + refusals_not_reported` is not a total of
+             *     anything -- do not do that arithmetic. `refused` is a deduplicated UNION over the two
+             *     tokens and this is a per-token SUM, so a name dropped from one token's report can still
+             *     reach the list through the other's: a hook padding only the ID token reports `sub` in
+             *     the list AND a remainder of one, with nothing actually missing. It is a sum rather than
+             *     a maximum because the two tokens can drop DIFFERENT names, and a maximum would then
+             *     understate.
+             *
+             *     ZERO IS EXACT. Zero means neither token's list was truncated, so `refused` is complete.
+             *     That is the reading to build on; a non-zero value means "there may be more, go look at
+             *     the hook" and nothing more precise. Computing the true distinct-missing count would
+             *     require materialising the dropped names, which is the allocation the cap exists to
+             *     avoid.
+             */
+            refusals_not_reported: number;
+            /**
+             * @description Claim names the fence refused, DEDUPLICATED across the two tokens.
+             *
+             *     CAPPED per token, and `refusals_not_reported` is how you know. The fence reports at most
+             *     sixty-four names for each of the two tokens and keeps the alphabetically first, so a
+             *     hook that returns ninety-six claims called `a000`..`a095` alongside `sub` pushes `sub`
+             *     off that token's list. The refusal still happens -- the fence blocks it at issuance
+             *     either way -- but a reviewer reading this list as complete would approve a hook that
+             *     attempted a reserved name.
+             *
+             *     Deduplicated because a hook setting `sub` in both tokens is making one mistake, so this
+             *     list holds at most a hundred and twenty-eight names, not sixty-four. Read
+             *     `refusals_not_reported` first: while it is zero this list is complete.
+             */
+            refused: string[];
+            /**
+             * @description How many claims the hook returned with a value that is not JSON.
+             *
+             *     A SEPARATE class from `refused`, and it has to be reported separately because it leaves
+             *     no other trace. A refused claim is one the fence would not let the hook write; this is
+             *     one the hook mis-serialised, so the host cannot read it and drops it -- and under the
+             *     replace contract dropping it REMOVES it from the token.
+             *
+             *     Without this number the report for such a claim is indistinguishable from the report for
+             *     a hook that deliberately dropped it: absent from the claim maps, absent from `refused`,
+             *     and `refusals_not_reported` zero. An operator would approve a hook that silently strips
+             *     a claim from every token it shapes.
+             *
+             *     It is a COUNT and not a name list because the names are unbounded -- a hook may return
+             *     any number of claims -- and a second capped list would need its own truncation count,
+             *     which is the truncation problem `refusals_not_reported` already exists for. WHICH claims
+             *     they were is not reported anywhere, the server log included: it carries this same count
+             *     and no names. What the count buys is the difference between "the hook dropped these on
+             *     purpose" and "look at your serialisation", and the missing names are the claims you
+             *     expected to see in the maps above and do not.
+             */
+            values_not_json: number;
+            /**
+             * Format: int32
+             * @description Which version ran.
+             *
+             *     RESOLVED, not echoed. A run that named a version gets that number back; a run that named
+             *     none gets the version of the hook that is currently deployed, which is the newest row in
+             *     the history.
+             *
+             *     NOT `null` on any path this API offers, and the sentence that stood here said the
+             *     opposite: it named "a hook deployed and then deleted", which is the one case that
+             *     certainly does not produce one. The delete removes the `token_hooks` row and leaves
+             *     `token_hook_versions` alone -- that table has no foreign key to it and no trigger -- so a
+             *     deleted hook keeps its history, and asking this endpoint about it answers 404, an
+             *     `ErrorBody` with no version in it at all.
+             *
+             *     A `null` needs the reverse: an ACTIVE hook whose history is EMPTY. A deploy writes both
+             *     rows in one transaction, `0165_token_hook_versions.sql` backfills version 1 for every
+             *     hook that predates the history, and the prune deletes only
+             *     `version <= MAX(version) - TOKEN_HOOK_VERSION_RETENTION` -- so no write this server
+             *     performs leaves that state behind. Measured: reaching it took a hand-run
+             *     `DELETE FROM token_hook_versions` under a live hook. The field stays optional because
+             *     the database can hold that row set, not because a client can produce it.
+             */
+            version_run?: number | null;
+        };
+        /**
          * @description One historical deploy of a client's hook (issue #114 criterion 5).
          *
          *     METADATA, never the component -- the same reason `TokenHookView` withholds it, multiplied
@@ -10259,6 +10509,82 @@ export interface operations {
             };
             /** @description Environment not found, malformed client id, or no such version. A version that existed can become no-such-version: the history is capped, so a number read from an older listing may since have been pruned */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    testTokenHook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The authorize client identifier whose tokens the hook shapes */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestTokenHookRequest"];
+            };
+        };
+        responses: {
+            /** @description The hook ran. `outcome` is `completed` or `aborted`; an aborted run is still a 200, because the QUESTION was answered. `refused` is capped, so read `refusals_not_reported` before treating it as complete, and on a grant that mints no ID token `id_token_claims` is empty with `id_token_claims_discarded` saying how many the hook returned, and `values_not_json` for claims the hook mis-serialised, which are dropped and appear in neither list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestTokenHookResponse"];
+                };
+            };
+            /** @description An unreadable body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, malformed client id, no hook deployed, or no such version */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description This build or this process does not carry the WASM hook runtime */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -304,6 +304,57 @@ pub struct HookClaims {
     pub id_token: BTreeMap<String, serde_json::Value>,
     /// Accepted access-token claims.
     pub access_token: BTreeMap<String, serde_json::Value>,
+    /// An UPPER BOUND on how many refused names are missing from [`refused`](Self::refused).
+    ///
+    /// `filter_hook_claims` caps the reported list, and it walks a `BTreeMap` -- so the names
+    /// it keeps are the alphabetically FIRST ones, and a hook that returns ninety-six claims
+    /// called `a000`..`a095` alongside `sub` pushes `sub` off the end of that token's report.
+    /// The refusal still happens; what is lost is the operator seeing it.
+    ///
+    /// That matters here and not at issuance, because a DRAFT RUN is somebody deciding whether
+    /// to deploy. Carrying the count is what makes the list say "and there are more" instead of
+    /// reading as complete, which is the same reason `organization.membership_changed` carries
+    /// a required `truncated`.
+    ///
+    /// A BOUND AND NOT A COUNT, and an earlier version of this doc called it a count. `refused`
+    /// is a deduplicated UNION over the two tokens while this is a per-token SUM, so the two
+    /// use opposite conventions over the same data on purpose, and the arithmetic a reader
+    /// wants to do -- `refused.len()` plus this -- is not a total of anything. A hook padding
+    /// only the ID token reports `sub` IN the list and a remainder of one, with nothing missing
+    /// at all. It is a sum rather than a maximum because the two tokens can drop DIFFERENT
+    /// names, and a maximum would then understate.
+    ///
+    /// ZERO IS EXACT: neither token's list was truncated, so `refused` is complete. That is the
+    /// reading to build on. Anything more precise needs the dropped NAMES, and not
+    /// materialising those is what the cap is for.
+    pub refusals_not_reported: usize,
+    /// How many returned claims had a value that is not JSON, across both tokens.
+    ///
+    /// A DIFFERENT class from [`refused`](Self::refused) and reported separately because the
+    /// remedy is different: the fence answers "may a hook write this NAME", and this one is
+    /// the hook's own serialisation. `fence` drops such a claim -- under the WIT contract's
+    /// REPLACE semantics that REMOVES it from the token -- and at issuance the log line is the
+    /// whole remedy, for the same reason refusals are only logged there.
+    ///
+    /// A DRAFT RUN is again the caller that can act on it. Without this the drop is invisible:
+    /// the claim is absent from the accepted maps and absent from `refused`, which is the same
+    /// report a hook that deliberately dropped it produces. Measured against the shipped
+    /// `echo-request` fixture, whose values are built with an unescaped
+    /// `format!("\"{subject}\"")`: a subject containing one `\"` made both of its subject
+    /// claims vanish from a `completed` run whose `refused` was empty and whose
+    /// `refusals_not_reported` was zero.
+    pub values_not_json: usize,
+    /// Claim names the protected-claim fence REFUSED, across both tokens.
+    ///
+    /// The issuance path ignores this and is right to: the token is issued without those claims
+    /// either way, and there is nobody to show an error to mid-login. `fence`'s own doc says
+    /// exactly that, and it stays true.
+    ///
+    /// A DRAFT RUN is the caller that can act on it (issue #114 criterion 5). An operator
+    /// asking "what would version 3 do to this event" is asking a question the log line answers
+    /// after the fact and for a login that already happened; carrying the names out is what
+    /// lets the answer include "and it tried to set `sub`, which was refused".
+    pub refused: Vec<String>,
 }
 
 /// One invocation's inputs.
@@ -407,6 +458,31 @@ pub async fn run(
     }
 }
 
+/// Run a hook RECORD the caller already has, rather than the one deployed for this client.
+///
+/// Issue #114 criterion 5's fixture-based draft testing: an operator asks "what would version 3
+/// do to this event", and the only honest answer runs version 3 through the same code that
+/// would run it if it were active. A second path built for the question would answer about
+/// itself.
+///
+/// So this is deliberately the SAME function the issuance path calls, exposed rather than
+/// duplicated -- the fence, the payload-version check, the limits, the cache and the fault
+/// classification are all the shipped ones. What it does NOT do is apply the failure policy:
+/// [`run`] does that, and it is a statement about whether a LOGIN proceeds. A draft run has no
+/// login to fail, and an operator testing a hook wants to see the fault rather than have it
+/// swallowed by `fail_open`.
+///
+/// # Errors
+///
+/// [`HookFault`] exactly as the issuance path would raise it, unswallowed.
+pub async fn run_record(
+    runtime: &HookRuntime,
+    invocation: &Invocation<'_>,
+    record: &ironauth_store::token_hook_store::TokenHookRecord,
+) -> Result<Option<HookClaims>, HookFault> {
+    run_deployed_hook(&runtime.engine, &runtime.cache, invocation, record).await
+}
+
 /// Run the deployed hook, with every fault reported as one.
 ///
 /// Split out of [`run`] so the failure policy is applied in ONE place: every `?` in here is a
@@ -478,21 +554,38 @@ async fn run_deployed_hook(
             HookFault::Aborted
         })?;
 
+    let (id_token, mut refused, id_not_reported, id_not_json) = fence(
+        &customization.id_token_claims,
+        id_token_claims,
+        scope,
+        client_id,
+        "id_token",
+    );
+    let (access_token, access_refused, access_not_reported, access_not_json) = fence(
+        &customization.access_token_claims,
+        access_token_claims,
+        scope,
+        client_id,
+        "access_token",
+    );
+    // ONE list across both tokens, deduplicated: a hook that tries to set `sub` in both is
+    // making one mistake, and reporting it twice would read as two.
+    refused.extend(access_refused);
+    refused.sort_unstable();
+    refused.dedup();
+
     Ok(Some(HookClaims {
-        id_token: fence(
-            &customization.id_token_claims,
-            id_token_claims,
-            scope,
-            client_id,
-            "id_token",
-        ),
-        access_token: fence(
-            &customization.access_token_claims,
-            access_token_claims,
-            scope,
-            client_id,
-            "access_token",
-        ),
+        id_token,
+        access_token,
+        refused,
+        // SUMMED, and that makes it an UPPER BOUND rather than a count -- see the field's own
+        // doc. The list above is a deduplicated union and this is a per-token sum, so a name
+        // dropped from one token's report can still reach the list through the other's. The sum
+        // and not the max because the two tokens can drop different names. Zero is exact.
+        refusals_not_reported: id_not_reported + access_not_reported,
+        // SUMMED for the same reason: a hook whose serialisation is broken in both lists broke
+        // it twice, and each break is a claim the token will not carry.
+        values_not_json: id_not_json + access_not_json,
     }))
 }
 
@@ -734,16 +827,36 @@ fn limits() -> Limits {
 
 /// Put a hook's returned claims through the protected-claim fence, and log what it refused.
 ///
-/// The refusals are logged rather than returned, because a caller cannot act on them: the token
-/// is issued without those claims either way. What an OPERATOR can act on is the log line, which
-/// is why it names the claim and the reason.
+/// The refusals are logged AND returned, and the two audiences are why.
+///
+/// At ISSUANCE nobody can act on them: the token is minted without those claims either way and
+/// there is no one to show an error to mid-request, so the log line is the whole remedy and it
+/// names the claim and the reason. This doc said only that, and it was true until a caller
+/// appeared who is not an issuance.
+///
+/// A DRAFT RUN is that caller (issue #114 criterion 5). An operator asking what a hook would do
+/// before deploying it can act on "it tried to set `sub`" immediately, so the names come back
+/// as well -- with the count of the ones the cap dropped, because the list is a sample and
+/// reading it as complete is how a padded hook gets approved.
+///
+/// The unparseable-value count comes back for the same reason and is the same argument: it is
+/// a claim the hook meant to write and the token will not carry, and the report is the product
+/// here.
+///
+/// Returns the kept claims, the refused NAMES, how many refusals did not fit that list, and how
+/// many values were not JSON -- in that order.
 fn fence(
     returned: &[(String, String)],
     handed: &serde_json::Map<String, serde_json::Value>,
     scope: Scope,
     client_id: &str,
     token: &'static str,
-) -> BTreeMap<String, serde_json::Value> {
+) -> (
+    BTreeMap<String, serde_json::Value>,
+    Vec<String>,
+    usize,
+    usize,
+) {
     // EVERY returned claim is parsed and handed to the fence, and the reason is that truncating
     // here defeats two things `filter_hook_claims` promises. Its doc says "which claims overflow
     // is decided in claim-name order, so it is the same set on every invocation" and "the
@@ -759,7 +872,9 @@ fn fence(
     //
     // A claim whose value is not JSON is DROPPED rather than refused by name: the fence answers
     // "may a hook write this NAME", and an unparseable value is a different failure with a
-    // different reason, counted separately below.
+    // different reason. It is counted separately and RETURNED, not only logged: the drop leaves
+    // no trace in either list, so a draft report without this number cannot be told apart from
+    // one for a hook that deliberately dropped the claim.
     let mut parsed: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut unparseable = 0_usize;
     for (name, value_json) in returned {
@@ -826,7 +941,16 @@ fn fence(
     // not use the ordering to smuggle anything past the fence.
     let mut kept = echoed;
     kept.extend(outcome.accepted);
-    kept
+    let refused = outcome
+        .refused
+        .into_iter()
+        .map(|(name, _reason)| name)
+        .collect();
+    // THE COUNT TRAVELS WITH THE LIST. `filter_hook_claims` caps what it reports, and its own
+    // doc says a non-zero remainder "is a thing an auditor must be told rather than left to
+    // infer" -- so dropping it here turns a truncated sample into something that reads
+    // complete.
+    (kept, refused, outcome.refusals_not_reported, unparseable)
 }
 
 /// The wire shape the guest ABI takes: a name and its value as JSON TEXT.

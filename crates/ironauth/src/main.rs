@@ -680,6 +680,28 @@ async fn assemble_planes(
         tracing::info!("OIDC provider not mounted: oidc.enabled is false");
         None
     };
+    // ONE HOOK ENGINE FOR THE PROCESS, shared with the management plane (issue #114
+    // criterion 5's draft testing).
+    //
+    // Read off the ASSEMBLED data plane rather than built here, and that direction is the
+    // point: a wasmtime `Engine` owns the compiled-code cache, so a second engine would mean a
+    // draft run compiles a component the issuance path has already compiled -- 33 ms for a Rust
+    // hook and six and a half SECONDS for a TypeScript one -- and would answer about a cache no
+    // login uses. Sharing makes "what would this hook do" a question about the same machinery
+    // that will actually do it.
+    //
+    // Nothing happens when either plane is absent, or when the build has no `wasm-hooks`: the
+    // accessor is `None` and the management state keeps its own `None`, which its draft
+    // endpoint reports as a configuration answer rather than as a hook that produced nothing.
+    let management = match (
+        management,
+        oidc.as_ref().and_then(|plane| plane.state.hook_engine()),
+    ) {
+        (Some(management), Some(runtime)) => {
+            Some(management.with_hook_runtime(std::sync::Arc::clone(runtime)))
+        }
+        (management, _) => management,
+    };
     Ok(AssembledPlanes { management, oidc })
 }
 

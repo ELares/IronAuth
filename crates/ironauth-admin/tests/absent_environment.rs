@@ -609,6 +609,18 @@ fn claims_mapping_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/applications/{client}/token-hook/rollback"),
             body: Some(body_of(&serde_json::json!({ "version": 1 }))),
         },
+        // The DRAFT RUN. A POST that stores nothing, and it is here because this sweep
+        // classifies by METHOD, not by effect: a write-shaped door that skipped
+        // `require_live_environment` would RUN A HOOK in a decommissioned environment, which
+        // is exactly what a fence is for even when the run leaves no trace.
+        Case {
+            label: "token_hooks.testTokenHook",
+            method: "POST",
+            path: format!("{base}/applications/{client}/token-hook/test"),
+            body: Some(body_of(
+                &serde_json::json!({ "grant_type": "authorization_code" }),
+            )),
+        },
     ]
 }
 

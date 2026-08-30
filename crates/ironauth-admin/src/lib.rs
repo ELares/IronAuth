@@ -835,6 +835,10 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback",
             post(token_hooks::rollback_token_hook),
         )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test",
+            post(token_hooks::test_token_hook),
+        )
         // Per-environment, per-client signup forms as data (issue #87): set (fail-fast validated
         // against the active trait schema), get, and delete a form keyed on the authorize client
         // id.

@@ -63,7 +63,8 @@ use crate::error::{ApiError, ErrorBody};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
-    DeployTokenHookQuery, RollbackTokenHookRequest, TokenHookVersionView, TokenHookView,
+    DeployTokenHookQuery, RollbackTokenHookRequest, TestTokenHookRequest, TestTokenHookResponse,
+    TokenHookVersionView, TokenHookView,
 };
 
 /// The largest component this surface accepts, matching `token_hooks`' own CHECK.
@@ -760,6 +761,267 @@ pub async fn rollback_token_hook(
         component_bytes: usize::try_from(record.component_bytes).map_err(|_| ApiError::Internal)?,
         payload_version: u32::try_from(record.payload_version).map_err(|_| ApiError::Internal)?,
         failure_policy: record.failure_policy.as_str().to_owned(),
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// Run a client's token hook against a recorded event, without deploying anything.
+///
+/// Issue #114 criterion 5's fixture-based draft testing, and the half of the Auth0 Actions loop
+/// this surface was missing: deploy, ROLL BACK and list already worked, so an operator could
+/// recover from a bad hook but could not avoid shipping one.
+///
+/// # It runs the SHIPPED dispatch, not a copy of it
+///
+/// `ironauth_oidc::token_hook::run_record` is the same function an issuance calls, with the
+/// same limits, the same payload-version check, the same fence and the same fault
+/// classification. A second implementation built for this endpoint would answer about itself,
+/// which is the one thing a draft run must not do.
+///
+/// Two deliberate departures, both because a draft run has no login to protect:
+///
+/// * THE FAILURE POLICY IS NOT APPLIED. `run` swallows a fault under `fail_open` so a broken
+///   hook does not fail a login. Here the operator IS the audience, and hiding the fault is
+///   hiding the answer, so the outcome reports `aborted` with the reason.
+///
+/// # A deliberate DECLINE is reported as `aborted`, and that is a real limitation
+///
+/// The WIT contract distinguishes them -- its own doc says the error arm "is NOT the same thing
+/// as a trap" -- and `HookFault` does not: `Aborted` is documented as "exhausted a bound,
+/// trapped, OR DECLINED", because at issuance the difference changes nothing a client may see.
+/// It changes plenty for an operator testing a hook, and carrying it out means giving
+/// `HookFault` a payload it deliberately does not have. Not done here. Said rather than papered
+/// over with an outcome value nothing can produce.
+/// * THE FENCE'S REFUSALS ARE REPORTED, and so is the count of claims whose VALUE was not
+///   JSON. At issuance both are logged and dropped, because nobody can act on them
+///   mid-request. An operator asking what a hook would do can act on "it tried to set `sub`"
+///   immediately -- and on "one of your values is not JSON", which is the one class that
+///   otherwise leaves no trace at all: the claim is missing from the maps and missing from
+///   `refused`, exactly as it is for a hook that dropped it on purpose.
+///
+/// # The GRANT decides whether there is an ID half
+///
+/// `client_credentials`, `jwt:bearer` and token exchange mint no ID token, and their shipped
+/// dispatch is `apply_to_machine_token`, which hands the guest an EMPTY ID-token list and drops
+/// the one it returns. A draft run on those grants does the same and reports
+/// `id_token_claims_discarded` instead, so the answer is the one that door would give rather
+/// than the one the fixture asked for. That is not a third departure: it is the shipped
+/// behaviour of the grant the request names.
+///
+/// # Nothing is written, and one thing IS disclosed
+///
+/// No deploy, no version row, no audit `token_hook.set`. It is a READ plus a computation, which
+/// is why it is `management.read` rather than `write_config` -- and why it does not take the
+/// sudo freshness a deploy does.
+///
+/// It does disclose the hook's BEHAVIOUR, which the metadata read does not, and an earlier
+/// version of this paragraph said the opposite: that running a hook the operator can already
+/// read the bytes of discloses nothing new. No endpoint returns the component. `TokenHookView`
+/// and `TokenHookVersionView` carry a byte LENGTH, and `get_token_hook` calls `metadata` rather
+/// than `get` precisely so the bytes stay in the database. So a `management.read` credential
+/// that could previously learn a length, a payload version and a failure policy can now learn
+/// what the hook EMITS for an event it chose, for the deployed hook and for every retained
+/// version. That is what the endpoint is for, and it is bounded by the guest world importing
+/// NOTHING: a run is a pure function of the component and the supplied event, reaching no user,
+/// no stored row and no network. It sits with the reads on the same ground as
+/// `getClaimsMapping`, which hands this same reader the complete declarative rule list shaping
+/// the same tokens.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/test",
+    operation_id = "testTokenHook",
+    tag = "token-hooks",
+    request_body = TestTokenHookRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The hook ran. `outcome` is `completed` or `aborted`; an aborted run is still a 200, because the QUESTION was answered. `refused` is capped, so read `refusals_not_reported` before treating it as complete, and on a grant that mints no ID token `id_token_claims` is empty with `id_token_claims_discarded` saying how many the hook returned, and `values_not_json` for claims the hook mis-serialised, which are dropped and appear in neither list", body = TestTokenHookResponse),
+        (status = 400, description = "An unreadable body", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Environment not found, malformed client id, no hook deployed, or no such version", body = ErrorBody),
+        (status = 503, description = "This build or this process does not carry the WASM hook runtime", body = ErrorBody)
+    )
+)]
+pub async fn test_token_hook(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    // NO ACTOR, and that is the tell: `resolve_scope` returns one for writing onto an audit
+    // row, and this handler writes none.
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    //
+    // READ and not `write_config`, unlike its three write-shaped neighbours on this surface:
+    // this stores nothing, and what it DOES disclose -- the hook's behaviour on an event the
+    // caller supplied -- is a read of a hook resource this credential may already read, bounded
+    // by a guest world that imports nothing. See the note on the handler.
+    principal.require_permission(ManagementPermission::Read)?;
+    let client = parse_client_id(&client_id, scope)?;
+    crate::org_context::require_live_environment(&state, &scope).await?;
+
+    let request: TestTokenHookRequest = crate::input::parse_json(&body)?;
+
+    // The RECORD to run: a named version, or the active hook. Both come back as the same type,
+    // so the dispatch below cannot tell which one it was handed -- which is the point.
+    // The plain repo, not the acting one: this READS. `acting` exists to carry an actor onto an
+    // audit row, and a draft run writes none.
+    let hooks = state.store().scoped(scope).token_hooks();
+    // AND WHICH VERSION THAT IS, resolved rather than echoed.
+    //
+    // `version_run` said "which version ran, so a run with no `version` says which one it
+    // picked" and was set to `request.version` at all three arms -- so in the case the sentence
+    // names, the omitted one, it serialised as null. The record carries no version number
+    // (`token_hooks` has no such column; the numbers live in the history), so the active
+    // version is the newest row in the history, which is what a deploy appends and what a
+    // rollback appends too.
+    //
+    // ONE READ, not two. The first version of this fix called `get` and then `newest_version`,
+    // which is two transactions and therefore two snapshots: a deploy landing between them
+    // returns the OLD component beside the NEW number, and the report then names a version
+    // whose bytes did not run -- the version an operator would roll back to.
+    // `active_with_version` resolves the pair in a single statement.
+    let (record, version_run) = if let Some(version) = request.version {
+        (
+            hooks.version(&client.to_string(), version).await?,
+            Some(version),
+        )
+    } else {
+        match hooks.active_with_version(&client.to_string()).await? {
+            Some((record, newest)) => (Some(record), newest),
+            None => (None, None),
+        }
+    };
+    let Some(record) = record else {
+        // The uniform not-found covers both "no hook deployed" and "no such version". They are
+        // different sentences to an operator, and the 404 body says both.
+        //
+        // NOT because distinguishing them would leak the version count -- it would not, to this
+        // caller: `listTokenHookVersions` is on the same `management.read` permission and hands
+        // them the whole list. Uniform because the two states are one answer to the question
+        // asked ("there is nothing here to run"), and because a body that branched would be a
+        // second place the version-existence rule is written down.
+        return Err(ApiError::NotFound);
+    };
+
+    // NOT a 500 and not a plain refusal, for the reason `NotConfigured` already gives about a
+    // missing DNS resolver: answering "the hook produced nothing" would be indistinguishable
+    // from a hook that produced nothing, and would send an operator to debug their component
+    // instead of their build.
+    let Some(runtime) = state.hook_runtime() else {
+        return Err(ApiError::NotConfigured(
+            "the WASM hook runtime is not available in this build or process".to_owned(),
+        ));
+    };
+
+    // NO `cfg` HERE, and that is deliberate. A `cfg` in this crate keys on THIS crate's flag
+    // while `HookRuntime` comes from `ironauth-oidc`'s, and the two can be enabled
+    // independently -- measured, that combination fails to compile. The stub module carries the
+    // whole seam instead, so one signature serves both builds.
+    let grant_type = request
+        .grant_type
+        .as_deref()
+        .unwrap_or("authorization_code");
+    // WHETHER THERE IS AN ID TOKEN AT ALL is decided by the GRANT, not by the fixture.
+    //
+    // `client_credentials`, `jwt:bearer` and token exchange mint no ID token, and their shipped
+    // dispatch -- `apply_to_machine_token` -- hands the guest an EMPTY ID-token list and DROPS
+    // the one it returns. Passing the request's list through would hand the guest an input no
+    // login on that grant produces, so a hook branching on that list takes a different branch
+    // here than in production, and the report would name an ID half nothing can carry.
+    let mints_id_token =
+        ironauth_oidc::claims_mapping_at_issuance::grant_mints_id_token(grant_type);
+    let no_id_token = serde_json::Map::new();
+    let invocation = ironauth_oidc::token_hook::Invocation {
+        scope,
+        client_id: &client.to_string(),
+        grant_type,
+        subject: request.subject.as_deref(),
+        id_token_claims: if mints_id_token {
+            &request.id_token_claims
+        } else {
+            &no_id_token
+        },
+        access_token_claims: &request.access_token_claims,
+    };
+    let outcome = ironauth_oidc::token_hook::run_record(runtime, &invocation, &record).await;
+    let view = match outcome {
+        Ok(Some(claims)) => {
+            // THE DISCARDED ID HALF IS COUNTED, for the same reason the fence's refusals are
+            // reported: at issuance it is a log line the operator has to go and find, and here
+            // they are the audience. An empty `id_token_claims` with a non-zero count says
+            // "your hook filled the ID list and this grant threw it away"; without the count
+            // it is indistinguishable from a hook that filled nothing.
+            let (id_token_claims, id_token_claims_discarded) = if mints_id_token {
+                (claims.id_token.into_iter().collect(), 0)
+            } else {
+                (serde_json::Map::new(), claims.id_token.len())
+            };
+            TestTokenHookResponse {
+                outcome: "completed".to_owned(),
+                reason: None,
+                id_token_claims,
+                access_token_claims: claims.access_token.into_iter().collect(),
+                refused: claims.refused,
+                refusals_not_reported: claims.refusals_not_reported,
+                values_not_json: claims.values_not_json,
+                id_token_claims_discarded,
+                version_run,
+            }
+        }
+        // UNREACHABLE, and named rather than described as a behaviour. `run_record` delegates
+        // to `run_deployed_hook`, whose only non-error exit is `Ok(Some(..))`. The `None` in
+        // the seam's type belongs to `run`, which uses it for "no hook deployed" and for a
+        // fail-open swallow -- neither of which a draft run reaches, because it resolves the
+        // record itself (404 above) and applies no failure policy. The arm is here because the
+        // match is exhaustive, not because anything produces it.
+        //
+        // What it must NOT be read as is "the hook contributed nothing". Under the REPLACE
+        // contract a hook that changes nothing ECHOES what it was handed, and `fence` keeps
+        // echoes rather than putting them through the fence -- so that hook reports the FULL
+        // maps, not empty ones.
+        Ok(None) => TestTokenHookResponse {
+            outcome: "completed".to_owned(),
+            reason: None,
+            id_token_claims: serde_json::Map::new(),
+            access_token_claims: serde_json::Map::new(),
+            refused: Vec::new(),
+            refusals_not_reported: 0,
+            values_not_json: 0,
+            id_token_claims_discarded: 0,
+            version_run,
+        },
+        Err(fault) => TestTokenHookResponse {
+            outcome: "aborted".to_owned(),
+            // A STABLE TOKEN, not `{fault:?}`. `HookFault`'s own doc says it deliberately
+            // carries no underlying error because "a client learning which resource bound
+            // a hook exhausted learns about the hook" -- and the four variants are exactly
+            // the distinction an operator needs: their artifact is wrong, their code
+            // misbehaved, their payload version is stale, or the store was unreachable.
+            reason: Some(
+                match fault {
+                    ironauth_oidc::token_hook::HookFault::Unavailable => "store_unavailable",
+                    ironauth_oidc::token_hook::HookFault::Unloadable => "component_unloadable",
+                    ironauth_oidc::token_hook::HookFault::Aborted => "aborted_or_declined",
+                    ironauth_oidc::token_hook::HookFault::PayloadVersion => "payload_version",
+                }
+                .to_owned(),
+            ),
+            id_token_claims: serde_json::Map::new(),
+            access_token_claims: serde_json::Map::new(),
+            refused: Vec::new(),
+            refusals_not_reported: 0,
+            values_not_json: 0,
+            id_token_claims_discarded: 0,
+            version_run,
+        },
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))

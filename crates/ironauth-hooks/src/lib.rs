@@ -134,4 +134,12 @@ pub mod fixtures {
     /// silently capping the TOKEN: a deployment with more than 32 extra claims deploying a
     /// do-nothing hook must not lose any of them.
     pub const ECHO_ONLY: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_ECHO_ONLY"));
+
+    /// A hook that refuses MORE claims than the fence will report.
+    ///
+    /// Ninety-six padding names plus a forged `sub`, in both tokens. The padding sorts
+    /// ahead of `sub` and fills the sixty-four-name refusal report, so `sub` is COUNTED
+    /// into `refusals_not_reported` and never NAMED. That is the state the count exists
+    /// for, and no other fixture reaches it: `claim-forger`, the widest, refuses five.
+    pub const CLAIM_FLOOD: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CLAIM_FLOOD"));
 }
