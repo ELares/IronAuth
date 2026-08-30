@@ -32565,11 +32565,12 @@ impl TokenHookRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT client_id, component, payload_version, failure_policy FROM token_hooks \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32607,12 +32608,14 @@ impl TokenHookRepo<'_> {
         let row = sqlx::query(
             "SELECT client_id, component, payload_version, failure_policy \
              FROM token_hook_versions \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4",
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4 \
+               AND name = $5",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
         .bind(version)
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32657,14 +32660,17 @@ impl TokenHookRepo<'_> {
         let row = sqlx::query(
             "SELECT h.client_id, h.component, h.payload_version, h.failure_policy, \
                     (SELECT MAX(v.version) FROM token_hook_versions v \
-                      WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.client_id = $3) \
+                      WHERE v.tenant_id = $1 AND v.environment_id = $2 AND v.client_id = $3 \
+                        AND v.name = $4) \
                     AS version \
              FROM token_hooks h \
-             WHERE h.tenant_id = $1 AND h.environment_id = $2 AND h.client_id = $3",
+             WHERE h.tenant_id = $1 AND h.environment_id = $2 AND h.client_id = $3 \
+               AND h.name = $4",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32699,11 +32705,12 @@ impl TokenHookRepo<'_> {
             "SELECT client_id, octet_length(component) AS component_bytes, payload_version, \
              failure_policy \
              FROM token_hooks \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client_id)
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32727,6 +32734,15 @@ pub struct ActingTokenHookRepo<'a> {
 }
 
 impl ActingTokenHookRepo<'_> {
+    // EVERY STATEMENT IN THIS FILE SPELLS THE HOOK NAME, and until the admin surface takes one
+    // from a caller they all spell [`DEFAULT_HOOK_NAME`]. That is deliberate rather than
+    // redundant: 0168 moved the identity to (scope, client, name), so a read keyed on
+    // (scope, client) alone stops being a lookup and becomes a scan whose first row wins. It
+    // returns the right answer today only because one hook exists per client, and it would go
+    // on returning A row -- silently, non-deterministically -- the moment a second one does.
+    // Naming it makes each of these a deliberate single-hook operation, and makes the ones that
+    // should become multi-hook a diff a reviewer sees rather than a behaviour that drifts.
+
     /// Audit `token_hook.claim_refused` for a deployed hook the fence refused at ISSUANCE.
     ///
     /// Issue #113 criterion 5's HOOK half. The mapping half is refused at configuration time
@@ -32849,11 +32865,19 @@ impl ActingTokenHookRepo<'_> {
             },
             async move |tx| {
                 sqlx::query(
+                    // THE NAME IS SPELLED, and `DEFAULT_HOOK_NAME` is what it is spelled as.
+                    // 0168 moved the identity to (scope, client, name), so the conflict target
+                    // has to name the new key or it names no unique constraint at all -- which
+                    // is not a subtle failure: leaving the old three-column target in place
+                    // turned every deploy into a 500, measured. Until the admin surface takes a
+                    // name from the caller, every deploy through this path addresses the one
+                    // hook a client had before ordering existed, which is what 0167 backfilled
+                    // every existing row to.
                     "INSERT INTO token_hooks \
-                     (tenant_id, environment_id, client_id, component, payload_version, \
+                     (tenant_id, environment_id, client_id, name, component, payload_version, \
                       failure_policy) \
-                     VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT (tenant_id, environment_id, client_id) DO UPDATE \
+                     VALUES ($1, $2, $3, $7, $4, $5, $6) \
+                     ON CONFLICT (tenant_id, environment_id, client_id, name) DO UPDATE \
                      SET component = EXCLUDED.component, \
                          payload_version = EXCLUDED.payload_version, \
                          failure_policy = EXCLUDED.failure_policy, \
@@ -32865,6 +32889,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&bytes)
                 .bind(payload_version)
                 .bind(failure_policy.as_str())
+                .bind(DEFAULT_HOOK_NAME)
                 .execute(&mut **tx)
                 .await?;
                 // THE HISTORY ROW, in the SAME transaction as the active one. A deploy that
@@ -32888,13 +32913,18 @@ impl ActingTokenHookRepo<'_> {
                 // PRIMARY KEY, which is a backstop the race never reaches. Naming the wrong
                 // mechanism is how a later reorder ships believing it is covered.
                 sqlx::query(
+                    // PER HOOK, not per client. A version belongs to the code it is a version
+                    // OF: with two hooks sharing one sequence, deploying B would advance A's
+                    // numbering and rolling A back would restore B's bytes. 0168 moved the
+                    // history's identity for this reason and the `MAX` has to move with it.
                     "INSERT INTO token_hook_versions \
-                     (tenant_id, environment_id, client_id, version, component, \
+                     (tenant_id, environment_id, client_id, name, version, component, \
                       payload_version, failure_policy) \
-                     SELECT $1, $2, $3, \
+                     SELECT $1, $2, $3, $7, \
                             COALESCE(MAX(version), 0) + 1, $4, $5, $6 \
                      FROM token_hook_versions \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND name = $7",
                 )
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
@@ -32902,6 +32932,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&bytes)
                 .bind(payload_version)
                 .bind(failure_policy.as_str())
+                .bind(DEFAULT_HOOK_NAME)
                 .execute(&mut **tx)
                 .await?;
                 // PRUNE TO THE NEWEST FEW, in the same transaction as the insert that grew it.
@@ -32915,17 +32946,23 @@ impl ActingTokenHookRepo<'_> {
                 // discard the whole history of a client that had not deployed in a while,
                 // which is exactly the client whose last-known-good matters most.
                 sqlx::query(
+                    // PER HOOK for the same reason the numbering is: a client-wide prune
+                    // would let one hook's deploys evict another hook's rollback targets, so a
+                    // busy hook would silently empty the history of a quiet one beside it.
                     "DELETE FROM token_hook_versions \
                      WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND name = $5 \
                        AND version <= ( \
                            SELECT MAX(version) FROM token_hook_versions \
                            WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                             AND name = $5 \
                        ) - $4",
                 )
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&client_id)
                 .bind(TOKEN_HOOK_VERSION_RETENTION)
+                .bind(DEFAULT_HOOK_NAME)
                 .execute(&mut **tx)
                 .await?;
                 enqueue_domain_event(tx, env, scope, event).await?;
@@ -32966,12 +33003,13 @@ impl ActingTokenHookRepo<'_> {
             "SELECT version, octet_length(component) AS component_bytes, payload_version, \
              failure_policy, (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM token_hook_versions \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4 \
              ORDER BY version DESC",
         )
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -33036,12 +33074,14 @@ impl ActingTokenHookRepo<'_> {
         let mut read = begin_scoped(self.store, scope).await?;
         let row = sqlx::query(
             "SELECT component, payload_version, failure_policy FROM token_hook_versions \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4",
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND version = $4 \
+               AND name = $5",
         )
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
         .bind(version)
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_optional(&mut *read)
         .await?;
         // THE ACTIVE ROW, read in the SAME transaction as the target, so the comparison below
@@ -33049,11 +33089,12 @@ impl ActingTokenHookRepo<'_> {
         // between.
         let active = sqlx::query(
             "SELECT component, payload_version, failure_policy FROM token_hooks \
-             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 AND name = $4",
         )
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
+        .bind(DEFAULT_HOOK_NAME)
         .fetch_optional(&mut *read)
         .await?;
         read.commit().await?;
@@ -33146,11 +33187,13 @@ impl ActingTokenHookRepo<'_> {
             async move |tx| {
                 let removed = sqlx::query(
                     "DELETE FROM token_hooks \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3",
+                     WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                       AND name = $4",
                 )
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&client_id)
+                .bind(DEFAULT_HOOK_NAME)
                 .execute(&mut **tx)
                 .await?;
                 // NOT FOUND rather than a silent success, the same reasoning the claim-mapping
@@ -33168,6 +33211,19 @@ impl ActingTokenHookRepo<'_> {
         .await
     }
 }
+
+/// The name a hook carries when nobody chose one.
+///
+/// Issue #114 criterion 5 gives a client more than one hook, addressed by name. Every hook that
+/// existed before that had no name to be addressed by, so migration 0167 backfilled them all to
+/// this one -- a RENAME of the row a client already had rather than a new row beside it, so the
+/// count of deployed hooks did not change and no client's tokens changed shape.
+///
+/// It is also what the deploy path writes until the admin surface takes a name from the caller.
+/// A constant rather than a literal at each site because it appears in the writer, the reader
+/// and the migration's backfill, and three copies of a string that must agree is how they stop
+/// agreeing.
+pub const DEFAULT_HOOK_NAME: &str = "default";
 
 /// How many deploys of one client's hook are kept.
 ///
