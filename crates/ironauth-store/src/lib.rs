@@ -102,6 +102,7 @@ mod redirect;
 mod repository;
 pub mod risk;
 mod scope;
+pub mod session_token_store;
 pub mod signup_form;
 pub mod sms_otp;
 pub mod snapshot;
@@ -200,15 +201,16 @@ pub use id::{
     RiskDisavowalId, RiskDisavowalKind, RiskLoginGeoId, RiskLoginGeoKind, RiskSignalId,
     RiskSignalKind, RoutingRuleId, RoutingRuleKind, ScopeStepUpPolicyId, ScopeStepUpPolicyKind,
     ScopedId, ScopedKind, ServiceAccountId, ServiceAccountKind, ServiceId, ServiceKind,
-    SessionEventId, SessionEventKind, SessionId, SessionKind, SigningKeyId, SigningKeyKind,
-    SignupFormId, SignupFormKind, SignupQuarantineId, SignupQuarantineKind, SmsOtpCodeId,
-    SmsOtpCodeKind, SmsRouteStatId, SmsRouteStatKind, StoredClientId, TenantId, TenantKind,
-    TotpCredentialId, TotpCredentialKind, TraitMigrationJobId, TraitMigrationJobKind,
-    TraitSchemaId, TraitSchemaKind, TrustedDeviceId, TrustedDeviceKind, UpstreamTokenGrantId,
-    UpstreamTokenGrantKind, UpstreamTokenId, UpstreamTokenKind, UserId, UserIdentifierId,
-    UserIdentifierKind, UserKind, VariableId, VariableKind, WebauthnChallengeId,
-    WebauthnChallengeKind, WebauthnCredentialId, WebauthnCredentialKind, WebhookDeliveryAttemptId,
-    WebhookDeliveryAttemptKind, WebhookEndpointId,
+    SessionEventId, SessionEventKind, SessionId, SessionKind, SessionTokenKeyId,
+    SessionTokenKeyKind, SigningKeyId, SigningKeyKind, SignupFormId, SignupFormKind,
+    SignupQuarantineId, SignupQuarantineKind, SmsOtpCodeId, SmsOtpCodeKind, SmsRouteStatId,
+    SmsRouteStatKind, StoredClientId, TenantId, TenantKind, TotpCredentialId, TotpCredentialKind,
+    TraitMigrationJobId, TraitMigrationJobKind, TraitSchemaId, TraitSchemaKind, TrustedDeviceId,
+    TrustedDeviceKind, UpstreamTokenGrantId, UpstreamTokenGrantKind, UpstreamTokenId,
+    UpstreamTokenKind, UserId, UserIdentifierId, UserIdentifierKind, UserKind, VariableId,
+    VariableKind, WebauthnChallengeId, WebauthnChallengeKind, WebauthnCredentialId,
+    WebauthnCredentialKind, WebhookDeliveryAttemptId, WebhookDeliveryAttemptKind,
+    WebhookEndpointId,
 };
 pub use identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,

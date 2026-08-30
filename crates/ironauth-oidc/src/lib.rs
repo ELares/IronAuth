@@ -172,6 +172,7 @@ mod scope_claims;
 mod sector;
 mod session;
 mod session_mgmt;
+pub mod session_tokenizer;
 mod sms_conversion;
 mod sms_otp;
 mod state;
@@ -576,6 +577,14 @@ pub fn oidc_router(state: OidcState) -> Router {
         // admin credentials). Every endpoint acts ONLY on the authenticated subject's
         // resources; the state-changing POSTs carry the #196 same-origin CSRF check.
         // The hosted account pages (M9) consume this API without any private endpoint.
+        // The SESSION TOKENIZER (issue #119): exchange the caller's own opaque session for a
+        // short-lived JWT defined by a named per-environment template, verifiable against that
+        // template's own JWKS with no database call. Authenticated by the SAME session cookie
+        // as the account API and by nothing else; an impersonated session is refused.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/session/tokenize",
+            post(session_tokenizer::tokenize),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/account/sessions",
             get(account::list_sessions),

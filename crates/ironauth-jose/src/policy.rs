@@ -512,6 +512,23 @@ token_profiles! {
     /// exporter is a foreign ORGANIZATION, but the header shape is IronAuth's, so
     /// `typ` stays a separator here.
     JourneyInterchange => "iaj+jws",
+    /// A TOKENIZED SESSION JWT (issue #119): `session+jwt`, the short-lived token a session
+    /// tokenizer template mints from a valid opaque session so a service mesh, a third-party
+    /// API, or an edge worker can verify an identity with no database call.
+    ///
+    /// Like `iaj+jws` this media type is IronAuth's own and deliberately NOT registered with
+    /// IANA: no standards body names this document. Unlike `iaj+jws` the separation it provides
+    /// is load bearing on a token that travels, so it is worth saying what it separates.
+    ///
+    /// A tokenized session JWT and an RFC 9068 access token can share an issuer, a subject and
+    /// an audience, and a resource server behind a mesh may be handed either. They authorize
+    /// differently: an access token carries `scope` and was issued through an OAuth grant a
+    /// client and a user consented to, while this one carries whatever claim set an operator's
+    /// template maps and was issued because a browser session existed. Presenting one as the
+    /// other would let a session stand in for a consented grant. RFC 8725 section 3.11 is what
+    /// this implements, and `typ` is the field that carries it: the mint stamps this and the
+    /// verifier requires it, so neither token answers to the other's policy.
+    SessionToken => "session+jwt",
 }
 
 impl TokenTyp {
@@ -791,6 +808,7 @@ mod tests {
                 // Issue #347. No RFC: an IronAuth-defined, deliberately
                 // unregistered media type for the signed `.iaj` journey archive.
                 TokenTyp::JourneyInterchange => "iaj+jws",
+                TokenTyp::SessionToken => "session+jwt",
             };
             assert_eq!(typ.media_type(), expected, "{typ:?}");
         }

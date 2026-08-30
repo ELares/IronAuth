@@ -512,6 +512,13 @@ func (c *Client) DeleteSecret(tenant_id string, environment_id string, name stri
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/secrets/" + escape(name), query, nil)
 }
 
+// DeleteSessionTokenTemplate performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates.
+//
+// Remove a session tokenizer template.
+func (c *Client) DeleteSessionTokenTemplate(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/session-token-templates", query, nil)
+}
+
 // DeleteSignupForm performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form.
 //
 // Delete a per-environment, per-client signup form.
@@ -1254,6 +1261,13 @@ func (c *Client) ListServiceAccountApiKeys(tenant_id string, environment_id stri
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/service-accounts/" + escape(service_account_id) + "/api-keys", query, nil)
 }
 
+// ListSessionTokenTemplates performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates.
+//
+// List an environment's session tokenizer templates.
+func (c *Client) ListSessionTokenTemplates(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/session-token-templates", query, nil)
+}
+
 // ListSessions performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions.
 //
 // List the sessions in an environment (cursor paginated), searchable by user and by client.
@@ -1749,6 +1763,13 @@ func (c *Client) SetOutboundVerification(tenant_id string, environment_id string
 // Set (create or replace) a secret by name.
 func (c *Client) SetSecret(tenant_id string, environment_id string, name string, query url.Values, body any) (*http.Response, error) {
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/secrets/" + escape(name), query, body)
+}
+
+// SetSessionTokenTemplate performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates.
+//
+// Create or replace a session tokenizer template.
+func (c *Client) SetSessionTokenTemplate(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/session-token-templates", query, body)
 }
 
 // SetSignupForm performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form.

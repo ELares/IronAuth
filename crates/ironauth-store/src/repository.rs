@@ -96,11 +96,11 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SigningKeyId,
-    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -819,6 +819,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn challenge_components(&self) -> ChallengeComponentRepo<'a> {
         ChallengeComponentRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The SESSION TOKENIZER templates for this scope (issue #119), read-only.
+    ///
+    /// Read by the tokenize endpoint on every mint and by the template's JWKS route on every
+    /// fetch. Read-only by design: a plane that could write itself a template could write itself
+    /// the audience it then mints for.
+    #[must_use]
+    pub fn session_token_templates(&self) -> SessionTokenTemplateRepo<'a> {
+        SessionTokenTemplateRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1947,6 +1960,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn challenge_components(&self) -> ActingChallengeComponentRepo<'a> {
         ActingChallengeComponentRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The SESSION TOKENIZER templates for this scope and actor (issue #119).
+    ///
+    /// The control plane's grants on `session_token_templates` exist for THIS and nothing else:
+    /// writing a template is writing an audience and a claim set for tokens that verify with no
+    /// database call.
+    #[must_use]
+    pub fn session_token_templates(&self) -> ActingSessionTokenTemplateRepo<'a> {
+        ActingSessionTokenTemplateRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -33088,6 +33115,371 @@ impl ChallengeComponentRepo<'_> {
         tx.commit().await?;
         Ok(rows)
     }
+}
+
+// ===========================================================================
+// Session tokenizer templates (issue #119).
+//
+// A template turns a valid opaque session into a short-lived JWT verified with no database call.
+// The CONTROL plane writes templates (writing one is writing an audience and a claim set); the
+// DATA plane reads them, because the tokenize endpoint and the template's JWKS route are what
+// mint from and publish them.
+// ===========================================================================
+
+/// The audit target for a session tokenizer template (issue #119).
+///
+/// The template NAME, for the reason a challenge component's audit row names its component: the
+/// name is the template's identity, it is what a tokenize request selects, and it is what
+/// appears in the template's JWKS URL. An operator reading why some API started accepting tokens
+/// needs to know which template, because that names the audience.
+struct SessionTokenTemplateTarget<'a>(&'a str);
+
+impl AuditTarget for SessionTokenTemplateTarget<'_> {
+    fn audit_target_kind(&self) -> &'static str {
+        "session_token_template"
+    }
+
+    fn audit_target_id(&self) -> String {
+        self.0.to_owned()
+    }
+}
+
+/// The mutating session-tokenizer-template repository for one scope and actor (issue #119).
+pub struct ActingSessionTokenTemplateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSessionTokenTemplateRepo<'_> {
+    /// Create a template, or replace one of the same name, together with its key.
+    ///
+    /// # The key is written in the SAME transaction, and a replace KEEPS the existing key
+    ///
+    /// Both halves matter and they pull in opposite directions, so they are written down.
+    ///
+    /// One transaction, because a template with no key is a template whose JWKS is empty and
+    /// whose mint has nothing to sign with: every tokenize call against it would fail and every
+    /// verifier polling its JWKS would cache an empty set. Two statements outside a transaction
+    /// would make that state reachable by an ordinary crash.
+    ///
+    /// A REPLACE LEAVES THE KEY ALONE (`ON CONFLICT ... DO UPDATE` touches the configuration
+    /// columns only, and the key insert is skipped when a key already exists). Rotating a key
+    /// invalidates every token already minted from the template and forces every verifier to
+    /// refetch, so it is an operator decision of its own -- not a side effect of raising a TTL
+    /// by thirty seconds. There is no rotation surface yet; when there is, it lands on the four
+    /// lifecycle instants this table already carries.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the key identifier is out of this scope;
+    /// [`StoreError::Database`] on a persistence fault, which includes the table's own bounds on
+    /// the name, the audience, the TTL and the rule count.
+    pub async fn set(
+        &self,
+        env: &Env,
+        template: crate::session_token_store::NewSessionTokenTemplate<'_>,
+        key: crate::session_token_store::NewSessionTokenKey<'_>,
+    ) -> Result<(), StoreError> {
+        if key.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        // Two bindings of one name: the audit target borrows for the whole call while the
+        // mutation closure is `async move` and owns what it captures.
+        let name = template.name.to_owned();
+        let bound = name.clone();
+        let audience = template.audience.to_owned();
+        let ttl_seconds = template.ttl_seconds;
+        let rules_json = template.rules_json.to_owned();
+        let key_id = key.id.to_string();
+        let seed = key.seed.to_vec();
+        let publish_at = key.publish_at_micros;
+        let activate_at = key.activate_at_micros;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SessionTokenTemplateSet,
+                target: &SessionTokenTemplateTarget(&bound),
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO session_token_templates \
+                     (tenant_id, environment_id, name, audience, ttl_seconds, rules) \
+                     VALUES ($1, $2, $3, $4, $5, $6::jsonb) \
+                     ON CONFLICT (tenant_id, environment_id, name) DO UPDATE \
+                     SET audience = EXCLUDED.audience, \
+                         ttl_seconds = EXCLUDED.ttl_seconds, \
+                         rules = EXCLUDED.rules, \
+                         updated_at = now()",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(&audience)
+                .bind(ttl_seconds)
+                .bind(&rules_json)
+                .execute(&mut **tx)
+                .await?;
+                // The key, ONLY when the template does not already have one. `WHERE NOT EXISTS`
+                // rather than a read-then-write, so two concurrent replaces cannot both decide
+                // the template has no key and insert two.
+                sqlx::query(
+                    "INSERT INTO session_token_template_keys \
+                     (tenant_id, environment_id, template_name, id, algorithm, material_kind, \
+                      key_material, publish_at, activate_at) \
+                     SELECT $1, $2, $3, $4, $5, $6, $7, \
+                            TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                            TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM session_token_template_keys \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND template_name = $3 \
+                     )",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&name)
+                .bind(&key_id)
+                .bind(crate::session_token_store::SESSION_TOKEN_ALGORITHM)
+                .bind(crate::session_token_store::SESSION_TOKEN_MATERIAL_KIND)
+                .bind(&seed)
+                .bind(publish_at)
+                .bind(activate_at)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Remove a template. Its keys go with it through the table's `ON DELETE CASCADE`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no template of that name exists in this scope;
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+        let scope = self.scope;
+        let owned = name.to_owned();
+        let bound = owned.clone();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SessionTokenTemplateDelete,
+                target: &SessionTokenTemplateTarget(&bound),
+            },
+            async move |tx| {
+                let done = sqlx::query(
+                    "DELETE FROM session_token_templates \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&owned)
+                .execute(&mut **tx)
+                .await?;
+                // A delete that matched nothing is a NOT FOUND rather than a silent success, so
+                // an operator who mistypes a name learns it instead of believing a template is
+                // gone while it keeps minting.
+                if done.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+}
+
+/// The read-only session-tokenizer-template repository for one scope (issue #119).
+///
+/// Read by the TOKENIZE endpoint on every mint and by the template's JWKS route on every fetch,
+/// which is why the data plane holds SELECT here and nothing else: the plane that mints tokens
+/// must not be able to write itself the audience it mints for.
+pub struct SessionTokenTemplateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SessionTokenTemplateRepo<'_> {
+    /// One template by the name a tokenize request selects it by, or [`None`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn get(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::session_token_store::SessionTokenTemplateRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT name, audience, ttl_seconds, rules::text AS rules_json \
+             FROM session_token_templates \
+             WHERE tenant_id = $1 AND environment_id = $2 AND name = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(
+            |row| crate::session_token_store::SessionTokenTemplateRecord {
+                name: row.get("name"),
+                audience: row.get("audience"),
+                ttl_seconds: row.get("ttl_seconds"),
+                rules_json: row.get("rules_json"),
+            },
+        ))
+    }
+
+    /// Every template in this scope, by name, for the management listing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn list(
+        &self,
+    ) -> Result<Vec<crate::session_token_store::SessionTokenTemplateRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT name, audience, ttl_seconds, rules::text AS rules_json \
+             FROM session_token_templates \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY name",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |row| crate::session_token_store::SessionTokenTemplateRecord {
+                    name: row.get("name"),
+                    audience: row.get("audience"),
+                    ttl_seconds: row.get("ttl_seconds"),
+                    rules_json: row.get("rules_json"),
+                },
+            )
+            .collect())
+    }
+
+    /// The keys a template PUBLISHES, oldest first.
+    ///
+    /// Publication is decided HERE and not by the caller: a key is published from `publish_at`
+    /// until `expire_at`, which is the same window `signing_keys` describes. Deciding it in the
+    /// query means the JWKS route and the mint cannot disagree about which keys exist.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, or if a stored row fails to decode.
+    pub async fn published_keys(
+        &self,
+        name: &str,
+        now_micros: i64,
+    ) -> Result<Vec<crate::session_token_store::SessionTokenKeyRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, key_material, \
+                    (EXTRACT(EPOCH FROM publish_at) * 1000000)::bigint AS publish_us, \
+                    (EXTRACT(EPOCH FROM activate_at) * 1000000)::bigint AS activate_us, \
+                    (EXTRACT(EPOCH FROM retire_at) * 1000000)::bigint AS retire_us, \
+                    (EXTRACT(EPOCH FROM expire_at) * 1000000)::bigint AS expire_us \
+             FROM session_token_template_keys \
+             WHERE tenant_id = $1 AND environment_id = $2 AND template_name = $3 \
+             AND publish_at <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             AND (expire_at IS NULL OR expire_at > \
+                  TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval) \
+             ORDER BY created_at, id",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(name)
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| session_token_key_from_row(row, &scope))
+            .collect()
+    }
+
+    /// The key a template SIGNS with right now: the newest key already active and not retired,
+    /// or [`None`] when the template has none.
+    ///
+    /// Separate from [`Self::published_keys`] because publishing and signing are different
+    /// windows and always were: a key is published BEFORE it signs (so verifiers have it cached
+    /// when the first token arrives) and stays published AFTER it retires (so tokens it already
+    /// signed keep verifying). A mint that read the published set and took the first would sign
+    /// with a key that is only pre-published, and a verifier that had not refetched would reject
+    /// every token until it did.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault, or if a stored row fails to decode.
+    pub async fn signing_key(
+        &self,
+        name: &str,
+        now_micros: i64,
+    ) -> Result<Option<crate::session_token_store::SessionTokenKeyRecord>, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT id, key_material, \
+                    (EXTRACT(EPOCH FROM publish_at) * 1000000)::bigint AS publish_us, \
+                    (EXTRACT(EPOCH FROM activate_at) * 1000000)::bigint AS activate_us, \
+                    (EXTRACT(EPOCH FROM retire_at) * 1000000)::bigint AS retire_us, \
+                    (EXTRACT(EPOCH FROM expire_at) * 1000000)::bigint AS expire_us \
+             FROM session_token_template_keys \
+             WHERE tenant_id = $1 AND environment_id = $2 AND template_name = $3 \
+             AND activate_at <= TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             AND retire_at IS NULL \
+             ORDER BY activate_at DESC, id DESC \
+             LIMIT 1",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(name)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| session_token_key_from_row(&row, &scope))
+            .transpose()
+    }
+}
+
+/// Reconstruct a [`crate::session_token_store::SessionTokenKeyRecord`] from a row read within
+/// scope.
+fn session_token_key_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<crate::session_token_store::SessionTokenKeyRecord, StoreError> {
+    let id_text: String = row.get("id");
+    let id = SessionTokenKeyId::parse_in_scope(&id_text, scope)?;
+    let material: Vec<u8> = row.get("key_material");
+    Ok(crate::session_token_store::SessionTokenKeyRecord {
+        id,
+        material: crate::session_token_store::SessionTokenKeyMaterial::new(material),
+        publish_at_unix_micros: row.get("publish_us"),
+        activate_at_unix_micros: row.get("activate_us"),
+        retire_at_unix_micros: row.get("retire_us"),
+        expire_at_unix_micros: row.get("expire_us"),
+    })
 }
 
 /// The read-only deployed-hook repository for one scope (issue #114).

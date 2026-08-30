@@ -4147,3 +4147,93 @@ async fn a_factors_secret_grants_split_read_from_write_config() {
         "and the revoke, which is idempotent and so succeeds for an ungranted name: {response}"
     );
 }
+
+/// The session tokenizer template surface splits WRITING a template from READING the list
+/// (issue #119).
+///
+/// This is what earns those three operations a place in `PERMISSION_PROVEN` rather than only in
+/// `CLASSIFIED`. Classification is a declaration that lives in a table; this drives a credential
+/// holding the WRONG permission and asserts the refusal names the right one.
+///
+/// The write half matters more than the read half. Writing a template names the AUDIENCE that
+/// will accept tokens for this environment's subjects and the TTL for which nothing can withdraw
+/// one, so a credential that may only read must not be able to create one -- and the refusal has
+/// to NAME what it wanted, or an operator cannot tell a missing grant from a broken route.
+#[tokio::test]
+async fn the_session_tokenizer_surface_splits_writing_a_template_from_reading_the_list() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "stt-perm-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "stt-perm-mint").await;
+    let base = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/session-token-templates?name=orders"
+    );
+    let listing =
+        format!("/v1/tenants/{tenant}/environments/{environment}/session-token-templates");
+    let body = serde_json::json!({
+        "audience": "https://orders.example",
+        "ttl_seconds": 60,
+        "rules": [],
+    })
+    .to_string();
+
+    // The WRITE under write_config is served. Asserted FIRST, so a later 403 is the permission
+    // talking rather than the route being broken or the body being rejected.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, served) = h.put_as(&base, &secret, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "write_config must be able to write a template: {served}"
+    );
+
+    // The LISTING is read-classified, so write_config alone is refused and the refusal names it.
+    let (status, _, refused) = h.get_as(&listing, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the listing answered a credential without management.read: {refused}"
+    );
+    assert!(
+        refused.contains("management.read"),
+        "the refusal must name the permission it wanted: {refused}"
+    );
+
+    // And the other direction: read may LIST but may not WRITE or DELETE.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+    let (status, _, listed) = h.get_as(&listing, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read must be able to list: {listed}"
+    );
+    assert!(listed.contains("orders"), "{listed}");
+
+    let (status, _, refused) = h.put_as(&base, &secret, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential wrote a template: {refused}"
+    );
+    assert!(
+        refused.contains("management.write_config"),
+        "the refusal must name the permission it wanted: {refused}"
+    );
+
+    let (status, _, refused) = h.delete_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential deleted a template: {refused}"
+    );
+    assert!(
+        refused.contains("management.write_config"),
+        "the refusal must name the permission it wanted: {refused}"
+    );
+}

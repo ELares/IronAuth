@@ -19377,6 +19377,271 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates": {
+      "get": {
+        "tags": [
+          "session-token-templates"
+        ],
+        "summary": "List an environment's session tokenizer templates.",
+        "operationId": "listSessionTokenTemplates",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The templates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTokenTemplatesView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "session-token-templates"
+        ],
+        "summary": "Create or replace a session tokenizer template.",
+        "operationId": "setSessionTokenTemplate",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "The template name a tokenize request selects with `tokenize_as`, and the name in the template's own JWKS URL. REQUIRED: renaming a template breaks both",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionTokenTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTokenTemplateView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid name, audience, TTL, or rule list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "session-token-templates"
+        ],
+        "summary": "Remove a session tokenizer template.",
+        "operationId": "deleteSessionTokenTemplate",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which template to remove. ITS KEYS GO WITH IT: the template's JWKS URL stops answering and every consumer verifying against it starts failing",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed, along with its key set"
+          },
+          "400": {
+            "description": "An absent name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, or no template of that name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions": {
       "get": {
         "tags": [
@@ -32111,6 +32376,51 @@
           }
         }
       },
+      "SessionTokenTemplateView": {
+        "type": "object",
+        "description": "One SESSION TOKENIZER template (issue #119).\n\nNEVER the key material. A template's key is private and the only public projection of it is\nthe JWK published at the template's own JWKS URL, which is a different surface with a\ndifferent reader. A management view that carried the seed would put a signing key in every\noperator's terminal scrollback.",
+        "required": [
+          "name",
+          "audience",
+          "ttl_seconds",
+          "rules"
+        ],
+        "properties": {
+          "audience": {
+            "type": "string",
+            "description": "The audience every token minted from this template carries."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name a tokenize request selects this template by, and the name in its JWKS URL."
+          },
+          "rules": {
+            "type": "object",
+            "description": "The claims mapper, as the ordered rule list. The same rule vocabulary a claims mapping\ncarries, minus `place`, which names a token this surface does not mint.\n\n`value_type = Object`, matching `ClaimsMappingView.rules`: a bare `serde_json::Value`\ndocuments as an UNTYPED node, which every generated SDK renders as `any`. Saying `Object`\nis not a full rule schema -- `claims_mapping::MappingRule` owns that -- but it is the\ndifference between a generated client that types this field and one that gives up on it."
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The token lifetime in seconds. ALSO the exact width of the window in which a revoked\nsession's already-minted token still verifies, because the token is verified with no\ndatabase call."
+          }
+        }
+      },
+      "SessionTokenTemplatesView": {
+        "type": "object",
+        "description": "Every session tokenizer template in an environment (issue #119).",
+        "required": [
+          "templates"
+        ],
+        "properties": {
+          "templates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionTokenTemplateView"
+            },
+            "description": "The templates, by name. Empty when the environment has none, which is what a fresh\nenvironment has: the tokenizer mints nothing until an operator writes a template."
+          }
+        }
+      },
       "SessionView": {
         "type": "object",
         "description": "A session, as the fleet-operations surface reports it (issue #32).\n\nSessions are first-class, searchable, metadata-carrying fleet resources rather\nthan an opaque internal table. The view deliberately reports REVOKED, ROTATED, and\nENDED sessions too (not just live ones), so an operator can inspect the whole\nlifecycle: `ended_at` plus `end_cause` say when and why, and `superseded_by` names\nthe successor when the session was rotated away at a privilege transition.\n\n`user_agent` and `peer_ip` are present only when the operator enabled the\ncorresponding OFF-BY-DEFAULT binding knob, so the safe default records neither.",
@@ -32520,6 +32830,30 @@
           "value": {
             "type": "string",
             "description": "The value to seal. It is sealed under the environment's DEK before it reaches the\ntable and is never readable through this API afterwards."
+          }
+        }
+      },
+      "SetSessionTokenTemplateRequest": {
+        "type": "object",
+        "description": "The request body for creating or replacing a session tokenizer template (issue #119).",
+        "required": [
+          "audience",
+          "ttl_seconds",
+          "rules"
+        ],
+        "properties": {
+          "audience": {
+            "type": "string",
+            "description": "The audience every token minted from this template carries. REQUIRED: RFC 8725 section\n3.9 asks for an audience restriction on every token, and a template with none would mint\na token every verifier in the estate accepts."
+          },
+          "rules": {
+            "type": "object",
+            "description": "The ordered rule list, as the same JSON a claims mapping carries. A raw value on purpose:\n`ironauth_oidc::claims_mapping` owns the rule shape, and a second definition here would be\ntwo definitions of one wire format. Documented as `Object` for the reason the view's own\nfield records."
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The token lifetime in seconds, which is also the revocation window. Bounded; the refusal\nnames the bounds and says what the number means."
           }
         }
       },

@@ -303,6 +303,10 @@ class Client:
         """Delete a secret by name. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets/{urllib.parse.quote(name)}", query, None)
 
+    def delete_session_token_template(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Remove a session tokenizer template. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-token-templates", query, None)
+
     def delete_signup_form(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a per-environment, per-client signup form. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/signup-form", query, None)
@@ -727,6 +731,10 @@ class Client:
         """listServiceAccountApiKeys. GET /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys", query, None)
 
+    def list_session_token_templates(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List an environment's session tokenizer templates. GET /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-token-templates", query, None)
+
     def list_sessions(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the sessions in an environment (cursor paginated), searchable by user and by client. GET /v1/tenants/{tenant_id}/environments/{environment_id}/sessions."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sessions", query, None)
@@ -1010,6 +1018,10 @@ class Client:
     def set_secret(self, tenant_id: str, environment_id: str, name: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or replace) a secret by name. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets/{urllib.parse.quote(name)}", query, body)
+
+    def set_session_token_template(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Create or replace a session tokenizer template. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/session-token-templates", query, body)
 
     def set_signup_form(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or overwrite) a per-environment, per-client signup form. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/signup-form."""

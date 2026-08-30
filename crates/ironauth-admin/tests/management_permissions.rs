@@ -192,6 +192,18 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // The DELETE is pinned separately from the deploy because its reason inverts the token
     // hook's: removing a hook restores the unshaped token, while removing a component a journey
     // still names makes every login that reaches that step REFUSE.
+    // SESSION TOKENIZER templates (issue #119). A template decides which AUDIENCE receives
+    // tokens for which subjects, with a claim set an operator chooses, verifiable for the whole
+    // TTL with nothing able to withdraw it early -- so both writes are `write_config` and the
+    // listing is `read`. The listing returns configuration and never key material, so demanding
+    // `write_config` for it would make asking which templates exist cost the authority to change
+    // them.
+    ("setSessionTokenTemplate", ManagementPermission::WriteConfig),
+    (
+        "deleteSessionTokenTemplate",
+        ManagementPermission::WriteConfig,
+    ),
+    ("listSessionTokenTemplates", ManagementPermission::Read),
     (
         "deployChallengeComponent",
         ManagementPermission::WriteConfig,
@@ -664,6 +676,12 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // The session tokenizer template surface (issue #119), proven by
+    // `the_session_tokenizer_surface_splits_writing_a_template_from_reading_the_list`: both
+    // directions on all three routes, each refusal asserted to NAME the permission it wanted.
+    "setSessionTokenTemplate",
+    "deleteSessionTokenTemplate",
+    "listSessionTokenTemplates",
     // Proven in `delegated_admin.rs`, each in BOTH directions: a credential holding a DIFFERENT
     // permission gets 403 and the classified one reaches the handler (404 on an absent client),
     // so neither a blanket refusal nor a missing gate would pass them. The DELETE is pinned
@@ -837,7 +855,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 189 operations declare a required permission and 45 have that permission proven. The other
+/// 192 operations declare a required permission and 48 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -852,7 +870,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 203 minus 59 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// its own: 206 minus 62 is always 144. (It read "166 minus 22", then "171 minus 27", while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
 /// pinned by the two `assert_eq!`s in the test below; if you change either, change this
@@ -870,12 +888,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        203,
+        206,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        59,
+        62,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -901,6 +919,12 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     (
         "challenge_components.rs",
         include_str!("../src/challenge_components.rs"),
+    ),
+    // The session tokenizer template surface (issue #119). Listed the moment the module
+    // existed, for the reason recorded above.
+    (
+        "session_token_templates.rs",
+        include_str!("../src/session_token_templates.rs"),
     ),
     ("messages.rs", include_str!("../src/messages.rs")),
     (
