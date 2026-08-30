@@ -2882,6 +2882,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to roll back; absent means `default`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -2985,6 +2994,15 @@
             "in": "path",
             "description": "The authorize client identifier whose tokens the hook shapes",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to run; absent means `default`",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -3101,6 +3119,15 @@
             "in": "path",
             "description": "The authorize client identifier whose tokens the hook shapes",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which of the client's hooks to list versions of; absent means `default`",
+            "required": false,
             "schema": {
               "type": "string"
             }

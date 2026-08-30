@@ -32661,6 +32661,7 @@ impl TokenHookRepo<'_> {
     pub async fn version(
         &self,
         client_id: &str,
+        name: &str,
         version: i32,
     ) -> Result<Option<TokenHookRecord>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
@@ -32674,7 +32675,7 @@ impl TokenHookRepo<'_> {
         .bind(self.scope.environment().to_string())
         .bind(client_id)
         .bind(version)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -32720,6 +32721,7 @@ impl TokenHookRepo<'_> {
     pub async fn active_with_version(
         &self,
         client_id: &str,
+        name: &str,
     ) -> Result<Option<(TokenHookRecord, Option<i32>)>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
@@ -32736,7 +32738,7 @@ impl TokenHookRepo<'_> {
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(client_id)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -33245,6 +33247,7 @@ impl ActingTokenHookRepo<'_> {
         &self,
         env: &Env,
         client: &ClientId,
+        name: &str,
     ) -> Result<Vec<TokenHookVersion>, StoreError> {
         let _ = env;
         if client.scope() != self.scope {
@@ -33262,7 +33265,7 @@ impl ActingTokenHookRepo<'_> {
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -33317,6 +33320,7 @@ impl ActingTokenHookRepo<'_> {
         &self,
         env: &Env,
         client: &ClientId,
+        name: &str,
         version: i32,
         event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
@@ -33334,7 +33338,7 @@ impl ActingTokenHookRepo<'_> {
         .bind(scope.environment().to_string())
         .bind(client.to_string())
         .bind(version)
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *read)
         .await?;
         // THE ACTIVE ROW, read in the SAME transaction as the target, so the comparison below
@@ -33347,7 +33351,7 @@ impl ActingTokenHookRepo<'_> {
         .bind(scope.tenant().to_string())
         .bind(scope.environment().to_string())
         .bind(client.to_string())
-        .bind(DEFAULT_HOOK_NAME)
+        .bind(name)
         .fetch_optional(&mut *read)
         .await?;
         read.commit().await?;
@@ -33386,10 +33390,11 @@ impl ActingTokenHookRepo<'_> {
             }
         }
 
-        // THE PLACEMENT IS THE DEFAULT HOOK'S, because a rollback restores CODE and must not
-        // move anything: the upsert below leaves `ordinal` alone on conflict, so a rollback of
-        // a hook that sits third leaves it third. Once the admin surface rolls a NAMED hook
-        // back, this is where its name arrives.
+        // THE PLACEMENT NAMES THE HOOK BEING ROLLED BACK, and its ordinal is ignored: a
+        // rollback restores CODE and must not move anything, and the upsert leaves `ordinal`
+        // alone on conflict, so a rollback of a hook that sits third leaves it third. The zero
+        // here is the value a hook that does not exist would take, and a rollback of a hook
+        // that does not exist has already failed above.
         self.set_with_event(
             env,
             client,
@@ -33397,7 +33402,7 @@ impl ActingTokenHookRepo<'_> {
                 component: &component,
                 payload_version,
                 failure_policy,
-                placement: HookPlacement::default_hook(),
+                placement: HookPlacement { name, ordinal: 0 },
             },
             event,
         )

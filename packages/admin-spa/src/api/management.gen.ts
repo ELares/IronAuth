@@ -10682,7 +10682,10 @@ export interface operations {
     };
     rollbackTokenHook: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Which of the client's hooks to roll back; absent means `default` */
+                name?: string;
+            };
             header?: never;
             path: {
                 /** @description The tenant identifier */
@@ -10749,7 +10752,10 @@ export interface operations {
     };
     testTokenHook: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Which of the client's hooks to run; absent means `default` */
+                name?: string;
+            };
             header?: never;
             path: {
                 /** @description The tenant identifier */
@@ -10825,7 +10831,10 @@ export interface operations {
     };
     listTokenHookVersions: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Which of the client's hooks to list versions of; absent means `default` */
+                name?: string;
+            };
             header?: never;
             path: {
                 /** @description The tenant identifier */

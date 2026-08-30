@@ -1427,3 +1427,106 @@ async fn a_hook_name_at_the_column_bound_is_accepted_and_one_past_it_is_refused(
          500: {body}"
     );
 }
+
+/// EVERY VERB REACHES A NAMED HOOK, not only the one a client had before ordering existed.
+///
+/// Criterion 5 asks that "versioned deploy, fixture-based draft testing, ordering, per-hook
+/// secrets, and rollback all work through the admin surface". Adding names made ordering work
+/// and left the other verbs addressing `default` only -- so a client with a second hook could
+/// deploy it and arrange it, and then could not list its versions, roll it back, or draft-test
+/// it. The criterion would have read as met while being met for one hook per client.
+///
+/// # Why the versions assertion is the sharp one
+///
+/// The version SEQUENCE is per hook. Deploying `beta` twice while `alpha` has one deploy must
+/// give beta versions 1 and 2 and leave alpha at 1 -- if the numbering were per CLIENT, beta's
+/// second deploy would be version 3, and rolling alpha back to "version 1" could restore beta's
+/// bytes. Asserting the COUNT and the NUMBERS is what separates those.
+#[tokio::test]
+async fn versions_rollback_and_draft_runs_all_address_the_named_hook() {
+    let harness = Harness::start(63).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let scope = scope_of(&tenant, &env);
+    let client = Harness::fresh_client_id(scope);
+    let base = hook_path(&tenant, &env, &client);
+
+    // `alpha` once, `beta` twice.
+    for name in ["alpha", "beta", "beta"] {
+        let (status, _, body) = harness
+            .put_bytes(&format!("{base}?payload_version=1&name={name}"), COMPONENT)
+            .await;
+        assert_eq!(status, StatusCode::OK, "deploy {name}: {body}");
+    }
+
+    let (status, _, body) = harness.get(&format!("{base}/versions?name=beta")).await;
+    assert_eq!(status, StatusCode::OK, "list beta's versions: {body}");
+    // A BARE LIST, not an envelope: the route returns `Vec<TokenHookVersionView>`.
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let numbers: Vec<i64> = listed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|v| v["version"].as_i64().expect("a version"))
+        .collect();
+    assert_eq!(
+        numbers,
+        vec![2, 1],
+        "beta has TWO versions, numbered from one: a per-CLIENT sequence would have made its \
+         second deploy version 3, and rolling `alpha` back to version 1 could then restore \
+         beta's bytes: {body}"
+    );
+
+    let (status, _, body) = harness.get(&format!("{base}/versions?name=alpha")).await;
+    assert_eq!(status, StatusCode::OK, "list alpha's versions: {body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        listed.as_array().expect("a list").len(),
+        1,
+        "and alpha's history is its own -- beta's two deploys did not advance it: {body}"
+    );
+
+    // A ROLLBACK ADDRESSES THE NAMED HOOK, and does not move it.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/rollback?name=beta"),
+            "k-roll-beta",
+            r#"{"version":1}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "roll beta back: {body}");
+    let (_, _, body) = harness.get(&format!("{base}/chain")).await;
+    let chain: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    let names: Vec<&str> = chain["hooks"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|hook| hook["name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "beta"],
+        "a rollback restores CODE and must not move a hook: {body}"
+    );
+
+    // AND A DRAFT RUN NAMES ONE TOO. The component here is a bare preamble rather than a
+    // loadable guest, so the run ABORTS -- which is still the answer to "what would this hook
+    // do", and it proves the route resolved the named hook rather than 404ing on it.
+    let (status, _, body) = harness
+        .post(
+            &format!("{base}/test?name=beta"),
+            "k-draft-beta",
+            &serde_json::json!({ "grant_type": "authorization_code" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a draft run of a NAMED hook must resolve it: a 404 here is the route addressing \
+         `default` and not finding this client's beta: {body}"
+    );
+    let view: serde_json::Value = serde_json::from_str(&body).expect("parse");
+    assert_eq!(
+        view["outcome"], "aborted",
+        "and it reports what that component does, which for a bare preamble is an abort: {body}"
+    );
+}

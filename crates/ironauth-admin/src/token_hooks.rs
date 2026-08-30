@@ -394,6 +394,7 @@ pub async fn get_token_hook(
     // Delegated administration (issue #102): classified `management.read`.
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
 
     // `metadata`, not `get`: the component runs to tens of megabytes and this reports its
     // LENGTH, so the length is computed where the bytes already are rather than by hauling
@@ -402,7 +403,7 @@ pub async fn get_token_hook(
         .store()
         .scoped(scope)
         .token_hooks()
-        .metadata(&client.to_string(), hook_name(query.name.as_deref())?)
+        .metadata(&client.to_string(), hook)
         .await?
         .ok_or(ApiError::NotFound)?;
     let view = TokenHookView {
@@ -467,6 +468,7 @@ pub async fn delete_token_hook(
     // can strip a security-relevant claim from every token.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     state
@@ -477,7 +479,7 @@ pub async fn delete_token_hook(
         .delete_with_event(
             state.env(),
             &client,
-            hook_name(query.name.as_deref())?,
+            hook,
             deleted_event(&state, scope, &client.to_string())
                 .as_ref()
                 .map(crate::events::PendingEvent::domain_event)
@@ -851,7 +853,8 @@ mod tests {
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to list versions of; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -865,11 +868,13 @@ pub async fn list_token_hook_versions(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // Delegated administration (issue #102): classified `management.read`.
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
 
     // AN EMPTY LIST, not a 404, when the client has never had a hook. "No versions" is a
     // complete and common answer to "what have I deployed", unlike `getTokenHook`, where
@@ -882,7 +887,7 @@ pub async fn list_token_hook_versions(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .versions(state.env(), &client)
+        .versions(state.env(), &client, hook)
         .await?;
     let view: Vec<TokenHookVersionView> = versions
         .into_iter()
@@ -920,7 +925,8 @@ pub async fn list_token_hook_versions(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to roll back; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -935,6 +941,7 @@ pub async fn rollback_token_hook(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
@@ -947,6 +954,7 @@ pub async fn rollback_token_hook(
     // stripped it from every token that client is issued.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: RollbackTokenHookRequest = crate::input::parse_json(&body)?;
@@ -963,7 +971,7 @@ pub async fn rollback_token_hook(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .versions(state.env(), &client)
+        .versions(state.env(), &client, hook)
         .await?
         .into_iter()
         .find(|candidate| candidate.version == request.version)
@@ -984,6 +992,7 @@ pub async fn rollback_token_hook(
         .rollback_to(
             state.env(),
             &client,
+            hook,
             request.version,
             announced
                 .as_ref()
@@ -1002,7 +1011,7 @@ pub async fn rollback_token_hook(
         // THE DEFAULT HOOK, matching the rollback above: `rollback_to` restores the default
         // hook's code, so the row it wrote is the row read back. When rollback takes a name,
         // both halves take the same one.
-        .metadata(&client.to_string(), ironauth_store::DEFAULT_HOOK_NAME)
+        .metadata(&client.to_string(), hook)
         .await?
         .ok_or(ApiError::Internal)?;
     let view = TokenHookView {
@@ -1085,7 +1094,8 @@ pub async fn rollback_token_hook(
     params(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
-        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes")
+        ("client_id" = String, Path, description = "The authorize client identifier whose tokens the hook shapes"),
+        ("name" = Option<String>, Query, description = "Which of the client's hooks to run; absent means `default`")
     ),
     security(("bearer" = [])),
     responses(
@@ -1101,6 +1111,7 @@ pub async fn test_token_hook(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    Query(query): Query<NamedTokenHookQuery>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // NO ACTOR, and that is the tell: `resolve_scope` returns one for writing onto an audit
@@ -1114,6 +1125,7 @@ pub async fn test_token_hook(
     // by a guest world that imports nothing. See the note on the handler.
     principal.require_permission(ManagementPermission::Read)?;
     let client = parse_client_id(&client_id, scope)?;
+    let hook = hook_name(query.name.as_deref())?;
     crate::org_context::require_live_environment(&state, &scope).await?;
 
     let request: TestTokenHookRequest = crate::input::parse_json(&body)?;
@@ -1139,11 +1151,11 @@ pub async fn test_token_hook(
     // `active_with_version` resolves the pair in a single statement.
     let (record, version_run) = if let Some(version) = request.version {
         (
-            hooks.version(&client.to_string(), version).await?,
+            hooks.version(&client.to_string(), hook, version).await?,
             Some(version),
         )
     } else {
-        match hooks.active_with_version(&client.to_string()).await? {
+        match hooks.active_with_version(&client.to_string(), hook).await? {
             Some((record, newest)) => (Some(record), newest),
             None => (None, None),
         }
