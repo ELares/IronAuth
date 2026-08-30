@@ -2605,3 +2605,46 @@ mod redacting_debug_tests {
         );
     }
 }
+
+/// One deployed CUSTOM FACTOR component, as the management API reports it (issue #114
+/// criterion 6).
+///
+/// METADATA, never the component. "What is deployed" is answered by the name, the size and the
+/// payload version; streaming the bytes back would make every read a multi-megabyte body to
+/// answer a question nobody asked.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ChallengeComponentView {
+    /// The name a journey step references this component by.
+    pub name: String,
+    /// How many bytes the deployed component is, so an operator can tell whether the thing
+    /// running is the thing they pushed.
+    pub component_bytes: usize,
+    /// The custom-challenge payload version the guest was built against.
+    pub payload_version: u32,
+    /// How many outbound requests ONE call of the triad may make. Zero means it may not.
+    pub fetch_budget: u32,
+}
+
+/// Every custom factor component deployed in an environment (issue #114 criterion 6).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ChallengeComponentsView {
+    /// The components, by name. Empty when the environment has none.
+    pub components: Vec<ChallengeComponentView>,
+}
+
+/// The environment secrets a custom factor component may read (issue #114 criterion 6).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ChallengeComponentSecretsView {
+    /// The component.
+    pub name: String,
+    /// The secret NAMES this component may read, sorted. Never the values.
+    ///
+    /// The same separation `TokenHookSecretsView` records: a grant is a reference, and the value
+    /// lives sealed behind a different repository and the platform key. That is what stops a
+    /// "what may this factor read" route ever being one keystroke from disclosing it.
+    ///
+    /// A NAME HERE MAY NOT RESOLVE, because the grant table deliberately has no foreign key onto
+    /// the secret: an operator may grant a name before the secret exists, and the host answers
+    /// `none` for a name with no value.
+    pub secrets: Vec<String>,
+}

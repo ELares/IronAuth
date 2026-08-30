@@ -243,6 +243,14 @@ name = "claims_mappings"
 path = "tests/claims_mappings.rs"
 required-features = ["testing"]
 
+# Custom factor component management (issue #114 criterion 6): the deploy/list/delete lifecycle
+# and the secret grants, through the real router. The surface that makes a factor deployable by an
+# operator rather than by a migration or a database console.
+[[test]]
+name = "challenge_components"
+path = "tests/challenge_components.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "token_hooks"
 path = "tests/token_hooks.rs"

@@ -79,6 +79,7 @@ pub mod usage;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+mod challenge_components;
 pub mod ciba_ping;
 mod claims_mappings;
 mod external_issuers;
@@ -826,6 +827,29 @@ pub fn management_router(state: AdminState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(
                     token_hooks::MAX_COMPONENT_BYTES + 1,
                 )),
+        )
+        // CUSTOM FACTOR components (issue #114 criterion 6). PER ENVIRONMENT, not per client:
+        // a journey step references one by name, and a journey is not a client's. The name
+        // travels as a query parameter for the reason the token-hook routes give -- a path
+        // segment would collide with `/secrets` and make a component called `secrets`
+        // unaddressable.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components",
+            put(challenge_components::deploy_challenge_component)
+                .get(challenge_components::list_challenge_components)
+                .delete(challenge_components::delete_challenge_component)
+                // AXUM'S DEFAULT BODY LIMIT IS 2 MiB and this route's cap is 16, so without this
+                // a legal 3 MiB component is a plain-text 413 from the framework before the
+                // handler runs. One byte above the cap, exactly as the token-hook deploy does.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    token_hooks::MAX_COMPONENT_BYTES + 1,
+                )),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets",
+            get(challenge_components::list_challenge_component_secrets)
+                .put(challenge_components::grant_challenge_component_secret)
+                .delete(challenge_components::revoke_challenge_component_secret),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/versions",

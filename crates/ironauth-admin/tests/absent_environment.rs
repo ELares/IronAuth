@@ -929,6 +929,33 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/keys/{management_key}"),
             body: None,
         },
+        // CUSTOM FACTOR components (issue #114 criterion 6). Per ENVIRONMENT rather than per
+        // client, so they live with the other environment-scoped writes. The deploy carries a
+        // body because it takes the component bytes; the grants take none.
+        Case {
+            label: "challenge_components.deployChallengeComponent",
+            method: "PUT",
+            path: format!("{base}/challenge-components?name=wordmark&payload_version=1"),
+            body: Some(body_of(&serde_json::json!({}))),
+        },
+        Case {
+            label: "challenge_components.deleteChallengeComponent",
+            method: "DELETE",
+            path: format!("{base}/challenge-components?name=wordmark"),
+            body: None,
+        },
+        Case {
+            label: "challenge_components.grantChallengeComponentSecret",
+            method: "PUT",
+            path: format!("{base}/challenge-components/secrets?name=wordmark&secret=api_key"),
+            body: None,
+        },
+        Case {
+            label: "challenge_components.revokeChallengeComponentSecret",
+            method: "DELETE",
+            path: format!("{base}/challenge-components/secrets?name=wordmark&secret=api_key"),
+            body: None,
+        },
         Case {
             label: "locales.setLocale",
             method: "PUT",
