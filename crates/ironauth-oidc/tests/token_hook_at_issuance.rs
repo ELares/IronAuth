@@ -1441,3 +1441,82 @@ async fn a_hook_refused_a_protected_claim_is_audited_and_a_well_behaved_one_is_n
         );
     }
 }
+
+/// A CLIENT'S HOOKS RUN IN ORDER, AND EACH SEES THE ONE BEFORE IT.
+///
+/// Issue #114 criterion 5's "explicit ordering of multiple hooks on one event". Before the chain
+/// the primary key allowed one hook per client, so there was nothing an order could be an order
+/// OF.
+///
+/// # Why this needs a fixture written for it
+///
+/// The first version of this test deployed `GOOD` (adds `tier`, echoes the rest) and
+/// `CLAIM_STRIPPER` (drops `email`, adds a marker), and asserted the token carried both markers
+/// and had lost `email`. Every one of those holds in EITHER order -- the two compose
+/// commutatively -- so the test passed with the chain read `ORDER BY ordinal DESC`. Measured: it
+/// did, which is the whole reason `CHAIN_OBSERVER` exists.
+///
+/// An order is observable only through a hook whose OUTPUT depends on its INPUT.
+/// `CHAIN_OBSERVER` echoes both lists and adds one boolean: whether the access list it was
+/// handed already carried `tier`, which is `GOOD`'s contribution. Behind `GOOD` that is true;
+/// ahead of it, false. Both arrangements are asserted here, because a single arrangement is
+/// satisfied by a dispatch that always reports true.
+#[tokio::test]
+async fn a_clients_hooks_run_in_order_and_each_sees_the_previous_ones_output() {
+    let harness = harness_with_hooks().await;
+    let client = *harness.client_id();
+
+    // THE OBSERVER SECOND: it is handed what the adder produced, so it sees `tier`.
+    harness
+        .deploy_token_hook_at(&client, "adder", 0, ironauth_hooks::fixtures::GOOD)
+        .await;
+    harness
+        .deploy_token_hook_at(
+            &client,
+            "observer",
+            1,
+            ironauth_hooks::fixtures::CHAIN_OBSERVER,
+        )
+        .await;
+
+    let (access, _) = exchange(&harness).await.expect("exchange");
+    let behind = claims(&access);
+    assert_eq!(
+        behind.get("saw_previous_hook"),
+        Some(&Value::from(true)),
+        "the hook at position 1 must be handed what the hook at position 0 produced, or the \
+         chain is two independent runs merged rather than a fold: {behind:?}"
+    );
+    assert_eq!(
+        behind.get("tier"),
+        Some(&Value::from("gold")),
+        "and the first hook's claim survives the second, which echoes it: {behind:?}"
+    );
+
+    // THE SAME TWO HOOKS, SWAPPED. Now the observer runs first and is handed the mint's claims,
+    // which carry no `tier`. Without this half the assertion above is satisfied by a dispatch
+    // that hands every hook the same thing and reports true by accident.
+    //
+    // A REORDER, not a redeploy. Deploying the same two names at new ordinals is a no-op: the
+    // upsert leaves `ordinal` alone on conflict, so a rollback restores a hook's code without
+    // moving it. The first version of this test redeployed and asserted the swap, and passed
+    // only because the arrangement never changed.
+    harness
+        .swap_hook_positions(&client, "adder", "observer")
+        .await;
+
+    let (access, _) = exchange(&harness).await.expect("the swapped exchange");
+    let ahead = claims(&access);
+    assert_eq!(
+        ahead.get("saw_previous_hook"),
+        Some(&Value::from(false)),
+        "ahead of the adder the observer is handed the MINT's claims, which carry no `tier`: \
+         {ahead:?}"
+    );
+    assert_eq!(
+        ahead.get("tier"),
+        Some(&Value::from("gold")),
+        "and the adder still ran, so the false above is the ORDER and not a hook that was \
+         skipped: {ahead:?}"
+    );
+}

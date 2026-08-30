@@ -92,6 +92,14 @@ pub mod fixtures {
     /// A hook that returns an error of its own rather than a customization.
     pub const DECLINER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_DECLINER"));
 
+    /// A hook that reports whether it was handed the previous hook's work.
+    ///
+    /// The only fixture that can measure a CHAIN'S ORDER: it echoes both lists and adds
+    /// `saw_previous_hook`, true when the access list it received already carried `good`'s
+    /// `tier`. Every other pair of fixtures composes commutatively, so a test built from them
+    /// passes with the chain read in reverse -- measured, it did.
+    pub const CHAIN_OBSERVER: &[u8] = include_bytes!(env!("IRONAUTH_GUEST_CHAIN_OBSERVER"));
+
     /// A hook that returns `sub` and `iss` -- the identity and the issuer.
     ///
     /// Issue #113 criterion 5's "or hook" half. It also returns one claim the fence ALLOWS, so

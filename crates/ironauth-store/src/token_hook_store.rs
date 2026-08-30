@@ -60,14 +60,88 @@ impl HookFailurePolicy {
 /// One deployed hook: the component, and the payload version its guest was built against.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TokenHookRecord {
-    /// The OAuth client whose tokens this hook shapes, unique per scope.
+    /// The OAuth client whose tokens this hook shapes.
+    ///
+    /// NOT unique per scope any more, and the doc used to say it was. Since migration 0168 a
+    /// client may hold several hooks, so the identity is `(scope, client_id, name)` and this
+    /// field alone no longer picks out a row.
     pub client_id: String,
+    /// WHICH of the client's hooks this is, and the handle an admin route addresses.
+    ///
+    /// Every hook that existed before ordering is `DEFAULT_HOOK_NAME`, which is what migration
+    /// 0167 backfilled them to.
+    pub name: String,
+    /// WHERE in the client's chain this hook runs, ascending, or [`None`] for a record that
+    /// has no position.
+    ///
+    /// Unique per client, so the order is total: two hooks at one position have no order
+    /// between them, and a chain that ran them would produce a token depending on which row
+    /// came back first.
+    ///
+    /// OPTIONAL BECAUSE A HISTORICAL VERSION HAS NO POSITION. This type carries both the ACTIVE
+    /// row and a row read out of the version history, and position is a property of the current
+    /// arrangement rather than of an archived component: version 3 of a hook was at whatever
+    /// position the hook occupied then, which nothing records and nothing needs. An earlier
+    /// draft made this a plain `i32` filled from `try_get(..).unwrap_or(0)`, which is the same
+    /// shape as a silent default -- a historical version would have read as "runs first", and a
+    /// query that forgot to project the column would have collapsed a whole client's order to
+    /// position zero without failing.
+    pub ordinal: Option<i32>,
     /// The WASM component.
     pub component: Vec<u8>,
     /// The payload version the guest expects (issue #113 criterion 6).
     pub payload_version: i32,
     /// What the dispatch does when this hook does not complete.
     pub failure_policy: HookFailurePolicy,
+}
+
+/// WHERE a deploy puts a hook in its client's chain: which hook it is, and in what position.
+///
+/// A pair rather than two parameters, and the reason is the one `Invocation`'s doc gives one
+/// layer down: `name` is a `&str` and so is the client id already in that signature, so a
+/// positional call with two of them swapped compiles. It also keeps the two halves of one
+/// decision together -- a caller that supplies a name has to say where it goes.
+#[derive(Debug, Clone, Copy)]
+pub struct HookPlacement<'a> {
+    /// The hook's stable handle, unique per client.
+    pub name: &'a str,
+    /// Its position in the chain, unique per client and ascending.
+    pub ordinal: i32,
+}
+
+impl HookPlacement<'_> {
+    /// The one hook a client had before ordering existed: `default`, first.
+    ///
+    /// What the pre-ordering deploy path means, spelled out. Migration 0167 backfilled every
+    /// existing row to exactly this, so a deploy through the unnamed path keeps addressing the
+    /// row it always addressed.
+    #[must_use]
+    pub const fn default_hook() -> Self {
+        Self {
+            name: crate::repository::DEFAULT_HOOK_NAME,
+            ordinal: 0,
+        }
+    }
+}
+
+/// WHAT a deploy installs: the component, the contract it was built against, what to do when it
+/// fails, and where it goes.
+///
+/// A struct rather than four more parameters, and the arity lint is the symptom rather than the
+/// reason. `component` and the numbers travel together on every call and mean nothing apart --
+/// a component without its payload version is bytes nobody can invoke -- and bundling them is
+/// the same argument [`HookPlacement`] makes for its own two halves.
+#[derive(Debug, Clone, Copy)]
+pub struct HookDeployment<'a> {
+    /// The WASM component to install.
+    pub component: &'a [u8],
+    /// The `token.customize` payload version the guest was built against (issue #113
+    /// criterion 6).
+    pub payload_version: i32,
+    /// What the dispatch does when this hook does not complete.
+    pub failure_policy: HookFailurePolicy,
+    /// Which hook this is and where in the chain it runs.
+    pub placement: HookPlacement<'a>,
 }
 
 /// Hand-written, and the component is rendered as a LENGTH.
@@ -79,6 +153,10 @@ impl std::fmt::Debug for TokenHookRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenHookRecord")
             .field("client_id", &self.client_id)
+            // WHICH hook and WHERE it runs, both of which a log line about a chain needs: two
+            // records for one client are otherwise indistinguishable in the output.
+            .field("name", &self.name)
+            .field("ordinal", &self.ordinal)
             .field("component_bytes", &self.component.len())
             .field("payload_version", &self.payload_version)
             .field("failure_policy", &self.failure_policy)

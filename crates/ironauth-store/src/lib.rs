@@ -389,4 +389,6 @@ pub use trait_schema::{
     parse_transform,
 };
 
-pub use token_hook_store::{HookFailurePolicy, TokenHookMetadata, TokenHookVersion};
+pub use token_hook_store::{
+    HookDeployment, HookFailurePolicy, HookPlacement, TokenHookMetadata, TokenHookVersion,
+};

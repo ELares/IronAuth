@@ -507,10 +507,10 @@ pub async fn run(
     let Invocation {
         scope, client_id, ..
     } = *invocation;
-    let record = store
+    let chain = store
         .scoped(scope)
         .token_hooks()
-        .get(client_id)
+        .chain(client_id)
         .await
         .map_err(|error| {
             tracing::error!(
@@ -518,44 +518,120 @@ pub async fn run(
                 tenant = %scope.tenant(),
                 client_id,
                 ?error,
-                "a token issuance could not read the client's hook"
+                "a token issuance could not read the client's hooks"
             );
             HookFault::Unavailable
         })?;
-    let Some(record) = record else {
+    if chain.is_empty() {
         return Ok(None);
-    };
+    }
 
-    // THE POLICY IS THE RECORD'S, so it is only knowable once the record is read -- which is
-    // why a failure to READ one is unconditionally fail-closed below and cannot be otherwise:
-    // there is no policy to consult when the thing carrying it is what did not load.
-    let failure_policy = record.failure_policy;
-    match run_deployed_hook(engine, cache, invocation, &record).await {
-        Ok(claims) => {
-            if let Some(contributed) = claims.as_ref() {
-                audit_refusals(store, env, scope, client_id, contributed).await;
+    // A FOLD, and the claim lists it folds are the ones the NEXT hook is handed.
+    //
+    // Issue #114 criterion 5 asks for "explicit ordering of multiple hooks on one event", and an
+    // order only means something if the later hook sees the earlier one's work. Under the WIT
+    // contract a hook REPLACES the claim set rather than returning a delta, so composing two
+    // hooks is exactly this: run the first against what the mint produced, then run the second
+    // against what the first produced. A dispatch that handed both the mint's original claims
+    // and merged the results afterwards would be an unordered dispatch wearing an order -- two
+    // hooks that both write `tier` would race, and which one won would depend on the merge
+    // rather than on the position the operator chose.
+    //
+    // ONE HOOK IS THE SAME CODE, not a special case beside it: a chain of one folds once and
+    // produces what the single-hook dispatch produced before ordering existed.
+    let mut carried: Option<HookClaims> = None;
+    // THE WIRE SHAPE, carried across hops. `Invocation` takes `serde_json::Map` and a hook hands
+    // back a `BTreeMap`, so each hop converts once. That is a copy of the CLAIM MAPS -- tens of
+    // small values -- and not of the component, which is the megabyte-scale thing and stays in
+    // the cache. A chain of one never enters the loop body's second half at all.
+    let mut id_map = invocation.id_token_claims.clone();
+    let mut access_map = invocation.access_token_claims.clone();
+    for record in &chain {
+        // THE POLICY IS THE RECORD'S, so it is only knowable once the record is read -- which
+        // is why a failure to READ one is unconditionally fail-closed above and cannot be
+        // otherwise: there is no policy to consult when the thing carrying it is what did not
+        // load. PER HOOK, so a fail-open hook does not open the chain: the next hook still runs
+        // under its own policy, and a fail-closed hook after a fail-open one still refuses.
+        let failure_policy = record.failure_policy;
+        let step = Invocation {
+            id_token_claims: &id_map,
+            access_token_claims: &access_map,
+            ..*invocation
+        };
+        match run_deployed_hook(engine, cache, &step, record).await {
+            Ok(Some(produced)) => {
+                id_map = produced
+                    .id_token
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                access_map = produced
+                    .access_token
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                carried = Some(merge_step(carried.take(), produced));
             }
-            Ok(claims)
+            Ok(None) => {}
+            Err(fault) => match failure_policy {
+                ironauth_store::HookFailurePolicy::FailClosed => return Err(fault),
+                ironauth_store::HookFailurePolicy::FailOpen => {
+                    // LOUD, and at error rather than warn. Fail-open means a token is being
+                    // minted that the operator's own hook did not shape, which is the situation
+                    // they most need to know about and the one that is otherwise invisible: the
+                    // request succeeds, the client is happy, and the claim the hook was deployed
+                    // to add or REMOVE is simply not applied.
+                    //
+                    // The CHAIN CONTINUES. The hooks after this one are a different operator
+                    // decision and their own policies still apply; skipping them because an
+                    // earlier one declined would apply this hook's policy to code that never
+                    // opted into it.
+                    tracing::error!(
+                        target: "ironauth.hooks",
+                        tenant = %scope.tenant(),
+                        client_id,
+                        hook = %record.name,
+                        ?fault,
+                        "a hook in the client's chain did not complete and its policy is \
+                         fail-open, so the token is being minted WITHOUT its contribution"
+                    );
+                }
+            },
         }
-        Err(fault) => match failure_policy {
-            ironauth_store::HookFailurePolicy::FailClosed => Err(fault),
-            ironauth_store::HookFailurePolicy::FailOpen => {
-                // LOUD, and at error rather than warn. Fail-open means a token is being minted
-                // that the operator's own hook did not shape, which is the situation they most
-                // need to know about and the one that is otherwise invisible: the request
-                // succeeds, the client is happy, and the claim the hook was deployed to add or
-                // REMOVE is simply not applied.
-                tracing::error!(
-                    target: "ironauth.hooks",
-                    tenant = %scope.tenant(),
-                    client_id,
-                    ?fault,
-                    "the client's hook did not complete and its policy is fail-open, so the \
-                     token is being minted WITHOUT the hook's contribution"
-                );
-                Ok(None)
-            }
-        },
+    }
+    if let Some(contributed) = carried.as_ref() {
+        audit_refusals(store, env, scope, client_id, contributed).await;
+    }
+    Ok(carried)
+}
+
+/// Fold one hook's output onto what the chain has produced so far.
+///
+/// The CLAIMS are the later hook's, wholesale, because the WIT contract is a replace: what the
+/// last hook returned is the claim set, and that is exactly what makes the order meaningful.
+///
+/// The DIAGNOSTICS accumulate, because they are a record of what happened rather than a value
+/// being computed. A refusal by the first hook is not undone by the second one behaving, and an
+/// operator reading "your chain tried to write a claim it may not" needs it to survive a later
+/// hook's success. `refused` is a deduplicated union for the reason it already was within one
+/// hook -- two hooks reaching for `sub` is two hooks making the same mistake, and the auditor
+/// wants the name once -- while the counts sum, because each hook truncated its own report
+/// independently.
+#[cfg(feature = "wasm-hooks")]
+fn merge_step(carried: Option<HookClaims>, produced: HookClaims) -> HookClaims {
+    let Some(carried) = carried else {
+        return produced;
+    };
+    let mut refused = carried.refused;
+    refused.extend(produced.refused);
+    refused.sort_unstable();
+    refused.dedup();
+    HookClaims {
+        id_token: produced.id_token,
+        access_token: produced.access_token,
+        refused,
+        refusals_not_reported: carried.refusals_not_reported + produced.refusals_not_reported,
+        values_not_json: carried.values_not_json + produced.values_not_json,
     }
 }
 
