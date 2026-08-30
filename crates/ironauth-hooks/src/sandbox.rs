@@ -422,12 +422,6 @@ impl Sandbox {
         (grant.transport)(url)
     }
 
-    /// How many requests this hook has spent, for a caller that wants to report it.
-    #[must_use]
-    pub fn requests_spent(&self) -> u32 {
-        self.fetch.as_ref().map_or(0, |grant| grant.spent)
-    }
-
     /// The value of a granted secret, or [`None`] when this hook may not read it.
     ///
     /// The whole of what the `secrets` import can do. A map lookup and nothing else -- see the

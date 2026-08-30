@@ -129,9 +129,13 @@ interface fetch {
   record response {
     /// The HTTP status.
     status: u16,
-    /// The body, as text. A response that is not valid UTF-8 is an error rather than a lossy
-    /// string: a hook parsing JSON would otherwise be handed replacement characters and decide
-    /// something about them.
+    /// The body, as text.
+    ///
+    /// A response that is not valid UTF-8 must be an ERROR rather than a lossy string -- a hook
+    /// parsing JSON would otherwise be handed replacement characters and decide something about
+    /// them. That is an obligation on whoever supplies the transport, not something this
+    /// interface can enforce: `string` in WIT is UTF-8 by construction, so by the time a body
+    /// reaches here the choice has already been made.
     body: string,
   }
 
