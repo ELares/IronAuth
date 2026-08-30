@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-fastly-verify"
+description = "Verify an IronAuth token at the edge from Rust/WASM (issue #118): the Fastly Compute snippet."
+publish = false
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# PURE RUST, ALL THREE, and that is the constraint that picked them rather than taste.
+#
+# `ironauth-jose` is this repository's own verifier and it is backed by `ring`, which does not
+# build for `wasm32`. Fastly Compute runs WASM, so the edge snippet cannot reuse the server's
+# core no matter how much one would prefer it to -- which is exactly why this file exists and
+# why it is judged against the same conformance corpus rather than trusted for looking similar.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+# `ecdsa` ON TOP OF THE WORKSPACE FEATURES. The workspace pins p256 for key HANDLING (pkcs8,
+# arithmetic) because the server signs through `ring`; this snippet has no `ring`, so it needs
+# p256's own ECDSA verifier. Additive, so the workspace build is unaffected.
+p256 = { workspace = true, features = ["ecdsa"] }
+# `sha2` COMES FROM `rsa`, not from the workspace, and the reason is a version skew worth
+# writing down: the workspace pins sha2 0.11 (digest 0.11) while rsa 0.9 is built against
+# digest 0.10, so `rsa::pkcs1v15::VerifyingKey<sha2::Sha256>` does not typecheck against the
+# workspace crate -- two `Sha256` types with the same name. Depending on `sha2` as an optional
+# feature of `rsa` gets the one rsa was compiled against, by construction.
+rsa = { workspace = true, features = ["sha2"] }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -35,6 +35,11 @@ members = [
     "crates/ironauth-connector",
     "crates/ironauth-journey",
     "crates/ironauth",
+    # The EDGE VERIFY SNIPPET (issue #118). A workspace member rather than a standalone crate
+    # with its own lockfile, deliberately: `cargo-deny`, `clippy --workspace` and `cargo fmt`
+    # then cover it without anybody wiring it in, and a snippet nobody's gates read is a snippet
+    # that rots. It is still copy-pasteable -- a user takes `src/lib.rs` and three dependencies.
+    "snippets/fastly-compute-verify",
 ]
 
 [workspace.package]

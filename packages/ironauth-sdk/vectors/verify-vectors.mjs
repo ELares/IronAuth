@@ -51,7 +51,7 @@ export default {
       {
         "kty": "OKP",
         "crv": "Ed25519",
-        "x": "F83SEmSVgKMBLYCoZfCPDHVGDGVoXVfyxRZsGnPPYQE",
+        "x": "HKXZ6AA3cXV3rkGkXABdZYVlYGj74LGGXH7khOzfzzo",
         "kid": "ed25519-decoy"
       }
     ]

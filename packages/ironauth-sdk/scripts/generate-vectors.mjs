@@ -102,11 +102,24 @@ const RS256_PUBLIC = {
   kid: 'rsa-1',
 };
 
-/** An Ed25519 key that is PUBLISHED but never signs anything, for the wrong-key case. */
+/**
+ * An Ed25519 key that is PUBLISHED but never signs anything, for the wrong-key case.
+ *
+ * A REAL public key, exported from a generated keypair, and that is load bearing rather than
+ * tidy. The previous value was 32 bytes that are not a point on the curve, and the two
+ * implementations judged against this corpus disagreed about it: WebCrypto's `importKey` accepts
+ * it and the signature check then fails (`bad_signature`, which is what the case asserts), while
+ * `ed25519-dalek`'s `VerifyingKey::from_bytes` validates the point and refuses the KEY -- so the
+ * Rust snippet reported `unknown_key` and failed a case it implements correctly.
+ *
+ * The case's own reason is "the named key is published but did not sign this token", and that
+ * sentence needs the published thing to actually be a key. Anything else tests point validation
+ * on one implementation and key resolution on another.
+ */
 const ED25519_DECOY_PUBLIC = {
   kty: 'OKP',
   crv: 'Ed25519',
-  x: 'F83SEmSVgKMBLYCoZfCPDHVGDGVoXVfyxRZsGnPPYQE',
+  x: 'HKXZ6AA3cXV3rkGkXABdZYVlYGj74LGGXH7khOzfzzo',
   kid: 'ed25519-decoy',
 };
 
@@ -457,6 +470,41 @@ const corpus = {
   cases,
 };
 
+const json = `${JSON.stringify(corpus, null, 2)}\n`;
 const target = new URL('../vectors/verify-vectors.json', import.meta.url);
-writeFileSync(target, `${JSON.stringify(corpus, null, 2)}\n`);
-process.stdout.write(`wrote ${cases.length} vectors to ${target.pathname}\n`);
+writeFileSync(target, json);
+
+// AND THE `.mjs` MIRROR, from the same object in the same run.
+//
+// That file's own header says "GENERATED from verify-vectors.json by
+// scripts/generate-vectors.mjs", and until this line existed that sentence was FALSE: this
+// script wrote only the JSON, so the module was hand-maintained while claiming not to be. The
+// single thing catching a drift was one assertion in `vectors.test.ts` -- which is a real gate,
+// but it tells you the two disagree AFTER someone has hand-edited one of them, rather than
+// making that impossible.
+//
+// Found while adding the Rust snippet: changing the decoy key regenerated the JSON, the module
+// kept the old value, and the two went out of step in one command.
+const moduleHeader = `// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// GENERATED from verify-vectors.json by scripts/generate-vectors.mjs. Do not edit.
+//
+// # Why a .mjs beside the .json
+//
+// The conformance corpus has to be readable from code that runs in FIVE runtimes,
+// including workerd. A JSON import needs either an import attribute or a bundler rule,
+// and support for both varies across those runtimes and across bundler versions, so a
+// JSON import in the shared checks would make the portability matrix depend on the very
+// thing it exists to test. A plain ES module imports identically everywhere.
+//
+// The JSON stays canonical: it is what the Rust conformance test and the Node suite read,
+// and \`the generated vectors module matches the json corpus\` in verify.test.ts fails if
+// this file drifts from it.
+
+export default `;
+const moduleTarget = new URL('../vectors/verify-vectors.mjs', import.meta.url);
+writeFileSync(moduleTarget, `${moduleHeader}${JSON.stringify(corpus, null, 2)};\n`);
+
+process.stdout.write(
+  `wrote ${cases.length} vectors to ${target.pathname} and ${moduleTarget.pathname}\n`,
+);
