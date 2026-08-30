@@ -112,7 +112,7 @@ const COMPONENT_PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0
 const MODULE_PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
 /// Resolve and authorize the `(tenant, environment)` scope from the path.
-async fn resolve_scope(
+pub(crate) async fn resolve_scope(
     state: &AdminState,
     principal: &Principal,
     tenant_id: &str,
@@ -149,7 +149,7 @@ fn parse_client_id(raw: &str, scope: Scope) -> Result<ClientId, ApiError> {
 }
 
 /// Refuse a component this build could not run, naming which check failed.
-fn validate_component(component: &[u8]) -> Result<(), ApiError> {
+pub(crate) fn validate_component(component: &[u8]) -> Result<(), ApiError> {
     if component.is_empty() {
         return Err(ApiError::BadRequest("invalid_component: the request body is empty; deploy the component bytes as the body with \
              Content-Type: application/wasm".to_owned()));

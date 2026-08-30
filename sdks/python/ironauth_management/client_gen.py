@@ -235,6 +235,10 @@ class Client:
         """Delete a brand's logo. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}/logo."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/brands/{urllib.parse.quote(slug)}/logo", query, None)
 
+    def delete_challenge_component(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Remove a custom factor component. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/challenge-components", query, None)
+
     def delete_claims_mapping(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a per-environment, per-client declarative claim mapping. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/claims-mapping", query, None)
@@ -330,6 +334,10 @@ class Client:
     def deny_sms_country(self, tenant_id: str, environment_id: str, country_code: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Stop allowing SMS to a country calling code. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/sms-otp/allowlist/{country_code}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/sms-otp/allowlist/{urllib.parse.quote(country_code)}", query, None)
+
+    def deploy_challenge_component(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Deploy (create or replace) a custom factor component. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/challenge-components", query, body)
 
     def deploy_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Deploy (create or replace) a client's WASM token hook. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook."""
@@ -555,6 +563,10 @@ class Client:
         """Get one variable by name. GET /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/variables/{urllib.parse.quote(name)}", query, None)
 
+    def grant_challenge_component_secret(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Grant a component permission to read an environment secret. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/challenge-components/secrets", query, None)
+
     def grant_token_hook_secret(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Grant a hook permission to read an environment secret. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/token-hook/secrets", query, None)
@@ -574,6 +586,14 @@ class Client:
     def list_brands(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List a per-environment's brands. GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/brands", query, None)
+
+    def list_challenge_component_secrets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the environment secrets a component may read. GET /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/challenge-components/secrets", query, None)
+
+    def list_challenge_components(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the custom factor components deployed in this environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/challenge-components", query, None)
 
     def list_connectors(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List federation connectors in an environment (cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors."""
@@ -874,6 +894,10 @@ class Client:
     def resume_webhook_endpoint(self, tenant_id: str, environment_id: str, endpoint_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Resume deliveries to a paused endpoint, under the secret it already had. POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/resume."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webhook-endpoints/{urllib.parse.quote(endpoint_id)}/resume", query, None)
+
+    def revoke_challenge_component_secret(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Withdraw a component's permission to read an environment secret. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/challenge-components/secrets", query, None)
 
     def revoke_invitation(self, tenant_id: str, environment_id: str, invitation_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Revoke a pending invitation (its token becomes unredeemable). POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke."""

@@ -4343,6 +4343,594 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components": {
+      "get": {
+        "tags": [
+          "challenge-components"
+        ],
+        "summary": "List the custom factor components deployed in this environment.",
+        "operationId": "listChallengeComponents",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deployed components, as metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeComponentsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "challenge-components"
+        ],
+        "summary": "Deploy (create or replace) a custom factor component.",
+        "operationId": "deployChallengeComponent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "The name a journey step references this component by. REQUIRED: there is no default, because a journey always names one explicitly",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "payload_version",
+            "in": "query",
+            "description": "The custom-challenge payload version the guest was built against",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "fetch_budget",
+            "in": "query",
+            "description": "How many outbound requests ONE call of the triad may make, 0 to 16. Absent means ZERO, which is not granted. Applied on a redeploy: capabilities travel with the code",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 16,
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The WebAssembly component bytes",
+          "content": {
+            "application/wasm": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeComponentView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown or absent payload version, an invalid name, an out-of-range fetch budget, or bytes that are not a WebAssembly component",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "challenge-components"
+        ],
+        "summary": "Remove a custom factor component.",
+        "operationId": "deleteChallengeComponent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which component to remove. REMOVING ONE A JOURNEY STILL NAMES MAKES EVERY LOGIN THAT REACHES THAT STEP REFUSE: a factor fails closed, so the step must come out of the journey too",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed, along with every secret grant it held"
+          },
+          "400": {
+            "description": "An invalid or absent name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, or no component of that name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets": {
+      "get": {
+        "tags": [
+          "challenge-components"
+        ],
+        "summary": "List the environment secrets a component may read.",
+        "operationId": "listChallengeComponentSecrets",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which component",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret NAMES this component may read, never their values",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeComponentSecretsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid or absent name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "challenge-components"
+        ],
+        "summary": "Grant a component permission to read an environment secret.",
+        "operationId": "grantChallengeComponentSecret",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which component",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "secret",
+            "in": "query",
+            "description": "The environment secret's name. REQUIRED: there is no meaningful default, and an omitted one would have to mean `all of them`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret NAMES this component may now read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeComponentSecretsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid or absent name or secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found, or that component is not deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "challenge-components"
+        ],
+        "summary": "Withdraw a component's permission to read an environment secret.",
+        "operationId": "revokeChallengeComponentSecret",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Which component",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "secret",
+            "in": "query",
+            "description": "The environment secret's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secret NAMES this component may still read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeComponentSecretsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An invalid or absent name or secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Environment not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}": {
       "get": {
         "tags": [
@@ -26166,6 +26754,76 @@
               "type": "string"
             },
             "description": "The sessions to revoke. Every id is scope-FENCED: one belonging to another\ntenant or environment is a uniform no-op (never an error that would confirm\nits existence), so a batch can never reach across a scope boundary."
+          }
+        }
+      },
+      "ChallengeComponentSecretsView": {
+        "type": "object",
+        "description": "The environment secrets a custom factor component may read (issue #114 criterion 6).",
+        "required": [
+          "name",
+          "secrets"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The component."
+          },
+          "secrets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The secret NAMES this component may read, sorted. Never the values.\n\nThe same separation `TokenHookSecretsView` records: a grant is a reference, and the value\nlives sealed behind a different repository and the platform key. That is what stops a\n\"what may this factor read\" route ever being one keystroke from disclosing it.\n\nA NAME HERE MAY NOT RESOLVE, because the grant table deliberately has no foreign key onto\nthe secret: an operator may grant a name before the secret exists, and the host answers\n`none` for a name with no value."
+          }
+        }
+      },
+      "ChallengeComponentView": {
+        "type": "object",
+        "description": "One deployed CUSTOM FACTOR component, as the management API reports it (issue #114\ncriterion 6).\n\nMETADATA, never the component. \"What is deployed\" is answered by the name, the size and the\npayload version; streaming the bytes back would make every read a multi-megabyte body to\nanswer a question nobody asked.",
+        "required": [
+          "name",
+          "component_bytes",
+          "payload_version",
+          "fetch_budget"
+        ],
+        "properties": {
+          "component_bytes": {
+            "type": "integer",
+            "description": "How many bytes the deployed component is, so an operator can tell whether the thing\nrunning is the thing they pushed.",
+            "minimum": 0
+          },
+          "fetch_budget": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many outbound requests ONE call of the triad may make. Zero means it may not.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "The name a journey step references this component by."
+          },
+          "payload_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The custom-challenge payload version the guest was built against.",
+            "minimum": 0
+          }
+        }
+      },
+      "ChallengeComponentsView": {
+        "type": "object",
+        "description": "Every custom factor component deployed in an environment (issue #114 criterion 6).",
+        "required": [
+          "components"
+        ],
+        "properties": {
+          "components": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChallengeComponentView"
+            },
+            "description": "The components, by name. Empty when the environment has none."
           }
         }
       },

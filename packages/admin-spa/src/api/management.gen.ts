@@ -621,6 +621,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the custom factor components deployed in this environment. */
+        get: operations["listChallengeComponents"];
+        /** Deploy (create or replace) a custom factor component. */
+        put: operations["deployChallengeComponent"];
+        post?: never;
+        /** Remove a custom factor component. */
+        delete: operations["deleteChallengeComponent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the environment secrets a component may read. */
+        get: operations["listChallengeComponentSecrets"];
+        /** Grant a component permission to read an environment secret. */
+        put: operations["grantChallengeComponentSecret"];
+        post?: never;
+        /** Withdraw a component's permission to read an environment secret. */
+        delete: operations["revokeChallengeComponentSecret"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}": {
         parameters: {
             query?: never;
@@ -3884,6 +3922,55 @@ export interface components {
              *     its existence), so a batch can never reach across a scope boundary.
              */
             session_ids?: string[];
+        };
+        /** @description The environment secrets a custom factor component may read (issue #114 criterion 6). */
+        ChallengeComponentSecretsView: {
+            /** @description The component. */
+            name: string;
+            /**
+             * @description The secret NAMES this component may read, sorted. Never the values.
+             *
+             *     The same separation `TokenHookSecretsView` records: a grant is a reference, and the value
+             *     lives sealed behind a different repository and the platform key. That is what stops a
+             *     "what may this factor read" route ever being one keystroke from disclosing it.
+             *
+             *     A NAME HERE MAY NOT RESOLVE, because the grant table deliberately has no foreign key onto
+             *     the secret: an operator may grant a name before the secret exists, and the host answers
+             *     `none` for a name with no value.
+             */
+            secrets: string[];
+        };
+        /**
+         * @description One deployed CUSTOM FACTOR component, as the management API reports it (issue #114
+         *     criterion 6).
+         *
+         *     METADATA, never the component. "What is deployed" is answered by the name, the size and the
+         *     payload version; streaming the bytes back would make every read a multi-megabyte body to
+         *     answer a question nobody asked.
+         */
+        ChallengeComponentView: {
+            /**
+             * @description How many bytes the deployed component is, so an operator can tell whether the thing
+             *     running is the thing they pushed.
+             */
+            component_bytes: number;
+            /**
+             * Format: int32
+             * @description How many outbound requests ONE call of the triad may make. Zero means it may not.
+             */
+            fetch_budget: number;
+            /** @description The name a journey step references this component by. */
+            name: string;
+            /**
+             * Format: int32
+             * @description The custom-challenge payload version the guest was built against.
+             */
+            payload_version: number;
+        };
+        /** @description Every custom factor component deployed in an environment (issue #114 criterion 6). */
+        ChallengeComponentsView: {
+            /** @description The components, by name. Empty when the environment has none. */
+            components: components["schemas"]["ChallengeComponentView"][];
         };
         /**
          * @description A per-environment, per-client declarative claim mapping, as returned by the management API
@@ -11673,6 +11760,389 @@ export interface operations {
                 };
             };
             /** @description Brand or asset not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listChallengeComponents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The deployed components, as metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChallengeComponentsView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deployChallengeComponent: {
+        parameters: {
+            query: {
+                /** @description The name a journey step references this component by. REQUIRED: there is no default, because a journey always names one explicitly */
+                name: string;
+                /** @description The custom-challenge payload version the guest was built against */
+                payload_version: number;
+                /** @description How many outbound requests ONE call of the triad may make, 0 to 16. Absent means ZERO, which is not granted. Applied on a redeploy: capabilities travel with the code */
+                fetch_budget?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description The WebAssembly component bytes */
+        requestBody: {
+            content: {
+                "application/wasm": string;
+            };
+        };
+        responses: {
+            /** @description Deployed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChallengeComponentView"];
+                };
+            };
+            /** @description An unknown or absent payload version, an invalid name, an out-of-range fetch budget, or bytes that are not a WebAssembly component */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteChallengeComponent: {
+        parameters: {
+            query: {
+                /** @description Which component to remove. REMOVING ONE A JOURNEY STILL NAMES MAKES EVERY LOGIN THAT REACHES THAT STEP REFUSE: a factor fails closed, so the step must come out of the journey too */
+                name: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed, along with every secret grant it held */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description An invalid or absent name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, or no component of that name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listChallengeComponentSecrets: {
+        parameters: {
+            query: {
+                /** @description Which component */
+                name: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret NAMES this component may read, never their values */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChallengeComponentSecretsView"];
+                };
+            };
+            /** @description An invalid or absent name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    grantChallengeComponentSecret: {
+        parameters: {
+            query: {
+                /** @description Which component */
+                name: string;
+                /** @description The environment secret's name. REQUIRED: there is no meaningful default, and an omitted one would have to mean `all of them` */
+                secret: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret NAMES this component may now read */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChallengeComponentSecretsView"];
+                };
+            };
+            /** @description An invalid or absent name or secret */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, or that component is not deployed */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revokeChallengeComponentSecret: {
+        parameters: {
+            query: {
+                /** @description Which component */
+                name: string;
+                /** @description The environment secret's name */
+                secret: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secret NAMES this component may still read */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChallengeComponentSecretsView"];
+                };
+            };
+            /** @description An invalid or absent name or secret */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
             404: {
                 headers: {
                     [name: string]: unknown;

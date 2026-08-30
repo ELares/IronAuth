@@ -2154,6 +2154,50 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{base}/keys/{key}"),
         ),
+        // ---- custom factor components (issue #114 criterion 6) ----
+        //
+        // PER ENVIRONMENT, not per client: a journey step references one by name, and a journey
+        // is not a client's. The deploy carries real component bytes because the route's preamble
+        // check refuses anything else, and this sweep must drive a request that REACHES the
+        // handler rather than one refused at the door.
+        Case {
+            label: "challenge_components.deployChallengeComponent",
+            method: "PUT",
+            path: format!("{base}/challenge-components?name=wordmark&payload_version=1"),
+            body: Some(COMPONENT_UPLOAD.to_owned()),
+            content_type: "application/wasm",
+            token: OPERATOR_TOKEN,
+        },
+        Case::empty(
+            "challenge_components.listChallengeComponents",
+            "GET",
+            format!("{base}/challenge-components"),
+        ),
+        Case::empty(
+            "challenge_components.listChallengeComponentSecrets",
+            "GET",
+            format!("{base}/challenge-components/secrets?name=wordmark"),
+        ),
+        // The GRANT then the REVOKE, in that order and adjacent: the grant is the door that
+        // WIDENS what code may read, and the revoke leaves the fixture as it found it -- these
+        // cases run in sequence against one environment, so a grant left standing would be
+        // visible to every case after it.
+        Case::empty(
+            "challenge_components.grantChallengeComponentSecret",
+            "PUT",
+            format!("{base}/challenge-components/secrets?name=wordmark&secret=live_surface_probe"),
+        ),
+        Case::empty(
+            "challenge_components.revokeChallengeComponentSecret",
+            "DELETE",
+            format!("{base}/challenge-components/secrets?name=wordmark&secret=live_surface_probe"),
+        ),
+        // LAST of the group, so the deploy above still exists for the reads and grants.
+        Case::empty(
+            "challenge_components.deleteChallengeComponent",
+            "DELETE",
+            format!("{base}/challenge-components?name=wordmark"),
+        ),
         // ---- locales ----
         Case::json(
             "locales.setLocale",

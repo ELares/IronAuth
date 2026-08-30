@@ -183,6 +183,33 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ("setClaimsMapping", ManagementPermission::WriteConfig),
     ("deleteClaimsMapping", ManagementPermission::WriteConfig),
     ("getClaimsMapping", ManagementPermission::Read),
+    // CUSTOM FACTOR components (issue #114 criterion 6). The three writes are `write_config`
+    // with the token-hook deploy and for a stronger reason: a hook shapes claims on a token the
+    // login has already earned, and a factor decides whether it is earned at all. The two reads
+    // are `read`, and neither returns a component or a secret VALUE -- the listing returns
+    // metadata and the secrets route returns NAMES.
+    //
+    // The DELETE is pinned separately from the deploy because its reason inverts the token
+    // hook's: removing a hook restores the unshaped token, while removing a component a journey
+    // still names makes every login that reaches that step REFUSE.
+    (
+        "deployChallengeComponent",
+        ManagementPermission::WriteConfig,
+    ),
+    (
+        "deleteChallengeComponent",
+        ManagementPermission::WriteConfig,
+    ),
+    ("listChallengeComponents", ManagementPermission::Read),
+    (
+        "grantChallengeComponentSecret",
+        ManagementPermission::WriteConfig,
+    ),
+    (
+        "revokeChallengeComponentSecret",
+        ManagementPermission::WriteConfig,
+    ),
+    ("listChallengeComponentSecrets", ManagementPermission::Read),
     ("deployTokenHook", ManagementPermission::WriteConfig),
     ("deleteTokenHook", ManagementPermission::WriteConfig),
     ("getTokenHook", ManagementPermission::Read),
@@ -645,6 +672,20 @@ const PERMISSION_PROVEN: &[&str] = &[
     "setClaimsMapping",
     "deleteClaimsMapping",
     "getClaimsMapping",
+    // CUSTOM FACTOR components (issue #114 criterion 6), proven in
+    // `write_config_is_required_and_sufficient_to_deploy_a_custom_factor`, its removal sibling,
+    // `read_is_required_and_sufficient_to_list_custom_factors`, and
+    // `a_factors_secret_grants_split_read_from_write_config`, each in BOTH directions.
+    //
+    // The three secret routes are proven by ONE test deliberately: they share a path and differ
+    // only in method, which is exactly the shape where a router-level gate would hand all three
+    // the same authority. Proving them apart is the point, so they are proven together.
+    "deployChallengeComponent",
+    "deleteChallengeComponent",
+    "listChallengeComponents",
+    "listChallengeComponentSecrets",
+    "grantChallengeComponentSecret",
+    "revokeChallengeComponentSecret",
     // Proven in `write_config_is_required_and_sufficient_for_a_token_hook_deploy`, its removal
     // sibling, and `read_is_required_and_sufficient_for_a_token_hook_read`, each in BOTH
     // directions. The removal is pinned separately from the deploy because its reason is the
@@ -811,7 +852,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 189 minus 45 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// its own: 203 minus 59 is always 144. (It read "166 minus 22", then "171 minus 27", while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
 /// pinned by the two `assert_eq!`s in the test below; if you change either, change this
@@ -829,12 +870,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        197,
+        203,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        53,
+        59,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -853,6 +894,14 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/claims_mappings.rs"),
     ),
     ("token_hooks.rs", include_str!("../src/token_hooks.rs")),
+    // The custom factor surface (issue #114 criterion 6). Listed the moment the module existed:
+    // a file NOT enumerated here is one this gate never reads, so its classification comments
+    // and its gate calls could disagree silently -- which they did, two comments against six
+    // calls, until it was added.
+    (
+        "challenge_components.rs",
+        include_str!("../src/challenge_components.rs"),
+    ),
     ("messages.rs", include_str!("../src/messages.rs")),
     (
         "service_account_keys.rs",

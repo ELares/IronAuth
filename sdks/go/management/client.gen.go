@@ -393,6 +393,13 @@ func (c *Client) DeleteBrandLogo(tenant_id string, environment_id string, slug s
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/brands/" + escape(slug) + "/logo", query, nil)
 }
 
+// DeleteChallengeComponent performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components.
+//
+// Remove a custom factor component.
+func (c *Client) DeleteChallengeComponent(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/challenge-components", query, nil)
+}
+
 // DeleteClaimsMapping performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping.
 //
 // Delete a per-environment, per-client declarative claim mapping.
@@ -559,6 +566,13 @@ func (c *Client) DeleteWebhookEndpoint(tenant_id string, environment_id string, 
 // Stop allowing SMS to a country calling code.
 func (c *Client) DenySmsCountry(tenant_id string, environment_id string, country_code string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/sms-otp/allowlist/" + escape(country_code), query, nil)
+}
+
+// DeployChallengeComponent performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components.
+//
+// Deploy (create or replace) a custom factor component.
+func (c *Client) DeployChallengeComponent(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/challenge-components", query, body)
 }
 
 // DeployTokenHook performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook.
@@ -953,6 +967,13 @@ func (c *Client) GetVariable(tenant_id string, environment_id string, name strin
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/variables/" + escape(name), query, nil)
 }
 
+// GrantChallengeComponentSecret performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets.
+//
+// Grant a component permission to read an environment secret.
+func (c *Client) GrantChallengeComponentSecret(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/challenge-components/secrets", query, nil)
+}
+
 // GrantTokenHookSecret performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/secrets.
 //
 // Grant a hook permission to read an environment secret.
@@ -986,6 +1007,20 @@ func (c *Client) ListBans(tenant_id string, environment_id string, query url.Val
 // List a per-environment's brands.
 func (c *Client) ListBrands(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/brands", query, nil)
+}
+
+// ListChallengeComponentSecrets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets.
+//
+// List the environment secrets a component may read.
+func (c *Client) ListChallengeComponentSecrets(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/challenge-components/secrets", query, nil)
+}
+
+// ListChallengeComponents performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components.
+//
+// List the custom factor components deployed in this environment.
+func (c *Client) ListChallengeComponents(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/challenge-components", query, nil)
 }
 
 // ListConnectors performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/connectors.
@@ -1511,6 +1546,13 @@ func (c *Client) ResumeTenant(tenant_id string, query url.Values) (*http.Respons
 // Resume deliveries to a paused endpoint, under the secret it already had.
 func (c *Client) ResumeWebhookEndpoint(tenant_id string, environment_id string, endpoint_id string, query url.Values) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints/" + escape(endpoint_id) + "/resume", query, nil)
+}
+
+// RevokeChallengeComponentSecret performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/challenge-components/secrets.
+//
+// Withdraw a component's permission to read an environment secret.
+func (c *Client) RevokeChallengeComponentSecret(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/challenge-components/secrets", query, nil)
 }
 
 // RevokeInvitation performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations/{invitation_id}/revoke.
