@@ -32994,8 +32994,14 @@ impl ChallengeComponentRepo<'_> {
     /// Every component in this scope, as METADATA.
     ///
     /// Never the components: a listing exists so an operator can see WHICH factors are deployed,
-    /// and a scope with eight eight-megabyte components would be sixty-four megabytes of response
-    /// to answer that.
+    /// and a scope with eight sixteen-megabyte components would be a hundred and twenty-eight
+    /// megabytes of response to answer that.
+    ///
+    /// UNBOUNDED, and deliberately, for the reason `chain_metadata` gives: this read returns a
+    /// LENGTH per row rather than bytes, and it is the read an operator uses to find what is
+    /// deployed. A listing that truncated would hide exactly the rows somebody is looking for --
+    /// and unlike the issuance path, nothing here is on a hot path where the count is chosen by
+    /// whoever can start a login.
     ///
     /// # Errors
     ///

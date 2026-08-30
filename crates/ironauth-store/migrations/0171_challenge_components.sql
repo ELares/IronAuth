@@ -10,8 +10,24 @@
 -- A token hook is deployed AGAINST A CLIENT: its identity is (scope, client, name), it has an
 -- ordinal because a client's hooks run as an ordered chain, and `MAX_HOOKS_PER_CLIENT` bounds
 -- how many of them one login can be made to run. A challenge component is deployed against the
--- ENVIRONMENT and referenced BY NAME from a journey step: no client, no ordinal, and the bound
--- that matters is on how many steps a journey has, which the journey validator already owns.
+-- ENVIRONMENT and referenced BY NAME from a journey step: no client, no ordinal.
+--
+-- # What is bounded here and what is not, said separately because they are separate axes
+--
+-- `MAX_HOOKS_PER_CLIENT` bounds RUNTIME WORK: every hook in a client's chain runs on every token
+-- that client is issued, so an unbounded chain is unbounded work on the hot path for a client
+-- that whoever can start a login gets to pick. This table needs no equivalent, because a login
+-- runs only the components THE STEPS ITS JOURNEY NAMES, and how many steps a journey may have is
+-- the journey validator's bound rather than this table's.
+--
+-- STORAGE GROWTH IS A DIFFERENT AXIS AND IS NOT BOUNDED HERE. An environment may hold as many
+-- components as its operator deploys, at up to sixteen mebibytes each. That is deliberate rather
+-- than overlooked: deploying one is a control-plane action an authenticated operator takes
+-- against their own environment, so it is a quota question, and quotas are `ironauth-quota`'s.
+-- A number written here would be a second, weaker quota that no operator could raise.
+--
+-- Answering the runtime axis and leaving the storage one implied is the shape of mistake this
+-- paragraph exists to avoid.
 --
 -- Putting them in one table would mean every existing read of `token_hooks` grows a filter it
 -- did not have -- `chain` would return components that export the wrong world and fail to
