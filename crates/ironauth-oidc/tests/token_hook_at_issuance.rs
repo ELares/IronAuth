@@ -1566,6 +1566,24 @@ async fn a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it() {
     harness
         .grant_hook_secret(&client, "reader", "granted")
         .await;
+    // THE GRANT IS AUDITED, and the row SAYS WHICH PAIR. A grant of access to a secret is
+    // exactly what an auditor reviewing "who can read what" has to be able to find without
+    // reading the hook -- and the target is the CLIENT, which may hold several hooks and
+    // reference several secrets, so a row naming only the client answers nothing.
+    let rows = harness
+        .audit_rows_for_action("token_hook.secret_granted")
+        .await;
+    assert_eq!(rows.len(), 1, "one grant, one row: {rows:?}");
+    let detail: Value = serde_json::from_str(
+        rows[0]
+            .detail
+            .as_deref()
+            .expect("the row carries the pair it granted"),
+    )
+    .expect("the detail is JSON");
+    assert_eq!(detail["hook"], Value::from("reader"), "{detail}");
+    assert_eq!(detail["secret"], Value::from("granted"), "{detail}");
+
     let (access, _) = exchange(&harness).await.expect("the granted exchange");
     let granted = claims(&access);
     assert_eq!(
@@ -1584,6 +1602,13 @@ async fn a_granted_secret_reaches_a_hook_at_issuance_and_a_revoke_stops_it() {
     harness
         .revoke_hook_secret(&client, "reader", "granted")
         .await;
+    // AND SO IS THE REVOKE, as its own action. A burst of revocations is a story, and an
+    // auditor grouping by action cannot see one if a withdrawal is a variant of a grant.
+    let rows = harness
+        .audit_rows_for_action("token_hook.secret_revoked")
+        .await;
+    assert_eq!(rows.len(), 1, "one revoke, one row: {rows:?}");
+
     let (access, _) = exchange(&harness).await.expect("the revoked exchange");
     let revoked = claims(&access);
     assert!(

@@ -32928,7 +32928,14 @@ impl ActingTokenHookRepo<'_> {
         let client_id = client.to_string();
         let hook = hook_name.to_owned();
         let secret = secret_name.to_owned();
-        write_audited(
+        // WHICH HOOK AND WHICH SECRET, on the row. The target is the CLIENT, which may hold
+        // eight hooks and reference many secrets, so a row that named only the client would
+        // answer "something about this client's hooks changed" -- and an auditor reviewing who
+        // can read what needs the pair. Both are operator-chosen NAMES rather than values, and
+        // both are bounded by their columns' own CHECKs, which is what keeps this inside
+        // `write_audited_detailed`'s rule that detail is never attacker-controlled free text.
+        let detail = serde_json::json!({ "hook": hook, "secret": secret }).to_string();
+        write_audited_detailed(
             AuditedWrite {
                 store: self.store,
                 scope,
@@ -32971,6 +32978,7 @@ impl ActingTokenHookRepo<'_> {
                 Ok(())
             },
             false,
+            Some(detail.as_str()),
         )
         .await
     }
@@ -33004,7 +33012,14 @@ impl ActingTokenHookRepo<'_> {
         let client_id = client.to_string();
         let hook = hook_name.to_owned();
         let secret = secret_name.to_owned();
-        write_audited(
+        // WHICH HOOK AND WHICH SECRET, on the row. The target is the CLIENT, which may hold
+        // eight hooks and reference many secrets, so a row that named only the client would
+        // answer "something about this client's hooks changed" -- and an auditor reviewing who
+        // can read what needs the pair. Both are operator-chosen NAMES rather than values, and
+        // both are bounded by their columns' own CHECKs, which is what keeps this inside
+        // `write_audited_detailed`'s rule that detail is never attacker-controlled free text.
+        let detail = serde_json::json!({ "hook": hook, "secret": secret }).to_string();
+        write_audited_detailed(
             AuditedWrite {
                 store: self.store,
                 scope,
@@ -33029,6 +33044,7 @@ impl ActingTokenHookRepo<'_> {
                 Ok(())
             },
             false,
+            Some(detail.as_str()),
         )
         .await
     }
