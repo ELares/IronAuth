@@ -388,33 +388,41 @@ mod tests {
             "the credential must be in the keychain for the disk walk to mean anything"
         );
 
-        let roots: Vec<std::path::PathBuf> = [
+        // TWO KINDS OF PLACE, walked differently, and the distinction is what keeps this test
+        // bounded.
+        //
+        // A per-user root like `%LOCALAPPDATA%` holds every application's data on the machine --
+        // tens of thousands of files on a Windows runner, none of them ours. Walking it
+        // recursively is not a unit test, it is a filesystem scan, and the first CI run on
+        // Windows is where that showed. So a ROOT is checked one level deep (a credential file
+        // dropped directly beside the config is the realistic mistake) and only the
+        // IRONAUTH-SPECIFIC directory under it is walked all the way down.
+        let mut shallow: Vec<std::path::PathBuf> = Vec::new();
+        let mut deep: Vec<std::path::PathBuf> = Vec::new();
+        for key in [
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "APPDATA",
             "LOCALAPPDATA",
-        ]
-        .iter()
-        .filter_map(|key| std::env::var_os(key).map(std::path::PathBuf::from))
-        .chain(
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .into_iter()
-                .flat_map(|home| {
-                    [
-                        home.join(".ironauth"),
-                        home.join(".config").join("ironauth"),
-                        home.join(".local").join("share").join("ironauth"),
-                        home.join("Library")
-                            .join("Application Support")
-                            .join("ironauth"),
-                    ]
-                }),
-        )
-        .collect();
+        ] {
+            if let Some(root) = std::env::var_os(key).map(std::path::PathBuf::from) {
+                deep.push(root.join("ironauth"));
+                shallow.push(root);
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            deep.push(home.join(".ironauth"));
+            deep.push(home.join(".config").join("ironauth"));
+            deep.push(home.join(".local").join("share").join("ironauth"));
+            deep.push(
+                home.join("Library")
+                    .join("Application Support")
+                    .join("ironauth"),
+            );
+        }
         assert!(
-            !roots.is_empty(),
+            !deep.is_empty(),
             "no per-user root could be derived, so this test would walk nothing and pass vacuously"
         );
 
@@ -433,14 +441,15 @@ mod tests {
         planted.extend_from_slice(token.as_bytes());
         std::fs::write(&decoy, &planted).expect("plant the decoy");
         assert_eq!(
-            find_token_on_disk(std::slice::from_ref(&decoy_dir), &token).as_deref(),
+            find_token_on_disk(std::slice::from_ref(&decoy_dir), &token, usize::MAX).as_deref(),
             Some(decoy.as_path()),
             "the finder must locate a token it is pointed straight at, or its silence below \
              means nothing"
         );
 
-        // AND NOW THE REAL CLAIM.
-        let found = find_token_on_disk(&roots, &token);
+        // AND NOW THE REAL CLAIM, over both kinds of place.
+        let found = find_token_on_disk(&deep, &token, usize::MAX)
+            .or_else(|| find_token_on_disk(&shallow, &token, 1));
         assert!(
             found.is_none(),
             "a default-mode credential store left the token in {}",
@@ -450,22 +459,43 @@ mod tests {
         );
     }
 
-    /// Walk `roots` and return the first file whose BYTES contain `token`.
+    /// Walk `roots` to at most `max_depth` levels and return the first file whose BYTES contain
+    /// `token`.
     ///
     /// Bytes rather than a UTF-8 read: a token written into a binary cache file is still a token
     /// on disk, and `read_to_string` would skip exactly those files. Unreadable entries are
     /// skipped rather than failing the walk -- a permission error on some unrelated file in a
     /// user's config tree is not evidence about this credential.
-    fn find_token_on_disk(roots: &[std::path::PathBuf], token: &str) -> Option<std::path::PathBuf> {
-        let mut stack: Vec<std::path::PathBuf> = roots.to_vec();
-        while let Some(dir) = stack.pop() {
+    fn find_token_on_disk(
+        roots: &[std::path::PathBuf],
+        token: &str,
+        max_depth: usize,
+    ) -> Option<std::path::PathBuf> {
+        // Declared before any statement: `clippy::items_after_statements` is a warning and CI
+        // builds with `-D warnings`.
+        const MOST_A_CREDENTIAL_FILE_COULD_BE: u64 = 4 * 1024 * 1024;
+        let mut stack: Vec<(std::path::PathBuf, usize)> =
+            roots.iter().map(|root| (root.clone(), 1)).collect();
+        while let Some((dir, depth)) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    stack.push(path);
+                    if depth < max_depth {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                // A SIZE BOUND before the read. A stored credential is a few hundred bytes, so
+                // nothing this test is looking for is large -- and reading whatever multi-gigabyte
+                // cache file happens to sit in a per-user root would trade a fast assertion for an
+                // out-of-memory failure that reads as a flaky test.
+                if entry
+                    .metadata()
+                    .is_ok_and(|meta| meta.len() > MOST_A_CREDENTIAL_FILE_COULD_BE)
+                {
                     continue;
                 }
                 let Ok(bytes) = std::fs::read(&path) else {
