@@ -1242,6 +1242,52 @@ impl Harness {
         key_id
     }
 
+    /// Install a SESSION TOKENIZER template (issue #119) with its own freshly generated Ed25519
+    /// key, through the control-plane repository the management surface uses.
+    ///
+    /// Returns the key's `stk_` identifier, which is the `kid` every token this template mints
+    /// carries -- a test asserting which key set a token belongs to needs it.
+    pub async fn install_session_token_template(
+        &self,
+        name: &str,
+        audience: &str,
+        ttl_seconds: i32,
+        rules_json: &str,
+    ) -> ironauth_store::SessionTokenKeyId {
+        let key_id = ironauth_store::SessionTokenKeyId::generate(&self.env, &self.scope);
+        let seed = self.fresh_ed25519_seed();
+        let (actor, corr) = self.seeding_actor();
+        // THE CONTROL-PLANE STORE, because that is the only plane that may write a template.
+        // `Harness::store()` is the DATA plane, which holds SELECT here and nothing else -- and
+        // that asymmetry is the feature rather than an inconvenience: a data plane able to write
+        // itself a template could write itself the audience it then mints for. A first draft of
+        // this helper used the data-plane store and got `permission denied`, which is the grant
+        // doing its job.
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .session_token_templates()
+            .set(
+                &self.env,
+                ironauth_store::session_token_store::NewSessionTokenTemplate {
+                    name,
+                    audience,
+                    ttl_seconds,
+                    rules_json,
+                },
+                ironauth_store::session_token_store::NewSessionTokenKey {
+                    id: &key_id,
+                    seed: &seed,
+                    publish_at_micros: 0,
+                    activate_at_micros: 0,
+                },
+            )
+            .await
+            .expect("install session token template");
+        key_id
+    }
+
     /// A fresh 32-byte Ed25519 seed drawn from the entropy seam, for provisioning a
     /// key with [`Harness::provision_signing_key`].
     #[must_use]

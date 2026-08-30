@@ -1375,6 +1375,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0172_aot_artifacts.sql"),
         },
+        Migration {
+            version: 173,
+            name: "session_token_templates",
+            // EXPAND: two new tables the old binary never reads or writes. Nothing existing
+            // changes shape -- in particular `signing_keys` is untouched, which is the whole
+            // reason the template keys live in a table of their own -- so a rollback to the
+            // previous binary leaves both inert.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0173_session_token_templates.sql"),
+        },
     ]
 }
 

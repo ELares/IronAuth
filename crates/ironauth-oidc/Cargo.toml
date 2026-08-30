@@ -1437,3 +1437,13 @@ required-features = ["testing"]
 name = "token_exchange"
 path = "tests/token_exchange.rs"
 required-features = ["testing"]
+
+# The SESSION TOKENIZER (issue #119): exchanging an opaque session for a short-lived JWT that
+# verifies from the template's own published JWKS with NO database call, that stops being minted
+# the instant the session is revoked, that never carries the session id itself, and that cannot
+# be verified under another template's key set or presented where an access token is expected.
+# Over a real database (DATABASE_URL).
+[[test]]
+name = "session_tokenizer"
+path = "tests/session_tokenizer.rs"
+required-features = ["testing"]

@@ -2198,6 +2198,32 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{base}/challenge-components?name=wordmark"),
         ),
+        // ---- session tokenizer templates (issue #119) ----
+        //
+        // PER ENVIRONMENT, like the components above: a template is what a session tokenizes
+        // against, and it has no client of its own. The write comes first so the listing has
+        // something to return, and the delete comes LAST so it does not remove what the read
+        // in between is meant to see.
+        Case::json(
+            "session_token_templates.setSessionTokenTemplate",
+            "PUT",
+            format!("{base}/session-token-templates?name=live-surface-probe"),
+            &serde_json::json!({
+                "audience": "https://live-surface.example",
+                "ttl_seconds": 60,
+                "rules": [],
+            }),
+        ),
+        Case::empty(
+            "session_token_templates.listSessionTokenTemplates",
+            "GET",
+            format!("{base}/session-token-templates"),
+        ),
+        Case::empty(
+            "session_token_templates.deleteSessionTokenTemplate",
+            "DELETE",
+            format!("{base}/session-token-templates?name=live-surface-probe"),
+        ),
         // ---- locales ----
         Case::json(
             "locales.setLocale",

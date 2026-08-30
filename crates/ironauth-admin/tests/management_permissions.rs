@@ -902,6 +902,12 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         "challenge_components.rs",
         include_str!("../src/challenge_components.rs"),
     ),
+    // The session tokenizer template surface (issue #119). Listed the moment the module
+    // existed, for the reason recorded above.
+    (
+        "session_token_templates.rs",
+        include_str!("../src/session_token_templates.rs"),
+    ),
     ("messages.rs", include_str!("../src/messages.rs")),
     (
         "service_account_keys.rs",

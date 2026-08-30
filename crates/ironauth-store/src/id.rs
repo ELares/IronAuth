@@ -1042,6 +1042,21 @@ impl ScopedKind for SigningKeyKind {
     const PREFIX: &'static str = "sik";
 }
 
+/// Marker for a session-token template key (`stk_`), the Ed25519 key one SESSION TOKENIZER
+/// template signs with and publishes in its own JWKS (issue #119). A tenant-scoped resource:
+/// the identifier embeds its `(tenant, environment)`, and it doubles as the JOSE `kid`.
+///
+/// A DISTINCT prefix from `sik_` is the point rather than a detail. A template's key set exists
+/// so a tokenized session JWT and an ID token can never be verified against each other's keys,
+/// and an identifier that parsed as either kind would let a `kid` cross that line by accident.
+/// `SigningKeyId::parse_in_scope` rejects an `stk_` value and this rejects a `sik_` one, so the
+/// separation the two tables give the ROWS the identifiers give the LOOKUPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionTokenKeyKind;
+impl ScopedKind for SessionTokenKeyKind {
+    const PREFIX: &'static str = "stk";
+}
+
 /// Marker for a resource server (`rsv_`), a registered protected API that OAuth
 /// access tokens are minted FOR (issue #29). A tenant-scoped resource: the
 /// identifier embeds its `(tenant, environment)`, so a resource-server row can
@@ -1949,6 +1964,9 @@ pub type FedcmNonceId = ScopedId<FedcmNonceKind>;
 /// A signing-key identifier (`sik_...`), which doubles as the JOSE `kid` of a
 /// per-environment signing key (issue #19).
 pub type SigningKeyId = ScopedId<SigningKeyKind>;
+/// A session-token template key identifier (`stk_...`), which doubles as the JOSE
+/// `kid` of one tokenizer template's own signing key (issue #119).
+pub type SessionTokenKeyId = ScopedId<SessionTokenKeyKind>;
 /// A resource-server identifier (`rsv_...`), a registered protected API that
 /// access tokens are minted for (issue #29). Its `audience` selects the token
 /// format the mint emits.

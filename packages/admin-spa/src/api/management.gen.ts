@@ -2554,6 +2554,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List an environment's session tokenizer templates. */
+        get: operations["listSessionTokenTemplates"];
+        /** Create or replace a session tokenizer template. */
+        put: operations["setSessionTokenTemplate"];
+        post?: never;
+        /** Remove a session tokenizer template. */
+        delete: operations["deleteSessionTokenTemplate"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/sessions": {
         parameters: {
             query?: never;
@@ -7268,6 +7287,45 @@ export interface components {
             revoked: boolean;
         };
         /**
+         * @description One SESSION TOKENIZER template (issue #119).
+         *
+         *     NEVER the key material. A template's key is private and the only public projection of it is
+         *     the JWK published at the template's own JWKS URL, which is a different surface with a
+         *     different reader. A management view that carried the seed would put a signing key in every
+         *     operator's terminal scrollback.
+         */
+        SessionTokenTemplateView: {
+            /** @description The audience every token minted from this template carries. */
+            audience: string;
+            /** @description The name a tokenize request selects this template by, and the name in its JWKS URL. */
+            name: string;
+            /**
+             * @description The claims mapper, as the ordered rule list. The same rule vocabulary a claims mapping
+             *     carries, minus `place`, which names a token this surface does not mint.
+             *
+             *     `value_type = Object`, matching `ClaimsMappingView.rules`: a bare `serde_json::Value`
+             *     documents as an UNTYPED node, which every generated SDK renders as `any`. Saying `Object`
+             *     is not a full rule schema -- `claims_mapping::MappingRule` owns that -- but it is the
+             *     difference between a generated client that types this field and one that gives up on it.
+             */
+            rules: Record<string, never>;
+            /**
+             * Format: int32
+             * @description The token lifetime in seconds. ALSO the exact width of the window in which a revoked
+             *     session's already-minted token still verifies, because the token is verified with no
+             *     database call.
+             */
+            ttl_seconds: number;
+        };
+        /** @description Every session tokenizer template in an environment (issue #119). */
+        SessionTokenTemplatesView: {
+            /**
+             * @description The templates, by name. Empty when the environment has none, which is what a fresh
+             *     environment has: the tokenizer mints nothing until an operator writes a template.
+             */
+            templates: components["schemas"]["SessionTokenTemplateView"][];
+        };
+        /**
          * @description A session, as the fleet-operations surface reports it (issue #32).
          *
          *     Sessions are first-class, searchable, metadata-carrying fleet resources rather
@@ -7611,6 +7669,28 @@ export interface components {
              *     table and is never readable through this API afterwards.
              */
             value: string;
+        };
+        /** @description The request body for creating or replacing a session tokenizer template (issue #119). */
+        SetSessionTokenTemplateRequest: {
+            /**
+             * @description The audience every token minted from this template carries. REQUIRED: RFC 8725 section
+             *     3.9 asks for an audience restriction on every token, and a template with none would mint
+             *     a token every verifier in the estate accepts.
+             */
+            audience: string;
+            /**
+             * @description The ordered rule list, as the same JSON a claims mapping carries. A raw value on purpose:
+             *     `ironauth_oidc::claims_mapping` owns the rule shape, and a second definition here would be
+             *     two definitions of one wire format. Documented as `Object` for the reason the view's own
+             *     field records.
+             */
+            rules: Record<string, never>;
+            /**
+             * Format: int32
+             * @description The token lifetime in seconds, which is also the revocation window. Bounded; the refusal
+             *     names the bounds and says what the number means.
+             */
+            ttl_seconds: number;
         };
         /**
          * @description The body to set (create or overwrite) a per-environment, per-client signup form (issue #87).
@@ -21539,6 +21619,188 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listSessionTokenTemplates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The templates */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionTokenTemplatesView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setSessionTokenTemplate: {
+        parameters: {
+            query: {
+                /** @description The template name a tokenize request selects with `tokenize_as`, and the name in the template's own JWKS URL. REQUIRED: renaming a template breaks both */
+                name: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionTokenTemplateRequest"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionTokenTemplateView"];
+                };
+            };
+            /** @description An invalid name, audience, TTL, or rule list */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteSessionTokenTemplate: {
+        parameters: {
+            query: {
+                /** @description Which template to remove. ITS KEYS GO WITH IT: the template's JWKS URL stops answering and every consumer verifying against it starts failing */
+                name: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed, along with its key set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description An absent name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Environment not found, or no template of that name */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -940,6 +940,20 @@ pub enum Action {
     ChallengeComponentSecretGranted,
     /// A CUSTOM FACTOR COMPONENT's secret grant was withdrawn (issue #114 criterion 6).
     ChallengeComponentSecretRevoked,
+    /// A SESSION TOKENIZER TEMPLATE was created or replaced (issue #119). The row names the
+    /// TEMPLATE, which is the identity a tokenize request selects and the name in the template's
+    /// own JWKS URL.
+    ///
+    /// Writing a template is writing an AUDIENCE and a claim set for tokens that verify with no
+    /// database call, so this is the row that explains why some third-party API started
+    /// accepting tokens for a set of subjects. The TTL is what an auditor reads next, because it
+    /// is the width of the window in which a revoked session's token still verifies.
+    SessionTokenTemplateSet,
+    /// A SESSION TOKENIZER TEMPLATE was removed (issue #119). Audited separately from the write
+    /// because the blast radius differs: the template's keys go with it (ON DELETE CASCADE), so
+    /// its JWKS URL stops answering and every consumer verifying against it starts failing. This
+    /// is the row that explains that outage.
+    SessionTokenTemplateDelete,
     /// A DEPLOYED TOKEN HOOK TRIED TO WRITE A CLAIM IT MAY NOT, and the fence refused it
     /// (issue #113 criterion 5: protected claims "cannot be overridden by any mapping or hook;
     /// attempts are rejected AND AUDITED").
@@ -1656,6 +1670,8 @@ impl Action {
             Action::ChallengeComponentDelete => "challenge_component.delete",
             Action::ChallengeComponentSecretGranted => "challenge_component.secret.granted",
             Action::ChallengeComponentSecretRevoked => "challenge_component.secret.revoked",
+            Action::SessionTokenTemplateSet => "session_token_template.set",
+            Action::SessionTokenTemplateDelete => "session_token_template.delete",
             Action::TokenHookSet => "token_hook.set",
             Action::TokenHookDelete => "token_hook.delete",
             Action::ClaimsMappingSet => "claims_mapping.set",

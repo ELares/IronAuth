@@ -956,6 +956,25 @@ fn environment_child_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/challenge-components/secrets?name=wordmark&secret=api_key"),
             body: None,
         },
+        // SESSION TOKENIZER templates (issue #119). Per ENVIRONMENT, like the custom factor
+        // components above: a template is an environment-level object a session tokenizes
+        // against, not a per-client one.
+        Case {
+            label: "session_token_templates.setSessionTokenTemplate",
+            method: "PUT",
+            path: format!("{base}/session-token-templates?name=orders"),
+            body: Some(body_of(&serde_json::json!({
+                "audience": "https://orders.example",
+                "ttl_seconds": 60,
+                "rules": [],
+            }))),
+        },
+        Case {
+            label: "session_token_templates.deleteSessionTokenTemplate",
+            method: "DELETE",
+            path: format!("{base}/session-token-templates?name=orders"),
+            body: None,
+        },
         Case {
             label: "locales.setLocale",
             method: "PUT",

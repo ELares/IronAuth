@@ -256,6 +256,15 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     // happened to a login attempt, and this is the configuration a later login will run.
     "challenge_component",
     "claims_mapping",
+    // A SESSION TOKENIZER TEMPLATE (issue #119). Entity management for the reason a claim
+    // mapping is -- it configures what a token carries rather than changing an account or an
+    // access grant -- and it is high-value on a SIEM stream for a reason of its own: the
+    // template names the AUDIENCE that will accept tokens for this environment's subjects, and
+    // its TTL is the width of the window in which a revoked session's token still verifies.
+    //
+    // NOT `authorize_session`, despite the word "session" in the name. That stream carries what
+    // happened to a session; this is the configuration a later tokenize call will run against.
+    "session_token_template",
     "signup_form",
     // A deployed WASM token hook is CODE an operator installs to shape a client's tokens
     // (issue #114). Entity management for the same reason a claim mapping is: it configures

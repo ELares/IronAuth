@@ -2632,6 +2632,59 @@ pub struct ChallengeComponentsView {
     pub components: Vec<ChallengeComponentView>,
 }
 
+/// One SESSION TOKENIZER template (issue #119).
+///
+/// NEVER the key material. A template's key is private and the only public projection of it is
+/// the JWK published at the template's own JWKS URL, which is a different surface with a
+/// different reader. A management view that carried the seed would put a signing key in every
+/// operator's terminal scrollback.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SessionTokenTemplateView {
+    /// The name a tokenize request selects this template by, and the name in its JWKS URL.
+    pub name: String,
+    /// The audience every token minted from this template carries.
+    pub audience: String,
+    /// The token lifetime in seconds. ALSO the exact width of the window in which a revoked
+    /// session's already-minted token still verifies, because the token is verified with no
+    /// database call.
+    pub ttl_seconds: i32,
+    /// The claims mapper, as the ordered rule list. The same rule vocabulary a claims mapping
+    /// carries, minus `place`, which names a token this surface does not mint.
+    ///
+    /// `value_type = Object`, matching `ClaimsMappingView.rules`: a bare `serde_json::Value`
+    /// documents as an UNTYPED node, which every generated SDK renders as `any`. Saying `Object`
+    /// is not a full rule schema -- `claims_mapping::MappingRule` owns that -- but it is the
+    /// difference between a generated client that types this field and one that gives up on it.
+    #[schema(value_type = Object)]
+    pub rules: serde_json::Value,
+}
+
+/// Every session tokenizer template in an environment (issue #119).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SessionTokenTemplatesView {
+    /// The templates, by name. Empty when the environment has none, which is what a fresh
+    /// environment has: the tokenizer mints nothing until an operator writes a template.
+    pub templates: Vec<SessionTokenTemplateView>,
+}
+
+/// The request body for creating or replacing a session tokenizer template (issue #119).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SetSessionTokenTemplateRequest {
+    /// The audience every token minted from this template carries. REQUIRED: RFC 8725 section
+    /// 3.9 asks for an audience restriction on every token, and a template with none would mint
+    /// a token every verifier in the estate accepts.
+    pub audience: String,
+    /// The token lifetime in seconds, which is also the revocation window. Bounded; the refusal
+    /// names the bounds and says what the number means.
+    pub ttl_seconds: i32,
+    /// The ordered rule list, as the same JSON a claims mapping carries. A raw value on purpose:
+    /// `ironauth_oidc::claims_mapping` owns the rule shape, and a second definition here would be
+    /// two definitions of one wire format. Documented as `Object` for the reason the view's own
+    /// field records.
+    #[schema(value_type = Object)]
+    pub rules: serde_json::Value,
+}
+
 /// The environment secrets a custom factor component may read (issue #114 criterion 6).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ChallengeComponentSecretsView {

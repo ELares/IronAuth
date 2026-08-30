@@ -121,6 +121,7 @@ mod response;
 mod routing_rules;
 mod secrets;
 mod service_account_keys;
+mod session_token_templates;
 mod sessions;
 mod signing_algorithm;
 mod signing_interop;
@@ -807,6 +808,16 @@ pub fn management_router(state: AdminState) -> Router {
         // Per-environment, per-client DECLARATIVE CLAIM MAPPINGS (issue #113): set (validated
         // against the one protected-claim fence, with every REFUSAL audited), get, and delete
         // the rule list that shapes a client's tokens.
+        // SESSION TOKENIZER TEMPLATES (issue #119): the per-environment objects that convert an
+        // opaque session into a short-lived JWT. Keyed on a NAME rather than on a client,
+        // because a template is an environment-level object a session tokenizes against and has
+        // no client of its own.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
+            put(session_token_templates::set_session_token_template)
+                .get(session_token_templates::list_session_token_templates)
+                .delete(session_token_templates::delete_session_token_template),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping",
             put(claims_mappings::set_claims_mapping)
