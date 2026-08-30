@@ -192,6 +192,18 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // The DELETE is pinned separately from the deploy because its reason inverts the token
     // hook's: removing a hook restores the unshaped token, while removing a component a journey
     // still names makes every login that reaches that step REFUSE.
+    // SESSION TOKENIZER templates (issue #119). A template decides which AUDIENCE receives
+    // tokens for which subjects, with a claim set an operator chooses, verifiable for the whole
+    // TTL with nothing able to withdraw it early -- so both writes are `write_config` and the
+    // listing is `read`. The listing returns configuration and never key material, so demanding
+    // `write_config` for it would make asking which templates exist cost the authority to change
+    // them.
+    ("setSessionTokenTemplate", ManagementPermission::WriteConfig),
+    (
+        "deleteSessionTokenTemplate",
+        ManagementPermission::WriteConfig,
+    ),
+    ("listSessionTokenTemplates", ManagementPermission::Read),
     (
         "deployChallengeComponent",
         ManagementPermission::WriteConfig,
