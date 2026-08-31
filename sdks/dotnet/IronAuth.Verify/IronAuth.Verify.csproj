@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The official .NET verifier artifact (issue #118, criterion 5).
+
+    ONE dependency, and the criterion named it: BouncyCastle, for Ed25519. Unlike the JDK, .NET
+    has no in-box Ed25519 as of .NET 10. That was verified rather than assumed, by reflecting
+    over System.Security.Cryptography and finding no Ed-anything public type. RSA and P-256 come
+    from the platform, so BouncyCastle is used for exactly one algorithm and nothing else.
+
+    net8.0 is the target rather than net10.0 so the artifact is usable by consumers on the
+    current LTS. It builds and runs on newer runtimes unchanged.
+
+    (No double hyphens anywhere in this comment: XML forbids them, and this repo writes them
+    where prose would otherwise use a long dash.)
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisMode>All</AnalysisMode>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
+  </ItemGroup>
+
+</Project>

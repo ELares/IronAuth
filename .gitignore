@@ -14,3 +14,7 @@ gate.log
 # Build output of the dependency-free Java verifier (issue #118); scripts/java-verify.sh
 # creates and removes it, so it is never a source of truth.
 sdks/java/out/
+
+# Build output of the .NET verifier (issue #118); scripts/dotnet-verify.sh recreates it.
+sdks/dotnet/**/bin/
+sdks/dotnet/**/obj/

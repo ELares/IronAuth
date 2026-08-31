@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The three suites that judge the .NET verifier (issue #118).
+
+    A console app rather than a test framework. The artifact's claim is that it carries ONE
+    dependency, BouncyCastle, for Ed25519; adding xunit and a runner to prove that would
+    undercut the point and put three more packages between a reader and the evidence.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>IronAuth.Verify.Checks</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../IronAuth.Verify/IronAuth.Verify.csproj" />
+  </ItemGroup>
+
+</Project>
