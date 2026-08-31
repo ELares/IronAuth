@@ -976,6 +976,12 @@ jobs:
         run: scripts/emulator-doc-freshness.sh
       - name: no plaintext credentials (no login path writes a token to a file)
         run: scripts/no-plaintext-credentials.sh
+      # Issue #117 criterion 5: the browser-app guidance ranks the three BCP architectures with
+      # their tradeoffs, and NO document describes storing a token in localStorage. The second
+      # half is a scan over the whole corpus rather than one page, because the way this guidance
+      # goes wrong is a quickstart three directories away showing the easy thing.
+      - name: BFF docs (the BCP ranking, and no localStorage token guidance)
+        run: scripts/bff-docs.sh
       # Issue #108 criterion 4. This job already checks out full history for the OpenAPI
       # changelog, which is the same thing this needs: a base revision to diff against.
       - name: event registry compatibility (a breaking payload change bumps its version)
@@ -1174,6 +1180,29 @@ jobs:
   # deployable, built here and NEVER part of the Rust release pipeline (the
   # in-process serving crate ironauth-admin-ui embeds a committed placeholder so
   # the Rust build needs no Node).
+  bff:
+    # Issue #117: the backend-for-frontend helper. Its own job rather than a step in the admin
+    # console's, because the two share only a language: a BFF failure reported under "admin spa"
+    # sends the reader to the wrong package.
+    #
+    # Node only. The package is framework-agnostic and BOTH adapters are driven from one
+    # lifecycle table, so a second runtime lane would re-run the same assertions rather than
+    # cover anything new -- unlike the SDK, whose whole claim is portability.
+    name: bff helper (five handler groups on two adapters)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: install (locked)
+        working-directory: packages/ironauth-bff
+        run: npm ci
+      - name: test
+        working-directory: packages/ironauth-bff
+        run: npm test
+
   admin-spa:
     name: admin spa (codegen freshness, typecheck, vite build)
     runs-on: ubuntu-latest
