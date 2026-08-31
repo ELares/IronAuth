@@ -1,0 +1,128 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!--
+  The IronAuth JWT debugger (issue #123).
+
+  Paste a token, name the environment, see whether it verifies and WHY NOT.
+
+  # It runs entirely in your browser
+
+  There is no server side. The token is never sent anywhere: the only network request this page
+  makes is a GET for the JWKS URL you type, and everything else -- decode, signature check,
+  claim checks -- happens in this tab through WebCrypto.
+
+  That is not a convenience. A hosted JWT debugger that receives your token receives a bearer
+  credential, and the well known ones say so in their own small print. This one cannot, because
+  it has nowhere to send it.
+
+  # It does not implement a single check of its own
+
+  `diagnose` decodes for display and then hands the token to the SDK's `verifyToken`. A debugger
+  with its own opinion of why a token failed is worse than none: it tells you one thing while
+  your resource server does another. Where the two could disagree, this one is defined to agree.
+
+  # Running it
+
+      cd packages/ironauth-sdk && npm run build && npx http-server -p 8080 .
+      open http://localhost:8080/tools/jwt-debugger.html
+
+  A `file://` URL will not work: the module import and the JWKS fetch both need an origin.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IronAuth JWT debugger</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin: .75rem 0 .25rem; font-weight: 600; }
+  textarea, input { width: 100%; font: 13px/1.4 ui-monospace, monospace; padding: .5rem; box-sizing: border-box; }
+  textarea { height: 7rem; }
+  button { margin-top: 1rem; padding: .5rem 1rem; font: inherit; cursor: pointer; }
+  .verdict { margin-top: 1.5rem; padding: 1rem; border-left: 4px solid; }
+  .ok { border-color: #2a7; }
+  .bad { border-color: #c33; }
+  .fix { margin-top: .5rem; opacity: .85; }
+  pre { background: rgba(127,127,127,.12); padding: .75rem; overflow-x: auto; font-size: 13px; }
+  .obs { list-style: none; padding: 0; font: 13px ui-monospace, monospace; }
+  .obs li { padding: .15rem 0; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+<h1>IronAuth JWT debugger</h1>
+<p><small>Runs entirely in this tab. The token is never sent anywhere; the only request made is a
+GET for the JWKS URL below.</small></p>
+
+<label for="token">Token</label>
+<textarea id="token" spellcheck="false" placeholder="eyJhbGciOiJFZERTQSIsImtpZCI6InNpa18uLi4ifQ..."></textarea>
+
+<label for="jwks">JWKS URL</label>
+<input id="jwks" spellcheck="false" placeholder="https://iss.example/t/ten_x/e/env_y/jwks.json">
+
+<label for="issuer">Expected issuer</label>
+<input id="issuer" spellcheck="false" placeholder="https://iss.example/t/ten_x/e/env_y">
+
+<label for="audience">Expected audience</label>
+<input id="audience" spellcheck="false" placeholder="cli_your_app">
+
+<label for="algorithms">Algorithms the issuer publishes</label>
+<input id="algorithms" spellcheck="false" value="EdDSA, ES256, RS256">
+
+<button id="run">Diagnose</button>
+
+<div id="out"></div>
+
+<script type="module">
+import { diagnose } from '../dist/debug.js';
+import { JwksCache } from '../dist/verify.js';
+
+const $ = (id) => document.getElementById(id);
+const escape = (value) =>
+  String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+$('run').addEventListener('click', async () => {
+  const out = $('out');
+  out.innerHTML = '<p>Checking...</p>';
+  const algorithms = $('algorithms').value.split(',').map((a) => a.trim()).filter(Boolean);
+  if (algorithms.length === 0) {
+    // The SDK refuses to build a verifier with no allow-list, deliberately, so this says why
+    // rather than letting the constructor throw an opaque error into the console.
+    out.innerHTML = '<div class="verdict bad"><strong>Name at least one algorithm.</strong>' +
+      '<div class="fix">A verifier with no allow-list would take the algorithm from the token, ' +
+      'which is the mistake RFC 8725 section 3.1 exists to prevent.</div></div>';
+    return;
+  }
+  let result;
+  try {
+    result = await diagnose($('token').value, {
+      issuer: $('issuer').value.trim(),
+      audience: $('audience').value.trim(),
+      algorithms,
+      keys: new JwksCache({ uri: $('jwks').value.trim() }),
+    });
+  } catch (error) {
+    // `diagnose` does not throw; reaching here means the JWKS could not be fetched at all, which
+    // is a different problem from a token that failed and is worth saying so.
+    out.innerHTML = '<div class="verdict bad"><strong>The JWKS could not be fetched.</strong>' +
+      `<div class="fix">${escape(error)}. Check the URL, and that it allows a cross-origin GET ` +
+      'from this page.</div></div>';
+    return;
+  }
+
+  const rows = result.observations.map((o) => `<li>${escape(o)}</li>`).join('');
+  out.innerHTML = `
+    <div class="verdict ${result.valid ? 'ok' : 'bad'}">
+      <strong>${escape(result.summary)}</strong>
+      ${result.reason ? `<div><small>reason: <code>${escape(result.reason)}</code></small></div>` : ''}
+      ${result.fix ? `<div class="fix">${escape(result.fix)}</div>` : ''}
+    </div>
+    <h2>What the token says</h2>
+    <ul class="obs">${rows}</ul>
+    <h3>Header</h3><pre>${escape(JSON.stringify(result.header ?? null, null, 2))}</pre>
+    <h3>Claims</h3><pre>${escape(JSON.stringify(result.claims ?? null, null, 2))}</pre>
+  `;
+});
+</script>
+</body>
+</html>

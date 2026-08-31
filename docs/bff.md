@@ -6,7 +6,7 @@ ranking without the tradeoffs is a slogan.
 
 ## The ranking
 
-### 1. Backend-for-frontend (BFF) — what to build
+### 1. Backend-for-frontend (BFF) -- what to build
 
 A server-side component in the same origin as the frontend holds every token. The browser holds
 one `__Host-` prefixed, `HttpOnly`, `Secure`, `SameSite` cookie carrying an opaque session id.
@@ -23,7 +23,7 @@ scaling component you now own. A purely static frontend cannot use this pattern.
 framework-agnostic, with adapters for `Request -> Response` runtimes and for the `(req, res)`
 shape Express and `node:http` share.
 
-### 2. Token-mediating backend — acceptable
+### 2. Token-mediating backend -- acceptable
 
 A backend holds the refresh token and hands the browser short-lived access tokens.
 
@@ -34,7 +34,7 @@ Fewer hops than a BFF, because API calls go direct.
 expires. You are trading a bounded exposure for the latency. That is a real trade and it can be
 the right one; it is second rather than first because the exposure is not zero.
 
-### 3. Browser-held tokens — last, and only with mitigations
+### 3. Browser-held tokens -- last, and only with mitigations
 
 The browser holds both tokens.
 
