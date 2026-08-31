@@ -185,6 +185,11 @@ const AUTHORIZE_SESSION_DOMAINS: &[&str] = &[
 /// The leading segments whose actions change a PRINCIPAL's own record (3001).
 const ACCOUNT_CHANGE_DOMAINS: &[&str] = &[
     "account",
+    // An AGENT is a principal with a lifecycle -- registered, suspended, revoked -- exactly
+    // the shape `service_account` already has below, so it shares that stream (issue #130).
+    // Deliberately NOT entity management: registering an agent creates something that can
+    // hold roles and obtain tokens, which is an account change, not configuration.
+    "agent",
     "human",
     "identifier",
     "invitation",

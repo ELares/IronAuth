@@ -635,6 +635,41 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An AGENT PRINCIPAL registered (issue #130). Carries all three facts an integrator
+        // needs to act on it: the agent, the organization it acts inside, and the user it
+        // acts FOR. A registration event naming only the agent would tell a SIEM that
+        // something appeared and nothing about whose authority it carries.
+        "agent.registered",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "agent_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "linked_user_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["agent_id", "organization_id", "linked_user_id"]
+        }"#,
+    ),
+    (
+        // And the lifecycle change, which is the one an incident responder subscribes to.
+        // `state` carries the resulting value rather than only the fact of a change, because
+        // "an agent was suspended" and "an agent was un-suspended" are different alerts.
+        "agent.state_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "agent_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "state": {"type": "string", "minLength": 1}
+            },
+            "required": ["agent_id", "organization_id", "state"]
+        }"#,
+    ),
+    (
         "organization.member_added",
         1,
         r#"{

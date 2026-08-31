@@ -1176,6 +1176,20 @@ impl ScopedKind for ServiceAccountKind {
     const PREFIX: &'static str = "sva";
 }
 
+/// Marker for a REGISTERED AGENT principal (`agt_`), an autonomous agent an operator
+/// registered inside one organization to act for one user (issue #130).
+///
+/// Distinct from the audit-actor [`AgentKind`], which is a single-level `agent` id naming WHO
+/// acted in a trail. This is the scoped PRINCIPAL an operator registers, lists, inspects and
+/// revokes -- environment-scoped because criterion 4 asks for exactly that, and because an
+/// unscoped agent id would make "list the agents acting for my organization" a filter over a
+/// global namespace rather than a question the scope answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentPrincipalKind;
+impl ScopedKind for AgentPrincipalKind {
+    const PREFIX: &'static str = "agt";
+}
+
 /// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
 /// (RFC 9126, issue #27) stored for later single-use reference from `/authorize`. A
 /// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so the
@@ -2007,6 +2021,8 @@ pub type DcrPolicyId = ScopedId<DcrPolicyKind>;
 /// client-credentials access token carries (issue #23). Distinct from the client's
 /// `cli_` id and consistent across issuances.
 pub type ServiceAccountId = ScopedId<ServiceAccountKind>;
+/// A registered agent principal identifier (`agt_...`).
+pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
 /// A registered external assertion issuer identifier (`xai_...`), a trust anchor
 /// the JWT bearer assertion grant accepts assertions from (issue #26).
 pub type ExternalIssuerId = ScopedId<ExternalIssuerKind>;

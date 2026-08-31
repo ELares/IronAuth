@@ -1412,6 +1412,22 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: Some(body_of(&serde_json::json!({ "user_id": user }))),
         },
         Case {
+            label: "agents.registerAgent",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/agents"),
+            body: Some(body_of(&serde_json::json!({
+                "linked_user_id": user,
+                "display_name": "deploy bot",
+                "tool_scopes": ["deploy"],
+            }))),
+        },
+        Case {
+            label: "agents.setAgentState",
+            method: "PUT",
+            path: format!("{base}/organizations/{org}/agents/agt_absent/state"),
+            body: Some(body_of(&serde_json::json!({ "state": "suspended" }))),
+        },
+        Case {
             label: "memberships.createServiceAccountMembership",
             method: "POST",
             path: format!("{base}/organizations/{org}/service-account-memberships"),

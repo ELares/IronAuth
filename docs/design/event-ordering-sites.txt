@@ -76,6 +76,7 @@ crates/ironauth-store/src/repository.rs:put_with_event:1
 crates/ironauth-store/src/repository.rs:record_domain_verification_with_event:1
 crates/ironauth-store/src/repository.rs:record_with_event:1
 crates/ironauth-store/src/repository.rs:redeem:1
+crates/ironauth-store/src/repository.rs:register:1
 crates/ironauth-store/src/repository.rs:register_with_event:1
 crates/ironauth-store/src/repository.rs:reject_with_event:1
 crates/ironauth-store/src/repository.rs:remove_allowlist_country_with_event:1
@@ -105,6 +106,7 @@ crates/ironauth-store/src/repository.rs:set_event_types_with_event:1
 crates/ironauth-store/src/repository.rs:set_id_token_signed_response_alg_with_event:1
 crates/ironauth-store/src/repository.rs:set_permission_claims_with_event:1
 crates/ironauth-store/src/repository.rs:set_require_pushed_authorization_requests_with_event:1
+crates/ironauth-store/src/repository.rs:set_state:1
 crates/ironauth-store/src/repository.rs:set_state_with_event:2
 crates/ironauth-store/src/repository.rs:set_traits_with_visibility:1
 crates/ironauth-store/src/repository.rs:set_with_event:12

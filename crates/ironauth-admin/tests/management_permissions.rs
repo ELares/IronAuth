@@ -135,6 +135,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "createServiceAccountMembership",
         ManagementPermission::WriteOrganizations,
     ),
+    ("registerAgent", ManagementPermission::WriteOrganizations),
+    ("setAgentState", ManagementPermission::WriteOrganizations),
+    ("listAgents", ManagementPermission::Read),
     ("deleteMembership", ManagementPermission::WriteOrganizations),
     ("listMemberships", ManagementPermission::Read),
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped
@@ -694,6 +697,14 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // The agent principal surface (issue #130), proven by
+    // `the_agent_surface_splits_registering_and_revoking_from_listing`: registering and
+    // revoking are write_organizations, listing is read, and each is driven in BOTH
+    // directions -- an agent acts with a person's authority, so who may create one and who
+    // may only look is the distinction that matters most here.
+    "registerAgent",
+    "setAgentState",
+    "listAgents",
     // Binding a MACHINE IDENTITY into an organization (issue #126), proven by
     // `write_organizations_is_required_to_add_a_machine_identity_to_an_org`: both directions,
     // because adding an identity to an organization grants it whatever roles that
@@ -926,12 +937,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        212,
+        215,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        68,
+        71,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -944,6 +955,9 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
 /// The admin source, read at COMPILE time so this cannot be fooled by a working tree that
 /// differs from what was built.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
+    // Listed the moment the module existed: a file NOT enumerated here is one this gate never
+    // reads, so its classification comments and its gate calls could disagree silently.
+    ("agents.rs", include_str!("../src/agents.rs")),
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
     (
         "claims_mappings.rs",

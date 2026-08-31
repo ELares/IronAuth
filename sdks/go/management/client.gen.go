@@ -1030,6 +1030,13 @@ func (c *Client) LinkUserExternalId(tenant_id string, environment_id string, use
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/external-id", query, body)
 }
 
+// ListAgents performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents.
+//
+// List the agents acting inside an organization.
+func (c *Client) ListAgents(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/agents", query, nil)
+}
+
 // ListBans performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans.
 //
 // List the active credential-abuse bans under an environment.
@@ -1478,6 +1485,13 @@ func (c *Client) ReadEventFeed(tenant_id string, environment_id string, query ur
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/events", query, nil)
 }
 
+// RegisterAgent performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents.
+//
+// Register an agent inside an organization.
+func (c *Client) RegisterAgent(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/agents", query, body)
+}
+
 // RegisterExternalIssuer performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers.
 //
 // Register an external assertion issuer as a trust anchor.
@@ -1686,6 +1700,13 @@ func (c *Client) RotateUserPersonalAccessToken(tenant_id string, environment_id 
 // Rotate an endpoint's signing secret, opening the overlap window.
 func (c *Client) RotateWebhookEndpointSecret(tenant_id string, environment_id string, endpoint_id string, query url.Values) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints/" + escape(endpoint_id) + "/rotate-secret", query, nil)
+}
+
+// SetAgentState performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state.
+//
+// Set an agent's lifecycle state.
+func (c *Client) SetAgentState(tenant_id string, environment_id string, organization_id string, agent_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/agents/" + escape(agent_id) + "/state", query, body)
 }
 
 // SetAutoLinkPosture performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture.

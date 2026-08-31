@@ -12741,6 +12741,337 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "List the agents acting inside an organization.",
+        "operationId": "listAgents",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum agents to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agents acting inside this organization, oldest first. INCLUDES suspended and revoked ones: an investigator's question is what WAS acting here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization not found, or the environment is absent or soft-deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Register an agent inside an organization.",
+        "operationId": "registerAgent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterAgentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or a tool set that is empty or oversized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization or linked user not found. The environment must be live too: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state": {
+      "put": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Set an agent's lifecycle state.",
+        "operationId": "setAgentState",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "The agent identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAgentStateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A state outside the closed set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found, another organization's agent, or already revoked (revocation is terminal)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys": {
       "get": {
         "tags": [
@@ -26885,6 +27216,76 @@
           }
         }
       },
+      "AgentList": {
+        "type": "object",
+        "description": "A page of agents.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgentView"
+            },
+            "description": "The agents on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, absent on the last one."
+          }
+        }
+      },
+      "AgentView": {
+        "type": "object",
+        "description": "One registered agent principal (issue #130).",
+        "required": [
+          "id",
+          "organization_id",
+          "linked_user_id",
+          "display_name",
+          "state",
+          "tool_scopes",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The agent identifier (`agt_...`, embeds its scope)."
+          },
+          "linked_user_id": {
+            "type": "string",
+            "description": "The user the agent acts FOR."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization the agent acts inside."
+          },
+          "state": {
+            "type": "string",
+            "description": "The lifecycle state: `active`, `suspended` or `revoked`."
+          },
+          "tool_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The DECLARED tool scopes. A request outside this set is refused."
+          }
+        }
+      },
       "ApiKeyCreated": {
         "type": "object",
         "description": "The creation response: the ONLY place the key itself ever appears.",
@@ -32355,6 +32756,33 @@
           }
         }
       },
+      "RegisterAgentRequest": {
+        "type": "object",
+        "description": "The body to register an agent inside an organization (issue #130).",
+        "required": [
+          "linked_user_id",
+          "display_name",
+          "tool_scopes"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "linked_user_id": {
+            "type": "string",
+            "description": "The user this agent acts FOR (a `usr_` id in this environment).",
+            "example": "usr_..."
+          },
+          "tool_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The tools this agent may use. At least one, at most 64, none blank."
+          }
+        }
+      },
       "RegisterExternalIssuerRequest": {
         "type": "object",
         "description": "The body to register an external issuer.",
@@ -33188,6 +33616,19 @@
               "null"
             ],
             "description": "The recorded user agent (only when the device binding knob is on)."
+          }
+        }
+      },
+      "SetAgentStateRequest": {
+        "type": "object",
+        "description": "The body to set an agent's lifecycle state (issue #130).",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "description": "`active`, `suspended` or `revoked`. Revocation is terminal."
           }
         }
       },

@@ -599,6 +599,10 @@ class Client:
         """Link an external id to a user. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/external-id."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/external-id", query, body)
 
+    def list_agents(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the agents acting inside an organization. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agents", query, None)
+
     def list_bans(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the active credential-abuse bans under an environment. GET /v1/tenants/{tenant_id}/environments/{environment_id}/abuse/bans."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/abuse/bans", query, None)
@@ -855,6 +859,10 @@ class Client:
         """Read the ordered event feed (issue #107). GET /v1/tenants/{tenant_id}/environments/{environment_id}/events."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/events", query, None)
 
+    def register_agent(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Register an agent inside an organization. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agents", query, body)
+
     def register_external_issuer(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Register an external assertion issuer as a trust anchor. POST /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/external-issuers", query, body)
@@ -974,6 +982,10 @@ class Client:
     def rotate_webhook_endpoint_secret(self, tenant_id: str, environment_id: str, endpoint_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Rotate an endpoint's signing secret, opening the overlap window. POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/rotate-secret."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webhook-endpoints/{urllib.parse.quote(endpoint_id)}/rotate-secret", query, None)
+
+    def set_agent_state(self, tenant_id: str, environment_id: str, organization_id: str, agent_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Set an agent's lifecycle state. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agents/{urllib.parse.quote(agent_id)}/state", query, body)
 
     def set_auto_link_posture(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set an environment's account-linking posture (issue #78). PUT /v1/tenants/{tenant_id}/environments/{environment_id}/auto-link-posture."""

@@ -2441,6 +2441,23 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{org_base}/memberships"),
             &serde_json::json!({ "user_id": unenrolled_user }),
         ),
+        Case::empty("agents.listAgents", "GET", format!("{org_base}/agents")),
+        Case::json(
+            "agents.registerAgent",
+            "POST",
+            format!("{org_base}/agents"),
+            &serde_json::json!({
+                "linked_user_id": unenrolled_user,
+                "display_name": "deploy bot",
+                "tool_scopes": ["deploy"],
+            }),
+        ),
+        Case::json(
+            "agents.setAgentState",
+            "PUT",
+            format!("{org_base}/agents/agt_absent/state"),
+            &serde_json::json!({ "state": "suspended" }),
+        ),
         Case::json(
             "memberships.createServiceAccountMembership",
             "POST",

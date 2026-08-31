@@ -84,6 +84,62 @@
       "type": "admin_consent.revoked"
     },
     {
+      "domain": "agent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "linked_user_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "organization_id",
+          "linked_user_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "agent.registered"
+    },
+    {
+      "domain": "agent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "state": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "organization_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "agent.state_changed"
+    },
+    {
       "domain": "api_key",
       "payload_schema": {
         "additionalProperties": false,
