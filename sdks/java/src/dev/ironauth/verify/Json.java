@@ -24,8 +24,20 @@ import java.util.Map;
  * selects a key or an algorithm: those come from the caller's policy.
  */
 final class Json {
+
+    /**
+     * How deeply values may nest.
+     *
+     * <p>This parser is recursive, so nesting depth is stack depth, and a {@code StackOverflowError}
+     * is an {@link Error}: it would escape every {@code catch} in the verifier and surface as a
+     * 500 rather than a refused token. A JWT header, a claim set and a JWK Set nest three or four
+     * deep; 32 is far above anything legitimate and far below anything dangerous.
+     */
+    private static final int MAX_DEPTH = 32;
+
     private final String text;
     private int at;
+    private int depth;
 
     private Json(String text) {
         this.text = text;
@@ -46,6 +58,9 @@ final class Json {
     private Object readValue() {
         if (at >= text.length()) {
             throw new IllegalArgumentException("unexpected end of input");
+        }
+        if (depth > MAX_DEPTH) {
+            throw new IllegalArgumentException("nested deeper than " + MAX_DEPTH);
         }
         char c = text.charAt(at);
         switch (c) {
@@ -74,9 +89,11 @@ final class Json {
         // that reorders makes a diff of two parsed documents unreadable.
         Map<String, Object> members = new LinkedHashMap<>();
         at++; // '{'
+        depth++;
         skipWhitespace();
         if (peek() == '}') {
             at++;
+            depth--;
             return members;
         }
         while (true) {
@@ -93,6 +110,7 @@ final class Json {
             char next = peek();
             at++;
             if (next == '}') {
+                depth--;
                 return members;
             }
             if (next != ',') {
@@ -104,9 +122,11 @@ final class Json {
     private List<Object> readArray() {
         List<Object> items = new ArrayList<>();
         at++; // '['
+        depth++;
         skipWhitespace();
         if (peek() == ']') {
             at++;
+            depth--;
             return items;
         }
         while (true) {
@@ -116,6 +136,7 @@ final class Json {
             char next = peek();
             at++;
             if (next == ']') {
+                depth--;
                 return items;
             }
             if (next != ',') {
@@ -142,6 +163,14 @@ final class Json {
                 out.append(c);
                 continue;
             }
+            // Bounds-checked BEFORE the read. Without this a token ending in a lone backslash
+            // makes charAt throw StringIndexOutOfBoundsException, which is not an
+            // IllegalArgumentException and so escapes the verifier's catch entirely: the caller
+            // gets an unchecked exception instead of a refusal, which in a servlet is a 500
+            // where a 401 belonged.
+            if (at >= text.length()) {
+                throw new IllegalArgumentException("input ends inside an escape");
+            }
             char escape = text.charAt(at++);
             switch (escape) {
                 case '"': out.append('"'); break;
@@ -153,6 +182,10 @@ final class Json {
                 case 'r': out.append('\r'); break;
                 case 't': out.append('\t'); break;
                 case 'u':
+                    // Same reasoning: substring past the end throws the wrong kind of exception.
+                    if (at + 4 > text.length()) {
+                        throw new IllegalArgumentException("input ends inside a \\u escape");
+                    }
                     out.append((char) Integer.parseInt(text.substring(at, at + 4), 16));
                     at += 4;
                     break;

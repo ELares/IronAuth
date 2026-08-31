@@ -212,8 +212,15 @@ public final class IronAuthVerifier {
         if (nowEpochSeconds > exp.longValue() + skewSeconds) {
             throw new VerifyException(Reason.EXPIRED, "exp passed at " + exp.longValue());
         }
-        if (claims.get("nbf") instanceof Double nbf && nowEpochSeconds < nbf.longValue() - skewSeconds) {
-            throw new VerifyException(Reason.NOT_YET_VALID, "nbf arrives at " + nbf.longValue());
+        if (claims.containsKey("nbf")) {
+            // Present but not a number is MALFORMED, not absent. Treating it as absent would mean
+            // `"nbf": "tomorrow"` silently disables the check it was written to perform.
+            if (!(claims.get("nbf") instanceof Double nbf)) {
+                throw new VerifyException(Reason.CLAIMS_MALFORMED, "nbf is present but not a number");
+            }
+            if (nowEpochSeconds < nbf.longValue() - skewSeconds) {
+                throw new VerifyException(Reason.NOT_YET_VALID, "nbf arrives at " + nbf.longValue());
+            }
         }
         return claims;
     }
@@ -303,7 +310,12 @@ public final class IronAuthVerifier {
                 return typed;
             }
             throw new VerifyException(reason, "the " + what + " is not a JSON object");
-        } catch (IllegalArgumentException malformed) {
+        } catch (RuntimeException malformed) {
+            // RuntimeException, not IllegalArgumentException. Everything reaching this point is
+            // attacker-controlled, and a parser defect must surface as a REFUSED TOKEN rather than
+            // as an unchecked exception the caller never declared. Json is bounds-checked so this
+            // should be unreachable; a backstop whose whole job is the case you did not think of
+            // is worth the four lines. VerifyException is checked, so it passes through untouched.
             throw new VerifyException(reason, "the " + what + " is not JSON");
         }
     }

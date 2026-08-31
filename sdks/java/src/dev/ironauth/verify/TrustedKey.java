@@ -14,7 +14,6 @@ import java.security.spec.EdECPublicKeySpec;
 import java.security.spec.NamedParameterSpec;
 import java.security.spec.RSAPublicKeySpec;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -157,16 +156,4 @@ public record TrustedKey(String kid, String kty, PublicKey key) {
         return "TrustedKey[kid=" + kid + ", kty=" + kty + "]";
     }
 
-    @Override
-    public boolean equals(Object other) {
-        return other instanceof TrustedKey that
-                && java.util.Objects.equals(kid, that.kid)
-                && java.util.Objects.equals(kty, that.kty)
-                && java.util.Objects.equals(key, that.key);
-    }
-
-    @Override
-    public int hashCode() {
-        return Arrays.hashCode(new Object[] {kid, kty, key});
-    }
 }

@@ -57,7 +57,7 @@ came out of mutating the verifier and seeing which suite noticed:
 | Suite | What only it can prove |
 | --- | --- |
 | `Conformance` | Agreement with the **shared** cross-language corpus: 19 vectors, 14 of them refusals. This is the only thing that measures interoperability rather than self-consistency. |
-| `SelfTest` | Properties needing a token this repo can **sign**, which a fixed corpus cannot contain: that key injection is refused *before* the signature is checked, that size is bounded before decoding, that a token without `exp` never verifies. |
+| `SelfTest` | Properties needing a token this repo can **sign**, which a fixed corpus cannot contain: that key injection is refused *before* the signature is checked, that size is bounded before decoding, that a token without `exp` never verifies. Also that **no input escapes `verify` as an unchecked exception** -- the corpus's malformed vectors are malformed *base64*, and these are valid base64 carrying hostile *JSON*. |
 | `SampleHarness` | The **sample**, run end to end against a real loopback issuer: discovery, `jwks_uri`, key decode, allow-list, verification. |
 
 ### This is the first verifier to check every accepted vector
@@ -83,6 +83,11 @@ above is actually measured.
   to show.
 - **`typ` is not enforced.** The shared corpus is run by six verifiers in five languages and mints
   ordinary `typ: JWT` tokens. IronAuth deployments pin their media type in the layer above.
+- **`Json` throws only `IllegalArgumentException`,** and that is a tested contract rather than a
+  convention. `verify` declares `VerifyException`, so a caller writes one `catch` and expects it to
+  cover every bad token; a reader that threw `StringIndexOutOfBoundsException` on a truncated escape
+  would turn an invalid token into a 500. Nesting is capped at 32 for the same reason -- the parser
+  is recursive, and a `StackOverflowError` is an `Error` that escapes every `catch` in the verifier.
 - **`Json` is not a general-purpose parser.** It reads what a JWT header, a claim set and a JWK Set
   contain, and nothing else. It is also **not a security boundary**: it parses segments *before*
   the signature is checked, so everything it returns is attacker-controlled until the verifier says

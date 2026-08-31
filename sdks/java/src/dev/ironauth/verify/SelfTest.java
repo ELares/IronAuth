@@ -98,6 +98,70 @@ public final class SelfTest {
                 "{\"iss\":\"" + ISSUER + "\",\"aud\":\"" + AUDIENCE + "\",\"sub\":\"usr_self\"}");
         refuses(verifier, noExpiry, Reason.CLAIMS_MALFORMED, "a token with no exp never verifies");
 
+        // NO INPUT ESCAPES AS AN UNCHECKED EXCEPTION.
+        //
+        // This is the property a review found broken. `verify` declares VerifyException, so a
+        // caller writes one catch and believes it covers every bad token. Two inputs made the
+        // hand-written JSON reader throw StringIndexOutOfBoundsException instead -- not an
+        // IllegalArgumentException, so it sailed past the verifier's catch and out of the method.
+        // In a servlet that is a 500 where a 401 belonged: the wrong status, the wrong alert, and
+        // a stack trace in the log for what is simply an invalid token.
+        //
+        // The corpus cannot reach this. Its malformed vectors are malformed BASE64; these are
+        // valid base64 carrying hostile JSON, and each one is a shape the reader has to bound.
+        char backslash = (char) 92;
+        String head = "{\"alg\":\"EdDSA\",\"kid\":\"self-1\",\"x\":\"";
+        List<String> hostileHeaders = List.of(
+                head + backslash,                          // input ends inside an escape
+                head + backslash + "u12",                  // input ends inside a hex escape
+                head + backslash + "uZZZZ" + "\"}",         // a hex escape with non-hex digits
+                head + backslash + "q\"}",                  // an escape that does not exist
+                "[".repeat(6100),                          // nesting deep enough to blow the stack
+                "{\"a\":".repeat(6100) + "1");             // the same, through objects
+        for (String hostile : hostileHeaders) {
+            String token = Fixtures.b64(hostile.getBytes(java.nio.charset.StandardCharsets.UTF_8)) + ".e30.AA";
+            checked++;
+            try {
+                verifier.verify(token, NOW);
+                FAILURES.add("a hostile header VERIFIED: " + summarise(hostile));
+            } catch (VerifyException expected) {
+                // A refusal is the whole point; which refusal is not, since these are all garbage.
+            } catch (Throwable escaped) {
+                FAILURES.add("a hostile header threw " + escaped.getClass().getName()
+                        + " out of verify(), which callers do not catch: " + summarise(hostile));
+            }
+        }
+
+        // AND THE SAME PROPERTY ONE LAYER DOWN, on the parser itself.
+        //
+        // The loop above passes with EITHER the reader's bounds checks OR the verifier's
+        // RuntimeException backstop in place, because each masks the other: a mutation run
+        // removing just one left the suite green. Two layers is the right design here, but it
+        // means neither is measured by an end-to-end test alone.
+        //
+        // So this asserts the reader's own contract directly, which only the bounds checks can
+        // satisfy: `Json.parse` throws IllegalArgumentException and NOTHING else. The backstop
+        // cannot make this pass, so the two layers now have one test each.
+        for (String hostile : hostileHeaders) {
+            checked++;
+            try {
+                Json.parse(hostile);
+                FAILURES.add("Json.parse accepted hostile input: " + summarise(hostile));
+            } catch (IllegalArgumentException expected) {
+                // The declared failure mode.
+            } catch (Throwable escaped) {
+                FAILURES.add("Json.parse threw " + escaped.getClass().getName()
+                        + ", which is outside its contract: " + summarise(hostile));
+            }
+        }
+
+        // `nbf` present but not a number must be MALFORMED, not treated as absent: otherwise
+        // `"nbf": "tomorrow"` silently disables the check it was written to perform.
+        refuses(verifier, Fixtures.mint(pair, "{\"alg\":\"EdDSA\",\"typ\":\"JWT\",\"kid\":\"self-1\"}",
+                        "{\"iss\":\"" + ISSUER + "\",\"aud\":\"" + AUDIENCE + "\",\"exp\":" + (NOW + 3600)
+                                + ",\"nbf\":\"tomorrow\"}"),
+                Reason.CLAIMS_MALFORMED, "a non-numeric nbf is malformed, not absent");
+
         // An empty allow-list reads as "allow nothing" and behaves as a silent outage, so it is
         // refused at construction rather than at the first request.
         try {
@@ -125,11 +189,17 @@ public final class SelfTest {
         }
         // A floor, so commenting assertions out fails here instead of reporting a smaller number
         // in a green run. It is a floor and not an equality: adding a property should not break it.
-        if (checked < 9) {
+        if (checked < 22) {
             System.err.println("FAIL: only " + checked + " properties ran; this suite is its list");
             System.exit(1);
         }
         System.out.println("java self-test: " + checked + " properties the corpus cannot express OK");
+    }
+
+    /** A short, log-safe rendering of a hostile input, so a failure names it without a wall of text. */
+    private static String summarise(String hostile) {
+        String head = hostile.length() > 40 ? hostile.substring(0, 40) + "..." : hostile;
+        return "(" + hostile.length() + " chars) " + head;
     }
 
     private static void accepts(IronAuthVerifier verifier, String token, String why) {
