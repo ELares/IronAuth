@@ -1337,9 +1337,9 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
       - name: build the sample and run the documented flow
         env:
           GRADLE_BIN: gradle
@@ -1362,7 +1362,6 @@ jobs:
           xcodebuild build \
             -scheme IronAuthSignIn \
             -destination 'generic/platform=iOS' \
-            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO
 
   java-verify:

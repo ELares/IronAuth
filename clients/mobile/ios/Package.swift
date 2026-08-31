@@ -11,7 +11,11 @@ import PackageDescription
 // present `SignInViewController`; that is the whole integration.
 let package = Package(
     name: "IronAuthSignIn",
-    platforms: [.iOS(.v13)],
+    // iOS 15, because AppAuth-iOS declares that floor and SwiftPM requires a consumer to be at
+    // or above its dependency's. Declaring .v13 here resolves to a refusal, not a warning:
+    // "requires minimum platform version 15.0 ... but ... supports 13.0". Checked against the
+    // dependency's own manifest rather than guessed, since nothing local can compile this.
+    platforms: [.iOS(.v15)],
     products: [
         .library(name: "IronAuthSignIn", targets: ["IronAuthSignIn"])
     ],
