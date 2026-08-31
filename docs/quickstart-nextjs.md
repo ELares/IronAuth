@@ -60,7 +60,7 @@ Nothing is pre-seeded here. This is what `create-next-app` gives anybody.
 
 ```bash quickstart
 (cd "$REPO/packages/ironauth-bff" && npm run build >/dev/null && npm pack --pack-destination "$QS_DIR" >/dev/null)
-npm install "$QS_DIR/ironauth-bff-0.0.0.tgz" > "$QS_DIR/install.log" 2>&1
+npm install "$(ls "$QS_DIR"/ironauth-bff-*.tgz)" > "$QS_DIR/install.log" 2>&1
 ```
 
 `@ironauth/bff` is not published yet, so this packs it from the repository and installs the
@@ -149,7 +149,16 @@ for _ in $(seq 1 120); do
   curl -sf -o /dev/null http://127.0.0.1:3000/ && break
   sleep 0.5
 done
-curl -sf -o /dev/null http://127.0.0.1:3000/
+# The page is FETCHED and counted, not just built. Otherwise "prefetch-heavy sample app" is a
+# claim about a file nothing in this run ever opens, and the twenty links could quietly become
+# two without any check noticing.
+curl -sf http://127.0.0.1:3000/ -o "$QS_DIR/home.html"
+# DISTINCT targets, not occurrences. Next emits each href more than once (the anchor and the
+# RSC payload), so counting matches reported 40 links on a page that has 20 -- a number that
+# passed the check while being wrong, which is the worse kind of green.
+LINKS=$(grep -oE '/auth/me\?n=[0-9]+' "$QS_DIR/home.html" | sort -u | wc -l | tr -d ' ')
+test "$LINKS" -ge 20 || { echo "the sample page rendered $LINKS distinct prefetch links, not 20"; exit 1; }
+echo "the sample page renders $LINKS distinct prefetched links"
 ```
 
 ## 7. Sign in
