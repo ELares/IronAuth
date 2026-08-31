@@ -5764,6 +5764,22 @@ impl ActingClientRepo<'_> {
         id: &ClientId,
         allowed: bool,
     ) -> Result<(), StoreError> {
+        self.set_allow_bearer_tokens_with_event(env, id, allowed, None)
+            .await
+    }
+
+    /// [`Self::set_allow_bearer_tokens`], additionally emitting `client.bearer_tokens_changed`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_allow_bearer_tokens`].
+    pub async fn set_allow_bearer_tokens_with_event(
+        &self,
+        env: &Env,
+        id: &ClientId,
+        allowed: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -5791,6 +5807,8 @@ impl ActingClientRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

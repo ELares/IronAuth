@@ -999,6 +999,10 @@ class Client:
         """Set (or clear) one client's scope allowlist. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/allowed-scopes."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/clients/{urllib.parse.quote(client_id)}/allowed-scopes", query, body)
 
+    def set_client_bearer_tokens(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Set a public client's exemption from the DPoP-by-default posture (issue #124). PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/clients/{urllib.parse.quote(client_id)}/bearer-tokens", query, body)
+
     def set_client_par_requirement(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set a client's Pushed Authorization Request requirement (RFC 9126). PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/clients/{urllib.parse.quote(client_id)}/par-requirement", query, body)

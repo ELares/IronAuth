@@ -533,6 +533,12 @@ fn posture_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: Some(body_of(&serde_json::json!({ "required": true }))),
         },
         Case {
+            label: "postures.setClientBearerTokens",
+            method: "PUT",
+            path: format!("{base}/clients/{client}/bearer-tokens"),
+            body: Some(body_of(&serde_json::json!({ "allowed": true }))),
+        },
+        Case {
             label: "postures.setAutoLinkPosture",
             method: "PUT",
             path: format!("{base}/auto-link-posture"),

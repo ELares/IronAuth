@@ -756,6 +756,13 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement",
             axum::routing::put(postures::set_client_par_requirement),
         )
+        // The per-client DPoP exemption (issue #124): the store write and its audit action
+        // shipped with no caller, so the hatch the enforcement documents could be opened by
+        // the test suite and by nobody else.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens",
+            axum::routing::put(postures::set_client_bearer_tokens),
+        )
         // The per-environment account-linking posture (issue #78, FORK B): the store
         // write and its audit action shipped with no caller.
         .route(

@@ -5250,6 +5250,112 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens": {
+      "put": {
+        "tags": [
+          "clients"
+        ],
+        "summary": "Set a public client's exemption from the DPoP-by-default posture (issue #124).",
+        "description": "This RELAXES a security control, and the relaxation is per client precisely so that it\ndoes not have to be deployment-wide: a single client that cannot mint proofs would\notherwise force every other client onto bearer tokens with it.",
+        "operationId": "setClientBearerTokens",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "path",
+            "description": "The client identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetClientBearerTokensRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored allowance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientBearerTokensView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or a body omitting `allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement": {
       "put": {
         "tags": [
@@ -27560,6 +27666,24 @@
           }
         }
       },
+      "ClientBearerTokensView": {
+        "type": "object",
+        "description": "A client's bearer-token allowance as stored.",
+        "required": [
+          "client_id",
+          "allow_bearer_tokens"
+        ],
+        "properties": {
+          "allow_bearer_tokens": {
+            "type": "boolean",
+            "description": "Whether this client is exempt from the DPoP-by-default posture."
+          },
+          "client_id": {
+            "type": "string",
+            "description": "The client this describes."
+          }
+        }
+      },
       "ClientParRequirementView": {
         "type": "object",
         "description": "A client's PAR requirement as stored.",
@@ -32987,6 +33111,19 @@
               "type": "string"
             },
             "description": "The scope tokens this client may request, or `null` to clear the allowlist\n(after which every scope passes the machine-grant denylist floor). An empty\narray is a real value: the client may then request no scope at all. REQUIRED:\nomitting the key is a 400, and it is NOT the same as sending `null`."
+          }
+        }
+      },
+      "SetClientBearerTokensRequest": {
+        "type": "object",
+        "description": "Allow (or stop allowing) unbound bearer tokens for one public client.",
+        "required": [
+          "allowed"
+        ],
+        "properties": {
+          "allowed": {
+            "type": "boolean",
+            "description": "Whether this public client may receive UNBOUND bearer tokens. `false`, the default\nfor every client, means it must present a DPoP proof at the token endpoint."
           }
         }
       },

@@ -1420,6 +1420,25 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The per-client DPoP exemption (issue #124). This one RELAXES a control rather than
+        // tightening one: `allowed: true` means this client's tokens stop being
+        // sender-constrained and become replayable by whoever steals them. An integrator
+        // watching the stream for security-posture changes needs to see it for exactly that
+        // reason, which is also why the payload states the direction rather than only naming
+        // the client.
+        "client.bearer_tokens_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "allowed": {"type": "boolean"}
+            },
+            "required": ["client_id", "allowed"]
+        }"#,
+    ),
+    (
         "client.par_requirement_changed",
         1,
         r#"{

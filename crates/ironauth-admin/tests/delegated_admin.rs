@@ -4400,3 +4400,64 @@ async fn the_caller_endpoint_reports_only_the_presenting_credential() {
         "the refusal must name the permission it wanted: {refused}"
     );
 }
+
+/// `management.write_config` is required to relax a client out of the DPoP posture (#124).
+///
+/// This route TURNS OFF a security control: `allowed: true` means the client's access tokens
+/// stop being sender-constrained and become replayable by whoever steals them. So the
+/// permission it demands is worth proving rather than merely declaring, and a credential
+/// scoped to user administration must not reach it.
+///
+/// BOTH DIRECTIONS, because a blanket refusal and a missing gate are indistinguishable from
+/// one of them. The second direction asserts only that the request gets PAST the permission
+/// gate: the handler then requires a fresh sudo elevation, so a 401 or a 404 there are both
+/// proof the gate let it through, and demanding a 200 would be testing sudo instead.
+#[tokio::test]
+async fn write_config_is_required_to_exempt_a_client_from_the_dpop_posture() {
+    let h = Harness::start(244).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-bearer").await;
+    // `cli_absentclient` is MALFORMED, so it fails `parse_client_id` -- which runs after the
+    // permission check. That is what lets 403 separate the gate from the handler without
+    // registering a client first.
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/clients/cli_absentclient/bearer-tokens"
+    );
+    let body = serde_json::json!({ "allowed": true }).to_string();
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&path, &secret, &body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential DISABLED sender-constrained tokens for a client: {response}"
+    );
+    assert!(
+        response.contains("management.write_config"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&path, &secret, &body).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_config did not cover the DPoP exemption, so the classification is wrong: \
+         {response}"
+    );
+}
+

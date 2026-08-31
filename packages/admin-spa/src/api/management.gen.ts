@@ -711,6 +711,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set a public client's exemption from the DPoP-by-default posture (issue #124).
+         * @description This RELAXES a security control, and the relaxation is per client precisely so that it
+         *     does not have to be deployment-wide: a single client that cannot mint proofs would
+         *     otherwise force every other client onto bearer tokens with it.
+         */
+        put: operations["setClientBearerTokens"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement": {
         parameters: {
             query?: never;
@@ -4177,6 +4199,13 @@ export interface components {
              */
             truncated: boolean;
         };
+        /** @description A client's bearer-token allowance as stored. */
+        ClientBearerTokensView: {
+            /** @description Whether this client is exempt from the DPoP-by-default posture. */
+            allow_bearer_tokens: boolean;
+            /** @description The client this describes. */
+            client_id: string;
+        };
         /** @description A client's PAR requirement as stored. */
         ClientParRequirementView: {
             /** @description The client this describes. */
@@ -7636,6 +7665,14 @@ export interface components {
              *     omitting the key is a 400, and it is NOT the same as sending `null`.
              */
             allowed_scopes: string[] | null;
+        };
+        /** @description Allow (or stop allowing) unbound bearer tokens for one public client. */
+        SetClientBearerTokensRequest: {
+            /**
+             * @description Whether this public client may receive UNBOUND bearer tokens. `false`, the default
+             *     for every client, means it must present a DPoP proof at the token endpoint.
+             */
+            allowed: boolean;
         };
         /** @description Require (or stop requiring) Pushed Authorization Requests for one client. */
         SetClientParRequirementRequest: {
@@ -12530,6 +12567,73 @@ export interface operations {
                 };
             };
             /** @description Missing or invalid credential, or a lapsed sudo elevation (the RFC 9470 insufficient_user_authentication challenge) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setClientBearerTokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The client identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetClientBearerTokensRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored allowance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClientBearerTokensView"];
+                };
+            };
+            /** @description Malformed request or a body omitting `allowed` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation */
             401: {
                 headers: {
                     [name: string]: unknown;

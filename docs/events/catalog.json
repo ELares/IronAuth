@@ -467,6 +467,28 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id",
+          "allowed"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "client.bearer_tokens_changed"
+    },
+    {
+      "domain": "client",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "client_id": {
             "minLength": 1,
             "type": "string"

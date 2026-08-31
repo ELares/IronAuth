@@ -1730,6 +1730,13 @@ func (c *Client) SetClientAllowedScopes(tenant_id string, environment_id string,
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/clients/" + escape(client_id) + "/allowed-scopes", query, body)
 }
 
+// SetClientBearerTokens performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens.
+//
+// Set a public client's exemption from the DPoP-by-default posture (issue #124).
+func (c *Client) SetClientBearerTokens(tenant_id string, environment_id string, client_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/clients/" + escape(client_id) + "/bearer-tokens", query, body)
+}
+
 // SetClientParRequirement performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/par-requirement.
 //
 // Set a client's Pushed Authorization Request requirement (RFC 9126).

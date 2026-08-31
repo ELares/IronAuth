@@ -483,6 +483,7 @@ use crate::views::{
         crate::webhook_endpoints::create_webhook_endpoint,
         crate::webhook_endpoints::rotate_webhook_endpoint_secret,
         crate::postures::set_client_par_requirement,
+        crate::postures::set_client_bearer_tokens,
         crate::postures::set_auto_link_posture,
         crate::queues::list_queue_depths,
         crate::webhook_endpoints::list_webhook_delivery_attempts,

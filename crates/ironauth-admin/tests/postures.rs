@@ -150,3 +150,119 @@ async fn the_auto_link_posture_sets_clears_and_refuses_a_token_outside_the_close
         "the refusal names the accepted set: {response}"
     );
 }
+
+#[tokio::test]
+async fn the_dpop_exemption_round_trips_and_is_read_back_from_the_client_row() {
+    let h = Harness::start(51).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let client = create_client(&h, &tenant, &environment).await;
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/clients/{client}/bearer-tokens");
+
+    let (status, _, response) = h
+        .put(&path, &serde_json::json!({ "allowed": true }).to_string())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let view: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(
+        view["client_id"],
+        Value::String(client.clone()),
+        "{response}"
+    );
+    assert_eq!(view["allow_bearer_tokens"], Value::Bool(true), "{response}");
+
+    // THE STORE HALF, read the way `enforce_public_client_dpop` reads it at the token
+    // endpoint. The response above could have been rendered from the request; this cannot.
+    let stored = h
+        .store()
+        .scoped(scope_of(&tenant, &environment))
+        .clients()
+        .get(
+            &ironauth_store::ClientId::parse_in_scope(&client, &scope_of(&tenant, &environment))
+                .expect("client id"),
+        )
+        .await
+        .expect("read the client");
+    assert!(
+        stored.allow_bearer_tokens,
+        "the flag the token endpoint gates on is actually set"
+    );
+
+    // And it turns back OFF. That direction matters more here than in the PAR case: this
+    // switch relaxes a control, so an operator who turned it on for a migration and cannot
+    // turn it back off has been handed a permanent downgrade.
+    let (status, _, response) = h
+        .put(&path, &serde_json::json!({ "allowed": false }).to_string())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let stored = h
+        .store()
+        .scoped(scope_of(&tenant, &environment))
+        .clients()
+        .get(
+            &ironauth_store::ClientId::parse_in_scope(&client, &scope_of(&tenant, &environment))
+                .expect("client id"),
+        )
+        .await
+        .expect("read the client");
+    assert!(
+        !stored.allow_bearer_tokens,
+        "the exemption must be revocable, or turning it on is a one-way door"
+    );
+}
+
+/// Relaxing a client SURFACES it in the environment's warnings.
+///
+/// The warning existed before this route did, and could never have fired: nothing in
+/// production could set the flag it filters on, so `bearer_relaxed_warnings` was
+/// unreachable code guarding an unreachable state. This is the test that connects the two,
+/// and it is the reason the route is worth having beyond "the setter now has a caller" --
+/// an operator who relaxes a client for one legacy app is rarely the one auditing the
+/// environment a year later, and the warning is what tells them.
+#[tokio::test]
+async fn relaxing_a_public_client_shows_up_in_the_environment_warnings() {
+    let h = Harness::start(52).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let client = create_client(&h, &tenant, &environment).await;
+    let warnings = format!("/v1/tenants/{tenant}/environments/{environment}/diagnostics/warnings");
+
+    // BEFORE, so a warning that was always present would not be mistaken for this one.
+    let (status, _, response) = h.get(&warnings).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(
+        !response.contains("dpop_posture_relaxed"),
+        "the environment warned about a relaxed client before anything was relaxed: {response}"
+    );
+
+    let path =
+        format!("/v1/tenants/{tenant}/environments/{environment}/clients/{client}/bearer-tokens");
+    let (status, _, response) = h
+        .put(&path, &serde_json::json!({ "allowed": true }).to_string())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let (status, _, response) = h.get(&warnings).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(
+        response.contains("dpop_posture_relaxed"),
+        "relaxing a public client raised no warning: {response}"
+    );
+    assert!(
+        response.contains(&client),
+        "the warning does not name the client it is about: {response}"
+    );
+
+    // And it CLEARS. A warning that stuck after the operator put the control back would
+    // train people to ignore it, which is worse than not warning at all.
+    let (status, _, response) = h
+        .put(&path, &serde_json::json!({ "allowed": false }).to_string())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, _, response) = h.get(&warnings).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(
+        !response.contains("dpop_posture_relaxed"),
+        "the warning survived re-tightening the client: {response}"
+    );
+}
+
