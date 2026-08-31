@@ -43,8 +43,19 @@ fi
 grep -qi 'DPoP' "$PAGE" || { echo "bff-docs: $PAGE ranks browser-held tokens without naming DPoP" >&2; exit 1; }
 grep -qi 'rotation' "$PAGE" || { echo "bff-docs: $PAGE ranks browser-held tokens without naming refresh rotation" >&2; exit 1; }
 
-# And the prohibition, over every document except the page that states it.
-offenders=$(grep -rliE 'localstorage' docs packages/*/README.md 2>/dev/null | grep -v "^${PAGE}$" || true)
+# And the prohibition, over every AUTHORED document except the page that states it.
+#
+# `docs/llms.txt` and `docs/llms-full.txt` are excluded because they are GENERATED: the corpus
+# concatenates every published page, so it necessarily contains whatever `docs/bff.md` says about
+# localStorage. Flagging that would be flagging the prohibition itself for existing, and the fix
+# an author would reach for -- softening the wording on the page that owns the subject -- is
+# exactly backwards.
+#
+# The exclusion is safe because a generated concatenation cannot introduce guidance: anything it
+# carries came from a source file this scan already reads.
+offenders=$(grep -rliE 'localstorage' docs packages/*/README.md 2>/dev/null \
+  | grep -v "^${PAGE}$" \
+  | grep -vE '^docs/llms(-full)?\.txt$' || true)
 if [ -n "$offenders" ]; then
   echo "bff-docs: localStorage is mentioned outside ${PAGE}:" >&2
   printf '  %s\n' $offenders >&2
