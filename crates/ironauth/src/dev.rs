@@ -303,6 +303,23 @@ pub struct SeededScope {
     /// and users, and without one every org-scoped surface (membership, org connections, the
     /// per-org policy overlay) has nothing to be exercised against in the emulator.
     pub organization: String,
+    /// A second client, owning the seeded MACHINE IDENTITY.
+    ///
+    /// Separate from [`Self::client`] deliberately. The first is the PUBLIC client a browser
+    /// or CLI signs in through; a machine identity belongs to a client that represents a
+    /// workload, and conflating them would make "the token was issued as the mapped identity"
+    /// satisfiable by a grant that simply resolved the presenting client's own account.
+    pub workload_client: String,
+    /// The seeded MACHINE IDENTITY (issue #126): the principal a workload-federation subject
+    /// mapping points at.
+    ///
+    /// Seeded because there is otherwise NO WAY TO GET ONE. A service account is minted as a
+    /// side effect of a client-credentials exchange (`service_accounts().ensure`) and has no
+    /// creation route on the management API, so an operator setting up workload federation
+    /// against a fresh environment has nothing to map a workload onto until some client has
+    /// already exchanged for a token. Every `subject-mappings` registration names a principal;
+    /// without this the emulator can register trust anchors and map them onto nothing.
+    pub machine_identity: String,
 }
 
 /// Distinguishes the seeded-identifier stream from the running server's, which draws from
@@ -353,6 +370,8 @@ pub fn seed_ids(seed: u64) -> SeededScope {
         environment: environment.to_string(),
         client: ironauth_store::ClientId::generate(&env, &scope).to_string(),
         organization: ironauth_store::OrganizationId::generate(&env, &scope).to_string(),
+        workload_client: ironauth_store::ClientId::generate(&env, &scope).to_string(),
+        machine_identity: ironauth_store::ServiceAccountId::generate(&env, &scope).to_string(),
     }
 }
 
@@ -442,13 +461,54 @@ pub fn seed_statements(scope: &SeededScope) -> Vec<String> {
              (id, tenant_id, environment_id, display_name, token_endpoint_auth_method, \
               redirect_uris, grant_types, first_party) \
              VALUES ('{}', '{}', '{}', 'dev client', 'none', ARRAY['{}'], \
-                     'authorization_code {}', true) \
+                     'authorization_code {} {}', true) \
              ON CONFLICT (id) DO NOTHING;",
             scope.client,
             scope.tenant,
             scope.environment,
             DEV_REDIRECT_URI,
-            ironauth_oidc::GrantType::DEVICE_CODE_URN
+            ironauth_oidc::GrantType::DEVICE_CODE_URN,
+            // The jwt-bearer grant (issue #126), so a WORKLOAD can present an ambient
+            // assertion through the emulator's public client. Public is the point: the
+            // criterion's "zero stored secrets" means the presenter has no secret either,
+            // and a confidential presenter would hide that the assertion is the only
+            // credential in the exchange.
+            ironauth_oidc::GrantType::JwtBearer.as_str()
+        ),
+        // The WORKLOAD client, which exists to OWN the machine identity below.
+        //
+        // NO SECRET IS SEEDED, so this client cannot authenticate, and that is deliberate
+        // rather than an omission. Nothing in the workload-federation flow authenticates as
+        // it: the mapping names the IDENTITY, and the assertion is presented by the public
+        // client. Seeding a usable secret would mean printing a second credential into the
+        // banner to make a client nothing uses slightly more complete.
+        //
+        // Separate from the public client for a reason `workload_federation.rs` measured: an
+        // identity owned by the PRESENTING client makes "the token was issued as the mapped
+        // identity" satisfiable by a grant that ignored the mapping and resolved the
+        // presenter's own service account. Different owner, different id, no such shortcut.
+        format!(
+            "INSERT INTO clients /* query-audit-allow: dev-only seeding as the cluster \
+             owner, before any server exists to route it through a scoped repository */ \
+             (id, tenant_id, environment_id, display_name, token_endpoint_auth_method, \
+              redirect_uris, grant_types, first_party) \
+             VALUES ('{}', '{}', '{}', 'dev workload', 'client_secret_basic', ARRAY[]::text[], \
+                     'client_credentials', true) \
+             ON CONFLICT (id) DO NOTHING;",
+            scope.workload_client, scope.tenant, scope.environment
+        ),
+        // THE MACHINE IDENTITY (issue #126). Seeded because there is otherwise no way to get
+        // one: `service_accounts().ensure` runs as a side effect of a client-credentials
+        // exchange and the management API has no creation route, so a fresh environment has
+        // nothing for a workload-federation subject mapping to point at.
+        format!(
+            "INSERT INTO service_accounts /* query-audit-allow: dev-only seeding as the \
+             cluster owner, before any server exists to route it through a scoped \
+             repository */ \
+             (id, tenant_id, environment_id, client_id, created_at) \
+             VALUES ('{}', '{}', '{}', '{}', now()) \
+             ON CONFLICT (id) DO NOTHING;",
+            scope.machine_identity, scope.tenant, scope.environment, scope.workload_client
         ),
     ]
 }
