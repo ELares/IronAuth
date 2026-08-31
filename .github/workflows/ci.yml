@@ -750,6 +750,12 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           ./scripts/quickstart.sh python
+      # The same gate, the same runner, a different guide. Go needs no dependencies at all: the
+      # standard library has crypto/ed25519, so the example verifies the signature itself.
+      - name: Assert the Go quickstart works, verbatim and within budget
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/quickstart.sh go
 
       - name: Assert the reference client passes the SDK conformance suite
         run: |
