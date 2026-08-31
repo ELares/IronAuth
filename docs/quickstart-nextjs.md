@@ -149,6 +149,14 @@ for _ in $(seq 1 120); do
   curl -sf -o /dev/null http://127.0.0.1:3000/ && break
   sleep 0.5
 done
+# THE SERVER WE STARTED, not merely a server. If the port was already taken, `next start` exits
+# while the process holding it answers happily -- and the whole run then tests somebody else's
+# server. Measured on the React guide: a leaked server made a deliberately broken guide pass.
+kill -0 "$(cat "$QS_DIR/next.pid")" 2>/dev/null || {
+  echo "the app server exited; its log:" >&2
+  cat "$QS_DIR/next.log" >&2
+  exit 1
+}
 # The page is FETCHED and counted, not just built. Otherwise "prefetch-heavy sample app" is a
 # claim about a file nothing in this run ever opens, and the twenty links could quietly become
 # two without any check noticing.
