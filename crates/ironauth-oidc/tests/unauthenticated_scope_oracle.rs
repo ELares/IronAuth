@@ -139,6 +139,17 @@ struct Case {
     /// The templated path it drives, which is also how it resolves against the router
     /// inventory: a literal that drifts matches nothing and fails the coverage test.
     template: &'static str,
+    /// A query string appended to the request, WITHOUT the leading `?`, or empty.
+    ///
+    /// Separate from `template` rather than folded into it, because `template` has to stay
+    /// exactly the path the router registers or the coverage test above stops matching it.
+    ///
+    /// It exists because a route with a REQUIRED query parameter is refused by the extractor
+    /// before its own logic runs, and a case that drove one without the parameter would compare
+    /// two `400`s from the query parser -- measuring the parser rather than the route. That is
+    /// the same trap this file's `live_status` field was added for, reached through the query
+    /// string instead of the body.
+    query: &'static str,
     method: &'static str,
     content_type: &'static str,
     body: &'static str,
@@ -150,10 +161,16 @@ struct Case {
 }
 
 /// The unauthenticated, scope-routed requests whose ghost-scope answer this file pins.
+/// Long by construction, and it should get longer: the coverage test above fails when a
+/// scope-routed route is neither driven here nor excluded, so every route this repository adds
+/// lands in this list or in that one. Splitting it to satisfy a line count would put the cases
+/// somewhere the next author does not look.
+#[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/device",
+            query: "",
             method: "POST",
             content_type: "application/x-www-form-urlencoded",
             body: "user_code=ABCD-EFGH",
@@ -167,6 +184,7 @@ fn cases() -> Vec<Case> {
         // `scoped_authorize.rs` owns, and would say nothing about the ghost case.
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/authorize",
+            query: "",
             method: "GET",
             content_type: "text/plain",
             body: "",
@@ -174,13 +192,54 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/device",
+            query: "",
             method: "GET",
             content_type: "text/plain",
             body: "",
             live_status: StatusCode::OK,
         },
+        // THE SESSION TOKENIZER'S THREE ROUTES (issue #119). Driven rather than excluded,
+        // because all three genuinely answer identically for a scope that never existed and
+        // that is worth pinning rather than asserting in a comment.
+        //
+        // The mint, with NO cookie. A live scope refuses an absent session with the same
+        // uniform `401` a ghost scope produces, because the refusal comes from the session
+        // guard and never from whether the scope resolves -- which is the property that
+        // stops this endpoint being a scope oracle for anyone who can send a POST.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/session/tokenize",
+            query: "tokenize_as=no-such-template",
+            method: "POST",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::UNAUTHORIZED,
+        },
+        // The mode report, which is PUBLIC and answers `{"enabled": false}` for a live
+        // environment nobody has configured. A ghost scope reads no row either, so the two
+        // answers are the same document -- and that is the point: the default is
+        // indistinguishable from "no such environment", so the endpoint discloses neither.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/session/token-mode",
+            query: "",
+            method: "GET",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::OK,
+        },
+        // A template's own JWKS. A live scope with no template of that name answers the
+        // uniform not-found, and so does a ghost scope: the template lookup fails first
+        // either way, so neither the scope nor the template name is enumerable here.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/session-tokens/{template}/jwks.json",
+            query: "",
+            method: "GET",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::NOT_FOUND,
+        },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/otp/send",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"identifier":"sweep@example.test"}"#,
@@ -188,6 +247,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/magic/send",
+            query: "",
             method: "POST",
             content_type: "application/x-www-form-urlencoded",
             body: "identifier=sweep%40example.test",
@@ -195,6 +255,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/pow/challenge",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"endpoint":"register","context":"sweep"}"#,
@@ -206,6 +267,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/otp/verify",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"identifier":"sweep@example.test","code":"000000"}"#,
@@ -213,6 +275,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/invitations/accept",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"token":"not-a-real-invitation-token"}"#,
@@ -227,6 +290,7 @@ fn cases() -> Vec<Case> {
         // Both halves matter: a gate that 404s only for real scopes would be the oracle.
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/recover/admin-approved/initiate",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"identifier":"sweep@example.test","code":"000000"}"#,
@@ -234,6 +298,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/recover/idv/initiate",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"identifier":"sweep@example.test","code":"000000","provider":"sweep"}"#,
@@ -241,6 +306,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/recover/finalize",
+            query: "",
             method: "POST",
             content_type: "application/json",
             body: r#"{"identifier":"sweep@example.test","code":"000000"}"#,
@@ -412,6 +478,12 @@ fn at(template: &str, scope: &Scope) -> String {
     template
         .replace("{tenant_id}", &scope.tenant().to_string())
         .replace("{environment_id}", &scope.environment().to_string())
+        // `{template}` is the session tokenizer's path parameter (issue #119), filled with a
+        // name no environment has. That is deliberate and it is what the case is for: the
+        // question is whether a LIVE scope and a GHOST scope answer a request for a template
+        // neither of them holds the same way. Substituting a name that exists somewhere would
+        // measure the template lookup instead of the scope one.
+        .replace("{template}", "no-such-template")
 }
 
 /// The COMPARABLE projection of a response: the status, EVERY header, and the body.
@@ -484,9 +556,13 @@ fn flush_run(out: &mut String, run: &mut String) {
 
 /// Drive one case at `scope`, presenting NO credential of any kind.
 async fn drive(harness: &Harness, case: &Case, scope: &Scope) -> (StatusCode, HeaderMap, String) {
-    let mut builder = Request::builder()
-        .method(case.method)
-        .uri(at(case.template, scope));
+    let path = at(case.template, scope);
+    let uri = if case.query.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", case.query)
+    };
+    let mut builder = Request::builder().method(case.method).uri(uri);
     if case.method != "GET" {
         builder = builder.header(header::CONTENT_TYPE, case.content_type);
     }
@@ -605,6 +681,7 @@ async fn the_device_verification_page_is_not_an_environment_existence_oracle() {
 
     let case = Case {
         template: "/t/{tenant_id}/e/{environment_id}/device",
+        query: "",
         method: "POST",
         content_type: "application/x-www-form-urlencoded",
         body: "",
@@ -731,6 +808,7 @@ async fn a_blinded_nonce_differs_between_two_requests_at_the_same_scope() {
     let live = harness.scope();
     let case = Case {
         template: "/t/{tenant_id}/e/{environment_id}/magic/send",
+        query: "",
         method: "POST",
         content_type: "application/x-www-form-urlencoded",
         body: "identifier=sweep%40example.test",
@@ -788,6 +866,7 @@ async fn the_proof_of_work_gate_is_not_an_environment_existence_oracle() {
     let ghost = ghost_scope(gate_on.env());
     let case = Case {
         template: "/t/{tenant_id}/e/{environment_id}/pow/challenge",
+        query: "",
         method: "POST",
         content_type: "application/json",
         body: r#"{"endpoint":"register","context":"sweep"}"#,
