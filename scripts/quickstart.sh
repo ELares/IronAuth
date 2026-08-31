@@ -82,9 +82,14 @@ fi
 cleanup() {
   # Whatever the guide started, stop. A quickstart that leaked an emulator would leave a Postgres
   # cluster behind on every CI run.
-  if [ -f "${QS_DIR}/emulator.pid" ]; then
-    kill "$(cat "${QS_DIR}/emulator.pid")" 2>/dev/null || true
-  fi
+  # EVERY pid file, not just the emulator's. The Next.js guide starts a second long-lived
+  # process (the app itself), and a cleanup that knew about one of them would leak the other on
+  # every CI run -- a leaked `next start` holds port 3000 and the next run fails for a reason
+  # that has nothing to do with the guide.
+  for pidfile in "${QS_DIR}"/*.pid; do
+    [ -f "$pidfile" ] || continue
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+  done
   rm -rf "$QS_DIR"
 }
 trap cleanup EXIT INT TERM

@@ -752,6 +752,15 @@ jobs:
           ./scripts/quickstart.sh python
       # The same gate, the same runner, a different guide. Go needs no dependencies at all: the
       # standard library has crypto/ed25519, so the example verifies the signature itself.
+      # Issue #116 criteria 1 and 5: the NEXT.JS quickstart, whose documented commands create a
+      # clean App Router project, install the BFF from a packed tarball, and complete a REAL
+      # login -- not a rendered page, an actual code exchange against the emulator with a
+      # DPoP-bound public client. The same run then checks the session cookie under twenty
+      # prefetches, which is where cookie chunking would show up if it ever arose.
+      - name: Assert the Next.js quickstart works, verbatim and within budget
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/quickstart.sh nextjs
       - name: Assert the Go quickstart works, verbatim and within budget
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
