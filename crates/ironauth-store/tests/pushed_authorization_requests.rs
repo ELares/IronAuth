@@ -567,3 +567,91 @@ async fn a_par_requirement_change_announces_the_client_and_the_setting() {
         }
     }
 }
+
+/// A DPoP-exemption change announces the client and the direction, in BOTH directions.
+///
+/// This flag is the one in this family that RELAXES a control: `allowed: true` means the
+/// client's access tokens stop being sender-constrained and become replayable by whoever
+/// steals them. A consumer mirroring security posture needs the relaxing direction most, so
+/// both are asserted -- a producer that hard-coded either would pass a test exercising one.
+///
+/// Lives here beside the PAR test because they are the same shape and the same defect history:
+/// a column the token endpoint reads, a setter with an audit action, and until issue #116 no
+/// caller in production at all.
+#[tokio::test]
+async fn a_bearer_token_exemption_change_announces_the_client_and_the_direction() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = create_client(&db, &env, scope).await;
+    let subject = client.to_string();
+
+    for (allowed, event_id) in [(true, "evt_bearer_on"), (false, "evt_bearer_off")] {
+        let envelope = ironauth_store::event_catalog::envelope(
+            event_id,
+            "client.bearer_tokens_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            1,
+            &serde_json::json!({ "client_id": subject, "allowed": allowed }),
+        )
+        .expect("client.bearer_tokens_changed is registered");
+
+        // THE CONTROL STORE, not the app store. `allow_bearer_tokens` is granted to
+        // `ironauth_control` alone (migration 0142) precisely so a data-plane compromise
+        // cannot switch off the control it enforces, and the admin API that performs this
+        // write is the control plane. Using the app store here failed with "permission denied
+        // for table clients", which is the grant working exactly as designed.
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .clients()
+            .set_allow_bearer_tokens_with_event(
+                &env,
+                &client,
+                allowed,
+                Some(&ironauth_store::DomainEvent {
+                    id: event_id,
+                    subject: &subject,
+                    envelope: &envelope,
+                }),
+            )
+            .await
+            .expect("set the flag");
+
+        // Claimed and COMPLETED each round: both events carry the client id as their ordering
+        // key, so the second is not claimable while the first is outstanding.
+        // Claimed on the APP plane, because that is the plane the webhook fan-out runs on.
+        // The write is control-plane and the delivery is data-plane, and this test spans both
+        // exactly as production does: a claim from the control store is refused outright.
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the change enqueues exactly one event");
+        assert_eq!(claimed[0].payload["type"], "client.bearer_tokens_changed");
+        assert_eq!(
+            claimed[0].payload["payload"]["allowed"], allowed,
+            "the event must carry the setting the write STORED, not a fixed value"
+        );
+        ironauth_store::event_catalog::validate_event(&claimed[0].payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+        for message in &claimed {
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+        }
+    }
+}
+

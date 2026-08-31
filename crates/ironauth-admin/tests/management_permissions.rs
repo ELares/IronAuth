@@ -503,6 +503,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("getOutboundVerification", ManagementPermission::Read),
     ("setClientParRequirement", ManagementPermission::WriteConfig),
+    ("setClientBearerTokens", ManagementPermission::WriteConfig),
     ("setAutoLinkPosture", ManagementPermission::WriteConfig),
     // The last reachable user operations.
     ("updateUser", ManagementPermission::WriteUsers),
@@ -689,6 +690,11 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // The per-client DPoP exemption (issue #124), proven by
+    // `write_config_is_required_to_exempt_a_client_from_the_dpop_posture`: both directions,
+    // because this route TURNS OFF sender-constrained tokens and a blanket refusal would look
+    // identical to a correct gate.
+    "setClientBearerTokens",
     // Proven by `the_caller_endpoint_reports_only_the_presenting_credential`, which drives it
     // with a credential that lacks `management.read` and asserts the refusal names it.
     "getCaller",
@@ -911,12 +917,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        210,
+        211,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        66,
+        67,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

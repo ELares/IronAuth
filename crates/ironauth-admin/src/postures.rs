@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Two security postures the data plane ENFORCES and nothing could set (issues #27, #78).
+//! Security postures the data plane ENFORCES and nothing could set (issues #27, #78, #116).
 //!
-//! Both were found by the same sweep and share one defect shape: a column the OIDC data
+//! Each was found by the same sweep and shares one defect shape: a column the OIDC data
 //! plane reads on every relevant request, a store setter that writes it, and no caller
 //! anywhere in production. The enforcement shipped; the way to turn it on did not.
 //!
@@ -18,7 +18,17 @@
 //!   account-linking default (issue #78, FORK B). The store write exists, carries its own
 //!   audit action and a column-scoped control grant, and had no caller.
 //!
-//! Neither is a new capability. Both are switches for machinery that already runs.
+//! * `clients.allow_bearer_tokens` is the per-client escape hatch from the DPoP-by-default
+//!   posture (issue #124). `enforce_public_client_dpop` reads it on every token request from
+//!   a public client, and its own doc comment explains why the hatch is per client: "a vendor
+//!   SDK the operator does not control", "a native app shipped before the operator adopted
+//!   this posture". Both of those describe AppAuth exactly, which supports no DPoP at all.
+//!   `set_allow_bearer_tokens` existed with its audit action and column, and MEASURED, its
+//!   only callers anywhere were three lines in `ironauth-oidc/tests/common/mod.rs`. So the
+//!   hatch the enforcement documents could be opened by the test suite and by nobody else,
+//!   and every AppAuth-based mobile app was unregisterable as a consequence.
+//!
+//! None is a new capability. All are switches for machinery that already runs.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -132,6 +142,107 @@ pub async fn set_client_par_requirement(
     Ok(json(StatusCode::OK, body_string))
 }
 
+/// Allow (or stop allowing) unbound bearer tokens for one public client.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetClientBearerTokensRequest {
+    /// Whether this public client may receive UNBOUND bearer tokens. `false`, the default
+    /// for every client, means it must present a DPoP proof at the token endpoint.
+    pub allowed: bool,
+}
+
+/// A client's bearer-token allowance as stored.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClientBearerTokensView {
+    /// The client this describes.
+    pub client_id: String,
+    /// Whether this client is exempt from the DPoP-by-default posture.
+    pub allow_bearer_tokens: bool,
+}
+
+/// Set a public client's exemption from the DPoP-by-default posture (issue #124).
+///
+/// This RELAXES a security control, and the relaxation is per client precisely so that it
+/// does not have to be deployment-wide: a single client that cannot mint proofs would
+/// otherwise force every other client onto bearer tokens with it.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/clients/{client_id}/bearer-tokens",
+    operation_id = "setClientBearerTokens",
+    tag = "clients",
+    request_body = SetClientBearerTokensRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("client_id" = String, Path, description = "The client identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The stored allowance", body = ClientBearerTokensView),
+        (status = 400, description = "Malformed request or a body omitting `allowed`", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or a lapsed sudo elevation", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found (absent, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody)
+    )
+)]
+pub async fn set_client_bearer_tokens(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, client_id)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteConfig)?;
+    // Turning OFF sender-constrained tokens for a client is the clearest case there is for
+    // a fresh privilege: it is a deliberate downgrade of a control, not a configuration
+    // tweak, and the resulting tokens are replayable by whoever steals them.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    require_live_environment(&state, &scope).await?;
+
+    // Address the target FIRST, for the reason `client_scopes.rs` records: a caller who
+    // cannot address the client must not learn "that client is not yours" from the STATUS
+    // of a body-level refusal.
+    let id = state
+        .store()
+        .scoped(scope)
+        .clients()
+        .parse_id(&client_id)
+        .map_err(|_| ApiError::NotFound)?;
+    // The read is the ADDRESSING check: a client of another scope, or an absent one, is
+    // the uniform not-found before the body is even parsed.
+    state.store().scoped(scope).clients().get(&id).await?;
+
+    let request: SetClientBearerTokensRequest = parse_json(&body)?;
+
+    let pending = bearer_tokens_event(&state, scope, &id, request.allowed);
+    state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .clients()
+        .set_allow_bearer_tokens_with_event(
+            state.env(),
+            &id,
+            request.allowed,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await?;
+
+    // Re-read through the SAME address, so the response reports what was stored rather
+    // than what was asked for.
+    let updated = state.store().scoped(scope).clients().get(&id).await?;
+    let view = ClientBearerTokensView {
+        client_id: id.to_string(),
+        allow_bearer_tokens: updated.allow_bearer_tokens,
+    };
+    let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
 /// Set or clear an environment's account-linking posture override.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAutoLinkPostureRequest {
@@ -229,6 +340,34 @@ pub async fn set_auto_link_posture(
 /// Requiring pushed authorization requests hardens that client's authorize leg, so a consumer
 /// mirroring client hardening posture acts on it. One type with the boolean rather than a
 /// required/not-required pair, matching the other two-direction flags in this registry.
+/// The event a per-client DPoP exemption change emits (issue #124).
+///
+/// Emitted for the RELAXING direction and the tightening one alike: an integrator watching
+/// for security-posture changes needs "this client stopped being sender-constrained" most,
+/// and a stream that only announced re-tightening would be worse than silent.
+fn bearer_tokens_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    client_id: &ironauth_store::ClientId,
+    allowed: bool,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = client_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "client.bearer_tokens_changed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({ "client_id": subject, "allowed": allowed }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
 fn par_requirement_event(
     state: &AdminState,
     scope: ironauth_store::Scope,

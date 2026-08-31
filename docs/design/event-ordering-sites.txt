@@ -94,6 +94,7 @@ crates/ironauth-store/src/repository.rs:rotate_secret_with_event:1
 crates/ironauth-store/src/repository.rs:rotate_with_event:1
 crates/ironauth-store/src/repository.rs:set:1
 crates/ironauth-store/src/repository.rs:set_active_with_event:1
+crates/ironauth-store/src/repository.rs:set_allow_bearer_tokens_with_event:1
 crates/ironauth-store/src/repository.rs:set_auto_link_posture_with_event:1
 crates/ironauth-store/src/repository.rs:set_config_with_event:1
 crates/ironauth-store/src/repository.rs:set_default_with_event:1
