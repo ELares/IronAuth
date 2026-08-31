@@ -742,6 +742,15 @@ jobs:
       # spec and contract and NOT from the generated SDKs, passes the published conformance
       # suite against the emulator. It runs here because this job already builds the binary
       # and has the Postgres binaries the emulator brings its own cluster up with.
+      # Issue #116 criterion 2: the Python quickstart's DOCUMENTED commands, run verbatim. The
+      # runner extracts them from `docs/quickstart-python.md` and has no copy of its own, so a
+      # guide that drifts from what works fails here by construction rather than by comparison.
+      # The 15-minute budget is enforced, because a quickstart that takes an hour is not one.
+      - name: Assert the Python quickstart works, verbatim and within budget
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/quickstart.sh python
+
       - name: Assert the reference client passes the SDK conformance suite
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
