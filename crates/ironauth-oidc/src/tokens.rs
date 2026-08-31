@@ -227,6 +227,12 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // the group ancestry, and is issuer-set only. A client custom claim must never
     // self-assert a role.
     "roles",
+    // RFC 9396 authorization details (issue #131 criterion 4): what the RESOURCE OWNER
+    // approved, copied from the stored request the approval decided. Issuer-set only and
+    // protected for the sharpest reason on this list: a client custom claim that could write
+    // it would let the client state what it was authorized to do, which is the one thing the
+    // person on the approval screen was there to decide.
+    "authorization_details",
     // Organization permissions (issue #98): `permissions` is resolved FRESH at
     // issuance from an authoritative store read over the mappings of the roles the
     // subject effectively holds, and is issuer-set only. A client custom claim must
@@ -578,6 +584,14 @@ pub struct MintRequest<'a> {
     /// legal value of this type, so the type cannot ask whether a door enabled hooks. See
     /// [`MappedAccessClaims`] for which doors are pinned by a test and which are not.
     pub access_extra_claims: &'a crate::claims_mapping_at_issuance::MappedAccessClaims,
+    /// The RFC 9396 `authorization_details` the resource owner approved (issue #131
+    /// criterion 4), echoed into the ACCESS token.
+    ///
+    /// Access token only, and not the ID token: this describes what the bearer may DO at a
+    /// resource server, which is what an access token is for. An ID token says who the person
+    /// is, and a resource server that read authorization from it would be reading the wrong
+    /// token.
+    pub authorization_details: Option<&'a serde_json::Value>,
     /// The per-client ID-token signing key (issue #30): the environment key of the
     /// algorithm this client negotiated as its `id_token_signed_response_alg` at
     /// dynamic registration. When [`Some`], the ID token (ONLY the ID token, never
@@ -909,6 +923,13 @@ pub(crate) fn build_access_token_claims(
     // claim already in place and leaves it. Folding earlier would make the fence the only
     // thing standing between this bag and a protocol claim, and a fence plus an ordering is
     // two reasons where one would do.
+    // BEFORE the extra-claims fold, so a claims mapping finds it already in place and the
+    // protected list is the second fence rather than the only one.
+    if let (serde_json::Value::Object(object), Some(details)) =
+        (&mut claims, request.authorization_details)
+    {
+        object.insert("authorization_details".to_owned(), details.clone());
+    }
     if let serde_json::Value::Object(object) = &mut claims {
         for (name, value) in request.access_extra_claims.as_map() {
             if PROTECTED_ACCESS_TOKEN_CLAIMS.contains(&name.as_str()) {
@@ -2112,6 +2133,7 @@ mod tests {
         let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
         MintRequest {
+            authorization_details: None,
             actor: None,
             scope,
             issuer: "https://issuer.test/t/x/e/y",

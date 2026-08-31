@@ -1231,6 +1231,12 @@ pub struct PendingBackchannelItem<'a> {
     /// not the person who started the flow, and the message is the only thing tying what
     /// they see here to what they are looking at on the other device.
     pub binding_message: Option<&'a str>,
+    /// The RFC 9396 `authorization_details` entries, one rendered line each.
+    ///
+    /// RAR exists so a person approves WHAT is being asked rather than a scope name standing
+    /// in for it. Rendering the scope and hiding these would defeat the extension: "payments"
+    /// is not "move 42 EUR to this account".
+    pub authorization_details: &'a [String],
 }
 
 /// The CIBA approval page (issue #131 criterion 1).
@@ -1268,9 +1274,24 @@ pub fn backchannel_approve_page(action: &str, pending: &[PendingBackchannelItem<
                   started it just now.</p>"
                 .to_owned(),
         };
+        // RENDERED ABOVE THE SCOPES, because when both are present the details are the
+        // specific thing and the scope is the category. A person who reads one line reads
+        // the first one.
+        let details = if item.authorization_details.is_empty() {
+            String::new()
+        } else {
+            let entries = item
+                .authorization_details
+                .iter()
+                .fold(String::new(), |mut acc, entry| {
+                    let _ = write!(acc, "<li>{}</li>", escape_html(entry));
+                    acc
+                });
+            format!("<p>This will authorize:</p><ul>{entries}</ul>")
+        };
         let _ = write!(
             acc,
-            "<section><h2>{client}</h2>{binding}\
+            "<section><h2>{client}</h2>{binding}{details}\
              <p>Requested scopes:</p><ul>{scopes}</ul>\
              <form method=\"post\" action=\"{action}\">{handle}\
              <p><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
@@ -1278,6 +1299,7 @@ pub fn backchannel_approve_page(action: &str, pending: &[PendingBackchannelItem<
              </form></section>",
             client = escape_html(item.client_name),
             binding = binding,
+            details = details,
             scopes = scopes,
             action = escape_html(action),
             handle = hidden_field("request_id", item.request_id),

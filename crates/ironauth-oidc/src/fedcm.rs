@@ -693,6 +693,9 @@ async fn mint_assertion(
     // audit hole as omitting it at the token endpoint.
     let actor = tokens::session_actor(state, scope, &session.session_id, now_micros).await;
     let request = MintRequest {
+        // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
+        // carries an approved document today.
+        authorization_details: None,
         actor: actor.as_ref().map(|imp| tokens::TokenActor {
             subject: &imp.impersonator,
             reason_code: &imp.reason_code,

@@ -251,6 +251,7 @@ async fn issue_ciba_tokens(
         &minted,
         approved.requested_scope.as_deref(),
         None,
+        approved.authorization_details.as_ref(),
     ))
 }
 
@@ -306,9 +307,9 @@ async fn mint_ciba_tokens(
     //
     // The wider door is the more reachable one. `BackchannelApprovalLinkage::auth_methods`
     // is a free-form `Option<&str>` that `decide` binds through with no validation, and the
-    // approval surface that will eventually populate it passes a string: one wrong spelling
-    // ("webauthn" for the token this crate actually uses) silently asserts a password
-    // authentication that never happened.
+    // approval surface passes a string: one wrong spelling ("webauthn" for the token this
+    // crate actually uses) would silently assert a password authentication that never
+    // happened.
     //
     // Every OTHER `parse_methods` caller reads a value written by `methods_token`, so it
     // round-trips by construction and cannot reach the fallback. CIBA is the only caller
@@ -325,11 +326,17 @@ async fn mint_ciba_tokens(
     //
     // And a THIRD residual, the widest of them: `authn`'s reserved `fedamr:` token carries an
     // upstream `amr` through verbatim. A value like `"pwd fedamr:<base64>"` passes this guard
-    // on its `pwd` token, and the decoded payload is then appended to the signed `amr` as-is,
-    // so an approval could assert arbitrary upstream method strings. Same deferral and the
-    // same reason as the two above: `auth_methods` has no production writer today, because
-    // `decide` has no non-test caller. All three want bounding where the approval surface
-    // lands, and they are enumerated here so that work does not have to rediscover them.
+    // on its `pwd` token, and the decoded payload is then appended to the signed `amr` as-is.
+    //
+    // ALL THREE ARE CLOSED BY CONSTRUCTION NOW THAT THE APPROVAL SURFACE EXISTS, which is
+    // where this comment said the bounding belonged. `backchannel_approve` passes
+    // `AuthenticatedSession::auth_methods`, the value the server itself wrote through
+    // `methods_token` when the person authenticated -- so it round-trips like every other
+    // `parse_methods` caller, nothing crossing a trust boundary reaches it, and a `fedamr:`
+    // token in it is a TRUE statement about how that person signed in rather than an
+    // assertion a caller chose. `decide` still accepts a free-form string, so these guards
+    // stay: they bound what a FUTURE writer could assert, and this file cannot see who its
+    // callers will be.
     let auth_methods = approved
         .auth_methods
         .as_deref()
@@ -370,6 +377,11 @@ async fn mint_ciba_tokens(
         signer,
         entry.policy(),
         &MintRequest {
+            // WHAT THE PERSON APPROVED (issue #131 criterion 4), copied from the stored
+            // request the approval decided. This is the whole point of RFC 9396: the access
+            // token states what the resource owner agreed to, so a resource server enforces
+            // the approval rather than a scope name standing in for it.
+            authorization_details: approved.authorization_details.as_ref(),
             actor: None,
             scope,
             issuer: &issuer,

@@ -593,6 +593,9 @@ struct Inner {
     // is offered on UserInfo ONLY, never on the authorization endpoint. A promotable
     // per-environment setting sourced from OidcConfig.
     userinfo_cors_origins: BTreeSet<String>,
+    /// The RFC 9396 `authorization_details` types this deployment recognises (issue #131
+    /// criterion 4). A SET, because membership is the only question asked of it.
+    authorization_details_types: BTreeSet<String>,
     // The per-environment legacy-flow enablement (issue #17). Each is a promotable
     // per-environment setting sourced from OidcConfig; all default to false, so the
     // safe default serves only the `code` flow with the `query` response mode. The
@@ -874,6 +877,11 @@ impl OidcState {
                 client_assertion_skew: Duration::from_secs(config.client_assertion_max_skew_secs),
                 client_key_resolver,
                 userinfo_cors_origins: config.userinfo_cors_origins.iter().cloned().collect(),
+                authorization_details_types: config
+                    .authorization_details_types
+                    .iter()
+                    .cloned()
+                    .collect(),
                 enable_response_type_id_token: config.enable_response_type_id_token,
                 enable_response_type_code_id_token: config.enable_response_type_code_id_token,
                 enable_response_type_none: config.enable_response_type_none,
@@ -2819,13 +2827,27 @@ impl OidcState {
     /// and the opposite reading would make the safe configuration the one an operator has to
     /// remember to type. A client sending no `authorization_details` at all is unaffected,
     /// which is what keeps the default-deny from breaking every existing client.
+    /// The registered types, in the shape the validator takes.
+    ///
+    /// A small allocation per validated request, which is the price of keeping the store's
+    /// validator free of any config type. The set is a handful of short strings and only a
+    /// request that ACTUALLY carries `authorization_details` reaches here.
     #[must_use]
-    pub fn registered_rar_types(&self) -> &[&'static str] {
-        // Deliberately a fixed empty slice rather than config today: the vocabulary is
-        // per-deployment domain language, and inventing a config key before anything can
-        // consume it would ship a knob with no effect. The seam is here so the knob has one
-        // place to land.
-        &[]
+    pub fn registered_rar_types(&self) -> Vec<&str> {
+        self.inner
+            .authorization_details_types
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Whether this deployment recognises any RAR type at all.
+    ///
+    /// Distinguishes "configured, and this type is not in it" from "RAR is not configured
+    /// here", which are the same refusal to a client and different problems to an operator.
+    #[must_use]
+    pub fn rar_is_configured(&self) -> bool {
+        !self.inner.authorization_details_types.is_empty()
     }
 
     /// The seconds the enforced polling interval grows by on each too-fast poll (issue

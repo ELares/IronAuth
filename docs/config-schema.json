@@ -934,6 +934,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "authorization_details_types": {
+          "default": [],
+          "description": "The RFC 9396 `authorization_details` types this deployment recognises (issue #131\ncriterion 4).\n\nEMPTY BY DEFAULT, and empty means REFUSE EVERY TYPE rather than allow any. A\ndeployment that has registered no types has defined the meaning of none of them, and\nthe opposite reading would make the safe configuration the one an operator has to\nremember to type. A client sending no `authorization_details` at all is unaffected,\nwhich is what keeps the default-deny from breaking every existing client.\n\nThe vocabulary is per-deployment domain language -- `payment_initiation`,\n`account_information`, whatever the API actually means -- so there is no useful\nbuilt-in list to ship. Each entry is matched EXACTLY against an entry's `type`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "backchannel_logout_enabled": {
           "default": false,
           "description": "Whether the OIDC Back-Channel Logout delivery consumers run (issue #34). OFF by\ndefault (the covenant posture: no mandatory background infrastructure), so the\ndefault build SENDS nothing. When enabled, the consumers drain the durable\nsession-ended outbox, fan one ended session out into one message per participating\nrelying party, build a signed Logout Token for each (carrying that RP's own `sid`),\nand POST it to the RP's registered `backchannel_logout_uri` through the\nSSRF-hardened outbound fetcher, with bounded-backoff retries and a dead-letter\nstate. Discovery advertises `backchannel_logout_supported` regardless (the OP\nsupports the mechanism); this switch governs only whether the consumers are\nscheduled: ending a session ENQUEUES a durable `session_ended` message either way,\nso with this off those messages accumulate undrained (see below).\n\nThis switch does NOT gate the PRODUCER, and an operator sizing a database should\nknow it. Ending an SSO session enqueues one durable `session_ended` message inside\nthe revoking transaction whatever this is set to, because `session_ended` is a\ndomain event rather than a logout implementation detail: it commits with the\nsession flip or not at all, and back-channel logout is one consumer of it. With\nthis switch off nothing consumes those messages, so they accumulate, and turning it\non later starts by draining the accumulated backlog and notifying relying parties\nabout sessions that ended long ago. A deployment that leaves it off and ends many\nsessions should expect `outbox_messages` to grow accordingly.",
@@ -2894,6 +2902,7 @@
           "trusted_contact_enabled": false
         },
         "authorization_code_ttl_secs": 60,
+        "authorization_details_types": [],
         "backchannel_logout_enabled": false,
         "backchannel_logout_request_timeout_secs": 10,
         "claims_enrichment": {

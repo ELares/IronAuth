@@ -920,6 +920,13 @@ name = "ciba_approval"
 path = "tests/ciba_approval.rs"
 required-features = ["testing"]
 
+# RFC 9396 rich authorization requests end to end (issue #131 criterion 4): the document
+# reaching the approval page, the access token, the token response, and introspection.
+[[test]]
+name = "ciba_rar"
+path = "tests/ciba_rar.rs"
+required-features = ["testing"]
+
 # The generic OIDC upstream federated login (issue #75, PR B): the end-to-end and
 # adversarial flow against a mock upstream driven through the fetch test-harness.
 [[test]]

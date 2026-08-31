@@ -514,6 +514,9 @@ async fn issue_device_tokens(
                 &minted,
                 grant.requested_scope.as_deref(),
                 refresh.as_deref(),
+                // The device grant carries no RFC 9396 document: `/device_authorization`
+                // accepts no `authorization_details`, so there is nothing approved to echo.
+                None,
             ))
         }
         // Already redeemed (a concurrent poll won, or a re-poll after success): the
@@ -649,6 +652,9 @@ async fn mint_device_tokens(
         signer,
         entry.policy(),
         &MintRequest {
+            // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
+            // carries an approved document today.
+            authorization_details: None,
             actor: session
                 .impersonation
                 .as_ref()
@@ -789,6 +795,7 @@ pub(crate) fn device_token_response(
     minted: &IssuedTokens,
     oauth_scope: Option<&str>,
     refresh_token: Option<&str>,
+    authorization_details: Option<&serde_json::Value>,
 ) -> Response {
     let mut body = json!({
         "access_token": minted.access.token(),
@@ -801,6 +808,13 @@ pub(crate) fn device_token_response(
     }
     if let Some(refresh) = refresh_token {
         body["refresh_token"] = json!(refresh);
+    }
+    // RFC 9396 section 7: the token response echoes the details the authorization was
+    // granted for. A client that asked for one thing and was approved for another learns it
+    // HERE, from the response, rather than by decoding an access token it may not be able to
+    // read (an opaque one carries no claims at all).
+    if let Some(details) = authorization_details {
+        body["authorization_details"] = details.clone();
     }
     crate::token::token_ok(&body.to_string())
 }
