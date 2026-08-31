@@ -6592,6 +6592,28 @@ silently included.
    binary, SHA256SUMS, and SBOM.
 4. First-time note: the release lane is validated end to end by the first
    real release; until then treat it as authored but unproven.
+5. Record a HUMAN-TIMED quickstart run per guide in `docs/dx/timed-runs.md`.
+   See below: this is DX evidence, and deliberately not a gate.
+
+## Human-timed quickstart runs
+
+CI runs every quickstart's documented commands on every push and enforces a
+15-minute budget. That proves the guides WORK and says nothing about what they
+feel like: a machine does not mistype a command, re-read a paragraph, or stop to
+work out which of two things it was meant to install.
+
+So each release also records a person walking one through, start to finish, and
+the number that matters is wall clock from opening the guide to a successful
+login.
+
+**This is not the acceptance gate and must never become one.** The gate is the
+scripted run. A timed run is one person on one machine on one day; treating it as
+a pass/fail would make a slow laptop a release blocker and would tempt whoever
+holds the stopwatch to skip the reading, which is the only part being measured.
+
+Record it in `docs/dx/timed-runs.md` with the template there. Report what was
+confusing even when the time was good: the time is the signal that something is
+wrong, and the notes are the only thing that says what.
 
 ---
 
@@ -7571,6 +7593,50 @@ answer stops changing after the first.
 **No failure path sets a cookie.** Cookie stacking is what happens when each failed attempt
 writes a fresh one: the header grows until a proxy rejects the request, and the symptom looks
 like an outage rather than a login problem.
+
+---
+
+# Human-timed quickstart runs
+
+Source: docs/dx/timed-runs.md
+
+# Human-timed quickstart runs
+
+DX evidence for issue #116 criterion 3. **Not a gate** -- see `docs/RELEASING.md` for why.
+
+CI already proves the guides work: `scripts/quickstart.sh` runs each guide's documented commands
+verbatim on every push, under a 15-minute budget. What it cannot tell us is what a guide feels
+like, because a machine does not mistype a command, re-read a paragraph, or stop to work out
+which of two things it was meant to install.
+
+## How to record one
+
+Walk one quickstart start to finish on a machine that has never run it. Time from **opening the
+guide** to **a successful login** -- not from the first command, because deciding what to do is
+part of the experience being measured.
+
+Then add a row, and write the notes even when the time was good. **The time is the signal that
+something is wrong; the notes are the only thing that says what.**
+
+```
+### <version> -- <guide>
+
+- **Wall clock:** 6m40s (guide open -> `signed in as ...`)
+- **Machine:** clean macOS 15, no Rust toolchain, no Go
+- **Where the time went:** 4m of it was the first `cargo build`
+- **Where I hesitated:** it was not obvious the emulator keeps running in the background
+- **What I got wrong:** pasted step 3 before step 2 finished; the error was clear
+- **Would a newcomer finish?** yes
+```
+
+## Runs
+
+_No runs recorded yet. The template above is what one looks like; the first entry lands with the
+first release that ships a quickstart._
+
+This section being empty is a fact rather than an omission, and it is written down rather than
+left blank: a heading with nothing under it reads as "nobody did this", which is exactly what it
+means. It is not a gate, so it does not block; it does mean there is no human evidence yet.
 
 ---
 

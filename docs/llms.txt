@@ -23,6 +23,7 @@ both files and fails if either drifts.
 - [IronAuth Threat Model](docs/THREAT-MODEL.md): Per-surface STRIDE analysis. This document is a merge-gated artifact: no new
 - [Will Not Implement, and Why](docs/WILL-NOT-IMPLEMENT.md): Deliberate refusals, published with reasons. A documented refusal list builds
 - [Browser-based apps: which architecture, and why](docs/bff.md): The OAuth 2.0 for Browser-Based Apps BCP (draft-ietf-oauth-browser-based-apps) ranks three
+- [Human-timed quickstart runs](docs/dx/timed-runs.md): DX evidence for issue #116 criterion 3. **Not a gate** -- see `docs/RELEASING.md` for why.
 - [Edge verification](docs/edge-verification.md): Verifying an IronAuth token needs no IronAuth service, no SDK install, and no network call on
 - [The IronAuth exit guide](docs/exit-guide.md): One of IronAuth's three named covenants is **no unexportable data**: you can
 - [IdP-side FedCM (experimental, issue #83)](docs/fedcm.md): IronAuth ships the IdP side of the W3C
