@@ -268,6 +268,13 @@ pub struct DiscoveryCapabilities {
     /// `form_post`). Empty by default; the `query` mode is always advertised from
     /// the registry.
     additional_response_modes: Vec<String>,
+    /// The RFC 9396 `authorization_details` types this deployment recognises (issue #131
+    /// criterion 4). Empty by default.
+    ///
+    /// Advertised ONLY when non-empty. An empty array would say "RAR is supported, with no
+    /// types", which is a different and misleading claim from the truth: a deployment that
+    /// registered nothing refuses every document, so the member is absent instead.
+    authorization_details_types: Vec<String>,
     /// Whether the authorization response carries the RFC 9207 `iss` parameter
     /// (issue #13). `false` until #13 lands and the authorization endpoint echoes
     /// `iss`, so discovery never claims a behavior the server does not yet have.
@@ -339,6 +346,7 @@ impl DiscoveryCapabilities {
             .with_require_pushed_authorization_requests(
                 config.require_pushed_authorization_requests,
             );
+        caps.authorization_details_types = config.authorization_details_types.clone();
         if config.enable_response_type_id_token {
             caps = caps.with_additional_response_type(ResponseType::IdToken.as_str());
         }
@@ -543,6 +551,15 @@ pub fn discovery_document(
         );
     }
 
+    // RFC 9396 section 10.1. Only when the deployment has registered something: a client
+    // reading this member learns which `type` values it may send, and advertising an empty
+    // list would invite it to send one and be refused.
+    if !capabilities.authorization_details_types.is_empty() {
+        document.insert(
+            "authorization_details_types_supported".to_owned(),
+            json!(capabilities.authorization_details_types),
+        );
+    }
     document.insert("scopes_supported".to_owned(), json!(SCOPES_SUPPORTED));
     document.insert("response_types_supported".to_owned(), json!(response_types));
     document.insert("response_modes_supported".to_owned(), json!(response_modes));

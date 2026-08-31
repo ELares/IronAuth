@@ -807,3 +807,47 @@ async fn backchannel_logout_session_support_is_advertised_truthfully() {
     // truthfully too, alongside the sid support that makes it targetable.
     assert_eq!(doc["backchannel_logout_supported"], json!(true));
 }
+
+/// RFC 9396 section 10.1: the registered `authorization_details` types are advertised, and
+/// ONLY when there are some (issue #131 criterion 4).
+///
+/// A client reading this member learns which `type` values it may send. Advertising an EMPTY
+/// list would invite it to send one and be refused, which is a different and worse claim than
+/// saying nothing at all -- so a deployment that registered none omits the member.
+#[tokio::test]
+async fn discovery_advertises_the_registered_authorization_details_types() {
+    let (router, scope) = router_and_scope(DiscoveryCapabilities::from_config(&OidcConfig {
+        authorization_details_types: vec!["payment_initiation".to_owned()],
+        ..OidcConfig::default()
+    }));
+    let uri = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, _, body) = get(&router, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        doc["authorization_details_types_supported"],
+        json!(["payment_initiation"]),
+        "discovery must advertise what the backchannel endpoint will accept: {doc}"
+    );
+
+    // ABSENT, not empty, where nothing is registered.
+    let (bare, bare_scope) =
+        router_and_scope(DiscoveryCapabilities::from_config(&OidcConfig::default()));
+    let uri = format!(
+        "/t/{}/e/{}/.well-known/openid-configuration",
+        bare_scope.tenant(),
+        bare_scope.environment()
+    );
+    let (status, _, body) = get(&bare, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        doc.get("authorization_details_types_supported").is_none(),
+        "a deployment that registered nothing must not advertise an empty list: {doc}"
+    );
+}
+

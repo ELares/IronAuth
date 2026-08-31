@@ -276,3 +276,4 @@ async fn a_request_carrying_no_details_is_unaffected() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
