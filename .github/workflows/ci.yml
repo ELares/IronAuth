@@ -881,8 +881,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
+      - name: Add the WebAssembly target
+        # A `rustup target add` STEP, not the action's `targets:` input, for the reason this
+        # workflow already records above the hooks job and the musl one: `rust-toolchain.toml`
+        # pins the toolchain cargo actually uses, and the action only equips its own. With
+        # `targets:` the target lands on `stable` and the pinned toolchain builds against a
+        # `core` it does not have -- which is exactly how this job first went red
+        # (`error[E0463]: can't find crate for core`).
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: Run the shared conformance corpus
         run: cargo test -p ironauth-fastly-verify
