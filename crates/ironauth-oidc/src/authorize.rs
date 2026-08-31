@@ -2987,25 +2987,88 @@ fn build_authorize_url(
     max_age: Option<&str>,
     emit_auth_time: bool,
 ) -> String {
-    append_query(
+    // Destructured EXHAUSTIVELY, with no `..` rest pattern, so the COMPILER decides
+    // what this function may ignore. The root cause of this whole class is that the
+    // list below is written BY HAND: `resource`, `dpop_jkt`, and `organization` were
+    // each added to `AuthorizeParams` by a different feature and none reached here, so
+    // each was silently dropped across every interactive login. Tests can only pin the
+    // fields someone already thought of; this stops the BUILD until a new field is
+    // deliberately either carried or named here as one that must not be. `par.rs`
+    // builds this same struct with an exhaustive literal, which is exactly why the
+    // three fields were handled correctly there and lost here.
+    let AuthorizeParams {
+        // Carried, in the pair list or the resource loop below.
+        response_type,
+        response_mode,
+        client_id,
+        redirect_uri,
+        scope,
+        state,
+        nonce,
+        code_challenge,
+        code_challenge_method,
+        acr_values,
+        claims,
+        resources,
+        organization,
+        dpop_jkt,
+        // NOT carried from `params`, each for a stated reason.
+        //
+        // An interaction CONSUMES `prompt`, `max_age`, and `emit_auth_time`: a resumed
+        // `prompt=login` would force the login that just happened to happen again. They
+        // arrive as ARGUMENTS so the caller decides what the next hop sees, and reading
+        // them off `params` here would undo that decision.
+        prompt: _,
+        max_age: _,
+        emit_auth_time: _,
+        // The hints arrive through `hints`, which owns their normalization; taking them
+        // off `params` would bypass it.
+        login_hint: _,
+        logout_hint: _,
+        ui_locales: _,
+        claims_locales: _,
+        display: _,
+        // A PAR request never resumes through THIS builder. `build_par_resume_url`
+        // re-presents the `request_uri` and the pushed request is read back from
+        // storage, so replaying either of these on a plain `/authorize` would be wrong.
+        request_uri: _,
+        par_resume: _,
+        // A consent DENIAL is the OUTCOME of an interaction, never an input to the next
+        // one; carrying it would re-deny the very request the user is sent back to.
+        consent_denied: _,
+    } = params;
+    let mut url = append_query(
         "/authorize",
         &[
-            ("response_type", params.response_type.as_deref()),
-            ("response_mode", params.response_mode.as_deref()),
-            ("client_id", params.client_id.as_deref()),
-            ("redirect_uri", params.redirect_uri.as_deref()),
-            ("scope", params.scope.as_deref()),
-            ("state", params.state.as_deref()),
-            ("nonce", params.nonce.as_deref()),
-            ("code_challenge", params.code_challenge.as_deref()),
+            ("response_type", response_type.as_deref()),
+            ("response_mode", response_mode.as_deref()),
+            ("client_id", client_id.as_deref()),
+            ("redirect_uri", redirect_uri.as_deref()),
+            ("scope", scope.as_deref()),
+            ("state", state.as_deref()),
+            ("nonce", nonce.as_deref()),
+            ("code_challenge", code_challenge.as_deref()),
             (
                 "code_challenge_method",
-                params.code_challenge_method.as_deref(),
+                code_challenge_method.as_deref(),
             ),
             ("prompt", prompt),
             ("max_age", max_age),
-            ("acr_values", params.acr_values.as_deref()),
-            ("claims", params.claims.as_deref()),
+            ("acr_values", acr_values.as_deref()),
+            ("claims", claims.as_deref()),
+            // The RFC 9449 section 10 code-to-key binding. Dropping it does not fail
+            // the request: the code is simply persisted UNBOUND, and
+            // `enforce_code_dpop_binding` returns Ok on a None jkt, so an intercepted
+            // code becomes redeemable under any key. The protection disappears on
+            // exactly the front-channel browser flows section 10 exists to defend.
+            ("dpop_jkt", dpop_jkt.as_deref()),
+            // The requested organization. It is load-bearing ONLY for a session with
+            // no org bound yet, which is precisely what an interactive login mints, and
+            // `resolve_org_context` runs AFTER the interaction gate. Dropped, the
+            // authoritative membership fence never sees the request: a subject who is
+            // not a member of the named org but holds one other membership is bound to
+            // THAT org, first-write-wins, instead of the uniform refusal.
+            ("organization", organization.as_deref()),
             ("login_hint", hints.login_hint()),
             ("logout_hint", hints.logout_hint()),
             ("ui_locales", hints.ui_locales()),
@@ -3013,7 +3076,18 @@ fn build_authorize_url(
             ("display", hints.display_param()),
             ("emit_auth_time", emit_auth_time.then_some("1")),
         ],
-    )
+    );
+    // RFC 8707 resource indicators are REPEATABLE, so they cannot ride the
+    // single-valued pair list above and are appended one at a time. Omitting them
+    // here silently drops every `resource` across an interactive login: the resumed
+    // request approves nothing, the code freezes an EMPTY granted set, and the token
+    // exchange that names the audience fails `invalid_target`. That makes an
+    // audience-bound token unobtainable through any flow that has to log the user in,
+    // which is every first sign-in (issue #28).
+    for resource in resources {
+        url = append_query(&url, &[("resource", Some(resource.as_str()))]);
+    }
+    url
 }
 
 /// The `/authorize` resume URL to send the user back to AFTER an interaction,
@@ -3221,11 +3295,17 @@ struct Resolved<'a> {
     /// The RFC 9449 `DPoP` proof-key thumbprint the code is SENDER-CONSTRAINED to
     /// (issue #368), or [`None`] for a code that is not key-bound.
     ///
-    /// Only the browserless first-party challenge ever sets this, and only from an
-    /// `auth_session` that was itself device-bound. The BROWSER path sets [`None`]
-    /// EXPLICITLY rather than relying on a default, so binding a browser code to a
-    /// proof key later has to be a deliberate edit at that call site instead of
-    /// something that happens by accident when a field gains a default.
+    /// BOTH paths set this. The browserless first-party challenge takes it from an
+    /// `auth_session` that was itself device-bound; the browser path takes it from the
+    /// request's own shape-validated `dpop_jkt` parameter (issue #124), which is the
+    /// delivery RFC 9449 section 10 specifies for a front-channel authorization.
+    ///
+    /// This doc previously said the browser path always set [`None`], which stopped
+    /// being true when #124 landed and is corrected here because the resume URL now
+    /// depends on it: a browser code IS key-bound whenever the client asked for it, so
+    /// losing `dpop_jkt` across an interaction downgrades a bound code to an unbound
+    /// one, and `enforce_code_dpop_binding` treats an unbound code as nothing to
+    /// enforce. That silent downgrade is what the resume builder now prevents.
     dpop_jkt: Option<&'a str>,
 }
 
@@ -3606,6 +3686,89 @@ pub(crate) async fn mint_challenge_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `AuthorizeParams` with every field absent, built through the SAME
+    /// `Deserialize` the endpoint uses. A field added to the struct later starts
+    /// absent here too, so these tests keep describing the real shape.
+    fn absent_params() -> AuthorizeParams {
+        serde_json::from_value(serde_json::json!({})).expect("every field is optional")
+    }
+
+    /// The resume URL an interaction carries, with nothing else set.
+    fn resume_url(params: &AuthorizeParams) -> String {
+        build_authorize_url(params, &InteractionHints::default(), None, None, false)
+    }
+
+    #[test]
+    fn the_resume_url_carries_the_resource_indicator_through_an_interaction() {
+        // Issue #28. Dropped, the resumed request approves NOTHING: the code freezes an
+        // empty granted set and the exchange naming the audience is `invalid_target`, so
+        // an audience-bound token is unobtainable through any flow that has to log the
+        // user in. The expected bytes are written out rather than computed with
+        // `percent_encode_query`, so this pins the ENCODING and not just the presence.
+        let mut params = absent_params();
+        params.resources = vec!["https://api.example/a".to_owned()];
+        assert!(
+            resume_url(&params).contains("resource=https%3A%2F%2Fapi.example%2Fa"),
+            "the resume URL must carry the resource: {}",
+            resume_url(&params)
+        );
+    }
+
+    #[test]
+    fn the_resume_url_carries_every_resource_of_a_multi_resource_request() {
+        // RFC 8707 allows `resource` to REPEAT, so one appended pair is not enough:
+        // carrying only the first would silently narrow the approved set.
+        let mut params = absent_params();
+        params.resources = vec![
+            "https://api.example/a".to_owned(),
+            "https://api.example/b".to_owned(),
+        ];
+        let url = resume_url(&params);
+        assert!(url.contains("resource=https%3A%2F%2Fapi.example%2Fa"), "first: {url}");
+        assert!(url.contains("resource=https%3A%2F%2Fapi.example%2Fb"), "second: {url}");
+        assert_eq!(url.matches("resource=").count(), 2, "exactly two: {url}");
+    }
+
+    #[test]
+    fn the_resume_url_carries_the_dpop_key_binding_through_an_interaction() {
+        // RFC 9449 section 10. Dropping this does NOT fail the request: the code is
+        // persisted unbound and `enforce_code_dpop_binding` returns Ok on a None jkt, so
+        // an intercepted code becomes redeemable under any key. The regression is silent,
+        // which is why it needs its own pin.
+        let mut params = absent_params();
+        params.dpop_jkt = Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I".to_owned());
+        assert!(
+            resume_url(&params)
+                .contains("dpop_jkt=0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"),
+            "the resume URL must carry dpop_jkt: {}",
+            resume_url(&params)
+        );
+    }
+
+    #[test]
+    fn the_resume_url_carries_the_requested_organization_through_an_interaction() {
+        // Issue #94. The parameter is load-bearing ONLY for a session with no org bound,
+        // which is exactly what an interactive login mints, and `resolve_org_context` runs
+        // after the interaction gate. Dropped, the membership fence never sees the request.
+        let mut params = absent_params();
+        params.organization = Some("org_abc".to_owned());
+        assert!(
+            resume_url(&params).contains("organization=org_abc"),
+            "the resume URL must carry organization: {}",
+            resume_url(&params)
+        );
+    }
+
+    #[test]
+    fn an_absent_parameter_is_omitted_from_the_resume_url_rather_than_emitted_empty() {
+        // The control for the three tests above: they must fail because the value is
+        // MISSING, not because every request emits the key regardless.
+        let url = resume_url(&absent_params());
+        assert!(!url.contains("resource="), "no resource key: {url}");
+        assert!(!url.contains("dpop_jkt="), "no dpop_jkt key: {url}");
+        assert!(!url.contains("organization="), "no organization key: {url}");
+    }
 
     /// The recorded session's `auth_time` (epoch micros) used by the `max_age`
     /// tests, chosen so a session is clearly in the past relative to a `now` after it.
