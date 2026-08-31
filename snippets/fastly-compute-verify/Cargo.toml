@@ -16,7 +16,7 @@ repository.workspace = true
 # build for `wasm32`. Fastly Compute runs WASM, so the edge snippet cannot reuse the server's
 # core no matter how much one would prefer it to -- which is exactly why this file exists and
 # why it is judged against the same conformance corpus rather than trusted for looking similar.
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
 # `ecdsa` ON TOP OF THE WORKSPACE FEATURES. The workspace pins p256 for key HANDLING (pkcs8,
 # arithmetic) because the server signs through `ring`; this snippet has no `ring`, so it needs
 # p256's own ECDSA verifier. Additive, so the workspace build is unaffected.
