@@ -7501,6 +7501,46 @@ non-simple and forces a CORS preflight the attacker's origin will not pass. `Sam
 first line; this is the second, because Lax still admits top-level GET navigations and browsers
 have differed on what counts.
 
+## Step-up authentication (RFC 9470)
+
+A route can require more than "signed in": a stronger factor, or a recent one.
+
+```ts
+import { satisfies, challengeHeader, stepUpLoginPath } from '@ironauth/bff';
+
+const requirement = { acrValues: ['urn:ietf:params:acr:phishing-resistant'], maxAgeSeconds: 300 };
+const verdict = satisfies(session, requirement, nowUnixSeconds);
+```
+
+`satisfies` returns the **gap**, not a boolean: `acr` (wrong factor), `stale` (right factor, too
+long ago), or `unknown` (the session recorded nothing). A caller that cannot tell them apart asks
+a user to re-authenticate when their factor was wrong, or asks for a stronger factor when theirs
+was merely old.
+
+**A session that recorded no `acr` does not satisfy an `acr` requirement.** Absence is not
+acceptance: a route demanding a phishing-resistant factor must not pass a session whose factor
+nobody recorded.
+
+Two shapes, because two callers:
+
+| caller | response |
+|---|---|
+| XHR | `401` with `WWW-Authenticate: ` + `challengeHeader(requirement)` |
+| page navigation | redirect to `stepUpLoginPath('/auth/login', requirement, returnTo)` |
+
+Returning a `401` to a top-level navigation shows the user a blank error; redirecting an XHR
+gives the fetch an HTML login page it will try to parse as JSON.
+
+The challenge carries **both** `acr_values` and `max_age`. One that named the error without them
+tells a client it is not authenticated *enough* and not what enough is.
+
+### `acr` and `auth_time` are server-side
+
+They live on the session record, never in the claims the frontend sees -- `acr` is something a
+resource server decides on, so it belongs in the set the allow-list keeps out. In a BFF there is
+no token for a caller to present, so a requirement is measured against what the session recorded
+at its last callback. A step-up completes when a new callback overwrites it.
+
 ## Failure handling
 
 Every handler returns a typed result rather than throwing or returning a bare status:
@@ -7518,6 +7558,19 @@ A **failed refresh destroys the session** rather than leaving it to fail on ever
 a session whose refresh token is dead cannot recover, and keeping it is keeping a cookie that
 says "signed in" while nothing works. The proxy never forwards a request without a token, because
 that turns an authentication problem into whatever the API says about an anonymous call.
+
+### Why that also ends the redirect loop
+
+The loop is concrete: a failed refresh returns `unauthenticated`, the caller redirects to login,
+the browser arrives with the **same dead session**, and round it goes.
+
+Destroying the session breaks it. The second attempt is `no_session` -- a *different* state, which
+a caller handles once. A regression test drives the same request twelve times and asserts the
+answer stops changing after the first.
+
+**No failure path sets a cookie.** Cookie stacking is what happens when each failed attempt
+writes a fresh one: the header grows until a proxy rejects the request, and the symptom looks
+like an outage rather than a login problem.
 
 ---
 

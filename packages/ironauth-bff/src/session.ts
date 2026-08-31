@@ -24,6 +24,20 @@ export interface SessionRecord {
   expiresAt: number;
   /** The identity claims the frontend is allowed to see. */
   claims: Record<string, unknown>;
+  /**
+   * The authentication context the ID token recorded, for step-up decisions (issue #116).
+   *
+   * SERVER-SIDE ONLY, and deliberately not in `claims`: `acr` is something a resource server
+   * makes decisions on, so it belongs in the set the frontend never sees. It is held here
+   * because in a BFF there is no token for a caller to present, so a step-up requirement has
+   * nothing else to be measured against.
+   *
+   * `undefined` means the ID token carried none, which `satisfies` treats as NOT satisfying an
+   * acr requirement rather than as acceptable.
+   */
+  acr?: string;
+  /** When the user authenticated, epoch seconds, for `max_age`. Server-side only, as above. */
+  authTime?: number;
 }
 
 /** What the server holds between the login redirect and the callback. */

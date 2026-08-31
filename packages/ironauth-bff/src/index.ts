@@ -53,3 +53,10 @@ export {
   sessionCookie,
   sessionFromCookieHeader,
 } from './cookie.js';
+export {
+  type StepUpGap,
+  type StepUpRequirement,
+  challengeHeader,
+  satisfies,
+  stepUpLoginPath,
+} from './step-up.js';
