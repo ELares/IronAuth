@@ -48927,6 +48927,17 @@ impl OrgMembershipRepo<'_> {
         Ok(OrganizationId::parse_in_scope(&organization, &self.scope).ok())
     }
 
+    /// One SERVICE-ACCOUNT organization membership by its membership id.
+    ///
+    /// The service-account twin of the user-membership read, and separate from it because the
+    /// two resolve different principal kinds: the addressing read that resolves a membership
+    /// for deletion tries both, and a single read that assumed a user would 404 on every
+    /// service-account membership.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope or names no service-account
+    /// membership; [`StoreError::Database`] on a persistence failure.
     pub async fn get_service_account(
         &self,
         id: &OrgMembershipId,
@@ -49780,6 +49791,15 @@ impl OrgGroupRepo<'_> {
         .await
     }
 
+    /// The effective PERMISSION set a service account holds in an organization.
+    ///
+    /// The permission twin of [`Self::effective_roles_for_service_account`]: same resolution
+    /// through the group tree, same depth bound, and the permissions the resolved roles grant
+    /// rather than the role slugs themselves.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn effective_permissions_for_service_account(
         &self,
         organization_id: &OrganizationId,

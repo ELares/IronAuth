@@ -49,8 +49,8 @@ use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 use crate::views::{
-    CreateMembershipRequest, CreateServiceAccountMembershipRequest, MembershipList,
-    MembershipView, ServiceAccountMembershipView,
+    CreateMembershipRequest, CreateServiceAccountMembershipRequest, MembershipList, MembershipView,
+    ServiceAccountMembershipView,
 };
 
 /// Add a user to an organization.

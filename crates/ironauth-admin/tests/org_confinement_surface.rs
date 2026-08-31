@@ -68,7 +68,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// this number bumped in the same change. It agrees with the count
 /// `deleted_environment.rs` resolves against the committed contract, which is the
 /// independent check that this scan is reading the same surface the document publishes.
-const ORG_ADDRESSED_OPERATIONS: usize = 36;
+const ORG_ADDRESSED_OPERATIONS: usize = 37;
 
 /// The path segment that makes an operation organization-addressed.
 fn org_addressed(attr: &str) -> bool {

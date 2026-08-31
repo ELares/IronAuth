@@ -265,4 +265,3 @@ async fn relaxing_a_public_client_shows_up_in_the_environment_warnings() {
         "the warning survived re-tightening the client: {response}"
     );
 }
-

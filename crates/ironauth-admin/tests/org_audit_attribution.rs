@@ -43,9 +43,13 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrgRole",
     "createOrganizationApiKey",
     "createProjectGrant",
+    "createServiceAccountMembership",
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
+    "deleteOrganization",
+    "disableOrganization",
+    "enableOrganization",
     "removeOrgGroupMember",
     "revokeOrganizationApiKey",
     "rotateOrganizationApiKey",
@@ -56,9 +60,6 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "unassignOrgRolePermission",
     "updateOrgGroup",
     "updateOrgRole",
-    "deleteOrganization",
-    "disableOrganization",
-    "enableOrganization",
     "withdrawProjectGrant",
 ];
 
@@ -89,6 +90,10 @@ const UNATTRIBUTED_CEILING: usize = 0;
 /// granularity `ADMIN_SOURCES` uses elsewhere in this crate, and it is honest about what
 /// it catches, which is a list padded with a module that never adopted the seam at all.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    (
+        "createServiceAccountMembership",
+        include_str!("../src/memberships.rs"),
+    ),
     (
         "createOrganizationApiKey",
         include_str!("../src/api_keys.rs"),
