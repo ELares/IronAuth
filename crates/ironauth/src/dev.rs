@@ -475,9 +475,18 @@ pub fn seed_statements(scope: &SeededScope) -> Vec<String> {
             // credential in the exchange.
             ironauth_oidc::GrantType::JwtBearer.as_str()
         ),
-        // The WORKLOAD client, which owns the machine identity below. Confidential-shaped
-        // (`client_secret_basic`) because that is what a workload client is, though nothing
-        // here authenticates as it: the identity is the point, not the client.
+        // The WORKLOAD client, which exists to OWN the machine identity below.
+        //
+        // NO SECRET IS SEEDED, so this client cannot authenticate, and that is deliberate
+        // rather than an omission. Nothing in the workload-federation flow authenticates as
+        // it: the mapping names the IDENTITY, and the assertion is presented by the public
+        // client. Seeding a usable secret would mean printing a second credential into the
+        // banner to make a client nothing uses slightly more complete.
+        //
+        // Separate from the public client for a reason `workload_federation.rs` measured: an
+        // identity owned by the PRESENTING client makes "the token was issued as the mapped
+        // identity" satisfiable by a grant that ignored the mapping and resolved the
+        // presenter's own service account. Different owner, different id, no such shortcut.
         format!(
             "INSERT INTO clients /* query-audit-allow: dev-only seeding as the cluster \
              owner, before any server exists to route it through a scoped repository */ \
