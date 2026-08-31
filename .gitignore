@@ -10,3 +10,7 @@ __pycache__/
 # changed by comparing the tree before and after, so a tracked log would make every run
 # report its own log.
 gate.log
+
+# Build output of the dependency-free Java verifier (issue #118); scripts/java-verify.sh
+# creates and removes it, so it is never a source of truth.
+sdks/java/out/
