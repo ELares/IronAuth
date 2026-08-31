@@ -44,6 +44,7 @@ crates/ironauth-store/src/repository.rs:ban_with_event:1
 crates/ironauth-store/src/repository.rs:bulk_revoke_with_events:1
 crates/ironauth-store/src/repository.rs:clear_default_with_event:1
 crates/ironauth-store/src/repository.rs:create:1
+crates/ironauth-store/src/repository.rs:create_for_service_account_with_event:1
 crates/ironauth-store/src/repository.rs:create_version_at_with_event:1
 crates/ironauth-store/src/repository.rs:create_version_with_event:1
 crates/ironauth-store/src/repository.rs:create_with_event:16

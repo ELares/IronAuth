@@ -323,6 +323,13 @@ func (c *Client) CreateServiceAccountApiKey(tenant_id string, environment_id str
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/service-accounts/" + escape(service_account_id) + "/api-keys", query, body)
 }
 
+// CreateServiceAccountMembership performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships.
+//
+// Add a MACHINE IDENTITY to an organization (issue #126).
+func (c *Client) CreateServiceAccountMembership(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/service-account-memberships", query, body)
+}
+
 // CreateSubjectMapping performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings.
 //
 // Author a subject mapping from an external subject to an IronAuth principal.

@@ -131,6 +131,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("listOrgRolePermissions", ManagementPermission::Read),
     ("createMembership", ManagementPermission::WriteOrganizations),
+    ("createServiceAccountMembership", ManagementPermission::WriteOrganizations),
     ("deleteMembership", ManagementPermission::WriteOrganizations),
     ("listMemberships", ManagementPermission::Read),
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped
@@ -690,6 +691,11 @@ fn the_unclassified_debt_is_counted_so_it_cannot_grow_unnoticed() {
 /// the false coverage claim this list exists to prevent. Hand-maintained, and only for
 /// operations somebody actually checked.
 const PERMISSION_PROVEN: &[&str] = &[
+    // Binding a MACHINE IDENTITY into an organization (issue #126), proven by
+    // `write_organizations_is_required_to_add_a_machine_identity_to_an_org`: both directions,
+    // because adding an identity to an organization grants it whatever roles that
+    // organization attaches.
+    "createServiceAccountMembership",
     // The per-client DPoP exemption (issue #124), proven by
     // `write_config_is_required_to_exempt_a_client_from_the_dpop_posture`: both directions,
     // because this route TURNS OFF sender-constrained tokens and a blanket refusal would look
@@ -917,12 +923,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        211,
+        212,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        67,
+        68,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

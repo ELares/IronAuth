@@ -1104,6 +1104,58 @@ struct CodeExchangeSession {
 /// # Errors
 ///
 /// [`TokenError::ServerError`] on a store fault or an unparsable recorded identifier.
+/// The organization context and effective roles a MACHINE IDENTITY carries (issue #126).
+///
+/// One definition for every door that mints under a service-account principal --
+/// `client_credentials`, `jwt:bearer`, and token exchange -- because that is the shape of the
+/// defect this codebase keeps finding: a claim resolved at one door and not another makes the
+/// unresolved door the one to use. The `claims_mapping_at_issuance` comment says the same
+/// thing about mappings, having been written after three grants were found minting tokens
+/// that ran none.
+///
+/// `(None, None)` for a subject that is not a service account, which is the ordinary case at
+/// token exchange: a user's organization is frozen onto their grant at authorization and is
+/// resolved by [`resolve_effective_roles`] instead. Reading a user's membership here would be
+/// a SECOND definition of a user's org context, which is the thing this exists to avoid.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] on a store fault. Never degraded to "no roles": on a mint path
+/// that is a silent authorization downgrade indistinguishable from an identity that
+/// legitimately holds none.
+pub(crate) async fn resolve_workload_org_and_roles(
+    state: &OidcState,
+    scope: Scope,
+    subject: &str,
+) -> Result<(Option<String>, Option<BTreeSet<String>>), TokenError> {
+    let Ok(service_account) = ironauth_store::ServiceAccountId::parse_in_scope(subject, &scope)
+    else {
+        return Ok((None, None));
+    };
+    let organization = state
+        .store()
+        .scoped(scope)
+        .org_memberships()
+        .sole_organization_for_service_account(&service_account)
+        .await
+        .map_err(|_| TokenError::ServerError)?;
+    let Some(organization) = organization else {
+        return Ok((None, None));
+    };
+    let roles = state
+        .store()
+        .scoped(scope)
+        .org_groups()
+        .effective_roles_for_service_account(
+            &organization,
+            &service_account,
+            state.max_group_depth(),
+        )
+        .await
+        .map_err(|_| TokenError::ServerError)?;
+    Ok((Some(organization.to_string()), Some(roles)))
+}
+
 async fn resolve_effective_roles(
     state: &OidcState,
     scope: Scope,

@@ -957,6 +957,21 @@ pub struct ClientCredentialsMintRequest<'a> {
     pub client_id: &'a str,
     /// The granted OAuth `scope` value, echoed into the token when present.
     pub oauth_scope: Option<&'a str>,
+    /// The organization this machine identity belongs to (issue #126), or [`None`] when that
+    /// is not a single unambiguous answer.
+    ///
+    /// A machine identity has no session to have chosen an organization in, the way a user's
+    /// is frozen onto the grant at authorization, so this comes from its membership and is
+    /// absent when it holds more than one. Emitted as `org_id`, the same claim a user's token
+    /// carries, so a resource server reads one shape for both principal kinds.
+    pub org_id: Option<&'a str>,
+    /// The effective organization roles this identity holds (issue #126), or [`None`] when
+    /// there is no unambiguous organization to resolve them in.
+    ///
+    /// Resolved FRESH at issuance from an authoritative read, exactly as a user's are, and
+    /// issuer-set only: `roles` is in [`PROTECTED_ACCESS_TOKEN_CLAIMS`] so a custom claim
+    /// cannot self-assert one.
+    pub roles: Option<&'a BTreeSet<String>>,
     /// The custom claims to embed: the per-client static ones, AFTER this client's
     /// declarative mapping and its deployed hook have shaped them (issue #113 criterion 1).
     ///
@@ -1052,6 +1067,18 @@ pub(crate) fn build_client_credentials_access_token_claims(
     });
     if let Some(scope) = request.oauth_scope {
         claims["scope"] = json!(scope);
+    }
+    // The organization context and roles (issue #126), BEFORE the custom-claims merge so the
+    // `or_insert_with` below finds them already in place. Both are also in
+    // `PROTECTED_ACCESS_TOKEN_CLAIMS`, so the fence is the second line of defence rather than
+    // the only one -- the same arrangement the user-token path uses.
+    if let serde_json::Value::Object(object) = &mut claims {
+        if let Some(org_id) = request.org_id {
+            object.insert("org_id".to_owned(), json!(org_id));
+        }
+        if let Some(roles) = request.roles {
+            object.insert("roles".to_owned(), json!(roles));
+        }
     }
     // Merge the per-client static custom claims. A custom claim can NEVER override a
     // protected registered claim: an explicitly protected name is skipped, and the
@@ -2761,6 +2788,8 @@ mod tests {
         // where a stored `{"permissions": [...]}` would actually be reachable. It is
         // dropped by the same explicit reserved-name filter.
         let cc_request = ClientCredentialsMintRequest {
+            org_id: None,
+            roles: None,
             scope: req.scope,
             issuer: "https://issuer.test/t/x/e/y",
             subject: "sva_machine",
@@ -2830,6 +2859,8 @@ mod tests {
         // and not a policy this builder applies. A plain, fully populated machine
         // request emits neither claim.
         let request = ClientCredentialsMintRequest {
+            org_id: None,
+            roles: None,
             scope: {
                 let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
                 Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env))
@@ -3018,6 +3049,8 @@ mod tests {
         let (env, _) = Env::deterministic(SystemTime::UNIX_EPOCH, 1);
         let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
         ClientCredentialsMintRequest {
+            org_id: None,
+            roles: None,
             scope,
             issuer: "https://issuer.test/t/x/e/y",
             subject,

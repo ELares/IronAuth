@@ -48,7 +48,10 @@ use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
-use crate::views::{CreateMembershipRequest, MembershipList, MembershipView};
+use crate::views::{
+    CreateMembershipRequest, CreateServiceAccountMembershipRequest, MembershipList,
+    MembershipView, ServiceAccountMembershipView,
+};
 
 /// Add a user to an organization.
 #[utoipa::path(
@@ -205,6 +208,215 @@ pub async fn create_membership(
     }
 }
 
+/// Add a MACHINE IDENTITY to an organization (issue #126).
+///
+/// Its own route rather than a variant of `createMembership`, because both the request and the
+/// response would otherwise have to make `user_id` optional -- and relaxing a required
+/// property is breaking for every consumer already decoding it.
+///
+/// This is the granting path for a capability the store has modelled since issue #99:
+/// `MembershipPrincipal::ServiceAccount`, `create_for_service_account` and
+/// `effective_permissions_for_service_account` all existed, AuthZEN read them, and the only
+/// callers of the creator anywhere were two test files. So a machine identity could hold roles
+/// in principle and could be given none in practice.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships",
+    operation_id = "createServiceAccountMembership",
+    tag = "organizations",
+    request_body = CreateServiceAccountMembershipRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST \
+         with the same key returns the original response without re-executing.")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 201, description = "Created", body = ServiceAccountMembershipView),
+        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Organization or machine identity not found. The environment must be live too: an absent or soft-deleted one answers this same not-found", body = ErrorBody),
+        (status = 409, description = "The machine identity is already a member", body = ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
+    )
+)]
+pub async fn create_service_account_membership(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
+    // Granting an identity a place in an organization is granting it whatever roles that
+    // organization attaches, so it is the class of change sudo mode exists for.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    let key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+
+    // Replay BEFORE the parent-existence precondition, so a genuine replay returns the
+    // original response even if the organization was disabled meanwhile.
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+
+    let request: CreateServiceAccountMembershipRequest = parse_json(&body)?;
+    // The identity must exist in THIS scope; a malformed or cross-scope id is the uniform
+    // not-found, never a cross-scope existence probe. Checked up front so an absent identity
+    // is a clean 404 rather than a foreign-key 500.
+    let service_account_id =
+        ironauth_store::ServiceAccountId::parse_in_scope(&request.service_account_id, &scope)
+            .map_err(|_| ApiError::NotFound)?;
+    if !state
+        .store()
+        .scoped(scope)
+        .service_accounts()
+        .exists(&service_account_id)
+        .await?
+    {
+        return Err(ApiError::NotFound);
+    }
+
+    let created_at_micros = state.now_unix_micros();
+    let membership_id = ironauth_store::OrgMembershipId::generate(state.env(), &scope);
+    // The response describes the ROW THE STORE RESOLVES, never the request: a re-add revives
+    // the removed row, which keeps its original id, creation time and metadata. Same renderer
+    // for the 201 and for the stored idempotency record, so a replay serves the same bytes.
+    let render = |record: &ironauth_store::ServiceAccountMembershipRecord| {
+        serde_json::to_string(&ServiceAccountMembershipView::from_record(record.clone()))
+    };
+    let write = ResolvedIdempotencyWrite {
+        credential_ref: &credential_ref,
+        key: &key,
+        request_fingerprint: &fingerprint,
+        response_status: 201,
+        response_body: &render,
+    };
+    let pending = service_account_membership_event(
+        &state,
+        scope,
+        &membership_id,
+        &org_id,
+        &service_account_id,
+    );
+
+    let result = state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        // Attribute the audit row to this organization (issue #110).
+        .in_organization(org_id)
+        .org_memberships(scope)
+        .create_for_service_account_with_event(
+            state.env(),
+            ironauth_store::NewServiceAccountMembership {
+                id: &membership_id,
+                organization_id: &org_id,
+                service_account_id: &service_account_id,
+                metadata: request.metadata.as_ref(),
+            },
+            created_at_micros,
+            Some(write),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await;
+
+    match result {
+        Ok(resolved) => {
+            let body_string = render(&resolved).map_err(|_| ApiError::Internal)?;
+            Ok(json(StatusCode::CREATED, body_string))
+        }
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(
+            "the machine identity is already a member of this organization".to_owned(),
+        )),
+        Err(StoreError::IdempotencyConflict) => {
+            idempotency::replay_after_conflict(&state, &credential_ref, &key, &fingerprint).await
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The event a machine identity LEAVING an organization emits (issue #126).
+fn service_account_membership_removed_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    membership_id: &ironauth_store::OrgMembershipId,
+    organization_id: &ironauth_store::OrganizationId,
+    service_account_id: &ironauth_store::ServiceAccountId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = membership_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.service_account_removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": organization_id.to_string(),
+            "service_account_id": service_account_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// The event a machine identity joining an organization emits (issue #126).
+fn service_account_membership_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    membership_id: &ironauth_store::OrgMembershipId,
+    organization_id: &ironauth_store::OrganizationId,
+    service_account_id: &ironauth_store::ServiceAccountId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = membership_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.service_account_added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": organization_id.to_string(),
+            "service_account_id": service_account_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
 /// List the members of an organization (cursor paginated).
 #[utoipa::path(
     get,
@@ -313,25 +525,58 @@ pub async fn delete_membership(
     // membership of a DIFFERENT organization (even in the same scope) presented under
     // this org's path is the uniform not-found, so a wrong-org path can never remove
     // another organization's membership.
-    let record = memberships.get(&id).await?;
-    if record.organization_id != org_id {
-        return Err(ApiError::NotFound);
-    }
-    let delta = membership_delta_event(
-        &state,
-        scope,
-        &org_id,
-        Vec::new(),
-        vec![record.user_id.to_string()],
-    );
-    let pending = membership_event(
-        &state,
-        scope,
-        &id,
-        &org_id,
-        &record.user_id,
-        "organization.member_removed",
-    );
+    // EITHER PRINCIPAL KIND. `get` reads user memberships only, and `get_service_account`
+    // reads the other, so resolving with just the first made a machine identity's membership
+    // a ONE-WAY DOOR: creatable through `createServiceAccountMembership` and removable by
+    // nothing. Measured, before this branch: the DELETE answered the uniform not-found.
+    //
+    // The store's `remove` never needed changing -- it matches on the membership id alone and
+    // its own comment records that decoding `user_id` as a String once broke exactly this. It
+    // was the ADDRESSING read in front of it that only knew about people.
+    let (delta, pending) = match memberships.get(&id).await {
+        Ok(record) => {
+            if record.organization_id != org_id {
+                return Err(ApiError::NotFound);
+            }
+            (
+                membership_delta_event(
+                    &state,
+                    scope,
+                    &org_id,
+                    Vec::new(),
+                    vec![record.user_id.to_string()],
+                ),
+                membership_event(
+                    &state,
+                    scope,
+                    &id,
+                    &org_id,
+                    &record.user_id,
+                    "organization.member_removed",
+                ),
+            )
+        }
+        Err(StoreError::NotFound) => {
+            let record = memberships.get_service_account(&id).await?;
+            if record.organization_id != org_id {
+                return Err(ApiError::NotFound);
+            }
+            // NO DELTA EVENT. `organization.membership_delta` carries user ids, and a
+            // machine identity is not one; inventing a shape for it here would put a value
+            // in that field no consumer's schema expects.
+            (
+                None,
+                service_account_membership_removed_event(
+                    &state,
+                    scope,
+                    &id,
+                    &org_id,
+                    &record.service_account_id,
+                ),
+            )
+        }
+        Err(other) => return Err(other.into()),
+    };
     state
         .store()
         .management()

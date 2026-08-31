@@ -195,6 +195,10 @@ class Client:
         """createServiceAccountApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys", query, body)
 
+    def create_service_account_membership(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Add a MACHINE IDENTITY to an organization (issue #126). POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/service-account-memberships", query, body)
+
     def create_subject_mapping(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Author a subject mapping from an external subject to an IronAuth principal. POST /v1/tenants/{tenant_id}/environments/{environment_id}/subject-mappings."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/subject-mappings", query, body)

@@ -597,6 +597,44 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A MACHINE IDENTITY joining an organization (issue #126).
+        //
+        // A separate type rather than a `user_id`-or-`service_account_id` variant of
+        // `organization.member_added`: that schema makes `user_id` REQUIRED, and relaxing a
+        // required property is breaking for every consumer already decoding it. A consumer
+        // that wants both subscribes to both; one that only ever expected people keeps
+        // working and does not silently start receiving members it cannot render.
+        "organization.service_account_added",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "membership_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "service_account_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["membership_id", "organization_id", "service_account_id"]
+        }"#,
+    ),
+    (
+        // The mirror, and the one an integrator DEPROVISIONS on. Both ends, for the reason
+        // the user pair records: a receiver that learns only about joins accumulates
+        // authority it can never take away.
+        "organization.service_account_removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "membership_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "service_account_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["membership_id", "organization_id", "service_account_id"]
+        }"#,
+    ),
+    (
         "organization.member_added",
         1,
         r#"{

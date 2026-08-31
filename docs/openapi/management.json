@@ -16939,6 +16939,141 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Add a MACHINE IDENTITY to an organization (issue #126).",
+        "description": "Its own route rather than a variant of `createMembership`, because both the request and the\nresponse would otherwise have to make `user_id` optional -- and relaxing a required\nproperty is breaking for every consumer already decoding it.\n\nThis is the granting path for a capability the store has modelled since issue #99:\n`MembershipPrincipal::ServiceAccount`, `create_for_service_account` and\n`effective_permissions_for_service_account` all existed, AuthZEN read them, and the only\ncallers of the creator anywhere were two test files. So a machine identity could hold roles\nin principle and could be given none in practice.",
+        "operationId": "createServiceAccountMembership",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST with the same key returns the original response without re-executing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateServiceAccountMembershipRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountMembershipView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization or machine identity not found. The environment must be live too: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The machine identity is already a member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe": {
       "post": {
         "tags": [
@@ -28523,6 +28658,27 @@
           }
         }
       },
+      "CreateServiceAccountMembershipRequest": {
+        "type": "object",
+        "description": "The body to bind a machine identity into an organization (issue #126).",
+        "required": [
+          "service_account_id"
+        ],
+        "properties": {
+          "metadata": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Optional free-form membership metadata; the empty object when omitted."
+          },
+          "service_account_id": {
+            "type": "string",
+            "description": "The machine identity to add (an `sva_` id in this environment).",
+            "example": "sva_..."
+          }
+        }
+      },
       "CreateSubjectMappingRequest": {
         "type": "object",
         "description": "The body to author a subject mapping.",
@@ -32777,6 +32933,45 @@
             "type": "integer",
             "format": "int32",
             "description": "The revision counter, incremented on every write. It is how an operator confirms a\nrotation actually landed without ever reading the value back."
+          }
+        }
+      },
+      "ServiceAccountMembershipView": {
+        "type": "object",
+        "description": "One organization membership held by a MACHINE IDENTITY (issue #126).\n\nA separate view from [`MembershipView`] rather than one with an optional `user_id`.\nRelaxing a required response property is breaking for every consumer already decoding it,\nand a membership list that sometimes omits the member is worse to consume than two shapes\nthat each always say what they are.",
+        "required": [
+          "id",
+          "organization_id",
+          "service_account_id",
+          "state",
+          "metadata",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Creation time, milliseconds since the Unix epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The membership identifier (`omb_...`, embeds its scope)."
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Free-form membership metadata (the empty object when none was set)."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization the identity is a member of (`org_...`)."
+          },
+          "service_account_id": {
+            "type": "string",
+            "description": "The member machine identity (`sva_...`)."
+          },
+          "state": {
+            "type": "string",
+            "description": "The membership lifecycle state (`active`)."
           }
         }
       },

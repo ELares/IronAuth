@@ -503,6 +503,13 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
             post(memberships::create_membership).get(memberships::list_memberships),
         )
+        // The MACHINE IDENTITY membership (issue #126). Its own path rather than a variant of
+        // the one above, because making `user_id` optional in either the request or the
+        // response is breaking for every consumer already decoding it.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships",
+            post(memberships::create_service_account_membership),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships/{membership_id}",
             delete(memberships::delete_membership),

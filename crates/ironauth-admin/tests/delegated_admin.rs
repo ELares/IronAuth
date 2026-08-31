@@ -4461,3 +4461,59 @@ async fn write_config_is_required_to_exempt_a_client_from_the_dpop_posture() {
     );
 }
 
+/// `management.write_organizations` is required to bind a MACHINE IDENTITY into an
+/// organization (issue #126).
+///
+/// Adding an identity to an organization grants it whatever roles that organization attaches,
+/// so this is an authorization grant wearing the clothes of a directory edit. A credential
+/// scoped to user administration must not reach it.
+///
+/// BOTH DIRECTIONS. The second asserts only that the request gets PAST the permission gate:
+/// the organization id is deliberately malformed, so the handler then answers the uniform
+/// not-found, and 403 versus 404 is exactly what separates the gate from the handler.
+#[tokio::test]
+async fn write_organizations_is_required_to_add_a_machine_identity_to_an_org() {
+    let h = Harness::start(245).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-sva-member").await;
+    let path = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/org_absentorg/service-account-memberships"
+    );
+    let body = serde_json::json!({ "service_account_id": "sva_absent" }).to_string();
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-sva-forbidden", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_users credential added a machine identity to an organization: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, response) = h.post_as(&path, &secret, "k-sva-allowed", &body).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover the machine-identity membership, so the \
+         classification is wrong: {response}"
+    );
+}
+

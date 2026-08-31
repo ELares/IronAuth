@@ -154,6 +154,17 @@ async fn manage_patch(
     send(router, request).await
 }
 
+/// `DELETE` on the management plane as the bootstrap operator.
+async fn manage_delete(router: &Router, path: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+        .body(Body::empty())
+        .expect("request builds");
+    send(router, request).await
+}
+
 /// `GET` from the management plane as the bootstrap operator.
 async fn manage_get(router: &Router, path: &str) -> (StatusCode, String) {
     let request = Request::builder()
@@ -1960,3 +1971,122 @@ async fn an_inline_key_set_carrying_private_material_is_refused() {
          above matter rather than being belt and braces: {body}"
     );
 }
+
+/// A MACHINE IDENTITY carries its organization roles into a federated token (issue #126).
+///
+/// The criterion says the workload is "mapped to a machine identity WITH ROLES", and until
+/// this landed a federated token carried none: `effective_permissions_for_service_account`
+/// existed with no token-grant caller, there was no `effective_roles` sibling for a service
+/// account, and nothing resolved which organization a machine identity belonged to. The
+/// membership itself could not even be created -- `create_for_service_account`'s only callers
+/// anywhere were two test files.
+///
+/// Every step here goes through the MANAGEMENT API, because a criterion satisfied only by
+/// seeding rows is one an operator cannot reproduce.
+#[tokio::test]
+async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
+    let h = Harness::start().await;
+    let router = management_plane(&h).await;
+    let identity = machine_identity(&h).await;
+    register_federation(&router, &h, &identity).await;
+
+    // An organization, a role in it, the identity bound in, and the role attached.
+    let (status, body) = manage_post(
+        &router,
+        &format!("{}/organizations", base(&h)),
+        "sva-org",
+        &serde_json::json!({ "display_name": "Deployers" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create the organization: {body}");
+    let org = json(&body)["id"].as_str().expect("an org id").to_owned();
+
+    let (status, body) = manage_post(
+        &router,
+        &format!("{}/organizations/{org}/roles", base(&h)),
+        "sva-role",
+        &serde_json::json!({ "slug": "deployer", "display_name": "Deployer" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create the role: {body}");
+    let role = json(&body)["id"].as_str().expect("a role id").to_owned();
+
+    // THE ROUTE THAT DID NOT EXIST. Without it a machine identity could hold roles in
+    // principle and be given none in practice.
+    let (status, body) = manage_post(
+        &router,
+        &format!("{}/organizations/{org}/service-account-memberships", base(&h)),
+        "sva-membership",
+        &serde_json::json!({ "service_account_id": identity }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "bind the identity: {body}");
+    let membership = json(&body)["id"].as_str().expect("a membership id").to_owned();
+    assert_eq!(
+        json(&body)["service_account_id"].as_str(),
+        Some(identity.as_str()),
+        "the view must name the identity it bound: {body}"
+    );
+
+    let (status, body) = manage_post(
+        &router,
+        &format!(
+            "{}/organizations/{org}/memberships/{membership}/roles",
+            base(&h)
+        ),
+        "sva-role-attach",
+        &serde_json::json!({ "role_id": role }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "attach the role: {body}");
+
+    // NOW the exchange. The token must carry the organization and the role.
+    let (status, body) = authenticate(&h, "jti-roles", GATE_VALUE).await;
+    assert_eq!(status, StatusCode::OK, "the exchange must succeed: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("an access token")
+        .to_owned();
+    let claims = jwt_payload(&access);
+    assert_eq!(
+        claims["sub"].as_str(),
+        Some(identity.as_str()),
+        "the token is the mapped identity: {claims}"
+    );
+    assert_eq!(
+        claims["org_id"].as_str(),
+        Some(org.as_str()),
+        "the token must carry the identity's organization: {claims}"
+    );
+    assert_eq!(
+        claims["roles"],
+        serde_json::json!(["deployer"]),
+        "the token must carry the roles that organization attached: {claims}"
+    );
+
+    // AND THE DOOR SWINGS BOTH WAYS. Removing the membership must remove the authority,
+    // which also proves the roles are resolved FRESH at issuance rather than frozen onto
+    // anything. A grant that could be given and not taken back is a one-way door, and the
+    // store's own comment records that decoding `user_id` as a String once made removing a
+    // machine's membership fail outright -- so this is asserted rather than assumed.
+    let (status, body) = manage_delete(
+        &router,
+        &format!("{}/organizations/{org}/memberships/{membership}", base(&h)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "remove the membership: {body}");
+
+    let (status, body) = authenticate(&h, "jti-roles-after", GATE_VALUE).await;
+    assert_eq!(status, StatusCode::OK, "the exchange still succeeds: {body}");
+    let claims = jwt_payload(json(&body)["access_token"].as_str().expect("an access token"));
+    assert_eq!(
+        claims["sub"].as_str(),
+        Some(identity.as_str()),
+        "still the mapped identity: {claims}"
+    );
+    assert!(
+        claims.get("roles").is_none() && claims.get("org_id").is_none(),
+        "a removed membership must take its organization and roles with it: {claims}"
+    );
+}
+
