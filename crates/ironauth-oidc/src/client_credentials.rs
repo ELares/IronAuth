@@ -237,6 +237,9 @@ async fn mint_and_persist(
     let entry = crate::token::grant_issuer_entry(state, scope).await?;
     let signer = entry.signer(state.now()).ok_or(TokenError::ServerError)?;
     let issuer = state.issuer_for(&scope);
+    // Resolved BEFORE the mint, through the one shared helper (issue #126).
+    let (workload_org, workload_roles) =
+        crate::token::resolve_workload_org_and_roles(state, scope, &subject).await?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,
@@ -245,6 +248,11 @@ async fn mint_and_persist(
             scope,
             issuer: &issuer,
             subject: &subject,
+            // The machine identity's organization and roles (issue #126), resolved through the
+            // ONE shared helper so all three doors that mint under a service-account principal
+            // answer alike. `(None, None)` for a subject that is not one.
+            org_id: workload_org.as_deref(),
+            roles: workload_roles.as_ref(),
             client_id: &client_id_str,
             oauth_scope: requested_scope,
             custom_claims: &custom_claims,

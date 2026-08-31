@@ -2441,6 +2441,12 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{org_base}/memberships"),
             &serde_json::json!({ "user_id": unenrolled_user }),
         ),
+        Case::json(
+            "memberships.createServiceAccountMembership",
+            "POST",
+            format!("{org_base}/service-account-memberships"),
+            &serde_json::json!({ "service_account_id": "sva_absent" }),
+        ),
         Case::empty(
             "org_effective_roles.getOrgMembershipEffectiveRoles",
             "GET",

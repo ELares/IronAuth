@@ -2274,6 +2274,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add a MACHINE IDENTITY to an organization (issue #126).
+         * @description Its own route rather than a variant of `createMembership`, because both the request and the
+         *     response would otherwise have to make `user_id` optional -- and relaxing a required
+         *     property is breaking for every consumer already decoding it.
+         *
+         *     This is the granting path for a capability the store has modelled since issue #99:
+         *     `MembershipPrincipal::ServiceAccount`, `create_for_service_account` and
+         *     `effective_permissions_for_service_account` all existed, AuthZEN read them, and the only
+         *     callers of the creator anywhere were two test files. So a machine identity could hold roles
+         *     in principle and could be given none in practice.
+         */
+        post: operations["createServiceAccountMembership"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe": {
         parameters: {
             query?: never;
@@ -4743,6 +4771,16 @@ export interface components {
              *     stored in plaintext.
              */
             value: string;
+        };
+        /** @description The body to bind a machine identity into an organization (issue #126). */
+        CreateServiceAccountMembershipRequest: {
+            /** @description Optional free-form membership metadata; the empty object when omitted. */
+            metadata?: Record<string, never> | null;
+            /**
+             * @description The machine identity to add (an `sva_` id in this environment).
+             * @example sva_...
+             */
+            service_account_id: string;
         };
         /** @description The body to author a subject mapping. */
         CreateSubjectMappingRequest: {
@@ -7357,6 +7395,31 @@ export interface components {
              *     rotation actually landed without ever reading the value back.
              */
             version: number;
+        };
+        /**
+         * @description One organization membership held by a MACHINE IDENTITY (issue #126).
+         *
+         *     A separate view from [`MembershipView`] rather than one with an optional `user_id`.
+         *     Relaxing a required response property is breaking for every consumer already decoding it,
+         *     and a membership list that sometimes omits the member is worse to consume than two shapes
+         *     that each always say what they are.
+         */
+        ServiceAccountMembershipView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The membership identifier (`omb_...`, embeds its scope). */
+            id: string;
+            /** @description Free-form membership metadata (the empty object when none was set). */
+            metadata: Record<string, never>;
+            /** @description The organization the identity is a member of (`org_...`). */
+            organization_id: string;
+            /** @description The member machine identity (`sva_...`). */
+            service_account_id: string;
+            /** @description The membership lifecycle state (`active`). */
+            state: string;
         };
         /** @description Whether an environment runs the OPT-IN short-lived JWT session mode (issue #119 criterion 4). */
         SessionJwtModeView: {
@@ -20171,6 +20234,94 @@ export interface operations {
             };
             /** @description Not found (no such live mapping: absent, already detached, either half in another scope, a role of another organization, or a pair whose two halves are individually visible but do not belong together). The environment must be live too: an absent or soft-deleted one answers this same not-found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createServiceAccountMembership: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateServiceAccountMembershipRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServiceAccountMembershipView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization or machine identity not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The machine identity is already a member */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

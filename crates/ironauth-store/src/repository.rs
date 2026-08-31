@@ -48880,6 +48880,53 @@ impl OrgMembershipRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no such live service-account membership is visible here.
+    /// The ONE organization a service account belongs to, or [`None`] when that is not a
+    /// single answer (issue #126).
+    ///
+    /// `None` covers both "no membership" and "more than one", deliberately. A machine
+    /// identity has no session to have chosen an organization in, the way a user's is frozen
+    /// onto the grant at authorization, so the only org context a federated token can carry
+    /// is one the membership decides unambiguously. With two memberships, picking either
+    /// would emit one organization's roles onto a token the other's resources will also
+    /// accept -- a silent cross-organization authorization, and exactly the accident a
+    /// deterministic "first row" would hide.
+    ///
+    /// ACTIVE memberships only: a suspended or soft-deleted one is not a place the identity
+    /// currently acts.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. Never swallowed into `None`: on the
+    /// mint path that is indistinguishable from an identity that legitimately has no org.
+    pub async fn sole_organization_for_service_account(
+        &self,
+        service_account_id: &ServiceAccountId,
+    ) -> Result<Option<OrganizationId>, StoreError> {
+        if service_account_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // LIMIT 2, not 1: the query has to be able to SEE the ambiguity it refuses on. With
+        // `LIMIT 1` a second membership is invisible and the caller silently gets the first.
+        let rows = sqlx::query(
+            "SELECT organization_id FROM org_memberships \
+             WHERE service_account_id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND deleted_at IS NULL AND owner_kind = 'service_account' \
+               AND state = 'active' \
+             LIMIT 2",
+        )
+        .bind(service_account_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        let organization: String = rows[0].get("organization_id");
+        Ok(OrganizationId::parse_in_scope(&organization, &self.scope).ok())
+    }
+
     pub async fn get_service_account(
         &self,
         id: &OrgMembershipId,
@@ -49705,6 +49752,34 @@ impl OrgGroupRepo<'_> {
     /// [`StoreError::Database`] on a persistence failure. A store fault is never swallowed
     /// into an empty set: on the mint path that is a silent authorization downgrade that
     /// looks exactly like a principal who legitimately holds nothing.
+    /// The effective ROLE slugs a service account holds in one organization (issue #126).
+    ///
+    /// The exact sibling of [`Self::effective_permissions_for_service_account`], and of
+    /// [`Self::effective_roles`] for users: one shared closure CTE, one membership seed, one
+    /// depth bound, so a machine identity and a person resolve their roles the same way. A
+    /// second resolution path here is how the two principal kinds drift.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization or the principal is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure. A store fault is never swallowed
+    /// into an empty set: on the mint path that is a silent authorization downgrade that
+    /// looks exactly like a principal who legitimately holds nothing.
+    pub async fn effective_roles_for_service_account(
+        &self,
+        organization_id: &OrganizationId,
+        service_account_id: &ServiceAccountId,
+        max_group_depth: u32,
+    ) -> Result<BTreeSet<String>, StoreError> {
+        self.resolve_effective(
+            organization_id,
+            MembershipPrincipal::ServiceAccount(service_account_id),
+            max_group_depth,
+            EFFECTIVE_ROLE_SLUGS_TAIL,
+        )
+        .await
+    }
+
     pub async fn effective_permissions_for_service_account(
         &self,
         organization_id: &OrganizationId,
@@ -54572,6 +54647,28 @@ impl ActingOrgMembershipRepo<'_> {
         spec: NewServiceAccountMembership<'_>,
         created_at_micros: i64,
     ) -> Result<ServiceAccountMembershipRecord, StoreError> {
+        self.create_for_service_account_with_event(env, spec, created_at_micros, None, None)
+            .await
+    }
+
+    /// [`Self::create_for_service_account`], with the idempotency record and the
+    /// `organization.service_account_added` event in the SAME transaction (issue #126).
+    ///
+    /// A distinct event type from `organization.member_added` rather than a variant of it:
+    /// that schema makes `user_id` required, and relaxing a required property is breaking for
+    /// every consumer already decoding it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_for_service_account`].
+    pub async fn create_for_service_account_with_event(
+        &self,
+        env: &Env,
+        spec: NewServiceAccountMembership<'_>,
+        created_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, ServiceAccountMembershipRecord>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<ServiceAccountMembershipRecord, StoreError> {
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.service_account_id.scope() != self.scope
@@ -54618,6 +54715,13 @@ impl ActingOrgMembershipRepo<'_> {
             None,
         )
         .await?;
+        // Rendered from the ROW this resolved, never the request, so a replay of a re-add
+        // serves the revived row's real id and metadata -- the same argument the user path
+        // records at its own call to this.
+        insert_resolved_idempotency(&mut tx, idempotency, &record).await?;
+        // BEFORE the commit, in the write's own transaction: a rolled-back membership
+        // announces nothing.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(record)
     }

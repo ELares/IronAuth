@@ -441,6 +441,56 @@ pub struct MembershipView {
     pub created_at_unix_ms: i64,
 }
 
+/// One organization membership held by a MACHINE IDENTITY (issue #126).
+///
+/// A separate view from [`MembershipView`] rather than one with an optional `user_id`.
+/// Relaxing a required response property is breaking for every consumer already decoding it,
+/// and a membership list that sometimes omits the member is worse to consume than two shapes
+/// that each always say what they are.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ServiceAccountMembershipView {
+    /// The membership identifier (`omb_...`, embeds its scope).
+    pub id: String,
+    /// The organization the identity is a member of (`org_...`).
+    pub organization_id: String,
+    /// The member machine identity (`sva_...`).
+    pub service_account_id: String,
+    /// The membership lifecycle state (`active`).
+    pub state: String,
+    /// Free-form membership metadata (the empty object when none was set).
+    #[schema(value_type = Object)]
+    pub metadata: serde_json::Value,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl ServiceAccountMembershipView {
+    /// Render the stored record.
+    #[must_use]
+    pub fn from_record(record: ironauth_store::ServiceAccountMembershipRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            organization_id: record.organization_id.to_string(),
+            service_account_id: record.service_account_id.to_string(),
+            state: record.state,
+            metadata: record.metadata,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+        }
+    }
+}
+
+/// The body to bind a machine identity into an organization (issue #126).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateServiceAccountMembershipRequest {
+    /// The machine identity to add (an `sva_` id in this environment).
+    #[schema(example = "sva_...")]
+    pub service_account_id: String,
+    /// Optional free-form membership metadata; the empty object when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub metadata: Option<serde_json::Value>,
+}
+
 impl MembershipView {
     /// Build a view from a stored membership record.
     #[must_use]

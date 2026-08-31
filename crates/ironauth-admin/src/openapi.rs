@@ -245,6 +245,7 @@ use crate::views::{
         crate::organizations::disable_organization,
         crate::organizations::enable_organization,
         crate::memberships::create_membership,
+        crate::memberships::create_service_account_membership,
         crate::memberships::list_memberships,
         crate::memberships::delete_membership,
         crate::permissions::create_permission,

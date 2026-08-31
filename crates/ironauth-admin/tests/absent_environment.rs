@@ -1407,6 +1407,12 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: Some(body_of(&serde_json::json!({ "user_id": user }))),
         },
         Case {
+            label: "memberships.createServiceAccountMembership",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/service-account-memberships"),
+            body: Some(body_of(&serde_json::json!({ "service_account_id": "sva_absent" }))),
+        },
+        Case {
             label: "memberships.deleteMembership",
             method: "DELETE",
             path: format!("{base}/organizations/{org}/memberships/{membership}"),
