@@ -43,25 +43,48 @@ fi
 grep -qi 'DPoP' "$PAGE" || { echo "bff-docs: $PAGE ranks browser-held tokens without naming DPoP" >&2; exit 1; }
 grep -qi 'rotation' "$PAGE" || { echo "bff-docs: $PAGE ranks browser-held tokens without naming refresh rotation" >&2; exit 1; }
 
-# And the prohibition, over every AUTHORED document except the page that states it.
+# And the prohibition, over every AUTHORED document.
 #
 # `docs/llms.txt` and `docs/llms-full.txt` are excluded because they are GENERATED: the corpus
 # concatenates every published page, so it necessarily contains whatever `docs/bff.md` says about
 # localStorage. Flagging that would be flagging the prohibition itself for existing, and the fix
 # an author would reach for -- softening the wording on the page that owns the subject -- is
-# exactly backwards.
+# exactly backwards. It is safe because a generated concatenation cannot introduce guidance:
+# anything it carries came from a source file this scan already reads.
 #
-# The exclusion is safe because a generated concatenation cannot introduce guidance: anything it
-# carries came from a source file this scan already reads.
+# TWO KINDS OF FILE MAY MENTION IT, and the second was learned rather than designed: the page
+# that owns the subject, and the agent SKILLS, whose whole job is to carry the prohibition to a
+# model that would otherwise reach for the easy thing. A skill that cannot say "never use
+# localStorage" is a skill missing its most important instruction.
+#
+# That is a small closed set and not a guess. And an allowed file must still CONTAIN a
+# prohibition -- checked below -- so being on this list cannot quietly turn a page into advice,
+# which is the failure the blanket rule was protecting against in the first place.
+ALLOWED_RE="^(${PAGE}|docs/skills/[a-z0-9-]+\.md|docs/llms(-full)?\.txt)$"
+
 offenders=$(grep -rliE 'localstorage' docs packages/*/README.md 2>/dev/null \
-  | grep -v "^${PAGE}$" \
-  | grep -vE '^docs/llms(-full)?\.txt$' || true)
+  | grep -vE "$ALLOWED_RE" || true)
 if [ -n "$offenders" ]; then
-  echo "bff-docs: localStorage is mentioned outside ${PAGE}:" >&2
+  echo "bff-docs: localStorage is mentioned outside the files that own the subject:" >&2
   printf '  %s\n' $offenders >&2
-  echo "  No IronAuth document may describe storing a token there. If this is a warning rather" >&2
-  echo "  than advice, it belongs in ${PAGE}, which is the one page that owns the subject." >&2
+  echo "  No IronAuth document may describe storing a token there. If this is a prohibition" >&2
+  echo "  rather than advice, it belongs in ${PAGE} or in an agent skill, which are the files" >&2
+  echo "  that own it." >&2
   exit 1
 fi
+
+# EVERY ALLOWED FILE THAT MENTIONS IT MUST FORBID IT. Without this, the allowance above is a
+# loophole: a skill could be edited into "store the token in localStorage for convenience" and
+# the gate would say nothing, which is precisely the outcome the blanket rule prevented.
+for allowed in $(grep -rliE 'localstorage' docs 2>/dev/null | grep -E "$ALLOWED_RE" || true); do
+  case "$allowed" in
+    docs/llms.txt|docs/llms-full.txt) continue ;;
+  esac
+  if ! grep -qiE 'no supported way|never (write|store|put)|must not' "$allowed"; then
+    echo "bff-docs: ${allowed} mentions localStorage without forbidding it" >&2
+    echo "  A file allowed to name it is allowed BECAUSE it carries the prohibition." >&2
+    exit 1
+  fi
+done
 
 echo "bff-docs: clean (the BCP ranking is present and no document describes localStorage token storage)"

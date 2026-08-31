@@ -1232,6 +1232,25 @@ jobs:
         working-directory: packages/ironauth-mcp
         run: npm test
 
+  docs-mcp:
+    # Issue #123 criterion 1: the recorded integration-task eval. It does not run a model -- it
+    # measures whether the docs MCP server surfaces the guidance each step of the task needs, and
+    # that what it surfaces is the CURRENT answer. That is the half that decays.
+    name: docs mcp (integration-task eval)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: install (locked)
+        working-directory: packages/ironauth-docs-mcp
+        run: npm ci
+      - name: test
+        working-directory: packages/ironauth-docs-mcp
+        run: npm test
+
   admin-spa:
     name: admin spa (codegen freshness, typecheck, vite build)
     runs-on: ubuntu-latest

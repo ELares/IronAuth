@@ -8756,3 +8756,151 @@ that session open indefinitely.
 
 If your environment relies on the idle timeout to end abandoned sessions, weigh that before
 enabling this mode. The absolute session lifetime still applies and is unaffected.
+
+---
+
+# Skill: add IronAuth login to an app
+
+Source: docs/skills/integrate-ironauth.md
+
+# Skill: add IronAuth login to an app
+
+Use this when a user asks to add authentication, login, SSO, or IronAuth to an application.
+
+## Before writing any code
+
+**Search the docs first.** Call `search_docs` before you write an IronAuth integration, every
+time. This product moves; an integration written from recall is written against whatever shape
+was current when you were trained, and the failure is silent -- it compiles, and it is wrong
+about the thing that matters.
+
+## Step 1: pick the architecture, and it is probably the BFF
+
+Read `docs/bff.md`. It ranks the three OAuth 2.0 for Browser-Based Apps BCP architectures with
+their tradeoffs:
+
+1. **Backend-for-frontend** -- every token server-side, browser holds one opaque cookie. Use
+   `@ironauth/bff`. Choose this unless the user cannot run a server.
+2. **Token-mediating backend** -- refresh token server-side, access token in the browser.
+   Acceptable; the access token is exposed to XSS for its lifetime.
+3. **Browser-held tokens** -- last, and only with **both** DPoP and refresh rotation.
+
+**Never write tokens to `localStorage`.** There is no supported way to do it and no IronAuth
+document describes one. If the user asks for it, explain what it costs and offer the BFF.
+
+## Step 2: get an environment
+
+Either point at an existing one, or boot the emulator:
+
+```
+cargo run -p ironauth --bin ironauth -- dev --seed 1
+```
+
+It prints an issuer and a seeded client id. It is offline and deterministic; `docs/EMULATOR.md`
+has the details.
+
+## Step 3: wire the BFF
+
+```ts
+import { MemorySessionStore, fetchAdapter, login, callback, logout, userinfo, proxy } from '@ironauth/bff';
+
+const config = {
+  issuer, clientId, clientSecret, redirectUri,
+  scope: 'openid profile',
+  apiBase,
+  sessionMaxAgeSeconds: 3600,
+  store: new MemorySessionStore(),
+};
+```
+
+Mount five routes: `login`, `callback`, `logout`, `userinfo`, and `proxy` for API calls.
+
+**`MemorySessionStore` is not for production.** A restart signs everybody out and a second
+replica shares no sessions. Say so to the user and point at `SessionStore`.
+
+**State-changing calls need the `X-IronAuth-BFF` header.** `logout` and any non-GET through the
+proxy refuse without it. That is the CSRF defence, not an accident.
+
+## Step 4: verify tokens at the edge, if the user needs to
+
+Read `docs/edge-verification.md`. It has the runtime support table with how each row is backed,
+and the snippets. **CloudFront Functions cannot do this** -- it has no asymmetric crypto -- and
+the doc says what to use instead.
+
+## What to tell the user
+
+- which of the three architectures you chose, and why;
+- that `MemorySessionStore` must be replaced before they ship;
+- the cookie is `__Host-` prefixed, `HttpOnly`, `Secure`, and its attributes are not
+  configurable, because they are the architecture.
+
+## Do not
+
+- put a token in `localStorage`, or in any browser storage that survives the tab;
+- disable a cookie attribute to make something work locally -- use the emulator over http on
+  localhost, which browsers permit for `Secure` cookies;
+- write your own JWT verification. Use `@ironauth/sdk`'s `verifyToken`, or a snippet from
+  `docs/edge-verification.md`. A hand-rolled verifier is how the 2025-2026 JOSE CVE wave
+  happened.
+
+---
+
+# Skill: migrate to IronAuth from an incumbent
+
+Source: docs/skills/migrate-to-ironauth.md
+
+# Skill: migrate to IronAuth from an incumbent
+
+Use this when a user is moving from Auth0, Okta, Cognito, Keycloak, or a homegrown identity
+system.
+
+## Before writing any code
+
+**Search the docs first.** Call `search_docs`. Migration guidance in particular ages badly,
+because it describes two moving products at once.
+
+## Step 1: read the exit guide, in both directions
+
+`docs/exit-guide.md` documents how to get OUT of IronAuth. Read it early and show it to the
+user: a vendor whose exit path is documented is making a different promise from one whose is
+not, and a user weighing a migration is entitled to know how the next one would go.
+
+## Step 2: users and their password hashes
+
+IronAuth imports **foreign password hashes** and rehashes them to Argon2id on the user's first
+successful login. That is the property that makes a migration invisible to users: no forced
+reset, no "please choose a new password" email.
+
+Search for the import surface rather than guessing at it, and check which hash formats are
+supported before promising the user a silent cutover.
+
+## Step 3: what does NOT come across
+
+Be explicit with the user, early:
+
+- **Sessions do not migrate.** Everyone signs in again once, on whatever schedule you cut over.
+- **Refresh tokens do not migrate.** They are the incumbent's credentials.
+- **Anything the incumbent does that IronAuth deliberately will not** -- read
+  `docs/WILL-NOT-IMPLEMENT.md` and check it against the user's list *before* planning the
+  migration, not after. A feature the product has decided against is not a roadmap item.
+
+## Step 4: the client and flow shapes
+
+IronAuth is standards-first, so an incumbent's standard flows port directly and its proprietary
+extensions do not. Map each of the user's flows to an OAuth/OIDC one; where an incumbent has a
+non-standard endpoint, find the standard equivalent rather than looking for a matching
+non-standard one.
+
+## Step 5: cut over per environment
+
+Migrate a staging environment first and run the user's real login flows against it. IronAuth
+issuers are per environment, so a token from staging is not valid in production -- which is a
+safety property during a migration and also the most common source of "wrong issuer" errors
+while one is in progress.
+
+## What to tell the user
+
+- everyone signs in again once;
+- passwords carry over silently and rehash on first login;
+- which of their incumbent's features have a standard equivalent and which do not;
+- the exit path out of IronAuth, because they just paid for not knowing one.

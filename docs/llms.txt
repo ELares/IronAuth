@@ -28,3 +28,5 @@ both files and fails if either drifts.
 - [IdP-side FedCM (experimental, issue #83)](docs/fedcm.md): IronAuth ships the IdP side of the W3C
 - [Verifying a signed log stream](docs/log-stream-verification.md): IronAuth can sign every batch it ships to a SIEM. This is how a consumer checks one, and
 - [The session tokenizer](docs/session-tokenizer.md): IronAuth sessions are opaque and database-backed. That is the right default: a session can be
+- [Skill: add IronAuth login to an app](docs/skills/integrate-ironauth.md): Use this when a user asks to add authentication, login, SSO, or IronAuth to an application.
+- [Skill: migrate to IronAuth from an incumbent](docs/skills/migrate-to-ironauth.md): Use this when a user is moving from Auth0, Okta, Cognito, Keycloak, or a homegrown identity
