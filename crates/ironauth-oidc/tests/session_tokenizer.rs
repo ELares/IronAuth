@@ -488,7 +488,7 @@ async fn deleting_the_template_turns_the_mode_off_rather_than_leaving_it_danglin
         .scoped(harness.scope())
         .acting(actor, corr)
         .session_token_templates()
-        .delete(harness.env(), "orders")
+        .delete(harness.env(), "orders", None)
         .await
         .expect("delete the template");
 

@@ -208,6 +208,7 @@ async fn setup() -> Harness {
                 fetch_budget: 0,
                 aot: None,
             },
+            None,
         )
         .await
         .expect("deploy the factor");
@@ -217,7 +218,7 @@ async fn setup() -> Harness {
         .scoped(scope)
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .grant_secret(&env, FACTOR, "wordmark_list")
+        .grant_secret(&env, FACTOR, "wordmark_list", None)
         .await
         .expect("grant the word list");
 
@@ -489,7 +490,7 @@ async fn a_journey_naming_an_undeployed_factor_refuses_rather_than_passing() {
         .scoped(scope)
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .delete(&env, FACTOR)
+        .delete(&env, FACTOR, None)
         .await
         .expect("delete the factor");
 
@@ -538,7 +539,7 @@ async fn revoking_a_factors_secret_closes_it_rather_than_opening_it() {
         .scoped(scope)
         .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .revoke_secret(&env, FACTOR, "wordmark_list")
+        .revoke_secret(&env, FACTOR, "wordmark_list", None)
         .await
         .expect("revoke the grant");
 
@@ -628,6 +629,7 @@ async fn the_stored_artifact_is_what_runs_and_a_foreign_key_falls_back_to_the_co
                         engine_key,
                     }),
                 },
+                None,
             )
             .await
             .expect("deploy");

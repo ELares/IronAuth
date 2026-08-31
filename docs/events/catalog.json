@@ -313,6 +313,98 @@
       "type": "brand_asset.set"
     },
     {
+      "domain": "challenge_component",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "challenge_component.deleted"
+    },
+    {
+      "domain": "challenge_component",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "secret_name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "secret_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "challenge_component.secret_granted"
+    },
+    {
+      "domain": "challenge_component",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "secret_name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "secret_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "challenge_component.secret_revoked"
+    },
+    {
+      "domain": "challenge_component",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "component_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "payload_version": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "component_bytes",
+          "payload_version"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "challenge_component.set"
+    },
+    {
       "domain": "claims_mapping",
       "payload_schema": {
         "additionalProperties": false,
@@ -2265,6 +2357,88 @@
       "type": "session.revoked"
     },
     {
+      "domain": "session_jwt_mode",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "template": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "template"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "session_jwt_mode.disabled"
+    },
+    {
+      "domain": "session_jwt_mode",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "template": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "template"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "session_jwt_mode.enabled"
+    },
+    {
+      "domain": "session_token_template",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "session_token_template.deleted"
+    },
+    {
+      "domain": "session_token_template",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "audience": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "audience",
+          "ttl_seconds"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "session_token_template.set"
+    },
+    {
       "domain": "signup_form",
       "payload_schema": {
         "additionalProperties": false,
@@ -2742,6 +2916,88 @@
       },
       "payload_schema_version": 1,
       "type": "token_hook.deployed"
+    },
+    {
+      "domain": "token_hook",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "order": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "client_id",
+          "order"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "token_hook.reordered"
+    },
+    {
+      "domain": "token_hook",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "hook_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "secret_name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id",
+          "hook_name",
+          "secret_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "token_hook.secret_granted"
+    },
+    {
+      "domain": "token_hook",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "hook_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "secret_name": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id",
+          "hook_name",
+          "secret_name"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "token_hook.secret_revoked"
     },
     {
       "domain": "trait_migration_job",

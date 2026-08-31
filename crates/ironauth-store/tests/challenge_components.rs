@@ -45,7 +45,7 @@ async fn a_component_deployed_on_the_control_plane_is_read_by_the_data_plane() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("deploy");
 
@@ -93,7 +93,7 @@ async fn a_redeploy_replaces_the_code_and_applies_the_budget() {
 
     acting()
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("first deploy");
 
@@ -110,6 +110,7 @@ async fn a_redeploy_replaces_the_code_and_applies_the_budget() {
                 fetch_budget: 3,
                 aot: None,
             },
+            None,
         )
         .await
         .expect("redeploy");
@@ -159,12 +160,12 @@ async fn a_grant_is_cascaded_away_with_its_component() {
 
     acting()
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("deploy");
     acting()
         .challenge_components()
-        .grant_secret(&env, "wordmark", "wordmark_list")
+        .grant_secret(&env, "wordmark", "wordmark_list", None)
         .await
         .expect("grant");
 
@@ -184,7 +185,7 @@ async fn a_grant_is_cascaded_away_with_its_component() {
 
     acting()
         .challenge_components()
-        .delete(&env, "wordmark")
+        .delete(&env, "wordmark", None)
         .await
         .expect("delete");
 
@@ -192,7 +193,7 @@ async fn a_grant_is_cascaded_away_with_its_component() {
     // nobody granted it.
     acting()
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("redeploy after delete");
     let record = db
@@ -227,7 +228,7 @@ async fn a_grant_to_an_undeployed_component_is_refused() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .grant_secret(&env, "never-deployed", "wordmark_list")
+        .grant_secret(&env, "never-deployed", "wordmark_list", None)
         .await
         .expect_err("a grant to a component that does not exist must be refused");
     assert!(
@@ -257,20 +258,20 @@ async fn a_revoke_is_idempotent_and_a_delete_of_nothing_is_not() {
 
     acting()
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("deploy");
     for round in 1..=2 {
         acting()
             .challenge_components()
-            .revoke_secret(&env, "wordmark", "never-granted")
+            .revoke_secret(&env, "wordmark", "never-granted", None)
             .await
             .unwrap_or_else(|error| panic!("revoke round {round} must succeed: {error:?}"));
     }
 
     let error = acting()
         .challenge_components()
-        .delete(&env, "never-deployed")
+        .delete(&env, "never-deployed", None)
         .await
         .expect_err("deleting nothing is not success");
     assert!(
@@ -295,7 +296,7 @@ async fn the_data_plane_cannot_write_a_component() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect_err("the data plane must not be able to deploy a factor");
     assert!(
@@ -320,7 +321,7 @@ async fn a_component_is_invisible_outside_its_scope() {
         .scoped(first)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("deploy in the first scope");
 
@@ -410,7 +411,7 @@ async fn the_bounds_are_refused_at_the_write() {
     for (why, deployment) in cases {
         let error = acting()
             .challenge_components()
-            .deploy(&env, deployment)
+            .deploy(&env, deployment, None)
             .await
             .expect_err(why);
         assert!(matches!(error, StoreError::Database(_)), "{why}: {error:?}");
@@ -442,6 +443,7 @@ async fn an_artifact_and_its_key_travel_together() {
                 aot: Some(&aot),
                 ..deployment("wordmark")
             },
+            None,
         )
         .await
         .expect("deploy with an artifact");
@@ -491,6 +493,7 @@ async fn a_redeploy_without_an_artifact_clears_the_stale_one() {
                 aot: Some(&aot),
                 ..deployment("wordmark")
             },
+            None,
         )
         .await
         .expect("deploy with an artifact");
@@ -509,6 +512,7 @@ async fn a_redeploy_without_an_artifact_clears_the_stale_one() {
                 fetch_budget: 0,
                 aot: None,
             },
+            None,
         )
         .await
         .expect("redeploy without one");
@@ -544,7 +548,7 @@ async fn the_artifact_columns_refuse_a_half_row_and_a_malformed_key() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .challenge_components()
-        .deploy(&env, deployment("wordmark"))
+        .deploy(&env, deployment("wordmark"), None)
         .await
         .expect("deploy");
 

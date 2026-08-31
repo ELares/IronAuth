@@ -2223,6 +2223,226 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A GRANT widens what DEPLOYED CODE may read, and it takes effect on the NEXT ISSUANCE
+        // with no redeploy, because the dispatch resolves grants per invocation. So a consumer
+        // watching what a client's hooks can reach cannot infer this from a deploy event: there
+        // may not be one.
+        //
+        // THE SECRET NAME, NEVER A VALUE, for the reason the grant table itself exists: it
+        // stores a reference so the value stays sealed behind a different repository and the
+        // platform key.
+        "token_hook.secret_granted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "hook_name": {"type": "string", "minLength": 1},
+                "secret_name": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id", "hook_name", "secret_name"]
+        }"#,
+    ),
+    (
+        // The withdrawal of the capability above, and the one an operator reaches for when a
+        // hook is misusing a secret. Both edges are announced because a consumer tracking what
+        // code may read needs both, and because this one is the remediation.
+        "token_hook.secret_revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "hook_name": {"type": "string", "minLength": 1},
+                "secret_name": {"type": "string", "minLength": 1}
+            },
+            "required": ["client_id", "hook_name", "secret_name"]
+        }"#,
+    ),
+    (
+        // A client's hooks run as an ORDERED CHAIN, and each one sees what the previous left. So
+        // reordering changes what every token that client is issued carries, without any hook's
+        // code changing -- which is precisely the change a consumer cannot see from a deploy
+        // event, because there is no deploy.
+        //
+        // THE RESULTING ORDER, by name, because that IS the change. Unlike every other payload
+        // here the address alone would say nothing: "the chain was reordered" without the order
+        // is a notification a consumer has to refetch to act on, and the order is a short list
+        // of names rather than a document.
+        "token_hook.reordered",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "client_id": {"type": "string", "minLength": 1},
+                "order": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1}
+                }
+            },
+            "required": ["client_id", "order"]
+        }"#,
+    ),
+    (
+        // A CUSTOM FACTOR COMPONENT decides whether a login succeeds (issue #114 criterion 6).
+        // Deploying one is deploying CODE onto the login path, so a consumer watching an
+        // environment's security posture needs to see it land -- and unlike a token hook, which
+        // shapes a token the login already earned, this decides whether it is earned at all.
+        //
+        // THE NAME AND THE SHAPE, never the component, for the reason `token_hook.deployed`
+        // gives: an event is a notification and not a binary store, and putting sixteen
+        // megabytes of WASM on every subscriber's stream would be a denial of service dressed as
+        // an announcement.
+        //
+        // The NAME rather than an id, because a component has no id of its own: it is deployed
+        // against the environment and referenced BY NAME from a journey step, so the name is the
+        // stable address an operator and a consumer both use.
+        "challenge_component.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1},
+                "component_bytes": {"type": "integer", "minimum": 1},
+                "payload_version": {"type": "integer", "minimum": 0}
+            },
+            "required": ["name", "component_bytes", "payload_version"]
+        }"#,
+    ),
+    (
+        // Removing a component a journey still names makes every login that reaches that step
+        // REFUSE -- a factor fails closed. A consumer cannot tell that from silence, which is
+        // why the removal announces itself separately from the deploy.
+        "challenge_component.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name"]
+        }"#,
+    ),
+    (
+        // A GRANT is a capability change: it widens what deployed code may read. Announced on
+        // its own rather than folded into whatever deploy accompanied it, for the reason the
+        // audit action gives -- an operator reading why a component could suddenly read a
+        // signing key must FIND the grant, not infer it from a redeploy.
+        //
+        // THE SECRET NAME, NEVER A VALUE. The whole point of the grant table is that it stores a
+        // reference and the value lives sealed behind a different repository and the platform
+        // key. An event carrying the value would undo that in one line.
+        "challenge_component.secret_granted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1},
+                "secret_name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name", "secret_name"]
+        }"#,
+    ),
+    (
+        // The withdrawal of the capability above. Its own type because a consumer tracking what
+        // code may read needs both edges, and because the two are different operator decisions.
+        "challenge_component.secret_revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1},
+                "secret_name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name", "secret_name"]
+        }"#,
+    ),
+    (
+        // A SESSION TOKENIZER TEMPLATE names the AUDIENCE that will accept short-lived JWTs for
+        // this environment's subjects, and the TTL for which nothing can withdraw one (issue
+        // #119). That is the highest-value configuration change this feature has, and a consumer
+        // watching an environment's security posture should not have to poll for it.
+        //
+        // THE TTL RIDES ALONG, and it is not decoration: it is the exact width of the window in
+        // which a revoked session's already-minted token still verifies. A consumer that tracks
+        // revocation latency reads this number, and refetching the template to learn it would
+        // make the event useless for that.
+        //
+        // NEVER THE RULES and never key material. The rules are configuration a consumer
+        // refetches -- `claims_mapping.set` gives the reason -- and the key's only public
+        // projection is the JWK at the template's own JWKS URL, which is a different surface
+        // with a different reader.
+        "session_token_template.set",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1},
+                "audience": {"type": "string", "minLength": 1},
+                "ttl_seconds": {"type": "integer", "minimum": 1}
+            },
+            "required": ["name", "audience", "ttl_seconds"]
+        }"#,
+    ),
+    (
+        // Deleting a template takes its KEYS with it, so its JWKS URL stops answering and every
+        // consumer verifying against it starts failing. That is an outage with a cause, and this
+        // is the event that names the cause.
+        "session_token_template.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {"type": "string", "minLength": 1}
+            },
+            "required": ["name"]
+        }"#,
+    ),
+    (
+        // The OPT-IN JWT SESSION MODE going ON (issue #119 criterion 4). This moves EVERY session
+        // check in the environment off the database and onto a token that keeps verifying until
+        // it expires -- the single most consequential configuration flip this product has, and
+        // the one an auditor most needs to see without polling.
+        //
+        // The TEMPLATE it was pointed at, because that names the audience and the TTL that now
+        // govern every session in the environment.
+        "session_jwt_mode.enabled",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "template": {"type": "string", "minLength": 1}
+            },
+            "required": ["template"]
+        }"#,
+    ),
+    (
+        // And going OFF. The SAFE direction -- every SDK returns to the database-backed check --
+        // but still a change every request in the environment feels, and a load characteristic
+        // somebody sized for. It names the template it WAS pointed at, so the row still says
+        // what was turned off.
+        "session_jwt_mode.disabled",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "template": {"type": "string", "minLength": 1}
+            },
+            "required": ["template"]
+        }"#,
+    ),
+    (
         // A signup form governs what a self-service REGISTRATION collects and requires, so
         // removing one changes who can sign up and with what. The client id rides along
         // because a signup form is per-client and that is how an operator refers to it.
@@ -3064,6 +3284,8 @@ mod tests {
         "message_template.set",
         "organization.default_role_set",
         "claims_mapping.set",
+        "challenge_component.set",
+        "session_token_template.set",
         "signup_form.set",
         "step_up_policy.set",
         // `withdrawn` (withdraw/withdrew/withdrawn) and `resent` (resend/resent/resent).

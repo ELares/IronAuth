@@ -267,6 +267,20 @@ pub async fn deploy_challenge_component(
                 payload_version: i32::try_from(payload_version).map_err(|_| ApiError::Internal)?,
                 fetch_budget,
             },
+            component_event(
+                &state,
+                scope,
+                "challenge_component.set",
+                &serde_json::json!({
+                    "name": name,
+                    "component_bytes": body.len(),
+                    "payload_version": payload_version,
+                }),
+                name,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
         )
         .await?;
 
@@ -381,7 +395,20 @@ pub async fn delete_challenge_component(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .challenge_components()
-        .delete(state.env(), name)
+        .delete(
+            state.env(),
+            name,
+            component_event(
+                &state,
+                scope,
+                "challenge_component.deleted",
+                &serde_json::json!({ "name": name }),
+                name,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -464,7 +491,24 @@ pub async fn grant_challenge_component_secret(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .challenge_components()
-        .grant_secret(state.env(), name, secret)
+        .grant_secret(
+            state.env(),
+            name,
+            secret,
+            component_event(
+                &state,
+                scope,
+                "challenge_component.secret_granted",
+                // THE NAME, NEVER THE VALUE. The grant table stores a reference precisely so the
+                // value stays sealed behind a different repository and the platform key, and an
+                // event carrying it would undo that in one line.
+                &serde_json::json!({ "name": name, "secret_name": secret }),
+                name,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     read_back_secrets(&state, scope, name).await
 }
@@ -510,7 +554,21 @@ pub async fn revoke_challenge_component_secret(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .challenge_components()
-        .revoke_secret(state.env(), name, secret)
+        .revoke_secret(
+            state.env(),
+            name,
+            secret,
+            component_event(
+                &state,
+                scope,
+                "challenge_component.secret_revoked",
+                &serde_json::json!({ "name": name, "secret_name": secret }),
+                name,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     read_back_secrets(&state, scope, name).await
 }
@@ -537,4 +595,36 @@ async fn read_back_secrets(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
+}
+
+/// Build the event a challenge-component write announces (issue #108's contract, #114's writes).
+///
+/// One builder for all four, because the differences are the type and the payload and everything
+/// else -- the envelope, the id, the subject -- is identical. Four near-identical functions would
+/// be four places for the subject to drift, and the SUBJECT is what keeps two events about one
+/// component ordered on a consumer's stream.
+///
+/// The subject is the component NAME because a component has no id of its own: it is deployed
+/// against the environment and referenced by name from a journey step.
+fn component_event(
+    state: &AdminState,
+    scope: Scope,
+    event_type: &str,
+    payload: &serde_json::Value,
+    name: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: name.to_owned(),
+        envelope,
+    })
 }
