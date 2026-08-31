@@ -578,3 +578,77 @@ test('every adapter renders unauthenticated the way the route asked', () => {
   assert.equal(page.status, 302);
   assert.equal(page.headers.get('location'), '/auth/login');
 });
+
+test('a token bound to a different key than we proved is refused', async () => {
+  // The BFF sends a proof; the SERVER decides what to bind to. If those disagree, every later
+  // request fails with an error about the request rather than about the login -- the kind of
+  // mismatch that costs an afternoon. It is caught once, at the callback, while the cause is
+  // still visible.
+  const store = new MemorySessionStore();
+  forgetDiscovery();
+  const send = (async (input: string | URL | Request): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url === `${ISSUER}/.well-known/openid-configuration`) {
+      return new Response(
+        JSON.stringify({
+          issuer: ISSUER,
+          authorization_endpoint: 'https://iss.example/authorize',
+          token_endpoint: 'https://iss.example/token',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    const b64 = (value: object) => Buffer.from(JSON.stringify(value)).toString('base64url');
+    // A JWT access token whose cnf.jkt is a thumbprint we did not produce.
+    const bound = `${b64({ alg: 'EdDSA' })}.${b64({ sub: 'usr_1', cnf: { jkt: 'someone-elses-key' } })}.sig`;
+    return new Response(
+      JSON.stringify({ access_token: bound, expires_in: 300, id_token: idToken() }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }) as unknown as typeof fetch;
+
+  // PUBLIC client (no secret), which is what turns DPoP on.
+  const config: BffConfig = { ...configOf(store, send), clientSecret: undefined };
+  const started = await login(config, {
+    method: 'GET',
+    url: 'https://app.example/auth/login',
+    headers: new Headers(),
+  });
+  assert.equal(started.kind, 'redirect');
+  const cookie = started.kind === 'redirect' ? (started.setCookie ?? '') : '';
+  const pendingId = /=([^;]*)/.exec(cookie)![1];
+  const state = new URL(started.kind === 'redirect' ? started.location : '').searchParams.get('state');
+
+  const done = await callback(config, {
+    method: 'GET',
+    url: `https://app.example/auth/callback?code=c1&state=${state}`,
+    headers: new Headers({ cookie: `${SESSION_COOKIE}=${pendingId}` }),
+  });
+  assert.equal(done.kind, 'upstream_error');
+  assert.match(done.kind === 'upstream_error' ? done.detail : '', /bound to a different key/);
+});
+
+test('an opaque access token is not treated as a binding failure', async () => {
+  // An opaque token is perfectly legal and says NOTHING about the binding, so an absent claim
+  // must not be read as evidence of a problem. Without this the check above would refuse every
+  // issuer that does not happen to mint JWT access tokens.
+  const store = new MemorySessionStore();
+  const upstreamed = upstream({ requireDpop: true });
+  const config: BffConfig = { ...configOf(store, upstreamed.send), clientSecret: undefined };
+  const started = await login(config, {
+    method: 'GET',
+    url: 'https://app.example/auth/login',
+    headers: new Headers(),
+  });
+  const cookie = started.kind === 'redirect' ? (started.setCookie ?? '') : '';
+  const pendingId = /=([^;]*)/.exec(cookie)![1];
+  const state = new URL(started.kind === 'redirect' ? started.location : '').searchParams.get('state');
+  const done = await callback(config, {
+    method: 'GET',
+    url: `https://app.example/auth/callback?code=c1&state=${state}`,
+    headers: new Headers({ cookie: `${SESSION_COOKIE}=${pendingId}` }),
+  });
+  assert.equal(done.kind, 'redirect');
+  // And the proof really was sent, which is what `requireDpop` on the fake enforces.
+  assert.ok(upstreamed.calls.some((call) => call.dpop !== null), 'no DPoP proof reached the token endpoint');
+});

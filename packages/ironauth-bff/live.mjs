@@ -15,7 +15,7 @@
  *
  *   node live.mjs <issuer> <client_id>
  */
-import { callback, login, userinfo, MemorySessionStore, SESSION_COOKIE } from './dist/index.js';
+import { callback, login, userinfo, thumbprint, MemorySessionStore, SESSION_COOKIE } from './dist/index.js';
 
 const [issuer, clientId] = process.argv.slice(2);
 if (!issuer || !clientId) {
@@ -189,13 +189,30 @@ if (who.kind === 'json') {
   );
 }
 
+// 5b. THE SERVER BOUND THE TOKEN TO OUR KEY, asserted rather than inferred.
+//
+// The callback refuses a mismatch, so a passing login already implies this. Implying is not
+// measuring: if the server stopped emitting `cnf` altogether the check would go quiet and this
+// script would still be green, having stopped testing the binding at all.
+{
+  const record = await store.getSession(sessionCookie[2]);
+  const [, claims] = record.accessToken.split('.');
+  const cnf = JSON.parse(Buffer.from(claims, 'base64url').toString('utf8')).cnf;
+  check('the access token carries a cnf.jkt', typeof cnf?.jkt === 'string', JSON.stringify(cnf));
+  check(
+    'the token is bound to the key this session proved possession of',
+    cnf?.jkt === (await thumbprint(record.dpopKey.publicJwk)),
+    `${cnf?.jkt} vs our key`,
+  );
+}
+
 // 5. The session record really is DPoP-bound. Without this the login could have succeeded on a
 // server that did not require a proof, and the binding would be untested.
 const record = await store.getSession(sessionCookie[2]);
 check('the session holds a DPoP key', record?.dpopKey?.privateJwk !== undefined);
 check('the DPoP key is EC P-256', record?.dpopKey?.publicJwk?.crv === 'P-256');
 
-if (checked < 11) {
+if (checked < 13) {
   failures.push(`only ${checked} checks ran`);
 }
 if (failures.length > 0) {

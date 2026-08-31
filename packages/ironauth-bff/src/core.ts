@@ -25,7 +25,7 @@
  */
 
 import { discover } from './discovery.js';
-import { dpopProof, newDpopKey, type DpopKey } from './dpop.js';
+import { dpopProof, newDpopKey, thumbprint, type DpopKey } from './dpop.js';
 import { SESSION_COOKIE, clearSessionCookie, sessionCookie, sessionFromCookieHeader } from './cookie.js';
 import { MemorySessionStore, type SessionRecord, type SessionStore, newId } from './session.js';
 
@@ -89,6 +89,31 @@ export interface BffConfig {
    * to override in either direction.
    */
   dpop?: boolean;
+}
+
+/**
+ * The `cnf.jkt` a JWT access token claims, or undefined when there is none to read.
+ *
+ * Deliberately tolerant: this parses an UNVERIFIED token, purely to compare a thumbprint the
+ * server chose against one we already hold. Nothing here decides whether the token is valid, so
+ * a token that does not parse is simply a token with no claim to compare -- not an error, and
+ * certainly not a reason to reject a login.
+ */
+function confirmationThumbprint(accessToken: string): string | undefined {
+  const segments = accessToken.split('.');
+  if (segments.length !== 3) {
+    return undefined;
+  }
+  try {
+    const claims = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(atob(segments[1].replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)),
+      ),
+    ) as { cnf?: { jkt?: unknown } };
+    return typeof claims.cnf?.jkt === 'string' ? claims.cnf.jkt : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Whether this configuration uses DPoP; see {@link BffConfig.dpop}. */
@@ -190,7 +215,16 @@ export async function login(config: BffConfig, request: BffRequest): Promise<Bff
   // FROM THE DISCOVERY DOCUMENT, never `${issuer}/authorize`: an IronAuth issuer carries an
   // environment path while its endpoints do not, so concatenation builds a URL that 404s. See
   // discovery.ts for the measurement.
-  const metadata = await discover(config.issuer, send(config), () => clock(config));
+  //
+  // Wrapped, because an issuer that is briefly unreachable is an ORDINARY event and every other
+  // handler here reports it as a typed result. Letting it throw from this one made a transient
+  // outage an unhandled exception in the caller's framework instead of a 502.
+  let metadata;
+  try {
+    metadata = await discover(config.issuer, send(config), () => clock(config));
+  } catch {
+    return { kind: 'upstream_error', status: 502, detail: 'the issuer metadata was unreadable' };
+  }
   const authorize = new URL(metadata.authorizationEndpoint);
   authorize.searchParams.set('response_type', 'code');
   authorize.searchParams.set('client_id', config.clientId);
@@ -286,6 +320,25 @@ export async function callback(config: BffConfig, request: BffRequest): Promise<
     return { kind: 'upstream_error', status: 502, detail: 'the token response carried no access token' };
   }
   const expiresIn = typeof token.expires_in === 'number' ? token.expires_in : 300;
+
+  // THE SERVER'S BINDING MUST BE TO OUR KEY.
+  //
+  // We send a proof; the server decides what to bind to. If those disagree, every later request
+  // fails with an error about the request rather than about the login, which is the kind of
+  // mismatch that costs an afternoon. Checked here, once, while the cause is still visible.
+  //
+  // Only when the token is a JWT carrying `cnf.jkt`: an opaque access token is perfectly legal
+  // and says nothing about the binding, so an absent claim is not evidence of a problem.
+  if (pending.dpopKey) {
+    const bound = confirmationThumbprint(accessToken);
+    if (bound !== undefined && bound !== (await thumbprint(pending.dpopKey.publicJwk))) {
+      return {
+        kind: 'upstream_error',
+        status: 502,
+        detail: 'the access token is bound to a different key than the one that proved possession',
+      };
+    }
+  }
 
   const sessionId = newId();
   await config.store.putSession(sessionId, {
