@@ -70583,6 +70583,30 @@ impl BackchannelAuthRepo<'_> {
         linkage: BackchannelApprovalLinkage<'_>,
         now_micros: i64,
     ) -> Result<bool, StoreError> {
+        self.decide_with_event(env, id, subject, approved, linkage, now_micros, None)
+            .await
+    }
+
+    /// [`Self::decide`], additionally emitting `backchannel_request.decided`.
+    ///
+    /// The event lands in the DECISION's transaction, so a refusal -- every path that returns
+    /// `Ok(false)` by dropping the transaction rather than committing it -- announces nothing.
+    /// A decision that did not happen must not appear to have happened.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decide`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decide_with_event(
+        &self,
+        env: &Env,
+        id: &BackchannelAuthRequestId,
+        subject: &str,
+        approved: bool,
+        linkage: BackchannelApprovalLinkage<'_>,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<bool, StoreError> {
         // AN APPROVAL MUST OPEN A GRANT. This is the other end of the invariant redemption
         // enforces, and enforcing only one end is what let five rounds of review find holes.
         //
@@ -70729,6 +70753,9 @@ impl BackchannelAuthRepo<'_> {
                 .await?;
             }
         }
+        // IN THE DECISION'S TRANSACTION, after every refusal path has already returned by
+        // dropping it. A rolled-back decision announces nothing.
+        enqueue_domain_event(&mut tx, env, self.scope, event).await?;
         tx.commit().await?;
         Ok(true)
     }

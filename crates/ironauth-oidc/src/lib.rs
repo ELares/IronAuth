@@ -96,6 +96,7 @@ mod consent;
 mod consent_core;
 mod dcr_policy;
 mod device;
+mod backchannel_approve;
 mod device_verify;
 mod discovery;
 mod disposable;
@@ -569,6 +570,14 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/device",
             get(device_verify::device_get).post(device_verify::device_post),
+        )
+        // The CIBA APPROVAL page (issue #131 criterion 1). The store has had
+        // `pending_for_subject` and `decide` since the feature landed and nothing exposed
+        // either over HTTP, so a backchannel request could be created, polled, and expire
+        // without any human ever being able to approve it.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/backchannel",
+            get(backchannel_approve::backchannel_get).post(backchannel_approve::backchannel_post),
         )
         // The self-service end-user account API (issue #61): an AUTHENTICATED user
         // manages their OWN account. Scope-routed under the per-environment path so
