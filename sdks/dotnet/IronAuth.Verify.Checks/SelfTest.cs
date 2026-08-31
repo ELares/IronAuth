@@ -161,6 +161,43 @@ internal static class SelfTest
         Accepts(verifier, Fixtures.Mint(pair, """{"alg":"EdDSA","typ":"JWT","kid":"self-1"}""", shallowClaims),
             "claims nested INSIDE the cap still verify (the control for the cap above)");
 
+        // DISPOSE ACTUALLY RELEASES THE HANDLE, rather than being a no-op that satisfies an
+        // analyzer. The RSA and P-256 keys wrap platform objects owning native handles; a
+        // deployment refetching JWKS on a rotation schedule builds a new key set every time, so a
+        // Dispose that did nothing would accumulate handles until a collection happened to run.
+        //
+        // Observable the only way it can be: after disposal the key must refuse to work.
+        using (System.Security.Cryptography.RSA rsa = System.Security.Cryptography.RSA.Create(2048))
+        {
+            System.Security.Cryptography.RSAParameters parameters = rsa.ExportParameters(false);
+            IReadOnlyList<TrustedKey> rsaKeys = TrustedKey.FromJwks(
+                $$"""{"keys":[{"kty":"RSA","n":"{{Base64Url.Encode(parameters.Modulus!)}}","e":"{{Base64Url.Encode(parameters.Exponent!)}}","kid":"rsa-self"}]}""");
+            _checked++;
+            if (rsaKeys.Count != 1)
+            {
+                Failures.Add("a generated RSA JWK did not decode, so the disposal check never ran");
+            }
+            else
+            {
+                // The control: it works BEFORE disposal. Without this, a key that never worked
+                // would pass the assertion below for entirely the wrong reason.
+                byte[] probe = Encoding.ASCII.GetBytes("probe");
+                _ = rsaKeys[0].Verify(probe, new byte[256]);
+
+                rsaKeys[0].Dispose();
+                _checked++;
+                try
+                {
+                    rsaKeys[0].Verify(probe, new byte[256]);
+                    Failures.Add("a disposed RSA key still verified, so Dispose released nothing");
+                }
+                catch (ObjectDisposedException)
+                {
+                    // As intended: the handle is gone.
+                }
+            }
+        }
+
         // An empty allow-list reads as "allow nothing" and behaves as a silent outage, so it is
         // refused at construction rather than at the first request.
         _checked++;
@@ -176,7 +213,7 @@ internal static class SelfTest
 
         // A floor, so commenting assertions out fails here instead of reporting a smaller number
         // in a green run. A floor and not an equality: adding a property should not break it.
-        if (_checked < 17)
+        if (_checked < 19)
         {
             Console.Error.WriteLine($"FAIL: only {_checked} properties ran; this suite is its list");
             return 1;

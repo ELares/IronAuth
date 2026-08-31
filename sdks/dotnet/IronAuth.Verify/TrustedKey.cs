@@ -21,7 +21,7 @@ namespace IronAuth.Verify;
 /// dependency the criterion anticipated.
 /// </para>
 /// </remarks>
-public abstract class TrustedKey
+public abstract class TrustedKey : IDisposable
 {
     /// <summary>The JWK key id, or null for a key published without one.</summary>
     public string? Kid { get; }
@@ -44,6 +44,32 @@ public abstract class TrustedKey
     /// </summary>
     public override string ToString() => $"TrustedKey[kid={Kid}, kty={Kty}]";
 
+    /// <summary>Release the platform key handles this key holds.</summary>
+    /// <remarks>
+    /// <para>
+    /// The RSA and P-256 subclasses wrap <see cref="System.Security.Cryptography.RSA"/> and
+    /// <see cref="System.Security.Cryptography.ECDsa"/>, which own native handles. A verifier
+    /// built once at startup would never notice, but a deployment refetching JWKS on a rotation
+    /// schedule builds a new key set every time and would accumulate handles until a collection
+    /// happened to run.
+    /// </para>
+    /// <para>
+    /// Ed25519 keys hold only managed BouncyCastle state and have nothing to release; they
+    /// implement this because the caller cannot tell the subclasses apart and should not have to.
+    /// </para>
+    /// </remarks>
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    /// <param name="disposing">true when called from <see cref="Dispose()"/> rather than a finalizer</param>
+    protected virtual void Dispose(bool disposing)
+    {
+        // Nothing by default: an Ed25519 key holds no unmanaged resource.
+    }
+
     /// <summary>Decode a JWK Set document into the keys this verifier can represent.</summary>
     /// <remarks>
     /// A key type this build cannot represent is SKIPPED rather than fatal: an issuer may publish
@@ -52,6 +78,10 @@ public abstract class TrustedKey
     /// <see cref="RejectReason.UnknownKid"/>, which is the right answer: this verifier really does
     /// not know that key.
     /// </remarks>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage(
+        "Reliability",
+        "CA2000:Dispose objects before losing scope",
+        Justification = "Ownership of each decoded key transfers to the returned list, which the caller disposes; a failure partway through disposes what was already built.")]
     public static IReadOnlyList<TrustedKey> FromJwks(string json)
     {
         using JsonDocument document = JsonDocument.Parse(json);
@@ -61,14 +91,27 @@ public abstract class TrustedKey
         }
 
         List<TrustedKey> decoded = [];
-        foreach (JsonElement jwk in keys.EnumerateArray())
+        try
         {
-            TrustedKey? key = TryDecode(jwk);
-            if (key is not null)
+            foreach (JsonElement jwk in keys.EnumerateArray())
             {
-                decoded.Add(key);
+                TrustedKey? key = TryDecode(jwk);
+                if (key is not null)
+                {
+                    decoded.Add(key);
+                }
             }
         }
+        catch
+        {
+            // A failure partway through would otherwise strand the keys already built, each
+            // holding a platform handle. TryDecode swallows the malformed-key cases itself, so
+            // reaching here means something unanticipated, which is exactly when a leak is
+            // least likely to be noticed.
+            decoded.ForEach(built => built.Dispose());
+            throw;
+        }
+        // Ownership passes to the caller with the list; see the Dispose remarks on this type.
         return decoded;
     }
 
@@ -154,6 +197,15 @@ internal sealed class P256Key : TrustedKey
     /// </remarks>
     public override bool Verify(ReadOnlySpan<byte> signingInput, ReadOnlySpan<byte> signature) =>
         _key.VerifyData(signingInput, signature, HashAlgorithmName.SHA256);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _key.Dispose();
+        }
+        base.Dispose(disposing);
+    }
 }
 
 /// <summary>An RSA key, verified by the platform.</summary>
@@ -170,4 +222,13 @@ internal sealed class RsaKey : TrustedKey
 
     public override bool Verify(ReadOnlySpan<byte> signingInput, ReadOnlySpan<byte> signature) =>
         _key.VerifyData(signingInput, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _key.Dispose();
+        }
+        base.Dispose(disposing);
+    }
 }

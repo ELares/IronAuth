@@ -75,6 +75,19 @@ publishing EdDSA only; for a verifier that cannot do ES256 at all, passing it pr
   reads in chunks from `ResponseHeadersRead` and stops at the limit, and the harness serves a
   two-megabyte key set to prove it.
 
+### Keys are disposable, and that is checked
+
+`TrustedKey` implements `IDisposable`. The RSA and P-256 subclasses wrap platform objects owning
+native handles; a deployment refetching JWKS on a rotation schedule builds a new key set every
+time, so keys that were never released would accumulate until a collection happened to run. Ed25519
+keys hold only managed state and have nothing to release, but implement it anyway because a caller
+cannot tell the subclasses apart and should not have to.
+
+Two different things guard it, because they catch different mistakes. `CA2213` fails the **build**
+if a subclass stops disposing its field, and a self-test property proves at **runtime** that
+disposal is not a no-op: a disposed key must refuse to verify, with a control asserting it worked
+beforehand.
+
 ## Scope limits, stated rather than left to be discovered
 
 - **No key fetching or caching.** `IronAuthVerifier` takes keys the caller resolved. `Sample`

@@ -86,8 +86,21 @@ public static class Sample
         algorithms.Remove("none");
 
         IReadOnlyList<TrustedKey> keys = TrustedKey.FromJwks(await FetchAsync(http, jwksUri).ConfigureAwait(false));
-        IronAuthVerifier verifier = new(algorithms, keys, issuer, audience, 60);
-        return verifier.Verify(token, nowEpochSeconds);
+        try
+        {
+            IronAuthVerifier verifier = new(algorithms, keys, issuer, audience, 60);
+            // The claims are a CLONE, so releasing the keys here cannot invalidate what is
+            // returned. This method builds a fresh key set on every call; a caching verifier would
+            // hold one instead, which is exactly why the verifier does not own its keys.
+            return verifier.Verify(token, nowEpochSeconds);
+        }
+        finally
+        {
+            foreach (TrustedKey key in keys)
+            {
+                key.Dispose();
+            }
+        }
     }
 
     private static async Task<string> FetchAsync(HttpClient http, string url)
