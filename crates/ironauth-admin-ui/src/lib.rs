@@ -57,7 +57,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
+use axum::http::{Extensions, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use rust_embed::RustEmbed;
@@ -153,10 +153,17 @@ pub fn router(management: Option<Router>, config: RuntimeConfig) -> Router {
     Router::new()
         .route(MOUNT_PREFIX, get(serve_index))
         .route("/admin/", get(serve_index))
-        // ONE handler owns every deeper path so the static-asset serving and the
-        // `/admin/api/*` proxy never register overlapping catch-all routes (which
-        // axum would reject). The handler dispatches on the raw path. `any` so the
-        // proxy can carry every method; the serving branch answers only GET.
+        // ONE handler owns every deeper path and dispatches on the raw path. `any` so
+        // the proxy can carry every method; the serving branch answers only GET.
+        //
+        // This is NOT because axum would reject the alternative. Measured against the
+        // pinned axum 0.8 and matchit 0.8, both a sibling catch-all at
+        // `/admin/api/{*rest}` and a `nest_service("/admin/api", management)` construct
+        // fine, and the nested form needs no extension clearing in the proxy at all
+        // because axum scopes the inner match itself. That is the better shape and is
+        // worth moving to; it is deliberately not bundled into a fix whose whole point
+        // is to stop the console 500ing, because it changes how every `/admin` path is
+        // matched and the single-handler dispatch is what the surrounding tests pin.
         .route("/admin/{*path}", any(serve_or_proxy))
         .with_state(UiState { management, config })
 }
@@ -235,6 +242,27 @@ async fn proxy_to_management(management: Router, request: Request) -> Response {
         return (StatusCode::BAD_REQUEST, Body::empty()).into_response();
     };
     parts.uri = uri;
+    // Drop the OUTER router's state before re-dispatching. `/admin/{*path}` captured
+    // one path parameter and left it in the extensions; axum ADDS the inner router's
+    // captures to that set rather than replacing it, so a management handler taking
+    // `Path<(tenant, environment)>` is handed THREE parameters and fails the arity
+    // check with "Wrong number of path arguments". Every parameterised management
+    // route is unreachable through the console until this is cleared, which is nearly
+    // the whole console: only the parameterless routes (`/v1/tenants`, `/v1/me`)
+    // survive.
+    //
+    // Clearing ALL of them is safe because NOTHING REACHABLE FROM THE MANAGEMENT
+    // ROUTER READS A REQUEST EXTENSION. That is the property, and it is a property of
+    // the routed code, not of where the router came from: an unlayered router can
+    // still hold a handler that reads an extension some OUTER layer inserted, which is
+    // exactly what the public plane's observability layer does when it inserts its
+    // client context. Checked directly: the management router's own extractors read
+    // HEADERS (the bearer principal, the declared entry path), and the one extension
+    // extractor in the workspace lives in `ironauth-server`, which this router is not
+    // wrapped in. A future extractor that reads an extension here would break, so the
+    // proxy test asserts the parameters arrive with their own values rather than
+    // asserting only a 200.
+    parts.extensions = Extensions::new();
     // A Router's Service error is Infallible, so this await never yields an Err.
     management
         .oneshot(Request::from_parts(parts, body))
@@ -398,6 +426,7 @@ mod tests {
     use super::{CONTENT_SECURITY_POLICY, RuntimeConfig, escape_attribute, router};
     use axum::Router;
     use axum::body::Body;
+    use axum::extract::Path;
     use axum::http::{Request, StatusCode, header};
     use axum::routing::any;
     use http_body_util::BodyExt;
@@ -521,6 +550,49 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&body),
             "POST /v1/tenants?limit=2 auth=Bearer at.jwt.token"
+        );
+    }
+
+    /// A stand-in management router whose route takes TWO path parameters, which is
+    /// the shape every NESTED management route has. `echo_management` above matches a
+    /// catch-all and extracts nothing, so it cannot observe a leaked parameter; that
+    /// is precisely why the proxy's arity failure never showed up in these tests.
+    fn parameterised_management() -> Router {
+        Router::new().route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}",
+            any(
+                |Path((tenant, environment)): Path<(String, String)>| async move {
+                    format!("tenant={tenant} environment={environment}")
+                },
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn proxies_a_management_route_that_carries_path_parameters() {
+        // The outer `/admin/{*path}` match leaves its own capture in the request
+        // extensions, and axum ADDS the inner router's captures to that set rather
+        // than replacing it. Forwarding the parts unchanged therefore hands a handler
+        // taking two parameters a set of three, and axum answers 500 with "Wrong
+        // number of path arguments". Only the PARAMETERLESS management routes survived
+        // that, so the console could list tenants and nothing else: every nested view
+        // (environments, users, clients, organizations) was a 500, while the same
+        // routes answered 200 on the management plane directly.
+        let router = router(Some(parameterised_management()), RuntimeConfig::default());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/tenants/ten_a/environments/env_b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_string(response).await,
+            "tenant=ten_a environment=env_b",
+            "each parameter reaches the handler with its own value"
         );
     }
 
