@@ -1,0 +1,20 @@
+{
+  "name": "@ironauth/bff",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The IronAuth backend-for-frontend helper (issue #117): the OAuth 2.0 for Browser-Based Apps BCP's first-choice architecture, framework-agnostic, with every token held server-side.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsc && node --test \"dist/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
