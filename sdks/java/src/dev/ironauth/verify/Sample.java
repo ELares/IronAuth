@@ -6,6 +6,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashSet;
@@ -125,14 +126,25 @@ public final class Sample {
                 .header("accept", "application/json")
                 .GET()
                 .build();
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() != 200) {
-            throw new IOException(url + " returned " + response.statusCode());
+        // ofInputStream, NOT ofString. ofString buffers the WHOLE body before returning, so a
+        // length check afterwards runs only once the memory is already spent -- the bound would
+        // read like a defence and stop nothing. Reading a bounded number of bytes and refusing
+        // the moment the limit is passed is the version that actually holds.
+        HttpResponse<java.io.InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        try (java.io.InputStream stream = response.body()) {
+            if (response.statusCode() != 200) {
+                throw new IOException(url + " returned " + response.statusCode());
+            }
+            byte[] buffer = new byte[8192];
+            java.io.ByteArrayOutputStream collected = new java.io.ByteArrayOutputStream();
+            int read;
+            while ((read = stream.read(buffer)) != -1) {
+                collected.write(buffer, 0, read);
+                if (collected.size() > MAX_DOCUMENT_BYTES) {
+                    throw new IOException(url + " returned more than " + MAX_DOCUMENT_BYTES + " bytes");
+                }
+            }
+            return collected.toString(StandardCharsets.UTF_8);
         }
-        String body = response.body();
-        if (body.length() > MAX_DOCUMENT_BYTES) {
-            throw new IOException(url + " returned " + body.length() + " bytes");
-        }
-        return body;
     }
 }

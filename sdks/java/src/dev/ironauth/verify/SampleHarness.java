@@ -40,6 +40,9 @@ public final class SampleHarness {
     /** The issuer name the discovery document claims, which is not always the one being asked for. */
     private static volatile String advertisedIssuer;
 
+    /** When set, discovery points at a key set far larger than the sample will read. */
+    private static volatile boolean oversizeJwks;
+
     /** When set, discovery answers 302 to a document that names the RIGHT issuer and wrong keys. */
     private static volatile boolean redirectDiscovery;
 
@@ -62,12 +65,16 @@ public final class SampleHarness {
                 return;
             }
             respond(exchange,
-                    "{\"issuer\":\"" + advertisedIssuer + "\",\"jwks_uri\":\"" + base + "/jwks\","
+                    "{\"issuer\":\"" + advertisedIssuer + "\",\"jwks_uri\":\"" + base
+                            + (oversizeJwks ? "/huge-jwks" : "/jwks") + "\","
                             + "\"id_token_signing_alg_values_supported\":" + advertisedAlgorithms + "}");
         });
         // The redirect target names the CORRECT issuer and points at a DIFFERENT key set. That
         // combination is the point: the issuer check cannot save you here, so only the decision
         // not to follow the redirect does.
+        // Two megabytes of valid JSON, over the sample's one-megabyte ceiling.
+        server.createContext("/huge-jwks", exchange -> respond(exchange,
+                "{\"keys\":[],\"padding\":\"" + "A".repeat(2 << 20) + "\"}"));
         server.createContext("/elsewhere-discovery", exchange -> respond(exchange,
                 "{\"issuer\":\"" + base + "\",\"jwks_uri\":\"" + base + "/elsewhere-jwks\","
                         + "\"id_token_signing_alg_values_supported\":[\"EdDSA\"]}"));
@@ -157,6 +164,20 @@ public final class SampleHarness {
             });
             advertisedIssuer = base;
 
+            // The document size ceiling is REAL, not a length check after the fact: a body is read
+            // in bounded chunks and refused the moment it passes the limit. Measured here because
+            // a bound nothing ever exceeds is indistinguishable from a bound that does not work.
+            oversizeJwks = true;
+            check("an oversized key set is refused rather than buffered", () -> {
+                try {
+                    Sample.verify(base, "cli_sample", token);
+                    return "it verified";
+                } catch (java.io.IOException expected) {
+                    return expected.getMessage().contains("more than") ? null : "failed with " + expected.getMessage();
+                }
+            });
+            oversizeJwks = false;
+
             // A redirect on discovery is an invitation to fetch someone else's keys, so the
             // client is built with Redirect.NEVER. Following it here would reach a document
             // naming the right issuer and the wrong keys, which every later check would accept.
@@ -183,7 +204,7 @@ public final class SampleHarness {
                 }
             });
 
-            if (checked < 8) {
+            if (checked < 9) {
                 FAILURES.add("only " + checked + " checks ran; this harness is its list");
             }
         } finally {

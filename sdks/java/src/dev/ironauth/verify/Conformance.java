@@ -233,6 +233,12 @@ public final class Conformance {
                 if (!(member.getValue() instanceof String value)) {
                     throw new IllegalStateException("the JWK member " + member.getKey() + " is not a string");
                 }
+                // This renders by concatenation, so a value carrying a quote or a backslash would
+                // silently produce a DIFFERENT key set rather than an error. Corpus values are
+                // base64url and identifiers; anything else is a corpus change this cannot express.
+                if (value.contains("\"") || value.contains("\\")) {
+                    throw new IllegalStateException("the JWK member " + member.getKey() + " needs escaping");
+                }
                 out.append('"').append(member.getKey()).append("\":\"").append(value).append('"');
             }
             out.append('}');
