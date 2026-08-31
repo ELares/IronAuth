@@ -1247,6 +1247,30 @@ jobs:
         working-directory: packages/ironauth-mcp
         run: npm test
 
+  dotnet-verify:
+    # Issue #118 criterion 5: the official .NET verifier artifact, against the SHARED
+    # cross-language conformance corpus.
+    #
+    # Its own job because it needs the .NET SDK and nothing else here does. ONE dependency,
+    # BouncyCastle, for Ed25519 alone: .NET has no in-box Ed25519 as of .NET 10, which was
+    # verified by reflecting over System.Security.Cryptography rather than taken from the docs.
+    # RSA and P-256 come from the platform.
+    name: dotnet verifier (shared conformance corpus, BouncyCastle for Ed25519)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          # The artifact targets net8.0 so consumers on the current LTS can use it; the 8.0
+          # runtime is installed alongside the SDK so the shipped target is what actually runs,
+          # rather than a roll-forward onto a newer runtime.
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: verify (corpus + self-test + live sample)
+        run: scripts/dotnet-verify.sh
+
   java-verify:
     # Issue #118 criterion 4: the official Java verifier artifact, against the SHARED
     # cross-language conformance corpus.
