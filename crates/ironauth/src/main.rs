@@ -5283,6 +5283,13 @@ fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
         scope.client,
         dev::DEV_REDIRECT_URI
     );
+    // The machine identity (issue #126), printed because a workload-federation subject
+    // mapping has to NAME one and there is no route that creates it: a reader who cannot see
+    // this value cannot register a mapping at all.
+    println!(
+        "ironauth dev: machine identity {} (owned by client {})",
+        scope.machine_identity, scope.workload_client
+    );
     println!("ironauth dev: operator token {}", dev::DEV_OPERATOR_TOKEN);
     println!(
         "ironauth dev: user {} / {}",

@@ -1364,6 +1364,41 @@ jobs:
             -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO
 
+  workload-github:
+    # Issue #126 criterion 1: a GitHub Actions job obtains an IronAuth access token using ONLY
+    # its ambient OIDC token, with zero stored secrets.
+    #
+    # The criterion names a JOB rather than a fixture, and that is the whole point of this
+    # lane. `jwt_bearer.rs` already has `a_github_actions_shaped_workload_token_binds_the_exact
+    # _repository_and_ref`, which mints a GitHub-SHAPED token and proves the mapping logic. It
+    # cannot prove that a token this repository did not mint, signed by a key set it has never
+    # seen, verifies against GitHub's real JWKS -- because the runner is the only thing that
+    # can produce one.
+    #
+    # ZERO STORED SECRETS is structural here rather than asserted: `id-token: write` is the
+    # only permission, there is no secret in the repository for this, and the presenting client
+    # is the emulator's PUBLIC client. The assertion is the only credential in the exchange.
+    name: workload federation (a real Actions OIDC token, zero stored secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      # Naming any permission drops the defaults, so `contents: read` has to come back for the
+      # checkout. `id-token: write` is what lets the job ask the runner for its own token.
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: exchange the runner's ambient token for an IronAuth access token
+        env:
+          # GitHub's real key set, fetched through the SSRF-hardened fetcher like any other
+          # external issuer. Nothing about this issuer is special-cased.
+          IRONAUTH_EXTERNAL_JWKS_URI: https://token.actions.githubusercontent.com/.well-known/jwks
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          scripts/workload-github.sh
+
   java-verify:
     # Issue #118 criterion 4: the official Java verifier artifact, against the SHARED
     # cross-language conformance corpus.
