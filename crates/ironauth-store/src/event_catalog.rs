@@ -618,6 +618,23 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The mirror, and the one an integrator DEPROVISIONS on. Both ends, for the reason
+        // the user pair records: a receiver that learns only about joins accumulates
+        // authority it can never take away.
+        "organization.service_account_removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "membership_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "service_account_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["membership_id", "organization_id", "service_account_id"]
+        }"#,
+    ),
+    (
         "organization.member_added",
         1,
         r#"{

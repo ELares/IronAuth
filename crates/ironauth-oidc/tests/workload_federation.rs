@@ -154,6 +154,17 @@ async fn manage_patch(
     send(router, request).await
 }
 
+/// `DELETE` on the management plane as the bootstrap operator.
+async fn manage_delete(router: &Router, path: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {OPERATOR_TOKEN}"))
+        .body(Body::empty())
+        .expect("request builds");
+    send(router, request).await
+}
+
 /// `GET` from the management plane as the bootstrap operator.
 async fn manage_get(router: &Router, path: &str) -> (StatusCode, String) {
     let request = Request::builder()
@@ -2051,6 +2062,31 @@ async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
         claims["roles"],
         serde_json::json!(["deployer"]),
         "the token must carry the roles that organization attached: {claims}"
+    );
+
+    // AND THE DOOR SWINGS BOTH WAYS. Removing the membership must remove the authority,
+    // which also proves the roles are resolved FRESH at issuance rather than frozen onto
+    // anything. A grant that could be given and not taken back is a one-way door, and the
+    // store's own comment records that decoding `user_id` as a String once made removing a
+    // machine's membership fail outright -- so this is asserted rather than assumed.
+    let (status, body) = manage_delete(
+        &router,
+        &format!("{}/organizations/{org}/memberships/{membership}", base(&h)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "remove the membership: {body}");
+
+    let (status, body) = authenticate(&h, "jti-roles-after", GATE_VALUE).await;
+    assert_eq!(status, StatusCode::OK, "the exchange still succeeds: {body}");
+    let claims = jwt_payload(json(&body)["access_token"].as_str().expect("an access token"));
+    assert_eq!(
+        claims["sub"].as_str(),
+        Some(identity.as_str()),
+        "still the mapped identity: {claims}"
+    );
+    assert!(
+        claims.get("roles").is_none() && claims.get("org_id").is_none(),
+        "a removed membership must take its organization and roles with it: {claims}"
     );
 }
 

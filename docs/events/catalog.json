@@ -2182,6 +2182,34 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "membership_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "service_account_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "membership_id",
+          "organization_id",
+          "service_account_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "organization.service_account_removed"
+    },
+    {
+      "domain": "organization",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "organization_id": {
             "minLength": 1,
             "type": "string"

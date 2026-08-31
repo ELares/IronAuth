@@ -359,6 +359,35 @@ pub async fn create_service_account_membership(
     }
 }
 
+/// The event a machine identity LEAVING an organization emits (issue #126).
+fn service_account_membership_removed_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    membership_id: &ironauth_store::OrgMembershipId,
+    organization_id: &ironauth_store::OrganizationId,
+    service_account_id: &ironauth_store::ServiceAccountId,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = membership_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "organization.service_account_removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": organization_id.to_string(),
+            "service_account_id": service_account_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
 /// The event a machine identity joining an organization emits (issue #126).
 fn service_account_membership_event(
     state: &AdminState,
@@ -496,25 +525,58 @@ pub async fn delete_membership(
     // membership of a DIFFERENT organization (even in the same scope) presented under
     // this org's path is the uniform not-found, so a wrong-org path can never remove
     // another organization's membership.
-    let record = memberships.get(&id).await?;
-    if record.organization_id != org_id {
-        return Err(ApiError::NotFound);
-    }
-    let delta = membership_delta_event(
-        &state,
-        scope,
-        &org_id,
-        Vec::new(),
-        vec![record.user_id.to_string()],
-    );
-    let pending = membership_event(
-        &state,
-        scope,
-        &id,
-        &org_id,
-        &record.user_id,
-        "organization.member_removed",
-    );
+    // EITHER PRINCIPAL KIND. `get` reads user memberships only, and `get_service_account`
+    // reads the other, so resolving with just the first made a machine identity's membership
+    // a ONE-WAY DOOR: creatable through `createServiceAccountMembership` and removable by
+    // nothing. Measured, before this branch: the DELETE answered the uniform not-found.
+    //
+    // The store's `remove` never needed changing -- it matches on the membership id alone and
+    // its own comment records that decoding `user_id` as a String once broke exactly this. It
+    // was the ADDRESSING read in front of it that only knew about people.
+    let (delta, pending) = match memberships.get(&id).await {
+        Ok(record) => {
+            if record.organization_id != org_id {
+                return Err(ApiError::NotFound);
+            }
+            (
+                membership_delta_event(
+                    &state,
+                    scope,
+                    &org_id,
+                    Vec::new(),
+                    vec![record.user_id.to_string()],
+                ),
+                membership_event(
+                    &state,
+                    scope,
+                    &id,
+                    &org_id,
+                    &record.user_id,
+                    "organization.member_removed",
+                ),
+            )
+        }
+        Err(StoreError::NotFound) => {
+            let record = memberships.get_service_account(&id).await?;
+            if record.organization_id != org_id {
+                return Err(ApiError::NotFound);
+            }
+            // NO DELTA EVENT. `organization.membership_delta` carries user ids, and a
+            // machine identity is not one; inventing a shape for it here would put a value
+            // in that field no consumer's schema expects.
+            (
+                None,
+                service_account_membership_removed_event(
+                    &state,
+                    scope,
+                    &id,
+                    &org_id,
+                    &record.service_account_id,
+                ),
+            )
+        }
+        Err(other) => return Err(other.into()),
+    };
     state
         .store()
         .management()
