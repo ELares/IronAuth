@@ -3132,6 +3132,11 @@ mod tests {
             // attacker obtained honestly, which is an audit forgery rather than a privilege
             // claim, and the reason `act` is reserved.
             "act": { "sub": "adm_victim", "reason_code": "forged" },
+            // RFC 9396 (issue #131). Absent from this fixture the sanity loop below
+            // compares None to None and FAILS: `assert_ne!` on two absent entries is
+            // not a pass. Every protected name has to appear here or the loop reports
+            // a hostile value it was never given.
+            "authorization_details": [{ "type": "evil", "actions": ["transfer"] }],
             // Organization context (issue #94): a machine token asserts no human org.
             "org_id": "org_evil",
             // Organization roles (issue #97): a machine token asserts no human

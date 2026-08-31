@@ -1907,8 +1907,8 @@ mod tests {
         // RESERVED_ENRICHMENT_CLAIMS is covered by the mint fold could be removed with
         // nothing red.
         assert_eq!(
-            checked, 50,
-            "the three lists are 25 + 5 + 20; a link was dropped from the chain"
+            checked, 51,
+            "the three lists are 26 + 5 + 20; a link was dropped from the chain"
         );
     }
 
