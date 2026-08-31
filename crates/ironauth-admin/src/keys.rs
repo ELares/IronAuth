@@ -302,6 +302,9 @@ pub async fn get_key(
 pub async fn delete_key(
     State(state): State<AdminState>,
     principal: Principal,
+    // How the caller says this arrived (issue #123 criterion 5): an MCP tool drives this
+    // handler, so the audit row must be able to say so.
+    entry_path: crate::entry_path::DeclaredEntryPath,
     Path((tenant_id, environment_id, key_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
@@ -317,6 +320,7 @@ pub async fn delete_key(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        .via(entry_path.0)
         .credentials(scope)
         .delete_with_event(
             state.env(),

@@ -982,6 +982,12 @@ jobs:
       # goes wrong is a quickstart three directories away showing the easy thing.
       - name: BFF docs (the BCP ranking, and no localStorage token guidance)
         run: scripts/bff-docs.sh
+      # Issue #123 criterion 5: every MUTATING admin MCP tool drives a handler that records the
+      # entry path. The tool set is declared in TypeScript and the handlers are Rust, so nothing
+      # in either language can compare them -- this resolves each tool through the published
+      # contract and reads the handler's signature.
+      - name: MCP entry path (every mutating tool's handler records how it arrived)
+        run: scripts/mcp-entry-path.sh
       # Issue #108 criterion 4. This job already checks out full history for the OpenAPI
       # changelog, which is the same thing this needs: a base revision to diff against.
       - name: event registry compatibility (a breaking payload change bumps its version)
@@ -1201,6 +1207,24 @@ jobs:
         run: npm ci
       - name: test
         working-directory: packages/ironauth-bff
+        run: npm test
+
+  mcp:
+    # Issue #123: the admin MCP server. Its own job for the reason the BFF's is: a failure
+    # reported under another package's name sends the reader to the wrong place.
+    name: admin mcp (tool scopes, confirmation, entry path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: install (locked)
+        working-directory: packages/ironauth-mcp
+        run: npm ci
+      - name: test
+        working-directory: packages/ironauth-mcp
         run: npm test
 
   admin-spa:

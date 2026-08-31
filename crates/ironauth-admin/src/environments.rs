@@ -321,6 +321,9 @@ pub async fn get_environment(
 pub async fn delete_environment(
     State(state): State<AdminState>,
     principal: Principal,
+    // How the caller says this arrived (issue #123 criterion 5): an MCP tool drives this
+    // handler, so the audit row must be able to say so.
+    entry_path: crate::entry_path::DeclaredEntryPath,
     Path((tenant_id, environment_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let actor = principal.require_operator()?;
@@ -363,6 +366,7 @@ pub async fn delete_environment(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
+        .via(entry_path.0)
         .environments(state.bootstrap_operator_id(), tenant)
         .delete_with_event(state.env(), &environment, deleted_event.as_ref())
         .await?;

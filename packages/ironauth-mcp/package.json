@@ -1,0 +1,20 @@
+{
+  "name": "@ironauth/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The IronAuth admin MCP server (issue #123): the management API as agent tools, with per-tool scope checks, destructive-operation confirmation, and audited attribution.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsc && node --test \"dist/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

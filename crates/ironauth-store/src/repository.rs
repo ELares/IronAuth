@@ -48156,6 +48156,22 @@ pub struct ActingManagementStore<'a> {
     acting: ActingContext,
 }
 
+impl ActingManagementStore<'_> {
+    /// Record that every audit row written through this store arrived by `entry_path`, the
+    /// management-plane peer of [`ActingStore::via`].
+    ///
+    /// Both planes need it because an agent tool drives both: deleting a user is environment
+    /// plane and deleting an ENVIRONMENT is management plane, and criterion 5 says "every
+    /// mutation" rather than "every mutation on one of the two planes".
+    #[must_use]
+    pub fn via(mut self, entry_path: Option<EntryPath>) -> Self {
+        if let Some(entry_path) = entry_path {
+            self.acting = self.acting.via(entry_path);
+        }
+        self
+    }
+}
+
 impl<'a> ActingManagementStore<'a> {
     /// Attribute every audit row written through this store to `organization` (issue
     /// #110), the management-plane peer of [`ActingStore::in_organization`].
