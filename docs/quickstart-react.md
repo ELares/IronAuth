@@ -273,11 +273,15 @@ cd "$QS_DIR/app"
 # The SPA source never mentions a token, so the BUNDLE must not either. This is a weak check on
 # its own -- a bundle can be innocent while a server leaks -- but it catches the specific
 # regression where someone "simplifies" the client by having it fetch tokens directly.
+# The BUNDLE MUST EXIST first. `grep dist/assets/*.js` over an empty glob finds nothing and
+# reports success, so without this the check passes hardest when there is no bundle at all.
+BUNDLES=$(ls dist/assets/*.js 2>/dev/null | wc -l | tr -d ' ')
+test "$BUNDLES" -ge 1 || { echo "no built bundle to inspect, so this check would pass vacuously"; exit 1; }
 if grep -rqE 'access_token|refresh_token' dist/assets/*.js; then
   echo "the built bundle references tokens; a SPA in this architecture never should"
   exit 1
 fi
-echo "the bundle references no tokens"
+echo "$BUNDLES bundle(s) inspected, none references a token"
 ```
 
 ## 10. Stop everything
