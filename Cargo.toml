@@ -153,7 +153,7 @@ caseless = "0.2"
 # MSRV 1.85 holds. Salt bytes are drawn from the ironauth-env entropy seam (never
 # the crate's own RNG), so hashing stays deterministic under test and the
 # invariant lints are satisfied.
-argon2 = "0.5"
+argon2 = "0.6"
 # The two OAuth2/OIDC client-secret authentication methods interoperate with a
 # real third-party Rust OAuth 2.0 client (issue #20 acceptance): the oauth2 crate
 # drives both client_secret_basic and client_secret_post against the token
