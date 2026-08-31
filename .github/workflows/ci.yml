@@ -761,6 +761,13 @@ jobs:
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
           ./scripts/quickstart.sh nextjs
+      # Issue #116 criterion 2's React third. A DIFFERENT integration from the Next.js guide on
+      # purpose: a bare `node:http` server rather than a framework, driving the same
+      # @ironauth/bff package. That is what makes "framework-agnostic" a measurement.
+      - name: Assert the React quickstart works, verbatim and within budget
+        run: |
+          PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
+          ./scripts/quickstart.sh react
       - name: Assert the Go quickstart works, verbatim and within budget
         run: |
           PG_BIN=$(dirname $(ls /usr/lib/postgresql/*/bin/pg_ctl | head -1)) \
