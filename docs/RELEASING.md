@@ -61,3 +61,25 @@ silently included.
    binary, SHA256SUMS, and SBOM.
 4. First-time note: the release lane is validated end to end by the first
    real release; until then treat it as authored but unproven.
+5. Record a HUMAN-TIMED quickstart run per guide in `docs/dx/timed-runs.md`.
+   See below: this is DX evidence, and deliberately not a gate.
+
+## Human-timed quickstart runs
+
+CI runs every quickstart's documented commands on every push and enforces a
+15-minute budget. That proves the guides WORK and says nothing about what they
+feel like: a machine does not mistype a command, re-read a paragraph, or stop to
+work out which of two things it was meant to install.
+
+So each release also records a person walking one through, start to finish, and
+the number that matters is wall clock from opening the guide to a successful
+login.
+
+**This is not the acceptance gate and must never become one.** The gate is the
+scripted run. A timed run is one person on one machine on one day; treating it as
+a pass/fail would make a slow laptop a release blocker and would tempt whoever
+holds the stopwatch to skip the reading, which is the only part being measured.
+
+Record it in `docs/dx/timed-runs.md` with the template there. Report what was
+confusing even when the time was good: the time is the signal that something is
+wrong, and the notes are the only thing that says what.
