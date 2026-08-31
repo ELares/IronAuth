@@ -28,6 +28,7 @@ both files and fails if either drifts.
 - [The IronAuth exit guide](docs/exit-guide.md): One of IronAuth's three named covenants is **no unexportable data**: you can
 - [IdP-side FedCM (experimental, issue #83)](docs/fedcm.md): IronAuth ships the IdP side of the W3C
 - [Verifying a signed log stream](docs/log-stream-verification.md): IronAuth can sign every batch it ships to a SIEM. This is how a consumer checks one, and
+- [Mobile: signing in over AppAuth](docs/mobile-appauth.md): IronAuth does not ship a mobile SDK. It documents a path over [AppAuth][appauth], which already
 - [Quickstart: authenticate a user from Go](docs/quickstart-go.md): Sign a real user in from a Go backend and verify the token you get, against a local IronAuth that
 - [Quickstart: sign a user in from Next.js](docs/quickstart-nextjs.md): Sign a real user into a **clean Next.js App Router project**, with every token held server-side and
 - [Quickstart: authenticate a user from Python](docs/quickstart-python.md): Sign a real user in from a Python backend and verify the token you get, against a local IronAuth

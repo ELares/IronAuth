@@ -27,6 +27,7 @@ protocol risk from the integrator, first.**
 | --- | --- |
 | Go management SDK | **Generated** from `docs/openapi/management.json` (`sdks/go`) |
 | Python management SDK | **Generated** from `docs/openapi/management.json` (`sdks/python`) |
+| iOS and Android sign-in samples | **Worked AppAuth integrations** (`clients/mobile`) -- sample apps, not a library. See [mobile-appauth.md](mobile-appauth.md), including why an AppAuth client needs the per-client DPoP exemption |
 | .NET token verification | **Hand-written** (`sdks/dotnet`) -- one dependency, BouncyCastle, because .NET still has no in-box Ed25519 as of .NET 10. Verification only: there is no .NET management SDK |
 | Java token verification | **Hand-written, dependency-free** (`sdks/java`) -- the JDK has had Ed25519 since Java 15, so it bundles nothing, not even a JSON parser. Verification only: there is no Java management SDK, and the generated clients remain Go and Python |
 | Reference client | **Hand-written from the published spec** (`clients/reference`) -- proves the spec is sufficient to build against without reading SDK source |
@@ -48,13 +49,16 @@ Nothing below is refused. Each entry states what would change our mind.
   no protocol-level changes, or a specific integrator blocks on framework glue rather than on
   the underlying flow.
 
-- **What**: full native mobile SDKs for iOS and Android.
+- **What**: full native iOS and Android SDKs beyond the documented AppAuth path.
   **Why**: AppAuth already implements RFC 8252 correctly (system browser plus PKCE, claimed
   HTTPS or custom-scheme redirects per platform) and is maintained by people who track
   platform changes we would otherwise chase. A native SDK of our own would mostly re-wrap it,
   and would own a platform-security surface we could not maintain as well.
-  **Instead**: documented AppAuth integration against IronAuth endpoints, plus documentation
-  for exposing native passkey ceremonies through the headless flow API.
+  **Instead**: documented AppAuth integration against IronAuth endpoints
+  ([mobile-appauth.md](mobile-appauth.md)) with SAMPLE APPS in `clients/mobile`, plus
+  documentation for exposing native passkey ceremonies through the headless flow API. The
+  samples are exactly that -- a worked integration a reader copies from -- and are not a
+  library anybody depends on, which is the distinction this entry still defers.
   **Revisit trigger**: AppAuth stops tracking a platform release, or a capability IronAuth
   needs cannot be expressed through it.
 

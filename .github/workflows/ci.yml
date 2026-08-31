@@ -1315,6 +1315,55 @@ jobs:
       - name: a real login, end to end
         run: scripts/bff-live.sh
 
+  mobile-verify:
+    # Issue #116 criterion 7: the AppAuth mobile path.
+    #
+    # Two halves, each proving what the other cannot. The BUILD half assembles the Android
+    # sample into a real APK against the real AppAuth library and checks the MERGED manifest
+    # for the redirect scheme (the source manifest cannot show it: the placeholder is
+    # interpolated by the library's own manifest). The FLOW half runs an AppAuth-SHAPED
+    # exchange -- public client, PKCE, loopback redirect, NO DPoP proof -- against a real
+    # IronAuth, with a CONTROL: before the per-client exemption is granted the identical
+    # exchange must be REFUSED. Without that control the flow half would pass against a server
+    # that never required DPoP and would prove nothing about the documented configuration.
+    name: mobile appauth (android build + the documented flow, with its control)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v4
+      - name: gradle
+        uses: gradle/actions/setup-gradle@v6
+      - name: build the sample and run the documented flow
+        env:
+          GRADLE_BIN: gradle
+        run: scripts/mobile-verify.sh
+
+  mobile-ios:
+    # The iOS half, which needs Xcode and therefore its own runner.
+    #
+    # A LIBRARY target compiled for iOS, which is the check that matters: it resolves
+    # `import AppAuth` and every method name and argument label against the real package.
+    # `swiftc -parse` in the other lane catches syntax and cannot catch any of that.
+    name: mobile appauth (ios sample compiles against AppAuth)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: compile the iOS sample for a generic iOS device
+        working-directory: clients/mobile/ios
+        run: |
+          xcodebuild build \
+            -scheme IronAuthSignIn \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO
+
   java-verify:
     # Issue #118 criterion 4: the official Java verifier artifact, against the SHARED
     # cross-language conformance corpus.
