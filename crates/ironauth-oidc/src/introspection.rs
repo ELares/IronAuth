@@ -115,6 +115,24 @@ pub struct IntrospectionClaims {
     /// and its row does not record a chain, so an exchange whose subject was opaque starts
     /// a fresh chain rather than silently dropping hops it could not see.
     pub act: Option<Value>,
+    /// The RFC 9396 `authorization_details` the token was granted for (issue #131
+    /// criterion 4), or [`None`] when the grant carried none.
+    ///
+    /// Reported so a resource server can enforce what the resource owner actually approved
+    /// rather than a scope name standing in for it.
+    ///
+    /// JWT ACCESS TOKENS ONLY today, and the limit is worth stating rather than discovering:
+    /// this is read from the token's own claims. An opaque access token carries none, and its
+    /// issued-token row does not record the document, so introspecting one reports no details
+    /// even when the grant had them. Closing that needs the document on the issued-token row
+    /// (or a join to the request through the grant), which is a migration rather than a read.
+    /// Until then a deployment on `at_jwt` -- the default -- gets the full picture and one on
+    /// `opaque` does not.
+    ///
+    /// Echoed as signed rather than summarised. The document's members beyond `type` are the
+    /// deployment's own vocabulary, and a resource server comparing against what it asked for
+    /// needs the bytes it would have compared, not this crate's reading of them.
+    pub authorization_details: Option<Value>,
     /// The proof-of-possession confirmation the token is bound to (RFC 7800), or
     /// [`None`] for an unbound token.
     ///
@@ -218,6 +236,12 @@ impl IntrospectionSerializer for JsonIntrospectionSerializer {
         // rather than flattened to the nearest actor.
         if let Some(act) = &claims.act {
             object.insert("act".to_owned(), act.clone());
+        }
+        // RFC 9396: what the resource owner approved. A resource server that enforces the
+        // approval rather than a scope name standing in for it reads this, and for an OPAQUE
+        // token this response is the only place it exists.
+        if let Some(details) = &claims.authorization_details {
+            object.insert("authorization_details".to_owned(), details.clone());
         }
         // RFC 9449 section 6.2: the binding travels as a TOP-LEVEL `cnf` member whose
         // content is the same `{ member: thumbprint }` object a bound JWT carries, so
@@ -470,6 +494,7 @@ async fn resolve_jwt(state: &OidcState, scope: Scope, token: &str) -> Option<Int
         // chain taken from the unverified payload would let a caller append a hop this
         // server never issued and have it reported as one that it did.
         act: claims.get("act").cloned(),
+        authorization_details: claims.get("authorization_details").cloned(),
         scope: claims
             .get("scope")
             .and_then(Value::as_str)
@@ -563,6 +588,7 @@ async fn resolve_opaque(
         // An opaque token carries no claims, so no chain is observable; an exchange from
         // one starts a fresh chain rather than dropping hops it cannot see.
         act: None,
+        authorization_details: None,
         scope: active.scope.clone(),
         client_id: Some(active.client_id.clone()),
         // The opaque row stores the LOCAL subject; derive the public sub through the
@@ -612,6 +638,7 @@ async fn resolve_refresh(
         active: true,
         // A refresh token is not a delegation carrier and never reports a chain.
         act: None,
+        authorization_details: None,
         scope: resolution.scope.clone(),
         client_id: Some(resolution.client_id.clone()),
         sub: Some(state.resolve_public_subject(&resolution.subject)),
@@ -684,6 +711,7 @@ mod tests {
         let claims = IntrospectionClaims {
             active: true,
             act: None,
+        authorization_details: None,
             scope: Some("openid profile".to_owned()),
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),
@@ -714,6 +742,7 @@ mod tests {
         let refresh = IntrospectionClaims {
             active: true,
             act: None,
+        authorization_details: None,
             scope: None,
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),

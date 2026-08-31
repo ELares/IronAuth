@@ -70248,6 +70248,13 @@ pub struct PendingBackchannelRequest {
     pub requested_scope: Option<String>,
     /// The message the client asked to have rendered.
     pub binding_message: Option<String>,
+    /// The RFC 9396 `authorization_details` the client requested, for the approval surface
+    /// to render (issue #131 criterion 4).
+    ///
+    /// RAR exists so a person approves WHAT is being asked for rather than a scope name that
+    /// stands in for it. A page that renders the scope and hides the details defeats the
+    /// point of the extension: "payments" is not "move 42 EUR to this account".
+    pub authorization_details: Option<serde_json::Value>,
 }
 
 /// The approval linkage an approved CIBA request carries into its issued tokens.
@@ -70518,7 +70525,7 @@ impl BackchannelAuthRepo<'_> {
     ) -> Result<Vec<PendingBackchannelRequest>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, client_id, requested_scope, binding_message \
+            "SELECT id, client_id, requested_scope, binding_message, authorization_details \
              FROM backchannel_authentication_requests \
              WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
                AND status = 'pending' \
@@ -70540,6 +70547,7 @@ impl BackchannelAuthRepo<'_> {
                     client_id: row.get("client_id"),
                     requested_scope: row.get("requested_scope"),
                     binding_message: row.get("binding_message"),
+                    authorization_details: row.get("authorization_details"),
                 })
             })
             .collect()

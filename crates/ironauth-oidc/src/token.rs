@@ -1406,6 +1406,9 @@ async fn mint_tokens(
         signer,
         entry.policy(),
         &MintRequest {
+            // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
+            // carries an approved document today.
+            authorization_details: None,
             // The `act` claim comes from the SESSION, never from the request (issue #101).
             // It rides the same read that proved the session live, so a token cannot claim
             // an impersonation the liveness check did not agree with.
@@ -2541,6 +2544,9 @@ async fn mint_refresh_access(
         signer,
         entry.policy(),
         &MintRequest {
+            // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
+            // carries an approved document today.
+            authorization_details: None,
             // The `act` claim rides the FAMILY (issue #101), copied from the session when
             // the family was minted. The bound checked earlier means a family past its cap
             // never reaches here, so a token carrying this claim is one the impersonation

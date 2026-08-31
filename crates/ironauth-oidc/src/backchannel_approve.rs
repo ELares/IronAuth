@@ -218,6 +218,16 @@ async fn render(
         names.push(name);
     }
 
+    // ONE LINE PER ENTRY, described generically. RFC 9396 leaves an entry's members open
+    // beyond `type`, so there is no fixed shape to format: what a deployment means by
+    // `payment_initiation` is its own vocabulary. Rendering `type` first and then each other
+    // member shows the person everything the client asked for without this code pretending to
+    // understand any of it -- and every value is escaped, since all of it is client-supplied.
+    let details: Vec<Vec<String>> = pending
+        .iter()
+        .map(|request| describe_details(request.authorization_details.as_ref()))
+        .collect();
+
     let scopes: Vec<Vec<&str>> = pending
         .iter()
         .map(|request| {
@@ -241,6 +251,7 @@ async fn render(
             client_name: names[index].as_str(),
             scopes: scopes[index].as_slice(),
             binding_message: request.binding_message.as_deref(),
+            authorization_details: details[index].as_slice(),
         })
         .collect();
 
@@ -248,6 +259,40 @@ async fn render(
         StatusCode::OK,
         pages::backchannel_approve_page(&action, &items),
     )
+}
+
+/// Describe an `authorization_details` document as one readable line per entry.
+///
+/// Generic on purpose. An entry's only required member is `type`; everything else is the
+/// deployment's own vocabulary, so this shows `type` and then each remaining member rather
+/// than pretending to understand any particular one. A document that is not an array of
+/// objects yields nothing: it was refused at the backchannel endpoint, so reaching here means
+/// the registry changed under a stored request, and rendering half-parsed JSON at a person
+/// about to authorize something is worse than rendering none.
+fn describe_details(document: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(entries) = document.and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let members = entry.as_object()?;
+            let kind = members.get("type").and_then(serde_json::Value::as_str)?;
+            let rest: Vec<String> = members
+                .iter()
+                .filter(|(name, _)| name.as_str() != "type")
+                .map(|(name, value)| match value {
+                    serde_json::Value::String(text) => format!("{name}: {text}"),
+                    other => format!("{name}: {other}"),
+                })
+                .collect();
+            Some(if rest.is_empty() {
+                kind.to_owned()
+            } else {
+                format!("{kind} ({})", rest.join(", "))
+            })
+        })
+        .collect()
 }
 
 /// This page's own scope-routed path, which is the decision form's action.

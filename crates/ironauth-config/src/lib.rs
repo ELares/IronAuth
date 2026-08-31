@@ -2503,6 +2503,20 @@ pub struct OidcConfig {
     /// value is the deployment default until per-environment overrides land.
     pub userinfo_cors_origins: Vec<String>,
 
+    /// The RFC 9396 `authorization_details` types this deployment recognises (issue #131
+    /// criterion 4).
+    ///
+    /// EMPTY BY DEFAULT, and empty means REFUSE EVERY TYPE rather than allow any. A
+    /// deployment that has registered no types has defined the meaning of none of them, and
+    /// the opposite reading would make the safe configuration the one an operator has to
+    /// remember to type. A client sending no `authorization_details` at all is unaffected,
+    /// which is what keeps the default-deny from breaking every existing client.
+    ///
+    /// The vocabulary is per-deployment domain language -- `payment_initiation`,
+    /// `account_information`, whatever the API actually means -- so there is no useful
+    /// built-in list to ship. Each entry is matched EXACTLY against an entry's `type`.
+    pub authorization_details_types: Vec<String>,
+
     /// Enable the legacy implicit `response_type=id_token` flow for this
     /// environment (issue #17). The spec-conform, safe default (`false`) leaves it
     /// DISABLED: the authorization endpoint accepts only `code` unless a legacy
@@ -3337,6 +3351,7 @@ impl Default for OidcConfig {
             client_assertion_max_skew_secs: 60,
             client_jwks_ttl_secs: 300,
             userinfo_cors_origins: Vec::new(),
+            authorization_details_types: Vec::new(),
             enable_response_type_id_token: false,
             enable_response_type_code_id_token: false,
             enable_response_type_none: false,

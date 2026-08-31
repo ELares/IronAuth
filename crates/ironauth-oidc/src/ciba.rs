@@ -294,7 +294,7 @@ fn parse_authorization_details(
                 .map_err(|_| CibaError::InvalidAuthorizationDetails)?,
         ),
     };
-    validate_authorization_details(details.as_ref(), state.registered_rar_types())
+    validate_authorization_details(details.as_ref(), &state.registered_rar_types())
         .map_err(|_| CibaError::InvalidAuthorizationDetails)?;
     Ok(details)
 }

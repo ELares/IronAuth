@@ -1391,6 +1391,9 @@ async fn mint_front_channel_id_token(
     .await
     .map_err(|_| ())?;
     let request = MintRequest {
+        // No RFC 9396 details on this door (issue #131 criterion 4): only the CIBA grant
+        // carries an approved document today.
+        authorization_details: None,
         // From the SESSION, never the request (issue #101), so an implicit or hybrid ID
         // token names the impersonator exactly when the code-exchange path would.
         actor: session
