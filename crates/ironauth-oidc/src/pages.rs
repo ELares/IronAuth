@@ -1217,6 +1217,80 @@ pub fn device_confirm_page(page: &DeviceConfirmPage<'_>) -> String {
     notice_document("Authorize device", &body)
 }
 
+/// One pending CIBA request, as the approval page renders it (issue #131 criterion 1).
+pub struct PendingBackchannelItem<'a> {
+    /// The request's logical id, carried as the hidden field the decision binds to.
+    pub request_id: &'a str,
+    /// The requesting client's display name.
+    pub client_name: &'a str,
+    /// The OAuth scopes the client asked for.
+    pub scopes: &'a [&'a str],
+    /// The `binding_message` the client asked to have rendered on this device.
+    ///
+    /// THE ANTI-PHISHING CUE, and the reason CIBA has one at all: the person approving is
+    /// not the person who started the flow, and the message is the only thing tying what
+    /// they see here to what they are looking at on the other device.
+    pub binding_message: Option<&'a str>,
+}
+
+/// The CIBA approval page (issue #131 criterion 1).
+///
+/// Every request gets its OWN form. One form with a request picker would let a mis-click
+/// approve a different request than the one whose `binding_message` the person just read,
+/// which is the entire failure mode a binding message exists to prevent.
+#[must_use]
+pub fn backchannel_approve_page(action: &str, pending: &[PendingBackchannelItem<'_>]) -> String {
+    if pending.is_empty() {
+        return notice_document(
+            "Approve a sign-in",
+            "<h1>Approve a sign-in</h1><p>There is nothing waiting for your approval.</p>",
+        );
+    }
+    let items = pending.iter().fold(String::new(), |mut acc, item| {
+        let scopes = if item.scopes.is_empty() {
+            "<li>(no scopes requested)</li>".to_owned()
+        } else {
+            item.scopes.iter().fold(String::new(), |mut inner, scope| {
+                let _ = write!(inner, "<li>{}</li>", escape_html(scope));
+                inner
+            })
+        };
+        // RENDERED PROMINENTLY, and rendered as text: it is attacker-influenced (the client
+        // chose it) so it is escaped like everything else, but it is the one thing on this
+        // page a person is meant to compare against another screen.
+        let binding = match item.binding_message {
+            Some(message) if !message.trim().is_empty() => format!(
+                "<p>Your other device should be showing: <strong>{}</strong></p>\
+                 <p>If it is not, do not approve this.</p>",
+                escape_html(message)
+            ),
+            _ => "<p>This request carried no confirmation message. Approve it only if you \
+                  started it just now.</p>"
+                .to_owned(),
+        };
+        let _ = write!(
+            acc,
+            "<section><h2>{client}</h2>{binding}\
+             <p>Requested scopes:</p><ul>{scopes}</ul>\
+             <form method=\"post\" action=\"{action}\">{handle}\
+             <p><button type=\"submit\" name=\"decision\" value=\"allow\">Approve</button> \
+             <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></p>\
+             </form></section>",
+            client = escape_html(item.client_name),
+            binding = binding,
+            scopes = scopes,
+            action = escape_html(action),
+            handle = hidden_field("request_id", item.request_id),
+        );
+        acc
+    });
+    let body = format!(
+        "<h1>Approve a sign-in</h1>\
+         <p>Something asked to sign in as you. Approve it only if you started it.</p>{items}"
+    );
+    notice_document("Approve a sign-in", &body)
+}
+
 /// The fields the RFC 8628 confirmation page renders (issue #24). Grouped into one
 /// borrow so the builder stays within the argument-count lint and the call site is
 /// legible.

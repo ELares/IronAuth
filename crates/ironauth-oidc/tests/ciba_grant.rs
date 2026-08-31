@@ -21,10 +21,12 @@
 //! (correctly) `slow_down`, so the tests advance past the interval between polls except
 //! where the point is the `slow_down` bookkeeping itself.
 //!
-//! CIBA has no approval surface yet, so approvals here go through the store, the same
-//! way `lifecycle_fence.rs` drives its arm. That is the one place these credentials are
-//! built differently from a real client's, and it should move to the surface when one
-//! lands.
+//! Approvals here go through the store, the same way `lifecycle_fence.rs` drives its arm.
+//! That used to be because CIBA had no approval surface at all; it now has one, and
+//! `ciba_approval.rs` drives it over HTTP end to end. These stay at the store because this
+//! file is about the GRANT: it needs to place a request in states a person cannot reach
+//! through a page (no recorded authentication method, a fenced user, an expired approval),
+//! and routing them through the surface would test the surface twice and those states never.
 
 mod common;
 

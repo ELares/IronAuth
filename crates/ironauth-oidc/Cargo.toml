@@ -912,6 +912,14 @@ name = "ciba_grant"
 path = "tests/ciba_grant.rs"
 required-features = ["testing"]
 
+# The CIBA APPROVAL page (issue #131 criterion 1). Separate from `ciba_grant` because it
+# drives the human half over HTTP, where that file drives the client half and reaches the
+# store directly for approvals it had no surface for.
+[[test]]
+name = "ciba_approval"
+path = "tests/ciba_approval.rs"
+required-features = ["testing"]
+
 # The generic OIDC upstream federated login (issue #75, PR B): the end-to-end and
 # adversarial flow against a mock upstream driven through the fetch test-harness.
 [[test]]
