@@ -60,3 +60,5 @@ export {
   satisfies,
   stepUpLoginPath,
 } from './step-up.js';
+export { discover, forgetDiscovery, type IssuerMetadata } from './discovery.js';
+export { newDpopKey, dpopProof, thumbprint, type DpopKey } from './dpop.js';

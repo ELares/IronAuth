@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { SESSION_COOKIE } from './cookie.js';
+import { forgetDiscovery } from './discovery.js';
 import {
   type BffConfig,
   type BffRequest,
@@ -36,13 +37,29 @@ function idToken(payload: Record<string, unknown>): string {
   return `${b64({ alg: 'EdDSA' })}.${b64(payload)}.signature`;
 }
 
+/** The endpoint host, deliberately NOT under the issuer path; see bff.test.ts for why. */
+const ENDPOINT_HOST = 'https://iss.example';
+
 /** An IdP that mints whatever authentication context the test asks for. */
 function idp(context: Record<string, unknown>, options: { refreshFails?: boolean } = {}) {
+  // The discovery cache is module-level, so a test reusing an issuer would otherwise inherit the
+  // previous test's endpoints.
+  forgetDiscovery();
   const calls: string[] = [];
   const send = async (input: string | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString();
     calls.push(url);
-    if (url === `${ISSUER}/token`) {
+    if (url === `${ISSUER}/.well-known/openid-configuration`) {
+      return new Response(
+        JSON.stringify({
+          issuer: ISSUER,
+          authorization_endpoint: `${ENDPOINT_HOST}/authorize`,
+          token_endpoint: `${ENDPOINT_HOST}/token`,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url === `${ENDPOINT_HOST}/token`) {
       const form = new URLSearchParams(typeof init?.body === 'string' ? init.body : '');
       if (form.get('grant_type') === 'refresh_token' && options.refreshFails) {
         return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 });
@@ -56,6 +73,9 @@ function idp(context: Record<string, unknown>, options: { refreshFails?: boolean
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       );
+    }
+    if (url.startsWith(ISSUER) || url.startsWith(ENDPOINT_HOST)) {
+      return new Response(JSON.stringify({ error: 'not_found', url }), { status: 404 });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   };
