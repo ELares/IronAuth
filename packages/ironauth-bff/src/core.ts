@@ -243,6 +243,10 @@ export async function callback(config: BffConfig, request: BffRequest): Promise<
     // an identity, not an authorization: `sub` and the profile fields, never `scope`, never a
     // token, never anything a resource server makes a decision on.
     claims: minimalClaims(token.id_token),
+    // SERVER-SIDE, for step-up (issue #116). Read from the same ID token payload the claims come
+    // from, but kept OFF the claims bag: `acr` is something a resource server decides on, and the
+    // allow-list exists to keep exactly that out of the frontend's hands.
+    ...authenticationContext(token.id_token),
   });
 
   return {
@@ -290,6 +294,32 @@ function minimalClaims(idToken: unknown): Record<string, unknown> {
     }
   }
   return claims;
+}
+
+/**
+ * The `acr` and `auth_time` an ID token recorded, for step-up decisions.
+ *
+ * Separate from {@link minimalClaims} because the two have opposite destinations: those claims go
+ * to the frontend, and these must not. Sharing a function would make it one edit to leak them.
+ */
+function authenticationContext(idToken: unknown): { acr?: string; authTime?: number } {
+  if (typeof idToken !== 'string') {
+    return {};
+  }
+  const payload = idToken.split('.')[1];
+  if (payload === undefined) {
+    return {};
+  }
+  try {
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+    const decoded = JSON.parse(json) as Record<string, unknown>;
+    return {
+      acr: typeof decoded.acr === 'string' ? decoded.acr : undefined,
+      authTime: typeof decoded.auth_time === 'number' ? decoded.auth_time : undefined,
+    };
+  } catch {
+    return {};
+  }
 }
 
 /**
