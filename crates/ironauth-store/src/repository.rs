@@ -82,22 +82,21 @@ use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
-    AgentPrincipalId, ApiKeyId,
-    AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
-    BackchannelAuthRequestId, BrandId, ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId,
-    ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId,
-    DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
-    ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId,
-    FlowVersionPinId, GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId,
-    IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
-    MessageId, MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId,
-    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
-    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
-    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
-    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    AgentPrincipalId, ApiKeyId, AssertionMappingId, AttestationConfigId, AuditId, AuditTarget,
+    AuthorizationCodeId, BackchannelAuthRequestId, BrandId, ClientAdminGrantId, ClientId,
+    ClientSessionId, ConnectorId, ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId,
+    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
+    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, FedcmNonceId, FederationLoginStateId,
+    FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId, GrantId, ImpersonationAuthorizationId,
+    InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId,
+    ManagementKeyId, Mds3BlobCacheId, MessageId, MessageTemplateId, MigrationRunId,
+    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
+    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
+    OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
+    ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
+    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
     SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
     SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
@@ -71901,33 +71900,15 @@ pub struct AgentRecord {
     pub display_name: String,
     /// The lifecycle state: `active`, `suspended` or `revoked`.
     pub state: String,
-    /// The DECLARED tool scopes. A request outside this set is refused.
+    /// The DECLARED tool scopes: what this agent may ask for.
+    ///
+    /// Recorded here and NOT yet enforced. The issuance path that checks a request against
+    /// this set, and audits the denial, is the follow-up half of #130. Documented as
+    /// declaration rather than as a control so nothing downstream reads a guarantee that
+    /// does not exist yet.
     pub tool_scopes: Vec<String>,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
-}
-
-impl AgentRecord {
-    /// Whether this agent may currently obtain tokens.
-    ///
-    /// ACTIVE ONLY. Suspended and revoked both answer `false`, and the distinction between
-    /// them is for the operator reading the list, not for the issuance path: criterion 5 asks
-    /// that a suspended agent obtain no tokens while staying listable, and a caller that had
-    /// to remember which states were live would eventually forget one.
-    #[must_use]
-    pub fn can_obtain_tokens(&self) -> bool {
-        self.state == "active"
-    }
-
-    /// Whether `tool` is inside this agent's declared set.
-    ///
-    /// EXACT membership, never a prefix or a wildcard. A declared set that matched by prefix
-    /// would make `files` grant `files.delete`, which is the kind of widening the set exists
-    /// to prevent.
-    #[must_use]
-    pub fn declares_tool(&self, tool: &str) -> bool {
-        self.tool_scopes.iter().any(|declared| declared == tool)
-    }
 }
 
 /// Everything registering an agent needs.
@@ -72123,14 +72104,23 @@ impl ActingAgentRepo<'_> {
 
     /// Set an agent's lifecycle state, auditing `agent.state.set`.
     ///
-    /// REVOKED IS TERMINAL. A revoked agent cannot be returned to active, because "revoke"
-    /// is what an incident responder reaches for and a control that can be quietly undone is
-    /// not one they can rely on. Suspension is the reversible one, which is why both exist.
+    /// REVOKED IS TERMINAL. A revoked agent cannot be returned to active or suspended,
+    /// because "revoke" is what an incident responder reaches for and a control that can be
+    /// quietly undone is not one they can rely on. Suspension is the reversible one, which
+    /// is why both exist.
+    ///
+    /// Re-revoking a revoked agent SUCCEEDS and writes its audit row. Terminal is about the
+    /// state never leaving `revoked`, not about refusing the request that puts it there: a
+    /// responder whose first revoke timed out, or a second responder acting on the same
+    /// alert, must not be told the agent does not exist, and the retry must leave a trace.
+    /// The predicate therefore blocks every transition OUT of revoked and permits the
+    /// idempotent one back into it.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if no such agent is visible in this scope, or the agent is
-    /// already revoked; [`StoreError::Database`] on a persistence failure.
+    /// revoked and the requested state is not `revoked`; [`StoreError::Database`] on a
+    /// persistence failure.
     pub async fn set_state(
         &self,
         env: &Env,
@@ -72146,7 +72136,12 @@ impl ActingAgentRepo<'_> {
         let id = *id;
         let state = state.to_owned();
         let mut record = None;
-        write_audited(
+        // WHICH state was set, on the row itself. Without it `agent.state.set` says only
+        // that something changed, and a responder reading the trail cannot tell a
+        // suspension from a revocation from a re-activation, which is the one question
+        // the trail exists to answer. The organization sibling records the same dimension.
+        let detail = format!("state={state}");
+        write_audited_detailed(
             AuditedWrite {
                 store: self.store,
                 scope,
@@ -72160,7 +72155,7 @@ impl ActingAgentRepo<'_> {
                     "UPDATE agents SET state = $1, \
                          updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
                      WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
-                       AND state <> 'revoked' \
+                       AND (state <> 'revoked' OR $1 = 'revoked') \
                      RETURNING id, organization_id, linked_user_id, display_name, state, \
                                tool_scopes, \
                                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint \
@@ -72179,6 +72174,7 @@ impl ActingAgentRepo<'_> {
                 Ok(())
             },
             false,
+            Some(&detail),
         )
         .await?;
         record.ok_or(StoreError::NotFound)

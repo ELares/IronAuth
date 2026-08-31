@@ -40,6 +40,13 @@ CREATE TABLE agents (
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
 
+    -- The scope columns are never empty. `error::is_absent_scope` converts a write into a
+    -- nonexistent scope to the uniform not-found by matching the scope foreign key's
+    -- 23503; without these keys there is no 23503, nothing converts, and the row LANDS
+    -- as an orphan under a scope that does not exist, then is hidden from every scope
+    -- that does by the policy below. Every sibling scoped table carries this pair.
+    CONSTRAINT agents_scope_nonempty
+        CHECK (tenant_id <> '' AND environment_id <> ''),
     CONSTRAINT agents_state_closed
         CHECK (state IN ('active', 'suspended', 'revoked')),
     -- 64 tools is far above anything an agent legitimately declares and far below anything
@@ -47,7 +54,18 @@ CREATE TABLE agents (
     CONSTRAINT agents_tool_scopes_bounded
         CHECK (array_length(tool_scopes, 1) IS NULL OR array_length(tool_scopes, 1) <= 64),
     CONSTRAINT agents_display_name_bounded
-        CHECK (char_length(display_name) BETWEEN 1 AND 200)
+        CHECK (char_length(display_name) BETWEEN 1 AND 200),
+    FOREIGN KEY (tenant_id) REFERENCES tenants (id),
+    FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
+    -- The organization the agent acts inside must exist. Organization ids are globally
+    -- unique, so an id-only key is sufficient, exactly as `org_memberships` does it.
+    -- This is the backstop that makes an agent in a nonexistent or cross-scope
+    -- organization impossible even though the handler resolves the org up front.
+    FOREIGN KEY (organization_id) REFERENCES organizations (id),
+    -- The user the agent acts FOR must exist. Users are soft-deleted, so an agent is
+    -- never hard-deleted out from under a scope, and the linkage an investigator
+    -- follows cannot dangle.
+    FOREIGN KEY (linked_user_id) REFERENCES users (id)
 );
 
 -- The listing criterion 1 asks for: every agent acting for one organization, oldest first.
@@ -81,8 +99,10 @@ GRANT SELECT, INSERT, UPDATE ON agents TO ironauth_control;
 GRANT SELECT ON agents TO ironauth_app;
 
 COMMENT ON COLUMN agents.state IS
-    'Issue #130: active | suspended | revoked. A suspended agent obtains no tokens and stays '
-    'listable and auditable, which a soft delete could not express.';
+    'Issue #130: active | suspended | revoked. Suspension is the reversible control and '
+    'revocation is terminal; both stay listable and auditable, which a soft delete could '
+    'not express. Blocking issuance for a non-active agent is the follow-up half.';
 COMMENT ON COLUMN agents.tool_scopes IS
-    'Issue #130: the DECLARED tool set. A request for anything outside it is refused and the '
-    'denial audited; the set lives here rather than in a token so an agent cannot widen it.';
+    'Issue #130: the DECLARED tool set, recorded here rather than in a token so an agent '
+    'cannot widen it. Checking a request against it, and auditing the denial, is the '
+    'follow-up half; this column is the declaration, not yet the control.';

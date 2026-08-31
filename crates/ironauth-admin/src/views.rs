@@ -504,7 +504,8 @@ pub struct AgentView {
     pub display_name: String,
     /// The lifecycle state: `active`, `suspended` or `revoked`.
     pub state: String,
-    /// The DECLARED tool scopes. A request outside this set is refused.
+    /// The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;
+    /// the issuance check and its audited denial are the follow-up half of #130.
     pub tool_scopes: Vec<String>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,

@@ -12779,11 +12779,21 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Maximum agents to return",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
             "required": false,
             "schema": {
               "type": "integer",
-              "format": "int64"
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -12794,6 +12804,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AgentList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -27282,7 +27302,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The DECLARED tool scopes. A request outside this set is refused."
+            "description": "The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;\nthe issuance check and its audited denial are the follow-up half of #130."
           }
         }
       },

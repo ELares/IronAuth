@@ -29,7 +29,7 @@ use ironauth_store::{
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::{ApiError, ErrorBody};
 use crate::idempotency;
-use crate::input::parse_json;
+use crate::input::{parse_json, require_non_empty};
 use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
@@ -103,7 +103,23 @@ pub async fn register_agent(
     // unattributable principal this whole issue exists to prevent.
     let linked_user_id =
         UserId::parse_in_scope(&request.linked_user_id, &scope).map_err(|_| ApiError::NotFound)?;
-    state.store().scoped(scope).users().get(&linked_user_id).await?;
+    state
+        .store()
+        .scoped(scope)
+        .users()
+        .get(&linked_user_id)
+        .await?;
+
+    // The schema bounds `display_name` at 1..=200 characters. Validated HERE too, because a
+    // CHECK violation inside the write transaction is SQLSTATE 23514, which is not a unique
+    // violation and so renders as a 500: a caller-controlled 500 is a defect, not a refusal.
+    // Every other handler with a display_name uses this same edge validator.
+    let display_name = require_non_empty(&request.display_name, "display_name")?;
+    if display_name.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "display_name must be at most 200 characters".to_owned(),
+        ));
+    }
 
     // AN EMPTY TOOL SET IS REFUSED, rather than registered as an agent that can do nothing.
     // The schema permits it (an empty array is a valid bound), so the refusal lives here: an
@@ -120,7 +136,11 @@ pub async fn register_agent(
             "tool_scopes may declare at most 64 tools".to_owned(),
         ));
     }
-    if request.tool_scopes.iter().any(|tool| tool.trim().is_empty()) {
+    if request
+        .tool_scopes
+        .iter()
+        .any(|tool| tool.trim().is_empty())
+    {
         return Err(ApiError::BadRequest(
             "a declared tool must not be blank".to_owned(),
         ));
@@ -156,7 +176,7 @@ pub async fn register_agent(
                 id: &agent_id,
                 organization_id: &org_id,
                 linked_user_id: &linked_user_id,
-                display_name: &request.display_name,
+                display_name: &display_name,
                 tool_scopes: &request.tool_scopes,
             },
             created_at_micros,
@@ -190,11 +210,16 @@ pub async fn register_agent(
         ("tenant_id" = String, Path, description = "The tenant identifier"),
         ("environment_id" = String, Path, description = "The environment identifier"),
         ("organization_id" = String, Path, description = "The organization identifier"),
-        ("limit" = Option<i64>, Query, description = "Maximum agents to return")
+        // The whole ListQuery, not a hand-written `limit`: the handler honours `cursor` and
+        // the response returns `next_cursor`, so documenting only `limit` leaves a typed
+        // client holding a cursor with no field to send it back in, and page 2 unreachable
+        // through the published contract.
+        ListQuery
     ),
     security(("bearer" = [])),
     responses(
         (status = 200, description = "The agents acting inside this organization, oldest first. INCLUDES suspended and revoked ones: an investigator's question is what WAS acting here", body = AgentList),
+        (status = 400, description = "Malformed cursor", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),
         (status = 404, description = "Organization not found, or the environment is absent or soft-deleted", body = ErrorBody)

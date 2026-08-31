@@ -52,7 +52,13 @@ async fn create_org(h: &Harness, tenant: &str, environment: &str, key: &str) -> 
 }
 
 /// Create an active user and return its id.
-async fn create_user(h: &Harness, tenant: &str, environment: &str, ident: &str, key: &str) -> String {
+async fn create_user(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    ident: &str,
+    key: &str,
+) -> String {
     let users = format!("/v1/tenants/{tenant}/environments/{environment}/users");
     let body = serde_json::json!({ "identifier": ident }).to_string();
     let (status, _, response) = h.post(&users, key, &body).await;
@@ -110,8 +116,16 @@ async fn an_agent_registers_lists_with_its_linkage_and_scopes_and_revokes() {
     let list: Value = serde_json::from_str(&response).expect("json");
     let item = &list["items"][0];
     assert_eq!(item["id"].as_str(), Some(agent_id.as_str()), "{response}");
-    assert_eq!(item["linked_user_id"].as_str(), Some(user.as_str()), "{response}");
-    assert_eq!(item["organization_id"].as_str(), Some(org.as_str()), "{response}");
+    assert_eq!(
+        item["linked_user_id"].as_str(),
+        Some(user.as_str()),
+        "{response}"
+    );
+    assert_eq!(
+        item["organization_id"].as_str(),
+        Some(org.as_str()),
+        "{response}"
+    );
     assert_eq!(
         item["tool_scopes"],
         serde_json::json!(["deploy", "read_logs"]),
@@ -121,7 +135,10 @@ async fn an_agent_registers_lists_with_its_linkage_and_scopes_and_revokes() {
     // REVOKE.
     let state_path = format!("{agents}/{agent_id}/state");
     let (status, _, response) = h
-        .put(&state_path, &serde_json::json!({ "state": "revoked" }).to_string())
+        .put(
+            &state_path,
+            &serde_json::json!({ "state": "revoked" }).to_string(),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(
@@ -133,7 +150,10 @@ async fn an_agent_registers_lists_with_its_linkage_and_scopes_and_revokes() {
     // AND REVOCATION IS TERMINAL. A control an incident responder reaches for is not one
     // that can be quietly undone.
     let (status, _, response) = h
-        .put(&state_path, &serde_json::json!({ "state": "active" }).to_string())
+        .put(
+            &state_path,
+            &serde_json::json!({ "state": "active" }).to_string(),
+        )
         .await;
     assert_eq!(
         status,
@@ -167,7 +187,11 @@ async fn a_suspended_agent_stays_listable_and_auditable() {
     let (status, _, response) = h.get(&agents).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let list: Value = serde_json::from_str(&response).expect("json");
-    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "{response}");
+    assert_eq!(
+        list["items"].as_array().map(Vec::len),
+        Some(1),
+        "{response}"
+    );
     assert_eq!(
         list["items"][0]["state"], "suspended",
         "a suspended agent must stay listable, and say so: {response}"
@@ -261,11 +285,35 @@ async fn an_agent_with_no_declared_tools_is_refused() {
 async fn registering_an_agent_for_an_absent_user_is_the_uniform_not_found() {
     // An agent linked to nobody is the unattributable principal this issue exists to prevent,
     // so the linkage is checked before anything is written.
+    //
+    // The id sent here is WELL FORMED and IN SCOPE, for a user that existed and no longer
+    // does. That is the only input that reaches the existence read: a syntactically invalid
+    // id is refused by `parse_in_scope` one line earlier, so a test using one passes with the
+    // existence check deleted and measures nothing.
     let h = Harness::start(264).await;
     let (tenant, environment) = tenant_env(&h).await;
     let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let user = create_user(&h, &tenant, &environment, "gone@example.test", "k-user").await;
+    let (status, _, response) = h
+        .delete(&format!(
+            "/v1/tenants/{tenant}/environments/{environment}/users/{user}"
+        ))
+        .await;
+    assert!(
+        status.is_success(),
+        "the linked user must be gone before the check is measured: {response}"
+    );
+
     let agents =
         format!("/v1/tenants/{tenant}/environments/{environment}/organizations/{org}/agents");
-    let (status, response) = register(&h, &agents, "usr_absent", &["deploy"], "k-agent").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+    let (status, response) = register(&h, &agents, &user, &["deploy"], "k-agent").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a well-formed id for a user that is gone: {response}"
+    );
+
+    // And the malformed-id path stays covered, so removing the parse would also be caught.
+    let (status, response) = register(&h, &agents, "usr_absent", &["deploy"], "k-agent-2").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a malformed id: {response}");
 }

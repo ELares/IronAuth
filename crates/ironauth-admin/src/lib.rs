@@ -81,6 +81,7 @@ mod whoami;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+mod agents;
 mod challenge_components;
 pub mod ciba_ping;
 mod claims_mappings;
@@ -89,7 +90,6 @@ pub mod flow_target_delivery;
 mod flow_targets;
 mod log_streams;
 mod mds3_health;
-mod agents;
 mod memberships;
 pub mod message_composer;
 pub mod message_http_provider;

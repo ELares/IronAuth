@@ -3783,7 +3783,10 @@ export interface components {
             organization_id: string;
             /** @description The lifecycle state: `active`, `suspended` or `revoked`. */
             state: string;
-            /** @description The DECLARED tool scopes. A request outside this set is refused. */
+            /**
+             * @description The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;
+             *     the issuance check and its audited denial are the follow-up half of #130.
+             */
             tool_scopes: string[];
         };
         /** @description The creation response: the ONLY place the key itself ever appears. */
@@ -17676,8 +17679,16 @@ export interface operations {
     listAgents: {
         parameters: {
             query?: {
-                /** @description Maximum agents to return */
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
                 limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -17699,6 +17710,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AgentList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Missing or invalid credential */

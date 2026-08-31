@@ -41,6 +41,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     // whole purpose is "a new endpoint goes through the fence at all" was blind to a
     // whole module. All four already resolve through `resolve_live_org`; the omission
     // was the scan's, not theirs.
+    ("agents.rs", include_str!("../src/agents.rs")),
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),
     (

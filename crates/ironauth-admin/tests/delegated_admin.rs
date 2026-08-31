@@ -4554,7 +4554,9 @@ async fn the_agent_surface_splits_registering_and_revoking_from_listing() {
         "a read credential must be able to see what is acting in an organization: {response}"
     );
 
-    let (status, _, response) = h.post_as(&agents, &secret, "k-agent-forbidden", &register).await;
+    let (status, _, response) = h
+        .post_as(&agents, &secret, "k-agent-forbidden", &register)
+        .await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
@@ -4585,7 +4587,9 @@ async fn the_agent_surface_splits_registering_and_revoking_from_listing() {
         &["management.write_organizations"],
     )
     .await;
-    let (status, _, response) = h.post_as(&agents, &secret, "k-agent-allowed", &register).await;
+    let (status, _, response) = h
+        .post_as(&agents, &secret, "k-agent-allowed", &register)
+        .await;
     assert_ne!(
         status,
         StatusCode::FORBIDDEN,
@@ -4598,4 +4602,3 @@ async fn the_agent_surface_splits_registering_and_revoking_from_listing() {
         "write_organizations did not cover the agent state change: {response}"
     );
 }
-
