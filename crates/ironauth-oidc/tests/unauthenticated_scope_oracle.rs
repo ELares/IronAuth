@@ -161,6 +161,11 @@ struct Case {
 }
 
 /// The unauthenticated, scope-routed requests whose ghost-scope answer this file pins.
+/// Long by construction, and it should get longer: the coverage test above fails when a
+/// scope-routed route is neither driven here nor excluded, so every route this repository adds
+/// lands in this list or in that one. Splitting it to satisfy a line count would put the cases
+/// somewhere the next author does not look.
+#[allow(clippy::too_many_lines)]
 fn cases() -> Vec<Case> {
     vec![
         Case {
