@@ -21,6 +21,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Report what the presenting credential is and may do. */
+        get: operations["getCaller"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/operators": {
         parameters: {
             query?: never;
@@ -3973,6 +3990,39 @@ export interface components {
              *     its existence), so a batch can never reach across a scope boundary.
              */
             session_ids?: string[];
+        };
+        /**
+         * @description What the presenting credential is and may do (issue #123 criterion 4).
+         *
+         *     Answers ONLY about the credential that presented it. There is no key parameter and there
+         *     cannot be one: telling the holder of a credential what it can do discloses nothing, while
+         *     answering about ANOTHER key would be exactly the credential-mapping this API refuses
+         *     elsewhere.
+         */
+        CallerView: {
+            /** @description The environment a management key is bound to. Absent for the operator plane. */
+            environment_id?: string | null;
+            /**
+             * @description The permission slugs this credential holds.
+             *
+             *     ABSENT is not "none". It means the credential's authority is not expressed as a
+             *     permission set -- an unrestricted key, or the operator plane, which is broader than any
+             *     permission and includes tenant lifecycle that none of them names. Read `unrestricted`
+             *     first; a consumer that treated absent as empty would advertise nothing for the credential
+             *     that can do the most.
+             */
+            permissions?: string[] | null;
+            /** @description `operator` or `management_key`. */
+            plane: string;
+            /** @description The tenant a management key is bound to. Absent for the operator plane. */
+            tenant_id?: string | null;
+            /**
+             * @description Whether this credential is unrestricted.
+             *
+             *     Carried explicitly rather than left to be inferred from `permissions` being absent,
+             *     because inferring it is exactly the mistake above and a boolean cannot be misread.
+             */
+            unrestricted: boolean;
         };
         /** @description The environment secrets a custom factor component may read (issue #114 criterion 6). */
         ChallengeComponentSecretsView: {
@@ -9063,6 +9113,44 @@ export interface operations {
                 };
             };
             /** @description Wrong plane */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    getCaller: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The presenting credential's own plane, scope and permissions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CallerView"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential is not granted management.read */
             403: {
                 headers: {
                     [name: string]: unknown;

@@ -666,6 +666,13 @@ func (c *Client) GetBrand(tenant_id string, environment_id string, slug string, 
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/brands/" + escape(slug), query, nil)
 }
 
+// GetCaller performs GET /v1/me.
+//
+// Report what the presenting credential is and may do.
+func (c *Client) GetCaller(query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/me", query, nil)
+}
+
 // GetClaimsMapping performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping.
 //
 // Get a per-environment, per-client declarative claim mapping.

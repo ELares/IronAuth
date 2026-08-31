@@ -4338,3 +4338,65 @@ async fn the_jwt_session_mode_switch_splits_flipping_it_from_reading_it() {
     );
     assert!(refused.contains("management.write_config"), "{refused}");
 }
+
+/// The caller-introspection endpoint reports only the PRESENTING credential (issue #123
+/// criterion 4).
+///
+/// Two things, and the second is what earns it a place in `PERMISSION_PROVEN`:
+///
+/// 1. what it says is true of the key that asked -- the scope it is bound to and the exact
+///    permissions it was restricted to, so an agent tool server can advertise the tools its own
+///    key can actually drive rather than a list an operator hand-configured; and
+/// 2. a credential without `management.read` is refused, and the refusal NAMES the permission.
+#[tokio::test]
+async fn the_caller_endpoint_reports_only_the_presenting_credential() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "whoami-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "whoami-mint").await;
+
+    // A key restricted to exactly two permissions.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_users"],
+    )
+    .await;
+    let (status, _, body) = h.get_as("/v1/me", &secret).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let me: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(me["plane"], "management_key");
+    // BOUND TO ITS OWN SCOPE, which is what a tool server needs to address anything at all.
+    assert_eq!(me["tenant_id"], tenant);
+    assert_eq!(me["environment_id"], environment);
+    assert_eq!(me["unrestricted"], false);
+    let mut held: Vec<String> = me["permissions"]
+        .as_array()
+        .expect("a permission list")
+        .iter()
+        .map(|value| value.as_str().expect("a slug").to_owned())
+        .collect();
+    held.sort();
+    // EXACTLY those two. A superset would make a tool server advertise a tool the key cannot
+    // drive, which is the failure criterion 4 names; a subset would hide one it can.
+    assert_eq!(held, vec!["management.read", "management.write_users"]);
+
+    // AND THE REFUSAL. A key without `management.read` cannot ask, and the message names the
+    // permission -- an operator who cannot tell a missing grant from a broken route goes looking
+    // in the wrong place.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_users"],
+    )
+    .await;
+    let (status, _, refused) = h.get_as("/v1/me", &secret).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert!(
+        refused.contains("management.read"),
+        "the refusal must name the permission it wanted: {refused}"
+    );
+}

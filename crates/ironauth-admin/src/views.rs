@@ -2699,6 +2699,35 @@ pub struct SetSessionTokenTemplateRequest {
     pub rules: serde_json::Value,
 }
 
+/// What the presenting credential is and may do (issue #123 criterion 4).
+///
+/// Answers ONLY about the credential that presented it. There is no key parameter and there
+/// cannot be one: telling the holder of a credential what it can do discloses nothing, while
+/// answering about ANOTHER key would be exactly the credential-mapping this API refuses
+/// elsewhere.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct CallerView {
+    /// `operator` or `management_key`.
+    pub plane: String,
+    /// The tenant a management key is bound to. Absent for the operator plane.
+    pub tenant_id: Option<String>,
+    /// The environment a management key is bound to. Absent for the operator plane.
+    pub environment_id: Option<String>,
+    /// The permission slugs this credential holds.
+    ///
+    /// ABSENT is not "none". It means the credential's authority is not expressed as a
+    /// permission set -- an unrestricted key, or the operator plane, which is broader than any
+    /// permission and includes tenant lifecycle that none of them names. Read `unrestricted`
+    /// first; a consumer that treated absent as empty would advertise nothing for the credential
+    /// that can do the most.
+    pub permissions: Option<Vec<String>>,
+    /// Whether this credential is unrestricted.
+    ///
+    /// Carried explicitly rather than left to be inferred from `permissions` being absent,
+    /// because inferring it is exactly the mistake above and a boolean cannot be misread.
+    pub unrestricted: bool,
+}
+
 /// Whether an environment runs the OPT-IN short-lived JWT session mode (issue #119 criterion 4).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SessionJwtModeView {

@@ -2198,6 +2198,9 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{base}/challenge-components?name=wordmark"),
         ),
+        // Caller introspection (issue #123 criterion 4). Not scope-routed: it answers about the
+        // credential rather than about an environment, so it takes no tenant or environment.
+        Case::empty("whoami.getCaller", "GET", "/v1/me".to_owned()),
         // ---- session tokenizer templates (issue #119) ----
         //
         // PER ENVIRONMENT, like the components above: a template is what a session tokenizes
