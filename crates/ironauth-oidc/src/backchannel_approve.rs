@@ -37,7 +37,9 @@
 use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use ironauth_store::{BackchannelApprovalLinkage, BackchannelAuthRequestId, GrantId, Scope};
+use ironauth_store::{
+    BackchannelApprovalLinkage, BackchannelAuthRequestId, CorrelationId, GrantId, Scope,
+};
 use serde::Deserialize;
 
 use crate::interaction;
@@ -129,11 +131,35 @@ pub async fn backchannel_post(
     // off a refusal.
     let grant = approved.then(|| GrantId::generate(state.env(), &scope));
     let now = epoch_micros(state.now());
+
+    // THE DECISION IS ANNOUNCED (issue #131 criterion 1). CIBA's shape is that the thing
+    // asking is not the thing approving, so "who said yes to this, and when" is recoverable
+    // from nothing else: the client only ever learns that its poll started succeeding. The
+    // DENIAL is announced too, and is the half a fraud team most wants -- it issues nothing,
+    // so it would otherwise leave no trace at all.
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject_id = session.subject.clone();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "backchannel_request.decided",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now / 1000,
+        &serde_json::json!({ "request_id": request_id.to_string(), "approved": approved }),
+    );
+    let decision_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            // The SUBJECT is the person who decided, which is the whole point of the record.
+            subject: &subject_id,
+            envelope,
+        });
     let decided = state
         .store()
         .scoped(scope)
         .backchannel_auth()
-        .decide(
+        .decide_with_event(
             state.env(),
             &request_id,
             &session.subject,
@@ -148,6 +174,7 @@ pub async fn backchannel_post(
                 auth_time_micros: Some(session.auth_time_unix_micros),
             },
             now,
+            decision_event.as_ref(),
         )
         .await;
 

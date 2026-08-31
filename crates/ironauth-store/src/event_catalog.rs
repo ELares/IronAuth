@@ -1420,6 +1420,26 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A human's decision on a CIBA backchannel request (issue #131 criterion 1).
+        //
+        // CIBA's shape is that the thing asking is not the thing approving, so "who said yes
+        // to this, and when" is not recoverable from anything else on the stream: the client
+        // only ever learns that its poll started succeeding. Carried on the DECISION rather
+        // than on the redemption because a denial issues nothing and would otherwise be
+        // invisible, and a denial is the half a fraud team most wants to see.
+        "backchannel_request.decided",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "request_id": {"type": "string", "minLength": 1},
+                "approved": {"type": "boolean"}
+            },
+            "required": ["request_id", "approved"]
+        }"#,
+    ),
+    (
         // The per-client DPoP exemption (issue #124). This one RELAXES a control rather than
         // tightening one: `allowed: true` means this client's tokens stop being
         // sender-constrained and become replayable by whoever steals them. An integrator

@@ -329,3 +329,131 @@ async fn a_cross_site_post_is_refused() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
+
+/// Drain every queued webhook event, so what a later claim returns is one decision's doing.
+async fn drain_events(harness: &Harness) {
+    loop {
+        let drained = harness
+            .store()
+            .scoped(harness.scope())
+            .outbox()
+            .claim(
+                harness.env(),
+                ironauth_store::WEBHOOK_EVENT_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("drain");
+        if drained.is_empty() {
+            break;
+        }
+        for message in drained {
+            harness
+                .store()
+                .scoped(harness.scope())
+                .outbox()
+                .complete(harness.env(), &message)
+                .await
+                .expect("complete");
+        }
+    }
+}
+
+/// The `backchannel_request.decided` events currently queued.
+async fn decision_events(harness: &Harness) -> Vec<serde_json::Value> {
+    let claimed = harness
+        .store()
+        .scoped(harness.scope())
+        .outbox()
+        .claim(
+            harness.env(),
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    claimed
+        .into_iter()
+        .map(|message| message.payload)
+        .filter(|payload| payload["type"] == "backchannel_request.decided")
+        .collect()
+}
+
+#[tokio::test]
+async fn a_decision_is_announced_on_the_event_stream_in_both_directions() {
+    // CIBA's shape is that the thing asking is not the thing approving, so "who said yes to
+    // this, and when" is recoverable from nothing else: the client only ever learns that its
+    // poll started succeeding. BOTH directions, because a producer that hard-coded either
+    // would pass a test exercising one -- and the DENIAL is the half a fraud team most wants,
+    // since it issues nothing and would otherwise leave no trace at all.
+    for approved in [true, false] {
+        let (harness, client_id) = ciba_harness().await;
+        let (_auth_req_id, subject, _hint) = start_request(&harness, &client_id, None).await;
+        let cookie = harness.session_cookie(&subject).await;
+        let (_status, _headers, page) = harness
+            .get_with_cookie(&approval_path(&harness), Some(&cookie))
+            .await;
+        let request_id = rendered_request_id(&page);
+        drain_events(&harness).await;
+
+        let decision = if approved { "allow" } else { "deny" };
+        let (status, _headers, outcome) = harness
+            .post_form(
+                &approval_path(&harness),
+                &form(&[("request_id", &request_id), ("decision", decision)]),
+                Some(&cookie),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{outcome}");
+
+        let events = decision_events(&harness).await;
+        assert_eq!(events.len(), 1, "one decision, one event: {events:?}");
+        assert_eq!(
+            events[0]["payload"]["approved"], approved,
+            "the event must carry the decision that was MADE, not a fixed value"
+        );
+        assert_eq!(
+            events[0]["payload"]["request_id"], request_id,
+            "the event must name the request it is about"
+        );
+        ironauth_store::event_catalog::validate_event(&events[0])
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_decision_announces_nothing() {
+    // The refusal paths return by DROPPING the transaction, so the event must go with it. An
+    // announcement for a decision that did not happen is worse than silence: a consumer would
+    // record an approval the store refused.
+    let (harness, client_id) = ciba_harness().await;
+    let (_auth_req_id, _subject, _hint) = start_request(&harness, &client_id, None).await;
+
+    let intruder_hint = format!(
+        "ciba-noevent-{}@example.test",
+        ironauth_store::CorrelationId::generate(harness.env())
+    );
+    let intruder = harness
+        .seed_user(&intruder_hint, common::SEED_PASSWORD)
+        .await;
+    let cookie = harness.session_cookie(&intruder).await;
+    let unknown =
+        ironauth_store::BackchannelAuthRequestId::generate(harness.env(), &harness.scope());
+    drain_events(&harness).await;
+
+    let (status, _headers, outcome) = harness
+        .post_form(
+            &approval_path(&harness),
+            &form(&[("request_id", &unknown.to_string()), ("decision", "allow")]),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert!(
+        decision_events(&harness).await.is_empty(),
+        "a refused decision must announce nothing"
+    );
+}
+

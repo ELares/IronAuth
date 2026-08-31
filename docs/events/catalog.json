@@ -148,6 +148,28 @@
       "type": "api_key.rotated"
     },
     {
+      "domain": "backchannel_request",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "approved": {
+            "type": "boolean"
+          },
+          "request_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "approved"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "backchannel_request.decided"
+    },
+    {
       "domain": "ban",
       "payload_schema": {
         "additionalProperties": false,

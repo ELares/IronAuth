@@ -49,7 +49,8 @@ crates/ironauth-store/src/repository.rs:create_version_with_event:1
 crates/ironauth-store/src/repository.rs:create_with_event:16
 crates/ironauth-store/src/repository.rs:create_with_id_with_event:2
 crates/ironauth-store/src/repository.rs:create_with_user_inner:1
-crates/ironauth-store/src/repository.rs:decide:2
+crates/ironauth-store/src/repository.rs:decide:1
+crates/ironauth-store/src/repository.rs:decide_with_event:1
 crates/ironauth-store/src/repository.rs:delete:4
 crates/ironauth-store/src/repository.rs:delete_with_event:23
 crates/ironauth-store/src/repository.rs:deploy:1
