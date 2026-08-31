@@ -988,6 +988,11 @@ jobs:
       # contract and reads the handler's signature.
       - name: MCP entry path (every mutating tool's handler records how it arrived)
         run: scripts/mcp-entry-path.sh
+      # Issue #123 criterion 2: the agent-facing index and corpus are regenerated from the
+      # documentation set and COVER it. Freshness alone would pass over a corpus that had
+      # quietly halved, so the gate also walks the published set independently.
+      - name: llms.txt (fresh, and covers the published documentation set)
+        run: scripts/llms-txt.sh
       # Issue #108 criterion 4. This job already checks out full history for the OpenAPI
       # changelog, which is the same thing this needs: a base revision to diff against.
       - name: event registry compatibility (a breaking payload change bumps its version)
