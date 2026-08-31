@@ -1395,6 +1395,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0174_session_jwt_mode.sql"),
         },
+        Migration {
+            version: 175,
+            name: "audit_entry_path",
+            // EXPAND: one NULLABLE column on an existing table, with no default, that the old
+            // binary neither reads nor writes. A rollback leaves it inert and every row it wrote
+            // simply has no entry path -- which is the same thing NULL means going forward.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0175_audit_entry_path.sql"),
+        },
     ]
 }
 

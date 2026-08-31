@@ -132,7 +132,7 @@ pub mod test_support;
 pub use repository::append_lock_key_from_parts;
 
 pub use abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
-pub use audit::{ActingContext, Action, ActorRef};
+pub use audit::{ActingContext, Action, ActorRef, EntryPath};
 pub use brand::{
     BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
     canonicalize_host,

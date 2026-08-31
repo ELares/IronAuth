@@ -1814,6 +1814,48 @@ pub struct ActingContext {
     actor: ActorRef,
     correlation: CorrelationId,
     organization: Option<crate::id::OrganizationId>,
+    entry_path: Option<EntryPath>,
+}
+
+/// How a management call ARRIVED (issue #123 criterion 5).
+///
+/// A CLOSED ENUM and not a string, for the reason migration 0175 gives: this column exists to be
+/// grouped by, and a free-text one is not. Adding a member is a migration, which is deliberate --
+/// an entry path nobody declared cannot appear in an operator's SIEM export.
+///
+/// SELF-DECLARED, not observed. The value comes from a request header the caller sets, so read a
+/// row's entry path as "the caller said this" rather than "the platform saw this". It is not a
+/// privilege and cannot become one: the caller is already authenticated and already authorized
+/// for the operation, and lying about their own provenance changes nothing they can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EntryPath {
+    /// Driven through an agent tool over the Model Context Protocol.
+    Mcp,
+}
+
+impl EntryPath {
+    /// The stored value, which is what the table's CHECK admits.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntryPath::Mcp => "mcp",
+        }
+    }
+
+    /// Parse a caller-supplied value, or [`None`].
+    ///
+    /// An UNRECOGNIZED value is `None` rather than an error, and the request proceeds with no
+    /// entry path recorded. Refusing the whole call would let a client break its own management
+    /// operations by sending a header this version does not know -- turning a provenance hint
+    /// into an availability dependency, which is far more damage than an unrecorded hint.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mcp" => Some(EntryPath::Mcp),
+            _ => None,
+        }
+    }
 }
 
 impl ActingContext {
@@ -1828,6 +1870,7 @@ impl ActingContext {
             actor,
             correlation,
             organization: None,
+            entry_path: None,
         }
     }
 
@@ -1855,6 +1898,25 @@ impl ActingContext {
     #[must_use]
     pub fn organization(&self) -> Option<crate::id::OrganizationId> {
         self.organization
+    }
+
+    /// Record that every audit row written under this context arrived by `entry_path`.
+    ///
+    /// Set from the caller's own declaration. See [`EntryPath`] for what that is worth.
+    #[must_use]
+    pub fn via(mut self, entry_path: EntryPath) -> Self {
+        self.entry_path = Some(entry_path);
+        self
+    }
+
+    /// How this action arrived, if the caller said.
+    ///
+    /// [`None`] means "not recorded", which is what a direct API call and every row written
+    /// before this existed both have. It does NOT mean "arrived directly": that would be a claim
+    /// about rows nobody measured.
+    #[must_use]
+    pub fn entry_path(&self) -> Option<EntryPath> {
+        self.entry_path
     }
 
     /// The acting principal.

@@ -781,3 +781,10 @@ required-features = ["testing"]
 name = "config_write_events"
 path = "tests/config_write_events.rs"
 required-features = ["testing"]
+
+# Issue #123 criterion 5: the entry path a caller declares reaches the audit row, a direct call
+# records none, and an unrecognised value records none rather than refusing the request.
+[[test]]
+name = "audit_entry_path"
+path = "tests/audit_entry_path.rs"
+required-features = ["testing"]

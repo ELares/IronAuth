@@ -59,7 +59,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
 use crate::abuse::{AbuseBanView, AbuseSubject, AbuseSubjectKind, AuthPath, NewBan};
-use crate::audit::{ActingContext, Action, ActorRef};
+use crate::audit::{ActingContext, Action, ActorRef, EntryPath};
 use crate::brand::{
     BrandAssetKind, BrandAssetMeta, BrandAssetRecord, BrandRecord, NewBrand, NewBrandAsset,
 };
@@ -1446,6 +1446,25 @@ impl<'a> ScopedStore<'a> {
             scope: self.scope,
             acting: ActingContext::new(actor, correlation),
         }
+    }
+}
+
+impl ActingStore<'_> {
+    /// Record that every audit row written through this store arrived by `entry_path`.
+    ///
+    /// A BUILDER rather than a parameter on `acting`, and the reason is arithmetic: `acting` has
+    /// two hundred and forty-five call sites in the admin crate alone, almost none of which are
+    /// reachable from an agent tool. Widening its signature would touch every one of them to
+    /// pass `None`, which is churn that buys nothing and reviews as noise.
+    ///
+    /// `None` is accepted and is a no-op, so a caller that has an `Option` from a request header
+    /// does not have to branch.
+    #[must_use]
+    pub fn via(mut self, entry_path: Option<EntryPath>) -> Self {
+        if let Some(entry_path) = entry_path {
+            self.acting = self.acting.via(entry_path);
+        }
+        self
     }
 }
 
@@ -44731,10 +44750,10 @@ async fn insert_audit_row<T: AuditTarget>(
         "INSERT INTO audit_log \
          (id, tenant_id, environment_id, action, actor_kind, actor_id, \
           target_kind, target_id, correlation_id, occurred_at, detail, stream, \
-          organization_id) \
+          organization_id, entry_path) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                  TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11, $12, \
-                 $13)",
+                 $13, $14)",
     )
     .bind(audit_id.to_string())
     .bind(spec.scope.tenant().to_string())
@@ -44751,6 +44770,9 @@ async fn insert_audit_row<T: AuditTarget>(
     // NULL where the caller established no organization, which is most mutations. See
     // `ActingContext::in_organization`.
     .bind(spec.acting.organization().map(|id| id.to_string()))
+    // NULL where the caller declared no entry path, which is every direct API call. That is
+    // "not recorded" and NOT "arrived directly" -- see `EntryPath`.
+    .bind(spec.acting.entry_path().map(EntryPath::as_str))
     .execute(&mut **tx)
     .await?;
     Ok(())
