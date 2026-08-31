@@ -32769,6 +32769,7 @@ impl ActingChallengeComponentRepo<'_> {
         &self,
         env: &Env,
         deployment: crate::token_hook_store::ChallengeDeployment<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
@@ -32818,6 +32819,9 @@ impl ActingChallengeComponentRepo<'_> {
                 .bind(aot_engine_key)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's own transaction: a deploy that failed announces nothing, and
+                // one that landed announces exactly once.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32835,7 +32839,12 @@ impl ActingChallengeComponentRepo<'_> {
     ///
     /// [`StoreError::NotFound`] when no component of that name exists, so a removal that matched
     /// nothing is not reported as success; [`StoreError::Database`] on a persistence fault.
-    pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+    pub async fn delete(
+        &self,
+        env: &Env,
+        name: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
         // the name for the whole call, while the mutation closure is `async move` and takes
@@ -32868,6 +32877,8 @@ impl ActingChallengeComponentRepo<'_> {
                 if result.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // AFTER the rows-affected guard: a delete that matched nothing announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32891,6 +32902,7 @@ impl ActingChallengeComponentRepo<'_> {
         env: &Env,
         name: &str,
         secret_name: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
@@ -32936,6 +32948,9 @@ impl ActingChallengeComponentRepo<'_> {
                 .bind(&secret_name)
                 .execute(&mut **tx)
                 .await?;
+                // AFTER the component-exists guard above: a grant against a component that is
+                // not there is a not-found and announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -32958,6 +32973,7 @@ impl ActingChallengeComponentRepo<'_> {
         env: &Env,
         name: &str,
         secret_name: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         let scope = self.scope;
         // TWO BINDINGS OF ONE NAME, and the second is not redundant: the audit target BORROWS
@@ -32988,6 +33004,12 @@ impl ActingChallengeComponentRepo<'_> {
                 .bind(&secret_name)
                 .execute(&mut **tx)
                 .await?;
+                // ANNOUNCED EVEN WHEN THE DELETE MATCHED NOTHING, unlike every other write here,
+                // because this one is deliberately IDEMPOTENT: revoking a name that was never
+                // granted is a success, so "the capability is not held" is the state the caller
+                // asked for and the state a consumer should be told about. A rows-affected guard
+                // would make the second run of a cleanup script silently announce nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -33205,6 +33227,7 @@ impl ActingSessionTokenTemplateRepo<'_> {
         env: &Env,
         template: crate::session_token_store::NewSessionTokenTemplate<'_>,
         key: crate::session_token_store::NewSessionTokenKey<'_>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if key.id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -33275,6 +33298,9 @@ impl ActingSessionTokenTemplateRepo<'_> {
                 .bind(activate_at)
                 .execute(&mut **tx)
                 .await?;
+                // In the write's own transaction: a template that failed to store announces
+                // nothing, and one that stored announces exactly once.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -33288,7 +33314,12 @@ impl ActingSessionTokenTemplateRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if no template of that name exists in this scope;
     /// [`StoreError::Database`] on a persistence fault.
-    pub async fn delete(&self, env: &Env, name: &str) -> Result<(), StoreError> {
+    pub async fn delete(
+        &self,
+        env: &Env,
+        name: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let owned = name.to_owned();
         let bound = owned.clone();
@@ -33317,6 +33348,8 @@ impl ActingSessionTokenTemplateRepo<'_> {
                 if done.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // AFTER the rows-affected guard: a delete that matched nothing announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -33520,7 +33553,12 @@ impl ActingSessionJwtModeRepo<'_> {
     /// [`StoreError::Database`] on a persistence fault, which includes the foreign key onto
     /// `session_token_templates`: naming a template that does not exist is refused by the
     /// database rather than stored, so the mode can never point at nothing.
-    pub async fn enable(&self, env: &Env, template: &str) -> Result<(), StoreError> {
+    pub async fn enable(
+        &self,
+        env: &Env,
+        template: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let name = template.to_owned();
         let bound = name.clone();
@@ -33546,6 +33584,7 @@ impl ActingSessionJwtModeRepo<'_> {
                 .bind(&name)
                 .execute(&mut **tx)
                 .await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -33560,7 +33599,12 @@ impl ActingSessionJwtModeRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the mode was not on;
     /// [`StoreError::Database`] on a persistence fault.
-    pub async fn disable(&self, env: &Env, template: &str) -> Result<(), StoreError> {
+    pub async fn disable(
+        &self,
+        env: &Env,
+        template: &str,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let scope = self.scope;
         let bound = template.to_owned();
         write_audited(
@@ -33587,6 +33631,7 @@ impl ActingSessionJwtModeRepo<'_> {
                 if done.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -34070,6 +34115,7 @@ impl ActingTokenHookRepo<'_> {
         client: &ClientId,
         hook_name: &str,
         secret_name: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -34125,6 +34171,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&secret)
                 .execute(&mut **tx)
                 .await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -34154,6 +34201,7 @@ impl ActingTokenHookRepo<'_> {
         client: &ClientId,
         hook_name: &str,
         secret_name: &str,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -34191,6 +34239,7 @@ impl ActingTokenHookRepo<'_> {
                 .bind(&secret)
                 .execute(&mut **tx)
                 .await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -34231,6 +34280,7 @@ impl ActingTokenHookRepo<'_> {
         env: &Env,
         client: &ClientId,
         order: &[String],
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if client.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -34294,6 +34344,9 @@ impl ActingTokenHookRepo<'_> {
                 if updated.rows_affected() != names.len() as u64 {
                     return Err(StoreError::NotFound);
                 }
+                // AFTER the count guard: a reorder that named a hook this client does not have
+                // is a not-found and announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

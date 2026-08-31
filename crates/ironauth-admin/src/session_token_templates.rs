@@ -208,6 +208,24 @@ pub async fn set_session_token_template(
                 publish_at_micros: now_micros,
                 activate_at_micros: now_micros,
             },
+            tokenizer_event(
+                &state,
+                scope,
+                "session_token_template.set",
+                // THE TTL RIDES ALONG because it is the exact width of the window in which a
+                // revoked session's already-minted token still verifies. A consumer tracking
+                // revocation latency reads this number; refetching to learn it would make the
+                // event useless for that. NEVER the rules and never key material.
+                &serde_json::json!({
+                    "name": template.name(),
+                    "audience": template.audience(),
+                    "ttl_seconds": template.ttl_seconds(),
+                }),
+                template.name(),
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
         )
         .await?;
 
@@ -322,7 +340,20 @@ pub async fn delete_session_token_template(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .session_token_templates()
-        .delete(state.env(), name)
+        .delete(
+            state.env(),
+            name,
+            tokenizer_event(
+                &state,
+                scope,
+                "session_token_template.deleted",
+                &serde_json::json!({ "name": name }),
+                name,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     Ok(no_content())
 }
@@ -397,7 +428,20 @@ pub async fn set_session_jwt_mode(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .session_jwt_mode()
-        .enable(state.env(), &template.name)
+        .enable(
+            state.env(),
+            &template.name,
+            tokenizer_event(
+                &state,
+                scope,
+                "session_jwt_mode.enabled",
+                &serde_json::json!({ "template": template.name }),
+                &template.name,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
 
     let view = SessionJwtModeView {
@@ -516,7 +560,53 @@ pub async fn delete_session_jwt_mode(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .session_jwt_mode()
-        .disable(state.env(), &template)
+        .disable(
+            state.env(),
+            &template,
+            tokenizer_event(
+                &state,
+                scope,
+                "session_jwt_mode.disabled",
+                &serde_json::json!({ "template": template }),
+                &template,
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     Ok(no_content())
+}
+
+/// Build the event a tokenizer or session-mode write announces (issue #108's contract).
+///
+/// One builder for all four, for the reason `challenge_components::component_event` gives: the
+/// differences are the type and the payload, and the SUBJECT is what keeps two events about one
+/// object ordered on a consumer's stream.
+///
+/// The subject is the template NAME. For the mode's two events that is the template it was
+/// pointed at, which is deliberate: the mode is per-environment and has no name of its own, and
+/// ordering its events beside the template's is what a consumer tracking "what governs this
+/// environment's sessions" needs.
+fn tokenizer_event(
+    state: &AdminState,
+    scope: Scope,
+    event_type: &str,
+    payload: &serde_json::Value,
+    subject: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: subject.to_owned(),
+        envelope,
+    })
 }

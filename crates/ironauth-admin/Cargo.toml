@@ -773,3 +773,11 @@ required-features = ["testing"]
 name = "ciba_ping"
 path = "tests/ciba_ping.rs"
 required-features = ["testing"]
+
+# Every configuration write that announces itself actually LANDS an event (issue #108). The
+# producer-coverage gate proves a handler BUILDS one; this proves the store emits it, which is a
+# different claim and is the one that was false while these producers were being written.
+[[test]]
+name = "config_write_events"
+path = "tests/config_write_events.rs"
+required-features = ["testing"]

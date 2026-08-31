@@ -1090,7 +1090,7 @@ impl Harness {
             .scoped(self.scope())
             .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
             .token_hooks()
-            .grant_secret(&env, client, hook, secret)
+            .grant_secret(&env, client, hook, secret, None)
             .await
             .expect("grant the secret");
     }
@@ -1103,7 +1103,7 @@ impl Harness {
             .scoped(self.scope())
             .acting(self.db().test_actor(&env), CorrelationId::generate(&env))
             .token_hooks()
-            .revoke_secret(&env, client, hook, secret)
+            .revoke_secret(&env, client, hook, secret, None)
             .await
             .expect("revoke the secret");
     }
@@ -1282,6 +1282,11 @@ impl Harness {
                     publish_at_micros: 0,
                     activate_at_micros: 0,
                 },
+                // NO EVENT from the harness. These helpers seed FIXTURES; the event is the
+                // management surface's to emit, and `ironauth-admin` has its own tests for that.
+                // Emitting one here would put rows on the outbox that every OIDC test then has
+                // to ignore.
+                None,
             )
             .await
             .expect("install session token template");
@@ -1298,7 +1303,7 @@ impl Harness {
             .scoped(self.scope)
             .acting(actor, corr)
             .session_jwt_mode()
-            .enable(&self.env, template)
+            .enable(&self.env, template, None)
             .await
             .expect("enable the jwt session mode");
     }

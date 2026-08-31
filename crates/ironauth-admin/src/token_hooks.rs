@@ -712,7 +712,26 @@ pub async fn reorder_token_hooks(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .reorder(state.env(), &client, &request.order)
+        .reorder(
+            state.env(),
+            &client,
+            &request.order,
+            hook_event(
+                &state,
+                scope,
+                "token_hook.reordered",
+                // THE RESULTING ORDER, because that IS the change. The address alone would be a
+                // notification a consumer has to refetch to act on.
+                &serde_json::json!({
+                    "client_id": client.to_string(),
+                    "order": request.order,
+                }),
+                &client.to_string(),
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
 
     // READ BACK, not echo. The request says what the caller asked for; the response says what
@@ -889,7 +908,27 @@ pub async fn grant_token_hook_secret(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .grant_secret(state.env(), &client, hook, secret)
+        .grant_secret(
+            state.env(),
+            &client,
+            hook,
+            secret,
+            hook_event(
+                &state,
+                scope,
+                "token_hook.secret_granted",
+                // THE NAME, NEVER THE VALUE.
+                &serde_json::json!({
+                    "client_id": client.to_string(),
+                    "hook_name": hook,
+                    "secret_name": secret,
+                }),
+                &client.to_string(),
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     read_back_secrets(&state, scope, &client, hook).await
 }
@@ -940,7 +979,26 @@ pub async fn revoke_token_hook_secret(
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .token_hooks()
-        .revoke_secret(state.env(), &client, hook, secret)
+        .revoke_secret(
+            state.env(),
+            &client,
+            hook,
+            secret,
+            hook_event(
+                &state,
+                scope,
+                "token_hook.secret_revoked",
+                &serde_json::json!({
+                    "client_id": client.to_string(),
+                    "hook_name": hook,
+                    "secret_name": secret,
+                }),
+                &client.to_string(),
+            )
+            .as_ref()
+            .map(crate::events::PendingEvent::domain_event)
+            .as_ref(),
+        )
         .await?;
     read_back_secrets(&state, scope, &client, hook).await
 }
@@ -1626,4 +1684,32 @@ pub async fn test_token_hook(
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
+}
+
+/// Build the event a token-hook capability or ordering write announces (issue #108's contract).
+///
+/// The subject is the CLIENT, matching `token_hook.deployed`: a hook has no id of its own, it is
+/// deployed against a client, and the client is what keeps two events about one chain ordered on
+/// a consumer's stream.
+fn hook_event(
+    state: &AdminState,
+    scope: Scope,
+    event_type: &str,
+    payload: &serde_json::Value,
+    client_id: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        payload,
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject: client_id.to_owned(),
+        envelope,
+    })
 }
