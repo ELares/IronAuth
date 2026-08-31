@@ -55,6 +55,7 @@ mod connectors;
 mod consents;
 mod dcr;
 mod diagnostics;
+mod entry_path;
 mod environments;
 mod error;
 mod event_feed;

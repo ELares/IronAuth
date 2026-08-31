@@ -289,9 +289,18 @@ fn user_deleted_event(
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
+// One line over clippy's bound after gaining the entry-path extractor, and allowed rather than
+// split: this handler is one linear sequence -- authorize, replay-check, validate, write, record
+// -- and cutting it in half to satisfy a line count would put the idempotency replay in a
+// different function from the write it replays.
+#[allow(clippy::too_many_lines)]
 pub async fn create_user(
     State(state): State<AdminState>,
     principal: Principal,
+    // How the caller says this arrived (issue #123 criterion 5). Named in the signature rather
+    // than read from `headers` below, so "which handlers record the entry path" is a question
+    // the compiler answers.
+    entry_path: crate::entry_path::DeclaredEntryPath,
     Path((tenant_id, environment_id)): Path<(String, String)>,
     uri: Uri,
     headers: HeaderMap,
@@ -387,6 +396,7 @@ pub async fn create_user(
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
+        .via(entry_path.0)
         .users()
         .admin_create_emitting(
             state.env(),

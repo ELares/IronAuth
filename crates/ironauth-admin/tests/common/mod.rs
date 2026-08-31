@@ -1074,6 +1074,32 @@ impl Harness {
         self.send(request).await
     }
 
+    /// A POST with extra request headers, for the surfaces whose behaviour depends on one.
+    pub async fn post_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        idempotency_key: &str,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, bearer(OPERATOR_TOKEN))
+            .header("idempotency-key", idempotency_key)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        self.send(
+            builder
+                .body(Body::from(body.to_owned()))
+                .expect("request builds"),
+        )
+        .await
+    }
+
     /// A PATCH with an arbitrary bearer token, for driving the environment-scoped
     /// MUTATION surface as a management key (the credential-scope tests).
     pub async fn patch_as(
