@@ -27,6 +27,7 @@ protocol risk from the integrator, first.**
 | --- | --- |
 | Go management SDK | **Generated** from `docs/openapi/management.json` (`sdks/go`) |
 | Python management SDK | **Generated** from `docs/openapi/management.json` (`sdks/python`) |
+| Java token verification | **Hand-written, dependency-free** (`sdks/java`) -- the JDK has had Ed25519 since Java 15, so it bundles nothing, not even a JSON parser. Verification only: there is no Java management SDK, and the generated clients remain Go and Python |
 | Reference client | **Hand-written from the published spec** (`clients/reference`) -- proves the spec is sufficient to build against without reading SDK source |
 
 The generated clients are produced by the pipeline in the [SDK contract](SDK-CONTRACT.md);
@@ -56,7 +57,7 @@ Nothing below is refused. Each entry states what would change our mind.
   **Revisit trigger**: AppAuth stops tracking a platform release, or a capability IronAuth
   needs cannot be expressed through it.
 
-- **What**: Java, .NET, Ruby, and PHP beyond generated management clients.
+- **What**: .NET, Ruby, and PHP beyond generated management clients.
   **Why**: for a server-side integration the protocol work is token verification, and that is
   a JOSE problem those ecosystems already solve well. The generated management client covers
   administration; a bespoke SDK on top would mostly restate a verification library.
@@ -64,6 +65,13 @@ Nothing below is refused. Each entry states what would change our mind.
   [edge verification](edge-verification.md).
   **Revisit trigger**: a verification path in one of these ecosystems proves error-prone in
   practice -- a recurring integrator mistake is evidence; an absence of one is not.
+  **Java left this list**, and the reason is worth recording because it is not the trigger
+  above. Nobody reported a Java integrator getting verification wrong. What changed is that
+  the cost collapsed: Ed25519 landed in the JDK itself, so the artifact could be written with
+  no dependencies at all rather than as glue around Nimbus and Tink. A deferral justified by
+  "this would mostly restate a library" stops holding when the thing no longer needs the
+  library. Note the narrow scope of what shipped -- verification, not administration; there
+  is still no Java management SDK, and this entry still covers that.
 
 ## Why deferrals are published rather than implied
 

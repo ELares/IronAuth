@@ -1247,6 +1247,29 @@ jobs:
         working-directory: packages/ironauth-mcp
         run: npm test
 
+  java-verify:
+    # Issue #118 criterion 4: the official Java verifier artifact, against the SHARED
+    # cross-language conformance corpus.
+    #
+    # Its own job because it needs a JDK and nothing else here does. Note what is NOT in these
+    # steps: no Maven, no Gradle, no dependency resolution, no lockfile. The artifact uses only
+    # the JDK -- Ed25519 has been in the platform since Java 15 (JEP 339) -- so `javac` and
+    # `java` are the entire toolchain, which is the strongest form of the criterion's "no extra
+    # user dependencies": there is nothing to resolve, so nothing can drift or break.
+    name: java verifier (shared conformance corpus, no dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # 17 is the floor the artifact needs (in-box Ed25519 arrived in 15, records in 17) and
+          # the gate checks it at runtime too, so a runner that quietly moved would say so.
+          java-version: 21
+      - name: verify (corpus + self-test + live sample)
+        run: scripts/java-verify.sh
+
   docs-mcp:
     # Issue #123 criterion 1: the recorded integration-task eval. It does not run a model -- it
     # measures whether the docs MCP server surfaces the guidance each step of the task needs, and
