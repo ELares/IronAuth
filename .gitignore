@@ -18,3 +18,9 @@ sdks/java/out/
 # Build output of the .NET verifier (issue #118); scripts/dotnet-verify.sh recreates it.
 sdks/dotnet/**/bin/
 sdks/dotnet/**/obj/
+
+# Android sample build output (issue #116); scripts/mobile-verify.sh recreates it.
+clients/mobile/android/app/build/
+clients/mobile/android/.gradle/
+clients/mobile/android/build/
+clients/mobile/android/local.properties
