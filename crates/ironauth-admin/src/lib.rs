@@ -73,6 +73,7 @@ mod keys;
 mod locales;
 mod messages;
 pub mod usage;
+mod whoami;
 
 /// SIEM log stream delivery (issue #110): the sink interface, the HTTP sink, and the
 /// shipper that reads audit rows forward from each stream's cursor. Public because the
@@ -200,6 +201,10 @@ pub fn management_router(state: AdminState) -> Router {
         )
         // The compatibility-wizard interop table (issue #93): an operator-plane read of
         // the per-verifier signing-algorithm recommendations. Unscoped and read only.
+        // WHAT THIS CREDENTIAL MAY DO (issue #123 criterion 4). Answers only about the caller,
+        // which is what lets an agent tool server advertise exactly the tools its own key can
+        // actually drive rather than a list an operator hand-configured.
+        .route("/v1/me", get(whoami::get_caller))
         .route(
             "/v1/interop/signing-recommendations",
             get(signing_algorithm::get_signing_recommendations),

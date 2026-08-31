@@ -59,6 +59,52 @@
         ]
       }
     },
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "operators"
+        ],
+        "summary": "Report what the presenting credential is and may do.",
+        "operationId": "getCaller",
+        "responses": {
+          "200": {
+            "description": "The presenting credential's own plane, scope and permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallerView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential is not granted management.read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/operators": {
       "get": {
         "tags": [
@@ -27257,6 +27303,48 @@
               "type": "string"
             },
             "description": "The sessions to revoke. Every id is scope-FENCED: one belonging to another\ntenant or environment is a uniform no-op (never an error that would confirm\nits existence), so a batch can never reach across a scope boundary."
+          }
+        }
+      },
+      "CallerView": {
+        "type": "object",
+        "description": "What the presenting credential is and may do (issue #123 criterion 4).\n\nAnswers ONLY about the credential that presented it. There is no key parameter and there\ncannot be one: telling the holder of a credential what it can do discloses nothing, while\nanswering about ANOTHER key would be exactly the credential-mapping this API refuses\nelsewhere.",
+        "required": [
+          "plane",
+          "unrestricted"
+        ],
+        "properties": {
+          "environment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The environment a management key is bound to. Absent for the operator plane."
+          },
+          "permissions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The permission slugs this credential holds.\n\nABSENT is not \"none\". It means the credential's authority is not expressed as a\npermission set -- an unrestricted key, or the operator plane, which is broader than any\npermission and includes tenant lifecycle that none of them names. Read `unrestricted`\nfirst; a consumer that treated absent as empty would advertise nothing for the credential\nthat can do the most."
+          },
+          "plane": {
+            "type": "string",
+            "description": "`operator` or `management_key`."
+          },
+          "tenant_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The tenant a management key is bound to. Absent for the operator plane."
+          },
+          "unrestricted": {
+            "type": "boolean",
+            "description": "Whether this credential is unrestricted.\n\nCarried explicitly rather than left to be inferred from `permissions` being absent,\nbecause inferring it is exactly the mistake above and a boolean cannot be misread."
           }
         }
       },

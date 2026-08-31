@@ -170,6 +170,7 @@ fn operation_ids_are_the_stable_set() {
             "getActiveTraitSchema",
             "getAuthzenConfiguration",
             "getBrand",
+            "getCaller",
             "getClaimsMapping",
             "getClientAdminConsent",
             "getClientAllowedScopes",
@@ -570,6 +571,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/variables/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}",
             "GET /v1/interop/signing-recommendations",
+            "GET /v1/me",
             "GET /v1/operators",
             "GET /v1/operators/{operator_id}",
             "GET /v1/resource-types",
@@ -886,7 +888,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        270,
+        271,
         "the documented route count is pinned"
     );
 

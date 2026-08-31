@@ -391,6 +391,10 @@ class Client:
         """Get a per-environment brand by slug. GET /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/brands/{urllib.parse.quote(slug)}", query, None)
 
+    def get_caller(self, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Report what the presenting credential is and may do. GET /v1/me."""
+        return self._do("GET", f"/v1/me", query, None)
+
     def get_claims_mapping(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Get a per-environment, per-client declarative claim mapping. GET /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/claims-mapping."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/applications/{urllib.parse.quote(client_id)}/claims-mapping", query, None)

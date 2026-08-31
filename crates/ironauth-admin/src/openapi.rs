@@ -25,7 +25,7 @@ use crate::signing_algorithm::{
 };
 use crate::views::{
     BrandAssetView, BrandPage, BrandView, BulkRevocationView, BulkRevokeSessionsRequest,
-    ChallengeComponentSecretsView, ChallengeComponentView, ChallengeComponentsView,
+    CallerView, ChallengeComponentSecretsView, ChallengeComponentView, ChallengeComponentsView,
     ClaimsMappingView, ClientAdminConsentView, ClientVerificationView, ConnectorCapabilitiesView,
     ConnectorHealthView, ConnectorList, ConnectorView, ConsentRevocationView,
     CreateConnectorRequest, CreateDcrPolicyRequest, CreateEnvironmentRequest,
@@ -356,6 +356,7 @@ use crate::views::{
         crate::token_hooks::list_token_hook_secrets,
         crate::token_hooks::grant_token_hook_secret,
         crate::token_hooks::revoke_token_hook_secret,
+        crate::whoami::get_caller,
         crate::session_token_templates::set_session_jwt_mode,
         crate::session_token_templates::get_session_jwt_mode,
         crate::session_token_templates::delete_session_jwt_mode,
@@ -588,6 +589,7 @@ use crate::views::{
         TokenHookChainView,
         TokenHookChainEntryView,
         ChallengeComponentSecretsView,
+        CallerView,
         SessionJwtModeView,
         SetSessionJwtModeRequest,
         SessionTokenTemplateView,
