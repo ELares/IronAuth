@@ -15,6 +15,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { forgetDiscovery } from './discovery.js';
 import { type NodeResponseLike, fetchAdapter, nodeAdapter, toResponse } from './adapters.js';
 import { COOKIE_BUDGET_BYTES, SESSION_COOKIE, assertHardened } from './cookie.js';
 import {
@@ -47,15 +48,44 @@ function idToken(): string {
   return `${b64({ alg: 'EdDSA' })}.${b64(payload)}.signature`;
 }
 
+/**
+ * The endpoint host, DELIBERATELY not under the issuer path.
+ *
+ * An IronAuth issuer carries a `/t/<tenant>/e/<environment>` path while its endpoints sit at the
+ * host root, so `${issuer}/token` resolves to a URL that 404s. This fake reproduces that
+ * arrangement, and 404s anything else on the issuer host, because the previous version answered
+ * ANY url with 200 -- which is why a BFF that could never have completed a real login passed
+ * every test it had.
+ */
+const ENDPOINT_HOST = 'https://iss.example';
+
 /** A fake IdP + upstream API. Records what it was asked. */
-function upstream(options: { refreshFails?: boolean } = {}) {
-  const calls: Array<{ url: string; authorization: string | null; body?: string }> = [];
+function upstream(options: { refreshFails?: boolean; requireDpop?: boolean } = {}) {
+  // The discovery cache is module-level, so a test reusing an issuer would otherwise inherit the
+  // previous test's endpoints.
+  forgetDiscovery();
+  const calls: Array<{ url: string; authorization: string | null; dpop: string | null; body?: string }> = [];
   const send = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString();
     const headers = new Headers(init?.headers as HeadersInit | undefined);
     const body = typeof init?.body === 'string' ? init.body : undefined;
-    calls.push({ url, authorization: headers.get('authorization'), body });
-    if (url === `${ISSUER}/token`) {
+    calls.push({ url, authorization: headers.get('authorization'), dpop: headers.get('dpop'), body });
+    if (url === `${ISSUER}/.well-known/openid-configuration`) {
+      return new Response(
+        JSON.stringify({
+          issuer: ISSUER,
+          authorization_endpoint: `${ENDPOINT_HOST}/authorize`,
+          token_endpoint: `${ENDPOINT_HOST}/token`,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url === `${ENDPOINT_HOST}/token`) {
+      // IronAuth's posture for a public client: no proof, no tokens. The fake enforces it so a
+      // BFF that stopped sending proofs fails here rather than in production.
+      if (options.requireDpop && headers.get('dpop') === null) {
+        return new Response(JSON.stringify({ error: 'invalid_dpop_proof' }), { status: 400 });
+      }
       const form = new URLSearchParams(body ?? '');
       if (form.get('grant_type') === 'refresh_token' && options.refreshFails) {
         return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 });
@@ -69,6 +99,11 @@ function upstream(options: { refreshFails?: boolean } = {}) {
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       );
+    }
+    // A 404 for anything else on the issuer's host. The old fake answered 200 to every URL,
+    // which is what let `${issuer}/token` look like it worked.
+    if (url.startsWith(ISSUER) || url.startsWith(ENDPOINT_HOST)) {
+      return new Response(JSON.stringify({ error: 'not_found', url }), { status: 404 });
     }
     return new Response(JSON.stringify({ ok: true, url }), {
       status: 200,
@@ -131,7 +166,10 @@ async function lifecycle(
   );
   assert.equal(loginResponse.status, 302);
   const authorize = new URL(loginResponse.headers.get('location') ?? '');
-  assert.equal(authorize.origin + authorize.pathname, `${ISSUER}/authorize`);
+  // FROM DISCOVERY, and the difference is the whole point: the endpoint is at the host root
+  // while the issuer carries an environment path. Asserting `${ISSUER}/authorize` here is what
+  // this test used to do, and it was asserting the bug.
+  assert.equal(authorize.origin + authorize.pathname, `${ENDPOINT_HOST}/authorize`);
   assert.equal(authorize.searchParams.get('code_challenge_method'), 'S256');
   assert.ok(authorize.searchParams.get('code_challenge'), 'a PKCE challenge is sent');
   const state = authorize.searchParams.get('state') ?? '';
@@ -539,4 +577,78 @@ test('every adapter renders unauthenticated the way the route asked', () => {
   const page = toResponse(result, { redirectTo: '/auth/login' });
   assert.equal(page.status, 302);
   assert.equal(page.headers.get('location'), '/auth/login');
+});
+
+test('a token bound to a different key than we proved is refused', async () => {
+  // The BFF sends a proof; the SERVER decides what to bind to. If those disagree, every later
+  // request fails with an error about the request rather than about the login -- the kind of
+  // mismatch that costs an afternoon. It is caught once, at the callback, while the cause is
+  // still visible.
+  const store = new MemorySessionStore();
+  forgetDiscovery();
+  const send = (async (input: string | URL | Request): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url === `${ISSUER}/.well-known/openid-configuration`) {
+      return new Response(
+        JSON.stringify({
+          issuer: ISSUER,
+          authorization_endpoint: 'https://iss.example/authorize',
+          token_endpoint: 'https://iss.example/token',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    const b64 = (value: object) => Buffer.from(JSON.stringify(value)).toString('base64url');
+    // A JWT access token whose cnf.jkt is a thumbprint we did not produce.
+    const bound = `${b64({ alg: 'EdDSA' })}.${b64({ sub: 'usr_1', cnf: { jkt: 'someone-elses-key' } })}.sig`;
+    return new Response(
+      JSON.stringify({ access_token: bound, expires_in: 300, id_token: idToken() }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }) as unknown as typeof fetch;
+
+  // PUBLIC client (no secret), which is what turns DPoP on.
+  const config: BffConfig = { ...configOf(store, send), clientSecret: undefined };
+  const started = await login(config, {
+    method: 'GET',
+    url: 'https://app.example/auth/login',
+    headers: new Headers(),
+  });
+  assert.equal(started.kind, 'redirect');
+  const cookie = started.kind === 'redirect' ? (started.setCookie ?? '') : '';
+  const pendingId = /=([^;]*)/.exec(cookie)![1];
+  const state = new URL(started.kind === 'redirect' ? started.location : '').searchParams.get('state');
+
+  const done = await callback(config, {
+    method: 'GET',
+    url: `https://app.example/auth/callback?code=c1&state=${state}`,
+    headers: new Headers({ cookie: `${SESSION_COOKIE}=${pendingId}` }),
+  });
+  assert.equal(done.kind, 'upstream_error');
+  assert.match(done.kind === 'upstream_error' ? done.detail : '', /bound to a different key/);
+});
+
+test('an opaque access token is not treated as a binding failure', async () => {
+  // An opaque token is perfectly legal and says NOTHING about the binding, so an absent claim
+  // must not be read as evidence of a problem. Without this the check above would refuse every
+  // issuer that does not happen to mint JWT access tokens.
+  const store = new MemorySessionStore();
+  const upstreamed = upstream({ requireDpop: true });
+  const config: BffConfig = { ...configOf(store, upstreamed.send), clientSecret: undefined };
+  const started = await login(config, {
+    method: 'GET',
+    url: 'https://app.example/auth/login',
+    headers: new Headers(),
+  });
+  const cookie = started.kind === 'redirect' ? (started.setCookie ?? '') : '';
+  const pendingId = /=([^;]*)/.exec(cookie)![1];
+  const state = new URL(started.kind === 'redirect' ? started.location : '').searchParams.get('state');
+  const done = await callback(config, {
+    method: 'GET',
+    url: `https://app.example/auth/callback?code=c1&state=${state}`,
+    headers: new Headers({ cookie: `${SESSION_COOKIE}=${pendingId}` }),
+  });
+  assert.equal(done.kind, 'redirect');
+  // And the proof really was sent, which is what `requireDpop` on the fake enforces.
+  assert.ok(upstreamed.calls.some((call) => call.dpop !== null), 'no DPoP proof reached the token endpoint');
 });

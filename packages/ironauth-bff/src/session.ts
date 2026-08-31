@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import type { DpopKey } from './dpop.js';
 
 /**
  * Where the tokens live (issue #117).
@@ -38,6 +39,17 @@ export interface SessionRecord {
   acr?: string;
   /** When the user authenticated, epoch seconds, for `max_age`. Server-side only, as above. */
   authTime?: number;
+  /**
+   * The DPoP key these tokens are bound to (RFC 9449), when the client uses DPoP.
+   *
+   * SERVER-SIDE ONLY, like the tokens, and for the same reason: it is the other half of the
+   * credential. A DPoP-bound access token is worthless without this key, which is the entire
+   * point, and it stops being true the moment the key reaches the browser.
+   *
+   * Held per SESSION rather than per process so a token stolen from one session cannot be
+   * replayed by another on the same replica.
+   */
+  dpopKey?: DpopKey;
 }
 
 /** What the server holds between the login redirect and the callback. */
@@ -50,6 +62,13 @@ export interface PendingLogin {
   returnTo: string;
   /** Epoch seconds after which this pending login is refused. */
   expiresAt: number;
+  /**
+   * The DPoP key generated at login, carried to the callback that redeems the code.
+   *
+   * Generated at LOGIN rather than at the callback because the token the exchange returns is
+   * bound to whichever key proved possession, and that key then has to be the session's.
+   */
+  dpopKey?: DpopKey;
 }
 
 /**

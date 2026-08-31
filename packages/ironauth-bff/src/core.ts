@@ -24,6 +24,8 @@
  * package could have had is ranked below it in `docs/bff.md` with the reasons.
  */
 
+import { discover } from './discovery.js';
+import { dpopProof, newDpopKey, thumbprint, type DpopKey } from './dpop.js';
 import { SESSION_COOKIE, clearSessionCookie, sessionCookie, sessionFromCookieHeader } from './cookie.js';
 import { MemorySessionStore, type SessionRecord, type SessionStore, newId } from './session.js';
 
@@ -77,6 +79,64 @@ export interface BffConfig {
   fetch?: typeof fetch;
   /** Injectable epoch-seconds clock. Defaults to the wall clock. */
   now?: () => number;
+  /**
+   * Whether to sender-constrain the tokens with DPoP (RFC 9449).
+   *
+   * Defaults to TRUE for a public client (no `clientSecret`) and false otherwise, because that
+   * is IronAuth's own posture: a public client MUST present a DPoP proof at the token endpoint
+   * or the exchange is refused. Defaulting rather than requiring the field means an existing
+   * public-client configuration starts working instead of continuing to fail; set it explicitly
+   * to override in either direction.
+   */
+  dpop?: boolean;
+}
+
+/**
+ * The `cnf.jkt` a JWT access token claims, or undefined when there is none to read.
+ *
+ * Deliberately tolerant: this parses an UNVERIFIED token, purely to compare a thumbprint the
+ * server chose against one we already hold. Nothing here decides whether the token is valid, so
+ * a token that does not parse is simply a token with no claim to compare -- not an error, and
+ * certainly not a reason to reject a login.
+ */
+function confirmationThumbprint(accessToken: string): string | undefined {
+  const segments = accessToken.split('.');
+  if (segments.length !== 3) {
+    return undefined;
+  }
+  try {
+    const claims = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(atob(segments[1].replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0)),
+      ),
+    ) as { cnf?: { jkt?: unknown } };
+    return typeof claims.cnf?.jkt === 'string' ? claims.cnf.jkt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether this configuration uses DPoP; see {@link BffConfig.dpop}. */
+function usesDpop(config: BffConfig): boolean {
+  return config.dpop ?? config.clientSecret === undefined;
+}
+
+/**
+ * The DPoP header for one outgoing request, or nothing when DPoP is off.
+ *
+ * Returned as a header object so callers spread it rather than branching around a string.
+ */
+async function dpopHeader(
+  config: BffConfig,
+  key: DpopKey | undefined,
+  method: string,
+  url: string,
+  accessToken?: string,
+): Promise<Record<string, string>> {
+  if (!usesDpop(config) || !key) {
+    return {};
+  }
+  return { dpop: await dpopProof(key, method, url, clock(config), accessToken) };
 }
 
 /** The header a state-changing BFF endpoint requires. */
@@ -138,6 +198,10 @@ export async function login(config: BffConfig, request: BffRequest): Promise<Bff
   const verifier = newId();
   const state = newId();
   const pendingId = newId();
+  // Generated HERE, not at the callback: the token the exchange returns is bound to whichever
+  // key proved possession, so the key has to exist before the exchange and survive into the
+  // session that will use it.
+  const dpopKey = usesDpop(config) ? await newDpopKey() : undefined;
   await config.store.putPending(pendingId, {
     verifier,
     state,
@@ -145,9 +209,23 @@ export async function login(config: BffConfig, request: BffRequest): Promise<Bff
     // A SHORT life. A pending login is a few seconds of user time; leaving it valid for an hour
     // widens the window in which a stolen `state` is worth anything.
     expiresAt: clock(config) + 600,
+    dpopKey,
   });
 
-  const authorize = new URL(`${config.issuer}/authorize`);
+  // FROM THE DISCOVERY DOCUMENT, never `${issuer}/authorize`: an IronAuth issuer carries an
+  // environment path while its endpoints do not, so concatenation builds a URL that 404s. See
+  // discovery.ts for the measurement.
+  //
+  // Wrapped, because an issuer that is briefly unreachable is an ORDINARY event and every other
+  // handler here reports it as a typed result. Letting it throw from this one made a transient
+  // outage an unhandled exception in the caller's framework instead of a 502.
+  let metadata;
+  try {
+    metadata = await discover(config.issuer, send(config), () => clock(config));
+  } catch {
+    return { kind: 'upstream_error', status: 502, detail: 'the issuer metadata was unreadable' };
+  }
+  const authorize = new URL(metadata.authorizationEndpoint);
   authorize.searchParams.set('response_type', 'code');
   authorize.searchParams.set('client_id', config.clientId);
   authorize.searchParams.set('redirect_uri', config.redirectUri);
@@ -208,10 +286,19 @@ export async function callback(config: BffConfig, request: BffRequest): Promise<
     form.set('client_secret', config.clientSecret);
   }
   let response: Response;
+  let metadata;
   try {
-    response = await send(config)(`${config.issuer}/token`, {
+    metadata = await discover(config.issuer, send(config), () => clock(config));
+  } catch {
+    return { kind: 'upstream_error', status: 502, detail: 'the issuer metadata was unreadable' };
+  }
+  try {
+    response = await send(config)(metadata.tokenEndpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        ...(await dpopHeader(config, pending.dpopKey, 'POST', metadata.tokenEndpoint)),
+      },
       body: form.toString(),
     });
   } catch {
@@ -234,8 +321,30 @@ export async function callback(config: BffConfig, request: BffRequest): Promise<
   }
   const expiresIn = typeof token.expires_in === 'number' ? token.expires_in : 300;
 
+  // THE SERVER'S BINDING MUST BE TO OUR KEY.
+  //
+  // We send a proof; the server decides what to bind to. If those disagree, every later request
+  // fails with an error about the request rather than about the login, which is the kind of
+  // mismatch that costs an afternoon. Checked here, once, while the cause is still visible.
+  //
+  // Only when the token is a JWT carrying `cnf.jkt`: an opaque access token is perfectly legal
+  // and says nothing about the binding, so an absent claim is not evidence of a problem.
+  if (pending.dpopKey) {
+    const bound = confirmationThumbprint(accessToken);
+    if (bound !== undefined && bound !== (await thumbprint(pending.dpopKey.publicJwk))) {
+      return {
+        kind: 'upstream_error',
+        status: 502,
+        detail: 'the access token is bound to a different key than the one that proved possession',
+      };
+    }
+  }
+
   const sessionId = newId();
   await config.store.putSession(sessionId, {
+    // The key that proved possession during the exchange IS the session's key: the access token
+    // is bound to it, so losing it here would leave a token nothing can present.
+    dpopKey: pending.dpopKey,
     accessToken,
     refreshToken: typeof token.refresh_token === 'string' ? token.refresh_token : undefined,
     expiresAt: clock(config) + expiresIn,
@@ -424,11 +533,25 @@ export async function proxy(config: BffConfig, request: BffRequest): Promise<Bff
   upstream.search = target.search;
 
   let response: Response;
+  // A DPoP-BOUND TOKEN IS NOT A BEARER TOKEN. Presenting one as `Bearer` is refused by a
+  // resource server that checks the binding, and accepted by one that does not -- which is the
+  // worse outcome, because it silently discards the sender constraint the login just paid for.
+  const bound = usesDpop(config) && session.dpopKey !== undefined;
+  const scheme = bound ? 'DPoP' : 'Bearer';
   try {
     response = await send(config)(upstream.toString(), {
       method: request.method,
       headers: {
-        authorization: `Bearer ${session.accessToken}`,
+        authorization: `${scheme} ${session.accessToken}`,
+        // `ath` binds this proof to THIS access token, so a proof captured from one request
+        // cannot be replayed with a different token.
+        ...(await dpopHeader(
+          config,
+          session.dpopKey,
+          request.method.toUpperCase(),
+          upstream.toString(),
+          session.accessToken,
+        )),
         // The COOKIE IS NOT FORWARDED, deliberately: the upstream authenticates with the bearer
         // token, and passing the session cookie on would hand a third-party API a credential for
         // this origin.
@@ -456,10 +579,21 @@ async function refresh(config: BffConfig, session: SessionRecord): Promise<Sessi
     form.set('client_secret', config.clientSecret);
   }
   let response: Response;
+  let metadata;
   try {
-    response = await send(config)(`${config.issuer}/token`, {
+    metadata = await discover(config.issuer, send(config), () => config.now?.() ?? Math.floor(Date.now() / 1000));
+  } catch {
+    return undefined;
+  }
+  try {
+    response = await send(config)(metadata.tokenEndpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        // The SAME key as the original grant. A refresh proved by a different key would be
+        // refused, and silently minting a new key here would unbind the session's tokens.
+        ...(await dpopHeader(config, session.dpopKey, 'POST', metadata.tokenEndpoint)),
+      },
       body: form.toString(),
     });
   } catch {
@@ -479,6 +613,9 @@ async function refresh(config: BffConfig, session: SessionRecord): Promise<Sessi
     return undefined;
   }
   return {
+    // CARRIED, not regenerated. The refreshed token is bound to the same key, and dropping it
+    // here would produce a session whose tokens no request could present.
+    dpopKey: session.dpopKey,
     accessToken,
     // ROTATION HONOURED: when the response carries a new refresh token the old one is discarded,
     // because IronAuth's refresh family detects reuse and replaying a rotated token kills the

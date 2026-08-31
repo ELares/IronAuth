@@ -1271,6 +1271,34 @@ jobs:
       - name: verify (corpus + self-test + live sample)
         run: scripts/dotnet-verify.sh
 
+  bff-live:
+    # Issue #116: the BFF against a REAL IronAuth, not a fake.
+    #
+    # Every other test in @ironauth/bff answers from a fake, and a fake is written by the same
+    # person as the code, from the same understanding, so it agrees with the code's mistakes. The
+    # one in that package answered 200 to any URL, which is why TWO defects that made a real login
+    # impossible passed every test the package had: endpoints built by concatenation (a 404
+    # against a real IronAuth, whose endpoints are not under the issuer path) and no DPoP proof at
+    # all (refused outright, since IronAuth requires DPoP for public clients).
+    #
+    # This lane is the only test in the package whose answer neither the code's author nor the
+    # fake's author gets to define.
+    name: bff live (real emulator, public client, DPoP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: install (locked)
+        working-directory: packages/ironauth-bff
+        run: npm ci
+      - name: a real login, end to end
+        run: scripts/bff-live.sh
+
   java-verify:
     # Issue #118 criterion 4: the official Java verifier artifact, against the SHARED
     # cross-language conformance corpus.
