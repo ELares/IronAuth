@@ -1674,7 +1674,23 @@ fn build_attester_registry(
         return None;
     }
     let mut registry = ironauth_oidc::attestation_client_auth::AttesterRegistry::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for attester in &config.oidc.attestation_client_auth.attesters {
+        // A REPEATED issuer keeps only the first key set, because the lookup returns the first
+        // match. The documented rotation story is "an attester's rotation is a config change",
+        // so the natural operator move is a second block for the same issuer with the new key
+        // -- which would silently keep the old one and fail every attestation signed with the
+        // new. Warned about rather than merged: merging would make two blocks mean something
+        // this build's lookup does not implement.
+        if !seen.insert(attester.issuer.as_str()) {
+            tracing::warn!(
+                issuer = %attester.issuer,
+                "attestation-based client authentication (issue #133): this issuer is \
+                 configured more than once and only the FIRST key set is used; put every key \
+                 for one attester in that attester's own `jwks`"
+            );
+            continue;
+        }
         if let Some(trusted) = ironauth_oidc::attestation_client_auth::TrustedAttester::from_jwks(
             &attester.issuer,
             attester.jwks.as_bytes(),
@@ -6390,6 +6406,27 @@ mod tests {
         assert!(
             build_attester_registry(&features, &unusable).is_none(),
             "an attester with no usable key is not trusted"
+        );
+
+        // 6. A REPEATED issuer arms the registry once and does not silently swallow the second
+        //    block. The lookup returns the first match, so two blocks for one issuer would
+        //    keep only the first key set: this pins that the build still succeeds (a duplicate
+        //    is an operator mistake, not a boot failure) and the warning is what tells them.
+        let duplicated = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = {{ enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }}\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n"
+        ));
+        assert!(
+            build_attester_registry(&features, &duplicated).is_some(),
+            "a duplicate issuer is an operator mistake, not a boot failure"
         );
     }
 

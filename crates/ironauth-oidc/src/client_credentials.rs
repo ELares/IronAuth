@@ -127,10 +127,21 @@ async fn attested_client(
     // over-broad in the other direction: it fired on ANY Authorization scheme, while
     // `parse_presented` deliberately ignores a non-Basic one, so a Bearer header alongside
     // these would have been a 400 where the secret path ignores it.
+    // PRESENT means non-empty after trimming, which is what `parse_presented` means by it.
+    // `serde_urlencoded` turns `client_secret=` into `Some("")`, and many form encoders emit
+    // exactly that for a value they do not have, so testing `.is_some()` refused a request the
+    // secret path would have ignored -- the same over-broad shape round 1 caught on the
+    // Authorization half, moved to a different axis.
+    let present = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
     if is_basic_scheme(authorization)
-        || params.client_secret.is_some()
-        || params.client_assertion.is_some()
-        || params.client_assertion_type.is_some()
+        || present(&params.client_secret)
+        || present(&params.client_assertion)
+        || present(&params.client_assertion_type)
     {
         return Err(TokenError::InvalidRequest(
             "more than one client authentication method was presented".to_owned(),
@@ -185,40 +196,38 @@ pub async fn client_credentials_grant(
     let (scope, authenticated, via_basic) = if let Some((scope, authenticated)) = attested {
         (scope, authenticated, false)
     } else {
-        {
-            // Recover the scope from the CLAIMED client id so the scoped authentication can
-            // run. A parse failure or a client id that declares no valid scope is a uniform
-            // invalid_client (a Basic attempt drives the 401 WWW-Authenticate).
-            let presented = parse_presented(
-                inputs.authorization,
-                inputs.client_id,
-                inputs.client_secret,
-                inputs.client_assertion,
-                inputs.client_assertion_type,
-            )
-            .map_err(|_| TokenError::InvalidClient {
-                via_basic: is_basic_scheme(authorization),
-            })?;
-            let via_basic = presented.via_basic();
-            let scope = ClientId::parse_declared_scope(presented.client_id())
-                .map(|id| id.scope())
-                .map_err(|_| TokenError::InvalidClient { via_basic })?;
+        // Recover the scope from the CLAIMED client id so the scoped authentication can
+        // run. A parse failure or a client id that declares no valid scope is a uniform
+        // invalid_client (a Basic attempt drives the 401 WWW-Authenticate).
+        let presented = parse_presented(
+            inputs.authorization,
+            inputs.client_id,
+            inputs.client_secret,
+            inputs.client_assertion,
+            inputs.client_assertion_type,
+        )
+        .map_err(|_| TokenError::InvalidClient {
+            via_basic: is_basic_scheme(authorization),
+        })?;
+        let via_basic = presented.via_basic();
+        let scope = ClientId::parse_declared_scope(presented.client_id())
+            .map(|id| id.scope())
+            .map_err(|_| TokenError::InvalidClient { via_basic })?;
 
-            // Authenticate the client (RFC 6749 4.4 REQUIRES it). The shared seam verifies the
-            // secret in scope and records any failure out of band, so enforcement matches the
-            // code and refresh grants.
-            let authenticated = client_auth::authenticate_client(state, scope, inputs)
-                .await
-                .map_err(|error| match error {
-                    ClientAuthError::InvalidRequest(message) => {
-                        TokenError::InvalidRequest(message.to_owned())
-                    }
-                    ClientAuthError::InvalidClient { via_basic } => {
-                        TokenError::InvalidClient { via_basic }
-                    }
-                })?;
-            (scope, authenticated, via_basic)
-        }
+        // Authenticate the client (RFC 6749 4.4 REQUIRES it). The shared seam verifies the
+        // secret in scope and records any failure out of band, so enforcement matches the
+        // code and refresh grants.
+        let authenticated = client_auth::authenticate_client(state, scope, inputs)
+            .await
+            .map_err(|error| match error {
+                ClientAuthError::InvalidRequest(message) => {
+                    TokenError::InvalidRequest(message.to_owned())
+                }
+                ClientAuthError::InvalidClient { via_basic } => {
+                    TokenError::InvalidClient { via_basic }
+                }
+            })?;
+        (scope, authenticated, via_basic)
     };
     // The ONE shared grant-restriction seam (issue #763): this client must be
     // registered for the grant it just presented.

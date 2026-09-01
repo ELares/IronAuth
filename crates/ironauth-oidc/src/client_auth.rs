@@ -442,9 +442,11 @@ pub async fn authenticate_client(
 /// what "plugs into the client-auth seam" has to mean; a parallel path that answered
 /// differently would be a second authentication surface with its own failure modes.
 ///
-/// REFUSES WHEN NO REGISTRY IS INSTALLED, which is the default and is what keeps the method
-/// unreachable rather than merely unadvertised. The boot path installs one only when the
-/// experimental acknowledgment names the exact draft revision.
+/// NOT REACHED WHEN NO REGISTRY IS INSTALLED, which is the default. The caller returns before
+/// this function when `state.attesters()` is `None`, so an unarmed deployment answers as though
+/// the two headers were not present -- not "the seam refuses", which is a different and weaker
+/// property. The boot path installs a registry only when the experimental acknowledgment names
+/// the exact draft revision AND at least one attester parses.
 ///
 /// # Errors
 ///
@@ -486,9 +488,13 @@ pub async fn authenticate_attested(
         }};
     }
 
+    // The registry, which the caller has already checked. Kept as a `let ... else` rather than
+    // an `expect` because a second caller is exactly the kind of thing that gets added, and
+    // this is the arm that would have to be right then. It is NOT where the off-posture
+    // property lives: `client_credentials::attested_client` returns before entering this
+    // function when no registry is installed, which is what makes an unarmed deployment answer
+    // as though these headers were not there at all.
     let Some(registry) = state.attesters() else {
-        // The feature is off, or on with no attester configured. Both authenticate nobody, and
-        // both look identical from outside, which is the point.
         fail!(ClientAuthDiagnosticReason::MethodMismatch);
     };
 
@@ -536,20 +542,18 @@ pub async fn authenticate_attested(
         // the same thing to a caller and the reason lands in a record an operator reads.
         fail!(ClientAuthDiagnosticReason::AssertionInvalid);
     };
-    {
-        Ok(AuthenticatedClient {
-            // From the ATTESTER's `sub`, not from what the request claimed. Byte-equal today
-            // because the seam refuses a mismatch, and taking it from the verified value is
-            // what makes the property structural rather than a consequence of a check three
-            // lines away in another file.
-            client_id: attested.client_id,
-            auth_method: ClientAuthMethod::AttestJwt,
-            allow_bearer_tokens: record.allow_bearer_tokens,
-            grant_types: record.grant_types.clone(),
-            token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
-            token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
-        })
-    }
+    Ok(AuthenticatedClient {
+        // From the ATTESTER's `sub`, not from what the request claimed. Byte-equal today
+        // because the seam refuses a mismatch, and taking it from the verified value is
+        // what makes the property structural rather than a consequence of a check three
+        // lines away in another file.
+        client_id: attested.client_id,
+        auth_method: ClientAuthMethod::AttestJwt,
+        allow_bearer_tokens: record.allow_bearer_tokens,
+        grant_types: record.grant_types.clone(),
+        token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
+        token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
+    })
 }
 
 /// Authenticate a client for the GLOBAL revocation and introspection endpoints

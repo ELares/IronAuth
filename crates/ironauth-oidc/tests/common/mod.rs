@@ -2099,7 +2099,23 @@ impl Harness {
         registry: Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>,
     ) {
         let state = self.state.clone().with_attesters(registry);
-        self.router = oidc_router(state.clone());
+        // ALL THREE routers, exactly as `main.rs` mounts them and as `enable_fedcm` does next
+        // door. `oidc_router` alone mounts no `.well-known/openid-configuration`, so a test
+        // asserting the prototype method is NOT advertised got a 404 and failed -- which is a
+        // 404 for the route rather than evidence about the document, and left the one property
+        // the module, the changelog and the operator note all lead with entirely unproven.
+        let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
+        let config = OidcConfig::default();
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&config),
+            Arc::clone(&self.registry),
+            self.env.clone(),
+        );
+        self.router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
         self.state = state;
     }
 

@@ -1396,29 +1396,19 @@ mod attestation_default_posture_tests {
     ///
     /// Pinned because it is the mechanism that makes a draft bump invalidate every
     /// acknowledgment in the wild, and a `0.1.0-exp.N` counter would silently stop doing that
-    /// while looking the same in the registry table. The module constant and the registry
-    /// entry are two places that could disagree, so the test reads both.
+    /// while looking the same in the registry table.
+    ///
+    /// ONE assertion, deliberately. An earlier version added a second comparing this constant
+    /// to a local function returning the same literal, which is implied by the first and read
+    /// as a cross-crate pin it was not. The real cross-crate pin is
+    /// `the_method_name_is_spelled_the_same_in_all_three_places` and
+    /// `the_pinned_draft_revision_is_the_one_the_acknowledgment_names` in the OIDC crate's own
+    /// suite, which can import both and does.
     #[test]
     fn the_acknowledgment_names_the_exact_draft_revision() {
         assert_eq!(
             ATTESTATION_CLIENT_AUTH_VERSION,
             "draft-ietf-oauth-attestation-based-client-auth-10"
         );
-        assert_eq!(
-            ATTESTATION_CLIENT_AUTH_VERSION,
-            ironauth_oidc_draft_revision(),
-            "the config registry and the implementing module must name the SAME revision, or an \
-             operator acknowledges one thing and gets another"
-        );
-    }
-
-    /// The revision the implementing module pins.
-    ///
-    /// Duplicated as a literal rather than imported: `ironauth-config` must not depend on
-    /// `ironauth-oidc` (the dependency runs the other way), so the two constants are checked
-    /// against one shared literal here and by an identical assertion in the OIDC crate's own
-    /// suite. Two tests over one string is what keeps them from drifting apart.
-    fn ironauth_oidc_draft_revision() -> &'static str {
-        "draft-ietf-oauth-attestation-based-client-auth-10"
     }
 }

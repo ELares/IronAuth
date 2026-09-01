@@ -26,6 +26,17 @@ revisions() {
     local pinned
     pinned=$(grep -A1 'pub const ATTESTATION_CLIENT_AUTH_VERSION' \
         crates/ironauth-config/src/features.rs | grep -oE '"[^"]+"' | tr -d '"')
+    # REFUSE an empty table rather than print one. This whole function exists so a green run
+    # says WHICH revision was satisfied; a grep that silently stopped matching -- a rename, a
+    # reformat that moved the literal off the following line -- would leave a blank column that
+    # reads as "no pinned revision" and passes. The lane would then be green about nothing.
+    if [ -z "$pinned" ]; then
+        echo "experimental-prototypes: could not read the pinned revision for" \
+             "attestation-client-auth out of crates/ironauth-config/src/features.rs." >&2
+        echo "The table below is derived from the SOURCE on purpose; fix the extraction rather" \
+             "than hard-coding the revision here." >&2
+        exit 1
+    fi
     printf '  %-28s %-52s %s\n' \
         'attestation-client-auth' "$pinned" 'docs/experimental/attestation-client-auth.md'
     echo

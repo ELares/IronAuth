@@ -408,14 +408,20 @@ fn attestation_algorithms() -> Vec<JwsAlgorithm> {
 /// An ABSENT `typ` never matches: the draft requires both media types explicitly, so
 /// its absence is a token that did not come from a conforming minter.
 fn media_type_is(header_typ: Option<&str>, expected: &str) -> bool {
+    // The `application/` prefix is OPTIONAL and case-insensitive, which is what
+    // `ironauth_jose::TokenTyp::matches` does with `eq_ignore_ascii_case`. The first version
+    // stripped two literal spellings, `application/` and `APPLICATION/`, so a conforming
+    // attester sending `Application/oauth-client-attestation+jwt` was refused -- fail-closed,
+    // and still a second hand-rolled copy of a vetted comparison that had already drifted from
+    // it in the doc comment claiming parity.
     let Some(candidate) = header_typ else {
         return false;
     };
-    let candidate = candidate
-        .strip_prefix("application/")
-        .or_else(|| candidate.strip_prefix("APPLICATION/"))
-        .unwrap_or(candidate);
-    candidate.eq_ignore_ascii_case(expected)
+    let stripped = candidate
+        .get(..12)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("application/"))
+        .map_or(candidate, |_| &candidate[12..]);
+    stripped.eq_ignore_ascii_case(expected)
 }
 
 /// The `iss` of an UNVERIFIED compact JWS, for attester SELECTION only.
