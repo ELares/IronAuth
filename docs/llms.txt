@@ -22,6 +22,7 @@ both files and fails if either drifts.
 - [SDK priority policy](docs/SDK-POLICY.md): Which SDKs IronAuth ships, which are deferred, and the reasoning behind the order.
 - [IronAuth Threat Model](docs/THREAT-MODEL.md): Per-surface STRIDE analysis. This document is a merge-gated artifact: no new
 - [Will Not Implement, and Why](docs/WILL-NOT-IMPLEMENT.md): Deliberate refusals, published with reasons. A documented refusal list builds
+- [Agent principals](docs/agents.md): An **agent** is an autonomous process an operator registers inside one organization to act for
 - [Browser-based apps: which architecture, and why](docs/bff.md): The OAuth 2.0 for Browser-Based Apps BCP (draft-ietf-oauth-browser-based-apps) ranks three
 - [Human-timed quickstart runs](docs/dx/timed-runs.md): DX evidence for issue #116 criterion 3. **Not a gate** -- see `docs/RELEASING.md` for why.
 - [Edge verification](docs/edge-verification.md): Verifying an IronAuth token needs no IronAuth service, no SDK install, and no network call on

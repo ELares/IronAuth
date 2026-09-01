@@ -45,8 +45,8 @@ use ironauth_env::Env;
 
 use crate::audit::ActorRef;
 use crate::id::{
-    ConnectorId, CorrelationId, CredentialId, GrantId, IssuedTokenId, OrganizationId, ServiceId,
-    SessionId, SigningKeyId, UserId, UserIdentifierId,
+    AgentPrincipalId, ConnectorId, CorrelationId, CredentialId, GrantId, IssuedTokenId,
+    OrganizationId, ServiceId, SessionId, SigningKeyId, UserId, UserIdentifierId,
 };
 use crate::identifier::{IdentifierType, UniquenessMode};
 use crate::org_policy::{AuthPolicy, ORG_POLICY_MAX_SESSION_TTL_SECS};
@@ -396,6 +396,30 @@ impl IdorHarness {
     /// Run with the data plane store (`ironauth_app`), which holds the sink's SELECT grant.
     pub fn register_policy_trace_probes(&mut self) -> &mut Self {
         self.register(Box::new(PolicyDecisionTraceReadProbe));
+        self
+    }
+
+    /// Register the AGENT PRINCIPAL probes (issue #130, criterion 4).
+    ///
+    /// The criterion asks for this harness "extended with the agent type", and it was not:
+    /// the org-confinement scan covered the same-environment cross-ORGANIZATION case, and
+    /// nothing anywhere probed the cross-TENANT or cross-ENVIRONMENT one. An agent is the
+    /// highest-value principal in the system to confuse across a boundary, because reading
+    /// one hands you the client it comes through, the person it acts for, and the tool set
+    /// bounding what it may ask for.
+    ///
+    /// Two probes, because an agent is reachable by two different keys and a fence on one is
+    /// not a fence on the other:
+    ///
+    ///   - BY ID (`agents.get`), the addressing read every management route performs;
+    ///   - BY CLIENT (`agents.for_client`), the read the TOKEN DOORS perform, keyed on a
+    ///     plain client-id string rather than a scoped id. That one matters more: a scoped
+    ///     id refuses a foreign value at the parse, so the fence is structural, while a
+    ///     plain string reaches the query and the isolation rests on the row filter and RLS.
+    ///     A probe over only the typed key would report the easy half.
+    pub fn register_agent_probes(&mut self) -> &mut Self {
+        self.register(Box::new(AgentReadProbe));
+        self.register(Box::new(AgentForClientProbe));
         self
     }
 
@@ -2617,6 +2641,88 @@ impl IsolationProbe for UpstreamTokenReadProbe {
                 // Resolving a foreign session's captured tokens would be a leak.
                 Ok(Some(_)) => ProbeOutcome::Leaked,
                 Ok(None) | Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `AgentRepo::get` (issue #130, criterion 4): an agent registered in one
+/// (tenant, environment) must never resolve under another. Reading one yields the client it
+/// obtains tokens through, the user it acts for, and the tool set bounding what it may ask
+/// for, so a cross-boundary read is a map of another tenant's automation.
+///
+/// The id is scoped, so for every foreign id the refusal happens at the PARSE and the query is
+/// never reached. That is the house pattern -- most probes in this file refuse a foreign id at
+/// the parse, by this idiom or through the repository's `parse_id` -- and it is worth being
+/// exact about: this probe measures that a foreign scoped id cannot be turned into
+/// an addressable one, not that the query behind it filters. The `for_client` probe beside it
+/// is the one that reaches a query.
+struct AgentReadProbe;
+
+impl IsolationProbe for AgentReadProbe {
+    fn name(&self) -> &'static str {
+        "agents.get"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let Ok(agent_id) = AgentPrincipalId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store.scoped(caller).agents().get(&agent_id).await {
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// Built-in probe for `AgentRepo::for_client` (issue #130, criterion 4): the read the TOKEN
+/// DOORS perform, keyed on a plain `client_id` STRING.
+///
+/// This is the probe that carries the weight. `for_client` takes an unscoped string, so
+/// nothing refuses a foreign value before the query runs and the isolation rests entirely on
+/// the row filter and forced row-level security. If it leaked, a client id observed in one
+/// tenant would resolve that tenant's agent under a caller's own scope, and the token doors
+/// would then gate issuance against a FOREIGN agent's declared tool set.
+struct AgentForClientProbe;
+
+impl IsolationProbe for AgentForClientProbe {
+    fn name(&self) -> &'static str {
+        "agents.for_client"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            match store.scoped(caller).agents().for_client(foreign_id).await {
+                Ok(None) => ProbeOutcome::Denied,
+                // `NotFound` counts as a LEAK, and collapsing every `Err` into `Denied` hid
+                // the very thing this probe exists to find. `for_client` decodes its row
+                // through `agent_from_row`, which parses the id, organization and linked user
+                // IN THE CALLER's SCOPE and maps any mismatch to `NotFound`. So that error
+                // means a row CAME BACK and failed to decode: the tenant predicate and
+                // row-level security both let a foreign row through and only the id decode
+                // stopped it.
+                // `Ok(Some(_))` and `NotFound` are ONE arm because they are one finding: a
+                // foreign row that decoded, and a foreign row that did not. Both mean the
+                // tenant predicate and row-level security let it through.
+                Ok(Some(_)) | Err(crate::error::StoreError::NotFound) => ProbeOutcome::Leaked,
+                // Any OTHER error is a database fault, not an isolation result. `ProbeOutcome`
+                // has no third variant, so reporting it either way would be a lie: as a leak
+                // it makes the harness cry wolf on a dropped connection, and as a denial it
+                // reports a probe that never ran as a probe that passed. It panics instead,
+                // which is what an unrunnable security check deserves.
+                Err(other) => panic!("the agents.for_client probe could not run: {other}"),
             }
         })
     }

@@ -1191,10 +1191,28 @@ pub(crate) async fn record_agent_issuance(
         return;
     };
     let actor = crate::util::client_service_actor(StoredClientId::Registered(&client_id));
-    if let Err(error) = state
+    // The attribution is BEST EFFORT and the row is not. These two parses cannot fail in
+    // practice (both are stringified typed ids from this same scope), but an early return on
+    // them would mean a token was minted and the trail said nothing at all -- trading a row
+    // with one dimension missing for no row, which is the wrong direction for an audit path.
+    let mut acting = state
         .store()
         .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
+        .acting(actor, CorrelationId::generate(state.env()));
+    // The same organization attribution the denial rows carry, for the same reason: an
+    // issuance a per-organization stream never sees is an issuance that stream cannot
+    // account for.
+    if let Ok(organization_id) =
+        ironauth_store::OrganizationId::parse_in_scope(&agent.organization_id, &scope)
+    {
+        acting = acting.in_organization(organization_id);
+    }
+    if let Ok(linked_user_id) =
+        ironauth_store::UserId::parse_in_scope(&agent.linked_user_id, &scope)
+    {
+        acting = acting.about_subject(linked_user_id);
+    }
+    if let Err(error) = acting
         .agents()
         .record_token_issued(
             state.env(),
@@ -1250,10 +1268,26 @@ pub(crate) async fn gate_agent_issuance(
     else {
         return Ok(None);
     };
-    let acting = state.store().scoped(scope).acting(
-        crate::util::client_service_actor(StoredClientId::Registered(&client_id)),
-        CorrelationId::generate(state.env()),
-    );
+    // ATTRIBUTED TO THE AGENT'S ORGANIZATION. Without this the denial row carries no
+    // organization, and `log_shipper` routes a per-organization stream by exactly that
+    // column, so `agent_token.deny` could never be delivered to the stream an operator set
+    // up to watch their own organization. Criterion 2 asks for events attributable to the
+    // agent AND its linked user AND its organization; this is the organization half, and it
+    // was missing at every agent_token write site while being present at every management
+    // one.
+    let acting = state
+        .store()
+        .scoped(scope)
+        .acting(
+            crate::util::client_service_actor(StoredClientId::Registered(&client_id)),
+            CorrelationId::generate(state.env()),
+        )
+        .in_organization(agent.organization_id)
+        // And the PERSON the agent acts for. The actor is the agent's client; the subject is
+        // the human whose authority it is exercising, and criterion 2 asks for both to be
+        // attributable. Without it an investigator handed a denial knows which machine was
+        // refused and not on whose behalf it was asking.
+        .about_subject(agent.linked_user_id);
     // SUSPENDED AND REVOKED BOTH REFUSE. The difference between them is for the operator
     // reading the list, not for this door: a suspended agent obtains no tokens while staying
     // listable, and revocation blocks new issuance outright.

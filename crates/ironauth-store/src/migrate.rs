@@ -1434,6 +1434,17 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0179_agent_vault_approvals.sql"),
         },
+        Migration {
+            version: 180,
+            name: "audit_subject",
+            // EXPAND: one nullable column and a partial index. The previous binary never
+            // selects it and every write leaves it NULL, so a rollback loses the dimension
+            // and nothing else. The audit CHAIN is untouched by construction: the column is
+            // deliberately absent from the canonical form the chain hashes, which
+            // `no_delivery_dimension_reaches_the_canonical_form` enforces.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0180_audit_subject.sql"),
+        },
     ]
 }
 

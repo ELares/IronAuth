@@ -800,3 +800,126 @@ async fn plant_upstream_token(db: &TestDatabase, env: &Env, scope: Scope) -> Ses
         .expect("capture upstream token");
     session
 }
+
+/// AGENT PRINCIPALS are isolated across every scope boundary (issue #130, criterion 4).
+///
+/// The criterion asks for "the cross-tenant IDOR harness extended with the agent type", and
+/// it was not: the org-confinement scan covers the same-environment cross-ORGANIZATION case
+/// and nothing anywhere probed the cross-TENANT or cross-ENVIRONMENT one. Reading an agent
+/// yields the client it obtains tokens through, the person it acts for, and the tool set
+/// bounding what it may ask for.
+///
+/// Both boundaries, and both keys. The `for_client` probe is the one that carries the weight:
+/// it takes a plain client-id STRING, so nothing refuses a foreign value before the query
+/// runs and the isolation rests entirely on the row filter and forced row-level security. A
+/// leak there would let a client id observed in one tenant resolve that tenant's agent under
+/// a caller's own scope, and the token doors would then gate issuance against a FOREIGN
+/// agent's declared tool set.
+#[tokio::test]
+async fn an_agent_is_unreachable_from_another_tenant_or_environment() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
+    let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
+
+    // The SAME client-id string in each foreign scope, so a leak could only come from a scope
+    // boundary miss rather than from the handle being globally unique.
+    let victim_client = "cli_victim_agent";
+    let agent_b = plant_agent(&db, &env, scope_b, victim_client).await;
+    let agent_a2 = plant_agent(&db, &env, scope_a2, victim_client).await;
+
+    let mut harness = IdorHarness::new();
+    harness.register_agent_probes();
+    assert_eq!(
+        harness.probe_names(),
+        // REGISTRATION order, which is what `probe_names` returns: `AgentReadProbe` first.
+        vec!["agents.get", "agents.for_client"],
+        "both agent read surfaces are registered with the harness"
+    );
+
+    let foreign = [
+        victim_client.to_string(),
+        agent_b.to_string(),
+        agent_a2.to_string(),
+    ];
+    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
+    let leaks = harness.run(db.store(), scope_a, &refs).await;
+    assert!(leaks.is_empty(), "cross-scope leak detected: {leaks:?}");
+
+    // Each agent is STILL readable in its OWN scope, so the isolation above is a genuine
+    // scope boundary rather than a global miss. Without this the test passes against a
+    // `for_client` that returns None for everything.
+    for (scope, agent) in [(scope_b, &agent_b), (scope_a2, &agent_a2)] {
+        let by_client = db
+            .store()
+            .scoped(scope)
+            .agents()
+            .for_client(victim_client)
+            .await
+            .expect("read in own scope");
+        assert_eq!(
+            by_client.map(|record| record.id.to_string()),
+            Some(agent.to_string()),
+            "the agent resolves by its client in its own scope"
+        );
+        db.store()
+            .scoped(scope)
+            .agents()
+            .get(agent)
+            .await
+            .expect("the agent survives every cross-scope probe in its own scope");
+    }
+}
+
+/// Plant one active agent in `scope`, bound to `client_id`, for the isolation probes.
+async fn plant_agent(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    client_id: &str,
+) -> ironauth_store::AgentPrincipalId {
+    let organization = ironauth_store::OrganizationId::generate(env, &scope);
+    sqlx::query(
+        "INSERT INTO organizations /* query-audit-allow: owner test seed */ \
+         (id, tenant_id, environment_id, display_name) VALUES ($1, $2, $3, 'idor org')",
+    )
+    .bind(organization.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("seed organization");
+
+    let user = ironauth_store::UserId::generate(env, &scope);
+    sqlx::query(
+        "INSERT INTO users /* query-audit-allow: owner test seed */ \
+         (id, tenant_id, environment_id) VALUES ($1, $2, $3)",
+    )
+    .bind(user.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("seed user");
+
+    let agent = ironauth_store::AgentPrincipalId::generate(env, &scope);
+    sqlx::query(
+        "INSERT INTO agents /* query-audit-allow: owner test seed */ \
+         (id, tenant_id, environment_id, organization_id, linked_user_id, display_name, \
+          state, tool_scopes, client_id) \
+         VALUES ($1, $2, $3, $4, $5, 'idor bot', 'active', ARRAY['deploy']::text[], $6)",
+    )
+    .bind(agent.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(organization.to_string())
+    .bind(user.to_string())
+    .bind(client_id)
+    .execute(db.owner_pool())
+    .await
+    .expect("seed agent");
+    agent
+}

@@ -190,8 +190,13 @@ pub async fn register_agent(
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
-        // Attribute the audit row to this organization (issue #110).
+        // Attribute the audit row to this organization (issue #110) AND to the person the
+        // agent will act for (issue #130, criterion 2). Both, at all four agent write sites:
+        // an earlier version set only the organization here and on `set_state`, so two of the
+        // four actions carried no subject and `docs/agents.md`'s "every one of the four" was
+        // false for exactly the two an operator performs by hand.
         .in_organization(org_id)
+        .about_subject(linked_user_id)
         .agents(scope)
         .register(
             state.env(),
@@ -361,6 +366,9 @@ pub async fn set_agent_state(
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
         .in_organization(org_id)
+        // The person the agent acts for, read off the record this handler already fetched to
+        // enforce the organization nesting.
+        .about_subject(existing.linked_user_id)
         .agents(scope)
         .set_state(
             state.env(),

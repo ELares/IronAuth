@@ -1517,6 +1517,16 @@ impl<'a> ActingStore<'a> {
         self
     }
 
+    /// Record that every audit row written through this store is ABOUT `subject`.
+    ///
+    /// See [`crate::audit::ActingContext::about_subject`]: the human the action concerns,
+    /// which is not the actor performing it.
+    #[must_use]
+    pub fn about_subject(mut self, subject: crate::id::UserId) -> Self {
+        self.acting = self.acting.about_subject(subject);
+        self
+    }
+
     /// The mutating organization-membership repository for this scope and actor.
     ///
     /// Exposed on the DATA plane because migration 0084 grants `ironauth_app`
@@ -44826,10 +44836,10 @@ async fn insert_audit_row<T: AuditTarget>(
         "INSERT INTO audit_log \
          (id, tenant_id, environment_id, action, actor_kind, actor_id, \
           target_kind, target_id, correlation_id, occurred_at, detail, stream, \
-          organization_id, entry_path) \
+          organization_id, entry_path, subject_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                  TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, $11, $12, \
-                 $13, $14)",
+                 $13, $14, $15)",
     )
     .bind(audit_id.to_string())
     .bind(spec.scope.tenant().to_string())
@@ -44849,6 +44859,9 @@ async fn insert_audit_row<T: AuditTarget>(
     // NULL where the caller declared no entry path, which is every direct API call. That is
     // "not recorded" and NOT "arrived directly" -- see `EntryPath`.
     .bind(spec.acting.entry_path().map(EntryPath::as_str))
+    // NULL where the row is not about a person, which is most mutations. See
+    // `ActingContext::about_subject`.
+    .bind(spec.acting.subject().map(|id| id.to_string()))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -44914,6 +44927,16 @@ pub struct ChainedAuditRow {
     pub occurred_micros: i64,
     /// The optional operator-safe detail dimension.
     pub detail: Option<String>,
+    /// The organization this row was attributed to, when it belongs to one (issue #110).
+    ///
+    /// Carried so the shipped OCSF event can NAME it. Deliberately absent from
+    /// [`ChainedAuditRow::canonical`]: see the note there.
+    pub organization_id: Option<String>,
+    /// The human this row is ABOUT, when it is about one (issue #130, criterion 2).
+    ///
+    /// Distinct from the actor: an agent obtaining a token is the actor and the person it
+    /// acts for is the subject. Also absent from the canonical form.
+    pub subject_id: Option<String>,
 }
 
 impl ChainedAuditRow {
@@ -44924,6 +44947,13 @@ impl ChainedAuditRow {
     /// BREAKING change to every existing chain: every entry sealed under the old
     /// shape would fail to recompute. A new field therefore needs a version tag
     /// carried on the entry, not a quiet addition.
+    ///
+    /// `organization_id` and `subject_id` are on the struct and NOT here, for exactly that
+    /// reason. They are DELIVERY dimensions: a per-organization stream selects on one and a
+    /// SIEM correlates by the other, and neither changes what the chain seals. Sealing them
+    /// would have invalidated every entry already written, to add nothing the tamper-evidence
+    /// needs. `no_delivery_dimension_reaches_the_canonical_form` fails if a future edit adds
+    /// one.
     #[must_use]
     pub fn canonical(&self) -> serde_json::Value {
         serde_json::json!({
@@ -46750,7 +46780,7 @@ impl AuditChainRepo<'_> {
 
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-                    correlation_id, detail, \
+                    correlation_id, detail, organization_id, subject_id, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
@@ -46780,6 +46810,12 @@ impl AuditChainRepo<'_> {
                 correlation_id: row.get("correlation_id"),
                 occurred_micros: row.get("occurred_micros"),
                 detail: row.get("detail"),
+                // `get`, not `try_get(..).ok().flatten()`. The lenient form turns a column
+                // the query forgot to SELECT into `None`, which is indistinguishable from a
+                // row that genuinely has none -- and that is exactly how these two shipped
+                // unselected: every event rendered without them and nothing failed.
+                organization_id: row.get("organization_id"),
+                subject_id: row.get("subject_id"),
             };
             let record_hash = crate::ocsf::chain_link(&prev, &record.canonical());
             seq += 1;
@@ -46953,7 +46989,7 @@ impl AuditChainRepo<'_> {
         }
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-                    correlation_id, detail, \
+                    correlation_id, detail, organization_id, subject_id, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
@@ -46991,6 +47027,12 @@ impl AuditChainRepo<'_> {
                 correlation_id: row.get("correlation_id"),
                 occurred_micros: row.get("occurred_micros"),
                 detail: row.get("detail"),
+                // `get`, not `try_get(..).ok().flatten()`. The lenient form turns a column
+                // the query forgot to SELECT into `None`, which is indistinguishable from a
+                // row that genuinely has none -- and that is exactly how these two shipped
+                // unselected: every event rendered without them and nothing failed.
+                organization_id: row.get("organization_id"),
+                subject_id: row.get("subject_id"),
             })
             .collect())
     }
@@ -47066,7 +47108,7 @@ impl AuditChainRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-                    correlation_id, detail, \
+                    correlation_id, detail, organization_id, subject_id, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3",
@@ -47092,6 +47134,8 @@ impl AuditChainRepo<'_> {
                     correlation_id: row.get("correlation_id"),
                     occurred_micros: row.get("occurred_micros"),
                     detail: row.get("detail"),
+                    organization_id: row.get("organization_id"),
+                    subject_id: row.get("subject_id"),
                 },
             );
         }
@@ -48257,6 +48301,16 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn in_organization(mut self, organization: crate::id::OrganizationId) -> Self {
         self.acting = self.acting.in_organization(organization);
+        self
+    }
+
+    /// Record that every audit row written through this store is ABOUT `subject`.
+    ///
+    /// See [`crate::audit::ActingContext::about_subject`]: the human the action concerns,
+    /// which is not the actor performing it.
+    #[must_use]
+    pub fn about_subject(mut self, subject: crate::id::UserId) -> Self {
+        self.acting = self.acting.about_subject(subject);
         self
     }
 
@@ -72396,7 +72450,68 @@ impl ActingAgentRepo<'_> {
                 .fetch_optional(&mut **tx)
                 .await?
                 .ok_or(StoreError::NotFound)?;
-                record = Some(agent_from_row(&row, &scope)?);
+                let agent = agent_from_row(&row, &scope)?;
+
+                // REVOCATION KILLS THE OUTSTANDING TOKENS, in the same transaction as the
+                // state change (issue #130, criterion 1).
+                //
+                // Setting the state alone only blocks the NEXT issuance. It said nothing
+                // about the tokens already in the agent's hands, and nothing consults agent
+                // state at validation time, so before this a revoked agent kept working with
+                // what it already held until every token expired. "Outstanding tokens die"
+                // is the half of the criterion the state change does not deliver.
+                //
+                // The GRANTS, because an access token derives its active state from
+                // `grants.revoked_at` (migration 0022 says so where it grants the control
+                // role that column). Revoking them makes every issued token, opaque and JWT
+                // alike, resolve as inactive at introspection, at UserInfo, and at the vault
+                // exchange, and stops any refresh chain. What it CANNOT reach is a resource
+                // server that verifies an `at+jwt` signature without asking IronAuth: that
+                // token stays verifiable until its `exp`, which is the residual window
+                // `docs/agents.md` states as a number.
+                //
+                // Scoped to the client AND to the client's SERVICE-ACCOUNT SUBJECT, which is
+                // the narrowest predicate that names this agent's grants.
+                //
+                // The client alone is not narrow enough, and a comment here previously said
+                // it was: `agents_client_unique` is a partial unique index on the AGENTS
+                // table, so it guarantees no second agent shares the client and says nothing
+                // about who holds GRANTS on it. `grants` is keyed (client_id, subject) and
+                // rows arrive from four paths, three of which carry a HUMAN subject; nothing
+                // stops an operator binding an agent to a client that also serves interactive
+                // logins. Revoking the agent would then have revoked every live grant on that
+                // client, invalidating unrelated people's sessions and refresh chains.
+                //
+                // A machine grant's subject is the client's service-account principal, minted
+                // by `service_accounts().ensure(client_id)` on the issuance path. Constraining
+                // to it leaves human grants on the same client untouched, which is the
+                // difference between revoking an agent and revoking a client.
+                //
+                // An UNBOUND agent has no door, so no grants; a client with no service
+                // account has never minted a machine token, so the subquery matches nothing.
+                if state == "revoked" {
+                    if let Some(client_id) = agent.client_id.as_deref() {
+                        sqlx::query(
+                            "UPDATE grants \
+                             SET revoked_at = TIMESTAMPTZ 'epoch' \
+                                 + ($1::text || ' microseconds')::interval \
+                             WHERE tenant_id = $2 AND environment_id = $3 \
+                               AND client_id = $4 AND revoked_at IS NULL \
+                               AND subject IN ( \
+                                   SELECT id FROM service_accounts \
+                                   WHERE tenant_id = $2 AND environment_id = $3 \
+                                     AND client_id = $4 \
+                               )",
+                        )
+                        .bind(now_micros)
+                        .bind(scope.tenant().to_string())
+                        .bind(scope.environment().to_string())
+                        .bind(client_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                }
+                record = Some(agent);
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
@@ -73200,5 +73315,65 @@ impl ActingAgentVaultApprovalRepo<'_> {
             Some(&detail),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod audit_delivery_dimension_tests {
+    use super::ChainedAuditRow;
+
+    fn row() -> ChainedAuditRow {
+        ChainedAuditRow {
+            audit_id: "aud_1".to_owned(),
+            action: "agent_token.issue".to_owned(),
+            actor_kind: "service".to_owned(),
+            actor_id: "svc_1".to_owned(),
+            target_kind: "agent".to_owned(),
+            target_id: "agp_1".to_owned(),
+            correlation_id: "cor_1".to_owned(),
+            occurred_micros: 1_700_000_000_000_000,
+            detail: Some("scope=deploy".to_owned()),
+            organization_id: Some("org_1".to_owned()),
+            subject_id: Some("usr_1".to_owned()),
+        }
+    }
+
+    /// The DELIVERY dimensions never reach what the chain seals.
+    ///
+    /// `organization_id` and `subject_id` are on the row so the shipped OCSF event can name
+    /// them. They must NOT be in `canonical()`: that value is the hash input for
+    /// `audit_chain`, and every entry sealed under the old shape would fail to recompute
+    /// against a wider one. A verifier would report tampering across the whole history, on
+    /// data that had not been tampered with.
+    ///
+    /// Asserted by the STRONGEST available test: two rows differing ONLY in the delivery
+    /// dimensions must canonicalize identically. A test that listed the expected keys would
+    /// pass on a `canonical()` that had quietly gained a third field nobody listed.
+    #[test]
+    fn no_delivery_dimension_reaches_the_canonical_form() {
+        let with_dimensions = row();
+        let without = ChainedAuditRow {
+            organization_id: None,
+            subject_id: None,
+            ..row()
+        };
+        assert_eq!(
+            with_dimensions.canonical(),
+            without.canonical(),
+            "organization_id and subject_id must not change what the chain seals; adding \
+             either to canonical() invalidates every audit_chain entry already written"
+        );
+
+        // The control. Without it the assertion above is satisfied by a `canonical()` that
+        // returned a constant, which would seal nothing at all.
+        let different_action = ChainedAuditRow {
+            action: "agent_token.deny".to_owned(),
+            ..row()
+        };
+        assert_ne!(
+            with_dimensions.canonical(),
+            different_action.canonical(),
+            "a field the chain DOES seal still changes the canonical form"
+        );
     }
 }

@@ -1874,6 +1874,8 @@ pub struct ActingContext {
     actor: ActorRef,
     correlation: CorrelationId,
     organization: Option<crate::id::OrganizationId>,
+    /// The human this action is ABOUT, distinct from the actor performing it.
+    subject: Option<crate::id::UserId>,
     entry_path: Option<EntryPath>,
 }
 
@@ -1930,6 +1932,7 @@ impl ActingContext {
             actor,
             correlation,
             organization: None,
+            subject: None,
             entry_path: None,
         }
     }
@@ -1958,6 +1961,32 @@ impl ActingContext {
     #[must_use]
     pub fn organization(&self) -> Option<crate::id::OrganizationId> {
         self.organization
+    }
+
+    /// Record that every audit row written under this context is ABOUT `subject`.
+    ///
+    /// The human the action concerns, which is not the same thing as the actor: an agent
+    /// obtaining a token is acting as itself and acting FOR a person, and criterion 2 of
+    /// issue #130 asks for both to be attributable. The actor columns carry the first; this
+    /// carries the second.
+    ///
+    /// Set ONLY where the caller has established the link. [`None`] means "this row is not
+    /// about a person", which is a fact rather than missing data, and is the right answer for
+    /// most mutations.
+    ///
+    /// The TYPED id for the same reason [`ActingContext::in_organization`] takes one: a
+    /// `UserId` embeds its (tenant, environment), so a subject from another scope cannot be
+    /// attached at all.
+    #[must_use]
+    pub fn about_subject(mut self, subject: crate::id::UserId) -> Self {
+        self.subject = Some(subject);
+        self
+    }
+
+    /// The human this action is about, if it is about one.
+    #[must_use]
+    pub fn subject(&self) -> Option<crate::id::UserId> {
+        self.subject
     }
 
     /// Record that every audit row written under this context arrived by `entry_path`.
