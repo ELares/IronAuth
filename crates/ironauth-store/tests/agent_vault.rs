@@ -148,7 +148,7 @@ async fn store_connection(
                 refresh_token: Some(DOWNSTREAM_REFRESH),
                 granted_scopes: &["https://www.googleapis.com/auth/drive.readonly".to_owned()],
                 expires_at_unix_micros: None,
-                requires_approval: false,
+                requires_approval: Some(false),
                 refresh: None,
             },
             now_micros(env),
@@ -901,7 +901,7 @@ async fn the_ordinary_read_knows_a_refresh_is_possible_without_opening_the_clien
                 refresh_token: Some(DOWNSTREAM_REFRESH),
                 granted_scopes: &["mail.read".to_owned()],
                 expires_at_unix_micros: None,
-                requires_approval: false,
+                requires_approval: Some(false),
                 refresh: Some(ironauth_store::VaultRefreshConfig {
                     token_endpoint: "https://oauth2.example.test/token",
                     client_id: "downstream-client",
@@ -976,7 +976,7 @@ async fn a_client_secret_does_not_open_as_an_access_token_or_the_reverse() {
                 refresh_token: Some(DOWNSTREAM_REFRESH),
                 granted_scopes: &["mail.read".to_owned()],
                 expires_at_unix_micros: None,
-                requires_approval: false,
+                requires_approval: Some(false),
                 refresh: Some(ironauth_store::VaultRefreshConfig {
                     token_endpoint: "https://oauth2.example.test/token",
                     client_id: "downstream-client",
@@ -1496,5 +1496,197 @@ async fn the_queue_returns_no_more_than_the_limit_and_keeps_the_oldest() {
     assert_eq!(
         bounded[0].id, live,
         "and it keeps the OLDEST, because an approver works a queue from the front"
+    );
+}
+
+/// Replacing an expired access token does NOT turn the approval gate off (issue #132).
+///
+/// The operator's commonest write on this route is "the downstream token expired, here is a
+/// new one": provider, access token, scopes. Under replace-semantics that silently made a
+/// sensitive connection ordinary, and the flag was write-only, so nothing showed them. The
+/// write now reports what the row ENDED UP being rather than what was sent.
+#[tokio::test]
+async fn a_re_store_that_omits_the_flag_keeps_a_sensitive_connection_sensitive() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let acting = || {
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+
+    let id = AgentVaultConnectionId::generate(&env, &scope);
+    let sensitive = acting()
+        .agent_vault()
+        .store_connection(
+            &env,
+            NewVaultConnection {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                access_token: DOWNSTREAM_ACCESS,
+                refresh_token: Some(DOWNSTREAM_REFRESH),
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: None,
+                requires_approval: Some(true),
+                refresh: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("store a sensitive connection");
+    assert!(
+        sensitive.requires_approval,
+        "the control: it was stored sensitive"
+    );
+
+    // The ordinary repair: a fresh access token, nothing said about sensitivity.
+    let replacement = AgentVaultConnectionId::generate(&env, &scope);
+    let after = acting()
+        .agent_vault()
+        .store_connection(
+            &env,
+            NewVaultConnection {
+                id: &replacement,
+                agent_id: &agent,
+                provider: "google",
+                access_token: "ya29.A-REPLACEMENT-ACCESS-TOKEN",
+                refresh_token: None,
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: None,
+                requires_approval: None,
+                refresh: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("re-store");
+    assert_eq!(
+        after.id, id,
+        "the row keeps the id it was created with, so the caller's fresh id addresses nothing"
+    );
+    assert!(
+        after.requires_approval,
+        "omitting the flag left the gate ON, and the write says so"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .agent_vault()
+            .connection(&agent, "google")
+            .await
+            .expect("read")
+            .expect("exists")
+            .requires_approval,
+        "and the row itself agrees"
+    );
+
+    // And `false` still means false: a preserving default that could not be overridden would
+    // make a sensitive connection permanent, which is the opposite failure.
+    let ordinary = acting()
+        .agent_vault()
+        .store_connection(
+            &env,
+            NewVaultConnection {
+                id: &AgentVaultConnectionId::generate(&env, &scope),
+                agent_id: &agent,
+                provider: "google",
+                access_token: DOWNSTREAM_ACCESS,
+                refresh_token: None,
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: None,
+                requires_approval: Some(false),
+                refresh: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("re-store as ordinary");
+    assert!(
+        !ordinary.requires_approval,
+        "an explicit false still turns the gate off"
+    );
+}
+
+/// A refreshed credential is written by the DATA plane, which holds UPDATE and not INSERT.
+///
+/// The claim the fix rests on, and nothing checked it: the first version re-stored through
+/// `management()` on the data-plane pool, which is the same low-privilege pool, so the upsert
+/// was refused by Postgres at the moment a refresh succeeded -- the worst possible time,
+/// because the provider had already rotated the token.
+#[tokio::test]
+async fn the_data_plane_can_write_a_refreshed_credential_and_cannot_insert_a_new_one() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let id = store_connection(&db, &env, scope, &agent, "google").await;
+
+    // The UPDATE, as the data plane. This is the write the token door performs.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault()
+        .refresh_stored_credential(
+            &env,
+            ironauth_store::RefreshedCredentialWrite {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                access_token: "ya29.A-FRESH-ACCESS-TOKEN",
+                refresh_token: Some("1//A-ROTATED-REFRESH-TOKEN"),
+                expires_at_unix_micros: None,
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("the data plane may replace a refreshed credential");
+
+    let after = db
+        .store()
+        .scoped(scope)
+        .agent_vault()
+        .connection(&agent, "google")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(after.access_token, "ya29.A-FRESH-ACCESS-TOKEN");
+    assert_eq!(
+        after.refresh_token.as_deref(),
+        Some("1//A-ROTATED-REFRESH-TOKEN"),
+        "the rotated refresh token replaced the stored one"
+    );
+
+    // And the INSERT it does not hold. Without this the assertion above would be satisfied by
+    // a data plane that could do anything, and the plane separation would be untested.
+    let mut tx = db.app_pool().begin().await.expect("app transaction");
+    for (key, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(&value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind the scope");
+    }
+    let refused = sqlx::query(
+        "INSERT INTO agent_vault_connections \
+         (id, tenant_id, environment_id, agent_id, provider, access_token_sealed, \
+          access_token_dek_version, granted_scopes, state) \
+         VALUES ($1, $2, $3, $4, 'github', '\\x00'::bytea, 1, ARRAY[]::text[], 'active')",
+    )
+    .bind(AgentVaultConnectionId::generate(&env, &scope).to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(agent.to_string())
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        refused.is_err(),
+        "the data plane must not be able to create a connection"
     );
 }

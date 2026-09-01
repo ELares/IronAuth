@@ -34885,8 +34885,11 @@
             "description": "The downstream refresh token, when the provider issued one. Sealed too."
           },
           "requires_approval": {
-            "type": "boolean",
-            "description": "Whether exchanging for this credential is a SENSITIVE action that blocks on an\nout-of-band approval (issue #132, criterion 4).\n\nThe OPERATOR's decision, taken here because they are the one establishing the\nconnection and they are the one who knows what reaching it can do. It is deliberately\nnot the agent's: the gate used to run when the agent's exchange request named\n`authorization_details`, so a denied agent omitted the field and received the\ncredential anyway. Default false, so an existing connection behaves as it did."
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether exchanging for this credential is a SENSITIVE action that blocks on an\nout-of-band approval (issue #132, criterion 4).\n\nThe OPERATOR's decision, taken here because they are the one establishing the\nconnection and they are the one who knows what reaching it can do. It is deliberately\nnot the agent's: the gate used to run when the agent's exchange request named\n`authorization_details`, so a denied agent omitted the field and received the\ncredential anyway.\n\nABSENT MEANS LEAVE IT AS IT IS, which is not what the sibling `refresh` field does and\nis deliberate. This route is a PUT, so the natural reading is \"replace\"; but the\nnatural OPERATION is replacing an expired access token, and under replace-semantics\nthat turned the approval gate off on a sensitive connection without saying so. Sending\n`false` still makes a connection ordinary; on a first store, absent means the same as\n`false`."
           }
         }
       },
@@ -36095,7 +36098,6 @@
           "id",
           "agent_id",
           "provider",
-          "state",
           "expires_at",
           "requested_details"
         ],
@@ -36117,15 +36119,12 @@
           },
           "provider": {
             "type": "string",
-            "description": "The downstream provider the action is against."
+            "description": "The downstream provider the held action targets.",
+            "example": "google"
           },
           "requested_details": {
             "type": "object",
             "description": "What the agent ASKED to do (RFC 9396 authorization details).\n\nThe thing being approved. It was stored by migration 0179 \"verbatim so the approver is\nshown the request rather than a summary of it\" and then read by nothing, so the queue\nsaid \"this agent wants google\" and an operator narrowed it blind. Two different pending\nactions on one provider were indistinguishable."
-          },
-          "state": {
-            "type": "string",
-            "description": "`pending`, `approved` or `denied`."
           }
         }
       },
@@ -36137,13 +36136,19 @@
           "agent_id",
           "provider",
           "granted_scopes",
-          "state"
+          "state",
+          "requires_approval",
+          "can_refresh"
         ],
         "properties": {
           "agent_id": {
             "type": "string",
             "description": "The agent it belongs to.",
             "example": "agp_..."
+          },
+          "can_refresh": {
+            "type": "boolean",
+            "description": "Whether this connection can renew itself when its credential expires.\n\nThe configuration itself is never reported: the client secret is sealed and the\nendpoint and client id are the operator's own input. What an operator cannot otherwise\ntell is whether the connection will renew or has to be re-established, and that is the\nquestion this answers."
           },
           "granted_scopes": {
             "type": "array",
@@ -36161,6 +36166,10 @@
             "type": "string",
             "description": "The provider.",
             "example": "google"
+          },
+          "requires_approval": {
+            "type": "boolean",
+            "description": "Whether reaching this connection blocks on an out-of-band approval.\n\nReported because the flag was WRITE-ONLY: an operator could set a connection sensitive\nand had no way to read back whether it still was, which is the worst property for a\ncontrol to have. Nothing else on this surface answers \"is this gated\"."
           },
           "state": {
             "type": "string",

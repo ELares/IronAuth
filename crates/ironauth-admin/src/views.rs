@@ -595,9 +595,16 @@ pub struct StoreVaultConnectionRequest {
     /// connection and they are the one who knows what reaching it can do. It is deliberately
     /// not the agent's: the gate used to run when the agent's exchange request named
     /// `authorization_details`, so a denied agent omitted the field and received the
-    /// credential anyway. Default false, so an existing connection behaves as it did.
+    /// credential anyway.
+    ///
+    /// ABSENT MEANS LEAVE IT AS IT IS, which is not what the sibling `refresh` field does and
+    /// is deliberate. This route is a PUT, so the natural reading is "replace"; but the
+    /// natural OPERATION is replacing an expired access token, and under replace-semantics
+    /// that turned the approval gate off on a sensitive connection without saying so. Sending
+    /// `false` still makes a connection ordinary; on a first store, absent means the same as
+    /// `false`.
     #[serde(default)]
-    pub requires_approval: bool,
+    pub requires_approval: Option<bool>,
 
     /// How this connection refreshes itself, when it can (issue #132, criterion 3).
     ///
@@ -650,6 +657,19 @@ pub struct VaultConnectionView {
     pub granted_scopes: Vec<String>,
     /// `active` or `failed`.
     pub state: String,
+    /// Whether reaching this connection blocks on an out-of-band approval.
+    ///
+    /// Reported because the flag was WRITE-ONLY: an operator could set a connection sensitive
+    /// and had no way to read back whether it still was, which is the worst property for a
+    /// control to have. Nothing else on this surface answers "is this gated".
+    pub requires_approval: bool,
+    /// Whether this connection can renew itself when its credential expires.
+    ///
+    /// The configuration itself is never reported: the client secret is sealed and the
+    /// endpoint and client id are the operator's own input. What an operator cannot otherwise
+    /// tell is whether the connection will renew or has to be re-established, and that is the
+    /// question this answers.
+    pub can_refresh: bool,
 }
 
 /// One approval awaiting a decision, as the approver sees it (issue #132).
@@ -665,10 +685,9 @@ pub struct VaultApprovalView {
     /// The agent whose action is held.
     #[schema(example = "agp_...")]
     pub agent_id: String,
-    /// The downstream provider the action is against.
+    /// The downstream provider the held action targets.
+    #[schema(example = "google")]
     pub provider: String,
-    /// `pending`, `approved` or `denied`.
-    pub state: String,
     /// When the request stops being answerable, in seconds since the epoch. After this a
     /// decision can no longer take effect: a timeout issues no tokens.
     pub expires_at: i64,

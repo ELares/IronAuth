@@ -146,3 +146,33 @@ CREATE INDEX agent_vault_approvals_action_idx
 CREATE UNIQUE INDEX agent_vault_approvals_one_pending_per_action
     ON agent_vault_approvals (tenant_id, environment_id, agent_id, provider, action_digest)
     WHERE state = 'pending';
+
+-- ---------------------------------------------------------------------------
+-- An approval is SPENT when the credential it authorized is handed over
+-- (issue #132, criterion 4).
+--
+-- Found by review. An approved row authorized every exchange of that action for the whole
+-- window: one human decision on "pay 1 GBP" let the agent take the credential fifty times in
+-- the next hour. The approval is a decision about AN ACTION, so it authorizes an action, not
+-- an hour of them.
+--
+-- 'consumed' rather than a `consumed_at` column plus a state, because the two would be a pair
+-- that can disagree, and `agent_vault_approvals_decision_paired` already ties every non-pending
+-- state to a decision timestamp. A consumed row keeps its `decided_at` and `decided_by`: the
+-- human still decided it, and losing who approved what at the moment it is spent would be
+-- exactly backwards.
+--
+-- The gate answers a consumed row by raising a NEW request, which the pending-uniqueness index
+-- permits because it is partial on `state = 'pending'`. So an agent that legitimately needs the
+-- action twice asks twice, and a human answers twice.
+ALTER TABLE agent_vault_approvals
+    DROP CONSTRAINT agent_vault_approvals_state_closed;
+
+ALTER TABLE agent_vault_approvals
+    ADD CONSTRAINT agent_vault_approvals_state_closed
+    CHECK (state IN ('pending', 'approved', 'denied', 'expired', 'consumed'));
+
+COMMENT ON COLUMN agent_vault_approvals.state IS
+    'pending | approved | denied | expired | consumed. A closed set: an unknown state would be '
+    'a request nothing can decide and nothing can time out. `consumed` means the credential it '
+    'authorized has been handed over, so it authorizes nothing further (issue #132).';

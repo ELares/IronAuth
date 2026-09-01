@@ -115,15 +115,28 @@ async fn refresh_connection(
     connection: &ironauth_store::VaultConnection,
     actor: ActorRef,
     correlation: CorrelationId,
-) -> Result<RefreshedCredential, &'static str> {
+) -> Result<RefreshedCredential, RefreshFailure> {
+    // `refresh` is opened only by `connection_with_refresh`, and the caller reaches here only
+    // after `can_refresh` said the configuration exists. `agent_vault_connections_refresh_
+    // config_paired` makes "the endpoint is present" mean "all four are present", so this is
+    // an argument fault rather than a state an operator can produce, and it is reported as a
+    // deployment fault rather than as a connection that must be re-established -- an earlier
+    // version returned the latter and a test asserted the operator would see it, which was a
+    // sentence about an unreachable line.
     let Some(config) = connection.refresh.as_ref() else {
-        return Err("this connection cannot refresh and must be re-established");
+        return Err(RefreshFailure::Deployment(
+            "this connection was read without its refresh configuration",
+        ));
     };
     let Some(refresh_token) = connection.refresh_token.as_deref() else {
-        return Err("this connection stored no refresh token");
+        return Err(RefreshFailure::Provider(
+            "this connection stored no refresh token",
+        ));
     };
     let Some(federation) = state.federation() else {
-        return Err("this deployment cannot reach a provider to refresh");
+        return Err(RefreshFailure::Deployment(
+            "this deployment cannot reach a provider to refresh",
+        ));
     };
 
     let form = format!(
@@ -150,22 +163,35 @@ async fn refresh_connection(
         http = http.allow_plaintext_http();
     }
 
-    // EVERY failure below marks the connection, and the mark is what isolation means.
+    // WHICH failures mark the connection, and which do not.
+    //
+    // The first version marked on every failure, and "every" included a timeout. A five-second
+    // provider blip during one agent request therefore set `state='failed'` permanently: the
+    // exchange refuses a failed connection BEFORE the refresh block, so it never retried, and
+    // the only writer that restores `active` is the operator re-storing an access token they
+    // got from a consent flow they no longer have. One blip cost a re-consent.
+    //
+    // A TRANSPORT failure is a statement about the network, not about the credential, so it is
+    // reported and the connection is left alone to be retried. A provider REFUSAL, or an
+    // answer that is not a token, is a statement about the credential: that is what the
+    // isolation half of criterion 3 is about, and that is what marks.
     let outcome = async {
         let response = federation
             .fetcher()
             .fetch(http)
             .await
-            .map_err(|_| "the provider could not be reached")?;
+            .map_err(|_| RefreshFailure::Transport("the provider could not be reached"))?;
         if !response.status().is_success() {
-            return Err("the provider refused the refresh");
+            return Err(RefreshFailure::Provider("the provider refused the refresh"));
         }
         let body: serde_json::Value = serde_json::from_slice(response.body())
-            .map_err(|_| "the provider's response is not JSON")?;
+            .map_err(|_| RefreshFailure::Provider("the provider's response is not JSON"))?;
         let access_token = body
             .get("access_token")
             .and_then(serde_json::Value::as_str)
-            .ok_or("the provider's response carried no access_token")?
+            .ok_or(RefreshFailure::Provider(
+                "the provider's response carried no access_token",
+            ))?
             .to_owned();
         // A provider MAY rotate the refresh token and MAY omit it, in which case the stored
         // one stays valid. Keeping the old one on omission is the difference between a
@@ -185,22 +211,65 @@ async fn refresh_connection(
 
     match outcome {
         Ok(refreshed) => Ok(refreshed),
-        Err(reason) => {
-            // Best effort: the refresh already failed, and failing to RECORD that must not
-            // turn one dead downstream into a request that reports something else.
-            let _ = state
-                .store()
-                .scoped(scope)
-                .acting(actor, correlation)
-                .agent_vault()
-                .mark_failed(
-                    state.env(),
-                    &connection.id,
-                    reason,
-                    crate::util::epoch_micros(state.now()),
-                )
-                .await;
-            Err(reason)
+        Err(failure) => {
+            if let RefreshFailure::Provider(reason) = failure {
+                // Best effort: the refresh already failed, and failing to RECORD that must not
+                // turn one dead downstream into a request that reports something else.
+                let _ = state
+                    .store()
+                    .scoped(scope)
+                    .acting(actor, correlation)
+                    .agent_vault()
+                    .mark_failed(
+                        state.env(),
+                        &connection.id,
+                        reason,
+                        crate::util::epoch_micros(state.now()),
+                    )
+                    .await;
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// Why a refresh did not produce a credential, and whether that says anything about the
+/// CONNECTION.
+///
+/// The distinction is the whole point of the type. Marking a connection failed takes it out of
+/// service until an operator re-establishes it, which is right when the provider has told us
+/// the stored credential is no good and wrong when the network was briefly unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshFailure {
+    /// The provider answered, and its answer says the stored credential cannot be spent.
+    /// MARKS the connection.
+    Provider(&'static str),
+    /// The provider could not be reached. Says nothing about the credential, so the connection
+    /// is left alone and the next request tries again.
+    Transport(&'static str),
+    /// This deployment cannot perform a refresh at all. Also says nothing about the
+    /// credential, and an operator looking at the connection would find nothing wrong with it.
+    Deployment(&'static str),
+}
+
+impl RefreshFailure {
+    /// The sentence to put on the wire.
+    fn reason(self) -> &'static str {
+        match self {
+            RefreshFailure::Provider(reason)
+            | RefreshFailure::Transport(reason)
+            | RefreshFailure::Deployment(reason) => reason,
+        }
+    }
+
+    /// Whether the refusal is about the connection (`409`, the operator must act) or about
+    /// reaching the provider (`503`, the agent should try again).
+    fn status(self) -> StatusCode {
+        match self {
+            RefreshFailure::Provider(_) => StatusCode::CONFLICT,
+            RefreshFailure::Transport(_) | RefreshFailure::Deployment(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 }
@@ -240,6 +309,18 @@ fn action_digest(details: &serde_json::Value) -> String {
 /// nobody made. An hour is long enough for a human on another device and short enough that a
 /// forgotten request does not sit authorizing something a week later.
 const APPROVAL_WINDOW_MICROS: i64 = 60 * 60 * 1_000_000;
+
+/// How many actions ONE agent may have awaiting approval at once.
+///
+/// The approver's queue is a human surface and this is the only thing that bounds how much of
+/// it one agent occupies: the pending-uniqueness index is per `(agent, provider, action)` and
+/// the action is whatever JSON the agent sent, so without a cap a compromised agent raises
+/// arbitrarily many distinct rows.
+///
+/// Eight, because it is far above what a working agent does (an agent waiting on eight
+/// unanswered human decisions is already stuck) and far below what hides a request in a
+/// bounded queue.
+const MAX_PENDING_APPROVALS_PER_AGENT: i64 = 8;
 
 /// The `202` a sensitive exchange gets while it waits on a human.
 fn pending_response(approval: &ironauth_store::VaultApproval) -> Response {
@@ -601,6 +682,206 @@ pub async fn exchange(
             "this connection is marked failed and must be re-established",
         );
     }
+    // THE APPROVAL GATE (issue #132, criterion 4). Entered when the OPERATOR marked this
+    // connection sensitive, never when the agent named authorization details: an agent that
+    // could decide whether the gate ran could decline to run it, and one did -- omitting the
+    // field after a denial returned the identical credential.
+    //
+    // BEFORE THE REFRESH, and that ordering is a control rather than a tidying. The refresh
+    // spends the OPERATOR's downstream refresh token at the provider, and with a rotating
+    // provider it rotates it. Running it first meant a request that was about to be refused
+    // -- a denied approval, or one still pending, or a sensitive request stating no action at
+    // all -- still drove a privileged token grant at the third party on the operator's
+    // credential. Nothing downstream is spent for a request that will not be issued.
+    //
+    // The criterion is "a seeded sensitive action BLOCKS until an out-of-band approval renders
+    // its authorization_details; denial or timeout issues no tokens". Blocking cannot mean
+    // holding the request open: the approver is a human on another device and the wait is
+    // unbounded. It means the exchange issues NOTHING and hands back something to poll.
+    //
+    // The four answers, and every one of them decided by the row rather than by this code
+    // remembering what it did last time:
+    //
+    //   - no approval yet     -> raise one, answer `approval_pending`, issue nothing;
+    //   - pending             -> answer `approval_pending` again, issue nothing;
+    //   - approved and live   -> issue, carrying what the APPROVER agreed to;
+    //   - denied, or approved past its deadline -> refuse, issue nothing.
+    //
+    // A timeout is the absence of a decision, not an event: `authorizes` computes it from the
+    // deadline on the row, so an approval nobody answered stops authorizing on its own and
+    // needs no sweeper to have run for the refusal to be correct.
+    let mut approved_details = None;
+    let mut approved_for: Option<String> = None;
+    if connection.requires_approval {
+        // SENSITIVITY IS THE OPERATOR'S DECISION, not the agent's. This used to run when the
+        // REQUEST named `authorization_details`, which meant a denied agent re-sent the same
+        // exchange with the field omitted and received the identical credential: "denial
+        // issues no tokens" was true of this block's interior and false of the endpoint. The
+        // connection now carries the answer, and the agent cannot decline to enter the gate.
+        let Some(requested_details) = request.authorization_details.as_ref() else {
+            // A sensitive connection with no stated action is a bad request, not a bypass.
+            // There is nothing for an approver to decide and nothing to bind an approval to.
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "this connection requires approval, so the request must state the \
+                 authorization_details it is for",
+            );
+        };
+        // The action, as a digest of its CANONICAL form, so an approval is bound to the exact
+        // request it was raised for. `serde_json::Value` orders object keys, so two requests
+        // that differ only in key order produce one digest -- and two that differ in any value
+        // produce different ones, which is what stops an approval for a payment of one from
+        // authorizing a payment of a million.
+        let action_digest = action_digest(requested_details);
+
+        let Ok(existing) = store
+            .agent_vault_approvals()
+            .latest_for(&agent_id, &request.provider, &action_digest)
+            .await
+        else {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "the approval could not be read",
+            );
+        };
+
+        // Four answers, and the ORDER matters: a row past its deadline is dead whatever its
+        // state, so the expiry is checked before the state rather than after. Checking state
+        // first is how the previous version deadlocked -- a pending row past its deadline
+        // matched the pending arm and answered 202 forever, invisible to the approver's queue
+        // (which excludes expired rows) and undecidable (the decision refuses them too), while
+        // an approved row past its deadline answered 403 forever. Both were permanent, and
+        // neither raised a replacement.
+        let live = existing
+            .as_ref()
+            .is_some_and(|approval| now_micros < approval.expires_at_unix_micros);
+        match existing {
+            Some(approval) if live && approval.state == "approved" => {
+                // What the approver AGREED to, which may be narrower than what was asked. An
+                // approval that stated nothing means "exactly what was asked", so the request
+                // is echoed rather than the field being dropped: a caller that received no
+                // statement at all could not tell an unnarrowed approval from a missing one.
+                approved_details = Some(
+                    approval
+                        .approved_details
+                        .clone()
+                        .unwrap_or_else(|| requested_details.clone()),
+                );
+                approved_for = Some(approval.id.to_string());
+            }
+            Some(approval) if live && approval.state == "pending" => {
+                return pending_response(&approval);
+            }
+            // Denied, and still live. A denial stands for as long as it was given for, and
+            // re-raising here would make it a speed bump. It stops standing when it expires,
+            // which is the same rule the approval gets.
+            //
+            // Matched on `denied` EXPLICITLY rather than on "anything else that is live",
+            // which is what it used to be. A `consumed` row is also live and also not
+            // approved, and under the old catch-all a spent approval read as a refusal: the
+            // agent asking a second time for an action a human had already approved once was
+            // told it was denied, which is both wrong and unrecoverable until the row expired.
+            Some(approval) if live && approval.state == "denied" => {
+                return refuse(
+                    StatusCode::FORBIDDEN,
+                    "access_denied",
+                    "this action was not approved",
+                );
+            }
+            // Nothing, nothing still live, or an approval already SPENT: raise one. This is
+            // the arm that makes a timeout recoverable rather than terminal, and the one that
+            // makes a second exchange of the same action cost a second human decision.
+            _ => {
+                // HOW MANY an agent may have waiting at once. Without this the queue is a
+                // surface one agent can fill: the unique index is per action, the action is
+                // agent-chosen JSON, so N distinct detail objects are N pending rows. Raise
+                // 250 junk requests, then the one you want unseen, and the approver's page is
+                // junk with no page two. Refusing past the bound costs a well-behaved agent
+                // nothing -- it would have to be waiting on eight unanswered actions already.
+                match store
+                    .agent_vault_approvals()
+                    .pending_count_for_agent(&agent_id, now_micros)
+                    .await
+                {
+                    Ok(pending) if pending >= MAX_PENDING_APPROVALS_PER_AGENT => {
+                        return refuse(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "too_many_pending_approvals",
+                            "this agent already has the maximum number of actions awaiting \
+                             approval; wait for one to be decided or to time out",
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        return refuse(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "the approval queue could not be read",
+                        );
+                    }
+                }
+                let approval_id =
+                    ironauth_store::AgentVaultApprovalId::generate(state.env(), &scope);
+                let expires_at = now_micros.saturating_add(APPROVAL_WINDOW_MICROS);
+                match acting_for_approval(&state, scope, request_actor, correlation)
+                    .agent_vault_approvals()
+                    .request(
+                        state.env(),
+                        ironauth_store::NewVaultApproval {
+                            id: &approval_id,
+                            agent_id: &agent_id,
+                            provider: &request.provider,
+                            requested_details,
+                            action_digest: &action_digest,
+                            expires_at_unix_micros: expires_at,
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    // A concurrent exchange raised the same action first, which the unique
+                    // partial index refuses. Not a fault: re-read and answer with the winner,
+                    // so both callers poll the SAME approval. Answering 500 here would have
+                    // been a server error for a request that behaved correctly, and inserting
+                    // anyway would leave an approver deciding a row nothing reads.
+                    Err(ironauth_store::StoreError::Conflict) => {
+                        return match store
+                            .agent_vault_approvals()
+                            .latest_for(&agent_id, &request.provider, &action_digest)
+                            .await
+                        {
+                            Ok(Some(winner)) => pending_response(&winner),
+                            _ => refuse(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "the approval could not be read",
+                            ),
+                        };
+                    }
+                    Err(_) => {
+                        return refuse(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "the approval could not be raised",
+                        );
+                    }
+                }
+                return (
+                    StatusCode::ACCEPTED,
+                    [(header::CACHE_CONTROL, "no-store")],
+                    Json(ApprovalPending {
+                        status: "approval_pending".to_owned(),
+                        approval_id: approval_id.to_string(),
+                        expires_at: expires_at / 1_000_000,
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // EXPIRED: refresh it rather than refusing (issue #132, criterion 3).
     //
     // This is what makes the stored refresh token worth storing. An expired credential is not
@@ -686,8 +967,22 @@ pub async fn exchange(
                         connection.access_token = refreshed.access_token;
                         connection.expires_at_unix_micros = expires_at;
                     }
-                    Err(reason) => {
-                        return refuse(StatusCode::CONFLICT, "connection_failed", reason);
+                    Err(failure) => {
+                        // The STATUS says whether the operator has to act. A provider that
+                        // refused the credential is a 409 and the connection is now marked; a
+                        // provider that could not be reached is a 503 and the connection is
+                        // untouched, so the agent retrying is the right next move rather than
+                        // a re-consent.
+                        return refuse(
+                            failure.status(),
+                            match failure {
+                                RefreshFailure::Provider(_) => "connection_failed",
+                                RefreshFailure::Transport(_) | RefreshFailure::Deployment(_) => {
+                                    "provider_unreachable"
+                                }
+                            },
+                            failure.reason(),
+                        );
                     }
                 }
             }
@@ -708,169 +1003,10 @@ pub async fn exchange(
         );
     }
 
-    // THE APPROVAL GATE (issue #132, criterion 4). Reached only when the request NAMES
-    // authorization details, which is what makes an action sensitive.
-    //
-    // The criterion is "a seeded sensitive action BLOCKS until an out-of-band approval renders
-    // its authorization_details; denial or timeout issues no tokens". Blocking cannot mean
-    // holding the request open: the approver is a human on another device and the wait is
-    // unbounded. It means the exchange issues NOTHING and hands back something to poll.
-    //
-    // The four answers, and every one of them decided by the row rather than by this code
-    // remembering what it did last time:
-    //
-    //   - no approval yet     -> raise one, answer `approval_pending`, issue nothing;
-    //   - pending             -> answer `approval_pending` again, issue nothing;
-    //   - approved and live   -> issue, carrying what the APPROVER agreed to;
-    //   - denied, or approved past its deadline -> refuse, issue nothing.
-    //
-    // A timeout is the absence of a decision, not an event: `authorizes` computes it from the
-    // deadline on the row, so an approval nobody answered stops authorizing on its own and
-    // needs no sweeper to have run for the refusal to be correct.
-    let mut approved_details = None;
-    let mut approved_for: Option<String> = None;
-    if connection.requires_approval {
-        // SENSITIVITY IS THE OPERATOR'S DECISION, not the agent's. This used to run when the
-        // REQUEST named `authorization_details`, which meant a denied agent re-sent the same
-        // exchange with the field omitted and received the identical credential: "denial
-        // issues no tokens" was true of this block's interior and false of the endpoint. The
-        // connection now carries the answer, and the agent cannot decline to enter the gate.
-        let Some(requested_details) = request.authorization_details.as_ref() else {
-            // A sensitive connection with no stated action is a bad request, not a bypass.
-            // There is nothing for an approver to decide and nothing to bind an approval to.
-            return refuse(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "this connection requires approval, so the request must state the \
-                 authorization_details it is for",
-            );
-        };
-        // The action, as a digest of its CANONICAL form, so an approval is bound to the exact
-        // request it was raised for. `serde_json::Value` orders object keys, so two requests
-        // that differ only in key order produce one digest -- and two that differ in any value
-        // produce different ones, which is what stops an approval for a payment of one from
-        // authorizing a payment of a million.
-        let action_digest = action_digest(requested_details);
-
-        let Ok(existing) = store
-            .agent_vault_approvals()
-            .latest_for(&agent_id, &request.provider, &action_digest)
-            .await
-        else {
-            return refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "the approval could not be read",
-            );
-        };
-
-        // Four answers, and the ORDER matters: a row past its deadline is dead whatever its
-        // state, so the expiry is checked before the state rather than after. Checking state
-        // first is how the previous version deadlocked -- a pending row past its deadline
-        // matched the pending arm and answered 202 forever, invisible to the approver's queue
-        // (which excludes expired rows) and undecidable (the decision refuses them too), while
-        // an approved row past its deadline answered 403 forever. Both were permanent, and
-        // neither raised a replacement.
-        let live = existing
-            .as_ref()
-            .is_some_and(|approval| now_micros < approval.expires_at_unix_micros);
-        match existing {
-            Some(approval) if live && approval.state == "approved" => {
-                // What the approver AGREED to, which may be narrower than what was asked. An
-                // approval that stated nothing means "exactly what was asked", so the request
-                // is echoed rather than the field being dropped: a caller that received no
-                // statement at all could not tell an unnarrowed approval from a missing one.
-                approved_details = Some(
-                    approval
-                        .approved_details
-                        .clone()
-                        .unwrap_or_else(|| requested_details.clone()),
-                );
-                approved_for = Some(approval.id.to_string());
-            }
-            Some(approval) if live && approval.state == "pending" => {
-                return pending_response(&approval);
-            }
-            // Denied, and still live. A denial stands for as long as it was given for, and
-            // re-raising here would make it a speed bump. It stops standing when it expires,
-            // which is the same rule the approval gets.
-            Some(_) if live => {
-                return refuse(
-                    StatusCode::FORBIDDEN,
-                    "access_denied",
-                    "this action was not approved",
-                );
-            }
-            // Nothing, or nothing still live: raise one. This is the arm that makes a timeout
-            // recoverable rather than terminal.
-            _ => {
-                let approval_id =
-                    ironauth_store::AgentVaultApprovalId::generate(state.env(), &scope);
-                let expires_at = now_micros.saturating_add(APPROVAL_WINDOW_MICROS);
-                match acting_for_approval(&state, scope, request_actor, correlation)
-                    .agent_vault_approvals()
-                    .request(
-                        state.env(),
-                        ironauth_store::NewVaultApproval {
-                            id: &approval_id,
-                            agent_id: &agent_id,
-                            provider: &request.provider,
-                            requested_details,
-                            action_digest: &action_digest,
-                            expires_at_unix_micros: expires_at,
-                        },
-                    )
-                    .await
-                {
-                    Ok(()) => {}
-                    // A concurrent exchange raised the same action first, which the unique
-                    // partial index refuses. Not a fault: re-read and answer with the winner,
-                    // so both callers poll the SAME approval. Answering 500 here would have
-                    // been a server error for a request that behaved correctly, and inserting
-                    // anyway would leave an approver deciding a row nothing reads.
-                    Err(ironauth_store::StoreError::Conflict) => {
-                        return match store
-                            .agent_vault_approvals()
-                            .latest_for(&agent_id, &request.provider, &action_digest)
-                            .await
-                        {
-                            Ok(Some(winner)) => pending_response(&winner),
-                            _ => refuse(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "server_error",
-                                "the approval could not be read",
-                            ),
-                        };
-                    }
-                    Err(_) => {
-                        return refuse(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            "the approval could not be raised",
-                        );
-                    }
-                }
-                return (
-                    StatusCode::ACCEPTED,
-                    [(header::CACHE_CONTROL, "no-store")],
-                    Json(ApprovalPending {
-                        status: "approval_pending".to_owned(),
-                        approval_id: approval_id.to_string(),
-                        expires_at: expires_at / 1_000_000,
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // What the exchange row says. The provider, and the APPROVAL that authorized it when one
-    // did: without the second, nothing joins "credential handed over" to "approval that
-    // permitted it", and accountability is the whole reason this row exists.
-    let exchange_detail = match approved_for.as_ref() {
-        Some(approval_id) => format!("{} approval={approval_id}", request.provider),
-        None => request.provider.clone(),
-    };
+    // The exchange row names the provider AND the APPROVAL that authorized it when one did:
+    // without the second, nothing joins "credential handed over" to "approval that permitted
+    // it", and accountability is the whole reason this row exists. Two arguments rather than
+    // one packed string, so `provider=` in the detail is always a provider.
 
     // The exchange row, BEFORE the credential leaves. A record written afterwards is one a
     // crash can lose while the credential is already gone.
@@ -878,9 +1014,44 @@ pub async fn exchange(
         .store()
         .scoped(scope)
         .acting(request_actor, correlation);
+    // SPEND the approval, before the credential leaves and in the same order the exchange row
+    // is written: the approver decided one action, so it authorizes one exchange. Under the
+    // first version a single "yes" to a payment of one let the agent take the credential as
+    // often as it liked for the next hour, which is a decision about a WINDOW rather than
+    // about the action the human was shown.
+    //
+    // A failure to spend it REFUSES the exchange rather than proceeding. The alternative --
+    // hand over the credential and hope -- is the same over-grant this closes, and the update
+    // is scoped to a still-approved row, so the only way it fails is a concurrent exchange
+    // having spent it first, which is exactly when nothing further should be issued.
+    if let Some(approval_id) = approved_for.as_deref() {
+        let parsed = ironauth_store::AgentVaultApprovalId::parse_in_scope(approval_id, &scope);
+        let spent = match parsed {
+            Ok(id) => {
+                acting_for_approval(&state, scope, request_actor, correlation)
+                    .agent_vault_approvals()
+                    .consume(state.env(), &id, now_micros)
+                    .await
+            }
+            Err(_) => Err(ironauth_store::StoreError::NotFound),
+        };
+        if spent.is_err() {
+            return refuse(
+                StatusCode::FORBIDDEN,
+                "access_denied",
+                "this approval has already been used; request approval again",
+            );
+        }
+    }
+
     if acting
         .agent_vault()
-        .record_exchange(state.env(), &connection.id, &exchange_detail)
+        .record_exchange(
+            state.env(),
+            &connection.id,
+            &request.provider,
+            approved_for.as_deref(),
+        )
         .await
         .is_err()
     {

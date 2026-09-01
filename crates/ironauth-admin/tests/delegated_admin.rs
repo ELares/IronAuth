@@ -4664,7 +4664,7 @@ async fn the_agent_vault_surface_splits_deciding_from_reading_the_queue() {
         "the refusal does not name the permission required: {response}"
     );
 
-    // And a WRITE credential reaches both writes.
+    // Now a credential holding WRITE and not read.
     restrict(
         &h,
         &tenant,
@@ -4673,6 +4673,22 @@ async fn the_agent_vault_surface_splits_deciding_from_reading_the_queue() {
         &["management.write_organizations"],
     )
     .await;
+
+    // It reaches both writes -- and NOT the queue. The second
+    // half is what makes the queue's entry in `PERMISSION_PROVEN` honest: "read is sufficient"
+    // holds unchanged if the handler's `require_permission` were deleted outright, so on its
+    // own it proves nothing about the permission.
+    let (status, _, response) = h.get_as(&queue, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write-only credential read the approver's queue: {response}"
+    );
+    assert!(
+        response.contains("management.read"),
+        "the refusal does not name the permission required: {response}"
+    );
+
     let (status, _, response) = h.put_as(&connection, &secret, &store).await;
     assert_ne!(
         status,

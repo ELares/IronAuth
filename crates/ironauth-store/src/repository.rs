@@ -4475,7 +4475,8 @@ impl ActingMds3BlobCacheRepo<'_> {
                        fetched_at = EXCLUDED.fetched_at, verified_at = EXCLUDED.verified_at, \
                        updated_at = EXCLUDED.updated_at \
                      WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no \
-                     RETURNING id",
+                     RETURNING id, requires_approval, \
+                               refresh_token_endpoint IS NOT NULL AS can_refresh",
         )
         .bind(candidate_id.to_string())
         .bind(scope.tenant().to_string())
@@ -72736,6 +72737,21 @@ pub struct RefreshedCredentialWrite<'a> {
     pub expires_at_unix_micros: Option<i64>,
 }
 
+/// What a stored connection ends up being, read out of the write's own `RETURNING`.
+///
+/// The id alone was not enough once `requires_approval` stopped being replace-semantics: a
+/// caller that reported what it SENT would report the gate as off on exactly the re-store
+/// where the stored value kept it on. These come from the row.
+pub struct StoredVaultConnection {
+    /// The id the row actually has. On a re-store it keeps the one it was created with, so a
+    /// caller's freshly minted id addresses nothing.
+    pub id: AgentVaultConnectionId,
+    /// Whether reaching it blocks on an approval, after the COALESCE.
+    pub requires_approval: bool,
+    /// Whether it carries a refresh configuration.
+    pub can_refresh: bool,
+}
+
 /// Everything raising one approval request needs.
 ///
 /// A struct rather than seven positional parameters, matching [`NewVaultConnection`] next door.
@@ -72775,7 +72791,14 @@ pub struct NewVaultConnection<'a> {
     /// When the access token expires, in microseconds since the epoch.
     pub expires_at_unix_micros: Option<i64>,
     /// Whether exchanging for this credential blocks on an out-of-band approval.
-    pub requires_approval: bool,
+    ///
+    /// `None` means LEAVE IT AS IT IS, which is what a re-store that does not mention the
+    /// field must do. It used to be a plain `bool`, so an operator replacing an expired access
+    /// token on a sensitive connection -- a PUT carrying the provider, the token and the
+    /// scopes -- silently turned the approval gate OFF, and nothing showed them, because the
+    /// flag was write-only. `Some(false)` still means "make it ordinary"; absent means "do not
+    /// touch it", and on a first store it means the same as `Some(false)`.
+    pub requires_approval: Option<bool>,
     /// How this connection refreshes itself, when it can.
     ///
     /// [`None`] means it cannot: a credential established through a flow that returned no
@@ -73033,7 +73056,7 @@ impl ActingAgentVaultRepo<'_> {
         env: &Env,
         spec: NewVaultConnection<'_>,
         now_micros: i64,
-    ) -> Result<AgentVaultConnectionId, StoreError> {
+    ) -> Result<StoredVaultConnection, StoreError> {
         self.store_connection_with_event(env, spec, now_micros, None)
             .await
     }
@@ -73061,7 +73084,7 @@ impl ActingAgentVaultRepo<'_> {
         spec: NewVaultConnection<'_>,
         now_micros: i64,
         event: Option<&DomainEvent<'_>>,
-    ) -> Result<AgentVaultConnectionId, StoreError> {
+    ) -> Result<StoredVaultConnection, StoreError> {
         if spec.id.scope() != self.scope || spec.agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -73081,6 +73104,8 @@ impl ActingAgentVaultRepo<'_> {
         // The id the row ends up with, read out of the upsert's own RETURNING rather than
         // assumed to be the one the caller minted.
         let mut effective_id: Option<String> = None;
+        let mut effective_requires_approval = false;
+        let mut effective_can_refresh = false;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -73172,7 +73197,8 @@ impl ActingAgentVaultRepo<'_> {
                          refresh_client_secret_sealed = EXCLUDED.refresh_client_secret_sealed, \
                          refresh_client_secret_dek_version = \
                              EXCLUDED.refresh_client_secret_dek_version, \
-                         requires_approval = EXCLUDED.requires_approval, \
+                         requires_approval = COALESCE(EXCLUDED.requires_approval, \
+                             agent_vault_connections.requires_approval), \
                          granted_scopes = EXCLUDED.granted_scopes, \
                          expires_at = EXCLUDED.expires_at, \
                          state = 'active', \
@@ -73206,7 +73232,14 @@ impl ActingAgentVaultRepo<'_> {
                 .await
                 .map(|row| {
                     let stored: String = row.get("id");
+                    // The EFFECTIVE flags, not the ones that were sent. `requires_approval` is
+                    // COALESCEd, so on a re-store that omits it the stored value wins, and a
+                    // caller reporting what it sent would report the wrong thing exactly when
+                    // it matters -- the case where an operator would otherwise not know the
+                    // gate is still on.
                     effective_id = Some(stored);
+                    effective_requires_approval = row.get("requires_approval");
+                    effective_can_refresh = row.get("can_refresh");
                 })?;
                 // In the SAME transaction as the row. An event enqueued afterwards is one a
                 // crash can lose while the credential is already stored, which would leave an
@@ -73218,7 +73251,13 @@ impl ActingAgentVaultRepo<'_> {
         )
         .await?;
         let stored = effective_id.ok_or(StoreError::NotFound)?;
-        AgentVaultConnectionId::parse_in_scope(&stored, &scope).map_err(|_| StoreError::NotFound)
+        let id = AgentVaultConnectionId::parse_in_scope(&stored, &scope)
+            .map_err(|_| StoreError::NotFound)?;
+        Ok(StoredVaultConnection {
+            id,
+            requires_approval: effective_requires_approval,
+            can_refresh: effective_can_refresh,
+        })
     }
 
     /// Replace a connection's stored TOKENS after a successful refresh (issue #132).
@@ -73411,11 +73450,20 @@ impl ActingAgentVaultRepo<'_> {
         env: &Env,
         id: &AgentVaultConnectionId,
         provider: &str,
+        approval: Option<&str>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        let detail = format!("provider={provider}");
+        // TWO fields, not one string the caller packed. The caller used to pass
+        // "google approval=ava_..." as `provider`, so `provider=` in the detail carried a
+        // value that is not a provider and anything reading that field got the wrong answer
+        // for exactly the rows -- the approved, sensitive ones -- an investigator cares most
+        // about.
+        let detail = match approval {
+            Some(approval) => format!("provider={provider} approval={approval}"),
+            None => format!("provider={provider}"),
+        };
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,
@@ -73472,6 +73520,16 @@ impl VaultApproval {
     pub fn authorizes(&self, now_micros: i64) -> bool {
         self.state == "approved" && now_micros < self.expires_at_unix_micros
     }
+
+    /// Whether the credential this approval authorized has already been handed over.
+    ///
+    /// A spent approval is not a denial and not a timeout: the human said yes and the yes was
+    /// used. Asking again raises a new request, so a second exchange of the same action costs
+    /// a second human decision, which is what deciding an ACTION means.
+    #[must_use]
+    pub fn is_consumed(&self) -> bool {
+        self.state == "consumed"
+    }
 }
 
 /// The READ side of the sensitive-action approval queue, for this scope (issue #132).
@@ -73521,6 +73579,46 @@ impl AgentVaultApprovalRepo<'_> {
             action_digest: row.get("action_digest"),
             expires_at_unix_micros: row.get("expires_us"),
         }))
+    }
+
+    /// How many approvals this AGENT currently has pending and still answerable.
+    ///
+    /// The queue is a HUMAN surface, and nothing else bounds how much of it one agent can
+    /// occupy: the unique index is per `(agent, provider, action)` and the action is agent-
+    /// chosen JSON, so N distinct `authorization_details` values are N pending rows. A
+    /// compromised agent could raise 250 junk requests and then the one it wanted nobody to
+    /// look at, and the approver's bounded page would be junk with no way to reach page two.
+    ///
+    /// Counted per agent rather than per organization so one noisy agent cannot deny the
+    /// queue to its neighbours, which is the same reason it is counted at all.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent is out of this scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn pending_count_for_agent(
+        &self,
+        agent_id: &AgentPrincipalId,
+        now_micros: i64,
+    ) -> Result<i64, StoreError> {
+        if agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM agent_vault_approvals \
+             WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 \
+               AND state = 'pending' \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(agent_id.to_string())
+        .bind(now_micros)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(count)
     }
 
     /// The LATEST approval for `(agent, provider, action)`, whatever its state.
@@ -73745,6 +73843,64 @@ impl ActingAgentVaultApprovalRepo<'_> {
                 Ok(())
             },
             false,
+        )
+        .await
+    }
+
+    /// Mark an approval SPENT, at the moment the credential it authorized is handed over.
+    ///
+    /// Scoped to a row that is still `approved`, so a double issue cannot spend it twice and a
+    /// denied or already-consumed row is untouched. Returns [`StoreError::NotFound`] when
+    /// nothing was updated, which the caller treats as "somebody else got there first" rather
+    /// than as a fault.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope or the row was not `approved`;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn consume(
+        &self,
+        env: &Env,
+        id: &AgentVaultApprovalId,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultApprovalDecided,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE agent_vault_approvals \
+                     SET state = 'consumed' \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND state = 'approved' \
+                       AND expires_at > TIMESTAMPTZ 'epoch' \
+                           + ($4::text || ' microseconds')::interval",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some("outcome=consumed"),
         )
         .await
     }

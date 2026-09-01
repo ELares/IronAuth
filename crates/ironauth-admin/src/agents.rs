@@ -643,11 +643,16 @@ pub async fn store_agent_vault_connection(
         // The id the ROW has, returned by the write. Minting one and reporting it was the
         // defect: on a re-store the row keeps its first id, so the operator was handed one
         // nothing could address and a later `mark_failed` on it would answer not-found.
-        id: stored_id.to_string(),
+        id: stored_id.id.to_string(),
         agent_id: id.to_string(),
         provider,
         granted_scopes: request.granted_scopes,
         state: "active".to_owned(),
+        // Read out of the ROW, not echoed from the request. On a re-store that omits
+        // `requires_approval` the stored value wins, so echoing the request would report the
+        // gate as off in exactly the case where the operator most needs to see it is on.
+        requires_approval: stored_id.requires_approval,
+        can_refresh: stored_id.can_refresh,
     })
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -744,7 +749,6 @@ pub async fn list_agent_vault_approvals(
             id: approval.id.to_string(),
             agent_id: approval.agent_id.to_string(),
             provider: approval.provider,
-            state: approval.state,
             expires_at: approval.expires_at_unix_micros / 1_000_000,
             requested_details: approval.requested_details,
         })
