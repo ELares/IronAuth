@@ -57,10 +57,22 @@ impl ResourceType {
 /// alongside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRef {
-    /// Which collection.
-    pub resource_type: ResourceType,
-    /// The resource id, when the path addressed a single resource rather than the collection.
-    pub id: Option<String>,
+    resource_type: ResourceType,
+    id: Option<String>,
+}
+
+impl ResourceRef {
+    /// Which collection this reference addresses.
+    #[must_use]
+    pub fn resource_type(&self) -> ResourceType {
+        self.resource_type
+    }
+
+    /// The resource id, when the path addressed one rather than the collection.
+    #[must_use]
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
 }
 
 /// Why a path was refused.
@@ -248,7 +260,7 @@ mod tests {
         ] {
             let parsed = parse_resource_path(&format!("/Users/{id}"))
                 .unwrap_or_else(|error| panic!("{id:?} must be accepted: {error}"));
-            assert_eq!(parsed.id.as_deref(), Some(id));
+            assert_eq!(parsed.id(), Some(id));
         }
     }
 

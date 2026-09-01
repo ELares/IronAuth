@@ -28,12 +28,29 @@ use crate::filter::{Filter, FilterError, parse_filter};
 /// Like the filter and the resource path, this cannot hold text that was not understood.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchPath {
+    attribute: String,
+    selector: Option<Filter>,
+    sub_attribute: Option<String>,
+}
+
+impl PatchPath {
     /// The attribute being patched, for example `members` or `name`.
-    pub attribute: String,
-    /// The value selector, when the path carried one: `members[value eq "x"]`.
-    pub selector: Option<Filter>,
-    /// The sub-attribute, when the path named one: `...].display` or `name.givenName`.
-    pub sub_attribute: Option<String>,
+    #[must_use]
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    /// The value selector, when the path carried one.
+    #[must_use]
+    pub fn selector(&self) -> Option<&Filter> {
+        self.selector.as_ref()
+    }
+
+    /// The sub-attribute, when the path named one.
+    #[must_use]
+    pub fn sub_attribute(&self) -> Option<&str> {
+        self.sub_attribute.as_deref()
+    }
 }
 
 /// Why a PATCH path was refused.
@@ -52,6 +69,11 @@ pub enum PatchPathError {
     InvalidSelector(FilterError),
     /// Trailing input after the path.
     Trailing,
+    /// The path exceeded [`MAX_LEN`].
+    TooLong {
+        /// The bound that was exceeded.
+        limit: usize,
+    },
 }
 
 /// The maximum PATCH path length in bytes, bounded for the same reason the filter is.
@@ -77,62 +99,113 @@ fn is_legal_attribute(name: &str) -> bool {
 /// [`PatchPathError`], never echoing the rejected input.
 pub fn parse_patch_path(raw: &str) -> Result<PatchPath, PatchPathError> {
     if raw.len() > MAX_LEN {
-        return Err(PatchPathError::IllegalAttribute);
+        return Err(PatchPathError::TooLong { limit: MAX_LEN });
     }
-    let trimmed = raw.trim();
+    // ASCII space only. Trimming Unicode whitespace would silently accept a path a client did
+    // not send, which is the normalize-rather-than-refuse behaviour this crate argues against
+    // everywhere else.
+    let trimmed = raw.trim_matches(' ');
     if trimmed.is_empty() {
         return Err(PatchPathError::Empty);
     }
 
-    // A URN-qualified path keeps its URN with the attribute: splitting on the LAST colon, as
-    // the filter parser does, because a SCIM URN contains colons of its own.
-    let (prefix, rest) = match trimmed.rfind(':') {
-        Some(index) => (Some(&trimmed[..index]), &trimmed[index + 1..]),
-        None => (None, trimmed),
-    };
-
-    let Some(open) = rest.find('[') else {
-        // No selector: `attr` or `attr.sub`.
-        let (attribute, sub) = split_attribute(rest)?;
-        return Ok(PatchPath {
-            attribute: qualify(prefix, attribute),
-            selector: None,
-            sub_attribute: sub,
-        });
-    };
-
-    let Some(close) = rest.rfind(']') else {
-        return Err(PatchPathError::UnclosedSelector);
-    };
-    if close < open {
-        return Err(PatchPathError::UnclosedSelector);
-    }
-    let attribute = &rest[..open];
-    if !is_legal_attribute(attribute) {
-        return Err(PatchPathError::IllegalAttribute);
-    }
-    // The SAME filter parser the query surface uses. See the module docs for why this is not
-    // a second parser tuned for this position.
-    let selector = parse_filter(&rest[open + 1..close]).map_err(PatchPathError::InvalidSelector)?;
-
-    let tail = &rest[close + 1..];
-    let sub_attribute = if tail.is_empty() {
-        None
-    } else {
-        let Some(sub) = tail.strip_prefix('.') else {
-            return Err(PatchPathError::Trailing);
+    // THE BRACKET SCAN COMES FIRST. It used to run on the post-colon remainder, which meant
+    // where the path split depended on data INSIDE the selector, and that was wrong twice
+    // over:
+    //
+    //   - a selector value containing a colon broke the path. `$ref` and `photos.value` are
+    //     URIs in RFC 7643, so `photos[value eq "https://ex/p.png"].display` is ordinary
+    //     Okta traffic and it was REFUSED.
+    //   - a colon after an unclosed `[` bypassed the unclosed-bracket guard entirely, so
+    //     `members[:x` parsed with the unbalanced bracket sitting in `attribute` and the
+    //     filter parser never invoked.
+    //
+    // Splitting the head from the selector first, and looking for the URN only in the head,
+    // removes both: nothing inside the brackets can decide how the outside is read.
+    let (head, bracketed) = if let Some(open) = trimmed.find('[') {
+        let Some(close) = trimmed.rfind(']') else {
+            return Err(PatchPathError::UnclosedSelector);
         };
-        if !is_legal_attribute(sub) {
+        if close < open {
+            return Err(PatchPathError::UnclosedSelector);
+        }
+        (
+            &trimmed[..open],
+            Some((&trimmed[open + 1..close], &trimmed[close + 1..])),
+        )
+    } else {
+        // A `]` with no `[` is unbalanced in the other direction, and is refused rather than
+        // treated as an ordinary character: it is only ever the tail of a selector somebody
+        // truncated.
+        if trimmed.contains(']') {
+            return Err(PatchPathError::UnclosedSelector);
+        }
+        (trimmed, None)
+    };
+
+    // The URN split happens in the HEAD only, on the last colon, because a SCIM URN contains
+    // colons of its own.
+    let (urn, attribute_part) = match head.rfind(':') {
+        Some(index) => (Some(&head[..index]), &head[index + 1..]),
+        None => (None, head),
+    };
+    // THE URN IS VALIDATED. It used to be passed through untouched, so everything before the
+    // last colon -- a NUL, a newline, a quote, `../`, `%2e%2e`, a whole SQL fragment -- landed
+    // in `attribute` and the type's promise that it holds nothing unparsed was false for that
+    // half. The filter parser never had this hole: it constrains its scan alphabet before
+    // splitting, so the two parsers for one grammar disagreed exactly where this module's own
+    // header argues they must not.
+    if let Some(urn) = urn {
+        if !is_legal_urn(urn) {
             return Err(PatchPathError::IllegalAttribute);
         }
-        Some(sub.to_owned())
-    };
+    }
 
-    Ok(PatchPath {
-        attribute: qualify(prefix, attribute),
-        selector: Some(selector),
-        sub_attribute,
-    })
+    match bracketed {
+        None => {
+            let (attribute, sub) = split_attribute(attribute_part)?;
+            Ok(PatchPath {
+                attribute: qualify(urn, attribute),
+                selector: None,
+                sub_attribute: sub,
+            })
+        }
+        Some((selector_text, tail)) => {
+            if !is_legal_attribute(attribute_part) {
+                return Err(PatchPathError::IllegalAttribute);
+            }
+            // The SAME filter parser the query surface uses. See the module docs for why this
+            // is not a second parser tuned for this position.
+            let selector = parse_filter(selector_text).map_err(PatchPathError::InvalidSelector)?;
+            let sub_attribute = if tail.is_empty() {
+                None
+            } else {
+                let Some(sub) = tail.strip_prefix('.') else {
+                    return Err(PatchPathError::Trailing);
+                };
+                if !is_legal_attribute(sub) {
+                    return Err(PatchPathError::IllegalAttribute);
+                }
+                Some(sub.to_owned())
+            };
+            Ok(PatchPath {
+                attribute: qualify(urn, attribute_part),
+                selector: Some(selector),
+                sub_attribute,
+            })
+        }
+    }
+}
+
+/// A legal SCIM schema URN: the alphabet RFC 7643 URNs are written in, and nothing else.
+///
+/// The same allowlist reasoning as everywhere else here. A URN outside it is refused rather
+/// than escaped, because an allowlist cannot be bypassed by an encoding nobody thought of.
+fn is_legal_urn(urn: &str) -> bool {
+    !urn.is_empty()
+        && urn
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '$'))
 }
 
 fn qualify(prefix: Option<&str>, attribute: &str) -> String {
@@ -167,24 +240,56 @@ mod tests {
         // which system sent the request: one that branched would be one dialect away from a
         // bug the other never reaches.
         let okta = parse_patch_path(r#"members[value eq "usr_a"]"#).expect("okta dialect");
-        assert_eq!(okta.attribute, "members");
-        assert!(okta.selector.is_some());
+        assert_eq!(okta.attribute(), "members");
+        assert!(okta.selector().is_some());
 
         let entra = parse_patch_path("members").expect("entra dialect");
-        assert_eq!(entra.attribute, "members");
-        assert!(entra.selector.is_none());
+        assert_eq!(entra.attribute(), "members");
+        assert!(entra.selector().is_none());
 
-        // The same struct, differing only in whether a selector was present.
-        assert_eq!(okta.attribute, entra.attribute);
-        assert_eq!(okta.sub_attribute, entra.sub_attribute);
+        // EXHAUSTIVE, by struct pattern rather than by picking accessors. An earlier version
+        // compared `attribute` and `sub_attribute`, which are the two fields the assertions
+        // above had already pinned, so it could not fail; worse, a field added later would
+        // have been silently excluded from "the same shape". Destructuring means a new field
+        // stops this compiling until somebody says which dialect it differs on.
+        let PatchPath {
+            attribute: okta_attribute,
+            selector: okta_selector,
+            sub_attribute: okta_sub,
+        } = &okta;
+        let PatchPath {
+            attribute: entra_attribute,
+            selector: entra_selector,
+            sub_attribute: entra_sub,
+        } = &entra;
+        assert_eq!(okta_attribute, entra_attribute, "the target attribute");
+        assert_eq!(okta_sub, entra_sub, "the sub-attribute");
+        assert!(
+            okta_selector.is_some() && entra_selector.is_none(),
+            "the selector is the ONE field the dialects differ on, and it differs in exactly \
+             this direction: Okta narrows in the path, Entra narrows in the operation value"
+        );
+
+        // And the difference stays confined to it when the path carries more. A consumer
+        // reading `attribute` and `sub_attribute` gets the same answer either way, which is
+        // the property that lets it not branch.
+        let okta_sub_path =
+            parse_patch_path(r#"members[value eq "usr_a"].display"#).expect("okta dialect");
+        let entra_sub_path = parse_patch_path("members.display").expect("entra dialect");
+        assert_eq!(okta_sub_path.attribute(), entra_sub_path.attribute());
+        assert_eq!(
+            okta_sub_path.sub_attribute(),
+            entra_sub_path.sub_attribute()
+        );
+        assert_eq!(okta_sub_path.sub_attribute(), Some("display"));
     }
 
     #[test]
     fn a_selector_with_a_sub_attribute_parses_all_three_parts() {
         let parsed = parse_patch_path(r#"members[value eq "usr_a"].display"#).expect("valid");
-        assert_eq!(parsed.attribute, "members");
-        assert_eq!(parsed.sub_attribute.as_deref(), Some("display"));
-        let Some(Filter::Compare { op, value, .. }) = parsed.selector else {
+        assert_eq!(parsed.attribute(), "members");
+        assert_eq!(parsed.sub_attribute(), Some("display"));
+        let Some(Filter::Compare { op, value, .. }) = parsed.selector().cloned() else {
             panic!("a comparison selector");
         };
         assert_eq!(op, CompareOp::Equal);
@@ -209,10 +314,70 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(
-            parsed.attribute,
+            parsed.attribute(),
             "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
             "split on the LAST colon, so a URN containing colons survives"
         );
+    }
+
+    #[test]
+    fn a_hostile_urn_prefix_is_refused_rather_than_carried() {
+        // The blocker this file shipped with. Everything before the last colon went into
+        // `attribute` untouched, so the type's promise that it holds nothing unparsed was
+        // false for exactly the half an attacker controls most cheaply.
+        for hostile in [
+            "';DROP TABLE users--:userName", // query-audit-allow: parser input, not a query
+            "<script>alert(1)</script>:userName",
+            "../../../../etc/passwd:members[value eq \"a\"]",
+            "a\rb\nc:active",
+            "m\0:x",
+            "m%00:x",
+            "m/../:x",
+            "m\":x",
+            "!!!:userName",
+            ":userName",
+        ] {
+            assert!(
+                parse_patch_path(hostile).is_err(),
+                "must refuse {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selector_value_containing_a_colon_is_a_path_a_real_client_sends() {
+        // `$ref` and `photos.value` are URIs in RFC 7643, so these are ordinary Okta traffic.
+        // They were REFUSED, because the colon split ran before the bracket scan and a colon
+        // inside the selector decided where the path was cut.
+        for legitimate in [
+            r#"photos[value eq "https://ex.com/p.png"].display"#,
+            r#"members[$ref eq "https://ex.com/v2/Users/2819c223"]"#,
+            r#"schemas[value eq "urn:ietf:params:scim:schemas:core:2.0:User"]"#,
+            r#"members[value eq "a:b"]"#,
+        ] {
+            assert!(
+                parse_patch_path(legitimate).is_ok(),
+                "must accept {legitimate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_colon_cannot_smuggle_an_unclosed_bracket_past_the_guard() {
+        // `members[` was refused, and `members[:x` was ACCEPTED with the unbalanced bracket
+        // sitting in `attribute` and the filter parser never invoked. The guard existed and
+        // the colon split moved the input out from under it.
+        for hostile in [
+            "members[",
+            "members[:x",
+            r#"members[value eq "a" :x"#,
+            "members]",
+        ] {
+            assert!(
+                parse_patch_path(hostile).is_err(),
+                "must refuse {hostile:?}"
+            );
+        }
     }
 
     #[test]

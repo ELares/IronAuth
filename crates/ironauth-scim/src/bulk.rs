@@ -9,8 +9,11 @@
 //! `ServiceProviderConfig`, and a client sizes its batches from them. A server that advertises
 //! a limit it does not enforce has published a promise an attacker reads as a budget; one
 //! that enforces a limit it does not advertise breaks well-behaved clients at random. So
-//! [`BulkLimits`] is ONE value: the same struct is rendered into the config document and
-//! enforced here, and there is no second constant for the two to drift apart.
+//! [`BulkLimits`] is ONE value: [`crate::ServiceProviderConfig`] renders that same struct
+//! into the published document and this module enforces it, with no second constant for the
+//! two to drift apart. The equality is TESTED there, by reading the number a client would
+//! read out of the document and proving it is exactly where [`validate_bulk`] changes its
+//! answer; the tests here pin the enforcement itself.
 //!
 //! PER-OPERATION RESULTS. A bulk request that fails as a unit tells a client nothing about
 //! which of its fifty operations was the problem, and the client's only recovery is to retry
@@ -241,9 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn the_advertised_limits_are_the_enforced_limits() {
-        // One value for both, so the config document and this check cannot drift. A server
-        // that advertises a limit it does not enforce has published a budget.
+    fn the_refusal_names_the_limit_it_enforced() {
+        // Named for what it actually checks. The advertised-equals-enforced property is a
+        // claim about TWO artifacts and cannot be tested from inside one of them, so it lives
+        // in `service_provider_config`, where the published document is available to read.
+        // What this pins is the enforcement: the bound is where it says it is, it is
+        // inclusive, and the error carries the number rather than a generic refusal.
         let limits = BulkLimits {
             max_operations: 2,
             max_payload_bytes: 100,

@@ -21,6 +21,7 @@ mod filter;
 mod patch;
 mod path;
 mod resource;
+mod service_provider_config;
 
 pub use bulk::{
     BulkError, BulkLimits, BulkOperation, BulkOperationResult, BulkRequest, validate_bulk,
@@ -28,6 +29,9 @@ pub use bulk::{
 pub use patch::{PatchPath, PatchPathError, parse_patch_path};
 pub use path::{PathError, ResourceRef, ResourceType, parse_resource_path};
 pub use resource::ScimUser;
+pub use service_provider_config::{
+    AuthenticationScheme, BulkConfig, FilterConfig, ScimLimits, ServiceProviderConfig, Supported,
+};
 
 pub use filter::{
     AttributePath, CompareOp, Filter, FilterError, PresentOp, ScimErrorBody, Value, parse_filter,

@@ -9,11 +9,18 @@
 //! text reached the datastore". Those are different problems and only one of them is fixable
 //! by being careful.
 //!
-//! So [`Filter`] cannot represent unparsed text. There is no `Filter::Raw`, no
-//! `Filter::from_str` that stores what it could not understand, and no public constructor
-//! at all: [`parse_filter`] is the only way to obtain one. A caller that wanted to pass a
-//! filter through untouched has nothing to put it in. The compiler enforces what a review
-//! comment would otherwise have to.
+//! So [`Filter`] cannot REPRESENT unparsed text. There is no `Filter::Raw` and no
+//! `From<String>`: every variant is a construct the grammar produced, so a caller who wanted
+//! to pass a filter through untouched has nothing to put it in.
+//!
+//! Being precise about the limit of that, because an earlier version of this paragraph
+//! overstated it and a reviewer was right to say so: `Filter` is an enum a consumer has to
+//! MATCH on, so its variants are public and a caller can hand-build a tree. What they cannot
+//! do is build one that holds text nobody parsed, which is the property the datastore
+//! boundary needs. [`crate::ResourceRef`] and [`crate::PatchPath`] carry `String`s rather
+//! than a closed shape, so those two DO hide their fields and can only be produced by their
+//! parsers; the difference is deliberate and follows from what each type has to let a
+//! consumer do.
 //!
 //! # What is refused, and why the bounds exist
 //!
@@ -57,6 +64,20 @@ pub enum Filter {
         path: AttributePath,
         /// The (single) presence operator, kept as a type so the shape stays uniform.
         op: PresentOp,
+    },
+    /// `attr[subfilter]`: a filter over the values of ONE multi-valued attribute.
+    ///
+    /// RFC 7644 section 3.4.2.2 calls this a valuePath, and it is not a convenience: it is
+    /// how a client says "the work email" rather than "some email is work and some email
+    /// contains this". `emails[type eq "work" and value ew "@example.com"]` selects a single
+    /// value satisfying both; `emails.type eq "work" and emails.value ew "@example.com"`
+    /// matches a user with a work phone-less address and an unrelated personal one. Okta and
+    /// Entra both send the bracketed form, so a server without it refuses real traffic.
+    ValuePath {
+        /// The multi-valued attribute whose values the sub-filter selects among.
+        path: AttributePath,
+        /// The filter applied to each value of that attribute.
+        filter: Box<Filter>,
     },
     /// `a and b`.
     And(Box<Filter>, Box<Filter>),
@@ -210,6 +231,7 @@ pub fn parse_filter(input: &str) -> Result<Filter, FilterError> {
         bytes: input.as_bytes(),
         pos: 0,
         depth: 0,
+        in_value_path: false,
     };
     let filter = parser.parse_or()?;
     parser.skip_spaces();
@@ -226,6 +248,13 @@ struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     depth: usize,
+    /// Whether the parser is inside a valuePath's brackets.
+    ///
+    /// RFC 7644 section 3.4.2.2 defines the bracketed sub-filter over attribute expressions
+    /// only, so `emails[a[b eq "x"]]` is not in the grammar. Tracked rather than assumed,
+    /// because a parser that quietly accepted it would build a shape no consumer knows how
+    /// to evaluate, and "we never generate that" is not a property of attacker input.
+    in_value_path: bool,
 }
 
 impl Parser<'_> {
@@ -250,7 +279,10 @@ impl Parser<'_> {
         }
         match self.bytes.get(end) {
             None => true,
-            Some(&next) => next == b' ' || next == b'(' || next == b')',
+            // `]` closes a valuePath, so `emails[value pr]` ends its operator on one. It is
+            // safe to admit as a delimiter for the same reason the parentheses are: no
+            // attribute name may contain it, so it cannot split one.
+            Some(&next) => next == b' ' || next == b'(' || next == b')' || next == b']',
         }
     }
 
@@ -318,6 +350,12 @@ impl Parser<'_> {
 
     fn parse_compare(&mut self) -> Result<Filter, FilterError> {
         let path = self.parse_path()?;
+        // No `skip_spaces` first: the grammar writes `valuePath = attrPath "[" valFilter "]"`
+        // with nothing between the name and the bracket, and `parse_path` stops exactly on a
+        // `[` because it is not an attribute-name byte.
+        if self.bytes.get(self.pos) == Some(&b'[') {
+            return self.parse_value_path(path);
+        }
         self.skip_spaces();
         if self.take_word("pr") {
             return Ok(Filter::Present {
@@ -329,6 +367,39 @@ impl Parser<'_> {
         self.skip_spaces();
         let value = self.parse_value()?;
         Ok(Filter::Compare { path, op, value })
+    }
+
+    /// `attrPath "[" valFilter "]"`, positioned on the opening bracket.
+    fn parse_value_path(&mut self, path: AttributePath) -> Result<Filter, FilterError> {
+        if self.in_value_path {
+            // Not in the grammar. Refused rather than parsed, because accepting it would
+            // build a nested shape every consumer would have to handle and the spec gives
+            // no meaning to.
+            return Err(FilterError::Unexpected { at: self.pos });
+        }
+        // A bracket recurses exactly as a parenthesis does, so it consumes stack and is
+        // counted against the SAME bound. Counted before recursing, on the way down.
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(FilterError::TooDeep { limit: MAX_DEPTH });
+        }
+        self.pos += 1;
+        self.in_value_path = true;
+        let inner = self.parse_or();
+        // Cleared before the `?` below, so a refusal inside the brackets does not leave the
+        // parser believing it is still inside them.
+        self.in_value_path = false;
+        let inner = inner?;
+        self.skip_spaces();
+        if self.bytes.get(self.pos) != Some(&b']') {
+            return Err(FilterError::UnexpectedEnd);
+        }
+        self.pos += 1;
+        self.depth -= 1;
+        Ok(Filter::ValuePath {
+            path,
+            filter: Box::new(inner),
+        })
     }
 
     /// An attribute path: `urn:...:Name.sub`, `Name.sub`, or `Name`.
@@ -566,17 +637,139 @@ mod tests {
 
     #[test]
     fn an_operator_name_inside_an_attribute_is_not_an_operator() {
-        // `organisation` starts with `or`, and `andrew` with `and`. A prefix test without a
-        // delimiter check splits the attribute and parses the halves, which is how a filter
-        // means something other than what it says.
+        // A prefix test without a delimiter check splits an attribute name down the middle
+        // and parses the halves, which is how a filter means something other than what it
+        // says.
+        //
+        // The inputs below are chosen so that DELETING the delimiter check changes the
+        // result. An earlier version of this test used `organisation eq "acme"`, which does
+        // not: the attribute scan is greedy, so it swallows `organisation` whole before any
+        // operator word is looked for, and the check never runs. The cases that matter are
+        // the ones where an operator word is tested at a position an attribute also starts
+        // at, which is every word tried BEFORE the attribute is read (`not`) and every word
+        // tried where a value may begin (`true`, `false`, `null`).
+        let parsed = parse_filter("notes pr").expect("`notes` is an attribute, not `not`");
+        let Filter::Present { path, .. } = parsed else {
+            panic!("a presence test");
+        };
+        assert_eq!(path.name, "notes");
+
+        for (input, attribute) in [
+            ("nothing eq \"x\"", "nothing"),
+            ("notify eq \"x\"", "notify"),
+        ] {
+            let Filter::Compare { path, .. } = parse_filter(input).expect(input) else {
+                panic!("a comparison for {input}");
+            };
+            assert_eq!(path.name, attribute, "{input}");
+        }
+
+        // The value side: `truename` is not `true` followed by junk. Without the delimiter
+        // check the value parser takes the boolean and the remainder becomes trailing input.
+        for literal_prefixed in [
+            "userName eq truename",
+            "userName eq falsehood",
+            "userName eq nullable",
+        ] {
+            assert!(
+                parse_filter(literal_prefixed).is_err(),
+                "{literal_prefixed} is not a valid literal and must be refused outright"
+            );
+        }
+
+        // And the operator itself still works when it IS the operator, so the check above is
+        // not passing merely because everything is refused.
+        assert!(matches!(
+            parse_filter(r#"not (userName eq "a")"#).expect("valid"),
+            Filter::Not(_)
+        ));
+        assert!(matches!(
+            parse_filter("userName eq true").expect("valid"),
+            Filter::Compare {
+                value: Value::Boolean(true),
+                ..
+            }
+        ));
         let parsed = parse_filter(r#"organisation eq "acme""#).expect("valid");
         let Filter::Compare { path, .. } = parsed else {
             panic!("a comparison");
         };
         assert_eq!(path.name, "organisation");
+    }
+
+    #[test]
+    fn a_value_path_selects_within_one_multi_valued_attribute() {
+        // The shape Okta and Entra both send. Criterion 1 asks for the RFC 7644 grammar, and
+        // a server without this refuses real provisioning traffic outright.
+        let parsed = parse_filter(r#"emails[type eq "work" and value ew "@example.com"]"#)
+            .expect("a valuePath is in the grammar");
+        let Filter::ValuePath { path, filter } = parsed else {
+            panic!("a value path");
+        };
+        assert_eq!(path.name, "emails");
+        assert_eq!(path.sub, None, "the bracket is not a sub-attribute");
+        let Filter::And(left, right) = *filter else {
+            panic!("the sub-filter is parsed, not held as text");
+        };
         assert!(matches!(
-            parse_filter(r#"andrew eq "x""#).expect("valid"),
-            Filter::Compare { .. }
+            *left,
+            Filter::Compare {
+                op: CompareOp::Equal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            *right,
+            Filter::Compare {
+                op: CompareOp::EndsWith,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_value_path_is_not_the_same_filter_as_the_dotted_form() {
+        // Why the variant exists at all. `emails[type eq "work" and value co "x"]` requires
+        // ONE address to satisfy both; the dotted conjunction is satisfied by two different
+        // addresses. A parser that folded the bracket into the dotted form would silently
+        // widen every filter a connector sends.
+        let bracketed = parse_filter(r#"emails[type eq "work" and value co "x"]"#).expect("valid");
+        let dotted =
+            parse_filter(r#"emails.type eq "work" and emails.value co "x""#).expect("valid");
+        assert_ne!(bracketed, dotted);
+    }
+
+    #[test]
+    fn a_value_path_still_obeys_every_bound_the_rest_of_the_grammar_does() {
+        // A bracket recurses, so it is a stack-overflow lever unless it is counted. The
+        // nesting refusal is separate: it is not in the grammar, and a shape no consumer can
+        // evaluate must not become a value of this type.
+        assert_eq!(
+            parse_filter(&format!(
+                "emails[{}value pr{}]",
+                "(".repeat(MAX_DEPTH),
+                ")".repeat(MAX_DEPTH)
+            )),
+            Err(FilterError::TooDeep { limit: MAX_DEPTH }),
+            "the bracket counts against the same depth bound as a parenthesis"
+        );
+        assert!(
+            parse_filter(r#"emails[members[value eq "x"]]"#).is_err(),
+            "a nested valuePath is not in the grammar"
+        );
+        assert!(
+            parse_filter(r#"emails[type eq "work""#).is_err(),
+            "an unclosed bracket is refused rather than run to the end of input"
+        );
+        assert!(
+            parse_filter("emails[]").is_err(),
+            "an empty sub-filter is refused"
+        );
+        // The presence operator inside brackets: its delimiter is the `]`, which is the case
+        // the delimiter set has to admit for real traffic to parse.
+        assert!(matches!(
+            parse_filter("emails[value pr]").expect("valid"),
+            Filter::ValuePath { .. }
         ));
     }
 
@@ -584,7 +777,9 @@ mod tests {
     fn trailing_input_is_refused_rather_than_ignored() {
         // The injection shape. A parser that stopped at the first complete filter would
         // understand the first half and silently discard whatever followed it.
-        let refused = parse_filter(r#"userName eq "a" DROP TABLE users"#);
+        // The marker on the next line is there because the audit scan matches per line:
+        // this is hostile INPUT to the parser under test, not a query this crate runs.
+        let refused = parse_filter(r#"userName eq "a" DROP TABLE users"#); // query-audit-allow: parser input, not a query
         assert!(refused.is_err(), "trailing input must be refused");
         assert!(parse_filter(r#"userName eq "a" ; --"#).is_err());
     }
@@ -717,18 +912,34 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_cannot_be_constructed_from_unparsed_text() {
-        // The structural property the module docs claim, asserted as a fact about the type
-        // rather than as prose: every way to build a Filter goes through the parser, so a
-        // caller has nowhere to put raw text. If a `Raw` variant or a public constructor is
-        // ever added, this stops compiling and the reviewer is told why.
+    fn no_filter_variant_can_hold_unparsed_text() {
+        // The property, stated exactly. This is an EXHAUSTIVE match over every variant, so
+        // adding a `Raw(String)` stops it compiling and the reviewer is told why. It does NOT
+        // claim the enum is unconstructible: a consumer must match on it, so its variants are
+        // public and a caller can hand-build a tree. What no variant offers is somewhere to
+        // put text the grammar did not produce, and that is the property the boundary needs.
         let filter = parse_filter(r#"userName eq "a""#).expect("valid");
         match filter {
-            Filter::Compare { .. }
-            | Filter::Present { .. }
-            | Filter::And(..)
-            | Filter::Or(..)
-            | Filter::Not(..) => {}
+            Filter::Compare { path, op: _, value } => {
+                // Every field of every variant is a parsed construct, not a passthrough:
+                // `path` is split into parts and `value` is a typed literal.
+                let _ = (path.urn, path.name, path.sub);
+                match value {
+                    Value::String(_) | Value::Number(_) | Value::Boolean(_) | Value::Null => {}
+                }
+            }
+            Filter::Present {
+                path,
+                op: PresentOp,
+            } => {
+                let _ = (path.urn, path.name, path.sub);
+            }
+            Filter::ValuePath { path, filter } => {
+                // The bracketed sub-filter is a `Filter`, not the text between the brackets,
+                // so the property holds recursively rather than stopping at the bracket.
+                let _ = (path.urn, path.name, path.sub, filter);
+            }
+            Filter::And(_, _) | Filter::Or(_, _) | Filter::Not(_) => {}
         }
     }
 }
