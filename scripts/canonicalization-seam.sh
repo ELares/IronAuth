@@ -54,9 +54,25 @@ fi
 # mint a "canonical" value that never passed the seam, defeating the type-level
 # guarantee. The private field already blocks this across modules; the lint keeps a
 # future refactor inside the crate honest and makes the invariant self-documenting.
+#
+# A RETURN TYPE is not a construction. `fn f() -> CanonicalIdentifier {` matches the
+# same text, and a function that returns the type is precisely a function that had to
+# call the seam to obtain one, which is the behaviour the rule wants rather than the one
+# it forbids. The `seam-allow:` marker cannot cover it either: rustfmt moves a trailing
+# comment off a signature line into the body, so a marker there does not survive `cargo
+# fmt` and the two checks would contradict each other. The awk pass below therefore
+# deletes any `-> CanonicalIdentifier {` occurrence from a COPY of the line and keeps
+# the line only if a construction-shaped match remains, so `-> CanonicalIdentifier {
+# CanonicalIdentifier { .. } }` on one line is still reported. The original line is what
+# gets printed.
 bypass=$(grep -rn --include='*.rs' -E 'CanonicalIdentifier[[:space:]]*\{' crates \
   | grep -v "^${SEAM_FILE}:" \
-  | grep -v 'seam-allow:' || true)
+  | grep -v 'seam-allow:' \
+  | awk '{
+      copy = $0
+      gsub(/->[ \t]*CanonicalIdentifier[ \t]*\{/, "", copy)
+      if (copy ~ /CanonicalIdentifier[ \t]*\{/) { print $0 }
+    }' || true)
 if [ -n "$bypass" ]; then
   echo "canonicalization-seam: rule 'no-bypass' violated: a CanonicalIdentifier is"
   echo "  constructed outside the seam module (${SEAM_FILE}); route the value through"

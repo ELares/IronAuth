@@ -35,8 +35,8 @@ jobs:
         # EVERY registered target belongs here. A target absent from this matrix has
         # never run, which is exactly how issue #418 sat undetected; keep this list
         # equal to the union of `cargo fuzz list` over every `*/fuzz` crate. As of
-        # issue #419 that is 14 targets, matching the 14 `fuzz_targets/*.rs` files and
-        # the 14 `[[bin]]` entries.
+        # issue #135 that is 15 targets, matching the 15 `fuzz_targets/*.rs` files and
+        # the 15 `[[bin]]` entries.
         #
         # That equality is ENFORCED, not merely documented here: the gate runs
         # `scripts/fuzz-matrix-freshness.sh`, which fails naming any target that is
@@ -79,6 +79,11 @@ jobs:
             target: claim_mapping
           - dir: crates/ironauth-connector
             target: connector_def
+          # SCIM filter grammar (issue #135). The filter parser runs on a query string
+          # an external provisioning connector chose, before any scope check narrows it,
+          # so a panic here is reachable by every SCIM client the deployment trusts.
+          - dir: .
+            target: scim_filter
     steps:
       - uses: actions/checkout@v7
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The

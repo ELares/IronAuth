@@ -1,0 +1,12 @@
+{
+  "source": "Microsoft Entra provisioning documentation: a bare path with the target in value",
+  "path": "/Groups/grp_7f31",
+  "method": "PATCH",
+  "patch_path": "members",
+  "body": {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [
+      { "op": "add", "path": "members", "value": [{ "value": "usr_2c9a8b" }] }
+    ]
+  }
+}

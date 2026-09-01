@@ -1,0 +1,17 @@
+{
+  "source": "RFC 7643 section 4.3 enterprise extension, as Entra sends it",
+  "path": "/Users/usr_2c9a8b",
+  "method": "PATCH",
+  "patch_path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
+  "filter": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber eq \"701984\"",
+  "body": {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [
+      {
+        "op": "replace",
+        "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
+        "value": "701984"
+      }
+    ]
+  }
+}

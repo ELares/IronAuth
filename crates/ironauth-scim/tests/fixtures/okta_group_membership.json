@@ -1,0 +1,12 @@
+{
+  "source": "Okta group push: a member is removed by a filtered PATCH path",
+  "path": "/Groups/grp_7f31",
+  "method": "PATCH",
+  "patch_path": "members[value eq \"usr_2c9a8b\"]",
+  "body": {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [
+      { "op": "remove", "path": "members[value eq \"usr_2c9a8b\"]" }
+    ]
+  }
+}
