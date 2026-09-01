@@ -1515,6 +1515,16 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the experimental agent token vault (issue #132) for the harness and rebuild the
+    /// protocol router, so `/agent/vault/exchange` answers instead of the flag-off uniform
+    /// 404. Sets `with_agent_vault_enabled(true)`, the arming bool the boot path resolves
+    /// from the strict feature ladder.
+    pub fn enable_agent_vault(&mut self) {
+        let state = self.state.clone().with_agent_vault_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install the custom (declarative) journey source (issue #92, PR 4) and rebuild the protocol
     /// router, so a `custom` flow resolves its compiled transition table. Preserves any previously
     /// installed hashing pool and the flows toggle.

@@ -405,10 +405,17 @@ fn query_carries_access_token(query: Option<&str>) -> bool {
 /// An access token as PRESENTED at `UserInfo`: the token, the HTTP authentication
 /// scheme it came under (`Bearer` or `DPoP`), and the single `DPoP` proof header
 /// value (present only for a `DPoP`-scheme presentation).
-struct Presented {
+pub(crate) struct Presented {
     token: String,
     scheme: PresentedScheme,
     proof: Option<String>,
+}
+
+impl Presented {
+    /// The presented token, whatever scheme carried it.
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 /// Extract the presented access token, its scheme, and (for a `DPoP` presentation)
@@ -423,7 +430,7 @@ struct Presented {
 /// more than one `Authorization` header, or (for a `DPoP` presentation) more than one
 /// `DPoP` header, is [`UserInfoError::InvalidRequest`]. The `DPoP` header is read ONLY
 /// for a `DPoP`-scheme presentation; a bearer presentation ignores it.
-fn presented_credential(headers: &HeaderMap) -> Result<Presented, UserInfoError> {
+pub(crate) fn presented_credential(headers: &HeaderMap) -> Result<Presented, UserInfoError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let Some(first) = values.next() else {
         return Err(UserInfoError::MissingToken);
@@ -504,7 +511,9 @@ fn read_single_dpop_header(headers: &HeaderMap) -> Result<Option<String>, UserIn
 /// sender-constrained token as a plain bearer, downgrading its binding. Inert today
 /// (nothing mints a non-`jkt`-bound access token), a fail-closed guard for when mTLS
 /// binding lands.
-fn confirmation_jkt(confirmation: Option<&Confirmation>) -> Result<Option<&str>, UserInfoError> {
+pub(crate) fn confirmation_jkt(
+    confirmation: Option<&Confirmation>,
+) -> Result<Option<&str>, UserInfoError> {
     match confirmation {
         None => Ok(None),
         Some(Confirmation::Jkt(jkt)) => Ok(Some(jkt.as_str())),
@@ -516,7 +525,7 @@ fn confirmation_jkt(confirmation: Option<&Confirmation>) -> Result<Option<&str>,
 /// (its `cnf.jkt` or opaque `dpop_jkt`, or [`None`] when unbound), collapsing every
 /// `DPoP` failure to the uniform [`UserInfoError::InvalidToken`] (RFC 9449 7.1). The
 /// granular reason is logged server-side by the state helper, never surfaced.
-async fn enforce_dpop(
+pub(crate) async fn enforce_dpop(
     state: &OidcState,
     scope: &Scope,
     expected_jkt: Option<&str>,
@@ -608,7 +617,7 @@ fn success(claims: &Map<String, Value>) -> Response {
 /// issued, and the client's retry would then be refused by the very check that just
 /// challenged it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum UserInfoError {
+pub(crate) enum UserInfoError {
     /// No access token was presented: `401` with a bare `Bearer` challenge and NO
     /// error code (RFC 6750 3.1).
     MissingToken,

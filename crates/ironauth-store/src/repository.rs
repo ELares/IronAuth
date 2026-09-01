@@ -48316,6 +48316,22 @@ impl<'a> ActingManagementStore<'a> {
         }
     }
 
+    /// The mutating AGENT VAULT repository for `scope` (issue #132): store the downstream
+    /// credential an agent exchanges its IronAuth token for, audited.
+    ///
+    /// On the MANAGEMENT acting store rather than the data-plane one, and that is the whole
+    /// point of where it lives: migration 0178 grants the data-plane role no INSERT on this
+    /// table, so a write reached through the data plane would fail at the database. An
+    /// operator stores a credential; an agent only ever reads its own.
+    #[must_use]
+    pub fn agent_vault(&self, scope: Scope) -> ActingAgentVaultRepo<'a> {
+        ActingAgentVaultRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating organization-membership repository for `scope` (issue #94):
     /// add a user to an organization and remove one, each audited.
     #[must_use]
@@ -72435,6 +72451,7 @@ const VAULT_REFRESH_PURPOSE: &str = "refresh_token";
 fn agent_vault_seal_aad(
     scope: Scope,
     agent_id: &AgentPrincipalId,
+    provider: &str,
     purpose: &str,
     dek_version: i32,
 ) -> Aad {
@@ -72454,6 +72471,14 @@ fn agent_vault_seal_aad(
         // would leave a re-stored row sealed under an id the row no longer has, and
         // permanently unopenable. The agent is in the conflict key, so it cannot drift.
         .text(&agent_id.to_string())
+        // THE PROVIDER, for the same reason and by the same argument. It is in that conflict
+        // key too, so it cannot drift either, and leaving it out left the bug one grain over
+        // from the cross-agent one above: migration 0178 grants the data-plane role
+        // `UPDATE` on this table with no column restriction, so a write that flipped one
+        // row's `provider` from `github` to `google` satisfied the unique index, still
+        // authenticated (agent and purpose unchanged), opened cleanly, and handed the caller
+        // a GitHub credential labelled `google` -- which the agent then presents to Google.
+        .text(provider)
         .text(purpose)
         .version(i64::from(dek_version))
         .build()
@@ -72540,6 +72565,14 @@ impl AgentVaultRepo<'_> {
     /// because "this agent has a broken Google connection" and "this agent has no Google
     /// connection" are different answers and only one of them is worth telling an operator.
     ///
+    /// The REFRESH token is opened only when `with_refresh` is set.
+    ///
+    /// It was opened unconditionally, and nothing in the shipped binary reads it: the exchange
+    /// hands back the access token and there is no refresh path. So every exchange fetched a
+    /// second DEK and AEAD-opened the HIGHER-POWER of the two secrets into process memory in
+    /// order to drop it. A refresh token outlives the access token it renews, which is exactly
+    /// why it should not be decrypted by a caller that has no use for one.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the agent is out of this scope;
@@ -72549,6 +72582,33 @@ impl AgentVaultRepo<'_> {
         &self,
         agent_id: &AgentPrincipalId,
         provider: &str,
+    ) -> Result<Option<VaultConnection>, StoreError> {
+        self.connection_inner(agent_id, provider, false).await
+    }
+
+    /// The connection with its REFRESH token opened too.
+    ///
+    /// Separate from [`AgentVaultRepo::connection`] so that opening the refresh token is a
+    /// decision a caller makes rather than something every read pays for. There is no caller
+    /// in the shipped binary today; this is the seam a refresh path would use, and it exists
+    /// so that path does not arrive by widening the common read.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`AgentVaultRepo::connection`].
+    pub async fn connection_with_refresh(
+        &self,
+        agent_id: &AgentPrincipalId,
+        provider: &str,
+    ) -> Result<Option<VaultConnection>, StoreError> {
+        self.connection_inner(agent_id, provider, true).await
+    }
+
+    async fn connection_inner(
+        &self,
+        agent_id: &AgentPrincipalId,
+        provider: &str,
+        with_refresh: bool,
     ) -> Result<Option<VaultConnection>, StoreError> {
         if agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -72581,7 +72641,13 @@ impl AgentVaultRepo<'_> {
         let access_dek = fetch_dek_by_version(&mut tx, self.scope, master, access_version).await?;
         let access_sealed: Vec<u8> = row.get("access_token_sealed");
         let access_token = String::from_utf8(access_dek.open(
-            &agent_vault_seal_aad(self.scope, agent_id, VAULT_ACCESS_PURPOSE, access_version),
+            &agent_vault_seal_aad(
+                self.scope,
+                agent_id,
+                provider,
+                VAULT_ACCESS_PURPOSE,
+                access_version,
+            ),
             &Sealed::from_bytes(access_sealed)?,
         )?)
         .map_err(|_| StoreError::Encryption)?;
@@ -72589,11 +72655,20 @@ impl AgentVaultRepo<'_> {
         let refresh_sealed: Option<Vec<u8>> = row.get("refresh_token_sealed");
         let refresh_version: Option<i32> = row.get("refresh_token_dek_version");
         let refresh_token = match (refresh_sealed, refresh_version) {
-            (Some(sealed), Some(version)) => {
+            // The guard, not a branch above the match: an unguarded arm here would decrypt
+            // the refresh token and a later `if with_refresh` would only discard it, which is
+            // the cost this exists to avoid rather than the shape of the answer.
+            (Some(sealed), Some(version)) if with_refresh => {
                 let dek = fetch_dek_by_version(&mut tx, self.scope, master, version).await?;
                 Some(
                     String::from_utf8(dek.open(
-                        &agent_vault_seal_aad(self.scope, agent_id, VAULT_REFRESH_PURPOSE, version),
+                        &agent_vault_seal_aad(
+                            self.scope,
+                            agent_id,
+                            provider,
+                            VAULT_REFRESH_PURPOSE,
+                            version,
+                        ),
                         &Sealed::from_bytes(sealed)?,
                     )?)
                     .map_err(|_| StoreError::Encryption)?,
@@ -72652,6 +72727,27 @@ impl ActingAgentVaultRepo<'_> {
         spec: NewVaultConnection<'_>,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.store_connection_with_event(env, spec, now_micros, None)
+            .await
+    }
+
+    /// Store a downstream connection AND enqueue a domain event for it.
+    ///
+    /// Storing a credential on an agent's behalf is a management write an integrator watching
+    /// the stream needs to see: it is the moment an autonomous principal gains reach into a
+    /// third-party system. The event names the connection, the agent, the organization and
+    /// the provider, and NO part of the credential.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`ActingAgentVaultRepo::store_connection`].
+    pub async fn store_connection_with_event(
+        &self,
+        env: &Env,
+        spec: NewVaultConnection<'_>,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -72678,14 +72774,26 @@ impl ActingAgentVaultRepo<'_> {
                 let access_sealed = dek
                     .seal(
                         env.entropy(),
-                        &agent_vault_seal_aad(scope, &agent_id, VAULT_ACCESS_PURPOSE, dek_version),
+                        &agent_vault_seal_aad(
+                            scope,
+                            &agent_id,
+                            &provider,
+                            VAULT_ACCESS_PURPOSE,
+                            dek_version,
+                        ),
                         access.as_bytes(),
                     )
                     .into_bytes();
                 let refresh_sealed = refresh.as_ref().map(|value| {
                     dek.seal(
                         env.entropy(),
-                        &agent_vault_seal_aad(scope, &agent_id, VAULT_REFRESH_PURPOSE, dek_version),
+                        &agent_vault_seal_aad(
+                            scope,
+                            &agent_id,
+                            &provider,
+                            VAULT_REFRESH_PURPOSE,
+                            dek_version,
+                        ),
                         value.as_bytes(),
                     )
                     .into_bytes()
@@ -72729,6 +72837,10 @@ impl ActingAgentVaultRepo<'_> {
                 .bind(now_micros)
                 .execute(&mut **tx)
                 .await?;
+                // In the SAME transaction as the row. An event enqueued afterwards is one a
+                // crash can lose while the credential is already stored, which would leave an
+                // integrator's stream saying an agent has no reach it in fact has.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

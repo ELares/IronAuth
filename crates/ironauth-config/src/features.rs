@@ -101,16 +101,16 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
-/// The registry name of the signup fraud-review-queue experimental feature (issue #82,
-/// PR 2). One plain umbrella flag so the whole quarantine surface (the register-path
-/// quarantine hook, the quarantined-user authorize restrictions, and the admin review
-/// queue) toggles under one ack, mirroring the one-flag-per-surface FedCM precedent.
 /// The registry name of the agent token vault (issue #132, exploratory bet 1).
 ///
-/// ONE flag for the whole surface: the stored downstream connection, the exchange that
-/// hands an agent a third-party token, and the refresh that keeps one alive. They are
-/// useless apart, and an operator reasoning about "may an agent hold a Google token" is
-/// asking one question, not three.
+/// ONE flag for the whole surface: the stored downstream connection and the exchange that
+/// hands an agent a third-party token. They are useless apart, and an operator reasoning
+/// about "may an agent hold a Google token" is asking one question, not two.
+///
+/// Deliberately NOT claiming refresh. An earlier version of this sentence said the flag
+/// also turned on "the refresh that keeps one alive", and no refresh exists: nothing reads
+/// a stored refresh token, and this text is the operator-facing description of what the
+/// flag does.
 pub const AGENT_TOKEN_VAULT_FEATURE: &str = "agent-token-vault";
 
 /// The experimental `ack` version for the agent token vault (issue #132). It is
@@ -120,6 +120,10 @@ pub const AGENT_TOKEN_VAULT_FEATURE: &str = "agent-token-vault";
 /// exact revision; a graduation that changes the shape bumps it and invalidates the old ack.
 pub const AGENT_TOKEN_VAULT_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the signup fraud-review-queue experimental feature (issue #82,
+/// PR 2). One plain umbrella flag so the whole quarantine surface (the register-path
+/// quarantine hook, the quarantined-user authorize restrictions, and the admin review
+/// queue) toggles under one ack, mirroring the one-flag-per-surface FedCM precedent.
 pub const SIGNUP_QUARANTINE_FEATURE: &str = "signup-quarantine";
 
 /// The experimental `ack` version for the signup fraud-review-queue feature (issue #82,
@@ -525,8 +529,12 @@ impl FeatureRegistry {
     }
 
     /// Registers the agent token vault (issue #132, exploratory bet 1): a per-agent store of
-    /// DOWNSTREAM third-party credentials, the exchange that hands an agent one scoped to what
-    /// it declared, and the refresh that keeps a stored token alive.
+    /// DOWNSTREAM third-party credentials and the exchange that hands an agent one scoped to
+    /// what it declared.
+    ///
+    /// NOT refresh. A stored refresh token is sealed and never read, so an expired downstream
+    /// credential has to be re-established rather than renewed. That is a real limitation and
+    /// it is stated here because this doc is what an operator reads before enabling the flag.
     ///
     /// It is EXPLORATORY in the strongest sense on this ladder, because it makes IronAuth the
     /// CUSTODIAN of somebody else's credential. The storage shape, the exchange contract, and

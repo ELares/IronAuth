@@ -247,6 +247,7 @@ use crate::views::{
         crate::agents::register_agent,
         crate::agents::list_agents,
         crate::agents::set_agent_state,
+        crate::agents::store_agent_vault_connection,
         crate::memberships::create_membership,
         crate::memberships::create_service_account_membership,
         crate::memberships::list_memberships,

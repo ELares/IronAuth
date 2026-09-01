@@ -12,6 +12,7 @@
 /.well-known/openid-configuration/t/{tenant_id}/e/{environment_id}
 /.well-known/web-identity
 /.well-known/webauthn
+/agent/vault/exchange
 /authorize
 /backchannel_authenticate
 /connect/check_session

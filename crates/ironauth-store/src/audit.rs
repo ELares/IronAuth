@@ -791,11 +791,18 @@ pub enum Action {
     AgentVaultStore,
     /// A sensitive agent action was HELD pending an out-of-band approval (issue #132).
     AgentVaultApprovalRequested,
-    /// A held action was DECIDED: approved, denied, or timed out (issue #132).
+    /// A held action was DECIDED: approved or denied (issue #132).
     ///
-    /// One action for all three outcomes, with the outcome in the detail. An approver's
-    /// decision and a timeout are the same event to an investigator asking "what happened to
-    /// that request", and splitting them would put half the answer in a different stream.
+    /// One action for both outcomes, with the outcome in the detail. An approval and a denial
+    /// are the same event to an investigator asking "what happened to that request", and
+    /// splitting them would put half the answer in a different stream.
+    ///
+    /// A TIMEOUT emits nothing, and this said it did. Nothing writes state `expired`: an
+    /// approval that is never answered simply stops authorizing when its deadline passes,
+    /// which `VaultApproval::authorizes` computes from the row rather than from an event. So
+    /// the absence of a decision row IS the timeout, and an investigator has to read it that
+    /// way. A sweeper that expired the row and emitted this action would make the trail
+    /// self-describing; there is no sweeper.
     AgentVaultApprovalDecided,
     /// An agent EXCHANGED its IronAuth token for a stored downstream credential (issue #132).
     ///

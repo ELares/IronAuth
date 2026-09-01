@@ -1087,6 +1087,10 @@ class Client:
         """Subscribe an endpoint to a set of event types. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/event-types."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webhook-endpoints/{urllib.parse.quote(endpoint_id)}/event-types", query, body)
 
+    def store_agent_vault_connection(self, tenant_id: str, environment_id: str, organization_id: str, agent_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Store the downstream credential an agent exchanges its IronAuth token for (issue #132). PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/agents/{urllib.parse.quote(agent_id)}/vault-connections", query, body)
+
     def suspend_tenant(self, tenant_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Suspend a tenant (fence its data plane; reversible). POST /v1/tenants/{tenant_id}/suspend."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/suspend", query, None)

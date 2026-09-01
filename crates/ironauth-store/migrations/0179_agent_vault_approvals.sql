@@ -5,9 +5,15 @@
 -- The shape of the criterion decides the shape of the table: a sensitive action BLOCKS until
 -- somebody approves it, and denial or timeout issues no tokens. "Blocks" therefore cannot be
 -- a process holding a request open, because the approver is a human on another device and
--- the wait is unbounded. It is a DURABLE row the requester polls, which is also what makes
--- criterion 5 hold without any messaging backbone: a pending approval is a row, so it
--- survives a delivery worker restart because there is nothing in flight to lose.
+-- the wait is unbounded. It is a DURABLE row a requester would poll.
+--
+-- WOULD. This migration is the substrate for criterion 4 and NOT the criterion: nothing in
+-- the shipped binary raises one of these rows, polls one, or consults one before issuing.
+-- The exchange does not check for a pending approval. Said plainly here because a schema
+-- comment written in the present tense is read as a description of behaviour, and an earlier
+-- version of this paragraph stated the blocking and the polling as facts. The predicate that
+-- decides an approval (`VaultApproval::authorizes`) is implemented and tested; the caller
+-- that would consult it is not written.
 --
 -- The approved authorization_details (RFC 9396) are rendered ON DECISION and stored here.
 -- They are what the approver actually agreed to, which is not always what was asked for: an
@@ -62,7 +68,10 @@ CREATE TABLE agent_vault_approvals (
     FOREIGN KEY (agent_id) REFERENCES agents (id)
 );
 
--- The approver's queue: what is still waiting, oldest first.
+-- The index a queue listing would use: what is still waiting, oldest first. There is no
+-- such listing yet -- no list method and no route -- so this index serves no query in the
+-- codebase today. Kept rather than dropped because the file is immutable once it ships
+-- and adding it later costs a migration, but named for what it is.
 CREATE INDEX agent_vault_approvals_pending
     ON agent_vault_approvals (tenant_id, environment_id, state, created_at);
 
@@ -72,11 +81,37 @@ CREATE POLICY agent_vault_approvals_scope ON agent_vault_approvals
     USING (
         tenant_id = current_setting('ironauth.tenant_id', true)
         AND environment_id = current_setting('ironauth.environment_id', true)
+    )
+    -- The scope predicate is repeated as WITH CHECK rather than left to default to USING.
+    -- Postgres does default it, so the behaviour is unchanged; it is written out because the
+    -- sibling `agents` policy in 0176 writes both and a reader comparing the two should not
+    -- have to know the defaulting rule to see that they agree.
+    WITH CHECK (
+        tenant_id = current_setting('ironauth.tenant_id', true)
+        AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
 -- The control plane decides; the data plane raises a request and reads its own answer. It
 -- may not decide: an agent approving its own sensitive action is the whole thing this
 -- prevents.
+--
+-- Withholding UPDATE is only half of that, and the half that is easy to see. It stops the
+-- data plane DECIDING AN EXISTING ROW; it does not stop it INSERTING one that already
+-- arrives decided, because `agent_vault_approvals_decision_paired` accepts state 'approved'
+-- as long as `decided_at` is set, and `..._details_only_when_approved` then accepts any
+-- `approved_details` on it. Before this policy the only thing standing between an agent and
+-- its own approval was a hardcoded 'pending' literal in one Rust function.
+CREATE POLICY agent_vault_approvals_app_raises_only ON agent_vault_approvals
+    FOR INSERT TO ironauth_app
+    WITH CHECK (
+        tenant_id = current_setting('ironauth.tenant_id', true)
+        AND environment_id = current_setting('ironauth.environment_id', true)
+        AND state = 'pending'
+        AND decided_at IS NULL
+        AND decided_by IS NULL
+        AND approved_details IS NULL
+    );
+
 GRANT SELECT, INSERT, UPDATE ON agent_vault_approvals TO ironauth_control;
 GRANT SELECT, INSERT ON agent_vault_approvals TO ironauth_app;
 

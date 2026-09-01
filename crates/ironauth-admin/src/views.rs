@@ -561,6 +561,56 @@ pub struct RegisterAgentRequest {
     pub tool_scopes: Vec<String>,
 }
 
+/// The body to store an agent's downstream vault connection (issue #132).
+///
+/// The credential arrives here in PLAINTEXT and leaves this process sealed. That is the
+/// whole reason the route exists: an operator who has completed a downstream OAuth dance on
+/// the agent's behalf has a token in hand and nowhere to put it, and a vault nothing can
+/// write to is a vault that is always empty. The request body is the one place a downstream
+/// secret is ever accepted, so it is `no-store` on the way in and never echoed on the way
+/// out.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct StoreVaultConnectionRequest {
+    /// The downstream provider this credential is for. It must be a tool the agent DECLARED:
+    /// storing a credential an agent could never ask for is a credential with no reader.
+    #[schema(example = "google")]
+    pub provider: String,
+    /// The downstream access token. Sealed before it is written; never returned.
+    pub access_token: String,
+    /// The downstream refresh token, when the provider issued one. Sealed too.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// What the provider actually granted, which is not always what was asked for.
+    #[serde(default)]
+    pub granted_scopes: Vec<String>,
+    /// When the access token expires, in SECONDS since the Unix epoch. Absent means the
+    /// provider stated no expiry, not that the token never expires.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+}
+
+/// What an operator is told about a stored connection.
+///
+/// Carries NO secret, and it is a separate type from anything holding one so that cannot
+/// change by accident: there is no field here for a token to be added to without somebody
+/// writing it into a struct whose name says it is what the operator sees.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VaultConnectionView {
+    /// The connection identifier.
+    #[schema(example = "avc_...")]
+    pub id: String,
+    /// The agent it belongs to.
+    #[schema(example = "agp_...")]
+    pub agent_id: String,
+    /// The provider.
+    #[schema(example = "google")]
+    pub provider: String,
+    /// What the provider granted.
+    pub granted_scopes: Vec<String>,
+    /// `active` or `failed`.
+    pub state: String,
+}
+
 /// The body to set an agent's lifecycle state (issue #130).
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct SetAgentStateRequest {

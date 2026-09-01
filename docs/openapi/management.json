@@ -13092,6 +13092,121 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections": {
+      "put": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Store the downstream credential an agent exchanges its IronAuth token for (issue #132).",
+        "description": "THE GRANTING PATH. Without it the vault is unreachable: `store_connection` had no\nproduction caller at all, so every exchange answered \"this agent has no connection for\nthat provider\" forever and criterion 1 could not hold in any real deployment. This is the\nrepo's dominant defect class -- the enforcement ships, the way to turn it on does not --\nand it is worth naming here so the next surface does not repeat it.\n\nThe credential arrives in PLAINTEXT and is sealed before it is written. Three checks run\nbefore it is accepted, in this order, and each refuses with the uniform not-found rather\nthan a distinguishing error:\n\n  1. the organization must be live and the caller must reach it (`resolve_live_org`);\n  2. the agent must belong to THAT organization, so an agent of a sibling organization\n     presented under this path cannot be given a credential;\n  3. the provider must be inside the agent's DECLARED tool set. An agent that never\n     declared `google` cannot be handed a Google credential, because the exchange would\n     refuse to hand it back and the row would be a third-party secret nobody can reach --\n     stored, sealed, and permanently orphaned.",
+        "operationId": "storeAgentVaultConnection",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "agent_id",
+            "in": "path",
+            "description": "The agent identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreVaultConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored connection, carrying no secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultConnectionView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed body, a blank token, or a provider outside the agent's declared set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found, or another organization's agent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys": {
       "get": {
         "tags": [
@@ -34505,6 +34620,47 @@
           }
         }
       },
+      "StoreVaultConnectionRequest": {
+        "type": "object",
+        "description": "The body to store an agent's downstream vault connection (issue #132).\n\nThe credential arrives here in PLAINTEXT and leaves this process sealed. That is the\nwhole reason the route exists: an operator who has completed a downstream OAuth dance on\nthe agent's behalf has a token in hand and nowhere to put it, and a vault nothing can\nwrite to is a vault that is always empty. The request body is the one place a downstream\nsecret is ever accepted, so it is `no-store` on the way in and never echoed on the way\nout.",
+        "required": [
+          "provider",
+          "access_token"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "The downstream access token. Sealed before it is written; never returned."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the access token expires, in SECONDS since the Unix epoch. Absent means the\nprovider stated no expiry, not that the token never expires."
+          },
+          "granted_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the provider actually granted, which is not always what was asked for."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The downstream provider this credential is for. It must be a tool the agent DECLARED:\nstoring a credential an agent could never ask for is a credential with no reader.",
+            "example": "google"
+          },
+          "refresh_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The downstream refresh token, when the provider issued one. Sealed too."
+          }
+        }
+      },
       "SubjectMappingCreated": {
         "type": "object",
         "description": "The identifier a mapping creation minted.",
@@ -35679,6 +35835,45 @@
             "type": "integer",
             "format": "int32",
             "description": "The revision counter, incremented on every write. Exposed for observability, and\ndeliberately NOT accepted as a precondition on write: see the note on `set_variable`."
+          }
+        }
+      },
+      "VaultConnectionView": {
+        "type": "object",
+        "description": "What an operator is told about a stored connection.\n\nCarries NO secret, and it is a separate type from anything holding one so that cannot\nchange by accident: there is no field here for a token to be added to without somebody\nwriting it into a struct whose name says it is what the operator sees.",
+        "required": [
+          "id",
+          "agent_id",
+          "provider",
+          "granted_scopes",
+          "state"
+        ],
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "The agent it belongs to.",
+            "example": "agp_..."
+          },
+          "granted_scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What the provider granted."
+          },
+          "id": {
+            "type": "string",
+            "description": "The connection identifier.",
+            "example": "avc_..."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The provider.",
+            "example": "google"
+          },
+          "state": {
+            "type": "string",
+            "description": "`active` or `failed`."
           }
         }
       },

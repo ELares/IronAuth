@@ -44,8 +44,20 @@ CREATE TABLE agent_vault_connections (
 
     CONSTRAINT agent_vault_connections_scope_nonempty
         CHECK (tenant_id <> '' AND environment_id <> ''),
-    CONSTRAINT agent_vault_connections_provider_closed
-        CHECK (provider IN ('google', 'github')),
+    -- The provider is a bounded LABEL, not a closed enum. Issue #132 asks for generic
+    -- OAuth2/OIDC and API-key connectors plus a template registry seam, "not bespoke
+    -- per-provider integrations", and a CHECK naming two providers is the opposite shape:
+    -- every future connector would cost a migration to drop and re-add the constraint, and
+    -- this file is immutable once it ships. What the column actually needs is to be a short,
+    -- non-empty, unambiguous identifier, because it is echoed in an audit detail and in the
+    -- exchange response; which providers a deployment ALLOWS is a policy question the
+    -- registry answers, not a schema one.
+    CONSTRAINT agent_vault_connections_provider_shaped
+        CHECK (
+            provider <> ''
+            AND char_length(provider) <= 64
+            AND provider ~ '^[a-z0-9][a-z0-9_-]*$'
+        ),
     CONSTRAINT agent_vault_connections_state_closed
         CHECK (state IN ('active', 'failed')),
     -- The refresh token and its key version travel together or not at all: a sealed value

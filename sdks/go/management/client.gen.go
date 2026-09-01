@@ -1884,6 +1884,13 @@ func (c *Client) SetWebhookEventTypes(tenant_id string, environment_id string, e
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints/" + escape(endpoint_id) + "/event-types", query, body)
 }
 
+// StoreAgentVaultConnection performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections.
+//
+// Store the downstream credential an agent exchanges its IronAuth token for (issue #132).
+func (c *Client) StoreAgentVaultConnection(tenant_id string, environment_id string, organization_id string, agent_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/agents/" + escape(agent_id) + "/vault-connections", query, body)
+}
+
 // SuspendTenant performs POST /v1/tenants/{tenant_id}/suspend.
 //
 // Suspend a tenant (fence its data plane; reversible).

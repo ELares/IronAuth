@@ -18,9 +18,11 @@
 //! than no vault.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use ironauth_jose::Confirmation;
 use ironauth_store::{ActorRef, AgentPrincipalId, CorrelationId, ServiceId};
 use serde::{Deserialize, Serialize};
 
@@ -61,24 +63,35 @@ fn refuse(status: StatusCode, error: &str, description: &str) -> Response {
 ///
 /// A uniform 404 when the feature is off, so a deployment that never opted in does not
 /// advertise a surface by refusing it differently from any other unknown path.
+///
+/// The body arrives as [`Bytes`] and is parsed INSIDE the handler rather than extracted by
+/// `Json<..>`. That is not a style choice. `Json` is a FALLIBLE extractor, so axum runs it
+/// before the handler body: a request with no `Content-Type` was answered `415` while the
+/// feature was off, and a genuinely unknown path answers `404`. The difference is a
+/// feature-presence oracle available to an unauthenticated prober, which is exactly what the
+/// paragraph above claims cannot happen. The two other flag-gated handlers in this crate
+/// (`risk_signals`, `challenge`) take infallible bodies for the same reason.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the body is the authentication sequence and the two entitlement fences, in \
+    order, and every step reads what the step before it produced. Splitting it would put a \
+    fence in a function a future edit could reach the store without calling, which is the \
+    one property this handler exists to hold"
+)]
 pub async fn exchange(
     State(state): State<OidcState>,
     headers: HeaderMap,
-    Json(request): Json<ExchangeRequest>,
+    method: axum::http::Method,
+    body: Bytes,
 ) -> Response {
     if !state.agent_vault_enabled() {
         return StatusCode::NOT_FOUND.into_response();
     }
-
-    let Some(bearer) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-    else {
+    let Ok(request) = serde_json::from_slice::<ExchangeRequest>(&body) else {
         return refuse(
-            StatusCode::UNAUTHORIZED,
-            "invalid_token",
-            "an agent access token is required",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "the request body must be a JSON object naming a provider",
         );
     };
 
@@ -86,9 +99,26 @@ pub async fn exchange(
     // has: this endpoint hands out somebody else's credential on the strength of the answer.
     // A locally decoded claim set would accept any signature at all.
     //
-    // 1. the jti carries its scope, so a token from another environment does not resolve;
-    // 2. the jti resolves to a live grant, so a revoked chain is refused;
-    // 3. the token verifies cryptographically against that environment and client.
+    // 1. the presentation is read by UserInfo's own reader, so the scheme is matched
+    //    case-insensitively (RFC 7235) and a `DPoP <token>` presentation is accepted rather
+    //    than 401'd for not spelling `Bearer` exactly;
+    // 2. the jti carries its scope, so a token from another environment does not resolve;
+    // 3. the jti resolves to a live grant, so a revoked chain is refused;
+    // 4. the token verifies cryptographically against that environment and client;
+    // 5. the RFC 9449 binding is enforced, which step 4 does not do.
+    //
+    // Step 5 was missing, and the comment here claimed parity with UserInfo while it was.
+    // The direction of that gap is the dangerous one: a token carrying `cnf.jkt` was accepted
+    // as a plain bearer, so the proof-of-possession binding simply did not apply at the one
+    // endpoint that hands over a third party's credential.
+    let Ok(presented) = crate::userinfo::presented_credential(&headers) else {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "an agent access token is required",
+        );
+    };
+    let bearer = presented.token();
     let Some(jti_raw) = crate::userinfo::peek_jti(bearer) else {
         return refuse(
             StatusCode::UNAUTHORIZED,
@@ -138,6 +168,47 @@ pub async fn exchange(
         );
     };
 
+    // Step 5: the RFC 9449 binding. A token whose `cnf` names a proof key MUST arrive under
+    // the `DPoP` scheme with a valid proof over this method and URL; an unbound token MUST be
+    // a plain bearer. `confirmation_jkt` fails CLOSED on a confirmation that is not a `jkt`
+    // (an mTLS binding, say), so a future binding type cannot be silently ignored here the
+    // way it would be by a `cnf.get("jkt")` read.
+    let Ok(confirmation) = Confirmation::from_claims(verified.claims()) else {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "the token does not verify",
+        );
+    };
+    let Ok(expected_jkt) = crate::userinfo::confirmation_jkt(confirmation.as_ref()) else {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "the token does not verify",
+        );
+    };
+    if crate::userinfo::enforce_dpop(
+        &state,
+        &scope,
+        expected_jkt,
+        &presented,
+        method.as_str(),
+        bearer,
+    )
+    .await
+    .is_err()
+    {
+        // Collapsed to the uniform refusal (RFC 9449 section 7.1). The nonce-retry outcome is
+        // deliberately NOT surfaced here: this endpoint issues no DPoP nonce challenges of
+        // its own, and inventing one would tell a caller to retry against a server-side
+        // requirement that is not in force.
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "the token does not verify",
+        );
+    }
+
     // FENCE ONE: the token must name an agent. A token without `agent_id` belongs to an
     // ordinary machine identity or a person, and neither has a vault. The claim is
     // ISSUER-SET and on the protected list, so a client cannot self-assert it.
@@ -146,15 +217,19 @@ pub async fn exchange(
         .get("agent_id")
         .and_then(serde_json::Value::as_str)
     else {
+        // 401, not 403. RFC 6750 section 3.1 pairs `invalid_token` with 401 and
+        // `insufficient_scope` with 403, and every refusal in this group is a statement about
+        // the TOKEN rather than about what its holder may do. A client that reads the error
+        // code and the status together should not be given two answers.
         return refuse(
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             "invalid_token",
             "this token was not issued to an agent",
         );
     };
     let Ok(agent_id) = AgentPrincipalId::parse_in_scope(agent_claim, &scope) else {
         return refuse(
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             "invalid_token",
             "the agent identity is not of this scope",
         );
@@ -163,7 +238,7 @@ pub async fn exchange(
     let store = state.store().scoped(scope);
     let Ok(agent) = store.agents().get(&agent_id).await else {
         return refuse(
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             "invalid_token",
             "the agent named by this token no longer exists",
         );
@@ -177,12 +252,20 @@ pub async fn exchange(
         );
     }
 
+    // ONE correlation id and ONE service actor for the whole REQUEST, minted here rather than
+    // at each audited write. Each write used to generate its own, so the deny row and the
+    // exchange row of a single request shared no correlation at all and an investigator
+    // following one could not find the other. A correlation id that correlates nothing is
+    // just another random column.
+    let correlation = CorrelationId::generate(state.env());
+    let request_actor = ActorRef::service(ServiceId::generate(state.env()));
+
     // FENCE TWO: the provider must be inside the DECLARED set, at the AGENT grain.
     if !agent.declares_tool(&request.provider) {
-        let acting = state.store().scoped(scope).acting(
-            ActorRef::service(ServiceId::generate(state.env())),
-            CorrelationId::generate(state.env()),
-        );
+        let acting = state
+            .store()
+            .scoped(scope)
+            .acting(request_actor, correlation);
         let _ = acting
             .agents()
             .record_token_denied(state.env(), &agent_id, "vault-provider-undeclared")
@@ -216,10 +299,10 @@ pub async fn exchange(
         .split_whitespace()
         .any(|token| token == request.provider)
     {
-        let acting = state.store().scoped(scope).acting(
-            ActorRef::service(ServiceId::generate(state.env())),
-            CorrelationId::generate(state.env()),
-        );
+        let acting = state
+            .store()
+            .scoped(scope)
+            .acting(request_actor, correlation);
         let _ = acting
             .agents()
             .record_token_denied(state.env(), &agent_id, "vault-provider-outside-token-scope")
@@ -253,23 +336,38 @@ pub async fn exchange(
         }
     };
 
-    // A FAILED connection is refused DISTINCTLY from an absent one. "your Google connection
-    // is broken" and "you have no Google connection" call for different operator actions,
-    // and collapsing them would hide the one that is fixable.
-    if !connection.is_usable(crate::util::epoch_micros(state.now())) {
+    // An UNUSABLE connection is refused DISTINCTLY from an absent one. "your Google
+    // connection is broken" and "you have no Google connection" call for different operator
+    // actions, and collapsing them would hide the one that is fixable.
+    //
+    // But "unusable" is TWO conditions, and the refusal used to name only one of them: an
+    // `active` connection whose stored token had simply expired was reported as "marked
+    // failed", from a comment congratulating itself for not collapsing distinguishable
+    // states. The two are told apart here, because they are fixed differently: a failed
+    // connection needs re-establishing, an expired one needs a fresh token stored for the
+    // same connection.
+    let now_micros = crate::util::epoch_micros(state.now());
+    if connection.state != "active" {
         return refuse(
             StatusCode::CONFLICT,
             "connection_failed",
             "this connection is marked failed and must be re-established",
         );
     }
+    if !connection.is_usable(now_micros) {
+        return refuse(
+            StatusCode::CONFLICT,
+            "connection_expired",
+            "the stored credential for this connection has expired and must be replaced",
+        );
+    }
 
     // The exchange row, BEFORE the credential leaves. A record written afterwards is one a
     // crash can lose while the credential is already gone.
-    let acting = state.store().scoped(scope).acting(
-        ActorRef::service(ServiceId::generate(state.env())),
-        CorrelationId::generate(state.env()),
-    );
+    let acting = state
+        .store()
+        .scoped(scope)
+        .acting(request_actor, correlation);
     if acting
         .agent_vault()
         .record_exchange(state.env(), &connection.id, &request.provider)

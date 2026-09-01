@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The agent token vault (issue #132), criteria 1, 2 and 3.
+//! The agent token vault (issue #132).
+//!
+//! # What these tests cover, stated so the labels below are not read as more than they are
+//!
+//! The `AC4` labels name the predicate `VaultApproval::authorizes`, which is what an approval
+//! DECIDES. They do not establish that anything CONSULTS it: no exchange path calls it, and
+//! criterion 4's blocking half is not implemented. That is stated in the PR and it is stated
+//! here, because a test file is where somebody will look for what is covered.
+//!
+//! The `AC5` label is narrower still. It shows the row is durable across a fresh store handle
+//! over the same database, which is a property of reading from Postgres with no cache rather
+//! than of surviving a delivery worker. There is no delivery worker, no IronBus integration,
+//! and no notification of any kind: nothing tells a human an approval is pending.
 //!
 //! Criterion 2 is the load-bearing one and it is stated as a property of a RAW DUMP: the
 //! contents are encrypted at rest with per-tenant keys, and a dump yields no usable
@@ -129,13 +141,16 @@ async fn no_column_of_a_stored_connection_holds_the_downstream_plaintext() {
     // Read as the OWNER, bypassing every repository and the row-level policy: this is what a
     // dump sees. Every column is rendered to text, including the bytea ones, so a plaintext
     // hiding in a column nobody thought about is still caught.
+    //
+    // EVERY column, resolved by the database rather than listed here. The list used to be
+    // hand-written and named 10 of the 15 columns the migration declares, so "a column added
+    // later to carry a hint or a label" -- the exact case the paragraph above says this
+    // catches -- was the one case it could not catch. `to_jsonb(t)` expands the whole row and
+    // `jsonb_each_text` yields one value per column, so a column added tomorrow is scanned
+    // with no edit here.
     let columns: Vec<Option<String>> = sqlx::query_scalar(
-        "SELECT unnest(ARRAY[id, tenant_id, environment_id, agent_id, provider, \
-                            encode(access_token_sealed, 'escape'), \
-                            encode(coalesce(refresh_token_sealed, ''::bytea), 'escape'), \
-                            array_to_string(granted_scopes, ','), state, \
-                            coalesce(last_error, '')]) \
-         FROM agent_vault_connections WHERE tenant_id = $1 AND environment_id = $2",
+        "SELECT value FROM agent_vault_connections t, jsonb_each_text(to_jsonb(t)) \
+         WHERE t.tenant_id = $1 AND t.environment_id = $2",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
@@ -177,10 +192,30 @@ async fn the_stored_connection_opens_for_the_scope_that_wrote_it() {
         .expect("read the connection")
         .expect("a connection exists");
     assert_eq!(opened.access_token, DOWNSTREAM_ACCESS);
-    assert_eq!(opened.refresh_token.as_deref(), Some(DOWNSTREAM_REFRESH));
+    assert!(
+        opened.refresh_token.is_none(),
+        "the ordinary read does not open the refresh token, because nothing reads one: a \
+         refresh token outlives the access token it renews, so decrypting it into process \
+         memory on every exchange in order to drop it is the wrong default"
+    );
     assert!(
         opened.is_usable(now_micros(&env)),
         "a freshly stored connection is usable"
+    );
+
+    // And the explicit read DOES open it, so the round trip is still pinned. Without this the
+    // assertion above would be satisfied by a seal that never stored the refresh token at all.
+    let with_refresh = db
+        .store()
+        .scoped(scope)
+        .agent_vault()
+        .connection_with_refresh(&agent, "google")
+        .await
+        .expect("read the connection")
+        .expect("a connection exists");
+    assert_eq!(
+        with_refresh.refresh_token.as_deref(),
+        Some(DOWNSTREAM_REFRESH)
     );
 }
 
@@ -534,13 +569,27 @@ async fn a_timed_out_action_authorizes_nothing_and_cannot_be_decided_late() {
         .await
         .expect("read")
         .expect("exists");
+    // The STATE, not `authorizes`. `authorizes(now)` is `state == "approved" && now < expiry`,
+    // and `after` is past the expiry, so the deadline half is false whatever the state is:
+    // the old assertion passed identically whether the late decision landed or was refused,
+    // which is the one thing it was there to tell apart.
+    assert_eq!(
+        unchanged.state, "pending",
+        "the late decision left the row untouched"
+    );
     assert!(
-        !unchanged.authorizes(after),
-        "and the late decision changed nothing"
+        unchanged.approved_details.is_none(),
+        "and agreed to nothing"
     );
 }
 
-/// AC5: a pending approval survives a delivery worker restart, with no IronBus configured.
+/// A pending approval survives a fresh store handle over the same database.
+///
+/// Deliberately NOT labelled AC5. The criterion is "with IronBus enabled, pending approvals
+/// survive a delivery worker restart", and there is no delivery worker to restart: `get()`
+/// reads Postgres on every call with no cache, so this assertion is true by construction of
+/// the read path. It is worth having as a regression pin on durability; it is not evidence
+/// for the criterion, and labelling it AC5 claimed that it was.
 ///
 /// Modelled the way the criterion means it: the row is durable, so a NEW store handle over
 /// the same database sees the same pending request. Nothing is in flight to lose, which is
@@ -583,4 +632,111 @@ async fn a_pending_approval_survives_a_restart_with_no_bus_configured() {
         .expect("the pending approval is still there");
     assert_eq!(survived.state, "pending");
     assert!(!survived.authorizes(now), "and still authorizes nothing");
+}
+
+/// The seal's ASSOCIATED DATA binds the agent and the provider, not just the scope.
+///
+/// This test exists because the review pointed out that the PR's headline crypto fix could
+/// not be checked by anything in the suite. `agent_vault_seal_aad` is called by BOTH the seal
+/// and the open, so deleting a field from it changes the two symmetrically and every
+/// round-trip test still passes. The binding is only observable by MOVING a ciphertext.
+///
+/// Two moves, because the AAD binds two things and a test that made only one of them would
+/// leave the other in exactly the state that made this necessary:
+///
+///   - agent A's sealed bytes onto agent B's row. Without the agent in the AAD the DEK is
+///     per-scope, so B opens A's live third-party credential.
+///   - the `google` row's sealed bytes onto the `github` row of the SAME agent. Without the
+///     provider in the AAD the open succeeds and the caller is handed a Google credential
+///     labelled `github`, which it then presents to GitHub. Migration 0178 grants the
+///     data-plane role `UPDATE` on this table with no column restriction, so this is a move a
+///     single stray write performs.
+///
+/// Both are written as the OWNER, which is the point: the test is asking what the CRYPTO
+/// guarantees when the row-level checks have already been bypassed.
+#[tokio::test]
+async fn a_sealed_credential_does_not_open_on_another_agents_or_another_providers_row() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let agent_a = seed_agent(&db, &env, scope).await;
+    let agent_b = seed_agent(&db, &env, scope).await;
+    store_connection(&db, &env, scope, &agent_a, "google").await;
+    store_connection(&db, &env, scope, &agent_b, "google").await;
+    store_connection(&db, &env, scope, &agent_a, "github").await;
+
+    // Both rows open normally first. Without this the assertions below could pass because
+    // NOTHING opens, which would make the whole test vacuous.
+    for (agent, provider) in [
+        (&agent_a, "google"),
+        (&agent_b, "google"),
+        (&agent_a, "github"),
+    ] {
+        assert!(
+            db.store()
+                .scoped(scope)
+                .agent_vault()
+                .connection(agent, provider)
+                .await
+                .expect("read")
+                .is_some(),
+            "the {provider} connection for this agent opens before anything is moved"
+        );
+    }
+
+    let sealed_a: Vec<u8> = sqlx::query_scalar(
+        "SELECT access_token_sealed /* query-audit-allow: owner test read */ \
+         FROM agent_vault_connections WHERE agent_id = $1 AND provider = 'google'",
+    )
+    .bind(agent_a.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read agent A's sealed access token");
+
+    // MOVE ONE: onto another agent's row.
+    sqlx::query(
+        "UPDATE agent_vault_connections /* query-audit-allow: owner test write */ \
+         SET access_token_sealed = $1 WHERE agent_id = $2 AND provider = 'google'",
+    )
+    .bind(&sealed_a)
+    .bind(agent_b.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("move the ciphertext");
+
+    assert!(
+        matches!(
+            db.store()
+                .scoped(scope)
+                .agent_vault()
+                .connection(&agent_b, "google")
+                .await,
+            Err(ironauth_store::StoreError::Encryption)
+        ),
+        "agent B must not be able to open agent A's credential"
+    );
+
+    // MOVE TWO: onto the SAME agent's row for a different provider.
+    sqlx::query(
+        "UPDATE agent_vault_connections /* query-audit-allow: owner test write */ \
+         SET access_token_sealed = $1 WHERE agent_id = $2 AND provider = 'github'",
+    )
+    .bind(&sealed_a)
+    .bind(agent_a.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("move the ciphertext");
+
+    assert!(
+        matches!(
+            db.store()
+                .scoped(scope)
+                .agent_vault()
+                .connection(&agent_a, "github")
+                .await,
+            Err(ironauth_store::StoreError::Encryption)
+        ),
+        "a credential sealed for one provider must not open as another provider's"
+    );
 }

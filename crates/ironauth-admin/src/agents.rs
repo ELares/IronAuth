@@ -23,8 +23,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    AgentPrincipalId, ClientId, CorrelationId, NewAgent, ResolvedIdempotencyWrite, StoreError,
-    UserId,
+    AgentPrincipalId, AgentVaultConnectionId, ClientId, CorrelationId, NewAgent,
+    NewVaultConnection, ResolvedIdempotencyWrite, StoreError, UserId,
 };
 
 use crate::auth::{ManagementPermission, Principal};
@@ -35,7 +35,10 @@ use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
 use crate::state::AdminState;
-use crate::views::{AgentList, AgentView, RegisterAgentRequest, SetAgentStateRequest};
+use crate::views::{
+    AgentList, AgentView, RegisterAgentRequest, SetAgentStateRequest, StoreVaultConnectionRequest,
+    VaultConnectionView,
+};
 
 /// The states an operator may set. `revoked` is terminal; the store refuses to move out of it.
 const SETTABLE_STATES: [&str; 3] = ["active", "suspended", "revoked"];
@@ -403,6 +406,177 @@ fn agent_registered_event(
             "agent_id": subject,
             "organization_id": organization_id.to_string(),
             "linked_user_id": linked_user_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
+}
+
+/// Store the downstream credential an agent exchanges its IronAuth token for (issue #132).
+///
+/// THE GRANTING PATH. Without it the vault is unreachable: `store_connection` had no
+/// production caller at all, so every exchange answered "this agent has no connection for
+/// that provider" forever and criterion 1 could not hold in any real deployment. This is the
+/// repo's dominant defect class -- the enforcement ships, the way to turn it on does not --
+/// and it is worth naming here so the next surface does not repeat it.
+///
+/// The credential arrives in PLAINTEXT and is sealed before it is written. Three checks run
+/// before it is accepted, in this order, and each refuses with the uniform not-found rather
+/// than a distinguishing error:
+///
+///   1. the organization must be live and the caller must reach it (`resolve_live_org`);
+///   2. the agent must belong to THAT organization, so an agent of a sibling organization
+///      presented under this path cannot be given a credential;
+///   3. the provider must be inside the agent's DECLARED tool set. An agent that never
+///      declared `google` cannot be handed a Google credential, because the exchange would
+///      refuse to hand it back and the row would be a third-party secret nobody can reach --
+///      stored, sealed, and permanently orphaned.
+#[utoipa::path(
+    put,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections",
+    operation_id = "storeAgentVaultConnection",
+    tag = "organizations",
+    request_body = StoreVaultConnectionRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("agent_id" = String, Path, description = "The agent identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The stored connection, carrying no secret", body = VaultConnectionView),
+        (status = 400, description = "A malformed body, a blank token, or a provider outside the agent's declared set", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or a lapsed sudo elevation", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found, or another organization's agent", body = ErrorBody)
+    )
+)]
+pub async fn store_agent_vault_connection(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, agent_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
+    // Handing an agent a live third-party credential is at least as privileged as changing
+    // its lifecycle state, which already requires this.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+
+    let agents = state.store().scoped(scope).agents();
+    let id = agents.parse_id(&agent_id)?;
+    let agent = agents.get(&id).await?;
+    if agent.organization_id != org_id {
+        return Err(ApiError::NotFound);
+    }
+
+    let request: StoreVaultConnectionRequest = parse_json(&body)?;
+    let provider = require_non_empty(&request.provider, "provider")?;
+    let access_token = require_non_empty(&request.access_token, "access_token")?;
+    if !agent.declares_tool(&provider) {
+        return Err(ApiError::BadRequest(format!(
+            "the agent has not declared the tool {provider}, so it could never exchange for \
+             this credential"
+        )));
+    }
+    let refresh_token = match request.refresh_token.as_deref() {
+        Some(value) => Some(require_non_empty(value, "refresh_token")?),
+        None => None,
+    };
+    let refresh_token = refresh_token.as_deref();
+
+    let connection_id = AgentVaultConnectionId::generate(state.env(), &scope);
+    let pending = vault_connection_event(&state, scope, &connection_id, &id, &org_id, &provider);
+    // The CONTROL store: writes to the vault are control-plane, and the data-plane role holds
+    // no INSERT on this table.
+    state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .in_organization(org_id)
+        .agent_vault(scope)
+        .store_connection_with_event(
+            state.env(),
+            NewVaultConnection {
+                id: &connection_id,
+                agent_id: &id,
+                provider: &provider,
+                access_token: &access_token,
+                refresh_token,
+                granted_scopes: &request.granted_scopes,
+                expires_at_unix_micros: request.expires_at.map(|seconds| seconds * 1_000_000),
+            },
+            state.now_unix_micros(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await?;
+
+    // Built from what was WRITTEN rather than read back, deliberately. A read-back would
+    // have to open the sealed columns to return a view that carries no secret, which is a
+    // decryption performed only to throw the plaintext away. `store_connection` replaces any
+    // existing row for this (agent, provider) and returns it to `active`, so these are the
+    // values the row now holds.
+    //
+    // The view carries no secret, and the response is `no-store` because the REQUEST that
+    // reached it did carry one: an intermediary that cached this exchange would be caching
+    // the one place a downstream credential crosses the wire in plaintext.
+    let body_string = serde_json::to_string(&VaultConnectionView {
+        id: connection_id.to_string(),
+        agent_id: id.to_string(),
+        provider,
+        granted_scopes: request.granted_scopes,
+        state: "active".to_owned(),
+    })
+    .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// The event storing a downstream vault connection emits (issue #132).
+///
+/// Names the connection, the agent, the organization and the PROVIDER, and no part of the
+/// credential: an event carrying the secret would put it in every integrator's stream, which
+/// is the opposite of what sealing it at rest is for.
+fn vault_connection_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    connection_id: &AgentVaultConnectionId,
+    agent_id: &AgentPrincipalId,
+    organization_id: &ironauth_store::OrganizationId,
+    provider: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = agent_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "agent.vault_connection_stored",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "connection_id": connection_id.to_string(),
+            "agent_id": subject,
+            "organization_id": organization_id.to_string(),
+            "provider": provider,
         }),
     )?;
     Some(crate::events::PendingEvent {

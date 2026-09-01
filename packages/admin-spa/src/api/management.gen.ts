@@ -1862,6 +1862,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Store the downstream credential an agent exchanges its IronAuth token for (issue #132).
+         * @description THE GRANTING PATH. Without it the vault is unreachable: `store_connection` had no
+         *     production caller at all, so every exchange answered "this agent has no connection for
+         *     that provider" forever and criterion 1 could not hold in any real deployment. This is the
+         *     repo's dominant defect class -- the enforcement ships, the way to turn it on does not --
+         *     and it is worth naming here so the next surface does not repeat it.
+         *
+         *     The credential arrives in PLAINTEXT and is sealed before it is written. Three checks run
+         *     before it is accepted, in this order, and each refuses with the uniform not-found rather
+         *     than a distinguishing error:
+         *
+         *       1. the organization must be live and the caller must reach it (`resolve_live_org`);
+         *       2. the agent must belong to THAT organization, so an agent of a sibling organization
+         *          presented under this path cannot be given a credential;
+         *       3. the provider must be inside the agent's DECLARED tool set. An agent that never
+         *          declared `google` cannot be handed a Google credential, because the exchange would
+         *          refuse to hand it back and the row would be a third-party secret nobody can reach --
+         *          stored, sealed, and permanently orphaned.
+         */
+        put: operations["storeAgentVaultConnection"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys": {
         parameters: {
             query?: never;
@@ -8239,6 +8275,36 @@ export interface components {
             /** @description The OAuth scope token this policy governs. */
             scope_token: string;
         };
+        /**
+         * @description The body to store an agent's downstream vault connection (issue #132).
+         *
+         *     The credential arrives here in PLAINTEXT and leaves this process sealed. That is the
+         *     whole reason the route exists: an operator who has completed a downstream OAuth dance on
+         *     the agent's behalf has a token in hand and nowhere to put it, and a vault nothing can
+         *     write to is a vault that is always empty. The request body is the one place a downstream
+         *     secret is ever accepted, so it is `no-store` on the way in and never echoed on the way
+         *     out.
+         */
+        StoreVaultConnectionRequest: {
+            /** @description The downstream access token. Sealed before it is written; never returned. */
+            access_token: string;
+            /**
+             * Format: int64
+             * @description When the access token expires, in SECONDS since the Unix epoch. Absent means the
+             *     provider stated no expiry, not that the token never expires.
+             */
+            expires_at?: number | null;
+            /** @description What the provider actually granted, which is not always what was asked for. */
+            granted_scopes?: string[];
+            /**
+             * @description The downstream provider this credential is for. It must be a tool the agent DECLARED:
+             *     storing a credential an agent could never ask for is a credential with no reader.
+             * @example google
+             */
+            provider: string;
+            /** @description The downstream refresh token, when the provider issued one. Sealed too. */
+            refresh_token?: string | null;
+        };
         /** @description The identifier a mapping creation minted. */
         SubjectMappingCreated: {
             /** @description The `asm_` identifier. */
@@ -9134,6 +9200,34 @@ export interface components {
              *     deliberately NOT accepted as a precondition on write: see the note on `set_variable`.
              */
             version: number;
+        };
+        /**
+         * @description What an operator is told about a stored connection.
+         *
+         *     Carries NO secret, and it is a separate type from anything holding one so that cannot
+         *     change by accident: there is no field here for a token to be added to without somebody
+         *     writing it into a struct whose name says it is what the operator sees.
+         */
+        VaultConnectionView: {
+            /**
+             * @description The agent it belongs to.
+             * @example agp_...
+             */
+            agent_id: string;
+            /** @description What the provider granted. */
+            granted_scopes: string[];
+            /**
+             * @description The connection identifier.
+             * @example avc_...
+             */
+            id: string;
+            /**
+             * @description The provider.
+             * @example google
+             */
+            provider: string;
+            /** @description `active` or `failed`. */
+            state: string;
         };
         /** @description One declared verification address (issue #53): the trait name and its kind. */
         VerificationAddressView: {
@@ -17901,6 +17995,75 @@ export interface operations {
                 };
             };
             /** @description Not found, another organization's agent, or already revoked (revocation is terminal) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    storeAgentVaultConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The agent identifier */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreVaultConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored connection, carrying no secret */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VaultConnectionView"];
+                };
+            };
+            /** @description A malformed body, a blank token, or a provider outside the agent's declared set */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found, or another organization's agent */
             404: {
                 headers: {
                     [name: string]: unknown;
