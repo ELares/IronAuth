@@ -1428,6 +1428,18 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: Some(body_of(&serde_json::json!({ "state": "suspended" }))),
         },
         Case {
+            label: "agents.storeAgentVaultConnection",
+            method: "PUT",
+            path: format!("{base}/organizations/{org}/agents/agp_absent/vault-connections"),
+            // A real-shaped body. The environment is absent, so this must answer the uniform
+            // not-found BEFORE the body is read: a 400 here would tell a prober that the
+            // environment exists and only their JSON was wrong.
+            body: Some(body_of(&serde_json::json!({
+                "provider": "google",
+                "access_token": "downstream-token"
+            }))),
+        },
+        Case {
             label: "memberships.createServiceAccountMembership",
             method: "POST",
             path: format!("{base}/organizations/{org}/service-account-memberships"),
