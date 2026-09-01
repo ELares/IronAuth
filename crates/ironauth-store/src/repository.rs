@@ -48019,6 +48019,20 @@ pub struct ManagementStore<'a> {
 }
 
 impl<'a> ManagementStore<'a> {
+    /// The APPROVAL QUEUE for `scope` (issue #132), read side.
+    ///
+    /// On the management store because listing and deciding are the APPROVER's actions, and
+    /// the approver is an operator on the control plane. The data plane raises a request and
+    /// reads its own answer; it may not decide, which migration 0179 enforces with a
+    /// restrictive policy rather than leaving it to which accessor a caller happens to pick.
+    #[must_use]
+    pub fn agent_vault_approvals(&self, scope: Scope) -> AgentVaultApprovalRepo<'a> {
+        AgentVaultApprovalRepo {
+            store: self.store,
+            scope,
+        }
+    }
+
     /// Bind the control plane to a store. Crate-internal: callers reach this
     /// only through [`Store::management`].
     pub(crate) fn new(store: &'a Store) -> Self {
@@ -48380,6 +48394,19 @@ impl<'a> ActingManagementStore<'a> {
     #[must_use]
     pub fn agent_vault(&self, scope: Scope) -> ActingAgentVaultRepo<'a> {
         ActingAgentVaultRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The APPROVAL QUEUE for `scope` (issue #132), write side: DECIDE one.
+    ///
+    /// Only the control plane holds UPDATE on that table, so this accessor is the only route
+    /// to a decision and the data plane cannot reach it even by mistake.
+    #[must_use]
+    pub fn agent_vault_approvals_acting(&self, scope: Scope) -> ActingAgentVaultApprovalRepo<'a> {
+        ActingAgentVaultApprovalRepo {
             store: self.store,
             scope,
             acting: self.acting,
@@ -72561,6 +72588,13 @@ const VAULT_ACCESS_PURPOSE: &str = "access_token";
 /// credentials with very different power.
 const VAULT_REFRESH_PURPOSE: &str = "refresh_token";
 
+/// The purpose tag for the stored downstream CLIENT SECRET.
+///
+/// A third purpose, for the same reason the first two are distinct: the client secret is a
+/// different secret with a different lifetime, and a ciphertext copied between any two of these
+/// columns must fail to open rather than open as the other thing.
+const VAULT_CLIENT_SECRET_PURPOSE: &str = "refresh_client_secret";
+
 /// The associated data binding a sealed vault secret to its scope, its purpose, and the DEK
 /// version that sealed it.
 fn agent_vault_seal_aad(
@@ -72621,6 +72655,27 @@ pub struct VaultConnection {
     pub state: String,
     /// When the stored access token expires, when the provider said.
     pub expires_at_unix_micros: Option<i64>,
+    /// How this connection refreshes itself, OPENED, when it was read with the refresh.
+    ///
+    /// Always [`None`] from the ordinary read, for the same reason the refresh token is: a
+    /// caller with no use for the client secret should not have it decrypted into process
+    /// memory. [`AgentVaultRepo::connection_with_refresh`] is the read that opens both.
+    pub refresh: Option<OpenedRefreshConfig>,
+}
+
+/// A connection's refresh configuration with its client secret OPENED.
+///
+/// Deliberately NOT `Debug`: a derived formatter on a struct holding a downstream client
+/// secret puts that secret into the first log line or test failure that renders it, which is
+/// the same reason [`VaultConnection`] does not derive it.
+#[derive(Clone)]
+pub struct OpenedRefreshConfig {
+    /// The provider's token endpoint.
+    pub token_endpoint: String,
+    /// The downstream OAuth client the credential was issued to.
+    pub client_id: String,
+    /// That client's secret.
+    pub client_secret: String,
 }
 
 impl VaultConnection {
@@ -72660,6 +72715,28 @@ pub struct NewVaultConnection<'a> {
     pub granted_scopes: &'a [String],
     /// When the access token expires, in microseconds since the epoch.
     pub expires_at_unix_micros: Option<i64>,
+    /// How this connection refreshes itself, when it can.
+    ///
+    /// [`None`] means it cannot: a credential established through a flow that returned no
+    /// refresh token, or stored by hand, has to be re-established rather than renewed. That is
+    /// a fact about the connection and the exchange reports it as one.
+    pub refresh: Option<VaultRefreshConfig<'a>>,
+}
+
+/// What refreshing a stored credential at its provider needs.
+///
+/// All THREE together or none, which the schema also enforces: a partially configured refresh
+/// fails at the provider rather than at the edge, turning an operator's incomplete input into a
+/// downstream error nobody can act on.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultRefreshConfig<'a> {
+    /// The provider's token endpoint. `https` only, checked by the schema too, because this URL
+    /// is dereferenced with a refresh token in the body.
+    pub token_endpoint: &'a str,
+    /// The downstream OAuth client the credential was issued to.
+    pub client_id: &'a str,
+    /// That client's secret. Sealed before the row exists, under its own purpose tag.
+    pub client_secret: &'a str,
 }
 
 /// The READ side of the agent token vault, for this scope (issue #132).
@@ -72720,6 +72797,13 @@ impl AgentVaultRepo<'_> {
         self.connection_inner(agent_id, provider, true).await
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "eight lines over the pedantic bound. The body opens THREE secrets, each \
+        under its own associated data and its own key version, and the guards that decide \
+        which of them to open are the point: splitting it would separate a secret's open from \
+        the condition that says whether to open it at all"
+    )]
     async fn connection_inner(
         &self,
         agent_id: &AgentPrincipalId,
@@ -72738,6 +72822,8 @@ impl AgentVaultRepo<'_> {
         let row = sqlx::query(
             "SELECT id, agent_id, provider, access_token_sealed, access_token_dek_version, \
                     refresh_token_sealed, refresh_token_dek_version, granted_scopes, state, \
+                    refresh_token_endpoint, refresh_client_id, \
+                    refresh_client_secret_sealed, refresh_client_secret_dek_version, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
              FROM agent_vault_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
@@ -72794,6 +72880,43 @@ impl AgentVaultRepo<'_> {
             // reading one defensively as absent keeps a hand-edited row from opening garbage.
             _ => None,
         };
+
+        // The refresh CONFIGURATION, opened under the same condition and for the same reason:
+        // its client secret is a third secret, and a caller that is not about to refresh has
+        // no use for it. The schema pairs all four columns, so a half-present configuration
+        // cannot be written and reading one defensively as absent keeps a hand-edited row
+        // from opening garbage.
+        let refresh_endpoint: Option<String> = row.get("refresh_token_endpoint");
+        let refresh_client: Option<String> = row.get("refresh_client_id");
+        let secret_sealed: Option<Vec<u8>> = row.get("refresh_client_secret_sealed");
+        let secret_version: Option<i32> = row.get("refresh_client_secret_dek_version");
+        let refresh = match (
+            refresh_endpoint,
+            refresh_client,
+            secret_sealed,
+            secret_version,
+        ) {
+            (Some(endpoint), Some(client_id), Some(sealed), Some(version)) if with_refresh => {
+                let dek = fetch_dek_by_version(&mut tx, self.scope, master, version).await?;
+                let client_secret = String::from_utf8(dek.open(
+                    &agent_vault_seal_aad(
+                        self.scope,
+                        agent_id,
+                        provider,
+                        VAULT_CLIENT_SECRET_PURPOSE,
+                        version,
+                    ),
+                    &Sealed::from_bytes(sealed)?,
+                )?)
+                .map_err(|_| StoreError::Encryption)?;
+                Some(OpenedRefreshConfig {
+                    token_endpoint: endpoint,
+                    client_id,
+                    client_secret,
+                })
+            }
+            _ => None,
+        };
         tx.commit().await?;
 
         let id: String = row.get("id");
@@ -72809,6 +72932,7 @@ impl AgentVaultRepo<'_> {
             granted_scopes: row.get("granted_scopes"),
             state: row.get("state"),
             expires_at_unix_micros: row.get("expires_us"),
+            refresh,
         }))
     }
 }
@@ -72883,6 +73007,9 @@ impl ActingAgentVaultRepo<'_> {
         let refresh = spec.refresh_token.map(str::to_owned);
         let granted = spec.granted_scopes.to_vec();
         let expires = spec.expires_at_unix_micros;
+        let refresh_endpoint = spec.refresh.map(|cfg| cfg.token_endpoint.to_owned());
+        let refresh_client = spec.refresh.map(|cfg| cfg.client_id.to_owned());
+        let refresh_secret = spec.refresh.map(|cfg| cfg.client_secret.to_owned());
         // The id the row ends up with, read out of the upsert's own RETURNING rather than
         // assumed to be the one the caller minted.
         let mut effective_id: Option<String> = None;
@@ -72916,6 +73043,23 @@ impl ActingAgentVaultRepo<'_> {
                         access.as_bytes(),
                     )
                     .into_bytes();
+                // The client secret, under its OWN purpose tag, so a ciphertext moved between
+                // any two of this row's three secret columns fails to open rather than opening
+                // as the other thing.
+                let client_secret_sealed = refresh_secret.as_ref().map(|value| {
+                    dek.seal(
+                        env.entropy(),
+                        &agent_vault_seal_aad(
+                            scope,
+                            &agent_id,
+                            &provider,
+                            VAULT_CLIENT_SECRET_PURPOSE,
+                            dek_version,
+                        ),
+                        value.as_bytes(),
+                    )
+                    .into_bytes()
+                });
                 let refresh_sealed = refresh.as_ref().map(|value| {
                     dek.seal(
                         env.entropy(),
@@ -72935,8 +73079,13 @@ impl ActingAgentVaultRepo<'_> {
                      (id, tenant_id, environment_id, agent_id, provider, \
                       access_token_sealed, access_token_dek_version, \
                       refresh_token_sealed, refresh_token_dek_version, \
+                      refresh_token_endpoint, refresh_client_id, \
+                      refresh_client_secret_sealed, refresh_client_secret_dek_version, \
                       granted_scopes, expires_at, state, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             $13, $14, $15, \
+                             CASE WHEN $15::bytea IS NULL THEN NULL ELSE $7 END, \
+                             $10, \
                              CASE WHEN $11::bigint IS NULL THEN NULL ELSE \
                                  TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
                              END, \
@@ -72948,6 +73097,11 @@ impl ActingAgentVaultRepo<'_> {
                          access_token_dek_version = EXCLUDED.access_token_dek_version, \
                          refresh_token_sealed = EXCLUDED.refresh_token_sealed, \
                          refresh_token_dek_version = EXCLUDED.refresh_token_dek_version, \
+                         refresh_token_endpoint = EXCLUDED.refresh_token_endpoint, \
+                         refresh_client_id = EXCLUDED.refresh_client_id, \
+                         refresh_client_secret_sealed = EXCLUDED.refresh_client_secret_sealed, \
+                         refresh_client_secret_dek_version = \
+                             EXCLUDED.refresh_client_secret_dek_version, \
                          granted_scopes = EXCLUDED.granted_scopes, \
                          expires_at = EXCLUDED.expires_at, \
                          state = 'active', \
@@ -72967,6 +73121,9 @@ impl ActingAgentVaultRepo<'_> {
                 .bind(&granted)
                 .bind(expires)
                 .bind(now_micros)
+                .bind(refresh_endpoint.as_ref())
+                .bind(refresh_client.as_ref())
+                .bind(client_secret_sealed.as_ref())
                 // `fetch_one`, so the id the row ACTUALLY has comes back. The statement always
                 // ended `RETURNING id` and the result was discarded, which is what made a
                 // caller's minted id authoritative when it is not: on a re-store the row keeps
@@ -73169,6 +73326,103 @@ impl AgentVaultApprovalRepo<'_> {
             expires_at_unix_micros: row.get("expires_us"),
         }))
     }
+
+    /// The LATEST approval for `(agent, provider)`, whatever its state.
+    ///
+    /// The read the exchange performs before it hands anything over. Latest rather than
+    /// "the pending one": an agent that was denied and asks again must be told it was denied,
+    /// not handed a fresh pending request, or a denial is a speed bump rather than an answer.
+    /// Ordering is by `created_at` and then by `id`, so two requests in the same microsecond
+    /// still have one deterministic answer.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent is out of this scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn latest_for(
+        &self,
+        agent_id: &AgentPrincipalId,
+        provider: &str,
+    ) -> Result<Option<VaultApproval>, StoreError> {
+        if agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, agent_id, provider, state, approved_details, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM agent_vault_approvals \
+             WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(agent_id.to_string())
+        .bind(provider)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let stored_id: String = row.get("id");
+        let stored_agent: String = row.get("agent_id");
+        Ok(Some(VaultApproval {
+            id: AgentVaultApprovalId::parse_in_scope(&stored_id, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            agent_id: AgentPrincipalId::parse_in_scope(&stored_agent, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            provider: row.get("provider"),
+            state: row.get("state"),
+            approved_details: row.get("approved_details"),
+            expires_at_unix_micros: row.get("expires_us"),
+        }))
+    }
+
+    /// Every approval still awaiting a decision, oldest first: the APPROVER's QUEUE.
+    ///
+    /// The index migration 0179 created for this finally has a reader. A queue nobody can list
+    /// is a queue nobody answers, which is the difference between an approval surface and a
+    /// table that fills up.
+    ///
+    /// Rows whose deadline has already passed are excluded: they are timed out, and a timeout
+    /// issues no token, so presenting one to an approver would be asking for a decision that
+    /// can no longer take effect.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn pending(&self, now_micros: i64) -> Result<Vec<VaultApproval>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, agent_id, provider, state, approved_details, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM agent_vault_approvals \
+             WHERE tenant_id = $1 AND environment_id = $2 AND state = 'pending' \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_micros)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let stored_id: String = row.get("id");
+                let stored_agent: String = row.get("agent_id");
+                Ok(VaultApproval {
+                    id: AgentVaultApprovalId::parse_in_scope(&stored_id, &self.scope)
+                        .map_err(|_| StoreError::NotFound)?,
+                    agent_id: AgentPrincipalId::parse_in_scope(&stored_agent, &self.scope)
+                        .map_err(|_| StoreError::NotFound)?,
+                    provider: row.get("provider"),
+                    state: row.get("state"),
+                    approved_details: row.get("approved_details"),
+                    expires_at_unix_micros: row.get("expires_us"),
+                })
+            })
+            .collect()
+    }
 }
 
 /// The WRITE side of the approval queue, for this scope and actor (issue #132).
@@ -73265,6 +73519,42 @@ impl ActingAgentVaultApprovalRepo<'_> {
         decided_by: &str,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.decide_with_event(
+            env,
+            id,
+            approve,
+            approved_details,
+            decided_by,
+            now_micros,
+            None,
+        )
+        .await
+    }
+
+    /// [`ActingAgentVaultApprovalRepo::decide`], additionally enqueuing a domain event.
+    ///
+    /// A decision an integrator cannot see is one their monitoring cannot act on: an approval
+    /// that let an agent take a sensitive action is exactly the event a security team wants
+    /// delivered, and the audit row alone reaches only whoever reads audit rows.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`ActingAgentVaultApprovalRepo::decide`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent input the caller has already resolved; \
+        bundling them into a struct would move the parameter list rather than shorten it"
+    )]
+    pub async fn decide_with_event(
+        &self,
+        env: &Env,
+        id: &AgentVaultApprovalId,
+        approve: bool,
+        approved_details: Option<&serde_json::Value>,
+        decided_by: &str,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -73309,6 +73599,10 @@ impl ActingAgentVaultApprovalRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // In the SAME transaction as the decision. An event enqueued afterwards is one
+                // a crash can lose while the approval is already decided, leaving an
+                // integrator's stream saying an action is still waiting when it is not.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

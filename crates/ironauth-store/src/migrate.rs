@@ -1445,6 +1445,17 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0180_audit_subject.sql"),
         },
+        Migration {
+            version: 181,
+            name: "agent_vault_refresh",
+            // EXPAND: four nullable columns and two CHECKs over them, then `requires_approval`
+            // (NOT NULL with a default the old binary never writes) and `action_digest` (NOT
+            // NULL with a default, so an old binary raising an approval mid-rollout still
+            // can). The previous binary selects none of them, so a rollback simply means no
+            // connection refreshes and no connection is sensitive.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0181_agent_vault_refresh.sql"),
+        },
     ]
 }
 

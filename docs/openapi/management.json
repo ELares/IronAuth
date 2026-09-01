@@ -12741,6 +12741,200 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "The approvals awaiting a decision in this organization (issue #132, criterion 4).",
+        "description": "THE APPROVER's QUEUE. Migration 0179 created an index for it and nothing read it, and an\napproval surface nobody can list is a table that fills up rather than a control: the\nexchange raises a request and blocks, and without this the human it is waiting for has no\nway to learn that it is waiting.\n\nTimed-out rows are excluded. A decision after the deadline cannot take effect -- a timeout\nissues no tokens, exactly as a denial does -- so presenting one would be asking for a\ndecision that changes nothing.",
+        "operationId": "listAgentVaultApprovals",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The approvals awaiting a decision, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultApprovalList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization not found, or the environment is absent or soft-deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision": {
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "Decide one held action (issue #132, criterion 4).",
+        "description": "The out-of-band half the criterion names. Until this exists the exchange blocks for ever,\nwhich is a denial nobody made rather than an approval flow.\n\nTERMINAL both ways. The store refuses to decide a row that is already decided, so a second\ncall answers not-found rather than overwriting an approval with a denial or the reverse:\nan approver who changes their mind revokes the agent, which is a different and louder act.",
+        "operationId": "decideAgentVaultApproval",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "The organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "approval_id",
+            "in": "path",
+            "description": "The approval identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecideVaultApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Decided"
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential, or a lapsed sudo elevation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found, another organization's approval, or already decided",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents": {
       "get": {
         "tags": [
@@ -29586,6 +29780,26 @@
           }
         }
       },
+      "DecideVaultApprovalRequest": {
+        "type": "object",
+        "description": "The body deciding one held action (issue #132).",
+        "required": [
+          "approve"
+        ],
+        "properties": {
+          "approve": {
+            "type": "boolean",
+            "description": "`true` to approve, `false` to deny. Both are decisions and both are terminal."
+          },
+          "approved_details": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "What the approver AGREES to, which may be narrower than what was requested.\n\nOptional, and its absence on an approval means \"exactly what was asked\". Present, it is\nthe set that takes effect: an approver who narrows a request must have the narrowed set\nbe the one that applies, or the approval surface is decoration.\n\nIgnored on a denial, because a denial grants nothing and a set attached to one would be\na permission nobody can act on sitting in a row that says no."
+          }
+        }
+      },
       "DeliveryAttemptList": {
         "type": "object",
         "description": "An endpoint's delivery attempt history, newest first.",
@@ -34652,6 +34866,17 @@
             "description": "The downstream provider this credential is for. It must be a tool the agent DECLARED:\nstoring a credential an agent could never ask for is a credential with no reader.",
             "example": "google"
           },
+          "refresh": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VaultRefreshRequest",
+                "description": "How this connection refreshes itself, when it can (issue #132, criterion 3).\n\nAbsent means it cannot: an expired credential then has to be re-established rather than\nrenewed, and the exchange says so distinctly rather than reporting a failure. Present,\nall three parts are required, because a partially configured refresh fails at the\nprovider rather than at the edge."
+              }
+            ]
+          },
           "refresh_token": {
             "type": [
               "string",
@@ -35838,6 +36063,58 @@
           }
         }
       },
+      "VaultApprovalList": {
+        "type": "object",
+        "description": "A page of approvals awaiting a decision.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VaultApprovalView"
+            },
+            "description": "The approvals, oldest first."
+          }
+        }
+      },
+      "VaultApprovalView": {
+        "type": "object",
+        "description": "One approval awaiting a decision, as the approver sees it (issue #132).\n\nCarries what was REQUESTED and nothing that was granted: a pending row has granted nothing\nyet, and a field for it here would be a place for a caller to read a decision that has not\nbeen made.",
+        "required": [
+          "id",
+          "agent_id",
+          "provider",
+          "state",
+          "expires_at"
+        ],
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "The agent whose action is held.",
+            "example": "agp_..."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the request stops being answerable, in seconds since the epoch. After this a\ndecision can no longer take effect: a timeout issues no tokens."
+          },
+          "id": {
+            "type": "string",
+            "description": "The approval identifier.",
+            "example": "ava_..."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The downstream provider the action is against."
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending`, `approved` or `denied`."
+          }
+        }
+      },
       "VaultConnectionView": {
         "type": "object",
         "description": "What an operator is told about a stored connection.\n\nCarries NO secret, and it is a separate type from anything holding one so that cannot\nchange by accident: there is no field here for a token to be added to without somebody\nwriting it into a struct whose name says it is what the operator sees.",
@@ -35874,6 +36151,30 @@
           "state": {
             "type": "string",
             "description": "`active` or `failed`."
+          }
+        }
+      },
+      "VaultRefreshRequest": {
+        "type": "object",
+        "description": "What refreshing a stored credential at its provider needs (issue #132, criterion 3).",
+        "required": [
+          "token_endpoint",
+          "client_id",
+          "client_secret"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The DOWNSTREAM OAuth client the credential was issued to. Not an IronAuth client: it is\nchosen by whoever ran the consent flow at the provider."
+          },
+          "client_secret": {
+            "type": "string",
+            "description": "That client's secret. Sealed before the row exists, under its own purpose tag, and\nnever returned."
+          },
+          "token_endpoint": {
+            "type": "string",
+            "description": "The provider's token endpoint. `https` only: this URL is dereferenced by the server\nwith a refresh token in the body, so a plaintext one puts the credential on the wire.",
+            "example": "https://oauth2.googleapis.com/token"
           }
         }
       },

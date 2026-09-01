@@ -121,6 +121,7 @@ async fn store_connection(
                 refresh_token: Some(DOWNSTREAM_REFRESH),
                 granted_scopes: &["https://www.googleapis.com/auth/drive.readonly".to_owned()],
                 expires_at_unix_micros: None,
+                refresh: None,
             },
             now_micros(env),
         )

@@ -674,6 +674,26 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // carries the connection, the agent, the organization and the PROVIDER, and no part
         // of the credential: an event naming the secret would put it in every integrator's
         // stream, which is the opposite of what sealing it at rest is for.
+        // An approver DECIDED a held action (issue #132, criterion 4). Carries the outcome and
+        // what was agreed to, because an integrator watching for "who let the agent do that"
+        // needs both: an approval that narrowed the request is a different fact from one that
+        // granted it whole. Never the credential, which the approval never touches.
+        "agent.vault_approval_decided",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "approval_id": {"type": "string", "minLength": 1},
+                "agent_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "provider": {"type": "string", "minLength": 1},
+                "outcome": {"type": "string", "minLength": 1}
+            },
+            "required": ["approval_id", "agent_id", "organization_id", "provider", "outcome"]
+        }"#,
+    ),
+    (
         "agent.vault_connection_stored",
         1,
         r#"{

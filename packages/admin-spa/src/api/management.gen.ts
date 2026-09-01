@@ -1827,6 +1827,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The approvals awaiting a decision in this organization (issue #132, criterion 4).
+         * @description THE APPROVER's QUEUE. Migration 0179 created an index for it and nothing read it, and an
+         *     approval surface nobody can list is a table that fills up rather than a control: the
+         *     exchange raises a request and blocks, and without this the human it is waiting for has no
+         *     way to learn that it is waiting.
+         *
+         *     Timed-out rows are excluded. A decision after the deadline cannot take effect -- a timeout
+         *     issues no tokens, exactly as a denial does -- so presenting one would be asking for a
+         *     decision that changes nothing.
+         */
+        get: operations["listAgentVaultApprovals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Decide one held action (issue #132, criterion 4).
+         * @description The out-of-band half the criterion names. Until this exists the exchange blocks for ever,
+         *     which is a denial nobody made rather than an approval flow.
+         *
+         *     TERMINAL both ways. The store refuses to decide a row that is already decided, so a second
+         *     call answers not-found rather than overwriting an approval with a denial or the reverse:
+         *     an approver who changes their mind revokes the agent, which is a different and louder act.
+         */
+        post: operations["decideAgentVaultApproval"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents": {
         parameters: {
             query?: never;
@@ -5117,6 +5169,22 @@ export interface components {
              */
             webhook_id: string;
         };
+        /** @description The body deciding one held action (issue #132). */
+        DecideVaultApprovalRequest: {
+            /** @description `true` to approve, `false` to deny. Both are decisions and both are terminal. */
+            approve: boolean;
+            /**
+             * @description What the approver AGREES to, which may be narrower than what was requested.
+             *
+             *     Optional, and its absence on an approval means "exactly what was asked". Present, it is
+             *     the set that takes effect: an approver who narrows a request must have the narrowed set
+             *     be the one that applies, or the approval surface is decoration.
+             *
+             *     Ignored on a denial, because a denial grants nothing and a set attached to one would be
+             *     a permission nobody can act on sitting in a row that says no.
+             */
+            approved_details?: Record<string, never> | null;
+        };
         /** @description An endpoint's delivery attempt history, newest first. */
         DeliveryAttemptList: {
             /** @description The attempts, most recent first. */
@@ -8307,6 +8375,7 @@ export interface components {
              * @example google
              */
             provider: string;
+            refresh?: null | components["schemas"]["VaultRefreshRequest"];
             /** @description The downstream refresh token, when the provider issued one. Sealed too. */
             refresh_token?: string | null;
         };
@@ -9206,6 +9275,40 @@ export interface components {
              */
             version: number;
         };
+        /** @description A page of approvals awaiting a decision. */
+        VaultApprovalList: {
+            /** @description The approvals, oldest first. */
+            items: components["schemas"]["VaultApprovalView"][];
+        };
+        /**
+         * @description One approval awaiting a decision, as the approver sees it (issue #132).
+         *
+         *     Carries what was REQUESTED and nothing that was granted: a pending row has granted nothing
+         *     yet, and a field for it here would be a place for a caller to read a decision that has not
+         *     been made.
+         */
+        VaultApprovalView: {
+            /**
+             * @description The agent whose action is held.
+             * @example agp_...
+             */
+            agent_id: string;
+            /**
+             * Format: int64
+             * @description When the request stops being answerable, in seconds since the epoch. After this a
+             *     decision can no longer take effect: a timeout issues no tokens.
+             */
+            expires_at: number;
+            /**
+             * @description The approval identifier.
+             * @example ava_...
+             */
+            id: string;
+            /** @description The downstream provider the action is against. */
+            provider: string;
+            /** @description `pending`, `approved` or `denied`. */
+            state: string;
+        };
         /**
          * @description What an operator is told about a stored connection.
          *
@@ -9233,6 +9336,25 @@ export interface components {
             provider: string;
             /** @description `active` or `failed`. */
             state: string;
+        };
+        /** @description What refreshing a stored credential at its provider needs (issue #132, criterion 3). */
+        VaultRefreshRequest: {
+            /**
+             * @description The DOWNSTREAM OAuth client the credential was issued to. Not an IronAuth client: it is
+             *     chosen by whoever ran the consent flow at the provider.
+             */
+            client_id: string;
+            /**
+             * @description That client's secret. Sealed before the row exists, under its own purpose tag, and
+             *     never returned.
+             */
+            client_secret: string;
+            /**
+             * @description The provider's token endpoint. `https` only: this URL is dereferenced by the server
+             *     with a refresh token in the body, so a plaintext one puts the credential on the wire.
+             * @example https://oauth2.googleapis.com/token
+             */
+            token_endpoint: string;
         };
         /** @description One declared verification address (issue #53): the trait name and its kind. */
         VerificationAddressView: {
@@ -17778,6 +17900,127 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, or already deactivated: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listAgentVaultApprovals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The approvals awaiting a decision, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VaultApprovalList"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found, or the environment is absent or soft-deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    decideAgentVaultApproval: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The approval identifier */
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecideVaultApprovalRequest"];
+            };
+        };
+        responses: {
+            /** @description Decided */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found, another organization's approval, or already decided */
             404: {
                 headers: {
                     [name: string]: unknown;

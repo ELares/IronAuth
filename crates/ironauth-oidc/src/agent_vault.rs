@@ -28,11 +28,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::OidcState;
 
-/// The exchange request: which downstream provider the agent wants.
+/// The exchange request: which downstream provider the agent wants, and for what.
 #[derive(Debug, Deserialize)]
 pub struct ExchangeRequest {
-    /// `google` or `github`.
+    /// The downstream provider.
     pub provider: String,
+
+    /// The RFC 9396 authorization details this exchange is FOR, when the action is sensitive.
+    ///
+    /// Naming this is what makes an action sensitive, and that is deliberate: a server that
+    /// decided sensitivity from a list of its own would be guessing at a question only the
+    /// caller can answer, and a caller that could obtain a credential without saying what for
+    /// would never be held to anything. Present, the exchange goes through the APPROVAL GATE
+    /// and issues nothing until a human decides. Absent, it is an ordinary exchange.
+    ///
+    /// EXPLORATORY, like the rest of this surface: the shape a real deployment wants here is
+    /// the open question, and pinning it to RFC 9396 rather than inventing one is the cheapest
+    /// bet to unwind.
+    #[serde(default)]
+    pub authorization_details: Option<serde_json::Value>,
 }
 
 /// The exchange response.
@@ -47,6 +61,188 @@ pub struct ExchangeResponse {
     pub provider: String,
     /// What the provider actually granted, which is not always what was asked for.
     pub granted_scopes: Vec<String>,
+    /// What the APPROVER agreed to, present only on an approved sensitive exchange.
+    ///
+    /// Not an echo of the request. An approver who narrows a request must have the narrowed
+    /// set be the one that takes effect, or the approval surface is decoration; this is that
+    /// narrowed set, rendered from the decision rather than from what was asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<serde_json::Value>,
+}
+
+/// The answer to a sensitive exchange that is waiting on a human.
+///
+/// A distinct SHAPE and a distinct status, not an error: the caller has done nothing wrong and
+/// the correct behaviour is to come back. It carries the approval id so a caller can poll one
+/// thing rather than re-deriving which request it is waiting on.
+#[derive(Debug, Serialize)]
+pub struct ApprovalPending {
+    /// Always `approval_pending`.
+    pub status: String,
+    /// The approval to poll.
+    pub approval_id: String,
+    /// When the request stops being answerable, in seconds since the epoch. After this the
+    /// action is refused: a timeout issues no token, exactly as a denial does.
+    pub expires_at: i64,
+}
+
+/// Refresh a connection's stored credential at its provider (issue #132, criterion 3).
+///
+/// The half of criterion 3 that did not exist. The vault STORED a refresh token and nothing
+/// could spend it: refreshing means presenting that token at the provider's token endpoint
+/// with the client credentials that provider issued, and until migration 0180 none of those
+/// three things had anywhere to live.
+///
+/// Returns the fresh credential on success. On ANY failure the connection is MARKED FAILED and
+/// the error returned, which is the other half of the same criterion: one dead downstream is
+/// visible and isolated instead of taking an agent's other connections with it. Marked, never
+/// deleted, so an operator can see which one broke and why.
+///
+/// Rides the SSRF-hardened federation fetcher rather than a client of its own. The endpoint is
+/// operator-supplied and dereferenced with a refresh token in the body, so it gets the same
+/// address validation, redirect refusal and size bounds every other outbound in this system
+/// gets. A deployment with no federation runtime installed cannot refresh, which is reported
+/// as such rather than as a provider failure: nothing is wrong with the connection.
+async fn refresh_connection(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    connection: &ironauth_store::VaultConnection,
+    actor: ActorRef,
+    correlation: CorrelationId,
+) -> Result<RefreshedCredential, &'static str> {
+    let Some(config) = connection.refresh.as_ref() else {
+        return Err("this connection cannot refresh and must be re-established");
+    };
+    let Some(refresh_token) = connection.refresh_token.as_deref() else {
+        return Err("this connection stored no refresh token");
+    };
+    let Some(federation) = state.federation() else {
+        return Err("this deployment cannot reach a provider to refresh");
+    };
+
+    let form = format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={}&client_secret={}",
+        crate::util::percent_encode_query(refresh_token),
+        crate::util::percent_encode_query(&config.client_id),
+        crate::util::percent_encode_query(&config.client_secret),
+    );
+    let mut http = ironauth_fetch::FetchRequest::new(
+        ironauth_fetch::FetchPurpose::FederationToken,
+        axum::http::Method::POST,
+        config.token_endpoint.clone(),
+    )
+    .header(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+    )
+    .header(
+        header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/json"),
+    )
+    .body(form.into_bytes());
+    if federation.allow_http() {
+        http = http.allow_plaintext_http();
+    }
+
+    // EVERY failure below marks the connection, and the mark is what isolation means.
+    let outcome = async {
+        let response = federation
+            .fetcher()
+            .fetch(http)
+            .await
+            .map_err(|_| "the provider could not be reached")?;
+        if !response.status().is_success() {
+            return Err("the provider refused the refresh");
+        }
+        let body: serde_json::Value = serde_json::from_slice(response.body())
+            .map_err(|_| "the provider's response is not JSON")?;
+        let access_token = body
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("the provider's response carried no access_token")?
+            .to_owned();
+        // A provider MAY rotate the refresh token and MAY omit it, in which case the stored
+        // one stays valid. Keeping the old one on omission is the difference between a
+        // connection that refreshes twice and one that refreshes once.
+        let refresh_token = body
+            .get("refresh_token")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| refresh_token.to_owned(), ToOwned::to_owned);
+        let expires_in = body.get("expires_in").and_then(serde_json::Value::as_i64);
+        Ok(RefreshedCredential {
+            access_token,
+            refresh_token,
+            expires_in_secs: expires_in,
+        })
+    }
+    .await;
+
+    match outcome {
+        Ok(refreshed) => Ok(refreshed),
+        Err(reason) => {
+            // Best effort: the refresh already failed, and failing to RECORD that must not
+            // turn one dead downstream into a request that reports something else.
+            let _ = state
+                .store()
+                .scoped(scope)
+                .acting(actor, correlation)
+                .agent_vault()
+                .mark_failed(
+                    state.env(),
+                    &connection.id,
+                    reason,
+                    crate::util::epoch_micros(state.now()),
+                )
+                .await;
+            Err(reason)
+        }
+    }
+}
+
+/// What a successful refresh returned.
+///
+/// Deliberately NOT `Debug`, for the reason every other type here is not: it holds two
+/// downstream secrets.
+struct RefreshedCredential {
+    access_token: String,
+    refresh_token: String,
+    expires_in_secs: Option<i64>,
+}
+
+/// How long a raised approval stays answerable.
+///
+/// Bounded because the criterion says a TIMEOUT issues no tokens, and a request with no
+/// deadline never times out: it blocks for ever, which is indistinguishable from a denial
+/// nobody made. An hour is long enough for a human on another device and short enough that a
+/// forgotten request does not sit authorizing something a week later.
+const APPROVAL_WINDOW_MICROS: i64 = 60 * 60 * 1_000_000;
+
+/// The `202` a sensitive exchange gets while it waits on a human.
+fn pending_response(approval: &ironauth_store::VaultApproval) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ApprovalPending {
+            status: "approval_pending".to_owned(),
+            approval_id: approval.id.to_string(),
+            expires_at: approval.expires_at_unix_micros / 1_000_000,
+        }),
+    )
+        .into_response()
+}
+
+/// The acting store an approval RAISE is written through.
+///
+/// The DATA plane: raising a request is the agent's own action, and migration 0179 grants the
+/// app role INSERT for exactly this, narrowed by a restrictive policy to rows that arrive
+/// undecided. Deciding is the control plane's, and this store cannot reach it.
+fn acting_for_approval(
+    state: &OidcState,
+    scope: ironauth_store::Scope,
+    actor: ActorRef,
+    correlation: CorrelationId,
+) -> ironauth_store::ActingStore<'_> {
+    state.store().scoped(scope).acting(actor, correlation)
 }
 
 /// A refusal, in the shape the token endpoint already uses.
@@ -381,12 +577,182 @@ pub async fn exchange(
             "this connection is marked failed and must be re-established",
         );
     }
+    // EXPIRED: refresh it rather than refusing (issue #132, criterion 3).
+    //
+    // This is what makes the stored refresh token worth storing. An expired credential is not
+    // a broken connection, it is one that needs renewing, and the agent asking for it is
+    // exactly the moment to renew: refreshing on a schedule would spend a provider's rate
+    // limit on connections nobody is using, and refreshing eagerly at store time would leave
+    // the same problem an hour later.
+    //
+    // A refresh that FAILS marks the connection, which is the isolation half of the same
+    // criterion: this agent's Google connection is now visibly broken and its GitHub one is
+    // untouched. The refusal then names what actually happened rather than "expired", because
+    // the operator's next action differs.
+    let mut connection = connection;
+    if !connection.is_usable(now_micros) && connection.refresh.is_some() {
+        // Re-read WITH the refresh, which is the only read that opens the client secret.
+        let refreshable = store
+            .agent_vault()
+            .connection_with_refresh(&agent_id, &request.provider)
+            .await;
+        match refreshable {
+            Ok(Some(with_config)) => {
+                match refresh_connection(&state, scope, &with_config, request_actor, correlation)
+                    .await
+                {
+                    Ok(refreshed) => {
+                        let expires_at = refreshed
+                            .expires_in_secs
+                            .and_then(|seconds| seconds.checked_mul(1_000_000))
+                            .and_then(|micros| now_micros.checked_add(micros));
+                        // Re-stored through the CONTROL plane, which is the only role that may
+                        // write this table, and carrying the refresh configuration forward so
+                        // the NEXT expiry can renew too.
+                        let restored = state
+                            .store()
+                            .management()
+                            .acting(request_actor, correlation)
+                            .agent_vault(scope)
+                            .store_connection(
+                                state.env(),
+                                ironauth_store::NewVaultConnection {
+                                    id: &with_config.id,
+                                    agent_id: &agent_id,
+                                    provider: &request.provider,
+                                    access_token: &refreshed.access_token,
+                                    refresh_token: Some(&refreshed.refresh_token),
+                                    granted_scopes: &with_config.granted_scopes,
+                                    expires_at_unix_micros: expires_at,
+                                    refresh: with_config.refresh.as_ref().map(|cfg| {
+                                        ironauth_store::VaultRefreshConfig {
+                                            token_endpoint: &cfg.token_endpoint,
+                                            client_id: &cfg.client_id,
+                                            client_secret: &cfg.client_secret,
+                                        }
+                                    }),
+                                },
+                                now_micros,
+                            )
+                            .await;
+                        if restored.is_err() {
+                            return refuse(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "the refreshed credential could not be stored",
+                            );
+                        }
+                        connection.access_token = refreshed.access_token;
+                        connection.expires_at_unix_micros = expires_at;
+                    }
+                    Err(reason) => {
+                        return refuse(StatusCode::CONFLICT, "connection_failed", reason);
+                    }
+                }
+            }
+            _ => {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "the connection could not be read",
+                );
+            }
+        }
+    }
     if !connection.is_usable(now_micros) {
         return refuse(
             StatusCode::CONFLICT,
             "connection_expired",
             "the stored credential for this connection has expired and must be replaced",
         );
+    }
+
+    // THE APPROVAL GATE (issue #132, criterion 4). Reached only when the request NAMES
+    // authorization details, which is what makes an action sensitive.
+    //
+    // The criterion is "a seeded sensitive action BLOCKS until an out-of-band approval renders
+    // its authorization_details; denial or timeout issues no tokens". Blocking cannot mean
+    // holding the request open: the approver is a human on another device and the wait is
+    // unbounded. It means the exchange issues NOTHING and hands back something to poll.
+    //
+    // The four answers, and every one of them decided by the row rather than by this code
+    // remembering what it did last time:
+    //
+    //   - no approval yet     -> raise one, answer `approval_pending`, issue nothing;
+    //   - pending             -> answer `approval_pending` again, issue nothing;
+    //   - approved and live   -> issue, carrying what the APPROVER agreed to;
+    //   - denied, or approved past its deadline -> refuse, issue nothing.
+    //
+    // A timeout is the absence of a decision, not an event: `authorizes` computes it from the
+    // deadline on the row, so an approval nobody answered stops authorizing on its own and
+    // needs no sweeper to have run for the refusal to be correct.
+    let mut approved_details = None;
+    if let Some(requested_details) = request.authorization_details.as_ref() {
+        let Ok(existing) = store
+            .agent_vault_approvals()
+            .latest_for(&agent_id, &request.provider)
+            .await
+        else {
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "the approval could not be read",
+            );
+        };
+
+        match existing {
+            Some(approval) if approval.authorizes(now_micros) => {
+                // What the approver AGREED to, which may be narrower than what was asked.
+                approved_details.clone_from(&approval.approved_details);
+            }
+            Some(approval) if approval.state == "pending" => {
+                return pending_response(&approval);
+            }
+            // Decided against, or approved and now past its deadline. Both issue nothing, and
+            // both answer the same thing: this action is not authorized. Re-raising here would
+            // make a denial a speed bump.
+            Some(_) => {
+                return refuse(
+                    StatusCode::FORBIDDEN,
+                    "access_denied",
+                    "this action was not approved",
+                );
+            }
+            None => {
+                let approval_id =
+                    ironauth_store::AgentVaultApprovalId::generate(state.env(), &scope);
+                let expires_at = now_micros.saturating_add(APPROVAL_WINDOW_MICROS);
+                if acting_for_approval(&state, scope, request_actor, correlation)
+                    .agent_vault_approvals()
+                    .request(
+                        state.env(),
+                        &approval_id,
+                        &agent_id,
+                        &request.provider,
+                        requested_details,
+                        expires_at,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return refuse(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "the approval could not be raised",
+                    );
+                }
+                return (
+                    StatusCode::ACCEPTED,
+                    [(header::CACHE_CONTROL, "no-store")],
+                    Json(ApprovalPending {
+                        status: "approval_pending".to_owned(),
+                        approval_id: approval_id.to_string(),
+                        expires_at: expires_at / 1_000_000,
+                    }),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // The exchange row, BEFORE the credential leaves. A record written afterwards is one a
@@ -415,6 +781,7 @@ pub async fn exchange(
             access_token: connection.access_token,
             provider: connection.provider,
             granted_scopes: connection.granted_scopes,
+            authorization_details: approved_details,
         }),
     )
         .into_response()

@@ -177,6 +177,7 @@ async fn seed_connection(harness: &Harness, agent: &AgentPrincipalId, provider: 
                 refresh_token: Some("downstream-refresh-token"),
                 granted_scopes: &["mail.read".to_owned()],
                 expires_at_unix_micros: None,
+                refresh: None,
             },
             i64::try_from(
                 harness
