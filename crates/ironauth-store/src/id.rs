@@ -1210,6 +1210,13 @@ impl ScopedKind for AgentVaultConnectionKind {
     const PREFIX: &'static str = "avc";
 }
 
+/// Marker for a pending out-of-band approval of a sensitive agent action (`ava_`, issue #132).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentVaultApprovalKind;
+impl ScopedKind for AgentVaultApprovalKind {
+    const PREFIX: &'static str = "ava";
+}
+
 /// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
 /// (RFC 9126, issue #27) stored for later single-use reference from `/authorize`. A
 /// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so the
@@ -2046,6 +2053,8 @@ pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
 /// An agent vault connection identifier (`avc_...`), the stored downstream credential an
 /// agent exchanges its IronAuth token for (issue #132).
 pub type AgentVaultConnectionId = ScopedId<AgentVaultConnectionKind>;
+/// An out-of-band approval identifier (`ava_...`) for a sensitive agent action (issue #132).
+pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
 /// A registered external assertion issuer identifier (`xai_...`), a trust anchor
 /// the JWT bearer assertion grant accepts assertions from (issue #26).
 pub type ExternalIssuerId = ScopedId<ExternalIssuerKind>;

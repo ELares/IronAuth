@@ -788,6 +788,14 @@ pub enum Action {
     /// answer has to be findable without reading every token ever minted.
     /// A downstream credential was STORED for an agent (issue #132).
     AgentVaultStore,
+    /// A sensitive agent action was HELD pending an out-of-band approval (issue #132).
+    AgentVaultApprovalRequested,
+    /// A held action was DECIDED: approved, denied, or timed out (issue #132).
+    ///
+    /// One action for all three outcomes, with the outcome in the detail. An approver's
+    /// decision and a timeout are the same event to an investigator asking "what happened to
+    /// that request", and splitting them would put half the answer in a different stream.
+    AgentVaultApprovalDecided,
     /// An agent EXCHANGED its IronAuth token for a stored downstream credential (issue #132).
     ///
     /// The row an investigator asks for first after a third-party incident: which agent got
@@ -1687,6 +1695,8 @@ impl Action {
             Action::AgentRegister => "agent.register",
             Action::AgentStateSet => "agent.state.set",
             Action::AgentVaultStore => "agent_vault.store",
+            Action::AgentVaultApprovalRequested => "agent_vault.approval_requested",
+            Action::AgentVaultApprovalDecided => "agent_vault.approval_decided",
             Action::AgentVaultExchange => "agent_vault.exchange",
             Action::AgentVaultFailed => "agent_vault.failed",
             Action::AgentTokenIssue => "agent_token.issue",

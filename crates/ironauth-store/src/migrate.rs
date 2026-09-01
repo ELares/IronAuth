@@ -1427,6 +1427,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0178_agent_token_vault.sql"),
         },
+        Migration {
+            version: 179,
+            name: "agent_vault_approvals",
+            // EXPAND: a new table the old binary never reads or writes.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0179_agent_vault_approvals.sql"),
+        },
     ]
 }
 

@@ -82,9 +82,9 @@ use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
-    AgentPrincipalId, AgentVaultConnectionId, ApiKeyId, AssertionMappingId, AttestationConfigId,
-    AuditId, AuditTarget, AuthorizationCodeId, BackchannelAuthRequestId, BrandId,
-    ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
+    AgentPrincipalId, AgentVaultApprovalId, AgentVaultConnectionId, ApiKeyId, AssertionMappingId,
+    AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId, BackchannelAuthRequestId,
+    BrandId, ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
     CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId,
@@ -159,6 +159,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> AgentVaultRepo<'a> {
         AgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The READ side of the sensitive-action approval queue for this scope (issue #132).
+    #[must_use]
+    pub fn agent_vault_approvals(&self) -> AgentVaultApprovalRepo<'a> {
+        AgentVaultApprovalRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1543,6 +1552,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> ActingAgentVaultRepo<'a> {
         ActingAgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of the sensitive-action approval queue (issue #132).
+    #[must_use]
+    pub fn agent_vault_approvals(&self) -> ActingAgentVaultApprovalRepo<'a> {
+        ActingAgentVaultApprovalRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -72781,6 +72800,230 @@ impl ActingAgentVaultRepo<'_> {
                 target: id,
             },
             async |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// A held request for a sensitive agent action (issue #132).
+pub struct VaultApproval {
+    /// The approval identifier.
+    pub id: AgentVaultApprovalId,
+    /// The agent that asked.
+    pub agent_id: AgentPrincipalId,
+    /// The downstream provider the action targets.
+    pub provider: String,
+    /// `pending`, `approved`, `denied` or `expired`.
+    pub state: String,
+    /// What the approver AGREED to, present only on an approved row.
+    pub approved_details: Option<serde_json::Value>,
+    /// When the request stops being answerable, in microseconds since the epoch.
+    pub expires_at_unix_micros: i64,
+}
+
+impl VaultApproval {
+    /// Whether this approval authorizes the action AT `now_micros`.
+    ///
+    /// Both halves, deliberately. A row can be `approved` and past its deadline, because
+    /// nothing sweeps the table the instant a request expires and a sweep would be a
+    /// different kind of guarantee anyway. Reading the deadline HERE makes the timeout a
+    /// property of every read rather than of a job having run, which is what
+    /// "denial or timeout issues no tokens" needs.
+    #[must_use]
+    pub fn authorizes(&self, now_micros: i64) -> bool {
+        self.state == "approved" && now_micros < self.expires_at_unix_micros
+    }
+}
+
+/// The READ side of the sensitive-action approval queue, for this scope (issue #132).
+pub struct AgentVaultApprovalRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AgentVaultApprovalRepo<'_> {
+    /// One approval by id, scope-bound.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn get(
+        &self,
+        id: &AgentVaultApprovalId,
+    ) -> Result<Option<VaultApproval>, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, agent_id, provider, state, approved_details, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+             FROM agent_vault_approvals \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let stored_agent: String = row.get("agent_id");
+        Ok(Some(VaultApproval {
+            id: *id,
+            agent_id: AgentPrincipalId::parse_in_scope(&stored_agent, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            provider: row.get("provider"),
+            state: row.get("state"),
+            approved_details: row.get("approved_details"),
+            expires_at_unix_micros: row.get("expires_us"),
+        }))
+    }
+}
+
+/// The WRITE side of the approval queue, for this scope and actor (issue #132).
+pub struct ActingAgentVaultApprovalRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAgentVaultApprovalRepo<'_> {
+    /// Hold a sensitive action pending an out-of-band approval, auditing
+    /// `agent_vault.approval_requested`.
+    ///
+    /// The request is a DURABLE row rather than a held connection, because the approver is a
+    /// human on another device and the wait is unbounded. That is also what makes this
+    /// survive a delivery worker restart with or without a messaging backbone: there is
+    /// nothing in flight to lose.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent or the id is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn request(
+        &self,
+        env: &Env,
+        id: &AgentVaultApprovalId,
+        agent_id: &AgentPrincipalId,
+        provider: &str,
+        requested_details: &serde_json::Value,
+        expires_at_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let agent_id = *agent_id;
+        let provider = provider.to_owned();
+        let details = requested_details.clone();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultApprovalRequested,
+                target: &id,
+            },
+            async |tx| {
+                sqlx::query(
+                    "INSERT INTO agent_vault_approvals \
+                     (id, tenant_id, environment_id, agent_id, provider, requested_details, \
+                      state, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', \
+                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(agent_id.to_string())
+                .bind(&provider)
+                .bind(&details)
+                .bind(expires_at_unix_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Decide a held action, auditing `agent_vault.approval_decided`.
+    ///
+    /// `approved_details` is what the approver AGREED to, which may be narrower than the
+    /// request. Narrowing has to be expressible or the approval surface is decorative: an
+    /// approver who can only say yes to the whole thing is not approving, they are
+    /// acknowledging.
+    ///
+    /// Only a PENDING approval can be decided, and only before its deadline. A decision on
+    /// an expired request would let a slow approver resurrect an action the timeout already
+    /// refused, and "denial or timeout issues no tokens" has to mean the timeout is final.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the approval is out of this scope, absent, already
+    /// decided, or past its deadline; [`StoreError::Database`] on a persistence failure.
+    pub async fn decide(
+        &self,
+        env: &Env,
+        id: &AgentVaultApprovalId,
+        approve: bool,
+        approved_details: Option<&serde_json::Value>,
+        decided_by: &str,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let state = if approve { "approved" } else { "denied" };
+        let details = if approve {
+            approved_details.cloned()
+        } else {
+            None
+        };
+        let decided_by = decided_by.to_owned();
+        let detail = format!("outcome={state}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultApprovalDecided,
+                target: &id,
+            },
+            async |tx| {
+                let affected = sqlx::query(
+                    "UPDATE agent_vault_approvals \
+                     SET state = $1, approved_details = $2, decided_by = $3, \
+                         decided_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                     WHERE id = $5 AND tenant_id = $6 AND environment_id = $7 \
+                       AND state = 'pending' \
+                       AND expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval",
+                )
+                .bind(state)
+                .bind(details.as_ref())
+                .bind(&decided_by)
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
             false,
             Some(&detail),
         )

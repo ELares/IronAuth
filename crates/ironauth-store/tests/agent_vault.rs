@@ -12,8 +12,8 @@
 
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    AgentPrincipalId, AgentVaultConnectionId, CorrelationId, NewAgent, NewVaultConnection,
-    OrganizationId, Scope, UserId,
+    AgentPrincipalId, AgentVaultApprovalId, AgentVaultConnectionId, CorrelationId, NewAgent,
+    NewVaultConnection, OrganizationId, Scope, UserId,
 };
 
 /// A downstream access token that is unmistakable if it ever appears in a column.
@@ -277,4 +277,282 @@ async fn re_storing_a_failed_connection_repairs_it() {
         repaired.is_usable(),
         "re-establishing a connection is how a failed one is repaired"
     );
+}
+
+/// The RFC 9396 details a sensitive action asks for.
+fn requested_details() -> serde_json::Value {
+    serde_json::json!([{
+        "type": "https://ironauth.test/agent-action",
+        "actions": ["transfer"],
+        "locations": ["https://api.example/accounts"],
+    }])
+}
+
+/// AC4: a held action authorizes nothing until it is approved.
+#[tokio::test]
+async fn a_held_action_authorizes_nothing_while_it_is_pending() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            &id,
+            &agent,
+            "google",
+            &requested_details(),
+            now + 60_000_000,
+        )
+        .await
+        .expect("hold the action");
+
+    let held = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(held.state, "pending");
+    assert!(
+        !held.authorizes(now),
+        "a pending action must authorize nothing"
+    );
+    assert!(
+        held.approved_details.is_none(),
+        "and must carry no approved details"
+    );
+}
+
+/// AC4: an approval renders the details, and they are what the APPROVER agreed to.
+///
+/// The approver narrows the request here, and the narrowed set is what the row carries.
+/// Asserting only that some details appeared would pass on an implementation that stored the
+/// REQUEST back, which would make the approval surface decorative: an approver who cannot
+/// narrow is acknowledging, not approving.
+#[tokio::test]
+async fn an_approval_renders_the_details_the_approver_agreed_to() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    let control = db.control_store().scoped(scope);
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            &id,
+            &agent,
+            "google",
+            &requested_details(),
+            now + 60_000_000,
+        )
+        .await
+        .expect("hold");
+
+    // NARROWED: read-only, where the request asked to transfer.
+    let narrowed = serde_json::json!([{
+        "type": "https://ironauth.test/agent-action",
+        "actions": ["read"],
+        "locations": ["https://api.example/accounts"],
+    }]);
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(&env, &id, true, Some(&narrowed), "opr_reviewer", now)
+        .await
+        .expect("approve");
+
+    let decided = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(decided.authorizes(now), "an approved action authorizes");
+    assert_eq!(
+        decided.approved_details.as_ref(),
+        Some(&narrowed),
+        "the APPROVED details are the approver's, not the requester's"
+    );
+}
+
+/// AC4: a denial authorizes nothing and renders no details.
+#[tokio::test]
+async fn a_denial_authorizes_nothing_and_renders_no_details() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    let control = db.control_store().scoped(scope);
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            &id,
+            &agent,
+            "google",
+            &requested_details(),
+            now + 60_000_000,
+        )
+        .await
+        .expect("hold");
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(
+            &env,
+            &id,
+            false,
+            Some(&requested_details()),
+            "opr_reviewer",
+            now,
+        )
+        .await
+        .expect("deny");
+
+    let decided = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(decided.state, "denied");
+    assert!(!decided.authorizes(now), "a denial authorizes nothing");
+    assert!(
+        decided.approved_details.is_none(),
+        "and carries no details even though some were passed to the decision"
+    );
+}
+
+/// AC4: a TIMEOUT authorizes nothing, and is final.
+///
+/// Both halves. An expired request must not authorize, and a slow approver must not be able
+/// to resurrect it: if a decision after the deadline succeeded, the timeout would be a
+/// suggestion rather than a refusal.
+#[tokio::test]
+async fn a_timed_out_action_authorizes_nothing_and_cannot_be_decided_late() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    let control = db.control_store().scoped(scope);
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(&env, &id, &agent, "google", &requested_details(), now + 1)
+        .await
+        .expect("hold");
+
+    let after = now + 60_000_000;
+    let held = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(
+        !held.authorizes(after),
+        "a request past its deadline authorizes nothing, with no sweep having run"
+    );
+
+    let late = control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(
+            &env,
+            &id,
+            true,
+            Some(&requested_details()),
+            "opr_slow",
+            after,
+        )
+        .await;
+    assert!(
+        late.is_err(),
+        "a decision after the deadline must be refused, or the timeout is a suggestion"
+    );
+
+    let unchanged = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(
+        !unchanged.authorizes(after),
+        "and the late decision changed nothing"
+    );
+}
+
+/// AC5: a pending approval survives a delivery worker restart, with no IronBus configured.
+///
+/// Modelled the way the criterion means it: the row is durable, so a NEW store handle over
+/// the same database sees the same pending request. Nothing is in flight to lose, which is
+/// why this holds with or without a messaging backbone rather than because of one.
+#[tokio::test]
+async fn a_pending_approval_survives_a_restart_with_no_bus_configured() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            &id,
+            &agent,
+            "google",
+            &requested_details(),
+            now + 60_000_000,
+        )
+        .await
+        .expect("hold");
+
+    // The harness's own restart primitive: a fresh connection over the same database as the
+    // low-privilege app role, which is exactly what a restarted process gets. It exists
+    // because this repo already proves the same shape for sessions, and the argument is
+    // identical here: the authoritative state is in Postgres, so a restart loses nothing.
+    let restarted = db.restart_app_store().await;
+    let survived = restarted
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read after restart")
+        .expect("the pending approval is still there");
+    assert_eq!(survived.state, "pending");
+    assert!(!survived.authorizes(now), "and still authorizes nothing");
 }
