@@ -19,8 +19,8 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use common::{
-    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, json, location_param,
-    verify_clock,
+    Harness, PKCE_CHALLENGE, PKCE_VERIFIER, REDIRECT_URI, enc, form, form_field, json, location,
+    location_param, set_cookie_pair, verify_clock,
 };
 use ironauth_jose::verify;
 use ironauth_oidc::ClientAuthMethod;
@@ -867,5 +867,79 @@ async fn par_validates_resources_at_push_and_round_trips_a_valid_one() {
         json(&body)["error"],
         "invalid_target",
         "a malformed pushed resource is invalid_target at /par: {body}"
+    );
+}
+
+/// AC (issue #28): a resource indicator survives an INTERACTIVE authorization.
+///
+/// Every other test in this file pre-seeds a session cookie and consent, so they all
+/// exercise the no-interaction path. That is the path that kept working while the
+/// resume URL silently dropped `resource`, which is why the defect reached a live
+/// deployment: an audience-bound token was unobtainable through any flow that has to
+/// log the user in, and every first sign-in is one.
+///
+/// The exchange NAMES the resource and the assertion pins the minted `aud` VALUE.
+/// Both matter: with the resource dropped the code freezes an EMPTY granted set, and
+/// an exchange naming NO resource then falls through to the client-id audience with a
+/// 200, so a test asserting only "a token came back" passes on the broken code.
+#[tokio::test]
+async fn a_resource_indicator_survives_a_login_and_consent_interaction() {
+    let harness = Harness::start().await;
+    register_rs(&harness, RS_A, TokenFormat::AtJwt).await;
+    let client = harness.client_id().to_string();
+    harness
+        .seed_user("interactive-resource@example.test", "s3cr3t-passphrase")
+        .await;
+
+    // 1. Authorize with NO session, carrying the resource indicator.
+    let query = authorize_query(&client, &[RS_A]);
+    let (status, headers, body) = harness.authorize(&query).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+    let login_location = location(&headers).expect("login redirect");
+
+    // 2. Log in, round-tripping the return_to the server itself produced. This is the
+    //    hop that dropped the indicator: the resumed URL is built by the server, never
+    //    by the caller, so the test must not reconstruct it.
+    let (_s, _h, login_html) = harness.get_with_cookie(&login_location, None).await;
+    let return_to = form_field(&login_html, "return_to").expect("login return_to");
+    let login_body = form(&[
+        ("identifier", "interactive-resource@example.test"),
+        ("password", "s3cr3t-passphrase"),
+        ("return_to", &return_to),
+    ]);
+    let (status, headers, body) = harness.post_form("/login", &login_body, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "login: {body}");
+    let cookie = set_cookie_pair(&headers).expect("session cookie");
+    let resume = location(&headers).expect("resume after login");
+
+    // 3. Consent, which resumes through the SAME builder a second time.
+    let (_s, headers, _b) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    let consent_location = location(&headers).expect("consent redirect");
+    let (_s, _h, consent_html) = harness
+        .get_with_cookie(&consent_location, Some(&cookie))
+        .await;
+    let consent_return_to = form_field(&consent_html, "return_to").expect("consent return_to");
+    let consent_body = form(&[("decision", "allow"), ("return_to", &consent_return_to)]);
+    let (_s, headers, _b) = harness
+        .post_form("/consent", &consent_body, Some(&cookie))
+        .await;
+    let resume = location(&headers).expect("resume after consent");
+    let (_s, headers, _b) = harness.get_with_cookie(&resume, Some(&cookie)).await;
+    let code = location_param(&headers, "code").expect("code");
+
+    // 4. Redeem NAMING the resource. On the unfixed code the granted set is empty, so
+    //    this is `invalid_target` rather than a token.
+    let (status, _h, body) = harness.token(&token_form(&code, &client, &[RS_A])).await;
+    assert_eq!(status, StatusCode::OK, "token after interaction: {body}");
+    let access = json(&body)["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_owned();
+    let verified =
+        verify(&access, &harness.access_token_policy(RS_A), &verify_clock()).expect("verifies");
+    assert_eq!(
+        aud_members(verified.claims().get("aud").expect("aud")),
+        vec![RS_A.to_owned()],
+        "the token is audienced to the resource the interactive request asked for"
     );
 }
