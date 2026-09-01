@@ -2254,6 +2254,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-scim"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ironauth-screening"
 version = "0.1.0"
 dependencies = [
