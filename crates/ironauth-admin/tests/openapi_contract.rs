@@ -344,6 +344,7 @@ fn operation_ids_are_the_stable_set() {
             "setUserState",
             "setVariable",
             "setWebhookEventTypes",
+            "storeAgentVaultConnection",
             "suspendTenant",
             "testTokenHook",
             "unassignOrgGroupRole",
@@ -797,6 +798,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
@@ -898,7 +900,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        276,
+        277,
         "the documented route count is pinned"
     );
 

@@ -1167,8 +1167,9 @@ mod tests {
         let statements = seed_statements(&seed_ids(1));
         assert_eq!(
             statements.len(),
-            6,
-            "operator, tenant, environment, serving state, organization, client"
+            8,
+            "operator, tenant, environment, serving state, organization, the login client, \
+             the workload-emulator client, and its service account"
         );
         for statement in &statements {
             assert!(

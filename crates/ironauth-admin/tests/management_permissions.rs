@@ -137,6 +137,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("registerAgent", ManagementPermission::WriteOrganizations),
     ("setAgentState", ManagementPermission::WriteOrganizations),
+    (
+        "storeAgentVaultConnection",
+        ManagementPermission::WriteOrganizations,
+    ),
     ("listAgents", ManagementPermission::Read),
     ("deleteMembership", ManagementPermission::WriteOrganizations),
     ("listMemberships", ManagementPermission::Read),
@@ -918,8 +922,10 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// This pin may only improve: `PERMISSION_PROVEN` may grow, and the ratio may not get worse
 /// without somebody editing this assertion and noticing what they are doing.
 ///
-/// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 210 minus 66 is always 144. (It read "166 minus 22", then "171 minus 27", while
+/// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 145` ratchet below can no longer fail on
+/// its own: 216 minus 71 is always 145. (It read "166 minus 22", then "171 minus 27", then
+/// "210 minus 66" -- each of them stale, and the last of them stale in a doc paragraph that
+/// says in the same breath that this is the hazard, while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
 /// pinned by the two `assert_eq!`s in the test below; if you change either, change this
@@ -937,7 +943,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        215,
+        216,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
@@ -947,7 +953,7 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
     assert!(
-        unproven <= 144,
+        unproven <= 145,
         "the number of operations whose specific permission is UNPROVEN rose to {unproven}.          It may only fall. Add a `delegated_admin.rs` test that drives a credential holding a          different permission and asserts the refusal names the required one, then list the          operation in PERMISSION_PROVEN"
     );
 }

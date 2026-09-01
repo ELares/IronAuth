@@ -472,6 +472,8 @@ pub async fn store_agent_vault_connection(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     // Handing an agent a live third-party credential is at least as privileged as changing
     // its lifecycle state, which already requires this.
