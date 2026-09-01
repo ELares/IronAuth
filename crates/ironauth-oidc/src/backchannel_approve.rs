@@ -53,8 +53,7 @@ use crate::wellknown::parse_scope;
 /// Deliberately identical for "already decided", "expired", "belongs to someone else" and
 /// "never existed": a person can act on none of those distinctions, and an attacker holding a
 /// guessed id could act on all of them.
-const NOT_ACTIONABLE: &str =
-    "That request is no longer waiting for a decision. If your other device is still waiting, \
+const NOT_ACTIONABLE: &str = "That request is no longer waiting for a decision. If your other device is still waiting, \
      start again there.";
 
 /// The approval form: which request, and what was decided.

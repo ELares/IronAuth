@@ -18,9 +18,9 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::{Harness, form, json};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use common::{Harness, form, json};
 use ironauth_config::OidcConfig;
 use ironauth_oidc::ClientAuthMethod;
 use serde_json::Value;
@@ -128,8 +128,13 @@ fn base64_url(value: &str) -> Vec<u8> {
 
 /// `POST /introspect` as the token's own client.
 async fn introspect(harness: &Harness, token: &str, authorization: &str) -> Value {
-    let (status, body) =
-        post_authorized(harness, "/introspect", &form(&[("token", token)]), authorization).await;
+    let (status, body) = post_authorized(
+        harness,
+        "/introspect",
+        &form(&[("token", token)]),
+        authorization,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "introspect: {body}");
     json(&body)
 }
@@ -148,7 +153,11 @@ async fn an_unregistered_type_is_refused_by_default() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(json(&body)["error"], "invalid_authorization_details", "{body}");
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_authorization_details",
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -164,7 +173,11 @@ async fn an_unregistered_type_is_refused_even_when_others_are_registered() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(json(&body)["error"], "invalid_authorization_details", "{body}");
+    assert_eq!(
+        json(&body)["error"],
+        "invalid_authorization_details",
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -205,9 +218,7 @@ async fn a_registered_document_reaches_the_page_the_token_the_response_and_intro
         .await;
     assert_eq!(status, StatusCode::OK, "{outcome}");
 
-    harness
-        .clock()
-        .advance(std::time::Duration::from_secs(30));
+    harness.clock().advance(std::time::Duration::from_secs(30));
     let (status, tokens) = post_authorized(
         &harness,
         "/token",
@@ -276,4 +287,3 @@ async fn a_request_carrying_no_details_is_unaffected() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
-

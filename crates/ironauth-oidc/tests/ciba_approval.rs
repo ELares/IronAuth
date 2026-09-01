@@ -8,7 +8,7 @@
 //! everything below drives the same HTTP the person's browser would.
 //!
 //! The criterion asks for a poll flow that completes "backchannel request, pending state,
-//! user approval on the authentication device with binding_message rendered, token issued".
+//! user approval on the authentication device with `binding_message` rendered, token issued".
 //! Only the middle of that was reachable before: a request could be created, polled, and
 //! expire, with no way for any human to approve it.
 
@@ -294,7 +294,8 @@ async fn a_decided_request_answers_exactly_like_an_unknown_one() {
     let (repeat_status, _headers, repeat) = harness
         .post_form(&approval_path(&harness), &decision, Some(&cookie))
         .await;
-    let unknown = ironauth_store::BackchannelAuthRequestId::generate(harness.env(), &harness.scope());
+    let unknown =
+        ironauth_store::BackchannelAuthRequestId::generate(harness.env(), &harness.scope());
     let (unknown_status, _headers, unknown_body) = harness
         .post_form(
             &approval_path(&harness),
@@ -456,4 +457,3 @@ async fn a_refused_decision_announces_nothing() {
         "a refused decision must announce nothing"
     );
 }
-

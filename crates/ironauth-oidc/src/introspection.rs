@@ -711,7 +711,7 @@ mod tests {
         let claims = IntrospectionClaims {
             active: true,
             act: None,
-        authorization_details: None,
+            authorization_details: None,
             scope: Some("openid profile".to_owned()),
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),
@@ -742,7 +742,7 @@ mod tests {
         let refresh = IntrospectionClaims {
             active: true,
             act: None,
-        authorization_details: None,
+            authorization_details: None,
             scope: None,
             client_id: Some("cli_x".to_owned()),
             sub: Some("usr_abc".to_owned()),

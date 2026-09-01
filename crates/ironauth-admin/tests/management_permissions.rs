@@ -131,7 +131,10 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     ("listOrgRolePermissions", ManagementPermission::Read),
     ("createMembership", ManagementPermission::WriteOrganizations),
-    ("createServiceAccountMembership", ManagementPermission::WriteOrganizations),
+    (
+        "createServiceAccountMembership",
+        ManagementPermission::WriteOrganizations,
+    ),
     ("deleteMembership", ManagementPermission::WriteOrganizations),
     ("listMemberships", ManagementPermission::Read),
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped

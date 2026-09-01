@@ -850,4 +850,3 @@ async fn discovery_advertises_the_registered_authorization_details_types() {
         "a deployment that registered nothing must not advertise an empty list: {doc}"
     );
 }
-

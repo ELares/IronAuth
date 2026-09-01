@@ -2291,7 +2291,7 @@ export interface paths {
          *
          *     This is the granting path for a capability the store has modelled since issue #99:
          *     `MembershipPrincipal::ServiceAccount`, `create_for_service_account` and
-         *     `effective_permissions_for_service_account` all existed, AuthZEN read them, and the only
+         *     `effective_permissions_for_service_account` all existed, `AuthZEN` read them, and the only
          *     callers of the creator anywhere were two test files. So a machine identity could hold roles
          *     in principle and could be given none in practice.
          */
@@ -7733,7 +7733,7 @@ export interface components {
         SetClientBearerTokensRequest: {
             /**
              * @description Whether this public client may receive UNBOUND bearer tokens. `false`, the default
-             *     for every client, means it must present a DPoP proof at the token endpoint.
+             *     for every client, means it must present a `DPoP` proof at the token endpoint.
              */
             allowed: boolean;
         };

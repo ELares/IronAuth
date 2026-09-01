@@ -29,6 +29,62 @@
 
 use std::collections::BTreeSet;
 
+/// One function's source text, from its signature to the first column-zero `}`.
+///
+/// The same narrow reader `org_confinement_surface.rs` uses. It is a text scan and says
+/// so: it cannot follow a call into another module, which is why the caller also reads
+/// the same-file callees and why a handler that delegated attribution across a module
+/// boundary would fail this check rather than pass it silently.
+fn body_of<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let start = source.find(&format!("fn {name}("))?;
+    let end = source[start..].find("\n}\n").map(|offset| start + offset)?;
+    Some(&source[start..end])
+}
+
+/// The handler function name serving `operation`, resolved through its `operation_id`.
+fn handler_name(source: &str, operation: &str) -> Option<String> {
+    let marker = format!("operation_id = \"{operation}\"");
+    let at = source.find(&marker)?;
+    let tail = &source[at..];
+    let close = tail.find(")]")?;
+    let after = &tail[close..];
+    let fn_at = after.find("pub async fn ")?;
+    let rest = &after[fn_at + "pub async fn ".len()..];
+    let paren = rest.find('(')?;
+    Some(rest[..paren].to_owned())
+}
+
+/// The handler's own body plus the bodies of the same-file functions it calls.
+///
+/// One level of call depth, deliberately. Attribution in this crate is applied either in
+/// the handler or in a small resolver beside it (`resolve_live_org` and friends), and a
+/// deeper walk over a text scan would start matching names it cannot really resolve.
+fn handler_body_and_callees(source: &str, operation: &str) -> Option<String> {
+    let name = handler_name(source, operation)?;
+    let body = body_of(source, &name)?;
+    let mut reachable = body.to_owned();
+    for (index, _) in source.match_indices("fn ") {
+        let rest = &source[index + 3..];
+        let Some(paren) = rest.find('(') else {
+            continue;
+        };
+        let callee = &rest[..paren];
+        if callee.is_empty()
+            || !callee
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        if callee != name && body.contains(&format!("{callee}(")) {
+            if let Some(callee_body) = body_of(source, callee) {
+                reachable.push_str(callee_body);
+            }
+        }
+    }
+    Some(reachable)
+}
+
 /// Operations whose handler attributes its audit row to the organization in its path.
 ///
 /// #706 shipped the column and the seam; this list is where adoption becomes visible.
@@ -43,9 +99,13 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrgRole",
     "createOrganizationApiKey",
     "createProjectGrant",
+    "createServiceAccountMembership",
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
+    "deleteOrganization",
+    "disableOrganization",
+    "enableOrganization",
     "removeOrgGroupMember",
     "revokeOrganizationApiKey",
     "rotateOrganizationApiKey",
@@ -56,9 +116,6 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "unassignOrgRolePermission",
     "updateOrgGroup",
     "updateOrgRole",
-    "deleteOrganization",
-    "disableOrganization",
-    "enableOrganization",
     "withdrawProjectGrant",
 ];
 
@@ -84,11 +141,21 @@ const UNATTRIBUTED_CEILING: usize = 0;
 /// Where each attributed operation's handler lives, so the claim can be CHECKED.
 ///
 /// Without this, `ORG_ATTRIBUTED` is a list of assertions nobody verifies, and the ceiling
-/// falls by editing a constant. The check is per FILE, which is coarse: it proves the
-/// module calls the seam, not that this particular handler does. That is the same
-/// granularity `ADMIN_SOURCES` uses elsewhere in this crate, and it is honest about what
-/// it catches, which is a list padded with a module that never adopted the seam at all.
+/// falls by editing a constant.
+///
+/// The check is per HANDLER, not per file. It used to be per file, a bare
+/// `source.contains(".in_organization(")`, and the review that added
+/// `createServiceAccountMembership` showed exactly what that costs: `memberships.rs`
+/// already contained the call for `createMembership`, so deleting the call from the NEW
+/// handler left the test green. A ceiling of zero cannot rest on a check that cannot see
+/// the handler it names. [`handler_body_and_callees`] resolves the `operation_id` to its
+/// function and reads that function plus the same-file functions it calls, which is the
+/// granularity `org_confinement_surface.rs` already uses for the confinement fence.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    (
+        "createServiceAccountMembership",
+        include_str!("../src/memberships.rs"),
+    ),
     (
         "createOrganizationApiKey",
         include_str!("../src/api_keys.rs"),
@@ -230,10 +297,19 @@ fn the_organization_attribution_gap_is_counted_and_may_only_fall() {
                 )
             })
             .1;
+        let reachable = handler_body_and_callees(source, operation).unwrap_or_else(|| {
+            panic!(
+                "`{operation}` has an ATTRIBUTED_SOURCES entry but no handler could be \
+                 resolved from it. Either the operation_id is not in that file, or the \
+                 `#[utoipa::path]`/`pub async fn` shape changed and this scan has stopped \
+                 reading the surface"
+            )
+        });
         assert!(
-            source.contains(".in_organization("),
-            "`{operation}` is listed as attributed but its module never calls \
-             `.in_organization(..)`, so its audit rows carry no organization"
+            reachable.contains(".in_organization("),
+            "`{operation}` is listed as attributed but neither its handler nor any \
+             same-file function it calls invokes `.in_organization(..)`, so its audit \
+             rows carry no organization"
         );
     }
 

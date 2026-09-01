@@ -171,6 +171,13 @@ pub async fn client_credentials_grant(
 /// it against a fresh machine grant, and build the `200 OK` response (issue #23,
 /// steps 4-6 of the exchange). Split out of [`client_credentials_grant`] so each half
 /// stays readable; the client is already authenticated and its scope proven.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one line over the pedantic bound. The body is a straight sequence of \
+    steps (resolve the principal, mint, build the access record, persist), and \
+    splitting it would put the mint and the persist that makes it revocable in \
+    different functions, which is exactly the seam that must not be easy to skip"
+)]
 async fn mint_and_persist(
     state: &OidcState,
     scope: Scope,

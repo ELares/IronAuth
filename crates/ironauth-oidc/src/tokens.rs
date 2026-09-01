@@ -3098,6 +3098,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat probe of every protected claim, one assertion per name. \
+        Splitting it would put the emitted half and the absent half in different \
+        functions, and the accounting at the end that proves neither half missed a \
+        name would then have to be written twice or dropped"
+    )]
     fn a_custom_claim_never_sets_a_reserved_claim() {
         // A hostile custom-claims config naming EVERY reserved claim (protocol,
         // authentication-context, binding, and hash/session) plus a benign one. The
@@ -3132,6 +3139,11 @@ mod tests {
             // attacker obtained honestly, which is an audit forgery rather than a privilege
             // claim, and the reason `act` is reserved.
             "act": { "sub": "adm_victim", "reason_code": "forged" },
+            // RFC 9396 (issue #131). Absent from this fixture the sanity loop below
+            // compares None to None and FAILS: `assert_ne!` on two absent entries is
+            // not a pass. Every protected name has to appear here or the loop reports
+            // a hostile value it was never given.
+            "authorization_details": [{ "type": "evil", "actions": ["transfer"] }],
             // Organization context (issue #94): a machine token asserts no human org.
             "org_id": "org_evil",
             // Organization roles (issue #97): a machine token asserts no human
@@ -3193,10 +3205,52 @@ mod tests {
             "permissions",
             "permissions_status",
             "act",
+            "authorization_details",
         ] {
             assert!(
                 claims.get(reserved_absent).is_none(),
                 "{reserved_absent} must never be injected by a custom claim"
+            );
+        }
+        // Every protected name is now accounted for by NAME rather than by count: it is
+        // either emitted with a real minted value (asserted individually above) or
+        // asserted absent in the loop above. A review found `authorization_details` in
+        // neither half, which is how a protected claim ends up with no probe of its own
+        // while the count still looks right.
+        let emitted = [
+            "sub",
+            "iss",
+            "aud",
+            "client_id",
+            "exp",
+            "iat",
+            "jti",
+            "scope",
+        ];
+        let absent = [
+            "nbf",
+            "typ",
+            "token_type",
+            "acr",
+            "amr",
+            "auth_time",
+            "nonce",
+            "azp",
+            "cnf",
+            "at_hash",
+            "c_hash",
+            "sid",
+            "org_id",
+            "roles",
+            "permissions",
+            "permissions_status",
+            "act",
+            "authorization_details",
+        ];
+        for reserved in PROTECTED_ACCESS_TOKEN_CLAIMS {
+            assert!(
+                emitted.contains(reserved) || absent.contains(reserved),
+                "{reserved} is protected but this test neither asserts its minted value                  nor asserts it absent, so nothing here probes it at all"
             );
         }
         // The benign, non-reserved business claim is admitted.

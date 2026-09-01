@@ -1280,13 +1280,13 @@ pub fn backchannel_approve_page(action: &str, pending: &[PendingBackchannelItem<
         let details = if item.authorization_details.is_empty() {
             String::new()
         } else {
-            let entries = item
-                .authorization_details
-                .iter()
-                .fold(String::new(), |mut acc, entry| {
-                    let _ = write!(acc, "<li>{}</li>", escape_html(entry));
-                    acc
-                });
+            let entries =
+                item.authorization_details
+                    .iter()
+                    .fold(String::new(), |mut acc, entry| {
+                        let _ = write!(acc, "<li>{}</li>", escape_html(entry));
+                        acc
+                    });
             format!("<p>This will authorize:</p><ul>{entries}</ul>")
         };
         let _ = write!(

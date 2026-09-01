@@ -2445,7 +2445,10 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "memberships.createServiceAccountMembership",
             "POST",
             format!("{org_base}/service-account-memberships"),
-            &serde_json::json!({ "service_account_id": "sva_absent" }),
+            // The fixture's REAL service account. An absent id answers the uniform
+            // not-found at a healthy environment too, which leaves the soft-deleted
+            // fence unmeasurable through this route.
+            &serde_json::json!({ "service_account_id": service_account }),
         ),
         Case::empty(
             "org_effective_roles.getOrgMembershipEffectiveRoles",

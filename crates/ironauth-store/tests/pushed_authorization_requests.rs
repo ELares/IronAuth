@@ -654,4 +654,3 @@ async fn a_bearer_token_exemption_change_announces_the_client_and_the_direction(
         }
     }
 }
-

@@ -309,6 +309,12 @@ struct Fixture {
     spare_client: String,
     /// Seeded live: the target of the withdrawal case.
     grant: String,
+    /// The REAL service-account principal of `spare_client`, minted rather than made
+    /// up. An absent `sva_` id answers the uniform not-found at a HEALTHY environment
+    /// too, which would leave the soft-deleted fence unmeasurable through the
+    /// service-account membership route: the case would pass without distinguishing
+    /// anything.
+    service_account: String,
 }
 
 impl Fixture {
@@ -412,7 +418,7 @@ impl Fixture {
             spare_membership,
         ] = <[String; 6]>::try_from(org_rows).expect("six organization rows were seeded");
 
-        let (spare_client, grant) =
+        let (spare_client, grant, service_account) =
             Self::seed_project_grant(h, tenant, environment, &base, &role, key).await;
 
         let fixture = Self {
@@ -429,6 +435,7 @@ impl Fixture {
             spare_permission,
             spare_client,
             grant,
+            service_account,
         };
         fixture.seed_relations(h, key).await;
         fixture
@@ -455,7 +462,7 @@ impl Fixture {
         base: &str,
         role: &str,
         key: &str,
-    ) -> (String, String) {
+    ) -> (String, String, String) {
         let scope = Scope::new(
             TenantId::parse(tenant).expect("tenant id"),
             EnvironmentId::parse(environment).expect("environment id"),
@@ -487,7 +494,26 @@ impl Fixture {
             "project grant",
         )
         .await;
-        (spare_client, grant)
+        // The service-account principal of the spare client, minted through the same
+        // `ensure` the token path uses rather than invented, so the membership case
+        // addresses something that actually exists.
+        let service_account = h
+            .store()
+            .scoped(scope)
+            .acting(
+                ActorRef::service(ServiceId::generate(&sys)),
+                CorrelationId::generate(&sys),
+            )
+            .service_accounts()
+            .ensure(
+                &sys,
+                &ironauth_store::ClientId::parse_in_scope(&spare_client, &scope)
+                    .expect("the spare client id parses in scope"),
+            )
+            .await
+            .expect("mint the service-account principal")
+            .to_string();
+        (spare_client, grant, service_account)
     }
 
     /// Bind the entities together, so every WITHDRAWAL case has something live to
@@ -845,6 +871,7 @@ impl Fixture {
             spare_role,
             spare_user,
             spare_permission,
+            service_account,
             ..
         } = self;
         let spare_role_ref = serde_json::json!({ "role_id": spare_role }).to_string();
@@ -881,6 +908,16 @@ impl Fixture {
                 method: "POST",
                 path: format!("{base}/memberships"),
                 body: Some(serde_json::json!({ "user_id": spare_user }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
+                label: "memberships.createServiceAccountMembership",
+                method: "POST",
+                path: format!("{base}/service-account-memberships"),
+                body: Some(
+                    serde_json::json!({ "service_account_id": service_account }).to_string(),
+                ),
                 intent: Intent::Write,
                 live: StatusCode::CREATED,
             },
@@ -1097,6 +1134,7 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         spare_permission: "prm_y".to_owned(),
         spare_client: "cli_y".to_owned(),
         grant: "pgt_x".to_owned(),
+        service_account: "sva_x".to_owned(),
     };
     let cases = fixture.cases();
     let documented = documented_organization_operations();

@@ -298,6 +298,11 @@ async fn shaped_claims(
     already validated by the caller; bundling them into a struct would move the \
     parameter list rather than shorten it"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "two lines over the pedantic bound. The body is the RFC 8693 exchange \
+    in order, and every step reads a value the step before it produced"
+)]
 async fn issue(
     state: &OidcState,
     scope: Scope,

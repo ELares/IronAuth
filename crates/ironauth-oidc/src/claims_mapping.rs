@@ -45,8 +45,10 @@ use crate::tokens::PROTECTED_ACCESS_TOKEN_CLAIMS;
 /// Whether a mapping may write `name`.
 ///
 /// The union of the release floor and the MINT fold, not the floor alone. `PROTECTED_CLAIMS`
-/// is five names; `PROTECTED_ACCESS_TOKEN_CLAIMS` is twenty-five, and the extra twenty are the
-/// ones something makes a decision on: `scope` authorizes IronAuth's own management API, `cnf`
+/// is the smaller of the two and `PROTECTED_ACCESS_TOKEN_CLAIMS` the larger; the sizes are
+/// pinned by `the_three_protected_lists_together_are_this_many` rather than written here,
+/// because this sentence said "twenty-five" for as long as the constant held twenty-six.
+/// The names only the larger list holds are the ones something makes a DECISION on: `scope` authorizes IronAuth's own management API, `cnf`
 /// drives `DPoP` proof-of-possession, and `permissions`/`roles`/`org_id` are what `tokens.rs`
 /// calls "the only claims in the set a resource server makes an ACCESS decision on, so a
 /// self-asserted one is a privilege escalation rather than a cosmetic lie".
@@ -965,9 +967,10 @@ pub fn apply_for(
 #[cfg(test)]
 mod tests {
     use super::{
-        Destination, MappedClaims, MappingRule, Placement, RefusalReason, apply_for, validate,
+        Destination, MappedClaims, MappingRule, PROTECTED_ACCESS_TOKEN_CLAIMS, Placement,
+        RefusalReason, apply_for, validate,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn source() -> BTreeMap<String, serde_json::Value> {
         let mut claims = BTreeMap::new();
@@ -1907,52 +1910,80 @@ mod tests {
         // RESERVED_ENRICHMENT_CLAIMS is covered by the mint fold could be removed with
         // nothing red.
         assert_eq!(
-            checked, 50,
-            "the three lists are 25 + 5 + 20; a link was dropped from the chain"
+            checked, 51,
+            "the three lists are 26 + 5 + 20; a link was dropped from the chain"
         );
     }
 
-    /// The names a hook must never set, written out by hand.
+    /// The claim names the hook fence must refuse, enumerated BY HAND.
     ///
-    /// The test above loops the constants, so narrowing a constant narrows the test with it.
-    /// This one names them, so removing a claim from `PROTECTED_ACCESS_TOKEN_CLAIMS` has to be
-    /// an edit somebody makes here too.
+    /// A second enumeration on purpose. The test above loops the constants, so narrowing a
+    /// constant narrows that test with it; this list names them, so removing a claim from
+    /// `PROTECTED_ACCESS_TOKEN_CLAIMS` has to be an edit somebody makes here too. What a
+    /// hand list cannot do by itself is notice an ADDITION, which is covered by
+    /// [`the_hand_written_hook_list_covers_every_protected_access_token_claim`].
+    const HOOK_PROTECTED_NAMES: &[&str] = &[
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "nbf",
+        "jti",
+        "client_id",
+        "scope",
+        "typ",
+        "token_type",
+        "acr",
+        "amr",
+        "auth_time",
+        "nonce",
+        "azp",
+        "cnf",
+        "at_hash",
+        "c_hash",
+        "sid",
+        "org_id",
+        "roles",
+        "permissions",
+        "permissions_status",
+        "act",
+        "authorization_details",
+    ];
+
+    /// Every name in that list is refused when a hook returns it.
     #[test]
     fn the_claims_a_hook_may_never_set_are_these() {
-        for name in [
-            "iss",
-            "sub",
-            "aud",
-            "exp",
-            "iat",
-            "nbf",
-            "jti",
-            "client_id",
-            "scope",
-            "typ",
-            "token_type",
-            "acr",
-            "amr",
-            "auth_time",
-            "nonce",
-            "azp",
-            "cnf",
-            "at_hash",
-            "c_hash",
-            "sid",
-            "org_id",
-            "roles",
-            "permissions",
-            "permissions_status",
-            "act",
-        ] {
+        for name in HOOK_PROTECTED_NAMES {
             let mut returned = BTreeMap::new();
-            returned.insert(name.to_owned(), serde_json::json!("attacker"));
+            returned.insert((*name).to_owned(), serde_json::json!("attacker"));
             assert!(
                 super::filter_hook_claims(&returned).accepted.is_empty(),
                 "a hook set {name}"
             );
         }
+    }
+
+    /// The hand-written list above names every protected access-token claim.
+    ///
+    /// The list is deliberately INDEPENDENT of the constant: it is a second enumeration, so
+    /// deleting a name from `PROTECTED_ACCESS_TOKEN_CLAIMS` still has to be an edit somebody
+    /// makes here too, and the test above then fails. That is worth keeping. What it cannot
+    /// do on its own is notice an ADDITION, which is how `authorization_details` came to be
+    /// the one protected name the hook test never probed. This closes that direction without
+    /// giving up the independence: the hand list may hold extra names (it also covers the
+    /// other two protected lists), but it may not hold fewer.
+    #[test]
+    fn the_hand_written_hook_list_covers_every_protected_access_token_claim() {
+        let probed: BTreeSet<&str> = HOOK_PROTECTED_NAMES.iter().copied().collect();
+        let missing: Vec<&&str> = PROTECTED_ACCESS_TOKEN_CLAIMS
+            .iter()
+            .filter(|name| !probed.contains(*name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these protected claims are in PROTECTED_ACCESS_TOKEN_CLAIMS but the hook test              never probes them, so nothing checks that a hook is refused when it sets one:              {missing:?}"
+        );
     }
 
     /// A claim name with no name is refused, on every shape of "no name" the mapping half tests.

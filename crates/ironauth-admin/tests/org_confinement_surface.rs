@@ -3,7 +3,7 @@
 //! Every organization-addressed operation reaches the confinement fence (issue #102,
 //! acceptance criterion 2).
 //!
-//! # Why a structural pin rather than 36 end-to-end probes
+//! # Why a structural pin rather than an end-to-end probe per operation
 //!
 //! Confinement has ONE choke point. `resolve_live_org` performs the existence read and
 //! then calls `Principal::require_organization`, which is what answers the uniform
@@ -36,6 +36,12 @@ use std::collections::BTreeSet;
 /// their handlers delegate into. Read as text so a handler added tomorrow is covered
 /// without touching this list, provided its file is here.
 const ADMIN_SOURCES: &[(&str, &str)] = &[
+    // Added after a review measured the gap: four organization-addressed API-key
+    // operations live here and the scan could not see any of them, so the file whose
+    // whole purpose is "a new endpoint goes through the fence at all" was blind to a
+    // whole module. All four already resolve through `resolve_live_org`; the omission
+    // was the scan's, not theirs.
+    ("api_keys.rs", include_str!("../src/api_keys.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),
     (
         "org_effective_roles.rs",
@@ -65,10 +71,16 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// The number of organization-addressed operations the sources declare.
 ///
 /// Pinned so that ADDING one is a deliberate step: the new operation has to be fenced and
-/// this number bumped in the same change. It agrees with the count
-/// `deleted_environment.rs` resolves against the committed contract, which is the
-/// independent check that this scan is reading the same surface the document publishes.
-const ORG_ADDRESSED_OPERATIONS: usize = 36;
+/// this number bumped in the same change.
+///
+/// It agrees with the count `deleted_environment.rs` resolves against the committed
+/// contract, which is the independent check that this scan is reading the same surface
+/// the document publishes. That sentence was FALSE until a review measured it: this pin
+/// said 37 while the contract published 41, and the four-operation gap was `api_keys.rs`
+/// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
+/// worth nothing while nothing compares them, so the agreement is now asserted below
+/// rather than only claimed here.
+const ORG_ADDRESSED_OPERATIONS: usize = 41;
 
 /// The path segment that makes an operation organization-addressed.
 fn org_addressed(attr: &str) -> bool {
@@ -174,4 +186,71 @@ fn every_organization_addressed_operation_reaches_the_confinement_fence() {
          credential confined to one organization is not fenced out of a sibling on them \
          and the confinement is decoration on those paths: {unfenced:?}"
     );
+}
+
+/// The scan reads the same surface the committed contract publishes.
+///
+/// The pin's doc comment claimed this agreement for as long as the pin existed, and it
+/// was false the whole time: 37 here against 41 published, because `ADMIN_SOURCES` had no
+/// entry for `api_keys.rs` and the scan therefore could not see a whole module. A scan
+/// that silently covers a SUBSET of the surface answers "everything is fenced" about the
+/// part it happens to read, which is the one answer it must never be able to give wrongly.
+///
+/// So the agreement is measured rather than asserted in prose. It resolves the operation
+/// IDS, not just the counts: two sets of the same size that name different operations
+/// would satisfy a count comparison.
+#[test]
+fn the_scan_reads_every_operation_the_committed_contract_publishes() {
+    const COMMITTED_SPEC: &str = include_str!("../../../docs/openapi/management.json");
+    const ORGANIZATION_PREFIX: &str =
+        "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}";
+
+    let doc: serde_json::Value =
+        serde_json::from_str(COMMITTED_SPEC).expect("the committed spec parses");
+    let mut published = BTreeSet::new();
+    for (template, entries) in doc["paths"].as_object().expect("paths") {
+        if !template.starts_with(ORGANIZATION_PREFIX) {
+            continue;
+        }
+        for (_method, entry) in entries.as_object().expect("operations") {
+            published.insert(
+                entry["operationId"]
+                    .as_str()
+                    .expect("every operation carries an id")
+                    .to_owned(),
+            );
+        }
+    }
+
+    let scanned: BTreeSet<String> = org_operations()
+        .iter()
+        .filter_map(|(_file, handler, source)| operation_id_of(source, handler))
+        .collect();
+
+    let unscanned: Vec<&String> = published.difference(&scanned).collect();
+    assert!(
+        unscanned.is_empty(),
+        "the contract publishes these organization-addressed operations and this scan \
+         cannot see them, so nothing checks that they reach the confinement fence. Add \
+         their file to ADMIN_SOURCES: {unscanned:?}"
+    );
+    let unpublished: Vec<&String> = scanned.difference(&published).collect();
+    assert!(
+        unpublished.is_empty(),
+        "this scan reads operations the contract does not publish, so it is no longer \
+         reading the surface the document describes: {unpublished:?}"
+    );
+}
+
+/// The `operation_id` declared by the `#[utoipa::path]` attribute above `handler`.
+fn operation_id_of(source: &str, handler: &str) -> Option<String> {
+    const MARKER: &str = "operation_id = \"";
+    let at = source.find(&format!("pub async fn {handler}("))?;
+    // Search BACKWARDS from the handler, so the attribute read is the one immediately
+    // above it. A forward scan would pair a handler with the next attribute in the file.
+    let attribute = source[..at].rfind(concat!("#[utoipa", "::path("))?;
+    let block = &source[attribute..at];
+    let start = block.find(MARKER)? + MARKER.len();
+    let end = block[start..].find('"')?;
+    Some(block[start..start + end].to_owned())
 }

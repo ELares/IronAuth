@@ -346,7 +346,8 @@ impl DiscoveryCapabilities {
             .with_require_pushed_authorization_requests(
                 config.require_pushed_authorization_requests,
             );
-        caps.authorization_details_types = config.authorization_details_types.clone();
+        caps.authorization_details_types
+            .clone_from(&config.authorization_details_types);
         if config.enable_response_type_id_token {
             caps = caps.with_additional_response_type(ResponseType::IdToken.as_str());
         }

@@ -16945,7 +16945,7 @@
           "organizations"
         ],
         "summary": "Add a MACHINE IDENTITY to an organization (issue #126).",
-        "description": "Its own route rather than a variant of `createMembership`, because both the request and the\nresponse would otherwise have to make `user_id` optional -- and relaxing a required\nproperty is breaking for every consumer already decoding it.\n\nThis is the granting path for a capability the store has modelled since issue #99:\n`MembershipPrincipal::ServiceAccount`, `create_for_service_account` and\n`effective_permissions_for_service_account` all existed, AuthZEN read them, and the only\ncallers of the creator anywhere were two test files. So a machine identity could hold roles\nin principle and could be given none in practice.",
+        "description": "Its own route rather than a variant of `createMembership`, because both the request and the\nresponse would otherwise have to make `user_id` optional -- and relaxing a required\nproperty is breaking for every consumer already decoding it.\n\nThis is the granting path for a capability the store has modelled since issue #99:\n`MembershipPrincipal::ServiceAccount`, `create_for_service_account` and\n`effective_permissions_for_service_account` all existed, `AuthZEN` read them, and the only\ncallers of the creator anywhere were two test files. So a machine identity could hold roles\nin principle and could be given none in practice.",
         "operationId": "createServiceAccountMembership",
         "parameters": [
           {
@@ -33318,7 +33318,7 @@
         "properties": {
           "allowed": {
             "type": "boolean",
-            "description": "Whether this public client may receive UNBOUND bearer tokens. `false`, the default\nfor every client, means it must present a DPoP proof at the token endpoint."
+            "description": "Whether this public client may receive UNBOUND bearer tokens. `false`, the default\nfor every client, means it must present a `DPoP` proof at the token endpoint."
           }
         }
       },
