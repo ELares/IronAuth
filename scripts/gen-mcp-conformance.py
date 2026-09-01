@@ -75,8 +75,16 @@ def main() -> int:
         "## What the evidence column is",
         "",
         "The response the measurement actually saw: a status code, a challenge header, a",
-        "body. It is recorded verbatim rather than summarised, so an item that passes for",
-        "the wrong reason is visible here rather than hidden behind the word `pass`.",
+        "body. It is recorded rather than summarised, so an item that passes for the wrong",
+        "reason is visible here rather than hidden behind the word `pass`.",
+        "",
+        "Three things are done to it, each deliberately. Credential-bearing members are",
+        "REDACTED BY NAME, never by length: relying on a truncation point to keep a token",
+        "out of a committed file is not a redaction. Run-specific identifiers and ports are",
+        "normalised, so this page is stable across runs and its drift check stays",
+        "meaningful. And a long cell is TRUNCATED to 180 characters with a trailing `...`,",
+        "so the column stays readable; the untruncated value is in",
+        "`docs/conformance/mcp-results.json` after a run.",
         "",
         "| Item | Requirement | Outcome | Evidence |",
         "|------|-------------|---------|----------|",
@@ -84,6 +92,9 @@ def main() -> int:
     for item in items:
         evidence = normalise(item["evidence"]).replace("|", "\\|").replace("\n", " ")
         if len(evidence) > 180:
+            # The ellipsis is not decoration: without it a truncated cell reads as a complete
+            # response, and a reader cannot tell that the part which would have contradicted
+            # the outcome was simply cut off.
             evidence = evidence[:180] + "..."
         outcome = "pass" if item["outcome"] == "pass" else "**FAIL**"
         lines.append(

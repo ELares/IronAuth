@@ -16,8 +16,16 @@ reinterpretation of this one.
 ## What the evidence column is
 
 The response the measurement actually saw: a status code, a challenge header, a
-body. It is recorded verbatim rather than summarised, so an item that passes for
-the wrong reason is visible here rather than hidden behind the word `pass`.
+body. It is recorded rather than summarised, so an item that passes for the wrong
+reason is visible here rather than hidden behind the word `pass`.
+
+Three things are done to it, each deliberately. Credential-bearing members are
+REDACTED BY NAME, never by length: relying on a truncation point to keep a token
+out of a committed file is not a redaction. Run-specific identifiers and ports are
+normalised, so this page is stable across runs and its drift check stays
+meaningful. And a long cell is TRUNCATED to 180 characters with a trailing `...`,
+so the column stays readable; the untruncated value is in
+`docs/conformance/mcp-results.json` after a run.
 
 | Item | Requirement | Outcome | Evidence |
 |------|-------------|---------|----------|
@@ -26,11 +34,11 @@ the wrong reason is visible here rather than hidden behind the word `pass`.
 | `MCP-DCR` A client registers dynamically and receives an identifier | RFC 7591; MCP authorization registration | pass | `status=201 body={"application_type":"native","client_id":"cli_<id>","client_id_issued_at":<time>,"client_name":"mcp conformance client","grant_types":["authorization_code"],"id_tok...` |
 | `MCP-ADMIN-CONSENT` An operator pre-authorizes the registered client's scopes | IronAuth admin consent; MCP authorization client approval | pass | `status=200 body={"client_id":"cli_<id>","scope":"openid mcp.tools"}` |
 | `MCP-BEARER-EXEMPTION` A public client is exempted from the DPoP-by-default posture | RFC 9449; IronAuth DPoP-by-default (issue #124) | pass | `status=200 body={"client_id":"cli_<id>","allow_bearer_tokens":true}` |
-| `MCP-AUDIENCE-BOUND` A login yields a token bound to the MCP server it was requested for | RFC 8707; MCP authorization audience binding | pass | `code exchanged, scope=openid mcp.tools` |
+| `MCP-AUDIENCE-BOUND` A login yields a token whose aud is the MCP server it was requested for | RFC 8707; MCP authorization audience binding | pass | `aud=["http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-a"] requested=http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-a` |
 | `MCP-CALL-SUCCEEDS` The bound token is accepted by the server it names | RFC 9068 section 4 | pass | `status=200 body={"tool":"echo","resource":"http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-a","subject":"usr_<id>` |
 | `MCP-REPLAY-REFUSED` The same token replayed at another MCP server is refused | MCP authorization strict audience validation | pass | `status=401 www-authenticate=Bearer realm="http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-b", error="invalid_token", error_description="the credential is for another resource", r...` |
 | `MCP-INSUFFICIENT-SCOPE` A call missing the tool scope is a 403 naming the scope to request | RFC 6750 section 3.1; MCP authorization step-up | pass | `status=403 www-authenticate=Bearer realm="http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-a", error="insufficient_scope", scope="mcp.tools", error_description="the credential doe...` |
-| `MCP-QUICKSTART-BUDGET` Zero to a secured MCP server inside the documented budget | IronAuth MCP quickstart: 5 minutes | pass | `scripted run completed within the 300s budget` |
+| `MCP-QUICKSTART-BUDGET` Zero to a secured MCP server inside the documented budget | IronAuth MCP quickstart: 5 minutes | pass | `emulator start to authorized MCP call, bucketed: under 60s (budget 300s)` |
 
 ## What this bundle does not claim
 

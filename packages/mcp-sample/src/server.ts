@@ -87,6 +87,34 @@ export async function authorize(
 export function start(config: SampleServerConfig, port: number): Promise<{ close: () => void }> {
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
     void (async () => {
+      try {
+        await handle(config, request, response);
+      } catch (error) {
+        // An EXCEPTION MUST STILL BE AN ANSWER. Without this an unexpected throw inside
+        // verification leaves the socket open with no response, the driver hangs until its
+        // timeout, and an unhandled rejection takes the process down: the conformance run
+        // reports nothing at all rather than reporting a failure. A resource server that
+        // cannot answer is not a safer resource server.
+        if (!response.headersSent) {
+          response.writeHead(500, { "content-type": "application/json" });
+        }
+        response.end(JSON.stringify({ error: "server_error", detail: String(error) }));
+      }
+    })();
+  });
+  return new Promise((resolve) => {
+    server.listen(port, "127.0.0.1", () => resolve({ close: () => server.close() }));
+  });
+}
+
+/** The request path proper, so `start` owns only the error boundary around it. */
+async function handle(
+  config: SampleServerConfig,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  {
+    {
       const outcome = await authorize(config, request.headers.authorization);
       if ("kind" in outcome) {
         response.writeHead(statusFor(outcome), {
@@ -108,9 +136,6 @@ export function start(config: SampleServerConfig, port: number): Promise<{ close
           agent: outcome.raw["agent_id"] ?? null,
         }),
       );
-    })();
-  });
-  return new Promise((resolve) => {
-    server.listen(port, "127.0.0.1", () => resolve({ close: () => server.close() }));
-  });
+    }
+  }
 }

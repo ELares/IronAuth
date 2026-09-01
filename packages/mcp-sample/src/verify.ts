@@ -81,7 +81,10 @@ function importKey(jwk: Jwk): { key: ReturnType<typeof createPublicKey>; alg: st
       alg: "EdDSA",
     };
   }
-  if (jwk.kty === "EC" && jwk.x && jwk.y !== undefined) {
+  // ES256 is P-256 AND NOTHING ELSE (RFC 7518 section 3.4). Accepting any EC curve would
+  // let a P-384 or secp256k1 key verify under an `alg` of ES256, which is an algorithm the
+  // key was never issued for.
+  if (jwk.kty === "EC" && jwk.crv === "P-256" && jwk.x && jwk.y !== undefined) {
     return { key: createPublicKey({ key: jwk as never, format: "jwk" }), alg: "ES256" };
   }
   if (jwk.kty === "RSA" && jwk.n && jwk.e) {

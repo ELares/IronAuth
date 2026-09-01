@@ -24,3 +24,10 @@ clients/mobile/android/app/build/
 clients/mobile/android/.gradle/
 clients/mobile/android/build/
 clients/mobile/android/local.properties
+
+# The MEASURED results the conformance page is generated from (issue #129). A RUN artifact,
+# not a committed one: it carries the raw tenant, client, and user ids of whichever run
+# produced it, so committing it would churn on every run and the drift check that keeps the
+# page honest would be turned off within a week. The generated page IS the published
+# artifact, and it is committed and drift-checked.
+docs/conformance/mcp-results.json

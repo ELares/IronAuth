@@ -35,6 +35,71 @@ async function json(response: Response): Promise<Record<string, unknown>> {
   return (await response.json()) as Record<string, unknown>;
 }
 
+/** Response body keys that carry a credential and must never reach a committed page. */
+const SECRET_KEYS = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "client_secret",
+  "registration_access_token",
+  "token",
+];
+
+/**
+ * A response body rendered for the evidence column, with credential-bearing members
+ * REDACTED BY NAME.
+ *
+ * Not by length. The DCR response carries a `registration_access_token`, and in the first
+ * draft of this file the only thing keeping it out of two committed documents was that the
+ * evidence happened to be truncated before reaching it. A redaction that depends on where a
+ * string happens to end is not a redaction.
+ */
+function evidenceBody(body: Record<string, unknown>): string {
+  const safe: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body)) {
+    safe[key] = SECRET_KEYS.includes(key) ? "<redacted>" : value;
+  }
+  return JSON.stringify(safe);
+}
+
+/** A response body as evidence, without throwing when it is not JSON. */
+async function evidenceOf(response: Response): Promise<string> {
+  const text = await response.text();
+  try {
+    return evidenceBody(JSON.parse(text) as Record<string, unknown>);
+  } catch {
+    // A non-JSON body is exactly the case a FAILING item hits, so it must render rather
+    // than throw: an uncaught parse here turns a recorded failure into a crashed lane, and
+    // the page then reports nothing at all instead of reporting the failure.
+    return text.slice(0, 300);
+  }
+}
+
+/** The `resource_metadata` pointer out of a challenge, or the empty string. */
+function pointerOf(challenge: string): string {
+  return /resource_metadata="([^"]+)"/.exec(challenge)?.[1] ?? "";
+}
+
+/** The `aud` claim of a JWT, without verifying it: the driver reads, the server verifies. */
+function audienceOf(token: string): string[] {
+  const segment = token.split(".")[1];
+  if (segment === undefined) {
+    return [];
+  }
+  try {
+    const claims = JSON.parse(
+      Buffer.from(segment.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"),
+    ) as Record<string, unknown>;
+    const aud = claims["aud"];
+    if (typeof aud === "string") {
+      return [aud];
+    }
+    return Array.isArray(aud) ? aud.filter((m): m is string => typeof m === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 function randomKey(): string {
   return Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("hex");
 }
@@ -89,12 +154,18 @@ async function main(): Promise<void> {
         title: "An unauthenticated call is a 401 naming where the authorization server is",
         requirement: "MCP authorization; RFC 9728 section 5.1",
       },
-      anonymous.status === 401 && anonymousChallenge.includes("resource_metadata="),
+      // The pointer must be an ABSOLUTE url on the authorization server's own host, and
+      // the realm must be the resource. Checking only that the substring `resource_metadata=`
+      // appears would be the sample asserting its own literal: both halves of that are
+      // unconditional in server.ts, so nothing about IronAuth would be exercised.
+      anonymous.status === 401 &&
+        pointerOf(anonymousChallenge).startsWith(`${host}/.well-known/oauth-protected-resource`) &&
+        anonymousChallenge.includes(`realm="${resourceA}"`),
       `status=${anonymous.status} www-authenticate=${anonymousChallenge}`,
     );
 
     // ---- the pointer resolves to a document naming this authorization server ----
-    const metadataUrl = /resource_metadata="([^"]+)"/.exec(anonymousChallenge)?.[1] ?? "";
+    const metadataUrl = pointerOf(anonymousChallenge);
     const metadata = metadataUrl ? await fetch(metadataUrl) : null;
     const metadataBody = metadata?.ok ? await json(metadata) : {};
     const servers = (metadataBody["authorization_servers"] as string[] | undefined) ?? [];
@@ -149,7 +220,7 @@ async function main(): Promise<void> {
           requirement: "RFC 7591; MCP authorization registration",
         },
         registered.status === 201 && clientId !== "",
-        `status=${registered.status} body=${JSON.stringify(body).slice(0, 240)}`,
+        `status=${registered.status} body=${evidenceBody(body)}`,
       );
     } else {
       record(
@@ -187,7 +258,7 @@ async function main(): Promise<void> {
           requirement: "IronAuth admin consent; MCP authorization client approval",
         },
         consent.status === 200,
-        `status=${consent.status} body=${JSON.stringify(await json(consent)).slice(0, 200)}`,
+        `status=${consent.status} body=${await evidenceOf(consent)}`,
       );
 
       const bearer = await fetch(`${scopeBase}/clients/${clientId}/bearer-tokens`, {
@@ -206,7 +277,7 @@ async function main(): Promise<void> {
           requirement: "RFC 9449; IronAuth DPoP-by-default (issue #124)",
         },
         bearer.status === 200,
-        `status=${bearer.status} body=${JSON.stringify(await json(bearer)).slice(0, 200)}`,
+        `status=${bearer.status} body=${await evidenceOf(bearer)}`,
       );
     }
 
@@ -225,14 +296,21 @@ async function main(): Promise<void> {
         password: devPassword,
       });
       tokenForA = outcome.accessToken ?? "";
+      // The AUDIENCE, decoded and compared. Asserting only that a token came back would
+      // pass for a token audienced to the client, to the issuer, to both resources, or to
+      // nothing at all, which is every failure this item exists to rule out. The row cites
+      // RFC 8707; it has to look at the claim RFC 8707 is about.
+      const audience = audienceOf(tokenForA);
       record(
         {
           id: "MCP-AUDIENCE-BOUND",
-          title: "A login yields a token bound to the MCP server it was requested for",
+          title: "A login yields a token whose aud is the MCP server it was requested for",
           requirement: "RFC 8707; MCP authorization audience binding",
         },
-        tokenForA !== "",
-        outcome.detail,
+        audience.length === 1 && audience[0] === resourceA,
+        tokenForA === ""
+          ? outcome.detail
+          : `aud=${JSON.stringify(audience)} requested=${resourceA}`,
       );
     }
 
