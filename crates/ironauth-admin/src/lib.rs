@@ -515,6 +515,10 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state",
             axum::routing::put(agents::set_agent_state),
         )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections",
+            axum::routing::put(agents::store_agent_vault_connection),
+        )
         // The MACHINE IDENTITY membership (issue #126). Its own path rather than a variant of
         // the one above, because making `user_id` optional in either the request or the
         // response is breaking for every consumer already decoding it.

@@ -249,6 +249,11 @@ pub struct OidcState {
     // uniform 404 and discovery advertises nothing. The designated env and branding
     // that SHAPE the documents live in `Inner` (config data cannot arm the surface).
     fedcm_enabled: bool,
+    // The agent token vault (issue #132), armed through the builder for the SAME anti-bypass
+    // reason as fedcm: it is not a plain `OidcConfig` toggle an operator can set without
+    // acknowledging the exploratory version. With it false the exchange answers a uniform
+    // 404, and no agent can be handed a third-party credential at all.
+    agent_vault_enabled: bool,
     // Whether the experimental CIMD surface is armed (issue #128). Kept OUTSIDE `Inner` and
     // set through the builder for the SAME anti-bypass reason as fedcm: an operator who
     // could flip this from the `[oidc]` table would have the server dereferencing
@@ -1006,6 +1011,7 @@ impl OidcState {
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
             fedcm_enabled: false,
+            agent_vault_enabled: false,
             cimd_enabled: false,
             cimd_cache: Arc::new(crate::cimd::CimdCache::new(CIMD_CACHE_ENTRIES)),
             cimd_source: None,
@@ -1137,6 +1143,24 @@ impl OidcState {
     #[must_use]
     pub fn fedcm_enabled(&self) -> bool {
         self.fedcm_enabled
+    }
+
+    /// Arm the experimental agent token vault (issue #132).
+    ///
+    /// Through the BUILDER, never `OidcConfig`, for the same reason FedCM is: arming is only
+    /// ever reachable through the feature ladder, so an operator cannot hand agents
+    /// third-party credentials without acknowledging the exact exploratory version. When
+    /// false (the default) the exchange answers a uniform 404.
+    #[must_use]
+    pub fn with_agent_vault_enabled(mut self, enabled: bool) -> Self {
+        self.agent_vault_enabled = enabled;
+        self
+    }
+
+    /// Whether the agent token vault exchange is armed (issue #132).
+    #[must_use]
+    pub fn agent_vault_enabled(&self) -> bool {
+        self.agent_vault_enabled
     }
 
     /// Arm the experimental CIMD surface (issue #128) and install the document source.
@@ -3865,7 +3889,8 @@ impl OidcState {
     /// resource-server endpoint (RFC 9449 sections 7.1 and 4.3, issue #368). This is
     /// the resource-server counterpart to the issuance-side `resolve_dpop_binding`, and
     /// is shared by both access-token formats (`at+jwt` and opaque) so the enforcement
-    /// cannot diverge between them. Scope: the `userinfo` endpoint. Introspection is
+    /// cannot diverge between them. Scope: any endpoint accepting a presented access token; it was `userinfo` alone, which is
+    /// why the `htu` used to be a constant here. Introspection is
     /// deliberately OUT of scope: it is a CLIENT-facing endpoint where the token rides
     /// the request body under client authentication, not as a presented `DPoP`
     /// credential.
@@ -3880,7 +3905,7 @@ impl OidcState {
     /// single `invalid_token` (no oracle; the granular reason is logged server-side):
     /// - a BOUND token MUST be presented with the `DPoP` scheme (a `Bearer`
     ///   presentation of a bound token is refused, RFC 9449 7.1: no bearer downgrade), a
-    ///   proof MUST be present, the proof MUST validate against the `userinfo` `htu`,
+    ///   proof MUST be present, the proof MUST validate against the CALLER's `htu`,
     ///   the request method, the freshness window, and the `ath` of the EXACT presented
     ///   token, the proof key thumbprint MUST equal `expected_jkt`, and the proof `jti`
     ///   MUST be fresh in the cross-node replay store;
@@ -3890,6 +3915,12 @@ impl OidcState {
     /// # Errors
     ///
     /// `Err(())` for every rejection above (uniform, no oracle).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is an independent input the caller has already resolved, \
+        and the newest one (the endpoint's own htu) is the whole point: bundling them into a \
+        struct would move the parameter list rather than shorten it"
+    )]
     pub(crate) async fn verify_dpop_presentation(
         &self,
         scope: &Scope,
@@ -3897,6 +3928,12 @@ impl OidcState {
         scheme: crate::dpop::PresentedScheme,
         proof: Option<&str>,
         htm: &str,
+        // The endpoint's OWN normalized URL. A parameter rather than a constant, because a
+        // shared `htu` is a shared binding: a proof minted for one resource would validate at
+        // another, which is the replay the field exists to prevent. This was
+        // `normalized_htu_for_userinfo` inline, which was right while userinfo was the only
+        // caller and silently wrong the moment a second endpoint reused the function.
+        htu: &str,
         token: &str,
     ) -> Result<(), crate::dpop::DpopPresentationFailure> {
         use crate::dpop::{DpopPresentationFailure, PresentedScheme};
@@ -3926,21 +3963,19 @@ impl OidcState {
         };
 
         // The proof must carry the ath of the EXACT presented token string, and match
-        // the userinfo htu, the request method, and the freshness window. The htu is the
-        // deployment-root userinfo URL (never the per-environment issuer).
+        // the CALLER's htu, the request method, and the freshness window.
         let now = self.now();
-        let htu = crate::dpop::normalized_htu_for_userinfo(self);
         let ath = access_token_hash(token);
         let expected = DpopExpectations {
             htm,
-            htu: &htu,
+            htu,
             iat_leeway: crate::dpop::DPOP_IAT_LEEWAY,
             iat_skew: crate::dpop::DPOP_IAT_SKEW,
             ath: Some(&ath),
             nonce: None,
         };
         let validated = validate_dpop_proof(proof, &expected, now).map_err(|error| {
-            tracing::warn!(%error, "rejecting an invalid DPoP proof at userinfo");
+            tracing::warn!(%error, "rejecting an invalid DPoP proof");
             DpopPresentationFailure::Rejected
         })?;
 
@@ -3969,7 +4004,7 @@ impl OidcState {
                 .is_some_and(|nonce| self.dpop_nonces().is_acceptable(nonce, now));
             if !acceptable {
                 let nonce = self.dpop_nonces().issue(self.env().entropy(), now);
-                tracing::debug!("challenging a userinfo request for a server-issued DPoP nonce");
+                tracing::debug!(%htu, "challenging a request for a server-issued DPoP nonce");
                 return Err(DpopPresentationFailure::NeedsNonce { nonce });
             }
         }
@@ -3990,11 +4025,11 @@ impl OidcState {
             )
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "the DPoP proof replay store failed at userinfo");
+                tracing::warn!(%error, %htu, "the DPoP proof replay store failed");
                 DpopPresentationFailure::Rejected
             })?;
         if !fresh {
-            tracing::warn!("rejecting a replayed DPoP proof jti at userinfo");
+            tracing::warn!(%htu, "rejecting a replayed DPoP proof jti");
             return Err(DpopPresentationFailure::Rejected);
         }
         Ok(())

@@ -890,6 +890,13 @@ name = "agent_issuance"
 path = "tests/agent_issuance.rs"
 required-features = ["testing"]
 
+# The agent vault EXCHANGE endpoint (issue #132): the flag-off posture including the shape
+# that used to answer 415, both entitlement fences, and the audit row. Over a real database.
+[[test]]
+name = "agent_vault"
+path = "tests/agent_vault.rs"
+required-features = ["testing"]
+
 # RFC 8707 resource indicators (issue #28): URI validation, per-client allowlist
 # rejection with invalid_target, multi-resource authorization narrowed at the token
 # endpoint, refresh downscoping (and expansion rejection), cross-resource replay

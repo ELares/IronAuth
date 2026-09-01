@@ -238,7 +238,16 @@ async fn resolve(
     let cnf =
         Confirmation::from_claims(verified.claims()).map_err(|_| UserInfoError::InvalidToken)?;
     let expected_jkt = confirmation_jkt(cnf.as_ref())?;
-    enforce_dpop(state, &scope, expected_jkt, &presented, method, token).await?;
+    enforce_dpop(
+        state,
+        &scope,
+        expected_jkt,
+        &presented,
+        method,
+        &crate::dpop::normalized_htu_for_userinfo(state),
+        token,
+    )
+    .await?;
 
     // The granted scope drives which claim sets are released (Core 5.4). UserInfo
     // requires the openid scope (Core 5.3.1); its absence is insufficient_scope.
@@ -308,6 +317,7 @@ async fn resolve_opaque(
         active.dpop_jkt.as_deref(),
         presented,
         method,
+        &crate::dpop::normalized_htu_for_userinfo(state),
         token,
     )
     .await?;
@@ -405,10 +415,17 @@ fn query_carries_access_token(query: Option<&str>) -> bool {
 /// An access token as PRESENTED at `UserInfo`: the token, the HTTP authentication
 /// scheme it came under (`Bearer` or `DPoP`), and the single `DPoP` proof header
 /// value (present only for a `DPoP`-scheme presentation).
-struct Presented {
+pub(crate) struct Presented {
     token: String,
     scheme: PresentedScheme,
     proof: Option<String>,
+}
+
+impl Presented {
+    /// The presented token, whatever scheme carried it.
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 /// Extract the presented access token, its scheme, and (for a `DPoP` presentation)
@@ -423,7 +440,7 @@ struct Presented {
 /// more than one `Authorization` header, or (for a `DPoP` presentation) more than one
 /// `DPoP` header, is [`UserInfoError::InvalidRequest`]. The `DPoP` header is read ONLY
 /// for a `DPoP`-scheme presentation; a bearer presentation ignores it.
-fn presented_credential(headers: &HeaderMap) -> Result<Presented, UserInfoError> {
+pub(crate) fn presented_credential(headers: &HeaderMap) -> Result<Presented, UserInfoError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let Some(first) = values.next() else {
         return Err(UserInfoError::MissingToken);
@@ -504,7 +521,9 @@ fn read_single_dpop_header(headers: &HeaderMap) -> Result<Option<String>, UserIn
 /// sender-constrained token as a plain bearer, downgrading its binding. Inert today
 /// (nothing mints a non-`jkt`-bound access token), a fail-closed guard for when mTLS
 /// binding lands.
-fn confirmation_jkt(confirmation: Option<&Confirmation>) -> Result<Option<&str>, UserInfoError> {
+pub(crate) fn confirmation_jkt(
+    confirmation: Option<&Confirmation>,
+) -> Result<Option<&str>, UserInfoError> {
     match confirmation {
         None => Ok(None),
         Some(Confirmation::Jkt(jkt)) => Ok(Some(jkt.as_str())),
@@ -516,14 +535,54 @@ fn confirmation_jkt(confirmation: Option<&Confirmation>) -> Result<Option<&str>,
 /// (its `cnf.jkt` or opaque `dpop_jkt`, or [`None`] when unbound), collapsing every
 /// `DPoP` failure to the uniform [`UserInfoError::InvalidToken`] (RFC 9449 7.1). The
 /// granular reason is logged server-side by the state helper, never surfaced.
-async fn enforce_dpop(
+pub(crate) async fn enforce_dpop(
     state: &OidcState,
     scope: &Scope,
     expected_jkt: Option<&str>,
     presented: &Presented,
     method: &str,
+    // The endpoint's own normalized URL. See `verify_dpop_presentation`: two endpoints sharing
+    // one `htu` share no binding, so a caller that is not UserInfo passes its own.
+    htu: &str,
     token: &str,
 ) -> Result<(), UserInfoError> {
+    enforce_dpop_outcome(state, scope, expected_jkt, presented, method, htu, token)
+        .await
+        .map_err(|failure| match failure {
+            DpopRefusal::Rejected => UserInfoError::InvalidTokenDpop,
+            // Carried through rather than collapsed: this is the one DPoP outcome the
+            // client is meant to act on rather than be told nothing about.
+            DpopRefusal::NeedsNonce { nonce } => UserInfoError::UseDpopNonce { nonce },
+        })
+}
+
+/// Why a `DPoP` presentation was refused, for a caller that is not `UserInfo`.
+///
+/// Two outcomes and not one. A caller that collapsed them would answer a bare 401 to a client
+/// that has done nothing wrong and is being told to retry with a nonce it was never given,
+/// which is a permanent lockout that burns a server-issued nonce per attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DpopRefusal {
+    /// The uniform refusal: a bound token presented as a bearer, a missing, invalid or
+    /// replayed proof, a thumbprint mismatch, or a `DPoP` presentation of an unbound token.
+    Rejected,
+    /// The presentation must be retried carrying this server-issued nonce (RFC 9449 8).
+    NeedsNonce {
+        /// The value for the `DPoP-Nonce` response header.
+        nonce: String,
+    },
+}
+
+/// [`enforce_dpop`] without the `UserInfo` error mapping, for a caller that renders its own.
+pub(crate) async fn enforce_dpop_outcome(
+    state: &OidcState,
+    scope: &Scope,
+    expected_jkt: Option<&str>,
+    presented: &Presented,
+    method: &str,
+    htu: &str,
+    token: &str,
+) -> Result<(), DpopRefusal> {
     state
         .verify_dpop_presentation(
             scope,
@@ -531,14 +590,13 @@ async fn enforce_dpop(
             presented.scheme,
             presented.proof.as_deref(),
             method,
+            htu,
             token,
         )
         .await
         .map_err(|failure| match failure {
-            DpopPresentationFailure::Rejected => UserInfoError::InvalidTokenDpop,
-            // Carried through rather than collapsed: this is the one DPoP outcome the
-            // client is meant to act on rather than be told nothing about.
-            DpopPresentationFailure::NeedsNonce { nonce } => UserInfoError::UseDpopNonce { nonce },
+            DpopPresentationFailure::Rejected => DpopRefusal::Rejected,
+            DpopPresentationFailure::NeedsNonce { nonce } => DpopRefusal::NeedsNonce { nonce },
         })
 }
 
@@ -546,7 +604,7 @@ async fn enforce_dpop(
 /// handle. Bounded and total: an oversized token, a non-three-segment shape, a
 /// non-base64url payload, non-object claims, or a missing or non-string `jti` all
 /// yield [`None`]. Nothing here is trusted; the token is authenticated afterward.
-fn peek_jti(token: &str) -> Option<String> {
+pub(crate) fn peek_jti(token: &str) -> Option<String> {
     if token.len() > MAX_TOKEN_BYTES {
         return None;
     }
@@ -608,7 +666,7 @@ fn success(claims: &Map<String, Value>) -> Response {
 /// issued, and the client's retry would then be refused by the very check that just
 /// challenged it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum UserInfoError {
+pub(crate) enum UserInfoError {
     /// No access token was presented: `401` with a bare `Bearer` challenge and NO
     /// error code (RFC 6750 3.1).
     MissingToken,

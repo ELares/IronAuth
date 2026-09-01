@@ -74,6 +74,7 @@ mod account;
 pub mod account_linking;
 mod acme;
 pub mod advanced_recovery;
+pub mod agent_vault;
 mod authn;
 mod authorize;
 mod backchannel;
@@ -455,6 +456,13 @@ pub fn oidc_router(state: OidcState) -> Router {
             get(authorize::scoped_authorize_get).post(authorize::scoped_authorize_post),
         )
         .route("/token", post(token::token))
+        // The agent vault exchange (issue #132): an agent trades its IronAuth token for the
+        // downstream credential it is entitled to. MOUNTED UNCONDITIONALLY and gated INSIDE
+        // the handler, like every other flag-gated surface here: a route that appears and
+        // disappears with a flag answers a different shape of 404 than an unknown path, which
+        // tells an unauthenticated prober whether the feature exists. With the flag off this
+        // is a uniform 404.
+        .route("/agent/vault/exchange", post(agent_vault::exchange))
         // Pushed authorization requests (PAR, RFC 9126, issue #27): an authenticated
         // back-channel POST that validates a complete authorization request and
         // returns a one-time request_uri. Advertised in discovery as

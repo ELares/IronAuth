@@ -22,10 +22,11 @@ use ironauth_admin::webhook_delivery::{
 };
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
-    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, ORG_SCOPED_CLIENTS_FEATURE,
-    OidcConfig, OutboxConfig, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
-    ScreeningProvider, WASM_HOOKS_FEATURE, WebhooksConfig,
+    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, Config, FEDCM_FEATURE,
+    FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded,
+    ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
+    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, WASM_HOOKS_FEATURE,
+    WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -579,6 +580,8 @@ struct DataPlaneSurfaces {
     global_revocation: bool,
     /// The experimental IdP-side FedCM surface (issue #83).
     fedcm: bool,
+    /// The agent token vault (issue #132), armed only through the exploratory ladder.
+    agent_vault: bool,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
     /// The experimental org-scoped-clients surface (issue #103, milestone M10).
@@ -611,6 +614,7 @@ impl DataPlaneSurfaces {
         Self {
             global_revocation: features.is_enabled(config, GLOBAL_TOKEN_REVOCATION_FEATURE),
             fedcm: features.is_enabled(config, FEDCM_FEATURE),
+            agent_vault: features.is_enabled(config, AGENT_TOKEN_VAULT_FEATURE),
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
@@ -1396,6 +1400,7 @@ async fn build_oidc_plane(
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
     .with_fedcm_enabled(surfaces.fedcm)
+    .with_agent_vault_enabled(surfaces.agent_vault)
     .with_risk_signals_enabled(surfaces.risk_signals)
     .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
     .with_first_party_challenge_enabled(surfaces.first_party_challenge)

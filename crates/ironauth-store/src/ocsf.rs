@@ -195,6 +195,10 @@ const ACCOUNT_CHANGE_DOMAINS: &[&str] = &[
     // Deliberately NOT entity management: registering an agent creates something that can
     // hold roles and obtain tokens, which is an account change, not configuration.
     "agent",
+    // The vault (issue #132). Storing, exchanging, and failing a downstream connection are
+    // changes to what a principal HOLDS, which is the account-change stream, not the token
+    // stream: no IronAuth token is minted by any of them.
+    "agent_vault",
     "human",
     "identifier",
     "invitation",

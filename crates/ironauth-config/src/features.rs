@@ -101,6 +101,25 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the agent token vault (issue #132, exploratory bet 1).
+///
+/// ONE flag for the whole surface: the stored downstream connection and the exchange that
+/// hands an agent a third-party token. They are useless apart, and an operator reasoning
+/// about "may an agent hold a Google token" is asking one question, not two.
+///
+/// Deliberately NOT claiming refresh. An earlier version of this sentence said the flag
+/// also turned on "the refresh that keeps one alive", and no refresh exists: nothing reads
+/// a stored refresh token, and this text is the operator-facing description of what the
+/// flag does.
+pub const AGENT_TOKEN_VAULT_FEATURE: &str = "agent-token-vault";
+
+/// The experimental `ack` version for the agent token vault (issue #132). It is
+/// EXPLORATORY in the strongest sense on this ladder: it makes IronAuth CUSTODIAN of a
+/// third party's credential, so the storage shape, the exchange contract, and the failure
+/// isolation are all early and may break between releases. Enabling it acknowledges this
+/// exact revision; a graduation that changes the shape bumps it and invalidates the old ack.
+pub const AGENT_TOKEN_VAULT_VERSION: &str = "0.1.0-exp.1";
+
 /// The registry name of the signup fraud-review-queue experimental feature (issue #82,
 /// PR 2). One plain umbrella flag so the whole quarantine surface (the register-path
 /// quarantine hook, the quarantined-user authorize restrictions, and the admin review
@@ -279,6 +298,7 @@ impl FeatureRegistry {
         registry.register_risk_signals();
         registry.register_org_scoped_clients();
         registry.register_signup_quarantine();
+        registry.register_agent_token_vault();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();
@@ -504,6 +524,33 @@ impl FeatureRegistry {
              rejects, or extends the case through the management review queue. EXPLORATORY: \
              the quarantine model is early and may break between releases.",
             SIGNUP_QUARANTINE_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
+    /// Registers the agent token vault (issue #132, exploratory bet 1): a per-agent store of
+    /// DOWNSTREAM third-party credentials and the exchange that hands an agent one scoped to
+    /// what it declared.
+    ///
+    /// NOT refresh. A stored refresh token is sealed and never read, so an expired downstream
+    /// credential has to be re-established rather than renewed. That is a real limitation and
+    /// it is stated here because this doc is what an operator reads before enabling the flag.
+    ///
+    /// It is EXPLORATORY in the strongest sense on this ladder, because it makes IronAuth the
+    /// CUSTODIAN of somebody else's credential. The storage shape, the exchange contract, and
+    /// the per-connection failure isolation are all early and may break between releases. Off
+    /// by default; with the flag off nothing is stored, the exchange answers a uniform 404,
+    /// and an agent holds no third-party credential at all.
+    pub fn register_agent_token_vault(&mut self) {
+        self.register(Feature::experimental(
+            AGENT_TOKEN_VAULT_FEATURE,
+            "Agent token vault (issue #132): a per-agent store of downstream third-party \
+             credentials (Google, GitHub) that an agent exchanges its IronAuth token for, \
+             scoped to what the agent DECLARED and audited on every exchange. Contents are \
+             sealed with the per-tenant key hierarchy, so a raw database dump yields no \
+             usable third-party credential. EXPLORATORY: this makes IronAuth the custodian \
+             of another party's credential, and the storage and exchange shapes are early.",
+            AGENT_TOKEN_VAULT_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }

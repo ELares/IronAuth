@@ -670,6 +670,24 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An operator gave an agent a downstream third-party credential (issue #132). It
+        // carries the connection, the agent, the organization and the PROVIDER, and no part
+        // of the credential: an event naming the secret would put it in every integrator's
+        // stream, which is the opposite of what sealing it at rest is for.
+        "agent.vault_connection_stored",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "agent_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "provider": {"type": "string", "minLength": 1}
+            },
+            "required": ["agent_id", "organization_id", "provider"]
+        }"#,
+    ),
+    (
         "organization.member_added",
         1,
         r#"{

@@ -787,6 +787,32 @@ pub enum Action {
     /// question an investigator brings to an agent is "what did it do, and for whom" and the
     /// answer has to be findable without reading every token ever minted.
     AgentTokenIssue,
+    /// A downstream credential was STORED for an agent (issue #132).
+    AgentVaultStore,
+    /// A sensitive agent action was HELD pending an out-of-band approval (issue #132).
+    AgentVaultApprovalRequested,
+    /// A held action was DECIDED: approved or denied (issue #132).
+    ///
+    /// One action for both outcomes, with the outcome in the detail. An approval and a denial
+    /// are the same event to an investigator asking "what happened to that request", and
+    /// splitting them would put half the answer in a different stream.
+    ///
+    /// A TIMEOUT emits nothing, and this said it did. Nothing writes state `expired`: an
+    /// approval that is never answered simply stops authorizing when its deadline passes,
+    /// which `VaultApproval::authorizes` computes from the row rather than from an event. So
+    /// the absence of a decision row IS the timeout, and an investigator has to read it that
+    /// way. A sweeper that expired the row and emitted this action would make the trail
+    /// self-describing; there is no sweeper.
+    AgentVaultApprovalDecided,
+    /// An agent EXCHANGED its IronAuth token for a stored downstream credential (issue #132).
+    ///
+    /// The row an investigator asks for first after a third-party incident: which agent got
+    /// which provider's credential, and when. Without it the vault is a store nobody can
+    /// account for, and IronAuth would be the custodian of a credential with no record of
+    /// handing it over.
+    AgentVaultExchange,
+    /// An agent's downstream connection was marked FAILED (issue #132).
+    AgentVaultFailed,
     /// A token request from an agent was REFUSED (issue #130).
     ///
     /// The audited denial the declared tool set exists to produce. A control that refuses
@@ -1675,6 +1701,11 @@ impl Action {
             }
             Action::AgentRegister => "agent.register",
             Action::AgentStateSet => "agent.state.set",
+            Action::AgentVaultStore => "agent_vault.store",
+            Action::AgentVaultApprovalRequested => "agent_vault.approval_requested",
+            Action::AgentVaultApprovalDecided => "agent_vault.approval_decided",
+            Action::AgentVaultExchange => "agent_vault.exchange",
+            Action::AgentVaultFailed => "agent_vault.failed",
             Action::AgentTokenIssue => "agent_token.issue",
             Action::AgentTokenDeny => "agent_token.deny",
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",

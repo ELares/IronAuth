@@ -1197,6 +1197,26 @@ impl ScopedKind for AgentPrincipalKind {
     const PREFIX: &'static str = "agp";
 }
 
+/// Marker for an agent's stored downstream connection (`avc_`), the vault row holding a
+/// third-party credential an agent acts with (issue #132).
+///
+/// Environment-scoped like the agent it belongs to, so a connection id minted in one scope
+/// parses as a uniform not-found under another. That matters more here than almost anywhere
+/// else: this row holds somebody ELSE'S credential, and an id that could address across a
+/// boundary would make a cross-tenant read a naming question rather than a policy one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentVaultConnectionKind;
+impl ScopedKind for AgentVaultConnectionKind {
+    const PREFIX: &'static str = "avc";
+}
+
+/// Marker for a pending out-of-band approval of a sensitive agent action (`ava_`, issue #132).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentVaultApprovalKind;
+impl ScopedKind for AgentVaultApprovalKind {
+    const PREFIX: &'static str = "ava";
+}
+
 /// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
 /// (RFC 9126, issue #27) stored for later single-use reference from `/authorize`. A
 /// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so the
@@ -2030,6 +2050,11 @@ pub type DcrPolicyId = ScopedId<DcrPolicyKind>;
 pub type ServiceAccountId = ScopedId<ServiceAccountKind>;
 /// A registered agent principal identifier (`agp_...`).
 pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
+/// An agent vault connection identifier (`avc_...`), the stored downstream credential an
+/// agent exchanges its IronAuth token for (issue #132).
+pub type AgentVaultConnectionId = ScopedId<AgentVaultConnectionKind>;
+/// An out-of-band approval identifier (`ava_...`) for a sensitive agent action (issue #132).
+pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
 /// A registered external assertion issuer identifier (`xai_...`), a trust anchor
 /// the JWT bearer assertion grant accepts assertions from (issue #26).
 pub type ExternalIssuerId = ScopedId<ExternalIssuerKind>;

@@ -140,6 +140,34 @@
       "type": "agent.state_changed"
     },
     {
+      "domain": "agent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "provider": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "organization_id",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "agent.vault_connection_stored"
+    },
+    {
       "domain": "api_key",
       "payload_schema": {
         "additionalProperties": false,

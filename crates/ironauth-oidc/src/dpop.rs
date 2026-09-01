@@ -399,6 +399,25 @@ pub fn normalized_htu_for_userinfo(state: &OidcState) -> String {
     format!("{}/userinfo", state.issuer_base().trim_end_matches('/'))
 }
 
+/// The normalized `htu` a `DPoP` proof presented at the agent vault exchange must match
+/// (RFC 9449 section 4.3, issue #132).
+///
+/// The DEPLOYMENT-ROOT URL, like the token endpoint's and `userinfo`'s and unlike the
+/// challenge endpoint's: `/agent/vault/exchange` is mounted on the protocol router at the
+/// root, not under a per-environment issuer, and the scope is recovered from the presented
+/// token's own `jti` rather than from the path.
+///
+/// Its own function rather than a parameter on the userinfo one, for the reason this module
+/// already gives three times over: an `htu` is what stops a proof minted for one resource
+/// being replayed at another, so two endpoints sharing one string share no binding at all.
+#[must_use]
+pub fn normalized_htu_for_agent_vault(state: &OidcState) -> String {
+    format!(
+        "{}/agent/vault/exchange",
+        state.issuer_base().trim_end_matches('/')
+    )
+}
+
 /// The normalized `htu` a `DPoP` proof presented at the Authorization Challenge
 /// Endpoint must match (RFC 9449 section 4.3, issue #368).
 ///
