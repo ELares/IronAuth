@@ -768,6 +768,13 @@ pub enum Action {
     /// `(tenant, environment, issuer, external_subject)` unique key, which is what lets
     /// a rule authored against the wrong principal be replaced rather than only parked.
     ExternalAssertionSubjectMappingDelete,
+    /// An AGENT PRINCIPAL was registered inside an organization (issue #130).
+    AgentRegister,
+    /// A registered agent's lifecycle state was set (issue #130): suspended, revoked, or
+    /// returned to active. Audited on its own verb because suspension and revocation are the
+    /// controls an incident responder reaches for, and finding them under a generic update
+    /// means reading every update to know whether one happened.
+    AgentStateSet,
     /// A short-lived access token was issued under the JWT bearer assertion grant
     /// (issue #26): a validated external assertion was exchanged for a token under
     /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
@@ -1648,6 +1655,8 @@ impl Action {
             Action::ExternalAssertionSubjectMappingSetEnabled => {
                 "external_assertion_subject_mapping.set_enabled"
             }
+            Action::AgentRegister => "agent.register",
+            Action::AgentStateSet => "agent.state.set",
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
             Action::TokenExchangeIssue => "token_exchange.issue",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",

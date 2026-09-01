@@ -1827,6 +1827,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the agents acting inside an organization. */
+        get: operations["listAgents"];
+        put?: never;
+        /** Register an agent inside an organization. */
+        post: operations["registerAgent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set an agent's lifecycle state. */
+        put: operations["setAgentState"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys": {
         parameters: {
             query?: never;
@@ -3723,6 +3758,36 @@ export interface components {
              * @example omb_...
              */
             membership_id: string;
+        };
+        /** @description A page of agents. */
+        AgentList: {
+            /** @description The agents on this page, oldest first. */
+            items: components["schemas"]["AgentView"][];
+            /** @description The cursor for the next page, absent on the last one. */
+            next_cursor?: string | null;
+        };
+        /** @description One registered agent principal (issue #130). */
+        AgentView: {
+            /**
+             * Format: int64
+             * @description Creation time, milliseconds since the Unix epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description The agent identifier (`agp_...`, embeds its scope). */
+            id: string;
+            /** @description The user the agent acts FOR. */
+            linked_user_id: string;
+            /** @description The organization the agent acts inside. */
+            organization_id: string;
+            /** @description The lifecycle state: `active`, `suspended` or `revoked`. */
+            state: string;
+            /**
+             * @description The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;
+             *     the issuance check and its audited denial are the follow-up half of #130.
+             */
+            tool_scopes: string[];
         };
         /** @description The creation response: the ONLY place the key itself ever appears. */
         ApiKeyCreated: {
@@ -7042,6 +7107,18 @@ export interface components {
             /** @description The authenticated end-user subject the family's tokens are minted for. */
             subject: string;
         };
+        /** @description The body to register an agent inside an organization (issue #130). */
+        RegisterAgentRequest: {
+            /** @description The operator-facing label. */
+            display_name: string;
+            /**
+             * @description The user this agent acts FOR (a `usr_` id in this environment).
+             * @example usr_...
+             */
+            linked_user_id: string;
+            /** @description The tools this agent may use. At least one, at most 64, none blank. */
+            tool_scopes: string[];
+        };
         /** @description The body to register an external issuer. */
         RegisterExternalIssuerRequest: {
             /** @description An optional space-separated audience allowlist. Narrowing only. */
@@ -7581,6 +7658,11 @@ export interface components {
             superseded_by?: string | null;
             /** @description The recorded user agent (only when the device binding knob is on). */
             user_agent?: string | null;
+        };
+        /** @description The body to set an agent's lifecycle state (issue #130). */
+        SetAgentStateRequest: {
+            /** @description `active`, `suspended` or `revoked`. Revocation is terminal. */
+            state: string;
         };
         /** @description Set or clear an environment's account-linking posture override. */
         SetAutoLinkPostureRequest: {
@@ -17584,6 +17666,228 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, or already deactivated: a repeat delete). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listAgents: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The agents acting inside this organization, oldest first. INCLUDES suspended and revoked ones: an investigator's question is what WAS acting here */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentList"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization not found, or the environment is absent or soft-deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    registerAgent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST with the same key returns the original response without re-executing. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterAgentRequest"];
+            };
+        };
+        responses: {
+            /** @description Registered */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentView"];
+                };
+            };
+            /** @description Malformed request, or a tool set that is empty or oversized */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Organization or linked user not found. The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setAgentState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+                /** @description The organization identifier */
+                organization_id: string;
+                /** @description The agent identifier */
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAgentStateRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentView"];
+                };
+            };
+            /** @description A state outside the closed set */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential, or a lapsed sudo elevation */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not found, another organization's agent, or already revoked (revocation is terminal) */
             404: {
                 headers: {
                     [name: string]: unknown;

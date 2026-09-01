@@ -368,6 +368,13 @@ name = "memberships"
 path = "tests/memberships.rs"
 required-features = ["testing"]
 
+# Agent principals (issue #130): the operator surface criteria 1, 4 and 5 ask for -- register,
+# list with linkage and scopes, suspend, revoke -- over a real database.
+[[test]]
+name = "agents"
+path = "tests/agents.rs"
+required-features = ["testing"]
+
 # Organization roles and groups over HTTP (issue #97, PR 4): the two CRUD surfaces,
 # the dedicated reparent endpoint with its cycle and depth refusals, the
 # two-organization containment proof on every endpoint (row-level security fences

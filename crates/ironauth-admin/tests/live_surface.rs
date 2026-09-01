@@ -327,6 +327,7 @@ struct Fixture {
     /// A real `sva_` principal, so the service-account key cases address a live owner rather
     /// than an id that never resolved (issue #99).
     service_account: String,
+    agent: String,
     sa_api_key: String,
     /// A live personal access token handle, so the PAT cases address a real one (issue #99).
     pat: String,
@@ -508,6 +509,24 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create membership: {body}");
         let membership = field(&body, "/id", "seed membership");
+
+        // A LIVE agent, so the state-set case has a target that exists. Driving it at an
+        // absent id answers the uniform not-found at a healthy environment too, which
+        // makes the soft-deleted-environment fence unmeasurable through it.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/agents"),
+                "seed-agent",
+                &serde_json::json!({
+                    "linked_user_id": user,
+                    "display_name": "sweep bot",
+                    "tool_scopes": ["sweep.read"],
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create agent: {body}");
+        let agent = field(&body, "/id", "seed agent");
 
         let (status, _, body) = h
             .post(
@@ -1272,6 +1291,7 @@ impl Fixture {
             project_grant,
             api_key,
             service_account,
+            agent,
             sa_api_key,
             pat,
             doomed_tenant,
@@ -1333,6 +1353,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         project_grant,
         api_key,
         service_account,
+        agent,
         sa_api_key,
         pat,
         connector,
@@ -2441,6 +2462,23 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{org_base}/memberships"),
             &serde_json::json!({ "user_id": unenrolled_user }),
         ),
+        Case::empty("agents.listAgents", "GET", format!("{org_base}/agents")),
+        Case::json(
+            "agents.registerAgent",
+            "POST",
+            format!("{org_base}/agents"),
+            &serde_json::json!({
+                "linked_user_id": unenrolled_user,
+                "display_name": "deploy bot",
+                "tool_scopes": ["deploy"],
+            }),
+        ),
+        Case::json(
+            "agents.setAgentState",
+            "PUT",
+            format!("{org_base}/agents/{agent}/state"),
+            &serde_json::json!({ "state": "suspended" }),
+        ),
         Case::json(
             "memberships.createServiceAccountMembership",
             "POST",
@@ -3045,6 +3083,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         client: "cli_0".to_owned(),
         message: "msg_0".to_owned(),
         service_account: "sva_0".to_owned(),
+        agent: "agp_0".to_owned(),
         sa_api_key: "akey_0".to_owned(),
         pat: "akey_1".to_owned(),
         org_connection: "ocn_0".to_owned(),

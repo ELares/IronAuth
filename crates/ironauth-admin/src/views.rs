@@ -491,6 +491,71 @@ pub struct CreateServiceAccountMembershipRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// One registered agent principal (issue #130).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AgentView {
+    /// The agent identifier (`agp_...`, embeds its scope).
+    pub id: String,
+    /// The organization the agent acts inside.
+    pub organization_id: String,
+    /// The user the agent acts FOR.
+    pub linked_user_id: String,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// The lifecycle state: `active`, `suspended` or `revoked`.
+    pub state: String,
+    /// The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;
+    /// the issuance check and its audited denial are the follow-up half of #130.
+    pub tool_scopes: Vec<String>,
+    /// Creation time, milliseconds since the Unix epoch.
+    pub created_at_unix_ms: i64,
+}
+
+impl AgentView {
+    /// Render the stored record.
+    #[must_use]
+    pub fn from_record(record: ironauth_store::AgentRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            organization_id: record.organization_id.to_string(),
+            linked_user_id: record.linked_user_id.to_string(),
+            display_name: record.display_name,
+            state: record.state,
+            tool_scopes: record.tool_scopes,
+            created_at_unix_ms: ms(record.created_at_unix_micros),
+        }
+    }
+}
+
+/// A page of agents.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AgentList {
+    /// The agents on this page, oldest first.
+    pub items: Vec<AgentView>,
+    /// The cursor for the next page, absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The body to register an agent inside an organization (issue #130).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RegisterAgentRequest {
+    /// The user this agent acts FOR (a `usr_` id in this environment).
+    #[schema(example = "usr_...")]
+    pub linked_user_id: String,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// The tools this agent may use. At least one, at most 64, none blank.
+    pub tool_scopes: Vec<String>,
+}
+
+/// The body to set an agent's lifecycle state (issue #130).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetAgentStateRequest {
+    /// `active`, `suspended` or `revoked`. Revocation is terminal.
+    pub state: String,
+}
+
 impl MembershipView {
     /// Build a view from a stored membership record.
     #[must_use]

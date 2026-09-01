@@ -4516,3 +4516,89 @@ async fn write_organizations_is_required_to_add_a_machine_identity_to_an_org() {
          classification is wrong: {response}"
     );
 }
+
+/// Registering and revoking an agent is `write_organizations`; listing them is `read`
+/// (issue #130).
+///
+/// An agent acts with a person's authority inside an organization, so "who may create one"
+/// and "who may only look at the list" is the distinction that matters most on this surface.
+/// A read-only credential must be able to answer "what is acting here" -- that is the
+/// investigator's question criterion 1 exists for -- and must not be able to create or revoke.
+///
+/// ALL THREE OPERATIONS, in both directions. The ids below are deliberately malformed so the
+/// permission gate is what answers: 403 versus anything else separates the gate from the
+/// handler without registering an agent first.
+#[tokio::test]
+async fn the_agent_surface_splits_registering_and_revoking_from_listing() {
+    let h = Harness::start(246).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-agents").await;
+    let agents =
+        format!("/v1/tenants/{tenant}/environments/{environment}/organizations/org_absent/agents");
+    let state_path = format!("{agents}/agp_absent/state");
+    let register = serde_json::json!({
+        "linked_user_id": "usr_absent",
+        "display_name": "deploy bot",
+        "tool_scopes": ["deploy"],
+    })
+    .to_string();
+    let suspend = serde_json::json!({ "state": "suspended" }).to_string();
+
+    // A READ-ONLY credential may LIST and may not register or revoke.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let (status, _, response) = h.get_as(&agents, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must be able to see what is acting in an organization: {response}"
+    );
+
+    let (status, _, response) = h
+        .post_as(&agents, &secret, "k-agent-forbidden", &register)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential REGISTERED an agent: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    let (status, _, response) = h.put_as(&state_path, &secret, &suspend).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential changed an agent's state: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    // And a WRITE credential reaches both writes.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, response) = h
+        .post_as(&agents, &secret, "k-agent-allowed", &register)
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover agent registration: {response}"
+    );
+    let (status, _, response) = h.put_as(&state_path, &secret, &suspend).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover the agent state change: {response}"
+    );
+}

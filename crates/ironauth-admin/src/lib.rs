@@ -81,6 +81,7 @@ mod whoami;
 pub mod log_shipper;
 pub mod log_stream_signature;
 
+mod agents;
 mod challenge_components;
 pub mod ciba_ping;
 mod claims_mappings;
@@ -502,6 +503,17 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships",
             post(memberships::create_membership).get(memberships::list_memberships),
+        )
+        // Agent principals (issue #130): registered inside an organization, acting for a
+        // user, bounded by a declared tool set. Nested under the organization because that
+        // boundary is what criterion 4 asks for.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
+            post(agents::register_agent).get(agents::list_agents),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/state",
+            axum::routing::put(agents::set_agent_state),
         )
         // The MACHINE IDENTITY membership (issue #126). Its own path rather than a variant of
         // the one above, because making `user_id` optional in either the request or the

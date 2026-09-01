@@ -81,22 +81,22 @@ use crate::federation_state::{ConsumedFederationLoginState, NewFederationLoginSt
 use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
-    AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId, ApiKeyId,
-    AssertionMappingId, AttestationConfigId, AuditId, AuditTarget, AuthorizationCodeId,
-    BackchannelAuthRequestId, BrandId, ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId,
-    ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId,
-    DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId,
-    ExternalIssuerId, FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId,
-    FlowVersionPinId, GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId,
-    IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
-    MessageId, MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId,
-    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
-    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
-    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
-    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
+    AgentPrincipalId, ApiKeyId, AssertionMappingId, AttestationConfigId, AuditId, AuditTarget,
+    AuthorizationCodeId, BackchannelAuthRequestId, BrandId, ClientAdminGrantId, ClientId,
+    ClientSessionId, ConnectorId, ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId,
+    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
+    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, FedcmNonceId, FederationLoginStateId,
+    FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId, GrantId, ImpersonationAuthorizationId,
+    InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId,
+    ManagementKeyId, Mds3BlobCacheId, MessageId, MessageTemplateId, MigrationRunId,
+    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
+    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
+    OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
+    ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
+    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
     SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
     SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
@@ -143,6 +143,15 @@ impl<'a> ScopedStore<'a> {
     /// [`Store::scoped`], which is what makes the scope non-optional.
     pub(crate) fn new(store: &'a Store, scope: Scope) -> Self {
         Self { store, scope }
+    }
+
+    /// The READ side of the agent principal surface for this scope (issue #130).
+    #[must_use]
+    pub fn agents(&self) -> AgentRepo<'a> {
+        AgentRepo {
+            store: self.store,
+            scope: self.scope,
+        }
     }
 
     /// The read-only OAuth client repository for this scope. Reads need no
@@ -1507,6 +1516,16 @@ impl<'a> ActingStore<'a> {
             store: self.store,
             acting: self.acting,
             scope: self.scope,
+        }
+    }
+
+    /// The WRITE side of the agent principal surface for this scope and actor (issue #130).
+    #[must_use]
+    pub fn agents(&self) -> ActingAgentRepo<'a> {
+        ActingAgentRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
         }
     }
 
@@ -48247,6 +48266,17 @@ impl<'a> ActingManagementStore<'a> {
         }
     }
 
+    /// The mutating AGENT repository for `scope` (issue #130): register an agent and set its
+    /// lifecycle state, each audited.
+    #[must_use]
+    pub fn agents(&self, scope: Scope) -> ActingAgentRepo<'a> {
+        ActingAgentRepo {
+            store: self.store,
+            scope,
+            acting: self.acting,
+        }
+    }
+
     /// The mutating organization-membership repository for `scope` (issue #94):
     /// add a user to an organization and remove one, each audited.
     #[must_use]
@@ -48933,6 +48963,10 @@ impl OrgMembershipRepo<'_> {
     /// two resolve different principal kinds: the addressing read that resolves a membership
     /// for deletion tries both, and a single read that assumed a user would 404 on every
     /// service-account membership.
+    ///
+    /// Fenced the MIRROR way to [`OrgMembershipRepo::get`]: that one refuses a
+    /// service-account row and this one refuses a user row, so neither surface can be tricked
+    /// into rendering the other's principal by being handed its id.
     ///
     /// # Errors
     ///
@@ -71847,4 +71881,320 @@ mod message_recipient_seal_tests {
              are a join key across them for anyone holding either"
         );
     }
+}
+
+/// A registered agent principal (issue #130).
+///
+/// Three facts every authorization decision reads, held as columns rather than convention: the
+/// ORGANIZATION it acts inside, the USER it acts for, and the TOOLS it declared. See the
+/// migration header for why each is not optional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecord {
+    /// The agent principal identifier (`agp_...`, embeds its `(tenant, environment)`).
+    pub id: AgentPrincipalId,
+    /// The organization the agent acts inside.
+    pub organization_id: OrganizationId,
+    /// The user the agent acts FOR. An agent acting for nobody is unattributable.
+    pub linked_user_id: UserId,
+    /// The operator-facing label. Never an authorization input.
+    pub display_name: String,
+    /// The lifecycle state: `active`, `suspended` or `revoked`.
+    pub state: String,
+    /// The DECLARED tool scopes: what this agent may ask for.
+    ///
+    /// Recorded here and NOT yet enforced. The issuance path that checks a request against
+    /// this set, and audits the denial, is the follow-up half of #130. Documented as
+    /// declaration rather than as a control so nothing downstream reads a guarantee that
+    /// does not exist yet.
+    pub tool_scopes: Vec<String>,
+    /// Creation time in microseconds since the Unix epoch (the pagination key).
+    pub created_at_unix_micros: i64,
+}
+
+/// Everything registering an agent needs.
+#[derive(Debug, Clone, Copy)]
+pub struct NewAgent<'a> {
+    /// The agent id (minted by the caller, embeds this scope).
+    pub id: &'a AgentPrincipalId,
+    /// The organization the agent acts inside.
+    pub organization_id: &'a OrganizationId,
+    /// The user the agent acts for.
+    pub linked_user_id: &'a UserId,
+    /// The operator-facing label.
+    pub display_name: &'a str,
+    /// The declared tool scopes.
+    pub tool_scopes: &'a [String],
+}
+
+/// The READ side of the agent principal surface, for this scope.
+pub struct AgentRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AgentRepo<'_> {
+    /// Parse an untrusted agent identifier under this scope.
+    ///
+    /// The oracle-free boundary: a malformed identifier and one belonging to another scope
+    /// both answer the uniform not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for either.
+    pub fn parse_id(&self, raw: &str) -> Result<AgentPrincipalId, StoreError> {
+        AgentPrincipalId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Read one agent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such agent is visible in this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &AgentPrincipalId) -> Result<AgentRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
+             FROM agents WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        agent_from_row(&row, &self.scope)
+    }
+
+    /// The agents acting inside one organization, oldest first.
+    ///
+    /// EVERY state, including suspended and revoked. Criterion 1 asks an org admin to list all
+    /// agents acting for their organization and criterion 5 asks that a suspended one remain
+    /// listable, so filtering here would break both: the list an investigator needs is the one
+    /// that still shows what was turned off.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<AgentRecord>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
+             FROM agents \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| agent_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The WRITE side of the agent principal surface, for this scope and actor.
+pub struct ActingAgentRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAgentRepo<'_> {
+    /// Register an agent, auditing `agent.register` in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id belongs to another scope;
+    /// [`StoreError::Conflict`] if the id is already registered;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn register(
+        &self,
+        env: &Env,
+        spec: NewAgent<'_>,
+        created_at_micros: i64,
+        idempotency: Option<ResolvedIdempotencyWrite<'_, AgentRecord>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<AgentRecord, StoreError> {
+        if spec.id.scope() != self.scope
+            || spec.organization_id.scope() != self.scope
+            || spec.linked_user_id.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let organization_id = *spec.organization_id;
+        let linked_user_id = *spec.linked_user_id;
+        let display_name = spec.display_name.to_owned();
+        let tool_scopes = spec.tool_scopes.to_vec();
+        let mut record = None;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentRegister,
+                target: &id,
+            },
+            async |tx| {
+                let row = sqlx::query(
+                    "INSERT INTO agents \
+                     (id, tenant_id, environment_id, organization_id, linked_user_id, \
+                      display_name, state, tool_scopes, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval) \
+                     RETURNING id, organization_id, linked_user_id, display_name, state, \
+                               tool_scopes, \
+                               (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint \
+                                   AS created_at_micros",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(organization_id.to_string())
+                .bind(linked_user_id.to_string())
+                .bind(&display_name)
+                .bind(&tool_scopes)
+                .bind(created_at_micros)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|error| match &error {
+                    sqlx::Error::Database(db) if db.is_unique_violation() => StoreError::Conflict,
+                    _ => StoreError::from(error),
+                })?;
+                let resolved = agent_from_row(&row, &scope)?;
+                // Rendered from the ROW, in the write's own transaction: the 201 and its
+                // replays are the same bytes, and neither exists without the row.
+                insert_resolved_idempotency(tx, idempotency, &resolved).await?;
+                record = Some(resolved);
+                // In the write's transaction: a rolled-back registration announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+        record.ok_or(StoreError::NotFound)
+    }
+
+    /// Set an agent's lifecycle state, auditing `agent.state.set`.
+    ///
+    /// REVOKED IS TERMINAL. A revoked agent cannot be returned to active or suspended,
+    /// because "revoke" is what an incident responder reaches for and a control that can be
+    /// quietly undone is not one they can rely on. Suspension is the reversible one, which
+    /// is why both exist.
+    ///
+    /// Re-revoking a revoked agent SUCCEEDS and writes its audit row. Terminal is about the
+    /// state never leaving `revoked`, not about refusing the request that puts it there: a
+    /// responder whose first revoke timed out, or a second responder acting on the same
+    /// alert, must not be told the agent does not exist, and the retry must leave a trace.
+    /// The predicate therefore blocks every transition OUT of revoked and permits the
+    /// idempotent one back into it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such agent is visible in this scope, or the agent is
+    /// revoked and the requested state is not `revoked`; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set_state(
+        &self,
+        env: &Env,
+        id: &AgentPrincipalId,
+        state: &str,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<AgentRecord, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let state = state.to_owned();
+        let mut record = None;
+        // WHICH state was set, on the row itself. Without it `agent.state.set` says only
+        // that something changed, and a responder reading the trail cannot tell a
+        // suspension from a revocation from a re-activation, which is the one question
+        // the trail exists to answer. The organization sibling records the same dimension.
+        let detail = format!("state={state}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentStateSet,
+                target: &id,
+            },
+            async |tx| {
+                let row = sqlx::query(
+                    "UPDATE agents SET state = $1, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
+                       AND (state <> 'revoked' OR $1 = 'revoked') \
+                     RETURNING id, organization_id, linked_user_id, display_name, state, \
+                               tool_scopes, \
+                               (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint \
+                                   AS created_at_micros",
+                )
+                .bind(&state)
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+                record = Some(agent_from_row(&row, &scope)?);
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        record.ok_or(StoreError::NotFound)
+    }
+}
+
+/// Decode one `agents` row.
+fn agent_from_row(row: &sqlx::postgres::PgRow, scope: &Scope) -> Result<AgentRecord, StoreError> {
+    let id: String = row.get("id");
+    let organization_id: String = row.get("organization_id");
+    let linked_user_id: String = row.get("linked_user_id");
+    Ok(AgentRecord {
+        id: AgentPrincipalId::parse_in_scope(&id, scope).map_err(|_| StoreError::NotFound)?,
+        organization_id: OrganizationId::parse_in_scope(&organization_id, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        linked_user_id: UserId::parse_in_scope(&linked_user_id, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        display_name: row.get("display_name"),
+        state: row.get("state"),
+        tool_scopes: row.get("tool_scopes"),
+        created_at_unix_micros: row.get("created_at_micros"),
+    })
 }

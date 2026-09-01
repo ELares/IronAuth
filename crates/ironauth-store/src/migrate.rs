@@ -1404,6 +1404,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0175_audit_entry_path.sql"),
         },
+        Migration {
+            version: 176,
+            name: "agents",
+            // EXPAND: a new table the old binary never reads or writes, so a rollback to the
+            // previous binary leaves it inert.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0176_agents.sql"),
+        },
     ]
 }
 
