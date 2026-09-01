@@ -29,6 +29,13 @@ fn row(id: &str, occurred_micros: i64) -> ChainedAuditRow {
         correlation_id: "cor_1".to_string(),
         occurred_micros,
         detail: None,
+        // The DELIVERY dimensions, deliberately SET here rather than left None. They are not
+        // part of the canonical form, so a chain sealed over rows carrying them must verify
+        // exactly as one sealed over rows without them: if a future edit adds either to
+        // `canonical()`, every test in this file that seals and then verifies goes red,
+        // which is the alarm a silent widening deserves.
+        organization_id: Some("org_1".to_string()),
+        subject_id: Some("usr_1".to_string()),
     }
 }
 

@@ -1061,3 +1061,182 @@ fn a_failed_replay_is_retryable() {
     );
     assert_eq!(error.label(), "replay_failed");
 }
+
+/// A SIEM INGESTS THE AGENT EVENTS, and each one names the agent, its linked user, and its
+/// organization (issue #130, criterion 2).
+///
+/// The criterion asks for OCSF events "attributable to the agent and its linked user and
+/// organization, and a SIEM fixture ingests them". Before this there was no fixture: `git ls-files
+/// | grep -i siem` matched nothing, this suite's twenty tests never mentioned an agent, and the
+/// shipped event carried neither the linked user nor the organization at all -- `ChainedAuditRow`
+/// simply did not select those columns, so `render` could not name them.
+///
+/// What makes this a real ingestion rather than a render check: the event is taken from the
+/// SINK, after `ship_once` has selected it, rendered it, batched it and delivered it. A test that
+/// called `render` directly would prove the formatter works and say nothing about whether an
+/// agent event ever reaches a stream.
+///
+/// The rows are written through the ACTING STORE with the same attribution the production write
+/// sites use, so this is not a fixture inventing a shape the code does not produce.
+#[tokio::test]
+async fn a_siem_ingests_agent_events_naming_the_agent_its_user_and_its_organization() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let id = configure(&db, &env, scope, StreamSource::Both, SinkType::Http, None).await;
+
+    let planted = seed_agent_audit_rows(&db, &env, scope).await;
+
+    let sink = RecordingSink::new(SinkType::Http, true);
+    let sinks: Vec<Arc<dyn LogSink>> = vec![sink.clone()];
+    ship_once(db.store(), &env, scope, &sinks)
+        .await
+        .expect("ship");
+
+    let events = sink.events();
+    for action in [
+        "agent.register",
+        "agent.state.set",
+        "agent_token.issue",
+        "agent_token.deny",
+    ] {
+        let event = events
+            .iter()
+            .find(|event| event["activity_name"] == action)
+            .unwrap_or_else(|| panic!("the SIEM received no {action} event: {events:?}"));
+
+        // THE AGENT, as the OCSF target resource.
+        let uids: Vec<&str> = event["resources"]
+            .as_array()
+            .expect("resources is an array")
+            .iter()
+            .filter_map(|resource| resource["uid"].as_str())
+            .collect();
+        assert!(
+            uids.contains(&planted.agent.as_str()),
+            "{action} must name the agent, got {uids:?}"
+        );
+        // THE ORGANIZATION and THE LINKED USER, typed so a consumer selects rather than
+        // guesses by position.
+        for (label, uid) in [
+            ("organization", planted.organization.as_str()),
+            ("user", planted.linked_user.as_str()),
+        ] {
+            assert!(
+                event["resources"]
+                    .as_array()
+                    .expect("resources is an array")
+                    .iter()
+                    .any(|resource| resource["type"] == label && resource["uid"] == uid),
+                "{action} must carry the {label} {uid} as a typed resource, got {event}"
+            );
+        }
+        // The stream split is part of the criterion too: registration and lifecycle are
+        // account-change events, issuance and denial are authentication events, because they
+        // answer different questions and a SIEM files them under different dashboards.
+        let expected_stream = if action.starts_with("agent_token.") {
+            "authentication"
+        } else {
+            "account_change"
+        };
+        assert_eq!(
+            event["stream"], expected_stream,
+            "{action} belongs in the {expected_stream} stream"
+        );
+    }
+
+    assert_eq!(
+        health(db.store(), scope, &id).await.status(),
+        StreamStatus::Healthy
+    );
+}
+
+/// What `seed_agent_audit_rows` planted, so assertions name the EXACT ids.
+struct PlantedAgent {
+    agent: String,
+    linked_user: String,
+    organization: String,
+}
+
+/// Write one row of each agent action, with the attribution the production sites use.
+async fn seed_agent_audit_rows(db: &TestDatabase, env: &Env, scope: Scope) -> PlantedAgent {
+    let organization = ironauth_store::OrganizationId::generate(env, &scope);
+    sqlx::query(
+        "INSERT INTO organizations /* query-audit-allow: owner test seed */ \
+         (id, tenant_id, environment_id, display_name) VALUES ($1, $2, $3, 'siem org')",
+    )
+    .bind(organization.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("seed organization");
+
+    let user = ironauth_store::UserId::generate(env, &scope);
+    sqlx::query(
+        "INSERT INTO users /* query-audit-allow: owner test seed */ \
+         (id, tenant_id, environment_id) VALUES ($1, $2, $3)",
+    )
+    .bind(user.to_string())
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("seed user");
+
+    let agent = ironauth_store::AgentPrincipalId::generate(env, &scope);
+    let acting = db
+        .store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .in_organization(organization)
+        .about_subject(user);
+    acting
+        .agents(scope)
+        .register(
+            env,
+            ironauth_store::NewAgent {
+                id: &agent,
+                organization_id: &organization,
+                linked_user_id: &user,
+                display_name: "siem bot",
+                tool_scopes: &["deploy".to_owned()],
+                client_id: None,
+            },
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("register the agent");
+    acting
+        .agents(scope)
+        .set_state(env, &agent, "suspended", 0, None)
+        .await
+        .expect("suspend the agent");
+
+    // The two TOKEN-door rows, written through the data-plane acting store exactly as
+    // `record_agent_issuance` and `gate_agent_issuance` write them.
+    let data_plane = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .in_organization(organization)
+        .about_subject(user);
+    data_plane
+        .agents()
+        .record_token_issued(env, &agent, "deploy")
+        .await
+        .expect("record an issuance");
+    data_plane
+        .agents()
+        .record_token_denied(env, &agent, "suspended")
+        .await
+        .expect("record a denial");
+
+    PlantedAgent {
+        agent: agent.to_string(),
+        linked_user: user.to_string(),
+        organization: organization.to_string(),
+    }
+}

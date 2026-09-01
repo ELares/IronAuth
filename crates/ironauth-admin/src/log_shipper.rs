@@ -113,6 +113,32 @@ pub fn render(row: &ChainedAuditRow, scope: Scope) -> Option<Value> {
     if let Some(object) = event.as_object_mut() {
         object.insert("uid".to_string(), json!(row.audit_id));
         object.insert("correlation_uid".to_string(), json!(row.correlation_id));
+        // The ORGANIZATION and the SUBJECT, as additional OCSF `resources` entries beside the
+        // target (issue #130, criterion 2).
+        //
+        // The criterion asks for events attributable to the agent AND its linked user AND its
+        // organization. The target column carried the agent and nothing carried the other two,
+        // so an investigator handed `agent_token.issue` had to join back through the agent's
+        // registration row to learn which person the machine was acting for, and a
+        // per-organization stream could route by a column the shipped event never mentioned.
+        //
+        // `cloud.org.uid` is deliberately NOT reused for the organization: it carries the
+        // ENVIRONMENT, and overloading it would make two different things the same field.
+        // Each entry is TYPED, so a consumer selects rather than guesses by position.
+        let mut resources: Vec<Value> = object
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(organization) = row.organization_id.as_deref() {
+            resources.push(json!({"uid": organization, "type": "organization"}));
+        }
+        if let Some(subject) = row.subject_id.as_deref() {
+            resources.push(json!({"uid": subject, "type": "user"}));
+        }
+        if !resources.is_empty() {
+            object.insert("resources".to_string(), Value::Array(resources));
+        }
     }
     Some(event)
 }

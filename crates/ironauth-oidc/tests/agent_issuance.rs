@@ -318,3 +318,68 @@ async fn a_client_with_no_agent_still_issues_exactly_as_before() {
         "and writes no agent audit row: {rows:?}"
     );
 }
+
+/// The revocation SLO is DOCUMENTED, and the document agrees with the code (issue #130,
+/// criterion 1).
+///
+/// The criterion says outstanding tokens die "within the documented SLO", and there was no
+/// document: no `docs/agents.md`, and `grep -i slo docs/` matched nothing but the words "slow"
+/// and "slot". A window nobody wrote down is not one an operator can hold anybody to.
+///
+/// This pins the SENTENCE and the NUMBER separately, the same way
+/// `session_tokenizer.rs` pins its own window, because a table of numbers does not state the
+/// window as a function of the configured TTL and a sentence alone does not say what the
+/// default is. The number is read from the CONFIG DEFAULT rather than typed here twice, so a
+/// change to the default fails this test rather than quietly making the doc wrong.
+///
+/// Needs no database: it reads a committed file and a config default.
+#[test]
+fn the_revocation_window_is_documented_and_matches_the_configured_default() {
+    const DOC: &str = include_str!("../../../docs/agents.md");
+
+    assert!(
+        DOC.contains(
+            "**The revocation window is exactly `oidc.access_token_ttl_secs`, and only for a \
+             resource\n> server that does not introspect.**"
+        ),
+        "the doc must state the window as a function of the configured TTL, not as a bare number"
+    );
+
+    let default_ttl = ironauth_config::Config::default()
+        .oidc
+        .access_token_ttl_secs;
+    assert!(
+        DOC.contains(&format!(
+            "| Default `access_token_ttl_secs` | {default_ttl} |"
+        )),
+        "the doc's table must carry the CONFIGURED default ({default_ttl}), or it teaches a \
+         number the deployment does not use"
+    );
+    assert!(
+        DOC.contains(&format!(
+            "| Worst-case window, non-introspecting resource server | {default_ttl} |"
+        )),
+        "and the window row must equal it, since the window IS the token lifetime"
+    );
+    assert!(
+        DOC.contains("| Worst-case window, introspecting resource server | 0 |"),
+        "the introspecting case is zero, which is the half revoking the grants delivers"
+    );
+
+    // The two halves of what revocation does, both stated. Without the second sentence the doc
+    // describes the behaviour this PR fixed rather than the behaviour it now has.
+    assert!(
+        DOC.contains("New issuance stops immediately."),
+        "the doc states the immediate half"
+    );
+    assert!(
+        DOC.contains("The grants behind its outstanding tokens are revoked."),
+        "and the half that kills what was already issued"
+    );
+    // And that suspension is deliberately NOT that, or an operator reads the section above and
+    // assumes a pause also kills outstanding tokens.
+    assert!(
+        DOC.contains("**Suspension is not revocation.**"),
+        "the doc distinguishes suspension from revocation"
+    );
+}
