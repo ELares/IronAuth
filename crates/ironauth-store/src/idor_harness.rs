@@ -2651,9 +2651,11 @@ impl IsolationProbe for UpstreamTokenReadProbe {
 /// obtains tokens through, the user it acts for, and the tool set bounding what it may ask
 /// for, so a cross-boundary read is a map of another tenant's automation.
 ///
-/// The id is scoped, so the refusal is expected at the PARSE rather than at the query. The
-/// probe still drives the whole read, because "it cannot parse" is a claim about today's id
-/// type and the query behind it is what a future unscoped accessor would reach.
+/// The id is scoped, so for every foreign id the refusal happens at the PARSE and the query is
+/// never reached. That is the house pattern (thirteen sibling probes do the same) and it is
+/// worth being exact about: this probe measures that a foreign scoped id cannot be turned into
+/// an addressable one, not that the query behind it filters. The `for_client` probe beside it
+/// is the one that reaches a query.
 struct AgentReadProbe;
 
 impl IsolationProbe for AgentReadProbe {
@@ -2702,8 +2704,16 @@ impl IsolationProbe for AgentForClientProbe {
     ) -> BoxProbeFuture<'a> {
         Box::pin(async move {
             match store.scoped(caller).agents().for_client(foreign_id).await {
-                Ok(Some(_)) => ProbeOutcome::Leaked,
-                Ok(None) | Err(_) => ProbeOutcome::Denied,
+                // `Err` counts as a LEAK, not a denial, and collapsing the two hid the very
+                // thing this probe exists to find. `for_client` decodes its row through
+                // `agent_from_row`, which parses the id, organization and linked user IN THE
+                // CALLER's SCOPE and maps any mismatch to `NotFound`. So an error means a row
+                // CAME BACK and failed to decode -- which is the leak signature: the tenant
+                // predicate and row-level security both let a foreign row through, and only
+                // the id decode stopped it. Written as one arm with `Ok(Some(_))` because it
+                // is the same finding, not because the bodies happen to match.
+                Ok(Some(_)) | Err(_) => ProbeOutcome::Leaked,
+                Ok(None) => ProbeOutcome::Denied,
             }
         })
     }

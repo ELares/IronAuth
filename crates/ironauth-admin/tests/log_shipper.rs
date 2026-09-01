@@ -1131,13 +1131,17 @@ async fn a_siem_ingests_agent_events_naming_the_agent_its_user_and_its_organizat
                 "{action} must carry the {label} {uid} as a typed resource, got {event}"
             );
         }
-        // The stream split is part of the criterion too: registration and lifecycle are
-        // account-change events, issuance and denial are authentication events, because they
-        // answer different questions and a SIEM files them under different dashboards.
+        // The stream split is part of the criterion too: registration and lifecycle ship on
+        // the ADMIN_ACTION stream, issuance and denial on AUTHENTICATION, because they answer
+        // different questions and a SIEM files them under different dashboards.
+        //
+        // `admin_action`, not `account_change`: the latter is the OCSF CLASS name, and the
+        // stream is what `ship_once` loops over. Naming the class here made the assertion
+        // unsatisfiable for two of the four actions.
         let expected_stream = if action.starts_with("agent_token.") {
             "authentication"
         } else {
-            "account_change"
+            "admin_action"
         };
         assert_eq!(
             event["stream"], expected_stream,
@@ -1186,7 +1190,10 @@ async fn seed_agent_audit_rows(db: &TestDatabase, env: &Env, scope: Scope) -> Pl
 
     let agent = ironauth_store::AgentPrincipalId::generate(env, &scope);
     let acting = db
-        .store()
+        // The CONTROL store: migration 0176 grants `ironauth_app` SELECT on `agents` and
+        // nothing else, and `.management()` wraps the SAME pool rather than switching to
+        // another, so seeding through `db.store()` is refused by Postgres.
+        .control_store()
         .management()
         .acting(db.test_actor(env), CorrelationId::generate(env))
         .in_organization(organization)
@@ -1217,6 +1224,8 @@ async fn seed_agent_audit_rows(db: &TestDatabase, env: &Env, scope: Scope) -> Pl
 
     // The two TOKEN-door rows, written through the data-plane acting store exactly as
     // `record_agent_issuance` and `gate_agent_issuance` write them.
+    // These two ARE data-plane writes in production (the token doors run as `ironauth_app`),
+    // so the fixture uses that role deliberately rather than by omission.
     let data_plane = db
         .store()
         .scoped(scope)

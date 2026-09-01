@@ -7780,8 +7780,11 @@ Revoking an agent does two things, in one transaction:
    a suspended or revoked agent obtains nothing. There is no window here at all.
 2. **The grants behind its outstanding tokens are revoked.** An access token derives its active
    state from `grants.revoked_at`, so every token already issued to the agent resolves as
-   inactive at introspection, at UserInfo, and at the agent vault exchange, and any refresh
-   chain stops.
+   inactive at introspection and at UserInfo, and any refresh chain stops.
+
+   Scoped to the agent's grants, not the client's. The cascade constrains both the client and
+   the client's service-account subject, so a person who happens to hold a grant on the same
+   client is untouched: revoking an agent is not revoking a client.
 
 What revocation **cannot** reach is a resource server that verifies an `at+jwt` signature
 without asking IronAuth anything. That token is self-contained and stays verifiable until its
@@ -7790,7 +7793,7 @@ without asking IronAuth anything. That token is self-contained and stays verifia
 > **The revocation window is exactly `oidc.access_token_ttl_secs`, and only for a resource
 > server that does not introspect.**
 
-At the default `access_token_ttl_secs: 300` that is a five-minute worst case between an operator
+At the default `access_token_ttl_secs: 300` that is a 300-second worst case between an operator
 revoking an agent and the last token it holds ceasing to verify at a non-introspecting resource
 server. Every IronAuth-side check is immediate.
 
@@ -7823,7 +7826,14 @@ The first two are account-change events; the last two are authentication events,
 deliberately in different OCSF streams because they answer different questions.
 
 Every one of the four is attributed to the agent's **organization** and to its **linked user**,
-so a per-organization SIEM stream delivers them and a correlation by person finds them. The
+so a per-organization SIEM stream delivers them and a correlation by person finds them.
+
+One consequence worth stating, because it is a disclosure rather than a bug in the plumbing:
+an agent's linked user is validated to exist in the environment, not to be a member of the
+organization the agent belongs to. An operator who links a user from organization B to an
+agent in organization A puts B's user id on A's stream. Requiring membership at registration
+is the fix, and it is a behaviour change to an already-shipped route rather than something
+this attribution should paper over. The
 organization and the subject are carried on the audit row and rendered into the shipped OCSF
 event as typed `resources` entries; they are deliberately **not** part of what the audit chain
 seals, because adding a field to that would invalidate every entry already sealed.

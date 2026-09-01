@@ -1191,24 +1191,28 @@ pub(crate) async fn record_agent_issuance(
         return;
     };
     let actor = crate::util::client_service_actor(StoredClientId::Registered(&client_id));
-    let Ok(organization_id) =
-        ironauth_store::OrganizationId::parse_in_scope(&agent.organization_id, &scope)
-    else {
-        return;
-    };
-    let Ok(linked_user_id) = ironauth_store::UserId::parse_in_scope(&agent.linked_user_id, &scope)
-    else {
-        return;
-    };
-    if let Err(error) = state
+    // The attribution is BEST EFFORT and the row is not. These two parses cannot fail in
+    // practice (both are stringified typed ids from this same scope), but an early return on
+    // them would mean a token was minted and the trail said nothing at all -- trading a row
+    // with one dimension missing for no row, which is the wrong direction for an audit path.
+    let mut acting = state
         .store()
         .scoped(scope)
-        .acting(actor, CorrelationId::generate(state.env()))
-        // The same organization attribution the denial rows carry, for the same reason: an
-        // issuance a per-organization stream never sees is an issuance that stream cannot
-        // account for.
-        .in_organization(organization_id)
-        .about_subject(linked_user_id)
+        .acting(actor, CorrelationId::generate(state.env()));
+    // The same organization attribution the denial rows carry, for the same reason: an
+    // issuance a per-organization stream never sees is an issuance that stream cannot
+    // account for.
+    if let Ok(organization_id) =
+        ironauth_store::OrganizationId::parse_in_scope(&agent.organization_id, &scope)
+    {
+        acting = acting.in_organization(organization_id);
+    }
+    if let Ok(linked_user_id) =
+        ironauth_store::UserId::parse_in_scope(&agent.linked_user_id, &scope)
+    {
+        acting = acting.about_subject(linked_user_id);
+    }
+    if let Err(error) = acting
         .agents()
         .record_token_issued(
             state.env(),

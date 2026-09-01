@@ -34,9 +34,18 @@ COMMENT ON COLUMN audit_log.subject_id IS
     'not about a person, which is a fact rather than an omission. Deliberately absent from '
     'the audit_chain canonical form, so adding it did not invalidate any sealed entry.';
 
--- The index a SIEM correlation reads: everything about one person, newest first. Partial,
--- because the column is NULL on most rows and an index over those entries would be almost
--- entirely dead weight.
+-- The index a per-person correlation WOULD read: everything about one person, in the order
+-- every other ordered read of this table uses. Partial, because the column is NULL on most
+-- rows and an index over those would be almost entirely dead weight.
+--
+-- No query reads it today, and that is stated rather than implied: an index with no reader is
+-- write amplification on the busiest table in the system. It is created here because adding it
+-- later means an index build against a table that by then holds every audit row ever written,
+-- and because the shipped event now carries the dimension a correlation would filter on. If a
+-- reader has not appeared by the time this surface graduates, drop it.
+--
+-- ASCENDING, matching `0138_audit_organization.sql` and the shipper's `ORDER BY occurred_at,
+-- id`. A descending index here would serve a query nothing performs.
 CREATE INDEX audit_log_subject_idx
-    ON audit_log (tenant_id, environment_id, subject_id, occurred_at DESC)
+    ON audit_log (tenant_id, environment_id, subject_id, occurred_at)
     WHERE subject_id IS NOT NULL;

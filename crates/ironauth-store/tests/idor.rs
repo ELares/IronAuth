@@ -835,7 +835,8 @@ async fn an_agent_is_unreachable_from_another_tenant_or_environment() {
     harness.register_agent_probes();
     assert_eq!(
         harness.probe_names(),
-        vec!["agents.for_client", "agents.get"],
+        // REGISTRATION order, which is what `probe_names` returns: `AgentReadProbe` first.
+        vec!["agents.get", "agents.for_client"],
         "both agent read surfaces are registered with the harness"
     );
 

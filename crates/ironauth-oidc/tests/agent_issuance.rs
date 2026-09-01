@@ -366,6 +366,18 @@ fn the_revocation_window_is_documented_and_matches_the_configured_default() {
         "the introspecting case is zero, which is the half revoking the grants delivers"
     );
 
+    // THE PROSE, not just the table. A review proved this gap by rewriting the sentence to say
+    // "a NINETY-minute worst case" and watching the test stay green: the number was derived
+    // and the sentence beside it was hand-written, which is the drift a table-only assertion
+    // cannot see. The prose now states the SAME derived number.
+    assert!(
+        DOC.contains(&format!(
+            "`access_token_ttl_secs: {default_ttl}` that is a {default_ttl}-second worst case"
+        )),
+        "the sentence beside the table must state the same number the table does, in the \
+         same units, or a reader is taught one window and shown another"
+    );
+
     // The two halves of what revocation does, both stated. Without the second sentence the doc
     // describes the behaviour this PR fixed rather than the behaviour it now has.
     assert!(
@@ -381,5 +393,110 @@ fn the_revocation_window_is_documented_and_matches_the_configured_default() {
     assert!(
         DOC.contains("**Suspension is not revocation.**"),
         "the doc distinguishes suspension from revocation"
+    );
+}
+
+/// REVOKING AN AGENT KILLS ITS OUTSTANDING TOKENS, and only its own (issue #130, criterion 1).
+///
+/// Two properties in one test, because they fail in opposite directions and a test for either
+/// alone passes on the other's bug:
+///
+///   - WITHOUT the cascade, setting the state blocks the next issuance and leaves every token
+///     the agent already holds working until it expires. That is the half the criterion asks
+///     for and the half a state check does not deliver.
+///   - With a cascade scoped only to the CLIENT, revoking the agent revokes every live grant
+///     on that client. `agents_client_unique` guarantees no second AGENT shares the client; it
+///     says nothing about who holds GRANTS on it, and nothing stops an operator binding an
+///     agent to a client that also serves interactive logins. So a human's grant is seeded on
+///     the same client, and it must survive.
+///
+/// The subject is what separates them: a machine grant's subject is the client's
+/// service-account principal, a person's is their user id.
+#[tokio::test]
+async fn revoking_an_agent_revokes_its_grants_and_leaves_the_clients_human_grants_alone() {
+    let h = Harness::start().await;
+    let (client, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let client_id = client.to_string();
+    let seeded = seed_agent(&h, &client, &["deploy"]).await;
+
+    // A token for the agent, which opens a machine grant subject to the service account.
+    let (status, _headers, body) = h
+        .token_with_auth(
+            &cc_form(Some("deploy")),
+            Some(&basic_header(&client_id, &secret)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "agent issuance: {body}");
+
+    // A HUMAN's grant on the SAME client, seeded as the owner: this is the row the
+    // client-scoped cascade would have taken with it.
+    let human = h.seed_unique_user().await;
+    sqlx::query(
+        "INSERT INTO grants /* query-audit-allow: owner test seed */ \
+         (id, tenant_id, environment_id, client_id, subject, created_at) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(format!("gnt_human_{}", h.scope().environment()))
+    .bind(h.scope().tenant().to_string())
+    .bind(h.scope().environment().to_string())
+    .bind(&client_id)
+    .bind(&human)
+    .execute(h.db().owner_pool())
+    .await
+    .expect("seed a human grant on the same client");
+
+    let live_machine_grants = |label: &'static str| {
+        let pool = h.db().owner_pool().clone();
+        let tenant = h.scope().tenant().to_string();
+        let environment = h.scope().environment().to_string();
+        let client_id = client_id.clone();
+        async move {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM grants /* query-audit-allow: owner test read */ \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+                   AND revoked_at IS NULL \
+                   AND subject IN (SELECT id FROM service_accounts \
+                                   WHERE tenant_id = $1 AND environment_id = $2 \
+                                     AND client_id = $3)",
+            )
+            .bind(&tenant)
+            .bind(&environment)
+            .bind(&client_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: count machine grants: {error}"));
+            count
+        }
+    };
+
+    assert!(
+        live_machine_grants("before").await >= 1,
+        "the issuance opened a machine grant, which is what revocation has to reach"
+    );
+
+    set_state(&h, &seeded.id, "revoked").await;
+
+    assert_eq!(
+        live_machine_grants("after").await,
+        0,
+        "revoking the agent must revoke the grants behind its outstanding tokens; setting the \
+         state alone only blocks the NEXT issuance"
+    );
+
+    let (human_live,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM grants /* query-audit-allow: owner test read */ \
+         WHERE tenant_id = $1 AND environment_id = $2 AND subject = $3 \
+           AND revoked_at IS NULL",
+    )
+    .bind(h.scope().tenant().to_string())
+    .bind(h.scope().environment().to_string())
+    .bind(&human)
+    .fetch_one(h.db().owner_pool())
+    .await
+    .expect("count human grants");
+    assert_eq!(
+        human_live, 1,
+        "and it must NOT touch a person's grant on the same client: revoking an agent is not \
+         revoking the client"
     );
 }

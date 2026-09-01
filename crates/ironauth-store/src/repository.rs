@@ -46780,7 +46780,7 @@ impl AuditChainRepo<'_> {
 
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-                    correlation_id, detail, \
+                    correlation_id, detail, organization_id, subject_id, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
@@ -46810,8 +46810,12 @@ impl AuditChainRepo<'_> {
                 correlation_id: row.get("correlation_id"),
                 occurred_micros: row.get("occurred_micros"),
                 detail: row.get("detail"),
-                organization_id: row.try_get("organization_id").ok().flatten(),
-                subject_id: row.try_get("subject_id").ok().flatten(),
+                // `get`, not `try_get(..).ok().flatten()`. The lenient form turns a column
+                // the query forgot to SELECT into `None`, which is indistinguishable from a
+                // row that genuinely has none -- and that is exactly how these two shipped
+                // unselected: every event rendered without them and nothing failed.
+                organization_id: row.get("organization_id"),
+                subject_id: row.get("subject_id"),
             };
             let record_hash = crate::ocsf::chain_link(&prev, &record.canonical());
             seq += 1;
@@ -46985,7 +46989,7 @@ impl AuditChainRepo<'_> {
         }
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-                    correlation_id, detail, \
+                    correlation_id, detail, organization_id, subject_id, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3 \
@@ -47023,8 +47027,12 @@ impl AuditChainRepo<'_> {
                 correlation_id: row.get("correlation_id"),
                 occurred_micros: row.get("occurred_micros"),
                 detail: row.get("detail"),
-                organization_id: row.try_get("organization_id").ok().flatten(),
-                subject_id: row.try_get("subject_id").ok().flatten(),
+                // `get`, not `try_get(..).ok().flatten()`. The lenient form turns a column
+                // the query forgot to SELECT into `None`, which is indistinguishable from a
+                // row that genuinely has none -- and that is exactly how these two shipped
+                // unselected: every event rendered without them and nothing failed.
+                organization_id: row.get("organization_id"),
+                subject_id: row.get("subject_id"),
             })
             .collect())
     }
@@ -47100,7 +47108,7 @@ impl AuditChainRepo<'_> {
         let mut tx = begin_scoped(self.store, scope).await?;
         let rows = sqlx::query(
             "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
-                    correlation_id, detail, \
+                    correlation_id, detail, organization_id, subject_id, \
                     (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_micros \
              FROM audit_log \
              WHERE tenant_id = $1 AND environment_id = $2 AND stream = $3",
@@ -47126,8 +47134,8 @@ impl AuditChainRepo<'_> {
                     correlation_id: row.get("correlation_id"),
                     occurred_micros: row.get("occurred_micros"),
                     detail: row.get("detail"),
-                    organization_id: row.try_get("organization_id").ok().flatten(),
-                    subject_id: row.try_get("subject_id").ok().flatten(),
+                    organization_id: row.get("organization_id"),
+                    subject_id: row.get("subject_id"),
                 },
             );
         }
@@ -72462,9 +72470,25 @@ impl ActingAgentRepo<'_> {
                 // token stays verifiable until its `exp`, which is the residual window
                 // `docs/agents.md` states as a number.
                 //
-                // Scoped to the agent's BOUND CLIENT, which is exclusive to it
-                // (`agents_client_unique`), so this cannot reach another principal's grants.
-                // An UNBOUND agent has no door and therefore no grants to revoke.
+                // Scoped to the client AND to the client's SERVICE-ACCOUNT SUBJECT, which is
+                // the narrowest predicate that names this agent's grants.
+                //
+                // The client alone is not narrow enough, and a comment here previously said
+                // it was: `agents_client_unique` is a partial unique index on the AGENTS
+                // table, so it guarantees no second agent shares the client and says nothing
+                // about who holds GRANTS on it. `grants` is keyed (client_id, subject) and
+                // rows arrive from four paths, three of which carry a HUMAN subject; nothing
+                // stops an operator binding an agent to a client that also serves interactive
+                // logins. Revoking the agent would then have revoked every live grant on that
+                // client, invalidating unrelated people's sessions and refresh chains.
+                //
+                // A machine grant's subject is the client's service-account principal, minted
+                // by `service_accounts().ensure(client_id)` on the issuance path. Constraining
+                // to it leaves human grants on the same client untouched, which is the
+                // difference between revoking an agent and revoking a client.
+                //
+                // An UNBOUND agent has no door, so no grants; a client with no service
+                // account has never minted a machine token, so the subquery matches nothing.
                 if state == "revoked" {
                     if let Some(client_id) = agent.client_id.as_deref() {
                         sqlx::query(
@@ -72472,7 +72496,12 @@ impl ActingAgentRepo<'_> {
                              SET revoked_at = TIMESTAMPTZ 'epoch' \
                                  + ($1::text || ' microseconds')::interval \
                              WHERE tenant_id = $2 AND environment_id = $3 \
-                               AND client_id = $4 AND revoked_at IS NULL",
+                               AND client_id = $4 AND revoked_at IS NULL \
+                               AND subject IN ( \
+                                   SELECT id FROM service_accounts \
+                                   WHERE tenant_id = $2 AND environment_id = $3 \
+                                     AND client_id = $4 \
+                               )",
                         )
                         .bind(now_micros)
                         .bind(scope.tenant().to_string())
