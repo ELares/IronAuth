@@ -34873,7 +34873,7 @@
               },
               {
                 "$ref": "#/components/schemas/VaultRefreshRequest",
-                "description": "How this connection refreshes itself, when it can (issue #132, criterion 3).\n\nAbsent means it cannot: an expired credential then has to be re-established rather than\nrenewed, and the exchange says so distinctly rather than reporting a failure. Present,\nall three parts are required, because a partially configured refresh fails at the\nprovider rather than at the edge."
+                "description": "How this connection refreshes itself, when it can (issue #132, criterion 3).\n\nAbsent means it cannot: an expired credential then has to be re-established rather than\nrenewed, and the exchange says so distinctly rather than reporting a failure. Present,\nall three parts are required, because a partially configured refresh fails at the\nprovider rather than at the edge.\n\nThis route is a PUT and replaces the whole connection, so omitting this field on a\nre-store CLEARS an existing refresh configuration rather than leaving it alone. That is\nthe same semantics the access and refresh tokens already have here, and it is stated\nbecause the consequence differs: a cleared token is obviously gone, a cleared refresh\nconfiguration is invisible until the credential expires."
               }
             ]
           },
@@ -34883,6 +34883,10 @@
               "null"
             ],
             "description": "The downstream refresh token, when the provider issued one. Sealed too."
+          },
+          "requires_approval": {
+            "type": "boolean",
+            "description": "Whether exchanging for this credential is a SENSITIVE action that blocks on an\nout-of-band approval (issue #132, criterion 4).\n\nThe OPERATOR's decision, taken here because they are the one establishing the\nconnection and they are the one who knows what reaching it can do. It is deliberately\nnot the agent's: the gate used to run when the agent's exchange request named\n`authorization_details`, so a denied agent omitted the field and received the\ncredential anyway. Default false, so an existing connection behaves as it did."
           }
         }
       },
@@ -36067,7 +36071,8 @@
         "type": "object",
         "description": "A page of approvals awaiting a decision.",
         "required": [
-          "items"
+          "items",
+          "truncated"
         ],
         "properties": {
           "items": {
@@ -36076,6 +36081,10 @@
               "$ref": "#/components/schemas/VaultApprovalView"
             },
             "description": "The approvals, oldest first."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether more are waiting than this listing carries.\n\nThe listing is bounded, and a bounded list that does not say so reads as the whole\nqueue: an approver would answer 200 requests and believe they were done. There is no\ncursor to continue from because deciding a request removes it from the queue, so the\nway to see the rest is to answer some of these."
           }
         }
       },
@@ -36087,7 +36096,8 @@
           "agent_id",
           "provider",
           "state",
-          "expires_at"
+          "expires_at",
+          "requested_details"
         ],
         "properties": {
           "agent_id": {
@@ -36108,6 +36118,10 @@
           "provider": {
             "type": "string",
             "description": "The downstream provider the action is against."
+          },
+          "requested_details": {
+            "type": "object",
+            "description": "What the agent ASKED to do (RFC 9396 authorization details).\n\nThe thing being approved. It was stored by migration 0179 \"verbatim so the approver is\nshown the request rather than a summary of it\" and then read by nothing, so the queue\nsaid \"this agent wants google\" and an operator narrowed it blind. Two different pending\nactions on one provider were indistinguishable."
           },
           "state": {
             "type": "string",

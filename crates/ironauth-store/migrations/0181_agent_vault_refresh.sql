@@ -66,3 +66,83 @@ COMMENT ON COLUMN agent_vault_connections.refresh_token_endpoint IS
 COMMENT ON COLUMN agent_vault_connections.refresh_client_secret_sealed IS
     'Issue #132: the downstream client secret, sealed under its own purpose tag so it cannot '
     'be opened as an access or refresh token, and neither can be opened as it.';
+
+-- ---------------------------------------------------------------------------
+-- Which connections are SENSITIVE, and which ACTION an approval is for
+-- (issue #132, criterion 4).
+--
+-- Two columns for one defect, found by review: the approval gate restrained only a
+-- COOPERATIVE agent.
+--
+-- The gate ran when the exchange request named `authorization_details`, so the agent chose
+-- whether to enter it. A denied agent re-sent the same exchange with the field omitted and got
+-- the identical credential. "Denial issues no tokens" was true of the gate's interior and
+-- false of the endpoint. `requires_approval` moves that decision to the OPERATOR, where it
+-- belongs: they establish the connection, they say whether reaching it is sensitive, and the
+-- agent cannot opt out of the answer. Default false, so every connection stored before this
+-- behaves exactly as it did.
+--
+-- And an approval was keyed on (agent, provider) alone, so approving one action authorized
+-- EVERY action at that provider for the rest of the window: approve a payment of one, then
+-- exchange for a payment of a million against the same approval. The approver's narrowing
+-- changed a response field and nothing else, which is what 0179 calls "decorative". The digest
+-- binds an approval to the exact request it was raised for. A different action finds no
+-- approval and raises its own, which also means a denial of one action stops being a denial of
+-- everything the agent might ever do at that provider.
+--
+-- A DIGEST rather than the details themselves: the comparison is equality, the details can be
+-- large, and an index on a jsonb column to answer "is there an approval for exactly this" is a
+-- worse tool than an index on 64 hex characters.
+
+ALTER TABLE agent_vault_connections
+    ADD COLUMN requires_approval boolean NOT NULL DEFAULT false;
+
+COMMENT ON COLUMN agent_vault_connections.requires_approval IS
+    'Issue #132: whether exchanging for this credential is a sensitive action that blocks on '
+    'an out-of-band approval. Set by the OPERATOR at store time, never by the agent: an agent '
+    'that could decide this could decline to.';
+
+ALTER TABLE agent_vault_approvals
+    ADD COLUMN action_digest text;
+
+-- Backfilled to the empty string rather than left NULL, so the lookup predicate is a plain
+-- equality on every row. No row exists yet -- 0179 shipped in the same release as this -- but
+-- writing the backfill rather than assuming an empty table is what makes this safe if that
+-- ever stops being true.
+UPDATE agent_vault_approvals SET action_digest = '' WHERE action_digest IS NULL;
+
+ALTER TABLE agent_vault_approvals
+    ALTER COLUMN action_digest SET NOT NULL;
+
+-- NOT NULL with a DEFAULT, and the default is what makes the rollout safe. Migrations run
+-- before the new binary is everywhere, so for a window the OLD binary is still inserting
+-- approvals without this column; NOT NULL and no default turns that window into "no approval
+-- can be raised at all", which fails an agent's sensitive exchange for a reason no operator
+-- can see. An empty digest matches no lookup -- the reader's digest is always 64 hex
+-- characters -- so a row raised in that window is invisible to the gate rather than a pass:
+-- the agent asks again on the new binary, a properly bound request is raised, and the stray
+-- row times out.
+ALTER TABLE agent_vault_approvals
+    ALTER COLUMN action_digest SET DEFAULT '';
+
+ALTER TABLE agent_vault_approvals
+    ADD CONSTRAINT agent_vault_approvals_action_digest_shaped
+    CHECK (action_digest ~ '^[0-9a-f]{64}$' OR action_digest = '');
+
+-- The lookup the exchange performs: the newest approval for exactly this action.
+CREATE INDEX agent_vault_approvals_action_idx
+    ON agent_vault_approvals
+       (tenant_id, environment_id, agent_id, provider, action_digest, created_at DESC);
+
+-- ONE pending approval per (agent, provider, action). Two concurrent sensitive exchanges both
+-- read "no approval" and both insert, and the exchange then polls the newer of the two; an
+-- approver who decides the older one has decided a row nothing reads, and the agent waits for
+-- a decision that already happened. A unique index makes the second insert lose instead, and
+-- the loser re-reads the winner.
+--
+-- PARTIAL on `state = 'pending'`, because a decided approval is history: an agent that was
+-- approved, expired, and asks again must be able to raise a new request for the same action,
+-- and a unique index over every state would refuse it forever.
+CREATE UNIQUE INDEX agent_vault_approvals_one_pending_per_action
+    ON agent_vault_approvals (tenant_id, environment_id, agent_id, provider, action_digest)
+    WHERE state = 'pending';

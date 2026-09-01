@@ -72660,7 +72660,25 @@ pub struct VaultConnection {
     /// Always [`None`] from the ordinary read, for the same reason the refresh token is: a
     /// caller with no use for the client secret should not have it decrypted into process
     /// memory. [`AgentVaultRepo::connection_with_refresh`] is the read that opens both.
+    ///
+    /// Ask [`VaultConnection::can_refresh`] whether a refresh is POSSIBLE. Testing this field
+    /// for that answers "was the secret opened", which is a different question, and a caller
+    /// that confused the two would find its refresh path unreachable from the ordinary read.
     pub refresh: Option<OpenedRefreshConfig>,
+    /// Whether exchanging for this credential is a SENSITIVE action.
+    ///
+    /// Set by the operator at store time. The gate used to run when the agent's request named
+    /// `authorization_details`, which let a denied agent omit the field and get the credential
+    /// anyway; this is the same decision taken somewhere the agent cannot reach.
+    pub requires_approval: bool,
+    /// Whether this connection HAS a refresh configuration, whether or not it was opened.
+    ///
+    /// Populated from the row on EVERY read. It exists because the obvious test --
+    /// `refresh.is_some()` -- is false on the ordinary read even for a connection that can
+    /// refresh perfectly well, so a caller deciding "should I refresh this?" from the opened
+    /// value decides "no" every time and its refresh path is dead code. That is exactly what
+    /// happened, and it is why the two are separate fields rather than one.
+    pub can_refresh: bool,
 }
 
 /// A connection's refresh configuration with its client secret OPENED.
@@ -72699,6 +72717,47 @@ impl VaultConnection {
     }
 }
 
+/// The tokens a successful refresh produced, for [`ActingAgentVaultRepo::refresh_stored_credential`].
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshedCredentialWrite<'a> {
+    /// The connection being renewed.
+    pub id: &'a AgentVaultConnectionId,
+    /// Its agent, which the seal's associated data binds.
+    pub agent_id: &'a AgentPrincipalId,
+    /// Its provider, which the associated data binds too.
+    pub provider: &'a str,
+    /// The fresh access token.
+    pub access_token: &'a str,
+    /// The refresh token to keep: the rotated one when the provider sent it, otherwise the one
+    /// already stored. A provider MAY omit it, and dropping it then would leave a connection
+    /// that refreshes exactly once.
+    pub refresh_token: Option<&'a str>,
+    /// When the fresh access token expires, when the provider said.
+    pub expires_at_unix_micros: Option<i64>,
+}
+
+/// Everything raising one approval request needs.
+///
+/// A struct rather than seven positional parameters, matching [`NewVaultConnection`] next door.
+/// Two of these are opaque strings and two are scoped ids, which is the shape where a
+/// transposed pair compiles and raises an approval for the wrong action.
+pub struct NewVaultApproval<'a> {
+    /// The `ava_` id this request will carry.
+    pub id: &'a AgentVaultApprovalId,
+    /// The agent that asked.
+    pub agent_id: &'a AgentPrincipalId,
+    /// The downstream provider the action targets.
+    pub provider: &'a str,
+    /// What was requested, as RFC 9396 authorization details, stored verbatim so the approver
+    /// is shown the request rather than a summary of it.
+    pub requested_details: &'a serde_json::Value,
+    /// The digest binding this request to exactly one action. 64 lowercase hex characters.
+    pub action_digest: &'a str,
+    /// When the request stops being answerable. A pending approval with no deadline is an
+    /// action that blocks for ever.
+    pub expires_at_unix_micros: i64,
+}
+
 /// Everything storing a downstream connection needs.
 pub struct NewVaultConnection<'a> {
     /// The connection id (minted by the caller, embeds this scope).
@@ -72715,6 +72774,8 @@ pub struct NewVaultConnection<'a> {
     pub granted_scopes: &'a [String],
     /// When the access token expires, in microseconds since the epoch.
     pub expires_at_unix_micros: Option<i64>,
+    /// Whether exchanging for this credential blocks on an out-of-band approval.
+    pub requires_approval: bool,
     /// How this connection refreshes itself, when it can.
     ///
     /// [`None`] means it cannot: a credential established through a flow that returned no
@@ -72824,6 +72885,7 @@ impl AgentVaultRepo<'_> {
                     refresh_token_sealed, refresh_token_dek_version, granted_scopes, state, \
                     refresh_token_endpoint, refresh_client_id, \
                     refresh_client_secret_sealed, refresh_client_secret_dek_version, \
+                    requires_approval, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
              FROM agent_vault_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
@@ -72887,6 +72949,7 @@ impl AgentVaultRepo<'_> {
         // cannot be written and reading one defensively as absent keeps a hand-edited row
         // from opening garbage.
         let refresh_endpoint: Option<String> = row.get("refresh_token_endpoint");
+        let has_refresh_config = refresh_endpoint.is_some();
         let refresh_client: Option<String> = row.get("refresh_client_id");
         let secret_sealed: Option<Vec<u8>> = row.get("refresh_client_secret_sealed");
         let secret_version: Option<i32> = row.get("refresh_client_secret_dek_version");
@@ -72933,6 +72996,10 @@ impl AgentVaultRepo<'_> {
             state: row.get("state"),
             expires_at_unix_micros: row.get("expires_us"),
             refresh,
+            requires_approval: row.get("requires_approval"),
+            // From the ROW, not from whether the secret was opened. The schema pairs all four
+            // refresh columns, so the endpoint being present is the whole answer.
+            can_refresh: has_refresh_config,
         }))
     }
 }
@@ -73010,6 +73077,7 @@ impl ActingAgentVaultRepo<'_> {
         let refresh_endpoint = spec.refresh.map(|cfg| cfg.token_endpoint.to_owned());
         let refresh_client = spec.refresh.map(|cfg| cfg.client_id.to_owned());
         let refresh_secret = spec.refresh.map(|cfg| cfg.client_secret.to_owned());
+        let requires_approval = spec.requires_approval;
         // The id the row ends up with, read out of the upsert's own RETURNING rather than
         // assumed to be the one the caller minted.
         let mut effective_id: Option<String> = None;
@@ -73081,10 +73149,12 @@ impl ActingAgentVaultRepo<'_> {
                       refresh_token_sealed, refresh_token_dek_version, \
                       refresh_token_endpoint, refresh_client_id, \
                       refresh_client_secret_sealed, refresh_client_secret_dek_version, \
+                      requires_approval, \
                       granted_scopes, expires_at, state, created_at, updated_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                              $13, $14, $15, \
                              CASE WHEN $15::bytea IS NULL THEN NULL ELSE $7 END, \
+                             $16, \
                              $10, \
                              CASE WHEN $11::bigint IS NULL THEN NULL ELSE \
                                  TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
@@ -73102,6 +73172,7 @@ impl ActingAgentVaultRepo<'_> {
                          refresh_client_secret_sealed = EXCLUDED.refresh_client_secret_sealed, \
                          refresh_client_secret_dek_version = \
                              EXCLUDED.refresh_client_secret_dek_version, \
+                         requires_approval = EXCLUDED.requires_approval, \
                          granted_scopes = EXCLUDED.granted_scopes, \
                          expires_at = EXCLUDED.expires_at, \
                          state = 'active', \
@@ -73124,6 +73195,7 @@ impl ActingAgentVaultRepo<'_> {
                 .bind(refresh_endpoint.as_ref())
                 .bind(refresh_client.as_ref())
                 .bind(client_secret_sealed.as_ref())
+                .bind(requires_approval)
                 // `fetch_one`, so the id the row ACTUALLY has comes back. The statement always
                 // ended `RETURNING id` and the result was discarded, which is what made a
                 // caller's minted id authoritative when it is not: on a re-store the row keeps
@@ -73147,6 +73219,116 @@ impl ActingAgentVaultRepo<'_> {
         .await?;
         let stored = effective_id.ok_or(StoreError::NotFound)?;
         AgentVaultConnectionId::parse_in_scope(&stored, &scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// Replace a connection's stored TOKENS after a successful refresh (issue #132).
+    ///
+    /// An UPDATE, not the upsert `store_connection` performs, and the difference is a
+    /// privilege rather than a preference. Migration 0178 grants the data-plane role
+    /// `SELECT, UPDATE` on this table and deliberately withholds `INSERT`, saying why: "a
+    /// connection is established through an operator-driven flow, never as a side effect of a
+    /// token request". A refresh renews a row that already exists, which is exactly what
+    /// UPDATE expresses; routing it through the upsert would have needed a privilege the
+    /// refreshing plane does not hold and must not.
+    ///
+    /// The REFRESH CONFIGURATION is untouched. It describes how to renew, not what was
+    /// renewed, and rewriting it here would mean a refresh could silently repoint a connection
+    /// at a different provider endpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of this scope or does not exist;
+    /// [`StoreError::Encryption`] if the scope has no active key; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn refresh_stored_credential(
+        &self,
+        env: &Env,
+        spec: RefreshedCredentialWrite<'_>,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope || spec.agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let scope = self.scope;
+        let id = *spec.id;
+        let agent_id = *spec.agent_id;
+        let provider = spec.provider.to_owned();
+        let access = spec.access_token.to_owned();
+        let refresh = spec.refresh_token.map(str::to_owned);
+        let expires = spec.expires_at_unix_micros;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultStore,
+                target: &agent_id,
+            },
+            async |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                // Sealed under the SAME associated data the read will reconstruct: the agent
+                // and the provider are both in the row's identity and neither changes here.
+                let access_sealed = dek
+                    .seal(
+                        env.entropy(),
+                        &agent_vault_seal_aad(
+                            scope,
+                            &agent_id,
+                            &provider,
+                            VAULT_ACCESS_PURPOSE,
+                            dek_version,
+                        ),
+                        access.as_bytes(),
+                    )
+                    .into_bytes();
+                let refresh_sealed = refresh.as_ref().map(|value| {
+                    dek.seal(
+                        env.entropy(),
+                        &agent_vault_seal_aad(
+                            scope,
+                            &agent_id,
+                            &provider,
+                            VAULT_REFRESH_PURPOSE,
+                            dek_version,
+                        ),
+                        value.as_bytes(),
+                    )
+                    .into_bytes()
+                });
+                let affected = sqlx::query(
+                    "UPDATE agent_vault_connections \
+                     SET access_token_sealed = $1, access_token_dek_version = $2, \
+                         refresh_token_sealed = $3, refresh_token_dek_version = $4, \
+                         expires_at = CASE WHEN $5::bigint IS NULL THEN NULL ELSE \
+                             TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+                         END, \
+                         state = 'active', last_error = NULL, \
+                         updated_at = TIMESTAMPTZ 'epoch' \
+                             + ($6::text || ' microseconds')::interval \
+                     WHERE id = $7 AND tenant_id = $8 AND environment_id = $9",
+                )
+                .bind(&access_sealed)
+                .bind(dek_version)
+                .bind(refresh_sealed.as_ref())
+                .bind(refresh_sealed.as_ref().map(|_| dek_version))
+                .bind(expires)
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
     }
 
     /// Mark a connection FAILED, auditing `agent_vault.failed`.
@@ -73263,6 +73445,17 @@ pub struct VaultApproval {
     pub state: String,
     /// What the approver AGREED to, present only on an approved row.
     pub approved_details: Option<serde_json::Value>,
+    /// What the agent ASKED for, so an approver can see what they are deciding.
+    ///
+    /// Stored since 0179 and read by nothing, which left the queue showing "this agent wants
+    /// google" and an approver supplying a narrowed set blind. Two different pending actions
+    /// on one provider were indistinguishable.
+    pub requested_details: serde_json::Value,
+    /// The digest of the action this approval is FOR.
+    ///
+    /// An approval keyed on (agent, provider) alone authorized every action at that provider
+    /// for its whole window: approve a payment of one, exchange for a payment of a million.
+    pub action_digest: String,
     /// When the request stops being answerable, in microseconds since the epoch.
     pub expires_at_unix_micros: i64,
 }
@@ -73303,7 +73496,8 @@ impl AgentVaultApprovalRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, agent_id, provider, state, approved_details, \
+            "SELECT id, agent_id, provider, state, approved_details, requested_details, \
+                    action_digest, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
              FROM agent_vault_approvals \
              WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
@@ -73323,15 +73517,23 @@ impl AgentVaultApprovalRepo<'_> {
             provider: row.get("provider"),
             state: row.get("state"),
             approved_details: row.get("approved_details"),
+            requested_details: row.get("requested_details"),
+            action_digest: row.get("action_digest"),
             expires_at_unix_micros: row.get("expires_us"),
         }))
     }
 
-    /// The LATEST approval for `(agent, provider)`, whatever its state.
+    /// The LATEST approval for `(agent, provider, action)`, whatever its state.
     ///
     /// The read the exchange performs before it hands anything over. Latest rather than
     /// "the pending one": an agent that was denied and asks again must be told it was denied,
     /// not handed a fresh pending request, or a denial is a speed bump rather than an answer.
+    ///
+    /// Keyed on the ACTION as well, and that is the difference between an approval and a pass.
+    /// Without the digest, approving one action authorized every action at that provider for
+    /// the rest of the window -- approve a payment of one, then exchange for a payment of a
+    /// million against the same row -- and a denial of one action denied everything the agent
+    /// might ever do there.
     /// Ordering is by `created_at` and then by `id`, so two requests in the same microsecond
     /// still have one deterministic answer.
     ///
@@ -73343,22 +73545,26 @@ impl AgentVaultApprovalRepo<'_> {
         &self,
         agent_id: &AgentPrincipalId,
         provider: &str,
+        action_digest: &str,
     ) -> Result<Option<VaultApproval>, StoreError> {
         if agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, agent_id, provider, state, approved_details, \
+            "SELECT id, agent_id, provider, state, approved_details, requested_details, \
+                    action_digest, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
              FROM agent_vault_approvals \
              WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4 \
+               AND action_digest = $5 \
              ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(agent_id.to_string())
         .bind(provider)
+        .bind(action_digest)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -73373,11 +73579,14 @@ impl AgentVaultApprovalRepo<'_> {
             provider: row.get("provider"),
             state: row.get("state"),
             approved_details: row.get("approved_details"),
+            requested_details: row.get("requested_details"),
+            action_digest: row.get("action_digest"),
             expires_at_unix_micros: row.get("expires_us"),
         }))
     }
 
-    /// Every approval still awaiting a decision, oldest first: the APPROVER's QUEUE.
+    /// One organization's approvals still awaiting a decision, oldest first: the APPROVER's
+    /// QUEUE.
     ///
     /// The index migration 0179 created for this finally has a reader. A queue nobody can list
     /// is a queue nobody answers, which is the difference between an approval surface and a
@@ -73387,22 +73596,51 @@ impl AgentVaultApprovalRepo<'_> {
     /// issues no token, so presenting one to an approver would be asking for a decision that
     /// can no longer take effect.
     ///
+    /// THE ORGANIZATION FILTER IS IN THE QUERY, and that is not a tidying preference. The
+    /// approvals table carries no organization column -- an approval belongs to an agent and
+    /// the agent belongs to an organization -- so the first version read every pending row in
+    /// the environment and asked the agents table which organization each one was in, one
+    /// query per row. That is an N+1 an unauthenticated party can lengthen (a compromised
+    /// agent raising requests), and it makes `limit` a lie: a cap applied after the filter
+    /// bounds the answer, while a cap applied before it would silently hide THIS
+    /// organization's oldest requests behind another organization's newer ones.
+    ///
+    /// `limit` is a bound, not a page: there is no cursor here. The caller is told when it was
+    /// reached rather than being handed a truncated list that looks complete, which is why
+    /// this returns as many as `limit` and the route asks for one more than it will show.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn pending(&self, now_micros: i64) -> Result<Vec<VaultApproval>, StoreError> {
+    pub async fn pending_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+        now_micros: i64,
+        limit: i64,
+    ) -> Result<Vec<VaultApproval>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, agent_id, provider, state, approved_details, \
-                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
-             FROM agent_vault_approvals \
-             WHERE tenant_id = $1 AND environment_id = $2 AND state = 'pending' \
-               AND expires_at > TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
-             ORDER BY created_at, id",
+            "SELECT a.id, a.agent_id, a.provider, a.state, a.approved_details, \
+                    a.requested_details, a.action_digest, \
+                    (EXTRACT(EPOCH FROM a.expires_at) * 1000000)::bigint AS expires_us \
+             FROM agent_vault_approvals a \
+             JOIN agents g ON g.id = a.agent_id \
+                          AND g.tenant_id = a.tenant_id \
+                          AND g.environment_id = a.environment_id \
+             WHERE a.tenant_id = $1 AND a.environment_id = $2 AND a.state = 'pending' \
+               AND g.organization_id = $3 \
+               AND a.expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             ORDER BY a.created_at, a.id \
+             LIMIT $5",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
         .bind(now_micros)
+        .bind(limit)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -73418,6 +73656,8 @@ impl AgentVaultApprovalRepo<'_> {
                     provider: row.get("provider"),
                     state: row.get("state"),
                     approved_details: row.get("approved_details"),
+                    requested_details: row.get("requested_details"),
+                    action_digest: row.get("action_digest"),
                     expires_at_unix_micros: row.get("expires_us"),
                 })
             })
@@ -73445,15 +73685,15 @@ impl ActingAgentVaultApprovalRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the agent or the id is out of this scope;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn request(
-        &self,
-        env: &Env,
-        id: &AgentVaultApprovalId,
-        agent_id: &AgentPrincipalId,
-        provider: &str,
-        requested_details: &serde_json::Value,
-        expires_at_unix_micros: i64,
-    ) -> Result<(), StoreError> {
+    pub async fn request(&self, env: &Env, spec: NewVaultApproval<'_>) -> Result<(), StoreError> {
+        let NewVaultApproval {
+            id,
+            agent_id,
+            provider,
+            requested_details,
+            action_digest,
+            expires_at_unix_micros,
+        } = spec;
         if id.scope() != self.scope || agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -73462,6 +73702,7 @@ impl ActingAgentVaultApprovalRepo<'_> {
         let agent_id = *agent_id;
         let provider = provider.to_owned();
         let details = requested_details.clone();
+        let digest = action_digest.to_owned();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -73475,9 +73716,10 @@ impl ActingAgentVaultApprovalRepo<'_> {
                 sqlx::query(
                     "INSERT INTO agent_vault_approvals \
                      (id, tenant_id, environment_id, agent_id, provider, requested_details, \
+                      action_digest, \
                       state, expires_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -73485,9 +73727,21 @@ impl ActingAgentVaultApprovalRepo<'_> {
                 .bind(agent_id.to_string())
                 .bind(&provider)
                 .bind(&details)
+                .bind(&digest)
                 .bind(expires_at_unix_micros)
                 .execute(&mut **tx)
-                .await?;
+                .await
+                .map_err(|error| {
+                    // The unique partial index on one PENDING approval per action. A
+                    // concurrent exchange raised it first, which is not a fault: the caller
+                    // re-reads and finds the winner. Reported as Conflict rather than a
+                    // Database error so the caller can tell the two apart.
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
                 Ok(())
             },
             false,

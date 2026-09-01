@@ -613,6 +613,7 @@ pub async fn store_agent_vault_connection(
                 refresh_token,
                 granted_scopes: &request.granted_scopes,
                 expires_at_unix_micros: expires_at_micros,
+                requires_approval: request.requires_approval,
                 refresh: refresh_config,
             },
             state.now_unix_micros(),
@@ -714,6 +715,8 @@ pub async fn list_agent_vault_approvals(
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(
         &state,
@@ -724,36 +727,46 @@ pub async fn list_agent_vault_approvals(
     )
     .await?;
 
-    let agents = state.store().scoped(scope).agents();
-    let pending = state
+    // Asking for one MORE than will be shown is how `truncated` is answered without a second
+    // count query: if the extra row came back there is more waiting than this page carries.
+    let mut pending = state
         .store()
         .management()
         .agent_vault_approvals(scope)
-        .pending(state.now_unix_micros())
+        .pending_for_organization(&org_id, state.now_unix_micros(), APPROVAL_QUEUE_LIMIT + 1)
         .await?;
+    let truncated = pending.len() > usize_limit();
+    pending.truncate(usize_limit());
 
-    // Filtered to THIS organization, by asking the agent which organization it belongs to.
-    // The approvals table carries no organization column: an approval belongs to an agent and
-    // the agent belongs to an organization, and duplicating that here would be a second place
-    // for the two to disagree.
-    let mut items = Vec::new();
-    for approval in pending {
-        let agent = agents.get(&approval.agent_id).await?;
-        if agent.organization_id != org_id {
-            continue;
-        }
-        items.push(VaultApprovalView {
+    let items: Vec<VaultApprovalView> = pending
+        .into_iter()
+        .map(|approval| VaultApprovalView {
             id: approval.id.to_string(),
             agent_id: approval.agent_id.to_string(),
             provider: approval.provider,
             state: approval.state,
             expires_at: approval.expires_at_unix_micros / 1_000_000,
-        });
-    }
+            requested_details: approval.requested_details,
+        })
+        .collect();
 
-    let body_string =
-        serde_json::to_string(&VaultApprovalList { items }).map_err(|_| ApiError::Internal)?;
+    let body_string = serde_json::to_string(&VaultApprovalList { items, truncated })
+        .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
+}
+
+/// How many pending approvals one listing carries.
+///
+/// A queue is not a report: an approver answers the oldest requests, and a response that grows
+/// with the table is a denial-of-service an agent can cause by raising requests. There is no
+/// cursor here because there is nothing to page THROUGH -- deciding a request removes it from
+/// this list -- so the bound is a bound, and the response says when it was reached rather than
+/// looking complete.
+const APPROVAL_QUEUE_LIMIT: i64 = 200;
+
+/// The same bound as a `usize`, without a cast that could truncate on a 16-bit target.
+fn usize_limit() -> usize {
+    usize::try_from(APPROVAL_QUEUE_LIMIT).unwrap_or(usize::MAX)
 }
 
 /// Decide one held action (issue #132, criterion 4).
@@ -797,6 +810,8 @@ pub async fn decide_agent_vault_approval(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
     principal.require_permission(ManagementPermission::WriteOrganizations)?;
     // Approving a sensitive action is at least as privileged as changing an agent's state.
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
@@ -836,6 +851,7 @@ pub async fn decide_agent_vault_approval(
         &org_id,
         &approval.provider,
         request.approve,
+        &principal.actor().id_string(),
     );
     state
         .store()
@@ -884,6 +900,7 @@ fn vault_approval_decided_event(
     organization_id: &ironauth_store::OrganizationId,
     provider: &str,
     approve: bool,
+    decided_by: &str,
 ) -> Option<crate::events::PendingEvent> {
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let subject = agent_id.to_string();
@@ -899,6 +916,7 @@ fn vault_approval_decided_event(
             "organization_id": organization_id.to_string(),
             "provider": provider,
             "outcome": if approve { "approved" } else { "denied" },
+            "decided_by": decided_by,
         }),
     )?;
     Some(crate::events::PendingEvent {

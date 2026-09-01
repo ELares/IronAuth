@@ -150,6 +150,16 @@ async fn seed_agent(
 /// Store a downstream connection for `agent` through the CONTROL store, which is the only
 /// role migration 0178 grants INSERT on this table.
 async fn seed_connection(harness: &Harness, agent: &AgentPrincipalId, provider: &str) {
+    seed_connection_requiring(harness, agent, provider, false).await;
+}
+
+/// The same, with the operator's SENSITIVITY decision spelled out.
+async fn seed_connection_requiring(
+    harness: &Harness,
+    agent: &AgentPrincipalId,
+    provider: &str,
+    requires_approval: bool,
+) {
     let scope = harness.scope();
     let id = ironauth_store::AgentVaultConnectionId::generate(harness.env(), &scope);
     harness
@@ -177,6 +187,7 @@ async fn seed_connection(harness: &Harness, agent: &AgentPrincipalId, provider: 
                 refresh_token: Some("downstream-refresh-token"),
                 granted_scopes: &["mail.read".to_owned()],
                 expires_at_unix_micros: None,
+                requires_approval,
                 refresh: None,
             },
             i64::try_from(
@@ -510,5 +521,610 @@ async fn a_successful_exchange_hands_over_the_credential_and_audits_it() {
             .iter()
             .any(|action| action == "agent_vault.exchange"),
         "the hand-over is audited"
+    );
+}
+
+// ===========================================================================
+// The approval gate (issue #132, criterion 4).
+//
+// Every test below exists because a review found the property it pins was false, and the
+// fixtures are shaped by what those failures needed: a connection the OPERATOR marked
+// sensitive (the agent used to decide that by naming a field), and an action digest that
+// binds an approval to one request (an approval used to authorize every action at that
+// provider until it expired).
+
+/// Decide an approval as the control plane would, returning nothing.
+async fn decide(harness: &Harness, approval: &str, approve: bool, details: Option<&str>) {
+    let scope = harness.scope();
+    let id = ironauth_store::AgentVaultApprovalId::parse_in_scope(approval, &scope)
+        .expect("an approval id");
+    let agreed: Option<serde_json::Value> =
+        details.map(|raw| serde_json::from_str(raw).expect("the approver's details parse"));
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(harness.env())),
+            ironauth_store::CorrelationId::generate(harness.env()),
+        )
+        .agent_vault_approvals_acting(scope)
+        .decide(
+            harness.env(),
+            &id,
+            approve,
+            agreed.as_ref(),
+            "operator-under-test",
+            now_micros(harness),
+        )
+        .await
+        .expect("decide the approval");
+}
+
+/// The harness clock as epoch microseconds.
+fn now_micros(harness: &Harness) -> i64 {
+    i64::try_from(
+        harness
+            .state()
+            .now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a time after the epoch")
+            .as_micros(),
+    )
+    .expect("the epoch offset fits an i64")
+}
+
+/// An agent, a sensitive connection, and a token that names it.
+async fn sensitive_fixture(harness: &Harness) -> (ClientId, String, AgentPrincipalId) {
+    let (client, secret) = machine_client(harness).await;
+    let agent = seed_agent(harness, &client, &["google"]).await;
+    seed_connection_requiring(harness, &agent, "google", true).await;
+    let bearer = machine_token(harness, &client, &secret, Some("google")).await;
+    assert_eq!(
+        agent_claim(harness, &client, &bearer).as_deref(),
+        Some(agent.to_string().as_str()),
+        "the token names the agent, so the request reaches the gate"
+    );
+    (client, bearer, agent)
+}
+
+/// The action a sensitive exchange states, and a materially different one.
+const ACTION_SMALL: &str =
+    r#"{"provider":"google","authorization_details":[{"type":"payment","amount":1}]}"#;
+const ACTION_LARGE: &str =
+    r#"{"provider":"google","authorization_details":[{"type":"payment","amount":1000000}]}"#;
+
+#[tokio::test]
+async fn a_sensitive_exchange_raises_an_approval_and_issues_nothing() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    let (_client, bearer, _agent) = sensitive_fixture(&harness).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "it blocks rather than issues: {body}"
+    );
+    let parsed = json(&body);
+    assert_eq!(parsed["status"], "approval_pending");
+    assert!(
+        parsed["approval_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ava_")),
+        "and hands back something to poll: {body}"
+    );
+    assert!(
+        parsed.get("access_token").is_none(),
+        "no credential leaves while a human has not decided"
+    );
+
+    // Asking again finds the SAME approval rather than raising a second one.
+    let (again, again_body) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(again, StatusCode::ACCEPTED);
+    assert_eq!(
+        json(&again_body)["approval_id"],
+        parsed["approval_id"],
+        "a second ask polls the first request rather than raising another"
+    );
+}
+
+#[tokio::test]
+async fn a_denied_agent_cannot_get_the_credential_by_dropping_the_field() {
+    // THE BYPASS. The gate used to run when the REQUEST named `authorization_details`, so the
+    // agent chose whether to enter it: a denied agent re-sent the same exchange without the
+    // field and received the identical credential. "Denial issues no tokens" was true of the
+    // gate's interior and false of the endpoint.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    let (_client, bearer, _agent) = sensitive_fixture(&harness).await;
+
+    let (_, raised) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    let approval = json(&raised)["approval_id"]
+        .as_str()
+        .expect("an approval")
+        .to_owned();
+    decide(&harness, &approval, false, None).await;
+
+    let (denied, _) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(denied, StatusCode::FORBIDDEN, "the denial stands");
+
+    // The bypass itself: same exchange, field omitted.
+    let (bypass, bypass_body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_ne!(
+        bypass,
+        StatusCode::OK,
+        "omitting authorization_details must not hand over the credential: {bypass_body}"
+    );
+    assert!(
+        json(&bypass_body).get("access_token").is_none(),
+        "and no token is in the body either: {bypass_body}"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_authorizes_the_action_it_was_raised_for_and_no_other() {
+    // Approve a payment of one; exchange for a payment of a million. The approval used to be
+    // keyed on (agent, provider) alone, so the second request matched the first's approval and
+    // was issued -- which made the approver's narrowing, in migration 0179's own word,
+    // decorative.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    let (_client, bearer, _agent) = sensitive_fixture(&harness).await;
+
+    let (_, raised) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    let approval = json(&raised)["approval_id"]
+        .as_str()
+        .expect("an approval")
+        .to_owned();
+    decide(&harness, &approval, true, None).await;
+
+    // The approved action succeeds. This is the control: without it the assertion below passes
+    // against a gate that refuses everything.
+    let (approved, approved_body) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(
+        approved,
+        StatusCode::OK,
+        "the approved action is issued: {approved_body}"
+    );
+    assert_eq!(
+        json(&approved_body)["access_token"],
+        "downstream-access-token",
+        "and it is the downstream credential"
+    );
+
+    // A DIFFERENT action is not covered by it.
+    let (other, other_body) = exchange(&harness, Some(&bearer), ACTION_LARGE).await;
+    assert_eq!(
+        other,
+        StatusCode::ACCEPTED,
+        "a different action raises its OWN approval rather than riding the first: {other_body}"
+    );
+    assert_ne!(
+        json(&other_body)["approval_id"].as_str(),
+        Some(approval.as_str()),
+        "and it is a different approval"
+    );
+}
+
+#[tokio::test]
+async fn an_approver_who_narrows_the_request_has_the_narrowed_set_take_effect() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    let (_client, bearer, _agent) = sensitive_fixture(&harness).await;
+
+    let (_, raised) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    let approval = json(&raised)["approval_id"]
+        .as_str()
+        .expect("an approval")
+        .to_owned();
+    decide(
+        &harness,
+        &approval,
+        true,
+        Some(r#"[{"type":"payment","amount":1,"currency":"GBP"}]"#),
+    )
+    .await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        json(&body)["authorization_details"][0]["currency"],
+        "GBP",
+        "the response carries what the APPROVER agreed to, not an echo of the request: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_connection_is_unaffected_by_the_gate() {
+    // The control on the whole feature. `requires_approval` defaults false, so a connection an
+    // operator did not mark sensitive behaves exactly as it did before the gate existed --
+    // including when the agent names authorization details, which is now advisory rather than
+    // the trigger.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_connection_requiring(&harness, &agent, "google", false).await;
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an ordinary connection issues without an approval: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_sensitive_connection_refuses_a_request_that_states_no_action() {
+    // There is nothing for an approver to decide and nothing to bind an approval to, so this
+    // is a bad request rather than a bypass or a blanket approval.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    let (_client, bearer, _agent) = sensitive_fixture(&harness).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json(&body)["error"], "invalid_request");
+}
+
+// ===========================================================================
+// The refresh (issue #132, criterion 3).
+//
+// The criterion is "stored-token refresh works and a failing connection isolates without
+// affecting other connections". Both halves need a PROVIDER to answer, so these drive an
+// in-process token endpoint through the federation fetcher's injected dialer, the same rig
+// `federation.rs` uses. The alternative -- asserting on the store alone -- would have missed
+// the blocker a review found: the refresh branch guarded on a field the ordinary read never
+// populates, so the whole path was dead code and no store-level test could see it.
+
+/// What the stub token endpoint answers.
+#[derive(Clone, Copy)]
+enum Downstream {
+    /// A fresh access token and a rotated refresh token.
+    Rotates,
+    /// A fresh access token and NO refresh token, which a provider may legitimately do.
+    KeepsTheRefreshToken,
+    /// `invalid_grant`: the stored refresh token is spent or revoked.
+    Refuses,
+}
+
+/// A token endpoint on loopback, plus a count of what reached it.
+struct Provider {
+    addr: std::net::SocketAddr,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    last_body: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+async fn provider(behaviour: Downstream) -> Provider {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind the provider");
+    let addr = listener.local_addr().expect("provider address");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let last_body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&calls);
+    let body_slot = std::sync::Arc::clone(&last_body);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = std::sync::Arc::clone(&seen);
+            let body_slot = std::sync::Arc::clone(&body_slot);
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if let Some(at) = request.find("\r\n\r\n") {
+                    request[at + 4..].clone_into(&mut body_slot.lock().expect("lock"));
+                }
+                let (code, body) = match behaviour {
+                    Downstream::Rotates => (
+                        200,
+                        r#"{"access_token":"fresh-access-token","refresh_token":"rotated-refresh-token","expires_in":3600}"#
+                            .to_owned(),
+                    ),
+                    Downstream::KeepsTheRefreshToken => (
+                        200,
+                        r#"{"access_token":"fresh-access-token","expires_in":3600}"#.to_owned(),
+                    ),
+                    Downstream::Refuses => (400, r#"{"error":"invalid_grant"}"#.to_owned()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {code} S\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    Provider {
+        addr,
+        calls,
+        last_body,
+    }
+}
+
+/// A harness whose federation fetcher dials `addr` for every host, over plaintext http.
+fn with_provider(harness: &mut Harness, addr: std::net::SocketAddr) {
+    use ironauth_oidc::{FederationKeyResolver, FederationRuntime};
+    let resolver = std::sync::Arc::new(ironauth_fetch::StaticResolver::new(vec![
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+    ]));
+    let dialer = std::sync::Arc::new(ironauth_fetch::RecordingDialer::new(addr));
+    let fetcher = std::sync::Arc::new(ironauth_fetch::Fetcher::from_parts(
+        ironauth_fetch::FetchLimits::default(),
+        resolver,
+        dialer,
+    ));
+    let keys = std::sync::Arc::new(FederationKeyResolver::new_allow_http(
+        std::sync::Arc::clone(&fetcher),
+        std::time::Duration::from_secs(300),
+    ));
+    let runtime = std::sync::Arc::new(FederationRuntime::new_allow_http(
+        fetcher,
+        keys,
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(30),
+    ));
+    harness.install_federation(runtime);
+}
+
+/// Seed a connection that CAN refresh, with an access token that expired an hour ago.
+async fn seed_expired_refreshable(
+    harness: &Harness,
+    agent: &AgentPrincipalId,
+    provider_name: &str,
+    token_endpoint: &str,
+) {
+    let scope = harness.scope();
+    let id = ironauth_store::AgentVaultConnectionId::generate(harness.env(), &scope);
+    let now = now_micros(harness);
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(harness.env())),
+            ironauth_store::CorrelationId::generate(harness.env()),
+        )
+        .agent_vault(scope)
+        .store_connection(
+            harness.env(),
+            ironauth_store::NewVaultConnection {
+                id: &id,
+                agent_id: agent,
+                provider: provider_name,
+                access_token: "stale-access-token",
+                refresh_token: Some("downstream-refresh-token"),
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: Some(now - 3_600_000_000),
+                requires_approval: false,
+                refresh: Some(ironauth_store::VaultRefreshConfig {
+                    token_endpoint,
+                    client_id: "downstream-client",
+                    client_secret: "downstream-client-secret",
+                }),
+            },
+            now,
+        )
+        .await
+        .expect("store a refreshable connection");
+}
+
+#[tokio::test]
+async fn an_expired_credential_is_refreshed_and_the_fresh_one_is_stored() {
+    let downstream = provider(Downstream::Rotates).await;
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    with_provider(&mut harness, downstream.addr);
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_expired_refreshable(
+        &harness,
+        &agent,
+        "google",
+        "http://oauth2.example.test/token",
+    )
+    .await;
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        json(&body)["access_token"],
+        "fresh-access-token",
+        "the expired credential was renewed rather than handed over stale: {body}"
+    );
+    assert_eq!(
+        downstream.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one call reached the provider"
+    );
+    let sent = downstream.last_body.lock().expect("lock").clone();
+    assert!(
+        sent.contains("grant_type=refresh_token")
+            && sent.contains("refresh_token=downstream-refresh-token")
+            && sent.contains("client_secret=downstream-client-secret"),
+        "the refresh presented the stored token and the stored client credentials: {sent}"
+    );
+
+    // THE RE-STORE. A refresh that is not persisted renews on every single exchange, and the
+    // first version could not persist: it wrote through the data plane, which migration 0178
+    // grants no INSERT. A second exchange proves the fresh token came back from the DATABASE.
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        json(&body)["access_token"],
+        "fresh-access-token",
+        "the second exchange serves the stored fresh token: {body}"
+    );
+    assert_eq!(
+        downstream.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "and it did NOT call the provider again, so the refresh was persisted"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_that_omits_a_rotated_refresh_token_keeps_the_stored_one() {
+    // A provider MAY answer without a refresh token, meaning "keep using the one you have".
+    // Dropping it there would leave a connection that refreshes exactly once and then needs an
+    // operator, which looks like a provider fault and is ours.
+    let downstream = provider(Downstream::KeepsTheRefreshToken).await;
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    with_provider(&mut harness, downstream.addr);
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_expired_refreshable(
+        &harness,
+        &agent,
+        "google",
+        "http://oauth2.example.test/token",
+    )
+    .await;
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let stored = harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .agent_vault()
+        .connection(&agent, "google")
+        .await
+        .expect("read")
+        .expect("the connection is still there");
+    assert_eq!(
+        stored.refresh_token.as_deref(),
+        Some("downstream-refresh-token"),
+        "the stored refresh token survived a response that did not rotate it"
+    );
+    assert!(
+        stored.can_refresh,
+        "and the connection can still refresh next time"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_refresh_marks_its_own_connection_and_leaves_the_others_alone() {
+    // The ISOLATION half of criterion 3, and the only shape that tests it: one agent, two
+    // providers, one of them broken. A test with a single connection cannot distinguish
+    // "marked the failing one" from "marked everything".
+    let downstream = provider(Downstream::Refuses).await;
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    with_provider(&mut harness, downstream.addr);
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google", "github"]).await;
+    seed_expired_refreshable(
+        &harness,
+        &agent,
+        "google",
+        "http://oauth2.example.test/token",
+    )
+    .await;
+    seed_connection(&harness, &agent, "github").await;
+
+    let google = machine_token(&harness, &client, &secret, Some("google")).await;
+    let (status, body) = exchange(&harness, Some(&google), r#"{"provider":"google"}"#).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a refresh the provider refused must not issue anything: {body}"
+    );
+    assert!(
+        json(&body).get("access_token").is_none(),
+        "and no token is in the body: {body}"
+    );
+
+    // The broken connection is MARKED, not deleted: an operator has to be able to see which
+    // one is broken in order to re-establish it.
+    let store = harness.db().control_store();
+    let store = store.scoped(harness.scope());
+    let broken = store
+        .agent_vault()
+        .connection(&agent, "google")
+        .await
+        .expect("read");
+    assert!(
+        broken.is_none_or(|c| c.state == "failed"),
+        "the failing connection is visibly failed rather than silently gone"
+    );
+
+    // And the agent's OTHER provider is untouched, which is what isolation means.
+    let github = machine_token(&harness, &client, &secret, Some("github")).await;
+    let (status, body) = exchange(&harness, Some(&github), r#"{"provider":"github"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one dead downstream must not take the agent's other connections with it: {body}"
+    );
+    assert_eq!(json(&body)["access_token"], "downstream-access-token");
+}
+
+#[tokio::test]
+async fn an_expired_connection_that_cannot_refresh_says_so_distinctly() {
+    // Null refresh configuration is a FACT about the connection, not missing data: a credential
+    // from a flow that returned no refresh token has to be re-established. Reporting that as a
+    // provider failure would send an operator to look at a provider that is fine.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    let scope = harness.scope();
+    let id = ironauth_store::AgentVaultConnectionId::generate(harness.env(), &scope);
+    let now = now_micros(&harness);
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(harness.env())),
+            ironauth_store::CorrelationId::generate(harness.env()),
+        )
+        .agent_vault(scope)
+        .store_connection(
+            harness.env(),
+            ironauth_store::NewVaultConnection {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                access_token: "stale-access-token",
+                refresh_token: None,
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: Some(now - 3_600_000_000),
+                requires_approval: false,
+                refresh: None,
+            },
+            now,
+        )
+        .await
+        .expect("store an unrefreshable connection");
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an expired credential must not be handed over: {body}"
+    );
+    assert!(
+        body.contains("re-establish"),
+        "the answer tells the operator what to do about it: {body}"
     );
 }

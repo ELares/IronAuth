@@ -69,6 +69,7 @@ pub mod target;
 pub mod test_tls;
 pub mod txt;
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -305,7 +306,14 @@ impl Default for FetchLimits {
 
 /// One outbound request: its purpose, target, method, caller-set headers, body,
 /// and scheme opt-in. Built fluently; nothing here carries ambient authority.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand and REDACTS the body and the header values. A derived one is a
+/// credential leak waiting for its first `tracing::debug!("{request:?}")`: these bodies carry
+/// an agent's downstream refresh token and the downstream client secret (issue #132), and
+/// headers carry bearer credentials. Nothing formats a `FetchRequest` today, which is exactly
+/// why this is worth fixing now rather than after something does -- the derive is the kind of
+/// hazard that is invisible until the log line that trips it is already in production.
+#[derive(Clone)]
 pub struct FetchRequest {
     purpose: FetchPurpose,
     url: String,
@@ -314,6 +322,23 @@ pub struct FetchRequest {
     body: Bytes,
     allow_http: bool,
     timeout: Option<Duration>,
+}
+
+impl fmt::Debug for FetchRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Header NAMES are kept and values are not: which headers a request carries is useful
+        // when reading a log, and what is in them is the secret.
+        let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("FetchRequest")
+            .field("purpose", &self.purpose)
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("header_names", &header_names)
+            .field("body_bytes", &self.body.len())
+            .field("allow_http", &self.allow_http)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl FetchRequest {
@@ -729,5 +754,48 @@ impl Fetcher {
             resolver,
             dialer,
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::{FetchPurpose, FetchRequest};
+    use http::{HeaderName, HeaderValue, Method};
+
+    /// Formatting a request must not print what is IN it (issue #132).
+    ///
+    /// A refresh exchange puts an agent's downstream refresh token and the downstream client
+    /// secret in the body and a credential in a header. The derived `Debug` printed all three,
+    /// and the only thing standing between that and a log file was that nobody had yet written
+    /// the debug line.
+    #[test]
+    fn debug_prints_neither_the_body_nor_a_header_value() {
+        let request = FetchRequest::new(
+            FetchPurpose::FederationToken,
+            Method::POST,
+            "https://oauth2.example.test/token",
+        )
+        .body("grant_type=refresh_token&refresh_token=SECRET-REFRESH&client_secret=SECRET-CLIENT")
+        .header(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer SECRET-BEARER"),
+        );
+
+        let rendered = format!("{request:?}");
+        for secret in ["SECRET-REFRESH", "SECRET-CLIENT", "SECRET-BEARER"] {
+            assert!(
+                !rendered.contains(secret),
+                "the debug rendering leaked {secret}: {rendered}"
+            );
+        }
+        // The control: it still says enough to be worth logging.
+        assert!(
+            rendered.contains("oauth2.example.test") && rendered.contains("authorization"),
+            "the debug rendering is redacted into uselessness: {rendered}"
+        );
+        assert!(
+            rendered.contains("body_bytes"),
+            "the body's SIZE is the part that stays: {rendered}"
+        );
     }
 }

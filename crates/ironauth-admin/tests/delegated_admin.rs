@@ -4602,3 +4602,89 @@ async fn the_agent_surface_splits_registering_and_revoking_from_listing() {
         "write_organizations did not cover the agent state change: {response}"
     );
 }
+
+/// The agent VAULT surface splits storing a credential and deciding an approval from reading
+/// the approver's queue (issue #132).
+///
+/// Three operations arrived classified and unproven, which is the state this file exists to
+/// clear: a classification is a claim about the handler, and until a credential holding the
+/// WRONG permission is refused by name, it is only a claim. Storing a downstream credential
+/// and approving a sensitive action both change what an agent can reach OUTSIDE IronAuth, so
+/// both sit with the organization writes; the queue is a read because an approver has to see
+/// the request before deciding it.
+#[tokio::test]
+async fn the_agent_vault_surface_splits_deciding_from_reading_the_queue() {
+    let h = Harness::start(263).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-vault").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}/organizations/org_absent");
+    let queue = format!("{base}/agent-approvals");
+    let decision = format!("{queue}/ava_absent/decision");
+    let connection = format!("{base}/agents/agp_absent/vault-connections");
+    let store = serde_json::json!({
+        "provider": "google",
+        "access_token": "downstream-access-token",
+        "granted_scopes": ["mail.read"],
+    })
+    .to_string();
+    let decide = serde_json::json!({ "approve": true }).to_string();
+
+    // A READ-ONLY credential may see the queue and may not store or decide.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let (status, _, response) = h.get_as(&queue, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an approver with a read credential must be able to see what is waiting: {response}"
+    );
+
+    let (status, _, response) = h.put_as(&connection, &secret, &store).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential stored a downstream credential: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    let (status, _, response) = h
+        .post_as(&decision, &secret, "k-decide-forbidden", &decide)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential DECIDED an approval, which is the escalation this surface \
+         exists to prevent: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    // And a WRITE credential reaches both writes.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, response) = h.put_as(&connection, &secret, &store).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover storing a connection: {response}"
+    );
+    let (status, _, response) = h
+        .post_as(&decision, &secret, "k-decide-allowed", &decide)
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover the decision: {response}"
+    );
+}

@@ -588,12 +588,29 @@ pub struct StoreVaultConnectionRequest {
     #[serde(default)]
     pub expires_at: Option<i64>,
 
+    /// Whether exchanging for this credential is a SENSITIVE action that blocks on an
+    /// out-of-band approval (issue #132, criterion 4).
+    ///
+    /// The OPERATOR's decision, taken here because they are the one establishing the
+    /// connection and they are the one who knows what reaching it can do. It is deliberately
+    /// not the agent's: the gate used to run when the agent's exchange request named
+    /// `authorization_details`, so a denied agent omitted the field and received the
+    /// credential anyway. Default false, so an existing connection behaves as it did.
+    #[serde(default)]
+    pub requires_approval: bool,
+
     /// How this connection refreshes itself, when it can (issue #132, criterion 3).
     ///
     /// Absent means it cannot: an expired credential then has to be re-established rather than
     /// renewed, and the exchange says so distinctly rather than reporting a failure. Present,
     /// all three parts are required, because a partially configured refresh fails at the
     /// provider rather than at the edge.
+    ///
+    /// This route is a PUT and replaces the whole connection, so omitting this field on a
+    /// re-store CLEARS an existing refresh configuration rather than leaving it alone. That is
+    /// the same semantics the access and refresh tokens already have here, and it is stated
+    /// because the consequence differs: a cleared token is obviously gone, a cleared refresh
+    /// configuration is invisible until the credential expires.
     #[serde(default)]
     pub refresh: Option<VaultRefreshRequest>,
 }
@@ -655,6 +672,14 @@ pub struct VaultApprovalView {
     /// When the request stops being answerable, in seconds since the epoch. After this a
     /// decision can no longer take effect: a timeout issues no tokens.
     pub expires_at: i64,
+    /// What the agent ASKED to do (RFC 9396 authorization details).
+    ///
+    /// The thing being approved. It was stored by migration 0179 "verbatim so the approver is
+    /// shown the request rather than a summary of it" and then read by nothing, so the queue
+    /// said "this agent wants google" and an operator narrowed it blind. Two different pending
+    /// actions on one provider were indistinguishable.
+    #[schema(value_type = Object)]
+    pub requested_details: serde_json::Value,
 }
 
 /// A page of approvals awaiting a decision.
@@ -662,6 +687,13 @@ pub struct VaultApprovalView {
 pub struct VaultApprovalList {
     /// The approvals, oldest first.
     pub items: Vec<VaultApprovalView>,
+    /// Whether more are waiting than this listing carries.
+    ///
+    /// The listing is bounded, and a bounded list that does not say so reads as the whole
+    /// queue: an approver would answer 200 requests and believe they were done. There is no
+    /// cursor to continue from because deciding a request removes it from the queue, so the
+    /// way to see the rest is to answer some of these.
+    pub truncated: bool,
 }
 
 /// The body deciding one held action (issue #132).

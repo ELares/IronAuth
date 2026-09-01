@@ -244,6 +244,10 @@ as a sentinel, so an absent one means absent.
       "minLength": 1,
       "type": "string"
     },
+    "decided_by": {
+      "minLength": 1,
+      "type": "string"
+    },
     "organization_id": {
       "minLength": 1,
       "type": "string"
@@ -262,7 +266,8 @@ as a sentinel, so an absent one means absent.
     "agent_id",
     "organization_id",
     "provider",
-    "outcome"
+    "outcome",
+    "decided_by"
   ],
   "type": "object"
 }
@@ -278,7 +283,8 @@ as a sentinel, so an absent one means absent.
   "agent_id": "agent_id_example",
   "organization_id": "organization_id_example",
   "provider": "provider_example",
-  "outcome": "outcome_example"
+  "outcome": "outcome_example",
+  "decided_by": "decided_by_example"
 }
 ```
 

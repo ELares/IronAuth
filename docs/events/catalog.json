@@ -152,6 +152,10 @@
             "minLength": 1,
             "type": "string"
           },
+          "decided_by": {
+            "minLength": 1,
+            "type": "string"
+          },
           "organization_id": {
             "minLength": 1,
             "type": "string"
@@ -170,7 +174,8 @@
           "agent_id",
           "organization_id",
           "provider",
-          "outcome"
+          "outcome",
+          "decided_by"
         ],
         "type": "object"
       },

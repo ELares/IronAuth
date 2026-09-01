@@ -93,10 +93,16 @@ pub struct ApprovalPending {
 /// with the client credentials that provider issued, and until migration 0180 none of those
 /// three things had anywhere to live.
 ///
-/// Returns the fresh credential on success. On ANY failure the connection is MARKED FAILED and
-/// the error returned, which is the other half of the same criterion: one dead downstream is
+/// Returns the fresh credential on success. A failure AT THE PROVIDER marks the connection and
+/// returns the reason, which is the other half of the same criterion: one dead downstream is
 /// visible and isolated instead of taking an agent's other connections with it. Marked, never
 /// deleted, so an operator can see which one broke and why.
+///
+/// The three checks BEFORE the provider is contacted -- no refresh configuration, no stored
+/// refresh token, no federation runtime -- return without marking, deliberately. Nothing is
+/// wrong with the connection in any of them: the first two describe a connection that was
+/// never set up to refresh, and the third describes a deployment that cannot reach any
+/// provider at all. Marking would report a working credential as broken.
 ///
 /// Rides the SSRF-hardened federation fetcher rather than a client of its own. The endpoint is
 /// operator-supplied and dereferenced with a refresh token in the body, so it gets the same
@@ -207,6 +213,24 @@ struct RefreshedCredential {
     access_token: String,
     refresh_token: String,
     expires_in_secs: Option<i64>,
+}
+
+/// The digest that binds an approval to ONE action.
+///
+/// Over the CANONICAL serialization: `serde_json::Value` keeps object keys ordered, so two
+/// requests differing only in key order digest the same and two differing in any value do not.
+/// That equality is the whole control -- without it an approval for one action authorized every
+/// action at that provider until it expired.
+fn action_digest(details: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_vec(details).unwrap_or_default();
+    let digest = Sha256::digest(&canonical);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// How long a raised approval stays answerable.
@@ -590,7 +614,12 @@ pub async fn exchange(
     // untouched. The refusal then names what actually happened rather than "expired", because
     // the operator's next action differs.
     let mut connection = connection;
-    if !connection.is_usable(now_micros) && connection.refresh.is_some() {
+    // `can_refresh`, NOT `refresh.is_some()`. The ordinary read never opens the client secret,
+    // so the opened value is always `None` here and testing it made this whole branch dead
+    // code: an expired connection fell straight through to the 409 below and the refresh path
+    // had no live caller at all. The two fields answer different questions and this is the one
+    // that asks whether a refresh is possible.
+    if !connection.is_usable(now_micros) && connection.can_refresh {
         // Re-read WITH the refresh, which is the only read that opens the client secret.
         let refreshable = store
             .agent_vault()
@@ -606,36 +635,48 @@ pub async fn exchange(
                             .expires_in_secs
                             .and_then(|seconds| seconds.checked_mul(1_000_000))
                             .and_then(|micros| now_micros.checked_add(micros));
-                        // Re-stored through the CONTROL plane, which is the only role that may
-                        // write this table, and carrying the refresh configuration forward so
-                        // the NEXT expiry can renew too.
+                        // An UPDATE through the DATA plane, which is the plane this
+                        // request is already on and which migration 0178 grants exactly
+                        // `SELECT, UPDATE` for. The upsert was wrong twice over: it needs
+                        // `INSERT`, which this role deliberately does not hold ("a connection
+                        // is established through an operator-driven flow, never as a side
+                        // effect of a token request"), and it would have failed AFTER the
+                        // refresh token was already spent at the provider.
                         let restored = state
                             .store()
-                            .management()
+                            .scoped(scope)
                             .acting(request_actor, correlation)
-                            .agent_vault(scope)
-                            .store_connection(
+                            .agent_vault()
+                            .refresh_stored_credential(
                                 state.env(),
-                                ironauth_store::NewVaultConnection {
+                                ironauth_store::RefreshedCredentialWrite {
                                     id: &with_config.id,
                                     agent_id: &agent_id,
                                     provider: &request.provider,
                                     access_token: &refreshed.access_token,
                                     refresh_token: Some(&refreshed.refresh_token),
-                                    granted_scopes: &with_config.granted_scopes,
                                     expires_at_unix_micros: expires_at,
-                                    refresh: with_config.refresh.as_ref().map(|cfg| {
-                                        ironauth_store::VaultRefreshConfig {
-                                            token_endpoint: &cfg.token_endpoint,
-                                            client_id: &cfg.client_id,
-                                            client_secret: &cfg.client_secret,
-                                        }
-                                    }),
                                 },
                                 now_micros,
                             )
                             .await;
                         if restored.is_err() {
+                            // The refresh token has already been SPENT at the provider and may
+                            // have been rotated, so the stored one is now potentially useless
+                            // and the connection genuinely is broken. Marked, best effort:
+                            // failing to record it must not change what this request answers.
+                            let _ = state
+                                .store()
+                                .scoped(scope)
+                                .acting(request_actor, correlation)
+                                .agent_vault()
+                                .mark_failed(
+                                    state.env(),
+                                    &with_config.id,
+                                    "the refreshed credential could not be stored",
+                                    now_micros,
+                                )
+                                .await;
                             return refuse(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 "server_error",
@@ -687,10 +728,33 @@ pub async fn exchange(
     // deadline on the row, so an approval nobody answered stops authorizing on its own and
     // needs no sweeper to have run for the refusal to be correct.
     let mut approved_details = None;
-    if let Some(requested_details) = request.authorization_details.as_ref() {
+    let mut approved_for: Option<String> = None;
+    if connection.requires_approval {
+        // SENSITIVITY IS THE OPERATOR'S DECISION, not the agent's. This used to run when the
+        // REQUEST named `authorization_details`, which meant a denied agent re-sent the same
+        // exchange with the field omitted and received the identical credential: "denial
+        // issues no tokens" was true of this block's interior and false of the endpoint. The
+        // connection now carries the answer, and the agent cannot decline to enter the gate.
+        let Some(requested_details) = request.authorization_details.as_ref() else {
+            // A sensitive connection with no stated action is a bad request, not a bypass.
+            // There is nothing for an approver to decide and nothing to bind an approval to.
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "this connection requires approval, so the request must state the \
+                 authorization_details it is for",
+            );
+        };
+        // The action, as a digest of its CANONICAL form, so an approval is bound to the exact
+        // request it was raised for. `serde_json::Value` orders object keys, so two requests
+        // that differ only in key order produce one digest -- and two that differ in any value
+        // produce different ones, which is what stops an approval for a payment of one from
+        // authorizing a payment of a million.
+        let action_digest = action_digest(requested_details);
+
         let Ok(existing) = store
             .agent_vault_approvals()
-            .latest_for(&agent_id, &request.provider)
+            .latest_for(&agent_id, &request.provider, &action_digest)
             .await
         else {
             return refuse(
@@ -700,46 +764,91 @@ pub async fn exchange(
             );
         };
 
+        // Four answers, and the ORDER matters: a row past its deadline is dead whatever its
+        // state, so the expiry is checked before the state rather than after. Checking state
+        // first is how the previous version deadlocked -- a pending row past its deadline
+        // matched the pending arm and answered 202 forever, invisible to the approver's queue
+        // (which excludes expired rows) and undecidable (the decision refuses them too), while
+        // an approved row past its deadline answered 403 forever. Both were permanent, and
+        // neither raised a replacement.
+        let live = existing
+            .as_ref()
+            .is_some_and(|approval| now_micros < approval.expires_at_unix_micros);
         match existing {
-            Some(approval) if approval.authorizes(now_micros) => {
-                // What the approver AGREED to, which may be narrower than what was asked.
-                approved_details.clone_from(&approval.approved_details);
+            Some(approval) if live && approval.state == "approved" => {
+                // What the approver AGREED to, which may be narrower than what was asked. An
+                // approval that stated nothing means "exactly what was asked", so the request
+                // is echoed rather than the field being dropped: a caller that received no
+                // statement at all could not tell an unnarrowed approval from a missing one.
+                approved_details = Some(
+                    approval
+                        .approved_details
+                        .clone()
+                        .unwrap_or_else(|| requested_details.clone()),
+                );
+                approved_for = Some(approval.id.to_string());
             }
-            Some(approval) if approval.state == "pending" => {
+            Some(approval) if live && approval.state == "pending" => {
                 return pending_response(&approval);
             }
-            // Decided against, or approved and now past its deadline. Both issue nothing, and
-            // both answer the same thing: this action is not authorized. Re-raising here would
-            // make a denial a speed bump.
-            Some(_) => {
+            // Denied, and still live. A denial stands for as long as it was given for, and
+            // re-raising here would make it a speed bump. It stops standing when it expires,
+            // which is the same rule the approval gets.
+            Some(_) if live => {
                 return refuse(
                     StatusCode::FORBIDDEN,
                     "access_denied",
                     "this action was not approved",
                 );
             }
-            None => {
+            // Nothing, or nothing still live: raise one. This is the arm that makes a timeout
+            // recoverable rather than terminal.
+            _ => {
                 let approval_id =
                     ironauth_store::AgentVaultApprovalId::generate(state.env(), &scope);
                 let expires_at = now_micros.saturating_add(APPROVAL_WINDOW_MICROS);
-                if acting_for_approval(&state, scope, request_actor, correlation)
+                match acting_for_approval(&state, scope, request_actor, correlation)
                     .agent_vault_approvals()
                     .request(
                         state.env(),
-                        &approval_id,
-                        &agent_id,
-                        &request.provider,
-                        requested_details,
-                        expires_at,
+                        ironauth_store::NewVaultApproval {
+                            id: &approval_id,
+                            agent_id: &agent_id,
+                            provider: &request.provider,
+                            requested_details,
+                            action_digest: &action_digest,
+                            expires_at_unix_micros: expires_at,
+                        },
                     )
                     .await
-                    .is_err()
                 {
-                    return refuse(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "the approval could not be raised",
-                    );
+                    Ok(()) => {}
+                    // A concurrent exchange raised the same action first, which the unique
+                    // partial index refuses. Not a fault: re-read and answer with the winner,
+                    // so both callers poll the SAME approval. Answering 500 here would have
+                    // been a server error for a request that behaved correctly, and inserting
+                    // anyway would leave an approver deciding a row nothing reads.
+                    Err(ironauth_store::StoreError::Conflict) => {
+                        return match store
+                            .agent_vault_approvals()
+                            .latest_for(&agent_id, &request.provider, &action_digest)
+                            .await
+                        {
+                            Ok(Some(winner)) => pending_response(&winner),
+                            _ => refuse(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "the approval could not be read",
+                            ),
+                        };
+                    }
+                    Err(_) => {
+                        return refuse(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "the approval could not be raised",
+                        );
+                    }
                 }
                 return (
                     StatusCode::ACCEPTED,
@@ -755,6 +864,14 @@ pub async fn exchange(
         }
     }
 
+    // What the exchange row says. The provider, and the APPROVAL that authorized it when one
+    // did: without the second, nothing joins "credential handed over" to "approval that
+    // permitted it", and accountability is the whole reason this row exists.
+    let exchange_detail = match approved_for.as_ref() {
+        Some(approval_id) => format!("{} approval={approval_id}", request.provider),
+        None => request.provider.clone(),
+    };
+
     // The exchange row, BEFORE the credential leaves. A record written afterwards is one a
     // crash can lose while the credential is already gone.
     let acting = state
@@ -763,7 +880,7 @@ pub async fn exchange(
         .acting(request_actor, correlation);
     if acting
         .agent_vault()
-        .record_exchange(state.env(), &connection.id, &request.provider)
+        .record_exchange(state.env(), &connection.id, &exchange_detail)
         .await
         .is_err()
     {

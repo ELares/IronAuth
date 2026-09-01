@@ -25,13 +25,28 @@
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AgentPrincipalId, AgentVaultApprovalId, AgentVaultConnectionId, CorrelationId, NewAgent,
-    NewVaultConnection, OrganizationId, Scope, UserId, VaultApproval,
+    NewVaultApproval, NewVaultConnection, OrganizationId, Scope, UserId, VaultApproval,
 };
 
 /// A downstream access token that is unmistakable if it ever appears in a column.
 const DOWNSTREAM_ACCESS: &str = "ya29.PLAINTEXT-GOOGLE-ACCESS-TOKEN-do-not-persist";
 /// And its refresh token, sealed under a DIFFERENT purpose than the access token.
 const DOWNSTREAM_REFRESH: &str = "1//PLAINTEXT-GOOGLE-REFRESH-TOKEN-do-not-persist";
+/// And the DOWNSTREAM CLIENT SECRET, the third secret this row holds.
+const DOWNSTREAM_CLIENT_SECRET: &str = "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ot-persist";
+
+/// The digest of the action these approvals are raised for.
+///
+/// An approval is keyed on (agent, provider, ACTION) so that approving one action does not
+/// authorize every other action at that provider. These tests exercise the row's own
+/// behaviour rather than the digest function, so one fixed well-shaped digest is enough --
+/// the column's CHECK requires 64 lowercase hex characters.
+const TEST_DIGEST: &str = "\
+1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A materially DIFFERENT action, for the tests that prove one approval does not cover another.
+const OTHER_DIGEST: &str = "\
+2222222222222222222222222222222222222222222222222222222222222222";
 
 fn now_micros(env: &ironauth_env::Env) -> i64 {
     i64::try_from(
@@ -46,6 +61,18 @@ fn now_micros(env: &ironauth_env::Env) -> i64 {
 
 /// Seed an organization, a user, and an agent, returning the agent.
 async fn seed_agent(db: &TestDatabase, env: &ironauth_env::Env, scope: Scope) -> AgentPrincipalId {
+    seed_agent_in_org(db, env, scope).await.0
+}
+
+/// The same, handing back the ORGANIZATION it was registered in.
+///
+/// The queue reads one organization's approvals, so a test that means to prove the filter has
+/// to be able to name two organizations and put an agent in each.
+async fn seed_agent_in_org(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    scope: Scope,
+) -> (AgentPrincipalId, OrganizationId) {
     let organization = OrganizationId::generate(env, &scope);
     sqlx::query(
         "INSERT INTO organizations /* query-audit-allow: owner test seed */ \
@@ -95,7 +122,7 @@ async fn seed_agent(db: &TestDatabase, env: &ironauth_env::Env, scope: Scope) ->
         )
         .await
         .expect("register agent");
-    agent
+    (agent, organization)
 }
 
 /// Store a Google connection for `agent`.
@@ -121,6 +148,7 @@ async fn store_connection(
                 refresh_token: Some(DOWNSTREAM_REFRESH),
                 granted_scopes: &["https://www.googleapis.com/auth/drive.readonly".to_owned()],
                 expires_at_unix_micros: None,
+                requires_approval: false,
                 refresh: None,
             },
             now_micros(env),
@@ -346,11 +374,14 @@ async fn a_held_action_authorizes_nothing_while_it_is_pending() {
         .agent_vault_approvals()
         .request(
             &env,
-            &id,
-            &agent,
-            "google",
-            &requested_details(),
-            now + 60_000_000,
+            NewVaultApproval {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
         )
         .await
         .expect("hold the action");
@@ -395,11 +426,14 @@ async fn an_approval_renders_the_details_the_approver_agreed_to() {
         .agent_vault_approvals()
         .request(
             &env,
-            &id,
-            &agent,
-            "google",
-            &requested_details(),
-            now + 60_000_000,
+            NewVaultApproval {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
         )
         .await
         .expect("hold");
@@ -449,11 +483,14 @@ async fn a_denial_authorizes_nothing_and_renders_no_details() {
         .agent_vault_approvals()
         .request(
             &env,
-            &id,
-            &agent,
-            "google",
-            &requested_details(),
-            now + 60_000_000,
+            NewVaultApproval {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
         )
         .await
         .expect("hold");
@@ -505,7 +542,17 @@ async fn a_timed_out_action_authorizes_nothing_and_cannot_be_decided_late() {
     control
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .agent_vault_approvals()
-        .request(&env, &id, &agent, "google", &requested_details(), now + 1)
+        .request(
+            &env,
+            NewVaultApproval {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 1,
+            },
+        )
         .await
         .expect("hold");
 
@@ -534,6 +581,8 @@ async fn a_timed_out_action_authorizes_nothing_and_cannot_be_decided_late() {
         provider: "google".to_owned(),
         state: "approved".to_owned(),
         approved_details: Some(requested_details()),
+        requested_details: requested_details(),
+        action_digest: TEST_DIGEST.to_owned(),
         expires_at_unix_micros: now + 1,
     };
     assert!(
@@ -610,11 +659,14 @@ async fn a_pending_approval_survives_a_restart_with_no_bus_configured() {
         .agent_vault_approvals()
         .request(
             &env,
-            &id,
-            &agent,
-            "google",
-            &requested_details(),
-            now + 60_000_000,
+            NewVaultApproval {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
         )
         .await
         .expect("hold");
@@ -816,5 +868,633 @@ async fn the_data_plane_may_raise_an_approval_and_may_not_decide_one() {
     assert!(
         refused.is_err(),
         "the data plane must not insert an already-approved row"
+    );
+}
+
+/// A connection's REFRESH CONFIGURATION round-trips, and the ordinary read says it exists
+/// without opening the client secret (issue #132, criterion 3).
+///
+/// The test that would have caught the blocker immediately. The refresh path guarded on
+/// `connection.refresh.is_some()`, which the ordinary read never populates, so the whole
+/// branch was dead code and an expired connection fell through to a 409 forever. `can_refresh`
+/// is the field that answers "is a refresh possible" and it must be true on the read that does
+/// NOT open the secret -- otherwise the caller deciding whether to refresh decides no, always.
+#[tokio::test]
+async fn the_ordinary_read_knows_a_refresh_is_possible_without_opening_the_client_secret() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+
+    let id = AgentVaultConnectionId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault(scope)
+        .store_connection(
+            &env,
+            NewVaultConnection {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                access_token: DOWNSTREAM_ACCESS,
+                refresh_token: Some(DOWNSTREAM_REFRESH),
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: None,
+                requires_approval: false,
+                refresh: Some(ironauth_store::VaultRefreshConfig {
+                    token_endpoint: "https://oauth2.example.test/token",
+                    client_id: "downstream-client",
+                    client_secret: DOWNSTREAM_CLIENT_SECRET,
+                }),
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("store a refreshable connection");
+
+    let plain = db
+        .store()
+        .scoped(scope)
+        .agent_vault()
+        .connection(&agent, "google")
+        .await
+        .expect("read")
+        .expect("a connection exists");
+    assert!(
+        plain.can_refresh,
+        "the ordinary read must know a refresh is POSSIBLE, or the refresh path is unreachable"
+    );
+    assert!(
+        plain.refresh.is_none(),
+        "and it must not have opened the client secret to answer that"
+    );
+
+    let opened = db
+        .store()
+        .scoped(scope)
+        .agent_vault()
+        .connection_with_refresh(&agent, "google")
+        .await
+        .expect("read")
+        .expect("a connection exists");
+    let config = opened
+        .refresh
+        .expect("the explicit read opens the configuration");
+    assert_eq!(config.token_endpoint, "https://oauth2.example.test/token");
+    assert_eq!(config.client_id, "downstream-client");
+    assert_eq!(
+        config.client_secret, DOWNSTREAM_CLIENT_SECRET,
+        "the client secret round-trips through its own purpose tag"
+    );
+}
+
+/// The client secret is sealed under its OWN associated data.
+///
+/// Three secrets now share one row and one key. A ciphertext moved between any two of the
+/// three columns must fail to open rather than open as the other thing, and the only way to
+/// observe that is to move one.
+#[tokio::test]
+async fn a_client_secret_does_not_open_as_an_access_token_or_the_reverse() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+
+    let id = AgentVaultConnectionId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault(scope)
+        .store_connection(
+            &env,
+            NewVaultConnection {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                access_token: DOWNSTREAM_ACCESS,
+                refresh_token: Some(DOWNSTREAM_REFRESH),
+                granted_scopes: &["mail.read".to_owned()],
+                expires_at_unix_micros: None,
+                requires_approval: false,
+                refresh: Some(ironauth_store::VaultRefreshConfig {
+                    token_endpoint: "https://oauth2.example.test/token",
+                    client_id: "downstream-client",
+                    client_secret: DOWNSTREAM_CLIENT_SECRET,
+                }),
+            },
+            now_micros(&env),
+        )
+        .await
+        .expect("store");
+
+    // It opens before anything is moved. Without this the assertion below could pass because
+    // NOTHING opens, which would make the test vacuous.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .agent_vault()
+            .connection_with_refresh(&agent, "google")
+            .await
+            .expect("read")
+            .is_some(),
+        "the connection opens before the move"
+    );
+
+    // The CLIENT SECRET's ciphertext into the ACCESS TOKEN's column, as the owner.
+    let secret_bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT refresh_client_secret_sealed /* query-audit-allow: owner test read */ \
+         FROM agent_vault_connections WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the sealed client secret");
+    sqlx::query(
+        "UPDATE agent_vault_connections /* query-audit-allow: owner test write */ \
+         SET access_token_sealed = $1 WHERE id = $2",
+    )
+    .bind(&secret_bytes)
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("move the ciphertext");
+
+    assert!(
+        matches!(
+            db.store()
+                .scoped(scope)
+                .agent_vault()
+                .connection(&agent, "google")
+                .await,
+            Err(ironauth_store::StoreError::Encryption)
+        ),
+        "a client secret must not open as an access token"
+    );
+}
+
+/// Raise one approval, handing back whatever the store said.
+///
+/// A free function rather than a closure because these tests call it after taking a borrow of
+/// the database, and the failing call is the POINT of one of them: the caller must be able to
+/// distinguish "lost the race" from any other error.
+async fn raise(
+    db: &TestDatabase,
+    env: &ironauth_env::Env,
+    control: &ironauth_store::ScopedStore<'_>,
+    agent: &AgentPrincipalId,
+    id: AgentVaultApprovalId,
+    digest: &str,
+    now: i64,
+) -> Result<(), ironauth_store::StoreError> {
+    control
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .agent_vault_approvals()
+        .request(
+            env,
+            NewVaultApproval {
+                id: &id,
+                agent_id: agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: digest,
+                expires_at_unix_micros: now + 60_000_000,
+            },
+        )
+        .await
+}
+
+/// An approval is found for the action it names and no other (issue #132, criterion 4).
+///
+/// The store half of the F4 defect. `latest_for` was keyed on (agent, provider), so the row
+/// raised for one action was returned for every other action at that provider, and the caller
+/// -- correctly, given what it was handed -- issued. Nothing about the exchange could fix that
+/// while the read itself could not tell two actions apart.
+#[tokio::test]
+async fn an_approval_is_found_only_for_the_action_it_names() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            NewVaultApproval {
+                id: &id,
+                agent_id: &agent,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
+        )
+        .await
+        .expect("raise");
+
+    let approvals = db.store().scoped(scope);
+    let approvals = approvals.agent_vault_approvals();
+    assert_eq!(
+        approvals
+            .latest_for(&agent, "google", TEST_DIGEST)
+            .await
+            .expect("read")
+            .map(|a| a.id),
+        Some(id),
+        "the control: the action it was raised for finds it"
+    );
+    assert!(
+        approvals
+            .latest_for(&agent, "google", OTHER_DIGEST)
+            .await
+            .expect("read")
+            .is_none(),
+        "a DIFFERENT action finds nothing, so approving one action does not authorize another"
+    );
+    assert!(
+        approvals
+            .latest_for(&agent, "github", TEST_DIGEST)
+            .await
+            .expect("read")
+            .is_none(),
+        "and the provider still separates them"
+    );
+}
+
+/// Two concurrent requests for one action leave ONE pending row, and the loser can read it.
+///
+/// Both racers read "no approval" and both insert. Without the unique index the exchange then
+/// polls the newer row, so an approver who answers the older one has decided something nothing
+/// reads and the agent waits forever for a decision that already happened.
+#[tokio::test]
+async fn only_one_pending_approval_exists_per_action_and_a_decided_one_may_be_reraised() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+    let control = db.control_store().scoped(scope);
+
+    let first = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, first, TEST_DIGEST, now)
+        .await
+        .expect("the first request wins");
+
+    let second = AgentVaultApprovalId::generate(&env, &scope);
+    assert!(
+        matches!(
+            raise(&db, &env, &control, &agent, second, TEST_DIGEST, now).await,
+            Err(ironauth_store::StoreError::Conflict)
+        ),
+        "a second pending request for the SAME action loses, and says so distinctly enough \
+         for the caller to re-read the winner"
+    );
+
+    // A different action is unaffected: the index is per-action, not a lock on the provider.
+    let other = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, other, OTHER_DIGEST, now)
+        .await
+        .expect("a different action raises its own request");
+
+    // And once the first is DECIDED it stops occupying the slot, which is what the partial
+    // predicate buys: an agent approved, expired, and asking again must be able to ask again.
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(&env, &first, true, None, "operator", now + 1)
+        .await
+        .expect("decide the first");
+    let again = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, again, TEST_DIGEST, now)
+        .await
+        .expect("the same action may be raised again once the previous one is decided");
+}
+
+/// The approver's queue lists what is still answerable, and nothing else.
+#[tokio::test]
+async fn the_queue_omits_decided_and_timed_out_requests() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (agent, org) = seed_agent_in_org(&db, &env, scope).await;
+    // A SECOND agent, in a DIFFERENT organization, whose request must not appear in this
+    // organization's queue. The filter moved into SQL when the route stopped resolving each
+    // agent's organization one query at a time, and a filter is only as good as the case that
+    // proves it excludes something.
+    let (stranger, _other_org) = seed_agent_in_org(&db, &env, scope).await;
+    let now = now_micros(&env);
+    let control = db.control_store().scoped(scope);
+
+    let live = AgentVaultApprovalId::generate(&env, &scope);
+    let decided = AgentVaultApprovalId::generate(&env, &scope);
+    let stale = AgentVaultApprovalId::generate(&env, &scope);
+    for (id, digest, expires) in [
+        (live, TEST_DIGEST, now + 60_000_000),
+        (decided, OTHER_DIGEST, now + 60_000_000),
+        (
+            stale,
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            now + 1,
+        ),
+    ] {
+        control
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .agent_vault_approvals()
+            .request(
+                &env,
+                NewVaultApproval {
+                    id: &id,
+                    agent_id: &agent,
+                    provider: "google",
+                    requested_details: &requested_details(),
+                    action_digest: digest,
+                    expires_at_unix_micros: expires,
+                },
+            )
+            .await
+            .expect("raise");
+    }
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(&env, &decided, true, None, "operator", now + 2)
+        .await
+        .expect("decide");
+
+    // The stranger's request: pending, live, and in another organization.
+    let elsewhere = AgentVaultApprovalId::generate(&env, &scope);
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            NewVaultApproval {
+                id: &elsewhere,
+                agent_id: &stranger,
+                provider: "google",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
+        )
+        .await
+        .expect("raise the stranger's request");
+
+    let queue: Vec<_> = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .pending_for_organization(&org, now + 30_000_000, 50)
+        .await
+        .expect("list the queue")
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    assert_eq!(
+        queue,
+        vec![live],
+        "only the request that is still pending, still answerable, and in THIS organization \
+         is queued"
+    );
+}
+
+/// A decision is TERMINAL: the second one is refused, in both directions.
+///
+/// Not "a denial cannot be re-denied" but "a denial cannot be turned into an approval". The
+/// gate reads the LATEST row for an action, so an approver -- or anything holding the write
+/// role -- flipping a denial after the fact would hand over the credential the denial refused,
+/// with the audit trail showing a decision that was already made.
+#[tokio::test]
+async fn a_decided_approval_cannot_be_decided_again() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+    let control = db.control_store().scoped(scope);
+
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, id, TEST_DIGEST, now)
+        .await
+        .expect("raise");
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(&env, &id, false, None, "operator", now + 1)
+        .await
+        .expect("the first decision lands");
+
+    let flipped = control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(
+            &env,
+            &id,
+            true,
+            Some(&requested_details()),
+            "operator",
+            now + 2,
+        )
+        .await;
+    assert!(
+        matches!(flipped, Err(ironauth_store::StoreError::NotFound)),
+        "a denial must not be flipped to an approval by a second decision"
+    );
+
+    let after = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(after.state, "denied", "and the row still says denied");
+    assert!(
+        after.approved_details.is_none(),
+        "with nothing attached that a gate could hand over"
+    );
+    assert!(!after.authorizes(now + 3), "so the action is still refused");
+}
+
+/// Migration 0181's CHECKs refuse what the code is written never to send.
+///
+/// A constraint the application always satisfies is still worth a test, because the
+/// application is not the only writer: a migration, an operator's psql session, or a future
+/// handler all reach this table, and these three are the invariants the refresh path assumes
+/// rather than verifies. Driven as the OWNER so the RLS policies are not what refuses them --
+/// a test that cannot tell a CHECK from a policy proves neither.
+#[tokio::test]
+async fn the_refresh_configuration_constraints_refuse_a_partial_or_plaintext_endpoint() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let id = store_connection(&db, &env, scope, &agent, "google").await;
+
+    // 1. HALF a configuration. The four travel together or a refresh fails at the provider
+    //    rather than at the edge, which turns incomplete operator input into a downstream
+    //    error nobody can act on.
+    let partial = sqlx::query(
+        "UPDATE agent_vault_connections /* query-audit-allow: owner constraint probe */ \
+         SET refresh_token_endpoint = 'https://oauth2.example.test/token' WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await;
+    assert!(
+        partial.is_err(),
+        "a refresh configuration missing its client credentials was accepted"
+    );
+
+    // 2. A PLAINTEXT endpoint. This URL is dereferenced with a refresh token in the body.
+    let plaintext = sqlx::query(
+        "UPDATE agent_vault_connections /* query-audit-allow: owner constraint probe */ \
+         SET refresh_token_endpoint = 'http://oauth2.example.test/token', \
+             refresh_client_id = 'downstream-client', \
+             refresh_client_secret_sealed = '\\x00'::bytea, \
+             refresh_client_secret_dek_version = 1 \
+         WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await;
+    assert!(
+        plaintext.is_err(),
+        "a plaintext token endpoint would put the refresh token on the wire"
+    );
+
+    // 3. The control: the COMPLETE https configuration is accepted, so the two refusals above
+    //    are the constraints doing their job rather than the row being unwritable.
+    sqlx::query(
+        "UPDATE agent_vault_connections /* query-audit-allow: owner constraint probe */ \
+         SET refresh_token_endpoint = 'https://oauth2.example.test/token', \
+             refresh_client_id = 'downstream-client', \
+             refresh_client_secret_sealed = '\\x00'::bytea, \
+             refresh_client_secret_dek_version = 1 \
+         WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("a complete https configuration is accepted");
+}
+
+/// An action digest is 64 hex characters or the empty string, and nothing else.
+///
+/// The empty string is the ROLLOUT value: the column is NOT NULL with a `''` default so an old
+/// binary mid-deploy can still raise an approval, and an empty digest matches no lookup, so
+/// such a row is invisible to the gate rather than a pass for every action.
+#[tokio::test]
+async fn an_action_digest_is_a_digest_or_the_rollout_default() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+    let control = db.control_store().scoped(scope);
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, id, TEST_DIGEST, now)
+        .await
+        .expect("raise");
+
+    for bad in [
+        "not-a-digest",
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789",
+        "0123",
+    ] {
+        let refused = sqlx::query(
+            "UPDATE agent_vault_approvals /* query-audit-allow: owner constraint probe */ \
+             SET action_digest = $1 WHERE id = $2",
+        )
+        .bind(bad)
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await;
+        assert!(
+            refused.is_err(),
+            "the shape check accepted {bad:?}, so a digest column can hold something no \
+             lookup will ever match"
+        );
+    }
+
+    // The control, and the rollout value.
+    for allowed in [OTHER_DIGEST, ""] {
+        sqlx::query(
+            "UPDATE agent_vault_approvals /* query-audit-allow: owner constraint probe */ \
+             SET action_digest = $1 WHERE id = $2",
+        )
+        .bind(allowed)
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("a well-shaped digest and the rollout default are both accepted");
+    }
+}
+
+/// The queue's bound is a bound (issue #132).
+///
+/// A separate test from the exclusions above because it needs a queue with MORE in it than the
+/// limit: bounding a one-row queue at one passes against a `LIMIT` that was never written,
+/// which is the shape of a cap test that proves nothing.
+#[tokio::test]
+async fn the_queue_returns_no_more_than_the_limit_and_keeps_the_oldest() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let (agent, org) = seed_agent_in_org(&db, &env, scope).await;
+    let now = now_micros(&env);
+    let control = db.control_store().scoped(scope);
+
+    let live = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, live, TEST_DIGEST, now)
+        .await
+        .expect("raise the older request");
+
+    let second_live = AgentVaultApprovalId::generate(&env, &scope);
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .request(
+            &env,
+            NewVaultApproval {
+                id: &second_live,
+                agent_id: &agent,
+                provider: "github",
+                requested_details: &requested_details(),
+                action_digest: TEST_DIGEST,
+                expires_at_unix_micros: now + 60_000_000,
+            },
+        )
+        .await
+        .expect("raise a second live request");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .agent_vault_approvals()
+            .pending_for_organization(&org, now + 30_000_000, 50)
+            .await
+            .expect("list")
+            .len(),
+        2,
+        "the control: unbounded, this organization has two waiting"
+    );
+
+    let bounded = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .pending_for_organization(&org, now + 30_000_000, 1)
+        .await
+        .expect("list the queue");
+    assert_eq!(bounded.len(), 1, "the limit bounds the answer");
+    assert_eq!(
+        bounded[0].id, live,
+        "and it keeps the OLDEST, because an approver works a queue from the front"
     );
 }
