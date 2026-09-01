@@ -632,6 +632,7 @@ enabled even when absent from `[features]`, and can be turned off with
 | `advanced-recovery` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Advanced recovery modes (issue #82): the recovery-method seam plus admin-approved recovery (a control-plane admin review queue), trusted-contact recovery (designated contacts confirm out of band with single-use links), and IDV-gated recovery (a generic external-verification step consuming a signed provider callback; IronAuth never verifies documents in house). The three modes are config sub-toggles under this one ack, and every mode completes THROUGH the recovery delay window and the downgrade invariant. EXPLORATORY: the seam is early and may break between releases. |
 | `agent-token-vault` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Agent token vault (issue #132): a per-agent store of downstream third-party credentials (Google, GitHub) that an agent exchanges its IronAuth token for, scoped to what the agent DECLARED and audited on every exchange. Contents are sealed with the per-tenant key hierarchy, so a raw database dump yields no usable third-party credential. A connection configured with a token endpoint and downstream client credentials RENEWS itself when the stored credential expires, and one an operator marked sensitive BLOCKS the exchange on an out-of-band human approval bound to the exact action requested. EXPLORATORY: this makes IronAuth the custodian of another party's credential, and the storage, exchange, refresh and approval shapes are early. |
 | `attestation-client-auth` | experimental | no | draft-ietf-oauth-attestation-based-client-auth-10 | crates/ironauth-oidc/CHANGELOG.md | Attestation-based client authentication (issue #133, draft-ietf-oauth-attestation-based-client-auth): a client instance holding no registered secret authenticates with an attestation minted by an attester this deployment trusts, plus a proof of possession signed with the key that attestation bound. PROTOTYPE: the wire format is an IETF draft, replay recording of the proof's jti is NOT wired, and no attester is trusted until one is configured -- a deployment that enables this and registers none authenticates nobody. |
+| `authzen-agent-profile` | experimental | no | 0.1.0-exp.1 | crates/ironauth-admin/CHANGELOG.md | AuthZEN agent tool-authorization profile (issue #133): the PDP answers `may this agent call this tool` for an AGENT principal, as the INTERSECTION of the tools the operator declared for that agent and the permissions the person it acts for holds in the organization. PROTOTYPE: it adds a subject type to a live authorization endpoint, the composition is IronAuth's rather than the AuthZEN MCP profile draft's, and an agent that is suspended, revoked, or in another organization is denied. |
 | `client-id-metadata-documents` | experimental | no | draft-parecki-04-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Client ID Metadata Documents: a URL client_id the authorization server DEREFERENCES and then trusts to describe a client, replacing registration for that client. EXPERIMENTAL: it inverts the usual trust direction, so an unregistered party chooses a URL the server fetches, and the IETF draft is still moving. Every hardening rule (https only, no redirects, no private or special-use targets, a size bound, an exact client_id match inside the document) exists because the alternative hands an attacker either the server's network position or another client's identity. Unknown domains are QUARANTINED, not allowed: consent is always shown and redirects are restricted to https. Registered clients are UNAFFECTED. |
 | `custom-domains-acme` | experimental | no | 0.1.0-exp.1 | crates/ironauth-store/CHANGELOG.md | Per-environment custom domains with built-in ACME (RFC 8555): CNAME verification, HTTP-01/DNS-01 challenges, and encrypted-at-rest certificate storage. EXPLORATORY: the cert-management operational model is unproven and a live issuance is infra/owner-gated on a provisioned CA account and a reachable domain. |
 | `fedcm` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | IdP-side FedCM (W3C Federated Credential Management): the origin-level /.well-known/web-identity, the config file, the accounts endpoint, and the id-assertion endpoint, plus Login Status headers. EXPLORATORY: browser support is Chrome only (Firefox paused, Safari absent) and the spec is a moving W3C draft. Redirect flows are UNAFFECTED. Graduates only on Firefox shipping or real embedding demand. |
@@ -8861,6 +8862,93 @@ Every one has a test in `crates/ironauth-oidc/tests/attestation_client_auth.rs`,
 - **A PoP with no `jti`**, so replay recording has something to record when it is wired.
 - **Anything expired**, any PoP claiming a lifetime longer than five minutes, and a PoP with no `iat` -- without one there is no lifetime to bound, and defaulting it to "now" would make an unbounded proof look short-lived to a server that received it late.
 - **A proof wearing the attestation's media type**, which is the other half of the swap and the check the first draft of the test suite left unexercised.
+
+---
+
+# AuthZEN agent tool profile (PROTOTYPE)
+
+Source: docs/experimental/authzen-agent-profile.md
+
+# AuthZEN agent tool profile (PROTOTYPE)
+
+**Drafts:** the AuthZEN MCP tool-authorization profile, over OpenID AuthZEN Authorization API 1.0
+**Feature flag:** `authzen-agent-profile`, EXPERIMENTAL
+**Acknowledgment version:** `0.1.0-exp.1`
+**Status:** prototype. It adds a subject type to an endpoint that is otherwise GA.
+
+## What it does
+
+Answers **may this agent call this tool** for an agent principal, on the AuthZEN PDP IronAuth
+already serves:
+
+```json
+{
+  "subject":  { "type": "agent", "id": "agp_..." },
+  "resource": { "type": "tool",  "id": "deploy" },
+  "action":   { "name": "call" },
+  "context":  { "organization_id": "org_..." }
+}
+```
+
+## The decision is an intersection, and that is the whole design
+
+An agent is not a principal that holds permissions. It acts **for** a person, with a narrower set
+of tools than that person could reach, so **both** halves must hold:
+
+- the **agent** must declare the tool. `tool_scopes` is the operator's statement of what this
+  machine may do, and a tool outside it is refused however privileged its human is.
+- the **linked user** must hold the mapped permission -- `{resource.type}.{action.name}`, the same
+  pure join the other two subject types use, resolved through the same `effective_permissions`
+  the token claims are built from. A second copy of that walk would be a second set of answers.
+
+Either half alone is a different and wrong question. Checking only the declared set lets a
+revoked human's agent keep working; checking only the human lets an agent call every tool its
+person could.
+
+An agent that is **suspended or revoked** is denied while staying listable and auditable, which is
+the split issue #130 criterion 5 draws at the token door. An agent belonging to **another
+organization**, or to none, is denied -- not reported missing: a PDP answers decisions, and
+distinguishing "no such agent" from "not allowed" would tell a caller which agent ids are real.
+
+## Where the tool name comes from
+
+`resource.id`, with `resource.type` required to be `tool`. This is the **one** place on the
+AuthZEN surface where `resource.id` is consulted; for a `user` or `service_account` subject it is
+accepted and ignored, because IronAuth grants permissions per organization rather than per
+instance. It is read here because the tool **is** the instance: `tool/deploy` and `tool/destroy`
+are two resources rather than one resource with two ids, and a profile that ignored the id could
+only ever answer "may this agent call *some* tool".
+
+## Turning it on
+
+```toml
+[features]
+authzen-agent-profile = { enabled = true, ack = "0.1.0-exp.1" }
+```
+
+**Why an `exp` counter here and a draft revision for attestation client auth.** That surface
+implements one IETF draft whose wire format the IETF may change, so the revision is the thing
+being acknowledged. This one composes IronAuth's **own** model -- an agent's declared tools, its
+linked user's effective permissions -- onto the AuthZEN request shape, and the MCP profile draft
+does not dictate that composition. What may break here is our decision, not theirs.
+
+**Off is not "the endpoint refuses an agent."** With the flag unset, an `agent` subject draws the
+same `subject_type_unsupported` refusal every unrecognised type has always drawn, byte for byte,
+so a deployment that has not opted in cannot tell from the answer that the type means anything in
+this build. That matters more here than for the other prototypes: this one widens a **live**
+authorization surface rather than adding a dark one.
+
+## What a graduation still needs
+
+- **The action name is not constrained.** `tool.call` and `tool.anything-else` are equally valid
+  slugs, so the profile answers for a permission an operator may never have intended to define.
+  A graduation should either pin the action set or document the slug space explicitly.
+- **No batch shortcut.** A PEP asking about twenty tools sends twenty entries and each resolves
+  the human's permissions again. The batch endpoint already accepts them; what is missing is one
+  resolution shared across a batch's entries.
+- **The AARP direction is not started.** The Access Request and Approval Profile is the other half
+  of the agent story the issue names, and the vault's approval flow (issue #132) is where it would
+  compose.
 
 ---
 

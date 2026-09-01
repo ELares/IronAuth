@@ -22,11 +22,11 @@ use ironauth_admin::webhook_delivery::{
 };
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE, Config,
-    FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE,
-    Loaded, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
-    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, WASM_HOOKS_FEATURE,
-    WebhooksConfig,
+    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE,
+    AUTHZEN_AGENT_PROFILE_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
+    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, ORG_SCOPED_CLIENTS_FEATURE,
+    OidcConfig, OutboxConfig, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
+    ScreeningProvider, WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -850,6 +850,19 @@ async fn build_admin_state(
             // Domain verification (issue #96): without a resolver the verify endpoint
             // answers 503 rather than reporting a domain unverified.
             let state = arm_domain_verification(state, env);
+            // The AuthZEN AGENT TOOL PROFILE (issue #133, PROTOTYPE). ONE plane: the PDP is a
+            // management-API surface and the data plane has no AuthZEN endpoint, so this is
+            // deliberately not a shared cross-plane value. Off unless the draft is
+            // acknowledged, and off is not "the endpoint refuses" but "the subject type has no
+            // meaning here", which is the same answer it gave before this existed.
+            //
+            // `builtin()` rather than a registry threaded in: it is the ONE production
+            // constructor and a test pins that every shipped feature is registered through it,
+            // so a second call cannot disagree with the first. Threading one through would add
+            // a parameter to this function for a value it can derive.
+            let state = state.with_agent_tool_profile_enabled(
+                FeatureRegistry::builtin().is_enabled(config, AUTHZEN_AGENT_PROFILE_FEATURE),
+            );
             Some(state)
         }
         Err(error) => {

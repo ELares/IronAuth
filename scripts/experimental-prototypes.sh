@@ -39,6 +39,17 @@ revisions() {
     fi
     printf '  %-28s %-52s %s\n' \
         'attestation-client-auth' "$pinned" 'docs/experimental/attestation-client-auth.md'
+
+    local authzen
+    authzen=$(grep -A1 'pub const AUTHZEN_AGENT_PROFILE_VERSION' \
+        crates/ironauth-config/src/features.rs | grep -oE '"[^"]+"' | tr -d '"')
+    if [ -z "$authzen" ]; then
+        echo "experimental-prototypes: could not read the pinned revision for" \
+             "authzen-agent-profile out of crates/ironauth-config/src/features.rs." >&2
+        exit 1
+    fi
+    printf '  %-28s %-52s %s\n' \
+        'authzen-agent-profile' "$authzen" 'docs/experimental/authzen-agent-profile.md'
     echo
     echo "Each is EXPERIMENTAL and off by default; enabling one requires an acknowledgment"
     echo "equal to the revision above, so a draft bump invalidates it deliberately."
@@ -65,6 +76,12 @@ cargo test -p ironauth-config attestation
 # `tests::the_attester_registry_needs_the_ack_and_an_attester` in a different package, and the
 # lane ran `-p ironauth-config attestation` believing it covered this. It matched nothing.
 cargo test -p ironauth --bin ironauth attester
+
+echo
+echo "== AuthZEN agent tool profile =="
+# The intersection, the confinement, the suspended-agent denial, and the OFF posture. Needs a
+# database.
+cargo test -p ironauth-admin --features testing --test authzen_agent_profile
 
 echo
 echo "experimental-prototypes: all pinned prototypes passed at the revisions above"

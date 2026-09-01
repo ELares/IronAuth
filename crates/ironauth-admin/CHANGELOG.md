@@ -1252,3 +1252,26 @@ range per docs/RELEASING.md.
     naming it keeps a resolvable target. For tenants and environments `audit_log`
     really does carry a foreign key to the retained row; for a management key it
     does not, and the retention is an application rule.
+
+## Unreleased
+
+### Experimental: the AuthZEN agent tool profile (issue #133)
+
+A PROTOTYPE answering `may this agent call this tool` on the AuthZEN PDP, off by default behind
+the `authzen-agent-profile` feature. The decision is the INTERSECTION of the tools the operator
+declared for the agent and the permissions the person it acts for holds in the organization;
+either half alone is a different question, and dropping one lets an agent either outlive its
+human's revocation or reach every tool that human could.
+
+`resource.id` names the tool, and this is the one profile on that surface that reads it.
+Suspended and revoked agents are denied while staying listable; an agent of another organization,
+or one that does not exist, is denied rather than reported missing.
+
+**With the flag off, an `agent` subject draws the same refusal an unrecognised type has always
+drawn, byte for byte.** That is deliberate: this prototype widens a LIVE authorization surface
+rather than adding a dark one, so an unarmed deployment must not be able to tell from the answer
+that the type means anything here.
+
+Limits are recorded in `docs/experimental/authzen-agent-profile.md`: the action name is
+unconstrained, a batch re-resolves the human's permissions per entry, and the AARP direction is
+not started.

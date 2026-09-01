@@ -101,6 +101,26 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the `AuthZEN` agent tool-authorization profile (issue #133,
+/// exploratory bet 5).
+///
+/// Separate from the `AuthZEN` PDP itself, which is GA. This flag adds a new subject TYPE to an
+/// endpoint operators already run, so shipping it unflagged would silently widen a live
+/// authorization surface: an `agent` subject that used to be refused as unrecognised would
+/// start returning decisions.
+pub const AUTHZEN_AGENT_PROFILE_FEATURE: &str = "authzen-agent-profile";
+
+/// The experimental `ack` version for the `AuthZEN` agent tool profile (issue #133).
+///
+/// A `0.1.0-exp.N` counter rather than a draft revision, and the difference from
+/// [`ATTESTATION_CLIENT_AUTH_VERSION`] is deliberate. That surface implements one IETF draft
+/// with a wire format the IETF may change, so the revision IS the thing being acknowledged.
+/// This one composes IronAuth's OWN model -- an agent's declared tools and its linked user's
+/// effective permissions -- onto the `AuthZEN` request shape, and the `AuthZEN` MCP profile draft
+/// does not dictate that composition. What may break here is our decision, not theirs, so the
+/// counter is ours.
+pub const AUTHZEN_AGENT_PROFILE_VERSION: &str = "0.1.0-exp.1";
+
 /// The registry name of the attestation-based client authentication prototype (issue #133,
 /// exploratory bet 4).
 ///
@@ -307,6 +327,22 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Registers the `AuthZEN` agent tool-authorization profile (issue #133, PROTOTYPE).
+    pub fn register_authzen_agent_profile(&mut self) {
+        self.register(Feature::experimental(
+            AUTHZEN_AGENT_PROFILE_FEATURE,
+            "AuthZEN agent tool-authorization profile (issue #133): the PDP answers \
+             `may this agent call this tool` for an AGENT principal, as the INTERSECTION of \
+             the tools the operator declared for that agent and the permissions the person it \
+             acts for holds in the organization. PROTOTYPE: it adds a subject type to a live \
+             authorization endpoint, the composition is IronAuth's rather than the AuthZEN MCP \
+             profile draft's, and an agent that is suspended, revoked, or in another \
+             organization is denied.",
+            AUTHZEN_AGENT_PROFILE_VERSION,
+            "crates/ironauth-admin/CHANGELOG.md",
+        ));
+    }
+
     /// Registers attestation-based client authentication (issue #133, PROTOTYPE).
     ///
     /// Its own registrar rather than a second `self.register` inside the vault's, which is
@@ -343,6 +379,7 @@ impl FeatureRegistry {
         registry.register_signup_quarantine();
         registry.register_agent_token_vault();
         registry.register_attestation_client_auth();
+        registry.register_authzen_agent_profile();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();

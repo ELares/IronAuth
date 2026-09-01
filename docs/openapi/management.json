@@ -28026,7 +28026,7 @@
               "string",
               "null"
             ],
-            "description": "The instance identifier. Accepted because `AuthZEN` 1.0 defines it and a `PEP` will\nsend it, and NOT consulted: `IronAuth` grants permissions per organization, not per\ninstance, so a decision that varied by instance would be answering a question this\nmodel cannot decide.\n\nThe allow is the honest spelling of that. Reading the field into a discard to quiet the\nlint would read like the value participates in something."
+            "description": "The instance identifier. Not consulted for a `user` or `service_account` subject:\n`IronAuth` grants permissions per organization, not per instance, so a decision that\nvaried by instance would be answering a question that model cannot decide.\n\nCONSULTED for the agent tool profile (issue #133), where it names the TOOL. That is not\nan exception smuggled in: `tool/deploy` and `tool/destroy` are two resources rather than\none resource with two ids, and a profile that ignored the id could only ever answer\n\"may this agent call SOME tool\". The sentence above stays true of the two subject types\nit describes, and this one says where it stops."
           },
           "type": {
             "type": "string",
