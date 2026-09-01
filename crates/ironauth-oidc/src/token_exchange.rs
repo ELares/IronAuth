@@ -391,11 +391,11 @@ async fn issue(
             // a decision. What separates the two is identity, not origin.
             custom_claims: &custom_claims,
             act: decision.act.as_ref(),
-            agent: agent.as_ref().map(|a| tokens::AgentTokenIdentity {
-                agent_id: a.agent_id.as_str(),
-                linked_user_id: a.linked_user_id.as_str(),
-                organization_id: a.organization_id.as_str(),
-            }),
+            // The GATE applies here; the identity claims do NOT. An exchange mints for the SUBJECT
+            // the exchanged token represented, so `agent_id` beside a `sub` that is someone else
+            // would say the token belongs to an agent while its own subject says it does not. The
+            // agent is the actor at this door, and RFC 8693 `act` is where an actor belongs.
+            agent: None,
         },
         &target,
     )

@@ -1123,6 +1123,25 @@ struct CodeExchangeSession {
 /// [`TokenError::ServerError`] on a store fault. Never degraded to "no roles": on a mint path
 /// that is a silent authorization downgrade indistinguishable from an identity that
 /// legitimately holds none.
+
+/// Truncate caller-controlled text before it becomes an audit detail.
+///
+/// The scope on a token request is whatever the caller sent. Writing it verbatim lets one
+/// request put an unbounded string into `audit_log.detail`, which is a row every export and
+/// every SIEM ingest then carries. The bound is generous enough that a real scope set is
+/// never cut and small enough that a hostile one cannot be a payload.
+fn bounded(detail: &str) -> String {
+    const MAX: usize = 512;
+    if detail.len() <= MAX {
+        return detail.to_owned();
+    }
+    let mut cut = MAX;
+    while !detail.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &detail[..cut])
+}
+
 /// What an agent-bound issuance carries into the token (issue #130).
 ///
 /// Owned rather than borrowed because it outlives the store read that produced it and is
@@ -1134,6 +1153,9 @@ pub(crate) struct GatedAgent {
     pub linked_user_id: String,
     /// The organization it acts inside.
     pub organization_id: String,
+    /// The client it came through, so the issuance row is attributed to the same actor the
+    /// denial row is.
+    pub client_id: String,
 }
 
 /// Record that an agent obtained a token, auditing `agent_token.issue` (issue #130).
@@ -1156,13 +1178,24 @@ pub(crate) async fn record_agent_issuance(
     else {
         return;
     };
-    let actor = ActorRef::service(ServiceId::generate(state.env()));
+    // The SAME actor the denial row carries. A fresh random service id per issuance would
+    // make every issue row attributable to a different actor that never existed, so an
+    // investigator could not join an agent's issuances to its denials, and the two halves of
+    // one incident would look like unrelated events.
+    let Ok(client_id) = ClientId::parse_in_scope(&agent.client_id, &scope) else {
+        return;
+    };
+    let actor = crate::util::client_service_actor(StoredClientId::Registered(&client_id));
     if let Err(error) = state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .agents()
-        .record_token_issued(state.env(), &agent_id, granted_scope.unwrap_or(""))
+        .record_token_issued(
+            state.env(),
+            &agent_id,
+            &bounded(granted_scope.unwrap_or("")),
+        )
         .await
     {
         tracing::warn!(
@@ -1253,6 +1286,7 @@ pub(crate) async fn gate_agent_issuance(
         agent_id: agent.id.to_string(),
         linked_user_id: agent.linked_user_id.to_string(),
         organization_id: agent.organization_id.to_string(),
+        client_id: client_id_str.to_owned(),
     }))
 }
 

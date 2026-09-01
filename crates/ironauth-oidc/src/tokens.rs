@@ -250,6 +250,20 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     // an authorization. The reverse matters too: a client that could set `act` on an ordinary
     // token could make a normal session look like somebody else impersonating it.
     "act",
+    // The agent principal, its human, and its organization (issue #130). Protected for the
+    // same reason as `act`, and it is the same failure: these three are the record of WHO
+    // acted. A client that could self-assert them could stamp any agent id it liked onto a
+    // token it obtained honestly, including a REVOKED agent's or one belonging to another
+    // organization, and a SIEM reading them to attribute an action could not tell a real
+    // agent issuance from a forged one. That is the entire deliverable of this half.
+    //
+    // Insertion order alone is NOT protection here, for the reason this file already states
+    // about `org_id` on a no-org session: "protocol wins by insertion order is no protection
+    // for a claim the protocol did NOT set on THIS token". The ordering only defends a token
+    // that HAS an agent; every other token leaves the key free for the custom-claims bag.
+    "agent_id",
+    "agent_linked_user",
+    "agent_organization",
 ];
 
 /// The resolved target for an access token: the audience(s) it is minted for, the
@@ -976,10 +990,19 @@ pub struct ClientCredentialsMintRequest<'a> {
     /// identity (issue #130).
     ///
     /// Carried as claims so a downstream system and the audit trail can attribute the action
-    /// to the agent AND to the human and organization it acts for. `sub` stays the stable
-    /// service-account principal, because that is what the client resolves to on every
-    /// issuance and changing it would break every existing consumer; the agent identity sits
-    /// beside it rather than replacing it.
+    /// to the agent AND to the human and organization it acts for.
+    ///
+    /// Set ONLY where the minted token is the agent's own, which is the client-credentials
+    /// door. At `jwt_bearer` and token exchange the subject is a different principal (the
+    /// mapped federated identity, or the identity the exchanged token represented), so an
+    /// `agent_id` beside that `sub` would assert the token belongs to an agent while its own
+    /// subject says otherwise. The agent is the ACTOR at those doors, which is what RFC 8693
+    /// `act` records. The GATE still runs at all three: what an agent may ask for is bounded
+    /// everywhere, and only the identity claim is scoped to the door it is true at.
+    ///
+    /// `sub` stays the stable service-account principal at the client-credentials door,
+    /// because that is what the client resolves to on every issuance there and changing it
+    /// would break every existing consumer; the agent identity sits beside it.
     pub agent: Option<AgentTokenIdentity<'a>>,
     /// The custom claims to embed: the per-client static ones, AFTER this client's
     /// declarative mapping and its deployed hook have shaped them (issue #113 criterion 1).
@@ -1104,8 +1127,10 @@ pub(crate) fn build_client_credentials_access_token_claims(
             object.insert("roles".to_owned(), json!(roles));
         }
         // The agent principal (issue #130), BESIDE the machine identity rather than instead
-        // of it. In the same block and for the same reason: before the custom-claims merge,
-        // so a client-configured claim of the same name cannot displace it.
+        // of it, and in the same block for the same reason. The ordering keeps a client's
+        // configured claim from DISPLACING one the protocol set; what stops a client
+        // ASSERTING one on a token with no agent at all is the protected list these three
+        // names are on, exactly as `org_id` and `roles` are.
         if let Some(agent) = &request.agent {
             object.insert("agent_id".to_owned(), json!(agent.agent_id));
             object.insert("agent_linked_user".to_owned(), json!(agent.linked_user_id));
@@ -3182,6 +3207,12 @@ mod tests {
             // not a pass. Every protected name has to appear here or the loop reports
             // a hostile value it was never given.
             "authorization_details": [{ "type": "evil", "actions": ["transfer"] }],
+            // The agent principal (issue #130). A client that could self-assert these could
+            // stamp any agent id onto a token it obtained honestly, including a revoked
+            // agent's, so the hostile values here are the ones a forger would choose.
+            "agent_id": "agt_attacker",
+            "agent_linked_user": "usr_victim",
+            "agent_organization": "org_victim",
             // Organization context (issue #94): a machine token asserts no human org.
             "org_id": "org_evil",
             // Organization roles (issue #97): a machine token asserts no human

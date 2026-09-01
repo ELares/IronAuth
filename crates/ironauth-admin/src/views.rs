@@ -545,9 +545,11 @@ pub struct AgentList {
 /// The body to register an agent inside an organization (issue #130).
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RegisterAgentRequest {
-    /// The OAuth client this agent obtains tokens through. OPTIONAL: an agent is useful
-    /// before it has one, and binding a client is what turns it into something that can hold
-    /// a credential, which is a decision worth making explicitly.
+    /// The OAuth client this agent obtains tokens through. OPTIONAL, and settable ONLY here:
+    /// there is no rebind route yet, so an agent registered without one stays unable to
+    /// obtain tokens until it is registered again with a client. It remains listable,
+    /// auditable, and revocable throughout, which is why the column is nullable rather than
+    /// required, but "register now and bind later" is not a workflow this surface offers.
     #[serde(default)]
     pub client_id: Option<String>,
     /// The user this agent acts FOR (a `usr_` id in this environment).

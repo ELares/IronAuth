@@ -72017,8 +72017,21 @@ impl AgentRepo<'_> {
     /// machine identity, which is the common case and must stay a cheap answer rather than an
     /// error.
     ///
-    /// The binding is unique per environment, so this resolves at most one agent: a client
-    /// bound twice is impossible by the schema rather than by this query being careful.
+    /// A LIVE agent wins over a revoked one on the same client, and a revoked one is still
+    /// returned when it is all there is. Both halves matter and they pull in opposite
+    /// directions:
+    ///
+    /// - The partial unique index excludes revoked rows so a client can be bound to a
+    ///   REPLACEMENT after its agent is revoked. Without that, responding to a compromise
+    ///   would permanently retire the client too.
+    /// - But a revoked agent must still RESOLVE, because the gate refuses what it resolves.
+    ///   Filtering revoked rows out here instead would make a revoked agent's client answer
+    ///   "not an agent" and receive an ORDINARY machine token: revocation would hand the
+    ///   client MORE reach than it had, which is the opposite of what revoking means. Caught
+    ///   by `a_revoked_agent_obtains_no_token` when this query filtered rather than ordered.
+    ///
+    /// The index guarantees at most one live row, so the ordering is a tie-break among
+    /// revoked rows only, and it is deterministic.
     ///
     /// # Errors
     ///
@@ -72033,7 +72046,9 @@ impl AgentRepo<'_> {
             "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, client_id, \
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
              FROM agents \
-             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3",
+             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             ORDER BY (state <> 'revoked') DESC, created_at DESC \
+             LIMIT 1",
         )
         .bind(client_id)
         .bind(self.scope.tenant().to_string())

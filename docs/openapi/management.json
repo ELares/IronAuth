@@ -32797,7 +32797,7 @@
               "string",
               "null"
             ],
-            "description": "The OAuth client this agent obtains tokens through. OPTIONAL: an agent is useful\nbefore it has one, and binding a client is what turns it into something that can hold\na credential, which is a decision worth making explicitly."
+            "description": "The OAuth client this agent obtains tokens through. OPTIONAL, and settable ONLY here:\nthere is no rebind route yet, so an agent registered without one stays unable to\nobtain tokens until it is registered again with a client. It remains listable,\nauditable, and revocable throughout, which is why the column is nullable rather than\nrequired, but \"register now and bind later\" is not a workflow this surface offers."
           },
           "display_name": {
             "type": "string",

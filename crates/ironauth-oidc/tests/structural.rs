@@ -228,3 +228,65 @@ fn pkce_method_registry_only_expresses_s256() {
         );
     }
 }
+
+/// Every door that mints a machine token also runs the AGENT GATE (issue #130).
+///
+/// The gate bounds what an agent may ask for. A gate on one door is not a gate: the other
+/// doors stay an unenforced path to the same token, so the property that matters is not
+/// "client_credentials checks" but "EVERY minting site checks". That is a property of the
+/// SET of call sites, which no behavioural test of one door can express.
+///
+/// This is a source scan, so be clear about what it does and does not prove. It proves the
+/// call is PRESENT in every module that builds the mint request, which is exactly the
+/// regression the reviewer of this change described: delete the call from two of the three
+/// and every behavioural test still passes. It does NOT prove the call is reached on every
+/// path through those modules; the behavioural suite in `agent_issuance.rs` does that for
+/// the client-credentials door, and the other two doors have no behavioural coverage yet.
+///
+/// The expected set is pinned EXACTLY rather than as a floor, so a scan that stopped finding
+/// anything fails loudly instead of passing vacuously.
+#[test]
+fn every_machine_token_door_runs_the_agent_gate() {
+    const DOORS: &[(&str, &str)] = &[
+        (
+            "client_credentials.rs",
+            include_str!("../src/client_credentials.rs"),
+        ),
+        ("jwt_bearer.rs", include_str!("../src/jwt_bearer.rs")),
+        (
+            "token_exchange.rs",
+            include_str!("../src/token_exchange.rs"),
+        ),
+    ];
+
+    for (name, source) in DOORS {
+        assert!(
+            source.contains("ClientCredentialsMintRequest {"),
+            "{name} is pinned as a minting door but no longer builds the mint request; either \
+             it stopped minting, in which case remove it here, or this scan has stopped \
+             reading the source and is checking nothing"
+        );
+        assert!(
+            source.contains("gate_agent_issuance("),
+            "{name} mints a machine token without running the agent gate, so an agent bound \
+             to that client can obtain a token outside its declared tool set through it"
+        );
+    }
+
+    // And no FOURTH door appeared without being added here. The mint request is built in
+    // exactly these three modules plus the type's own file and its inline tests; a new
+    // module constructing it is a new ungated path until it joins the list above.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("authorize.rs", include_str!("../src/authorize.rs")),
+        ("device.rs", include_str!("../src/device.rs")),
+        ("token.rs", include_str!("../src/token.rs")),
+        ("backchannel.rs", include_str!("../src/backchannel.rs")),
+    ];
+    for (name, source) in CRATE_SOURCES {
+        assert!(
+            !source.contains("ClientCredentialsMintRequest {"),
+            "{name} builds the machine mint request but is not a pinned door, so nothing \
+             asserts it runs the agent gate; add it to DOORS above and gate it"
+        );
+    }
+}

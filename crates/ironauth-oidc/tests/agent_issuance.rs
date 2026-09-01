@@ -42,11 +42,14 @@ fn cc_form(scope: Option<&str>) -> String {
 /// Seeded through the STORE rather than the management plane: this suite is about what the
 /// token doors do with an agent that exists, and routing every fixture through a second
 /// plane would make a management-side failure look like an issuance one.
-async fn seed_agent(
-    harness: &Harness,
-    client: &ClientId,
-    tool_scopes: &[&str],
-) -> AgentPrincipalId {
+/// What `seed_agent` created, so an assertion can name the EXACT ids rather than a shape.
+struct SeededAgent {
+    id: AgentPrincipalId,
+    linked_user: String,
+    organization: String,
+}
+
+async fn seed_agent(harness: &Harness, client: &ClientId, tool_scopes: &[&str]) -> SeededAgent {
     let env = harness.env();
     let scope = harness.scope();
     // The organization row directly: `organizations()` is a CONTROL-plane repository and
@@ -89,7 +92,11 @@ async fn seed_agent(
     .execute(harness.db().owner_pool())
     .await
     .expect("seed agent");
-    id
+    SeededAgent {
+        id,
+        linked_user: linked_user.to_string(),
+        organization: organization.to_string(),
+    }
 }
 
 /// Move a seeded agent to `state`, as the control plane would.
@@ -127,7 +134,7 @@ async fn a_token_for_an_agent_carries_the_agent_its_user_and_its_organization() 
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let client_id = client.to_string();
-    let agent = seed_agent(&harness, &client, &["deploy", "rollback"]).await;
+    let seeded = seed_agent(&harness, &client, &["deploy", "rollback"]).await;
 
     let (status, _headers, body) = harness
         .token_with_auth(
@@ -150,24 +157,25 @@ async fn a_token_for_an_agent_carries_the_agent_its_user_and_its_organization() 
     let claims = verified.claims();
     assert_eq!(
         claims.get("agent_id").and_then(serde_json::Value::as_str),
-        Some(agent.to_string().as_str()),
+        Some(seeded.id.to_string().as_str()),
         "the token names the agent principal"
     );
-    assert!(
+    // The EXACT ids, not their prefixes. A prefix assertion passes for any user and any
+    // organization in the scope, which is precisely the confusion this attribution exists to
+    // rule out: a token naming the wrong human still starts with `usr_`.
+    assert_eq!(
         claims
             .get("agent_linked_user")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|u| u.starts_with("usr_")),
-        "and the human it acts for: {:?}",
-        claims.get("agent_linked_user")
+            .and_then(serde_json::Value::as_str),
+        Some(seeded.linked_user.as_str()),
+        "the token names the human this agent acts for"
     );
-    assert!(
+    assert_eq!(
         claims
             .get("agent_organization")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|o| o.starts_with("org_")),
-        "and the organization it acts inside: {:?}",
-        claims.get("agent_organization")
+            .and_then(serde_json::Value::as_str),
+        Some(seeded.organization.as_str()),
+        "and the organization it acts inside"
     );
 
     // AC2: the issuance is on the trail, in its own stream-separated action.
@@ -224,9 +232,9 @@ async fn a_suspended_agent_obtains_no_token() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let client_id = client.to_string();
-    let agent = seed_agent(&harness, &client, &["deploy"]).await;
+    let seeded = seed_agent(&harness, &client, &["deploy"]).await;
 
-    set_state(&harness, &agent, "suspended").await;
+    set_state(&harness, &seeded.id, "suspended").await;
 
     let (status, _headers, body) = harness
         .token_with_auth(
@@ -255,9 +263,9 @@ async fn a_revoked_agent_obtains_no_token() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let client_id = client.to_string();
-    let agent = seed_agent(&harness, &client, &["deploy"]).await;
+    let seeded = seed_agent(&harness, &client, &["deploy"]).await;
 
-    set_state(&harness, &agent, "revoked").await;
+    set_state(&harness, &seeded.id, "revoked").await;
 
     let (status, _headers, body) = harness
         .token_with_auth(
