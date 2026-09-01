@@ -546,7 +546,7 @@ async fn enforce_dpop(
 /// handle. Bounded and total: an oversized token, a non-three-segment shape, a
 /// non-base64url payload, non-object claims, or a missing or non-string `jti` all
 /// yield [`None`]. Nothing here is trusted; the token is authenticated afterward.
-fn peek_jti(token: &str) -> Option<String> {
+pub(crate) fn peek_jti(token: &str) -> Option<String> {
     if token.len() > MAX_TOKEN_BYTES {
         return None;
     }

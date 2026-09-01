@@ -74,6 +74,7 @@ mod account;
 pub mod account_linking;
 mod acme;
 pub mod advanced_recovery;
+mod agent_vault;
 mod authn;
 mod authorize;
 mod backchannel;

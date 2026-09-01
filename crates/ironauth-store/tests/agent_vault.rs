@@ -110,7 +110,6 @@ async fn store_connection(
                 granted_scopes: &["https://www.googleapis.com/auth/drive.readonly".to_owned()],
                 expires_at_unix_micros: None,
             },
-            &db.master_key(),
             now_micros(env),
         )
         .await
@@ -173,7 +172,7 @@ async fn the_stored_connection_opens_for_the_scope_that_wrote_it() {
         .store()
         .scoped(scope)
         .agent_vault()
-        .connection(&agent, "google", &db.master_key())
+        .connection(&agent, "google")
         .await
         .expect("read the connection")
         .expect("a connection exists");
@@ -196,7 +195,7 @@ async fn an_agent_cannot_read_another_agents_connection() {
         .store()
         .scoped(scope)
         .agent_vault()
-        .connection(&second, "google", &db.master_key())
+        .connection(&second, "google")
         .await
         .expect("read");
     assert!(
@@ -228,7 +227,7 @@ async fn a_failed_connection_isolates_and_stays_visible() {
         .store()
         .scoped(scope)
         .agent_vault()
-        .connection(&agent, "google", &db.master_key())
+        .connection(&agent, "google")
         .await
         .expect("read")
         .expect("the failed connection is still readable, not deleted");
@@ -238,7 +237,7 @@ async fn a_failed_connection_isolates_and_stays_visible() {
         .store()
         .scoped(scope)
         .agent_vault()
-        .connection(&agent, "github", &db.master_key())
+        .connection(&agent, "github")
         .await
         .expect("read")
         .expect("the other connection exists");
@@ -270,7 +269,7 @@ async fn re_storing_a_failed_connection_repairs_it() {
         .store()
         .scoped(scope)
         .agent_vault()
-        .connection(&agent, "google", &db.master_key())
+        .connection(&agent, "google")
         .await
         .expect("read")
         .expect("exists");

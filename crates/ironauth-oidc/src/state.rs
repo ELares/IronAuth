@@ -249,6 +249,11 @@ pub struct OidcState {
     // uniform 404 and discovery advertises nothing. The designated env and branding
     // that SHAPE the documents live in `Inner` (config data cannot arm the surface).
     fedcm_enabled: bool,
+    // The agent token vault (issue #132), armed through the builder for the SAME anti-bypass
+    // reason as fedcm: it is not a plain `OidcConfig` toggle an operator can set without
+    // acknowledging the exploratory version. With it false the exchange answers a uniform
+    // 404, and no agent can be handed a third-party credential at all.
+    agent_vault_enabled: bool,
     // Whether the experimental CIMD surface is armed (issue #128). Kept OUTSIDE `Inner` and
     // set through the builder for the SAME anti-bypass reason as fedcm: an operator who
     // could flip this from the `[oidc]` table would have the server dereferencing
@@ -1006,6 +1011,7 @@ impl OidcState {
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
             fedcm_enabled: false,
+            agent_vault_enabled: false,
             cimd_enabled: false,
             cimd_cache: Arc::new(crate::cimd::CimdCache::new(CIMD_CACHE_ENTRIES)),
             cimd_source: None,
@@ -1137,6 +1143,24 @@ impl OidcState {
     #[must_use]
     pub fn fedcm_enabled(&self) -> bool {
         self.fedcm_enabled
+    }
+
+    /// Arm the experimental agent token vault (issue #132).
+    ///
+    /// Through the BUILDER, never `OidcConfig`, for the same reason FedCM is: arming is only
+    /// ever reachable through the feature ladder, so an operator cannot hand agents
+    /// third-party credentials without acknowledging the exact exploratory version. When
+    /// false (the default) the exchange answers a uniform 404.
+    #[must_use]
+    pub fn with_agent_vault_enabled(mut self, enabled: bool) -> Self {
+        self.agent_vault_enabled = enabled;
+        self
+    }
+
+    /// Whether the agent token vault exchange is armed (issue #132).
+    #[must_use]
+    pub fn agent_vault_enabled(&self) -> bool {
+        self.agent_vault_enabled
     }
 
     /// Arm the experimental CIMD surface (issue #128) and install the document source.

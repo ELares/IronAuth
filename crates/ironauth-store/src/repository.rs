@@ -72502,11 +72502,15 @@ impl AgentVaultRepo<'_> {
         &self,
         agent_id: &AgentPrincipalId,
         provider: &str,
-        master: &MasterKey,
     ) -> Result<Option<VaultConnection>, StoreError> {
         if agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
+        // Read HERE rather than taken from the caller, like every other sealed read in this
+        // module. A `&MasterKey` parameter would make the platform key travel through the
+        // OIDC crate to reach a store method, and the only public accessor for it is gated
+        // on `testing` precisely so it does not.
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, agent_id, provider, access_token_sealed, access_token_dek_version, \
@@ -72597,12 +72601,12 @@ impl ActingAgentVaultRepo<'_> {
         &self,
         env: &Env,
         spec: NewVaultConnection<'_>,
-        master: &MasterKey,
         now_micros: i64,
     ) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope || spec.agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
         let scope = self.scope;
         let id = *spec.id;
         let agent_id = *spec.agent_id;
