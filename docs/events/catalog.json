@@ -148,10 +148,6 @@
             "minLength": 1,
             "type": "string"
           },
-          "connection_id": {
-            "minLength": 1,
-            "type": "string"
-          },
           "organization_id": {
             "minLength": 1,
             "type": "string"
@@ -162,7 +158,6 @@
           }
         },
         "required": [
-          "connection_id",
           "agent_id",
           "organization_id",
           "provider"

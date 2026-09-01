@@ -740,3 +740,80 @@ async fn a_sealed_credential_does_not_open_on_another_agents_or_another_provider
         "a credential sealed for one provider must not open as another provider's"
     );
 }
+
+/// The DATA PLANE may raise an approval and may not decide one (issue #132, criterion 4).
+///
+/// Migration 0179 states this as its reason for existing, and the first version of the policy
+/// enforcing it did nothing at all: it was PERMISSIVE, and Postgres OR's permissive policies
+/// for one command, so it was combined with the table's scope policy -- which has no `FOR` and
+/// no `TO` clause, and whose `WITH CHECK` is the bare scope predicate an already-approved
+/// INSERT satisfies. The narrowing admitted every row it was written to refuse.
+///
+/// A permissive/restrictive slip is invisible without a probe, which is exactly how it
+/// shipped. This is the probe, modelled on the one migration 0100 carries for its identical
+/// construction, including the anti-vacuity control: without a positive case a policy that
+/// refused EVERYTHING would satisfy every negative below.
+#[tokio::test]
+async fn the_data_plane_may_raise_an_approval_and_may_not_decide_one() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let tenant = scope.tenant().to_string();
+    let environment = scope.environment().to_string();
+
+    // As the APP role, with the scope bound the way the repository layer binds it.
+    let mut tx = db.app_pool().begin().await.expect("app transaction");
+    for (key, value) in [
+        ("ironauth.tenant_id", &tenant),
+        ("ironauth.environment_id", &environment),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind the scope");
+    }
+
+    // 1. A PENDING row is writable. The anti-vacuity control: the data plane raising a request
+    //    is the whole point of it holding INSERT, and a policy that refused this would be
+    //    "secure" in the way a disconnected cable is.
+    let pending = AgentVaultApprovalId::generate(&env, &scope);
+    sqlx::query(
+        "INSERT INTO agent_vault_approvals \
+         (id, tenant_id, environment_id, agent_id, provider, requested_details, state, \
+          expires_at) \
+         VALUES ($1, $2, $3, $4, 'google', '{}'::jsonb, 'pending', now() + interval '1 hour')",
+    )
+    .bind(pending.to_string())
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(agent.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("the data plane may raise a pending approval");
+
+    // 2. An already-APPROVED row is refused. This is the attack: an agent approving its own
+    //    sensitive action. Withholding UPDATE blocks deciding an EXISTING row and does nothing
+    //    about inserting one that arrives decided, so before the RESTRICTIVE policy the only
+    //    thing in the way was a hardcoded 'pending' literal in one Rust function.
+    let approved = AgentVaultApprovalId::generate(&env, &scope);
+    let refused = sqlx::query(
+        "INSERT INTO agent_vault_approvals \
+         (id, tenant_id, environment_id, agent_id, provider, requested_details, state, \
+          decided_at, decided_by, approved_details, expires_at) \
+         VALUES ($1, $2, $3, $4, 'google', '{}'::jsonb, 'approved', now(), 'self', \
+                 '{\"everything\":true}'::jsonb, now() + interval '1 hour')",
+    )
+    .bind(approved.to_string())
+    .bind(&tenant)
+    .bind(&environment)
+    .bind(agent.to_string())
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        refused.is_err(),
+        "the data plane must not insert an already-approved row"
+    );
+}

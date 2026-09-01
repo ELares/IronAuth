@@ -72565,54 +72565,14 @@ impl AgentVaultRepo<'_> {
     /// because "this agent has a broken Google connection" and "this agent has no Google
     /// connection" are different answers and only one of them is worth telling an operator.
     ///
-    /// The ID of the connection this agent holds for `provider`, opening no secret.
+    /// The REFRESH token is NOT opened. Use [`AgentVaultRepo::connection_with_refresh`] when a
+    /// caller genuinely needs one.
     ///
-    /// Exists so a CALLER can name the row it is about to replace. `store_connection` upserts
-    /// on `(tenant, environment, agent, provider)` and does NOT update `id`, so a caller that
-    /// minted a fresh id and then re-stored an existing connection would hold an id the table
-    /// does not contain: its response, its event and its audit target would all name a row
-    /// nobody can address, and a later `mark_failed` on it would answer not-found.
-    ///
-    /// Deliberately NOT `connection().map(|c| c.id)`: that opens the sealed access token to
-    /// throw it away, and this is asked precisely on the path where the stored credential is
-    /// about to be replaced.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NotFound`] if the agent is out of this scope; [`StoreError::Database`]
-    /// on a persistence failure.
-    pub async fn connection_id(
-        &self,
-        agent_id: &AgentPrincipalId,
-        provider: &str,
-    ) -> Result<Option<AgentVaultConnectionId>, StoreError> {
-        if agent_id.scope() != self.scope {
-            return Err(StoreError::NotFound);
-        }
-        let mut tx = begin_scoped(self.store, self.scope).await?;
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM agent_vault_connections \
-             WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
-        )
-        .bind(self.scope.tenant().to_string())
-        .bind(self.scope.environment().to_string())
-        .bind(agent_id.to_string())
-        .bind(provider)
-        .fetch_optional(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        row.map(|(id,)| AgentVaultConnectionId::parse_in_scope(&id, &self.scope))
-            .transpose()
-            .map_err(|_| StoreError::NotFound)
-    }
-
-    /// The REFRESH token is opened only when `with_refresh` is set.
-    ///
-    /// It was opened unconditionally, and nothing in the shipped binary reads it: the exchange
-    /// hands back the access token and there is no refresh path. So every exchange fetched a
-    /// second DEK and AEAD-opened the HIGHER-POWER of the two secrets into process memory in
-    /// order to drop it. A refresh token outlives the access token it renews, which is exactly
-    /// why it should not be decrypted by a caller that has no use for one.
+    /// It used to be opened unconditionally, and nothing in the shipped binary reads it: the
+    /// exchange hands back the access token and there is no refresh path. So every exchange
+    /// fetched a second DEK and AEAD-opened the HIGHER-POWER of the two secrets into process
+    /// memory in order to drop it. A refresh token outlives the access token it renews, which
+    /// is exactly why it should not be decrypted by a caller that has no use for one.
     ///
     /// # Errors
     ///
@@ -72767,7 +72727,7 @@ impl ActingAgentVaultRepo<'_> {
         env: &Env,
         spec: NewVaultConnection<'_>,
         now_micros: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<AgentVaultConnectionId, StoreError> {
         self.store_connection_with_event(env, spec, now_micros, None)
             .await
     }
@@ -72782,13 +72742,20 @@ impl ActingAgentVaultRepo<'_> {
     /// # Errors
     ///
     /// The same as [`ActingAgentVaultRepo::store_connection`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "four lines over the pedantic bound. The body is one sealed write: derive the \
+        DEK, seal both secrets under their own associated data, upsert, read back the id the \
+        row actually has, enqueue the event in the same transaction. Splitting it would put \
+        the seal and the write that commits it in different functions"
+    )]
     pub async fn store_connection_with_event(
         &self,
         env: &Env,
         spec: NewVaultConnection<'_>,
         now_micros: i64,
         event: Option<&DomainEvent<'_>>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<AgentVaultConnectionId, StoreError> {
         if spec.id.scope() != self.scope || spec.agent_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -72801,6 +72768,9 @@ impl ActingAgentVaultRepo<'_> {
         let refresh = spec.refresh_token.map(str::to_owned);
         let granted = spec.granted_scopes.to_vec();
         let expires = spec.expires_at_unix_micros;
+        // The id the row ends up with, read out of the upsert's own RETURNING rather than
+        // assumed to be the one the caller minted.
+        let mut effective_id: Option<String> = None;
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -72808,7 +72778,13 @@ impl ActingAgentVaultRepo<'_> {
                 acting: &self.acting,
                 env,
                 action: Action::AgentVaultStore,
-                target: &id,
+                // THE AGENT, not the connection id. The id a caller mints is not necessarily
+                // the id the row ends up with: this is an upsert on (tenant, environment,
+                // agent, provider) that does NOT update `id`, so a second store keeps the
+                // first row's id and an audit row naming the minted one would point at a row
+                // nobody can address. The agent, plus the provider in the detail, identifies
+                // the connection exactly and neither can race.
+                target: &agent_id,
             },
             async |tx| {
                 let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
@@ -72876,8 +72852,18 @@ impl ActingAgentVaultRepo<'_> {
                 .bind(&granted)
                 .bind(expires)
                 .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
+                // `fetch_one`, so the id the row ACTUALLY has comes back. The statement always
+                // ended `RETURNING id` and the result was discarded, which is what made a
+                // caller's minted id authoritative when it is not: on a re-store the row keeps
+                // its original id. Read in the SAME statement, so no read-then-write race is
+                // possible -- an earlier fix read it first in its own transaction, which
+                // narrowed the window rather than closing it.
+                .fetch_one(&mut **tx)
+                .await
+                .map(|row| {
+                    let stored: String = row.get("id");
+                    effective_id = Some(stored);
+                })?;
                 // In the SAME transaction as the row. An event enqueued afterwards is one a
                 // crash can lose while the credential is already stored, which would leave an
                 // integrator's stream saying an agent has no reach it in fact has.
@@ -72886,7 +72872,9 @@ impl ActingAgentVaultRepo<'_> {
             },
             false,
         )
-        .await
+        .await?;
+        let stored = effective_id.ok_or(StoreError::NotFound)?;
+        AgentVaultConnectionId::parse_in_scope(&stored, &scope).map_err(|_| StoreError::NotFound)
     }
 
     /// Mark a connection FAILED, auditing `agent_vault.failed`.

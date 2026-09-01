@@ -5,8 +5,8 @@
 //! # Why this file exists
 //!
 //! It did not, and a review said so plainly: the handler that hands an agent somebody else's
-//! credential had NO test at all. Both entitlement fences, the flag-off posture, the refusals,
-//! and the audit row were asserted only by the comments describing them. The store suite next
+//! credential had NO test at all. All THREE entitlement fences, the flag-off posture, the
+//! refusals, and the audit row were asserted only by the comments describing them. The store suite next
 //! door covers the repository; nothing covered the HTTP surface, which is the part an attacker
 //! reaches.
 //!
@@ -153,7 +153,14 @@ async fn seed_connection(harness: &Harness, agent: &AgentPrincipalId, provider: 
     let scope = harness.scope();
     let id = ironauth_store::AgentVaultConnectionId::generate(harness.env(), &scope);
     harness
-        .store()
+        // The CONTROL store, and this line is the whole point: `harness.store()` is the
+        // low-privilege application pool, and `.management()` wraps that SAME pool rather
+        // than switching to another. Migration 0178 grants INSERT on this table to
+        // `ironauth_control` alone, so seeding through the data plane is refused by Postgres
+        // and the fixture panics before a request is ever sent. Every other `.management()`
+        // call site in this tree goes through `db().control_store()` for exactly this reason.
+        .db()
+        .control_store()
         .management()
         .acting(
             ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(harness.env())),
@@ -295,37 +302,101 @@ async fn a_token_that_names_no_agent_reaches_no_vault() {
     );
 }
 
+/// Narrow an agent's declared tool set AFTER a token was minted against the old one.
+///
+/// The only way to isolate fence two. `gate_agent_issuance` refuses a token naming a tool the
+/// agent has not declared, so a token that reaches the vault always names tools the agent
+/// declared AT MINT TIME. Removing one afterwards is a state an operator reaches, and it is
+/// the only state in which fence two decides anything fence three has not already decided.
+async fn narrow_declared_tools(harness: &Harness, agent: &AgentPrincipalId, tools: &[&str]) {
+    let owned: Vec<String> = tools.iter().map(|tool| (*tool).to_owned()).collect();
+    sqlx::query(
+        "UPDATE agents /* query-audit-allow: owner test seed */ SET tool_scopes = $1 \
+         WHERE id = $2",
+    )
+    .bind(&owned)
+    .bind(agent.to_string())
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("narrow the declared tools");
+}
+
 #[tokio::test]
 async fn an_undeclared_provider_is_refused_even_though_the_connection_exists() {
-    // FENCE TWO, and the ONLY interesting way to measure it. The connection is stored, so a
-    // handler with no declared-set check would hand the credential over. Refusing because the
-    // row is missing would prove nothing about the declared set at all.
+    // FENCE TWO, ISOLATED. The connection is stored, so a handler with no declared-set check
+    // would hand the credential over.
     //
-    // The agent declares `github` and a `google` connection is stored for it, which is a state
-    // an operator can reach: the storing route refuses an undeclared provider, but a tool can
-    // be REMOVED from an agent's declared set after a connection was stored under it, and the
-    // credential outlives the declaration.
+    // The fixture matters more than the assertion here, and an earlier version got it wrong in
+    // a way that made the test unable to tell fence two from fence three: it minted a token
+    // scoped `github` and asked for `google`, so deleting EITHER fence left the other one
+    // refusing and the test green. It proved only that at least one of the two existed.
+    //
+    // So: the agent declares `google`, the token is minted naming `google` (which is what puts
+    // `google` in the token's granted scope, satisfying fence three), and only THEN is `google`
+    // removed from the declared set. Fence three now passes and fence two is the only thing
+    // left that can refuse.
     let mut harness = Harness::start_store_backed().await;
     harness.enable_agent_vault();
 
     let (client, secret) = machine_client(&harness).await;
-    // The agent EXISTS before the token is minted, or the token carries no `agent_id` and the
-    // request dies at fence one having measured nothing about the declared set.
-    let agent = seed_agent(&harness, &client, &["github"]).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_connection(&harness, &agent, "google").await;
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+    assert_eq!(
+        agent_claim(&harness, &client, &bearer).as_deref(),
+        Some(agent.to_string().as_str()),
+        "the token names the agent, so the request reaches the fences"
+    );
+    narrow_declared_tools(&harness, &agent, &["github"]).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an agent must not receive a credential for a tool it no longer declares: {body}"
+    );
+    assert_eq!(json(&body)["error"], "access_denied");
+}
+
+#[tokio::test]
+async fn a_provider_outside_the_tokens_scope_is_refused_even_though_the_agent_declares_it() {
+    // FENCE THREE, ISOLATED, and nothing tested it at all: a grep for its denial reason across
+    // the whole repository returned one hit, the source line itself. It is the round-1 fix for
+    // "a narrowed token opened the whole vault", and deleting the entire block left every test
+    // in this file green.
+    //
+    // The mirror of the test above. The agent declares BOTH providers and holds a `google`
+    // connection, so fence two passes; the token is minted naming only `github`, so `google` is
+    // outside the granted scope and fence three is the only thing that can refuse.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google", "github"]).await;
     seed_connection(&harness, &agent, "google").await;
     let bearer = machine_token(&harness, &client, &secret, Some("github")).await;
     assert_eq!(
         agent_claim(&harness, &client, &bearer).as_deref(),
         Some(agent.to_string().as_str()),
-        "the token names the agent, so the request reaches fence two"
+        "the token names the agent, so the request reaches the fences"
     );
 
-    let (status, _) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
-    assert_ne!(
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(
         status,
+        StatusCode::FORBIDDEN,
+        "a token narrowed at issuance must not reach a provider outside its scope: {body}"
+    );
+    assert_eq!(json(&body)["error"], "access_denied");
+
+    // The CONTROL: the same agent, the same connection, a token that DOES name `google`,
+    // succeeds. Without it this test passes against a handler that refuses everything.
+    let widened = machine_token(&harness, &client, &secret, Some("google")).await;
+    let (ok_status, ok_body) = exchange(&harness, Some(&widened), r#"{"provider":"google"}"#).await;
+    assert_eq!(
+        ok_status,
         StatusCode::OK,
-        "an agent must not receive a credential for a tool it did not declare, and the \
-         connection existing is exactly what makes this the real test"
+        "and the same request with the provider inside the token's scope succeeds: {ok_body}"
     );
 }
 

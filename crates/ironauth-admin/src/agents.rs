@@ -505,7 +505,7 @@ pub async fn store_agent_vault_connection(
     // the edge for exactly this reason two functions away.
     if !provider_is_shaped(&provider) {
         return Err(ApiError::BadRequest(
-            "provider must be a lowercase identifier: it may contain only a-z, 0-9, `_` and              `-`, must start with a letter or digit, and must be at most 64 characters"
+            "provider must be a lowercase identifier: only a-z, 0-9, `_` and `-`, starting with a letter or digit, at most 64 characters"
                 .to_owned(),
         ));
     }
@@ -521,36 +521,37 @@ pub async fn store_agent_vault_connection(
     };
     let refresh_token = refresh_token.as_deref();
 
-    // The EXISTING connection's id when there is one, and a fresh id only when there is not.
-    //
-    // `store_connection` upserts on (tenant, environment, agent, provider) and does NOT update
-    // `id`, so minting unconditionally meant that re-storing a refreshed credential answered
-    // 200 with an id the table does not contain, published that id on every integrator's
-    // stream, and pointed the audit row at it. A later `mark_failed` on the id the operator
-    // was just handed would answer not-found: they could not mark the connection they had
-    // just stored. Read without opening the sealed columns, which is the point of
-    // `connection_id` existing rather than `connection().map(..)`.
+    // The instant, guarded against BOTH ways it can be unrepresentable: the i64 multiply, and
+    // the range Postgres can actually store. `checked_mul` alone left roughly a billion
+    // accepted second values (and a far wider negative band) that multiply cleanly and then
+    // raise 22008 at `TIMESTAMPTZ 'epoch' + interval`, which renders as a 500 -- an operator's
+    // bad request reported as a server fault, which is what the check was added to stop.
     let expires_at_micros = match request.expires_at {
         None => None,
-        Some(seconds) => Some(seconds.checked_mul(1_000_000).ok_or_else(|| {
-            ApiError::BadRequest("expires_at is too large to represent as an instant".to_owned())
-        })?),
+        Some(seconds) => Some(
+            seconds
+                .checked_mul(1_000_000)
+                .filter(|micros| (MIN_STORABLE_MICROS..=MAX_STORABLE_MICROS).contains(micros))
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "expires_at is outside the range of instants that can be stored".to_owned(),
+                    )
+                })?,
+        ),
     };
 
-    let connection_id = match state
-        .store()
-        .scoped(scope)
-        .agent_vault()
-        .connection_id(&id, &provider)
-        .await?
-    {
-        Some(existing) => existing,
-        None => AgentVaultConnectionId::generate(state.env(), &scope),
-    };
-    let pending = vault_connection_event(&state, scope, &connection_id, &id, &org_id, &provider);
+    // A fresh id, which the upsert uses only when there is no existing row: it upserts on
+    // (agent, provider) and does NOT update `id`, so a re-store keeps the row's original id.
+    // The AUTHORITATIVE id comes back from the write, not from here.
+    let connection_id = AgentVaultConnectionId::generate(state.env(), &scope);
+    // The event names the AGENT, the ORGANIZATION and the PROVIDER, and no connection id.
+    // (agent, provider) is the connection's identity -- it is the upsert key -- so the id is
+    // redundant here and carrying it would mean building the event before the write knows
+    // which id the row has.
+    let pending = vault_connection_event(&state, scope, &id, &org_id, &provider);
     // The CONTROL store: writes to the vault are control-plane, and the data-plane role holds
     // no INSERT on this table.
-    state
+    let stored_id = state
         .store()
         .management()
         .acting(actor, CorrelationId::generate(state.env()))
@@ -565,12 +566,6 @@ pub async fn store_agent_vault_connection(
                 access_token: &access_token,
                 refresh_token,
                 granted_scopes: &request.granted_scopes,
-                // `checked_mul`, because `expires_at` is OPERATOR INPUT and this was the only
-                // unguarded seconds-to-micros multiply in the crate. In debug it panicked
-                // inside an axum handler; in release it wrapped, and a crafted value wrapped
-                // to a PLAUSIBLE future expiry, silently extending how long a stored
-                // credential stays usable. An unrepresentable instant is a bad request, which
-                // is what it is.
                 expires_at_unix_micros: expires_at_micros,
             },
             state.now_unix_micros(),
@@ -597,7 +592,10 @@ pub async fn store_agent_vault_connection(
     // worth caching, so this is a corrected sentence rather than a missing header -- but a
     // comment asserting a header that is not sent is how the next reader stops checking.
     let body_string = serde_json::to_string(&VaultConnectionView {
-        id: connection_id.to_string(),
+        // The id the ROW has, returned by the write. Minting one and reporting it was the
+        // defect: on a re-store the row keeps its first id, so the operator was handed one
+        // nothing could address and a later `mark_failed` on it would answer not-found.
+        id: stored_id.to_string(),
         agent_id: id.to_string(),
         provider,
         granted_scopes: request.granted_scopes,
@@ -606,6 +604,17 @@ pub async fn store_agent_vault_connection(
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
 }
+
+/// The earliest instant a `timestamptz` can hold, in microseconds since the Unix epoch.
+///
+/// Postgres stores a timestamp as microseconds from 2000-01-01, so the representable range is
+/// that i64 window shifted by the 946 684 800 seconds between the two epochs. BOTH ends are
+/// named here rather than checking only the multiply, because a multiply succeeding says
+/// nothing about the database being able to store what it produced.
+const MIN_STORABLE_MICROS: i64 = i64::MIN + 946_684_800_000_000;
+
+/// The latest instant a `timestamptz` can hold, in microseconds since the Unix epoch.
+const MAX_STORABLE_MICROS: i64 = i64::MAX - 946_684_800_000_000;
 
 /// Whether `provider` matches the shape migration 0178's CHECK constraint requires.
 ///
@@ -632,7 +641,6 @@ fn provider_is_shaped(provider: &str) -> bool {
 fn vault_connection_event(
     state: &AdminState,
     scope: ironauth_store::Scope,
-    connection_id: &AgentVaultConnectionId,
     agent_id: &AgentPrincipalId,
     organization_id: &ironauth_store::OrganizationId,
     provider: &str,
@@ -646,7 +654,6 @@ fn vault_connection_event(
         &scope.environment().to_string(),
         state.now_unix_micros() / 1000,
         &serde_json::json!({
-            "connection_id": connection_id.to_string(),
             "agent_id": subject,
             "organization_id": organization_id.to_string(),
             "provider": provider,

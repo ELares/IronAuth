@@ -680,12 +680,11 @@ const REGISTERED: &[(&str, u32, &str)] = &[
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "connection_id": {"type": "string", "minLength": 1},
                 "agent_id": {"type": "string", "minLength": 1},
                 "organization_id": {"type": "string", "minLength": 1},
                 "provider": {"type": "string", "minLength": 1}
             },
-            "required": ["connection_id", "agent_id", "organization_id", "provider"]
+            "required": ["agent_id", "organization_id", "provider"]
         }"#,
     ),
     (

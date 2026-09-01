@@ -3889,7 +3889,8 @@ impl OidcState {
     /// resource-server endpoint (RFC 9449 sections 7.1 and 4.3, issue #368). This is
     /// the resource-server counterpart to the issuance-side `resolve_dpop_binding`, and
     /// is shared by both access-token formats (`at+jwt` and opaque) so the enforcement
-    /// cannot diverge between them. Scope: the `userinfo` endpoint. Introspection is
+    /// cannot diverge between them. Scope: any endpoint accepting a presented access token; it was `userinfo` alone, which is
+    /// why the `htu` used to be a constant here. Introspection is
     /// deliberately OUT of scope: it is a CLIENT-facing endpoint where the token rides
     /// the request body under client authentication, not as a presented `DPoP`
     /// credential.
@@ -3904,7 +3905,7 @@ impl OidcState {
     /// single `invalid_token` (no oracle; the granular reason is logged server-side):
     /// - a BOUND token MUST be presented with the `DPoP` scheme (a `Bearer`
     ///   presentation of a bound token is refused, RFC 9449 7.1: no bearer downgrade), a
-    ///   proof MUST be present, the proof MUST validate against the `userinfo` `htu`,
+    ///   proof MUST be present, the proof MUST validate against the CALLER's `htu`,
     ///   the request method, the freshness window, and the `ath` of the EXACT presented
     ///   token, the proof key thumbprint MUST equal `expected_jkt`, and the proof `jti`
     ///   MUST be fresh in the cross-node replay store;
@@ -3974,7 +3975,7 @@ impl OidcState {
             nonce: None,
         };
         let validated = validate_dpop_proof(proof, &expected, now).map_err(|error| {
-            tracing::warn!(%error, "rejecting an invalid DPoP proof at userinfo");
+            tracing::warn!(%error, "rejecting an invalid DPoP proof");
             DpopPresentationFailure::Rejected
         })?;
 
@@ -4003,7 +4004,7 @@ impl OidcState {
                 .is_some_and(|nonce| self.dpop_nonces().is_acceptable(nonce, now));
             if !acceptable {
                 let nonce = self.dpop_nonces().issue(self.env().entropy(), now);
-                tracing::debug!("challenging a userinfo request for a server-issued DPoP nonce");
+                tracing::debug!(%htu, "challenging a request for a server-issued DPoP nonce");
                 return Err(DpopPresentationFailure::NeedsNonce { nonce });
             }
         }
@@ -4024,11 +4025,11 @@ impl OidcState {
             )
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "the DPoP proof replay store failed at userinfo");
+                tracing::warn!(%error, %htu, "the DPoP proof replay store failed");
                 DpopPresentationFailure::Rejected
             })?;
         if !fresh {
-            tracing::warn!("rejecting a replayed DPoP proof jti at userinfo");
+            tracing::warn!(%htu, "rejecting a replayed DPoP proof jti");
             return Err(DpopPresentationFailure::Rejected);
         }
         Ok(())

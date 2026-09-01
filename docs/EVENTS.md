@@ -239,10 +239,6 @@ as a sentinel, so an absent one means absent.
       "minLength": 1,
       "type": "string"
     },
-    "connection_id": {
-      "minLength": 1,
-      "type": "string"
-    },
     "organization_id": {
       "minLength": 1,
       "type": "string"
@@ -253,7 +249,6 @@ as a sentinel, so an absent one means absent.
     }
   },
   "required": [
-    "connection_id",
     "agent_id",
     "organization_id",
     "provider"
@@ -268,7 +263,6 @@ as a sentinel, so an absent one means absent.
 
 ```json
 {
-  "connection_id": "connection_id_example",
   "agent_id": "agent_id_example",
   "organization_id": "organization_id_example",
   "provider": "provider_example"
