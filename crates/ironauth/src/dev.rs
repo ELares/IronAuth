@@ -896,6 +896,14 @@ pub fn dev_config_toml(database_url: &str, bind: &str, management_bind: &str) ->
          # the one thing it exists to serve.\n\
          enabled = true\n\
          \n\
+         # Dynamic Client Registration. Off by default, because open self-service registration\n\
+         # is an abuse surface a real deployment must decide about. On HERE because it is the\n\
+         # only path in the product that creates an OAuth client, so an emulator without it\n\
+         # cannot demonstrate a client registering at all, which is half of the MCP\n\
+         # authorization model (issue #129). Still gated: registration needs an initial\n\
+         # access token minted through the management API.\n\
+         registration_enabled = true\n\
+         \n\
          [oidc.federation]\n\
          # The federation routes exist unconditionally but are INERT (a uniform 404) until a\n\
          # runtime is installed, which this flag is what installs. Without it the seeded\n\

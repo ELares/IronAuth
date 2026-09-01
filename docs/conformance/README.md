@@ -81,3 +81,11 @@ Until those are done, no live conformance result exists, and nothing in this
 repo claims otherwise. In particular the seeded-regression demonstration in
 [MATRIX.md](MATRIX.md) documents the MECHANISM; it has not been run against the
 live suite here.
+
+## MCP authorization
+
+[`mcp.md`](mcp.md) is the MCP authorization conformance page (issue #129). It is
+GENERATED from measured results by `scripts/gen-mcp-conformance.py`; run
+`scripts/mcp-conformance.sh` to remeasure and regenerate it. It is linked from here
+because `docs/llms.txt` excludes this whole directory as generated fixtures, so a page
+nothing links to is a page nothing can find.
