@@ -1,0 +1,12 @@
+{
+  "source": "RFC 7644 section 3.3 example, Okta connector documentation",
+  "path": "/Users",
+  "method": "POST",
+  "body": {
+    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+    "userName": "bjensen@example.com",
+    "externalId": "701984",
+    "name": { "givenName": "Barbara", "familyName": "Jensen" },
+    "active": true
+  }
+}

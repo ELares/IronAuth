@@ -1,0 +1,10 @@
+{
+  "source": "Okta connector documentation: deactivation is a PATCH setting active to false",
+  "path": "/Users/usr_2c9a8b",
+  "method": "PATCH",
+  "patch_path": "active",
+  "body": {
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [{ "op": "replace", "path": "active", "value": false }]
+  }
+}

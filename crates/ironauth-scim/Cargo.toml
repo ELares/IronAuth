@@ -14,3 +14,6 @@ workspace = true
 ironauth-store = { path = "../ironauth-store" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
