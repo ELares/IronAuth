@@ -233,7 +233,7 @@ fn pkce_method_registry_only_expresses_s256() {
 ///
 /// The gate bounds what an agent may ask for. A gate on one door is not a gate: the other
 /// doors stay an unenforced path to the same token, so the property that matters is not
-/// "client_credentials checks" but "EVERY minting site checks". That is a property of the
+/// "`client_credentials` checks" but "EVERY minting site checks". That is a property of the
 /// SET of call sites, which no behavioural test of one door can express.
 ///
 /// This is a source scan, so be clear about what it does and does not prove. It proves the
@@ -247,6 +247,17 @@ fn pkce_method_registry_only_expresses_s256() {
 /// anything fails loudly instead of passing vacuously.
 #[test]
 fn every_machine_token_door_runs_the_agent_gate() {
+    /// Every module in this crate that could build a mint request, whether or not it does.
+    ///
+    /// Read by the FOURTH-DOOR check at the end: the request is built in exactly the three
+    /// doors plus the type's own file and its inline tests, so a new module constructing it
+    /// is a new ungated path until it joins `DOORS`.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("authorize.rs", include_str!("../src/authorize.rs")),
+        ("device.rs", include_str!("../src/device.rs")),
+        ("token.rs", include_str!("../src/token.rs")),
+        ("backchannel.rs", include_str!("../src/backchannel.rs")),
+    ];
     const DOORS: &[(&str, &str)] = &[
         (
             "client_credentials.rs",
@@ -276,12 +287,6 @@ fn every_machine_token_door_runs_the_agent_gate() {
     // And no FOURTH door appeared without being added here. The mint request is built in
     // exactly these three modules plus the type's own file and its inline tests; a new
     // module constructing it is a new ungated path until it joins the list above.
-    const CRATE_SOURCES: &[(&str, &str)] = &[
-        ("authorize.rs", include_str!("../src/authorize.rs")),
-        ("device.rs", include_str!("../src/device.rs")),
-        ("token.rs", include_str!("../src/token.rs")),
-        ("backchannel.rs", include_str!("../src/backchannel.rs")),
-    ];
     for (name, source) in CRATE_SOURCES {
         assert!(
             !source.contains("ClientCredentialsMintRequest {"),

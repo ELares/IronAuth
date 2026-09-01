@@ -1176,7 +1176,7 @@ impl ScopedKind for ServiceAccountKind {
     const PREFIX: &'static str = "sva";
 }
 
-/// Marker for a REGISTERED AGENT principal (`agt_`), an autonomous agent an operator
+/// Marker for a REGISTERED AGENT principal (`agp_`), an autonomous agent an operator
 /// registered inside one organization to act for one user (issue #130).
 ///
 /// Distinct from the audit-actor [`AgentKind`], which is a single-level `agt_` id naming WHO
@@ -2028,7 +2028,7 @@ pub type DcrPolicyId = ScopedId<DcrPolicyKind>;
 /// client-credentials access token carries (issue #23). Distinct from the client's
 /// `cli_` id and consistent across issuances.
 pub type ServiceAccountId = ScopedId<ServiceAccountKind>;
-/// A registered agent principal identifier (`agt_...`).
+/// A registered agent principal identifier (`agp_...`).
 pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
 /// A registered external assertion issuer identifier (`xai_...`), a trust anchor
 /// the JWT bearer assertion grant accepts assertions from (issue #26).

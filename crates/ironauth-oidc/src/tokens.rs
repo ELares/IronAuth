@@ -1087,8 +1087,14 @@ pub struct ClientCredentialsMintRequest<'a> {
 /// unattributable principal this issue exists to prevent, and a consumer that had to handle
 /// a partial set would have to decide what a missing half meant.
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "every field IS an identifier, and the suffix is what says so. \
+    Dropping it would leave `agent`, `linked_user` and `organization` naming ids \
+    that read as the objects themselves"
+)]
 pub struct AgentTokenIdentity<'a> {
-    /// The `agt_` principal this token was issued to.
+    /// The `agp_` principal this token was issued to.
     pub agent_id: &'a str,
     /// The user the agent acts FOR.
     pub linked_user_id: &'a str,
@@ -3210,7 +3216,7 @@ mod tests {
             // The agent principal (issue #130). A client that could self-assert these could
             // stamp any agent id onto a token it obtained honestly, including a revoked
             // agent's, so the hostile values here are the ones a forger would choose.
-            "agent_id": "agt_attacker",
+            "agent_id": "agp_attacker",
             "agent_linked_user": "usr_victim",
             "agent_organization": "org_victim",
             // Organization context (issue #94): a machine token asserts no human org.
@@ -3275,6 +3281,9 @@ mod tests {
             "permissions_status",
             "act",
             "authorization_details",
+            "agent_id",
+            "agent_linked_user",
+            "agent_organization",
         ] {
             assert!(
                 claims.get(reserved_absent).is_none(),
@@ -3315,6 +3324,9 @@ mod tests {
             "permissions_status",
             "act",
             "authorization_details",
+            "agent_id",
+            "agent_linked_user",
+            "agent_organization",
         ];
         for reserved in PROTECTED_ACCESS_TOKEN_CLAIMS {
             assert!(

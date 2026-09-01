@@ -1949,6 +1949,9 @@ mod tests {
         "permissions_status",
         "act",
         "authorization_details",
+        "agent_id",
+        "agent_linked_user",
+        "agent_organization",
     ];
 
     /// Every name in that list is refused when a hook returns it.

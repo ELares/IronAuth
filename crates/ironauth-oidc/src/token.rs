@@ -1123,7 +1123,6 @@ struct CodeExchangeSession {
 /// [`TokenError::ServerError`] on a store fault. Never degraded to "no roles": on a mint path
 /// that is a silent authorization downgrade indistinguishable from an identity that
 /// legitimately holds none.
-
 /// Truncate caller-controlled text before it becomes an audit detail.
 ///
 /// The scope on a token request is whatever the caller sent. Writing it verbatim lets one
@@ -1146,8 +1145,14 @@ fn bounded(detail: &str) -> String {
 ///
 /// Owned rather than borrowed because it outlives the store read that produced it and is
 /// threaded through a mint request built later.
+#[allow(
+    clippy::struct_field_names,
+    reason = "every field IS an identifier, and the suffix is what says so. \
+    Dropping it would leave `agent`, `linked_user` and `organization` naming ids \
+    that read as the objects themselves"
+)]
 pub(crate) struct GatedAgent {
-    /// The `agt_` principal.
+    /// The `agp_` principal.
     pub agent_id: String,
     /// The user it acts for.
     pub linked_user_id: String,
