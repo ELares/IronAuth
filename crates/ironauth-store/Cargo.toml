@@ -920,6 +920,13 @@ name = "absent_scope"
 path = "tests/absent_scope.rs"
 required-features = ["testing"]
 
+# The agent token vault (issue #132): encryption at rest asserted over every column of a raw
+# row, per-agent scoping, and per-connection failure isolation.
+[[test]]
+name = "agent_vault"
+path = "tests/agent_vault.rs"
+required-features = ["testing"]
+
 # A cursor over `sequence` skips events that commit out of order; a watermarked cursor does
 # not (issue #107). Reproduces the hazard before asserting the fix.
 [[test]]

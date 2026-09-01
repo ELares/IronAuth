@@ -786,6 +786,17 @@ pub enum Action {
     /// Its own action rather than a dimension of the generic machine issuance, because the
     /// question an investigator brings to an agent is "what did it do, and for whom" and the
     /// answer has to be findable without reading every token ever minted.
+    /// A downstream credential was STORED for an agent (issue #132).
+    AgentVaultStore,
+    /// An agent EXCHANGED its IronAuth token for a stored downstream credential (issue #132).
+    ///
+    /// The row an investigator asks for first after a third-party incident: which agent got
+    /// which provider's credential, and when. Without it the vault is a store nobody can
+    /// account for, and IronAuth would be the custodian of a credential with no record of
+    /// handing it over.
+    AgentVaultExchange,
+    /// An agent's downstream connection was marked FAILED (issue #132).
+    AgentVaultFailed,
     AgentTokenIssue,
     /// A token request from an agent was REFUSED (issue #130).
     ///
@@ -1675,6 +1686,9 @@ impl Action {
             }
             Action::AgentRegister => "agent.register",
             Action::AgentStateSet => "agent.state.set",
+            Action::AgentVaultStore => "agent_vault.store",
+            Action::AgentVaultExchange => "agent_vault.exchange",
+            Action::AgentVaultFailed => "agent_vault.failed",
             Action::AgentTokenIssue => "agent_token.issue",
             Action::AgentTokenDeny => "agent_token.deny",
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",

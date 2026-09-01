@@ -82,25 +82,26 @@ use crate::flow::{FlowRecord, NewFlow};
 use crate::flow_version::{FlowVersionRecord, NewFlowVersion};
 use crate::id::{
     AaguidRuleId, AbuseBanId, AccountLinkId, AcmeChallengeId, AdminSudoElevationId,
-    AgentPrincipalId, ApiKeyId, AssertionMappingId, AttestationConfigId, AuditId, AuditTarget,
-    AuthorizationCodeId, BackchannelAuthRequestId, BrandId, ClientAdminGrantId, ClientId,
-    ClientSessionId, ConnectorId, ConsentId, CorrelationId, CredentialClassPolicyId, CredentialId,
-    CustomDomainId, DcrPolicyId, DekId, DeviceCodeId, EmailOtpCodeId, EncryptedSecretId,
-    EnvironmentId, EnvironmentSecretId, ExternalIssuerId, FedcmNonceId, FederationLoginStateId,
-    FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId, GrantId, ImpersonationAuthorizationId,
-    InitialAccessTokenId, InvitationId, IssuedTokenId, KekId, LocaleBundleId, MagicLinkTokenId,
-    ManagementKeyId, Mds3BlobCacheId, MessageId, MessageTemplateId, MigrationRunId,
-    MigrationRunRecordId, OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgGroupId,
-    OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId,
-    OrgRolePermissionId, OrganizationId, OutboxMessageId, PermissionId, PowChallengeId,
-    ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
-    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
-    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
-    RiskLoginGeoId, RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
-    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    AgentPrincipalId, AgentVaultConnectionId, ApiKeyId, AssertionMappingId, AttestationConfigId,
+    AuditId, AuditTarget, AuthorizationCodeId, BackchannelAuthRequestId, BrandId,
+    ClientAdminGrantId, ClientId, ClientSessionId, ConnectorId, ConsentId, CorrelationId,
+    CredentialClassPolicyId, CredentialId, CustomDomainId, DcrPolicyId, DekId, DeviceCodeId,
+    EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
+    FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId,
+    GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
+    KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageId,
+    MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId,
+    OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
+    OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId, OutboxMessageId,
+    PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId, PushedRequestId,
+    RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId,
+    RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId,
+    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -149,6 +150,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn agents(&self) -> AgentRepo<'a> {
         AgentRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The READ side of the agent token vault for this scope (issue #132).
+    #[must_use]
+    pub fn agent_vault(&self) -> AgentVaultRepo<'a> {
+        AgentVaultRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1523,6 +1533,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn agents(&self) -> ActingAgentRepo<'a> {
         ActingAgentRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of the agent token vault for this scope and actor (issue #132).
+    #[must_use]
+    pub fn agent_vault(&self) -> ActingAgentVaultRepo<'a> {
+        ActingAgentVaultRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -72370,4 +72390,396 @@ fn agent_from_row(row: &sqlx::postgres::PgRow, scope: &Scope) -> Result<AgentRec
         client_id: row.get("client_id"),
         created_at_unix_micros: row.get("created_at_micros"),
     })
+}
+
+/// The seal label for an agent's stored downstream credential (issue #132).
+///
+/// Its OWN label, distinct from the users-PII one, so a vault ciphertext can never
+/// authenticate under the PII context or the reverse. The two hold different kinds of
+/// secret and are reachable by different code; a shared label would make a ciphertext moved
+/// between them open rather than fail.
+const AGENT_VAULT_SEAL_LABEL: &str = "ironauth.agent-vault.v1";
+
+/// The purpose tag for a stored downstream ACCESS token.
+const VAULT_ACCESS_PURPOSE: &str = "access_token";
+
+/// The purpose tag for a stored downstream REFRESH token.
+///
+/// Distinct from the access purpose so the two seals are not interchangeable: a refresh
+/// ciphertext copied into the access column fails to open rather than opening as the other
+/// secret, which is the difference between a corrupted row and a silent confusion of two
+/// credentials with very different power.
+const VAULT_REFRESH_PURPOSE: &str = "refresh_token";
+
+/// The associated data binding a sealed vault secret to its scope, its purpose, and the DEK
+/// version that sealed it.
+fn agent_vault_seal_aad(scope: Scope, purpose: &str, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(AGENT_VAULT_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(purpose)
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// A stored downstream connection, with its secrets OPENED (issue #132).
+///
+/// Deliberately not `Debug`: a derived formatter on a struct holding a third-party access
+/// token puts that token into the first log line, panic message, or test failure that ever
+/// renders it, and none of those places are ones a credential should reach.
+pub struct VaultConnection {
+    /// The connection identifier.
+    pub id: AgentVaultConnectionId,
+    /// The agent this connection belongs to.
+    pub agent_id: AgentPrincipalId,
+    /// The downstream provider (`google` or `github`).
+    pub provider: String,
+    /// The downstream access token, opened.
+    pub access_token: String,
+    /// The downstream refresh token, opened, when the provider issued one.
+    pub refresh_token: Option<String>,
+    /// What the provider actually granted, which is not always what was asked for.
+    pub granted_scopes: Vec<String>,
+    /// `active` or `failed`.
+    pub state: String,
+}
+
+impl VaultConnection {
+    /// Whether this connection may currently be exchanged for.
+    ///
+    /// A `failed` connection answers `false` and stays readable, which is the whole point of
+    /// marking rather than deleting: one broken downstream is visible and isolated instead of
+    /// taking an agent's other connections with it.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.state == "active"
+    }
+}
+
+/// Everything storing a downstream connection needs.
+pub struct NewVaultConnection<'a> {
+    /// The connection id (minted by the caller, embeds this scope).
+    pub id: &'a AgentVaultConnectionId,
+    /// The agent it belongs to.
+    pub agent_id: &'a AgentPrincipalId,
+    /// The downstream provider.
+    pub provider: &'a str,
+    /// The downstream access token, sealed before it is written.
+    pub access_token: &'a str,
+    /// The downstream refresh token, when the provider issued one.
+    pub refresh_token: Option<&'a str>,
+    /// What the provider granted.
+    pub granted_scopes: &'a [String],
+    /// When the access token expires, in microseconds since the epoch.
+    pub expires_at_unix_micros: Option<i64>,
+}
+
+/// The READ side of the agent token vault, for this scope (issue #132).
+pub struct AgentVaultRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl AgentVaultRepo<'_> {
+    /// The connection this agent holds for `provider`, with its secrets OPENED.
+    ///
+    /// Scoped by BOTH the agent id and the scope, so an agent cannot be handed the
+    /// connection of another agent even in its own environment. That is the per-agent
+    /// scoping the issue asks for, enforced at the read rather than checked afterwards: a
+    /// filter applied after the row is in hand is a filter somebody can forget to apply.
+    ///
+    /// Returns the connection whatever its state, including `failed`. The caller decides,
+    /// because "this agent has a broken Google connection" and "this agent has no Google
+    /// connection" are different answers and only one of them is worth telling an operator.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent is out of this scope;
+    /// [`StoreError::Encryption`] if the stored secret cannot be opened;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn connection(
+        &self,
+        agent_id: &AgentPrincipalId,
+        provider: &str,
+        master: &MasterKey,
+    ) -> Result<Option<VaultConnection>, StoreError> {
+        if agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, agent_id, provider, access_token_sealed, access_token_dek_version, \
+                    refresh_token_sealed, refresh_token_dek_version, granted_scopes, state \
+             FROM agent_vault_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(agent_id.to_string())
+        .bind(provider)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        let access_version: i32 = row.get("access_token_dek_version");
+        let access_dek = fetch_dek_by_version(&mut tx, self.scope, master, access_version).await?;
+        let access_sealed: Vec<u8> = row.get("access_token_sealed");
+        let access_token = String::from_utf8(access_dek.open(
+            &agent_vault_seal_aad(self.scope, VAULT_ACCESS_PURPOSE, access_version),
+            &Sealed::from_bytes(access_sealed)?,
+        )?)
+        .map_err(|_| StoreError::Encryption)?;
+
+        let refresh_sealed: Option<Vec<u8>> = row.get("refresh_token_sealed");
+        let refresh_version: Option<i32> = row.get("refresh_token_dek_version");
+        let refresh_token = match (refresh_sealed, refresh_version) {
+            (Some(sealed), Some(version)) => {
+                let dek = fetch_dek_by_version(&mut tx, self.scope, master, version).await?;
+                Some(
+                    String::from_utf8(dek.open(
+                        &agent_vault_seal_aad(self.scope, VAULT_REFRESH_PURPOSE, version),
+                        &Sealed::from_bytes(sealed)?,
+                    )?)
+                    .map_err(|_| StoreError::Encryption)?,
+                )
+            }
+            // The schema pairs the two columns, so a half-present refresh cannot be written;
+            // reading one defensively as absent keeps a hand-edited row from opening garbage.
+            _ => None,
+        };
+        tx.commit().await?;
+
+        let id: String = row.get("id");
+        let stored_agent: String = row.get("agent_id");
+        Ok(Some(VaultConnection {
+            id: AgentVaultConnectionId::parse_in_scope(&id, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            agent_id: AgentPrincipalId::parse_in_scope(&stored_agent, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            provider: row.get("provider"),
+            access_token,
+            refresh_token,
+            granted_scopes: row.get("granted_scopes"),
+            state: row.get("state"),
+        }))
+    }
+}
+
+/// The WRITE side of the agent token vault, for this scope and actor (issue #132).
+pub struct ActingAgentVaultRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingAgentVaultRepo<'_> {
+    /// Store a downstream connection for an agent, sealing its secrets and auditing
+    /// `agent_vault.store`.
+    ///
+    /// The tokens are SEALED before the row exists. There is no window in which a readable
+    /// third-party credential sits in this table, which is what makes the raw-dump criterion
+    /// a property of the schema rather than of how carefully every caller behaves.
+    ///
+    /// An existing connection for the same agent and provider is REPLACED, and replacing it
+    /// returns the connection to `active`: re-establishing a connection is exactly how an
+    /// operator repairs a failed one, and leaving it marked failed afterwards would mean the
+    /// repair silently did not take.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent is out of this scope; [`StoreError::Encryption`]
+    /// if the scope has no active key; [`StoreError::Database`] on a persistence failure.
+    pub async fn store_connection(
+        &self,
+        env: &Env,
+        spec: NewVaultConnection<'_>,
+        master: &MasterKey,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope || spec.agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *spec.id;
+        let agent_id = *spec.agent_id;
+        let provider = spec.provider.to_owned();
+        let access = spec.access_token.to_owned();
+        let refresh = spec.refresh_token.map(str::to_owned);
+        let granted = spec.granted_scopes.to_vec();
+        let expires = spec.expires_at_unix_micros;
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultStore,
+                target: &id,
+            },
+            async |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let access_sealed = dek
+                    .seal(
+                        env.entropy(),
+                        &agent_vault_seal_aad(scope, VAULT_ACCESS_PURPOSE, dek_version),
+                        access.as_bytes(),
+                    )
+                    .into_bytes();
+                let refresh_sealed = refresh.as_ref().map(|value| {
+                    dek.seal(
+                        env.entropy(),
+                        &agent_vault_seal_aad(scope, VAULT_REFRESH_PURPOSE, dek_version),
+                        value.as_bytes(),
+                    )
+                    .into_bytes()
+                });
+                sqlx::query(
+                    "INSERT INTO agent_vault_connections \
+                     (id, tenant_id, environment_id, agent_id, provider, \
+                      access_token_sealed, access_token_dek_version, \
+                      refresh_token_sealed, refresh_token_dek_version, \
+                      granted_scopes, expires_at, state, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+                             CASE WHEN $11::bigint IS NULL THEN NULL ELSE \
+                                 TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
+                             END, \
+                             'active', \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval) \
+                     ON CONFLICT (tenant_id, environment_id, agent_id, provider) DO UPDATE SET \
+                         access_token_sealed = EXCLUDED.access_token_sealed, \
+                         access_token_dek_version = EXCLUDED.access_token_dek_version, \
+                         refresh_token_sealed = EXCLUDED.refresh_token_sealed, \
+                         refresh_token_dek_version = EXCLUDED.refresh_token_dek_version, \
+                         granted_scopes = EXCLUDED.granted_scopes, \
+                         expires_at = EXCLUDED.expires_at, \
+                         state = 'active', \
+                         last_error = NULL, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(agent_id.to_string())
+                .bind(&provider)
+                .bind(&access_sealed)
+                .bind(dek_version)
+                .bind(refresh_sealed.as_ref())
+                .bind(refresh_sealed.as_ref().map(|_| dek_version))
+                .bind(&granted)
+                .bind(expires)
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?;
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Mark a connection FAILED, auditing `agent_vault.failed`.
+    ///
+    /// Marked, never deleted. The criterion is that one failing connection ISOLATES: an
+    /// agent whose Google refresh stopped working must still be able to use its GitHub one,
+    /// and an operator must be able to see which one broke and why. Deleting the row would
+    /// satisfy the first half and destroy the second.
+    ///
+    /// `reason` is bounded by the schema at 500 characters and must never be a provider's
+    /// response verbatim: an upstream error body can carry a token.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of this scope or does not exist;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn mark_failed(
+        &self,
+        env: &Env,
+        id: &AgentVaultConnectionId,
+        reason: &str,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        // Truncated HERE rather than trusted: the schema's bound would reject an over-long
+        // reason as a 23514, which renders as a 500, and a failing refresh should mark the
+        // connection rather than fail the request that noticed.
+        let reason: String = reason.chars().take(500).collect();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultFailed,
+                target: &id,
+            },
+            async |tx| {
+                let affected = sqlx::query(
+                    "UPDATE agent_vault_connections SET state = 'failed', last_error = $1, \
+                         updated_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+                     WHERE id = $3 AND tenant_id = $4 AND environment_id = $5",
+                )
+                .bind(&reason)
+                .bind(now_micros)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Record that an agent was handed a downstream credential, auditing
+    /// `agent_vault.exchange`.
+    ///
+    /// Audit-only. This is the row an investigator asks for first after a third-party
+    /// incident: which agent received which provider's credential, and when. Without it
+    /// IronAuth is the custodian of somebody else's credential with no record of handing it
+    /// over, which is the thing that makes a vault worse than no vault.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_exchange(
+        &self,
+        env: &Env,
+        id: &AgentVaultConnectionId,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let detail = format!("provider={provider}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultExchange,
+                target: id,
+            },
+            async |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
+    }
 }
