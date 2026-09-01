@@ -16,10 +16,16 @@
 
 #![forbid(unsafe_code)]
 
+mod bulk;
 mod filter;
+mod patch;
 mod path;
 mod resource;
 
+pub use bulk::{
+    BulkError, BulkLimits, BulkOperation, BulkOperationResult, BulkRequest, validate_bulk,
+};
+pub use patch::{PatchPath, PatchPathError, parse_patch_path};
 pub use path::{PathError, ResourceRef, ResourceType, parse_resource_path};
 pub use resource::ScimUser;
 

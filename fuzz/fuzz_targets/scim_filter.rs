@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! libFuzzer target for the SCIM filter parser (issue #135).
+//! libFuzzer target for the SCIM filter, PATCH path, and resource path parsers (issue #135).
 //!
 //! The filter is the one place a SCIM server takes a whole grammar from an unauthenticated
 //! shape of input, so the fuzzer's bytes go straight in: this parser's entry point IS the
@@ -28,6 +28,18 @@ fuzz_target!(|data: &[u8]| {
     let Ok(input) = std::str::from_utf8(data) else {
         return;
     };
+
+    // The PATCH path parser embeds the filter parser, so the same bytes reach it through a
+    // second entry point with a different prefix and suffix. Fuzzing only the filter would
+    // miss the bracket handling that decides which slice the filter parser even sees.
+    if let Ok(patch) = ironauth_scim::parse_patch_path(input) {
+        if let Some(selector) = &patch.selector {
+            walk(selector);
+        }
+    }
+    // The resource path parser: attacker-shaped input, and the one place an encoding trick
+    // would show up as an ACCEPTED path rather than a crash.
+    let _ = ironauth_scim::parse_resource_path(input);
 
     // The contract is that it RETURNS. Most inputs are refusals and that is the point.
     if let Ok(filter) = ironauth_scim::parse_filter(input) {
