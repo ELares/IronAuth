@@ -17,6 +17,9 @@
 #![forbid(unsafe_code)]
 
 mod filter;
+mod resource;
+
+pub use resource::ScimUser;
 
 pub use filter::{
     AttributePath, CompareOp, Filter, FilterError, PresentOp, ScimErrorBody, Value, parse_filter,

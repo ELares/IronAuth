@@ -11,5 +11,6 @@ description = "SCIM 2.0 inbound server surface for IronAuth (issue #135): the RF
 workspace = true
 
 [dependencies]
+ironauth-store = { path = "../ironauth-store" }
 serde.workspace = true
 serde_json.workspace = true

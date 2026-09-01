@@ -2257,6 +2257,7 @@ dependencies = [
 name = "ironauth-scim"
 version = "0.1.0"
 dependencies = [
+ "ironauth-store",
  "serde",
  "serde_json",
 ]
