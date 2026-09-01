@@ -3775,7 +3775,7 @@ export interface components {
             created_at_unix_ms: number;
             /** @description The operator-facing label. */
             display_name: string;
-            /** @description The agent identifier (`agt_...`, embeds its scope). */
+            /** @description The agent identifier (`agp_...`, embeds its scope). */
             id: string;
             /** @description The user the agent acts FOR. */
             linked_user_id: string;

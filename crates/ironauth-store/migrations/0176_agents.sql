@@ -23,7 +23,7 @@
 -- inert.
 
 CREATE TABLE agents (
-    -- The agt_ scoped identifier; embeds its (tenant, environment).
+    -- The agp_ scoped identifier; embeds its (tenant, environment).
     id               text        PRIMARY KEY,
     tenant_id        text        NOT NULL,
     environment_id   text        NOT NULL,

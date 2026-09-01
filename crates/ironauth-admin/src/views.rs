@@ -494,7 +494,7 @@ pub struct CreateServiceAccountMembershipRequest {
 /// One registered agent principal (issue #130).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AgentView {
-    /// The agent identifier (`agt_...`, embeds its scope).
+    /// The agent identifier (`agp_...`, embeds its scope).
     pub id: String,
     /// The organization the agent acts inside.
     pub organization_id: String,

@@ -71890,7 +71890,7 @@ mod message_recipient_seal_tests {
 /// migration header for why each is not optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
-    /// The agent principal identifier (`agt_...`, embeds its `(tenant, environment)`).
+    /// The agent principal identifier (`agp_...`, embeds its `(tenant, environment)`).
     pub id: AgentPrincipalId,
     /// The organization the agent acts inside.
     pub organization_id: OrganizationId,

@@ -63,6 +63,13 @@ const SETTABLE_STATES: [&str; 3] = ["active", "suspended", "revoked"];
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one line over the pedantic bound. The body is the registration in order: \
+    resolve the live organization, check the linked user is in it, parse and bound the \
+    declared tool set, insert, audit. Splitting it would separate the membership check \
+    from the insert it gates, which is the seam that must not be easy to skip"
+)]
 pub async fn register_agent(
     State(state): State<AdminState>,
     principal: Principal,

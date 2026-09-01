@@ -4535,7 +4535,7 @@ async fn the_agent_surface_splits_registering_and_revoking_from_listing() {
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-agents").await;
     let agents =
         format!("/v1/tenants/{tenant}/environments/{environment}/organizations/org_absent/agents");
-    let state_path = format!("{agents}/agt_absent/state");
+    let state_path = format!("{agents}/agp_absent/state");
     let register = serde_json::json!({
         "linked_user_id": "usr_absent",
         "display_name": "deploy bot",

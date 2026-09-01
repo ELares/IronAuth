@@ -1424,7 +1424,7 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
         Case {
             label: "agents.setAgentState",
             method: "PUT",
-            path: format!("{base}/organizations/{org}/agents/agt_absent/state"),
+            path: format!("{base}/organizations/{org}/agents/agp_absent/state"),
             body: Some(body_of(&serde_json::json!({ "state": "suspended" }))),
         },
         Case {

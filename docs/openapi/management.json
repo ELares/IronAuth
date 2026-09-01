@@ -27283,7 +27283,7 @@
           },
           "id": {
             "type": "string",
-            "description": "The agent identifier (`agt_...`, embeds its scope)."
+            "description": "The agent identifier (`agp_...`, embeds its scope)."
           },
           "linked_user_id": {
             "type": "string",

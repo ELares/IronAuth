@@ -1179,15 +1179,22 @@ impl ScopedKind for ServiceAccountKind {
 /// Marker for a REGISTERED AGENT principal (`agt_`), an autonomous agent an operator
 /// registered inside one organization to act for one user (issue #130).
 ///
-/// Distinct from the audit-actor [`AgentKind`], which is a single-level `agent` id naming WHO
+/// Distinct from the audit-actor [`AgentKind`], which is a single-level `agt_` id naming WHO
 /// acted in a trail. This is the scoped PRINCIPAL an operator registers, lists, inspects and
 /// revokes -- environment-scoped because criterion 4 asks for exactly that, and because an
 /// unscoped agent id would make "list the agents acting for my organization" a filter over a
 /// global namespace rather than a question the scope answers.
+///
+/// The prefix is `agp`, not `agt`, and the difference is load bearing rather than cosmetic.
+/// This kind first shipped here claiming `agt` as well, which
+/// [`every_declared_prefix_is_mutually_distinct`] refused: two kinds under one prefix means a
+/// presented `agt_...` no longer says which namespace it belongs to, and the two are parsed
+/// by different code with different scope rules. A prefix that does not identify its kind is
+/// not an identifier, it is a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AgentPrincipalKind;
 impl ScopedKind for AgentPrincipalKind {
-    const PREFIX: &'static str = "agt";
+    const PREFIX: &'static str = "agp";
 }
 
 /// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
