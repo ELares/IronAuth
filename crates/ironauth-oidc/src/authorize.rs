@@ -3012,15 +3012,33 @@ fn build_authorize_url(
         resources,
         organization,
         dpop_jkt,
+        // Carried as a STICKY marker, OR'd with the caller's argument below.
+        //
+        // This one was classified wrongly the first time, and the review caught it. It
+        // is not consumed by an interaction the way `prompt` and `max_age` are: it is
+        // the RECORD that a `max_age` was already consumed on an earlier hop, and the
+        // ID token still owes an `auth_time` because of it. Of the three callers only
+        // `login_resume_url` computed it; `consent_resume_url` and
+        // `preserve_resume_url` both passed a hard `false`. So a request that needed
+        // two interactions (log in, then consent, which is every first sign-in with
+        // `max_age`) reached the token endpoint with the marker gone,
+        // `auth_time_required` false, and no `auth_time` claim, which OIDC Core
+        // section 3.1.2.1 REQUIRES whenever `max_age` was requested.
+        //
+        // Fixed here rather than at the three call sites on purpose: a marker that
+        // three callers each have to remember to forward is the same hand-written list
+        // that lost `resource`, `dpop_jkt`, and `organization` in the first place.
+        // Once set it stays set, which is the only correct behaviour for a record of
+        // something that already happened.
+        emit_auth_time: already_owed_auth_time,
         // NOT carried from `params`, each for a stated reason.
         //
-        // An interaction CONSUMES `prompt`, `max_age`, and `emit_auth_time`: a resumed
-        // `prompt=login` would force the login that just happened to happen again. They
-        // arrive as ARGUMENTS so the caller decides what the next hop sees, and reading
-        // them off `params` here would undo that decision.
+        // An interaction CONSUMES `prompt` and `max_age`: a resumed `prompt=login`
+        // would force the login that just happened to happen again. They arrive as
+        // ARGUMENTS so the caller decides what the next hop sees, and reading them off
+        // `params` here would undo that decision.
         prompt: _,
         max_age: _,
-        emit_auth_time: _,
         // The hints arrive through `hints`, which owns their normalization; taking them
         // off `params` would bypass it.
         login_hint: _,
@@ -3048,10 +3066,7 @@ fn build_authorize_url(
             ("state", state.as_deref()),
             ("nonce", nonce.as_deref()),
             ("code_challenge", code_challenge.as_deref()),
-            (
-                "code_challenge_method",
-                code_challenge_method.as_deref(),
-            ),
+            ("code_challenge_method", code_challenge_method.as_deref()),
             ("prompt", prompt),
             ("max_age", max_age),
             ("acr_values", acr_values.as_deref()),
@@ -3074,7 +3089,12 @@ fn build_authorize_url(
             ("ui_locales", hints.ui_locales()),
             ("claims_locales", hints.claims_locales()),
             ("display", hints.display_param()),
-            ("emit_auth_time", emit_auth_time.then_some("1")),
+            // Sticky: set by THIS hop (the caller consumed a `max_age`) or already set
+            // by an earlier one. Either way the debt survives to the token endpoint.
+            (
+                "emit_auth_time",
+                (emit_auth_time || already_owed_auth_time.is_some()).then_some("1"),
+            ),
         ],
     );
     // RFC 8707 resource indicators are REPEATABLE, so they cannot ride the
@@ -3104,7 +3124,7 @@ fn preserve_resume_url(
     pushed: Option<&PushedContext>,
 ) -> String {
     match pushed {
-        Some(context) => build_par_resume_url(context, params.scope.as_deref(), hints, None),
+        Some(context) => build_par_resume_url(context, params, hints, None),
         None => build_authorize_url(
             params,
             hints,
@@ -3150,7 +3170,7 @@ fn login_resume_url(
                 max_age: None,
                 emit_auth_time: params.max_age.is_some(),
             });
-            build_par_resume_url(context, params.scope.as_deref(), hints, controls)
+            build_par_resume_url(context, params, hints, controls)
         }
         None => build_authorize_url(
             params,
@@ -3188,7 +3208,7 @@ fn consent_resume_url(
                     max_age: params.max_age.as_deref(),
                     emit_auth_time: false,
                 });
-            build_par_resume_url(context, params.scope.as_deref(), hints, controls)
+            build_par_resume_url(context, params, hints, controls)
         }
         None => build_authorize_url(
             params,
@@ -3228,19 +3248,27 @@ struct ResumeControls<'a> {
 /// otherwise no marker is emitted and the stored `prompt`/`max_age` stand.
 fn build_par_resume_url(
     context: &PushedContext,
-    scope: Option<&str>,
+    params: &AuthorizeParams,
     hints: &InteractionHints,
     controls: Option<ResumeControls<'_>>,
 ) -> String {
-    let (marker, prompt, max_age, emit_auth_time) = match controls {
+    let (marker, prompt, max_age, consumed_max_age) = match controls {
         Some(controls) => (
             Some("1"),
             controls.prompt,
             controls.max_age,
-            controls.emit_auth_time.then_some("1"),
+            controls.emit_auth_time,
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, false),
     };
+    // Sticky for the same reason it is sticky in `build_authorize_url`, and it has to
+    // be read HERE rather than forwarded by each caller: two of the three passed a
+    // hard `false`, and `preserve_resume_url` passes no controls at all, so on the PAR
+    // path a second interaction dropped the record that a `max_age` had already been
+    // consumed. `params` is taken whole rather than as a `scope` string precisely so
+    // this value has one source instead of three.
+    let emit_auth_time = (consumed_max_age || params.emit_auth_time.is_some()).then_some("1");
+    let scope = params.scope.as_deref();
     append_query(
         "/authorize",
         &[
@@ -3725,8 +3753,14 @@ mod tests {
             "https://api.example/b".to_owned(),
         ];
         let url = resume_url(&params);
-        assert!(url.contains("resource=https%3A%2F%2Fapi.example%2Fa"), "first: {url}");
-        assert!(url.contains("resource=https%3A%2F%2Fapi.example%2Fb"), "second: {url}");
+        assert!(
+            url.contains("resource=https%3A%2F%2Fapi.example%2Fa"),
+            "first: {url}"
+        );
+        assert!(
+            url.contains("resource=https%3A%2F%2Fapi.example%2Fb"),
+            "second: {url}"
+        );
         assert_eq!(url.matches("resource=").count(), 2, "exactly two: {url}");
     }
 
@@ -3739,8 +3773,7 @@ mod tests {
         let mut params = absent_params();
         params.dpop_jkt = Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I".to_owned());
         assert!(
-            resume_url(&params)
-                .contains("dpop_jkt=0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"),
+            resume_url(&params).contains("dpop_jkt=0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"),
             "the resume URL must carry dpop_jkt: {}",
             resume_url(&params)
         );
@@ -3764,10 +3797,74 @@ mod tests {
     fn an_absent_parameter_is_omitted_from_the_resume_url_rather_than_emitted_empty() {
         // The control for the three tests above: they must fail because the value is
         // MISSING, not because every request emits the key regardless.
-        let url = resume_url(&absent_params());
+        //
+        // One unrelated parameter is SET so the control is not satisfied by a degenerate
+        // URL. With everything absent the builder returns the bare `/authorize`, and
+        // three `!contains` assertions against an empty query string hold for a builder
+        // that emits nothing at all.
+        let mut params = absent_params();
+        params.client_id = Some("cli_control".to_owned());
+        let url = resume_url(&params);
+        assert!(
+            url.contains("client_id=cli_control"),
+            "the control is checked against a URL that carries something: {url}"
+        );
         assert!(!url.contains("resource="), "no resource key: {url}");
         assert!(!url.contains("dpop_jkt="), "no dpop_jkt key: {url}");
         assert!(!url.contains("organization="), "no organization key: {url}");
+        assert!(!url.contains("emit_auth_time="), "no marker key: {url}");
+    }
+
+    #[test]
+    fn the_auth_time_debt_survives_every_later_interaction() {
+        // The defect the exhaustive destructure was supposed to prevent, sitting inside
+        // the destructure itself: `emit_auth_time` was classified as CONSUMED by an
+        // interaction, like `prompt` and `max_age`. It is not. It is the RECORD that a
+        // `max_age` was consumed on an earlier hop and the ID token still owes an
+        // `auth_time`, which OIDC Core section 3.1.2.1 requires whenever `max_age` was
+        // requested.
+        //
+        // Of the three resume builders only `login_resume_url` computed the marker;
+        // `consent_resume_url` and `preserve_resume_url` each passed a hard `false`. So
+        // the sequence every first sign-in with `max_age` takes (no session, no recorded
+        // consent: log in, then consent) reached the token endpoint with the marker
+        // gone, `auth_time_required` false, and no `auth_time` claim.
+        let hints = InteractionHints::default();
+        let mut params = absent_params();
+        params.client_id = Some("cli_x".to_owned());
+        params.max_age = Some("0".to_owned());
+
+        // Hop 1: the login consumes `max_age` and records the debt.
+        let after_login = login_resume_url(&params, &hints, PromptSet::default(), None);
+        assert!(
+            after_login.contains("emit_auth_time=1"),
+            "the login hop records the debt: {after_login}"
+        );
+        assert!(
+            !after_login.contains("max_age="),
+            "and consumes the max_age that created it: {after_login}"
+        );
+
+        // Hop 2 resumes with what hop 1 wrote: `max_age` gone, marker set.
+        let mut resumed = absent_params();
+        resumed.client_id = Some("cli_x".to_owned());
+        resumed.emit_auth_time = Some("1".to_owned());
+
+        for (name, url) in [
+            (
+                "consent",
+                consent_resume_url(&resumed, &hints, PromptSet::default(), None),
+            ),
+            (
+                "preserve (MFA, step-up, registration)",
+                preserve_resume_url(&resumed, &hints, None),
+            ),
+        ] {
+            assert!(
+                url.contains("emit_auth_time=1"),
+                "the {name} hop must carry the debt forward, got {url}"
+            );
+        }
     }
 
     /// The recorded session's `auth_time` (epoch micros) used by the `max_age`
