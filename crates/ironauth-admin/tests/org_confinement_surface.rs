@@ -76,12 +76,12 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 ///
 /// It agrees with the count `deleted_environment.rs` resolves against the committed
 /// contract, which is the independent check that this scan is reading the same surface
-/// the document publishes. That sentence was FALSE until a review measured it: this pin
+/// the document publishes. That sentence was FALSE until a review measured it: the pin
 /// said 37 while the contract published 41, and the four-operation gap was `api_keys.rs`
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 41;
+const ORG_ADDRESSED_OPERATIONS: usize = 44;
 
 /// The path segment that makes an operation organization-addressed.
 fn org_addressed(attr: &str) -> bool {
