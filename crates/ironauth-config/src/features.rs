@@ -307,6 +307,28 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Registers attestation-based client authentication (issue #133, PROTOTYPE).
+    ///
+    /// Its own registrar rather than a second `self.register` inside the vault's, which is
+    /// where it first landed: a reader looking for where this flag is declared would have
+    /// found it under a function named for something else, and `builtin()` reads as the
+    /// inventory of what this build ships.
+    pub fn register_attestation_client_auth(&mut self) {
+        self.register(Feature::experimental(
+            ATTESTATION_CLIENT_AUTH_FEATURE,
+            "Attestation-based client authentication (issue #133, \
+             draft-ietf-oauth-attestation-based-client-auth): a client instance holding no \
+             registered secret authenticates with an attestation minted by an attester this \
+             deployment trusts, plus a proof of possession signed with the key that \
+             attestation bound. PROTOTYPE: the wire format is an IETF draft, replay recording \
+             of the proof's jti is NOT wired, and no attester is trusted until one is \
+             configured -- a deployment that enables this and registers none authenticates \
+             nobody.",
+            ATTESTATION_CLIENT_AUTH_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     /// The registry of every feature this build ships.
     #[must_use]
     pub fn builtin() -> Self {
@@ -320,6 +342,7 @@ impl FeatureRegistry {
         registry.register_org_scoped_clients();
         registry.register_signup_quarantine();
         registry.register_agent_token_vault();
+        registry.register_attestation_client_auth();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();
@@ -576,19 +599,6 @@ impl FeatureRegistry {
              this makes IronAuth the custodian of another party's credential, and the \
              storage, exchange, refresh and approval shapes are early.",
             AGENT_TOKEN_VAULT_VERSION,
-            "crates/ironauth-oidc/CHANGELOG.md",
-        ));
-        self.register(Feature::experimental(
-            ATTESTATION_CLIENT_AUTH_FEATURE,
-            "Attestation-based client authentication (issue #133, \
-             draft-ietf-oauth-attestation-based-client-auth): a client instance holding no \
-             registered secret authenticates with an attestation minted by an attester this \
-             deployment trusts, plus a proof of possession signed with the key that \
-             attestation bound. PROTOTYPE: the wire format is an IETF draft, replay recording \
-             of the proof's jti is NOT wired, and no attester is trusted until one is \
-             configured -- a deployment that enables this and registers none authenticates \
-             nobody.",
-            ATTESTATION_CLIENT_AUTH_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
@@ -1368,7 +1378,10 @@ mod attestation_default_posture_tests {
     #[test]
     fn the_default_config_neither_acknowledges_nor_configures_the_prototype() {
         let config = Config::default();
-        let registry = FeatureRegistry::new();
+        // `builtin()`, NOT `new()`. An empty registry reports every feature disabled, so the
+        // assertion below would have held against a flag that ships default-ON: the test would
+        // have been about the registry being empty rather than about the default posture.
+        let registry = FeatureRegistry::builtin();
         assert!(
             !registry.is_enabled(&config, ATTESTATION_CLIENT_AUTH_FEATURE),
             "the prototype must be off in a default deployment"

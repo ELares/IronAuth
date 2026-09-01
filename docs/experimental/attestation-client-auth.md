@@ -20,7 +20,9 @@ The method is accepted on the **client-credentials grant** only, and only for a 
 
 ## Turning it on
 
-Two conditions, and neither implies the other.
+**There is a third condition, and it cannot be met in this build.** No production path registers a client for `attest_jwt_client_auth`: dynamic registration admits only methods in `ClientAuthMethod::ALL`, this one is deliberately absent from it, the snapshot importer's method list excludes it, and the management API does not write `token_endpoint_auth_method` at all. So the surface below is exercisable by the test suite and by nothing else. That is the correct posture for a draft nobody should be registering clients against yet, and it is stated here because the two conditions that follow are otherwise a complete-looking recipe that produces nothing.
+
+The other two conditions, neither implying the other:
 
 ```toml
 [features]
@@ -31,7 +33,9 @@ issuer = "https://attester.example.com"
 jwks = '{"keys":[{"kty":"OKP","crv":"Ed25519","x":"...","kid":"..."}]}'
 ```
 
-The flag says the operator accepts a draft-stage wire format. The list says whose attestations they believe. **With the flag on and no attester configured, the method authenticates nobody** and a warning says so at boot: there is no wildcard and no "any valid signature" mode, because the attester is the party that decides which `client_id` an instance may claim.
+The flag says the operator accepts a draft-stage wire format. The list says whose attestations they believe.
+
+**Trust is DEPLOYMENT-WIDE, not per tenant.** The registry is built once at boot from this one config section, so an attester listed here can vouch for a client in any tenant and any environment. IronAuth's comparable trust anchor for the jwt-bearer grant, `external_assertion_issuers`, is a per-scope store row with its own enable switch; this is not that, and it has no revocation short of a config edit and a restart. Latent while no client can be registered for the method, and it is the first thing a graduation has to change. **With the flag on and no attester configured, the method authenticates nobody** and a warning says so at boot: there is no wildcard and no "any valid signature" mode, because the attester is the party that decides which `client_id` an instance may claim.
 
 ## The upgrade risk, stated plainly
 
@@ -43,7 +47,9 @@ The flag says the operator accepts a draft-stage wire format. The list says whos
 
 Stated so nothing here reads as finished.
 
-- **Replay recording.** The PoP's `jti` is required and returned, and this build does not record it. A replayed proof inside its own lifetime is accepted. The store seam `private_key_jwt` uses for exactly this exists and is where the wiring goes. Until it is wired, the only bound on the reuse window is a **five-minute maximum PoP lifetime**, enforced rather than documented.
+- **Client registration.** Nothing can register a client for this method (see above). Graduation means admitting it through dynamic registration and the management API, which also means deciding whether an operator may register one while the flag is off.
+- **Per-scope attesters.** Trust is deployment-wide (see above). Graduation means a per-scope registry with an enable switch and revocation that does not need a restart.
+- **Replay recording.** The PoP's `jti` is required and returned, and this build does not record it. A replayed proof inside its own lifetime is accepted. The store seam `private_key_jwt` uses for exactly this exists and is where the wiring goes. Until it is wired, the bound on reuse is the **claimed lifetime**: `exp - iat` must be at most five minutes, enforced rather than documented. That is not the same as a five-minute reuse WINDOW: the verifier allows 60 seconds of clock skew at each end, so a captured proof is replayable for up to about seven minutes.
 - **Attester key rotation.** Trust is a static, inline key set. A rotating attester is a config change. A JWKS-fetching registry means a fetch, a cache, a rotation policy and an SSRF surface, all of which are graduation work.
 - **The attestation's optional claims.** `aal`, `key_type`, `user_authentication` and `status` carry assurance level and revocation, and are not read. A deployment making authorization decisions on them would need them enforced.
 - **Grants beyond client credentials.** An attested instance asking for its own token is the shape the draft targets; the other grants are unchanged.
@@ -58,4 +64,5 @@ Every one has a test in `crates/ironauth-oidc/tests/attestation_client_auth.rs`,
 - **The two JWTs swapped**, and an attestation wearing the proof's media type. They share an issuer relationship and a key chain, and `typ` is what tells them apart (RFC 8725 section 3.11).
 - **A PoP minted for another deployment.** `aud` is matched exactly, so a proof harvested at one deployment is inert at another that trusts the same attester.
 - **A PoP with no `jti`**, so replay recording has something to record when it is wired.
-- **Anything expired**, and any PoP claiming a lifetime longer than five minutes.
+- **Anything expired**, any PoP claiming a lifetime longer than five minutes, and a PoP with no `iat` -- without one there is no lifetime to bound, and defaulting it to "now" would make an unbounded proof look short-lived to a server that received it late.
+- **A proof wearing the attestation's media type**, which is the other half of the swap and the check the first draft of the test suite left unexercised.

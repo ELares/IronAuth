@@ -462,7 +462,11 @@ pub async fn authenticate_attested(
     // Never a Basic attempt: these credentials do not use the Authorization header, so the
     // 401 + WWW-Authenticate shape RFC 6749 mandates for Basic does not apply here.
     let via_basic = false;
-    let method_str = crate::attestation_client_auth::ATTESTATION_AUTH_METHOD;
+    // What the CLIENT is registered for, filled in once the record is read. Recording the
+    // PRESENTED method instead made the diagnostics column mean two different things depending
+    // on which path wrote it: a probe with these headers against a `client_secret_basic` client
+    // recorded `attest_jwt_client_auth`, which is not what that client is registered for.
+    let mut method_str = "unknown".to_owned();
 
     macro_rules! fail {
         ($reason:expr) => {{
@@ -470,7 +474,7 @@ pub async fn authenticate_attested(
                 state,
                 scope,
                 presented_client_id,
-                method_str,
+                &method_str,
                 $reason,
                 None,
                 None,
@@ -507,15 +511,23 @@ pub async fn authenticate_attested(
     // The client's ONE registered method, enforced exactly as every other path enforces it: a
     // client registered for `client_secret_basic` cannot authenticate this way even holding a
     // perfectly good attestation, and the reverse.
+    method_str = record.auth_method.clone();
     if ClientAuthMethod::parse(&record.auth_method) != Some(ClientAuthMethod::AttestJwt) {
         fail!(ClientAuthDiagnosticReason::MethodMismatch);
     }
 
-    let Ok(_attested) = crate::attestation_client_auth::authenticate_attested_client(
+    let Ok(attested) = crate::attestation_client_auth::authenticate_attested_client(
         attestation,
         proof,
         presented_client_id,
-        state.issuer_base(),
+        // The per-ENVIRONMENT issuer, NOT `issuer_base()`. `issuer_base` is one value for the
+        // whole deployment, so an attestation minted for tenant A's environment would be
+        // audience-valid at tenant B's -- and it is not what this deployment stamps as `iss`
+        // on anything, so no attester following the module's own documentation ("aud is the
+        // issuer identifier") would ever produce a token that verified. Found by review:
+        // every DB-backed test of this path minted the right audience and would have failed
+        // in CI against the wrong one.
+        &state.issuer_for(&scope),
         registry,
         state.env().clock(),
     ) else {
@@ -526,7 +538,11 @@ pub async fn authenticate_attested(
     };
     {
         Ok(AuthenticatedClient {
-            client_id: presented_client_id.to_owned(),
+            // From the ATTESTER's `sub`, not from what the request claimed. Byte-equal today
+            // because the seam refuses a mismatch, and taking it from the verified value is
+            // what makes the property structural rather than a consequence of a check three
+            // lines away in another file.
+            client_id: attested.client_id,
             auth_method: ClientAuthMethod::AttestJwt,
             allow_bearer_tokens: record.allow_bearer_tokens,
             grant_types: record.grant_types.clone(),

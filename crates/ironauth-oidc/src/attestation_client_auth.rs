@@ -73,9 +73,19 @@
 //!   inside its own lifetime is therefore accepted. The store seam that
 //!   `private_key_jwt` uses for exactly this exists and is where the wiring goes;
 //!   until it is wired, `attestation_client_auth` is not a supported method, which is
-//!   why it is not advertised.
-//! - **Attester key rotation.** Trust is a static key set here. A JWKS-fetching
-//!   attester registry is graduation work.
+//!   why it is not advertised. The bound in the meantime is on the CLAIMED lifetime
+//!   (`exp - iat`), not on the reuse window: the verifier allows 60 seconds of skew at
+//!   each end, so a captured proof is replayable for about seven minutes rather than five.
+//! - **Client REGISTRATION.** Nothing in this build can register a client for
+//!   `attest_jwt_client_auth`: dynamic registration admits only methods in
+//!   [`ClientAuthMethod::ALL`], the snapshot importer's list excludes it, and the management
+//!   API does not write `token_endpoint_auth_method` at all. So the seam below is reachable
+//!   from the test suite and from nothing else. That is the right posture for a draft, and it
+//!   means the two configuration conditions are not the whole story.
+//! - **Attester key rotation, and attester SCOPE.** Trust is a static inline key set, held once
+//!   per DEPLOYMENT rather than per tenant, so a listed attester can vouch for a client in any
+//!   scope. The comparable anchor for the jwt-bearer grant is a per-scope store row with its own
+//!   enable switch; this is not that. Both are graduation work.
 //! - **The attestation's optional claims** (`aal`, `key_type`, `user_authentication`,
 //!   `status`) are not read. They carry assurance level and revocation, and a
 //!   deployment that made authorization decisions on them would need them enforced.
@@ -111,6 +121,12 @@ pub const ATTESTATION_TYP: &str = "oauth-client-attestation+jwt";
 pub const ATTESTATION_POP_TYP: &str = "oauth-client-attestation-pop+jwt";
 
 /// The `token_endpoint_auth_method` name this draft registers.
+///
+/// Spelled here, in [`crate::ClientAuthMethod::as_str`] and in
+/// [`crate::ClientAuthMethod::parse`], which is three literals for one wire string. They are
+/// pinned against each other by a test rather than deduplicated, because the enum's two arms
+/// are `match` limbs on a `&'static str` and routing them through a constant would make the
+/// method table read less clearly than the drift it prevents. The test is the deduplication.
 pub const ATTESTATION_AUTH_METHOD: &str = "attest_jwt_client_auth";
 
 /// The maximum lifetime a proof of possession may claim.
@@ -151,12 +167,6 @@ impl TrustedAttester {
             return None;
         }
         Some(Self { issuer, keys })
-    }
-
-    /// The attester's issuer identifier.
-    #[must_use]
-    pub fn issuer(&self) -> &str {
-        &self.issuer
     }
 }
 

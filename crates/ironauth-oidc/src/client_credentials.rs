@@ -107,10 +107,31 @@ async fn attested_client(
         return Ok(None);
     };
 
+    // WITH THE FEATURE OFF, these headers mean nothing and must change nothing. Checking the
+    // registry first is what keeps that true: the mixing refusal below used to run before it,
+    // so a deployment that had never enabled the prototype started answering 400 to a request
+    // with perfectly good Basic credentials that happened to carry the two headers -- where it
+    // had answered 200. A prototype that is off has to be invisible, not merely inert.
+    if state.attesters().is_none() {
+        return Ok(None);
+    }
+
     // Mixing methods is refused rather than resolved. RFC 6749 section 2.3 forbids more than
     // one authentication method on a request, and resolving it in either direction would be a
     // downgrade an attacker chooses.
-    if authorization.is_some() || params.client_secret.is_some() {
+    //
+    // ALL FOUR of the other credential inputs, not the two that came to mind. The first
+    // version named the Authorization header and `client_secret`, so a request carrying the
+    // attestation headers AND a `client_assertion` was silently resolved in favour of the
+    // attestation -- the exact thing the sentence above says cannot happen. And it was
+    // over-broad in the other direction: it fired on ANY Authorization scheme, while
+    // `parse_presented` deliberately ignores a non-Basic one, so a Bearer header alongside
+    // these would have been a 400 where the secret path ignores it.
+    if is_basic_scheme(authorization)
+        || params.client_secret.is_some()
+        || params.client_assertion.is_some()
+        || params.client_assertion_type.is_some()
+    {
         return Err(TokenError::InvalidRequest(
             "more than one client authentication method was presented".to_owned(),
         ));

@@ -393,3 +393,157 @@ async fn discovery_does_not_advertise_the_prototype_method() {
         "discovery still advertises the supported methods: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_deployment_with_the_prototype_off_ignores_the_headers_entirely() {
+    // "Nothing changes for a deployment that has not enabled it" has to mean the headers are
+    // INVISIBLE, not merely inert. The first version ran the mixing refusal before consulting
+    // the registry, so an unarmed deployment answered 400 to a request with perfectly good
+    // Basic credentials that happened to carry these headers -- where it had answered 200.
+    let harness = Harness::start().await;
+    let attester_key = key("attester-kid", 11);
+    let instance = key("instance-kid", 22);
+
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let client = client.to_string();
+    let audience = harness.issuer().to_owned();
+    let now = now_secs(&harness);
+    let basic = format!(
+        "Basic {}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{client}:{secret}")
+        )
+    );
+
+    // The control: the same credential without the headers.
+    let (control, _headers, control_body) = harness
+        .token_with_auth(&form(&[("grant_type", "client_credentials")]), Some(&basic))
+        .await;
+
+    // And now WITH them, on a deployment that never armed the prototype.
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(axum::http::header::AUTHORIZATION, &basic)
+        .header(
+            "OAuth-Client-Attestation",
+            attestation(&attester_key, &instance, &client, &audience, now),
+        )
+        .header(
+            "OAuth-Client-Attestation-PoP",
+            proof(&instance, &client, &audience, now),
+        )
+        .body(axum::body::Body::from(form(&[(
+            "grant_type",
+            "client_credentials",
+        )])))
+        .expect("request builds");
+    let (with_headers, _headers, body) = harness.send(request).await;
+
+    assert_eq!(
+        with_headers, control,
+        "an unarmed deployment must answer identically with and without the headers: \
+         {body} vs {control_body}"
+    );
+}
+
+#[tokio::test]
+async fn presenting_an_attestation_and_a_client_assertion_is_refused_as_two_methods() {
+    // The half the first version missed. It named the Authorization header and `client_secret`
+    // and stopped there, so an attestation presented alongside a `client_assertion` was
+    // silently RESOLVED in favour of the attestation -- which is the downgrade the refusal
+    // exists to prevent, chosen by whoever sends the request.
+    let mut harness = Harness::start().await;
+    let attester_key = key("attester-kid", 11);
+    let instance = key("instance-kid", 22);
+    harness.install_attesters(registry(&attester_key));
+
+    let client = harness
+        .create_confidential_client(ClientAuthMethod::AttestJwt)
+        .await
+        .0
+        .to_string();
+    let audience = harness.issuer().to_owned();
+    let now = now_secs(&harness);
+    let both = form(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", client.as_str()),
+        (
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        ),
+        ("client_assertion", "not.a.real.assertion"),
+    ]);
+
+    let (status, _headers, body) = harness
+        .token_attested(
+            &both,
+            Some(&attestation(
+                &attester_key,
+                &instance,
+                &client,
+                &audience,
+                now,
+            )),
+            Some(&proof(&instance, &client, &audience, now)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "an attestation alongside a client assertion is two methods: {body}"
+    );
+    assert!(body.contains("invalid_request"), "{body}");
+}
+
+#[tokio::test]
+async fn a_bearer_authorization_header_is_not_a_second_method() {
+    // The over-broad direction of the same check. `parse_presented` deliberately ignores a
+    // non-Basic `Authorization` -- mTLS client auth and bearer are not client-authentication
+    // inputs -- so firing on ANY scheme would have made this a 400 where the secret path
+    // ignores the header.
+    let mut harness = Harness::start().await;
+    let attester_key = key("attester-kid", 11);
+    let instance = key("instance-kid", 22);
+    harness.install_attesters(registry(&attester_key));
+
+    let client = harness
+        .create_confidential_client(ClientAuthMethod::AttestJwt)
+        .await
+        .0
+        .to_string();
+    let audience = harness.issuer().to_owned();
+    let now = now_secs(&harness);
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(axum::http::header::AUTHORIZATION, "Bearer irrelevant")
+        .header(
+            "OAuth-Client-Attestation",
+            attestation(&attester_key, &instance, &client, &audience, now),
+        )
+        .header(
+            "OAuth-Client-Attestation-PoP",
+            proof(&instance, &client, &audience, now),
+        )
+        .body(axum::body::Body::from(cc_form(&client)))
+        .expect("request builds");
+    let (status, _headers, body) = harness.send(request).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "a bearer header is not a client credential and must not make this two methods: {body}"
+    );
+}

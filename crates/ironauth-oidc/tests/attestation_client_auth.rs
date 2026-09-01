@@ -472,3 +472,79 @@ fn the_pinned_draft_revision_is_the_one_the_acknowledgment_names() {
         "the implementing module and the acknowledgment must name the SAME revision"
     );
 }
+
+#[test]
+fn a_proof_wearing_the_attestations_media_type_is_refused() {
+    // The OTHER media-type check, on the PoP side. The pair-swap test refuses earlier (an
+    // instance's `iss` is not a registered attester), and the mistyped-attestation test
+    // exercises the attestation-side check, so deleting the proof-side one left all sixteen
+    // tests passing -- while the module doc said every check has one. This is that test:
+    // signed by the right key, addressed to the right deployment, issued by the right client,
+    // and wearing the wrong media type.
+    let f = fixture();
+    let mistyped = jwt(
+        &f.instance_key,
+        ATTESTATION_TYP,
+        &json!({
+            "iss": CLIENT,
+            "aud": AUDIENCE,
+            "jti": "pop-0002",
+            "iat": NOW - 5,
+            "exp": NOW + 60,
+        }),
+    );
+    assert_eq!(
+        authenticate(&f, &attestation(&f), &mistyped),
+        Err(AttestationRejection::TypMismatch)
+    );
+}
+
+#[test]
+fn a_proof_with_no_iat_has_no_measurable_lifetime_and_is_refused() {
+    // The branch that makes the lifetime bound COMPUTABLE. Falling back to "now" for a missing
+    // `iat` would invert the bound: an unbounded `exp` would look short-lived to a server that
+    // received the proof late, so the check would pass for exactly the proof it exists to
+    // refuse. The module argues that at length and nothing checked it.
+    let f = fixture();
+    let undated = jwt(
+        &f.instance_key,
+        ATTESTATION_POP_TYP,
+        &json!({
+            "iss": CLIENT,
+            "aud": AUDIENCE,
+            "jti": "pop-0003",
+            "exp": NOW + 60,
+        }),
+    );
+    assert_eq!(
+        authenticate(&f, &attestation(&f), &undated),
+        Err(AttestationRejection::ProofInvalid)
+    );
+}
+
+#[test]
+fn the_method_name_is_spelled_the_same_in_all_three_places() {
+    // One wire string, three literals: this constant and the two `ClientAuthMethod` arms.
+    // A drift would make what the diagnostic records disagree with what the store holds, and
+    // a client registered under one spelling would be unauthenticatable under the other.
+    use ironauth_oidc::ClientAuthMethod;
+    use ironauth_oidc::attestation_client_auth::ATTESTATION_AUTH_METHOD;
+
+    assert_eq!(ATTESTATION_AUTH_METHOD, "attest_jwt_client_auth");
+    assert_eq!(
+        ClientAuthMethod::AttestJwt.as_str(),
+        ATTESTATION_AUTH_METHOD,
+        "the enum's wire spelling must be the one the draft registers"
+    );
+    assert_eq!(
+        ClientAuthMethod::parse(ATTESTATION_AUTH_METHOD),
+        Some(ClientAuthMethod::AttestJwt),
+        "and parsing that spelling must give the method back"
+    );
+    // The control: the method is still ABSENT from the advertised set, so this pinning did not
+    // quietly promote it.
+    assert!(
+        !ClientAuthMethod::ALL.contains(&ClientAuthMethod::AttestJwt),
+        "the prototype method must not be advertised"
+    );
+}

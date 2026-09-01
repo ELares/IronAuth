@@ -6302,6 +6302,97 @@ mod tests {
         );
     }
 
+    /// The attester registry needs BOTH conditions, and neither implies the other
+    /// (issue #133, criterion 6).
+    ///
+    /// Three cases rather than two, because the interesting one is the middle: an operator who
+    /// acknowledges the draft and configures nobody. Installing an EMPTY registry there would
+    /// make the seam refuse at its last check instead of its first, which looks identical from
+    /// outside and is a different thing to debug -- and would leave a `Some` in the state that
+    /// a later reader could take as "the method is armed".
+    #[test]
+    fn the_attester_registry_needs_the_ack_and_an_attester() {
+        let jwks = ironauth_jose::JwkSet::from_signing_keys([
+            &ironauth_jose::SigningKey::ed25519_from_seed(
+                Some("attester-kid".to_owned()),
+                &[9_u8; 32],
+            )
+            .expect("a key"),
+        ])
+        .expect("a jwk set")
+        .to_json()
+        .expect("jwks json");
+        // `builtin()`: the registry this build actually ships. `new()` is empty, so every
+        // `is_enabled` is false and the three refusals below would hold against a flag that
+        // ships default-on.
+        let features = FeatureRegistry::builtin();
+
+        // 1. The DEFAULT: no acknowledgment, no attesters.
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            build_attester_registry(&features, &bare).is_none(),
+            "the prototype is off in a default deployment"
+        );
+
+        // 2. Attesters configured, draft NOT acknowledged. The list alone must arm nothing:
+        //    an operator who wrote the config and never set the flag has not opted in.
+        let configured = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n"
+        ));
+        assert!(
+            build_attester_registry(&features, &configured).is_none(),
+            "an unacknowledged draft arms nothing, however the section is filled in"
+        );
+
+        // 3. Acknowledged with NO attester. The flag alone must arm nothing either.
+        let acked = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = { enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }\n",
+        );
+        assert!(
+            build_attester_registry(&features, &acked).is_none(),
+            "an acknowledged flag with nobody trusted authenticates nobody, and installs nothing"
+        );
+
+        // 4. BOTH. The control: without it the three refusals above would be satisfied by a
+        //    function that returns `None` unconditionally.
+        let armed = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = {{ enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }}\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n"
+        ));
+        assert!(
+            build_attester_registry(&features, &armed).is_some(),
+            "both conditions together arm it"
+        );
+
+        // 5. And an attester whose JWKS yields no key is dropped rather than trusted, so a
+        //    typo in the key material cannot produce a registry that verifies nothing while
+        //    reading as armed.
+        let unusable = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = { enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{\"keys\":[]}'\n",
+        );
+        assert!(
+            build_attester_registry(&features, &unusable).is_none(),
+            "an attester with no usable key is not trusted"
+        );
+    }
+
     #[test]
     fn federation_runtime_is_off_by_default_and_built_when_enabled() {
         // MEDIUM-1: the boot path must actually install the federation runtime. By default
