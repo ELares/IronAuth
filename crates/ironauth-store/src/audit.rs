@@ -786,6 +786,7 @@ pub enum Action {
     /// Its own action rather than a dimension of the generic machine issuance, because the
     /// question an investigator brings to an agent is "what did it do, and for whom" and the
     /// answer has to be findable without reading every token ever minted.
+    AgentTokenIssue,
     /// A downstream credential was STORED for an agent (issue #132).
     AgentVaultStore,
     /// A sensitive agent action was HELD pending an out-of-band approval (issue #132).
@@ -805,7 +806,6 @@ pub enum Action {
     AgentVaultExchange,
     /// An agent's downstream connection was marked FAILED (issue #132).
     AgentVaultFailed,
-    AgentTokenIssue,
     /// A token request from an agent was REFUSED (issue #130).
     ///
     /// The audited denial the declared tool set exists to produce. A control that refuses

@@ -13,7 +13,7 @@
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AgentPrincipalId, AgentVaultApprovalId, AgentVaultConnectionId, CorrelationId, NewAgent,
-    NewVaultConnection, OrganizationId, Scope, UserId,
+    NewVaultConnection, OrganizationId, Scope, UserId, VaultApproval,
 };
 
 /// A downstream access token that is unmistakable if it ever appears in a column.
@@ -178,7 +178,10 @@ async fn the_stored_connection_opens_for_the_scope_that_wrote_it() {
         .expect("a connection exists");
     assert_eq!(opened.access_token, DOWNSTREAM_ACCESS);
     assert_eq!(opened.refresh_token.as_deref(), Some(DOWNSTREAM_REFRESH));
-    assert!(opened.is_usable(), "a freshly stored connection is usable");
+    assert!(
+        opened.is_usable(now_micros(&env)),
+        "a freshly stored connection is usable"
+    );
 }
 
 /// AC1: per-agent scoping. One agent cannot be handed another's connection.
@@ -231,7 +234,10 @@ async fn a_failed_connection_isolates_and_stays_visible() {
         .await
         .expect("read")
         .expect("the failed connection is still readable, not deleted");
-    assert!(!broken.is_usable(), "the failed connection is not usable");
+    assert!(
+        !broken.is_usable(now_micros(&env)),
+        "the failed connection is not usable"
+    );
 
     let other = db
         .store()
@@ -242,7 +248,7 @@ async fn a_failed_connection_isolates_and_stays_visible() {
         .expect("read")
         .expect("the other connection exists");
     assert!(
-        other.is_usable(),
+        other.is_usable(now_micros(&env)),
         "one failing downstream must not disable the agent's other connections"
     );
 }
@@ -274,7 +280,7 @@ async fn re_storing_a_failed_connection_repairs_it() {
         .expect("read")
         .expect("exists");
     assert!(
-        repaired.is_usable(),
+        repaired.is_usable(now_micros(&env)),
         "re-establishing a connection is how a failed one is repaired"
     );
 }
@@ -479,6 +485,28 @@ async fn a_timed_out_action_authorizes_nothing_and_cannot_be_decided_late() {
     assert!(
         !held.authorizes(after),
         "a request past its deadline authorizes nothing, with no sweep having run"
+    );
+    // The deadline must be what refuses it, not the STATE. The row above is still `pending`,
+    // so an `authorizes` that only checked the state would refuse it too and this assertion
+    // would pass with the deadline check deleted. Approving it first makes the state say yes
+    // and leaves the deadline as the only thing that can say no, which is what the first
+    // mutation run of this file missed: it removed the deadline from `decide` and never
+    // touched `authorizes`.
+    let approved_but_stale = VaultApproval {
+        id,
+        agent_id: agent,
+        provider: "google".to_owned(),
+        state: "approved".to_owned(),
+        approved_details: Some(requested_details()),
+        expires_at_unix_micros: now + 1,
+    };
+    assert!(
+        approved_but_stale.authorizes(now),
+        "the control: before the deadline an approved action does authorize"
+    );
+    assert!(
+        !approved_but_stale.authorizes(after),
+        "an APPROVED action past its deadline authorizes nothing"
     );
 
     let late = control

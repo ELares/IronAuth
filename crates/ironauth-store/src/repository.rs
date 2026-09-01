@@ -72432,11 +72432,28 @@ const VAULT_REFRESH_PURPOSE: &str = "refresh_token";
 
 /// The associated data binding a sealed vault secret to its scope, its purpose, and the DEK
 /// version that sealed it.
-fn agent_vault_seal_aad(scope: Scope, purpose: &str, dek_version: i32) -> Aad {
+fn agent_vault_seal_aad(
+    scope: Scope,
+    agent_id: &AgentPrincipalId,
+    purpose: &str,
+    dek_version: i32,
+) -> Aad {
     Aad::builder()
         .text(AGENT_VAULT_SEAL_LABEL)
         .text(&scope.tenant().to_string())
         .text(&scope.environment().to_string())
+        // THE AGENT. Without it every sealed token in one (tenant, environment) is
+        // interchangeable: the DEK is per-scope, so a ciphertext copied from agent A's row
+        // onto agent B's opens cleanly and B is handed A's live third-party credential. The
+        // per-agent scoping is documented as "enforced at the read", and this is the layer
+        // that survives a bug in that read. The sibling secret of the same class,
+        // `upstream_token_seal_aad`, binds its `session_id` for exactly this reason.
+        //
+        // The AGENT and not the connection id: `store_connection` upserts on
+        // (tenant, environment, agent, provider) and does NOT update `id`, so binding the id
+        // would leave a re-stored row sealed under an id the row no longer has, and
+        // permanently unopenable. The agent is in the conflict key, so it cannot drift.
+        .text(&agent_id.to_string())
         .text(purpose)
         .version(i64::from(dek_version))
         .build()
@@ -72462,17 +72479,28 @@ pub struct VaultConnection {
     pub granted_scopes: Vec<String>,
     /// `active` or `failed`.
     pub state: String,
+    /// When the stored access token expires, when the provider said.
+    pub expires_at_unix_micros: Option<i64>,
 }
 
 impl VaultConnection {
-    /// Whether this connection may currently be exchanged for.
+    /// Whether this connection may currently be exchanged for, AT `now_micros`.
     ///
-    /// A `failed` connection answers `false` and stays readable, which is the whole point of
-    /// marking rather than deleting: one broken downstream is visible and isolated instead of
-    /// taking an agent's other connections with it.
+    /// Both the state and the DEADLINE. A `failed` connection answers `false` and stays
+    /// readable, which is the point of marking rather than deleting: one broken downstream is
+    /// visible and isolated instead of taking an agent's other connections with it.
+    ///
+    /// And an ACTIVE connection whose stored access token has expired answers `false` too.
+    /// Checking only the state would hand a caller a downstream credential the provider has
+    /// already stopped honouring, and the caller would learn that from the provider rather
+    /// than from here. A connection with no recorded expiry is treated as unexpiring, which
+    /// is what an absent `expires_at` means: the provider did not say.
     #[must_use]
-    pub fn is_usable(&self) -> bool {
+    pub fn is_usable(&self, now_micros: i64) -> bool {
         self.state == "active"
+            && self
+                .expires_at_unix_micros
+                .is_none_or(|expiry| now_micros < expiry)
     }
 }
 
@@ -72533,7 +72561,8 @@ impl AgentVaultRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, agent_id, provider, access_token_sealed, access_token_dek_version, \
-                    refresh_token_sealed, refresh_token_dek_version, granted_scopes, state \
+                    refresh_token_sealed, refresh_token_dek_version, granted_scopes, state, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
              FROM agent_vault_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
         )
@@ -72552,7 +72581,7 @@ impl AgentVaultRepo<'_> {
         let access_dek = fetch_dek_by_version(&mut tx, self.scope, master, access_version).await?;
         let access_sealed: Vec<u8> = row.get("access_token_sealed");
         let access_token = String::from_utf8(access_dek.open(
-            &agent_vault_seal_aad(self.scope, VAULT_ACCESS_PURPOSE, access_version),
+            &agent_vault_seal_aad(self.scope, agent_id, VAULT_ACCESS_PURPOSE, access_version),
             &Sealed::from_bytes(access_sealed)?,
         )?)
         .map_err(|_| StoreError::Encryption)?;
@@ -72564,7 +72593,7 @@ impl AgentVaultRepo<'_> {
                 let dek = fetch_dek_by_version(&mut tx, self.scope, master, version).await?;
                 Some(
                     String::from_utf8(dek.open(
-                        &agent_vault_seal_aad(self.scope, VAULT_REFRESH_PURPOSE, version),
+                        &agent_vault_seal_aad(self.scope, agent_id, VAULT_REFRESH_PURPOSE, version),
                         &Sealed::from_bytes(sealed)?,
                     )?)
                     .map_err(|_| StoreError::Encryption)?,
@@ -72588,6 +72617,7 @@ impl AgentVaultRepo<'_> {
             refresh_token,
             granted_scopes: row.get("granted_scopes"),
             state: row.get("state"),
+            expires_at_unix_micros: row.get("expires_us"),
         }))
     }
 }
@@ -72648,14 +72678,14 @@ impl ActingAgentVaultRepo<'_> {
                 let access_sealed = dek
                     .seal(
                         env.entropy(),
-                        &agent_vault_seal_aad(scope, VAULT_ACCESS_PURPOSE, dek_version),
+                        &agent_vault_seal_aad(scope, &agent_id, VAULT_ACCESS_PURPOSE, dek_version),
                         access.as_bytes(),
                     )
                     .into_bytes();
                 let refresh_sealed = refresh.as_ref().map(|value| {
                     dek.seal(
                         env.entropy(),
-                        &agent_vault_seal_aad(scope, VAULT_REFRESH_PURPOSE, dek_version),
+                        &agent_vault_seal_aad(scope, &agent_id, VAULT_REFRESH_PURPOSE, dek_version),
                         value.as_bytes(),
                     )
                     .into_bytes()
@@ -72682,7 +72712,8 @@ impl ActingAgentVaultRepo<'_> {
                          expires_at = EXCLUDED.expires_at, \
                          state = 'active', \
                          last_error = NULL, \
-                         updated_at = EXCLUDED.updated_at",
+                         updated_at = EXCLUDED.updated_at \
+                     RETURNING id",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())

@@ -177,10 +177,7 @@ pub async fn exchange(
         );
     }
 
-    // FENCE TWO: the provider must be inside the DECLARED set. An agent that never declared
-    // `google` cannot obtain a Google credential even when a connection exists for it, which
-    // is what makes the declared set bound the agent's downstream reach and not only its
-    // IronAuth scope.
+    // FENCE TWO: the provider must be inside the DECLARED set, at the AGENT grain.
     if !agent.declares_tool(&request.provider) {
         let acting = state.store().scoped(scope).acting(
             ActorRef::service(ServiceId::generate(state.env())),
@@ -194,6 +191,43 @@ pub async fn exchange(
             StatusCode::FORBIDDEN,
             "access_denied",
             "this agent did not declare that provider",
+        );
+    }
+
+    // FENCE THREE: the provider must also be in THIS TOKEN's granted scope.
+    //
+    // Fence two is the agent grain and is not enough on its own. `gate_agent_issuance` goes
+    // to real trouble to narrow a token per request: an agent declaring `google github` that
+    // asks for `scope=github` receives a token whose scope claim is exactly `github`, which
+    // is the least-privilege token that whole gate exists to produce. Without this fence that
+    // narrowed token still opens the full declared vault, so it is worth strictly more than
+    // the token endpoint said it was, and what it is worth is a credential IronAuth cannot
+    // revoke.
+    //
+    // An ABSENT scope claim is refused here rather than waved through. `gate_agent_issuance`
+    // permits a scope-less request because asking for nothing is not a widening, and a token
+    // that asked for nothing is exactly the one with no claim on any provider.
+    let granted_scope = verified
+        .claims()
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !granted_scope
+        .split_whitespace()
+        .any(|token| token == request.provider)
+    {
+        let acting = state.store().scoped(scope).acting(
+            ActorRef::service(ServiceId::generate(state.env())),
+            CorrelationId::generate(state.env()),
+        );
+        let _ = acting
+            .agents()
+            .record_token_denied(state.env(), &agent_id, "vault-provider-outside-token-scope")
+            .await;
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "this token was not granted that provider",
         );
     }
 
@@ -222,7 +256,7 @@ pub async fn exchange(
     // A FAILED connection is refused DISTINCTLY from an absent one. "your Google connection
     // is broken" and "you have no Google connection" call for different operator actions,
     // and collapsing them would hide the one that is fixable.
-    if !connection.is_usable() {
+    if !connection.is_usable(crate::util::epoch_micros(state.now())) {
         return refuse(
             StatusCode::CONFLICT,
             "connection_failed",
