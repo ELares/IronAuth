@@ -2063,6 +2063,46 @@ impl Harness {
         self.send(request).await
     }
 
+    /// `POST /token` carrying the two ATTESTATION headers (issue #133, PROTOTYPE).
+    ///
+    /// Separate from [`Harness::token_with_auth`] because these credentials do not ride the
+    /// `Authorization` header: they are two dedicated headers, and a caller presenting one of
+    /// them alongside a Basic credential is presenting two methods, which the grant refuses.
+    pub async fn token_attested(
+        &self,
+        form: &str,
+        attestation: Option<&str>,
+        proof: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(value) = attestation {
+            builder = builder.header("OAuth-Client-Attestation", value);
+        }
+        if let Some(value) = proof {
+            builder = builder.header("OAuth-Client-Attestation-PoP", value);
+        }
+        let request = builder
+            .body(Body::from(form.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// Install the trusted attesters and rebuild the protocol router (issue #133).
+    ///
+    /// With none installed -- the default -- the seam refuses before reading anything the
+    /// caller sent, which is what a test of the default posture drives.
+    pub fn install_attesters(
+        &mut self,
+        registry: Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>,
+    ) {
+        let state = self.state.clone().with_attesters(registry);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
     /// and an optional `Authorization` header (for a `client_secret_basic` client).
     pub async fn par(

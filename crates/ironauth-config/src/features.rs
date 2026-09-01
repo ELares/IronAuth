@@ -101,6 +101,25 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the attestation-based client authentication prototype (issue #133,
+/// exploratory bet 4).
+///
+/// ONE flag for the whole surface: the attester registry and the token-endpoint method that
+/// consults it. A deployment that trusted an attester but could not authenticate with one, or
+/// the reverse, has half a control, and half of this control authenticates nobody or trusts
+/// everybody depending on which half is missing.
+pub const ATTESTATION_CLIENT_AUTH_FEATURE: &str = "attestation-client-auth";
+
+/// The experimental `ack` version for attestation-based client authentication (issue #133).
+///
+/// It is the DRAFT REVISION itself rather than a `0.1.0-exp.N` counter, and that is
+/// deliberate: what an operator is acknowledging here is not IronAuth's confidence, it is a
+/// wire format the IETF may still change. Naming the revision means a draft bump invalidates
+/// every acknowledgment in the wild, which is exactly what should happen when the format an
+/// attester mints against moves.
+pub const ATTESTATION_CLIENT_AUTH_VERSION: &str =
+    "draft-ietf-oauth-attestation-based-client-auth-10";
+
 /// The registry name of the agent token vault (issue #132, exploratory bet 1).
 ///
 /// ONE flag for the whole surface: the stored downstream connection and the exchange that
@@ -557,6 +576,19 @@ impl FeatureRegistry {
              this makes IronAuth the custodian of another party's credential, and the \
              storage, exchange, refresh and approval shapes are early.",
             AGENT_TOKEN_VAULT_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+        self.register(Feature::experimental(
+            ATTESTATION_CLIENT_AUTH_FEATURE,
+            "Attestation-based client authentication (issue #133, \
+             draft-ietf-oauth-attestation-based-client-auth): a client instance holding no \
+             registered secret authenticates with an attestation minted by an attester this \
+             deployment trusts, plus a proof of possession signed with the key that \
+             attestation bound. PROTOTYPE: the wire format is an IETF draft, replay recording \
+             of the proof's jti is NOT wired, and no attester is trusted until one is \
+             configured -- a deployment that enables this and registers none authenticates \
+             nobody.",
+            ATTESTATION_CLIENT_AUTH_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));
     }
@@ -1316,5 +1348,64 @@ mod tests {
         ));
         registry.validate(&acked).expect("the exact ack boots");
         assert!(registry.is_enabled(&acked, FIRST_PARTY_CHALLENGE_FEATURE));
+    }
+}
+
+#[cfg(test)]
+mod attestation_default_posture_tests {
+    use super::{
+        ATTESTATION_CLIENT_AUTH_FEATURE, ATTESTATION_CLIENT_AUTH_VERSION, FeatureRegistry,
+    };
+    use crate::Config;
+
+    /// The DEFAULT CONFIG exposes the prototype nowhere (issue #133, criterion 6).
+    ///
+    /// The criterion says "default config exposes none of them", and that is two claims: the
+    /// flag is off, and the section it would need is empty. Either alone is satisfiable while
+    /// the other is not -- an acknowledged flag with no attesters, or attesters configured
+    /// under a flag nobody set -- so both are asserted, and asserted on `Config::default()`
+    /// rather than on a hand-written TOML that could drift from what a fresh boot loads.
+    #[test]
+    fn the_default_config_neither_acknowledges_nor_configures_the_prototype() {
+        let config = Config::default();
+        let registry = FeatureRegistry::new();
+        assert!(
+            !registry.is_enabled(&config, ATTESTATION_CLIENT_AUTH_FEATURE),
+            "the prototype must be off in a default deployment"
+        );
+        assert!(
+            config.oidc.attestation_client_auth.attesters.is_empty(),
+            "and no attester is trusted, so even an acknowledged flag would authenticate nobody"
+        );
+    }
+
+    /// The acknowledgment version IS the draft revision.
+    ///
+    /// Pinned because it is the mechanism that makes a draft bump invalidate every
+    /// acknowledgment in the wild, and a `0.1.0-exp.N` counter would silently stop doing that
+    /// while looking the same in the registry table. The module constant and the registry
+    /// entry are two places that could disagree, so the test reads both.
+    #[test]
+    fn the_acknowledgment_names_the_exact_draft_revision() {
+        assert_eq!(
+            ATTESTATION_CLIENT_AUTH_VERSION,
+            "draft-ietf-oauth-attestation-based-client-auth-10"
+        );
+        assert_eq!(
+            ATTESTATION_CLIENT_AUTH_VERSION,
+            ironauth_oidc_draft_revision(),
+            "the config registry and the implementing module must name the SAME revision, or an \
+             operator acknowledges one thing and gets another"
+        );
+    }
+
+    /// The revision the implementing module pins.
+    ///
+    /// Duplicated as a literal rather than imported: `ironauth-config` must not depend on
+    /// `ironauth-oidc` (the dependency runs the other way), so the two constants are checked
+    /// against one shared literal here and by an identical assertion in the OIDC crate's own
+    /// suite. Two tests over one string is what keeps them from drifting apart.
+    fn ironauth_oidc_draft_revision() -> &'static str {
+        "draft-ietf-oauth-attestation-based-client-auth-10"
     }
 }

@@ -136,6 +136,14 @@ pub enum ClientAuthMethod {
     ClientSecretJwt,
     /// `none`: a public client (PKCE only), no secret.
     None,
+    /// `attest_jwt_client_auth`: an attestation minted by a trusted attester plus a
+    /// proof of possession signed with the key it bound
+    /// (draft-ietf-oauth-attestation-based-client-auth, issue #133). PROTOTYPE:
+    /// deliberately absent from [`ALL`](Self::ALL) and
+    /// [`CONFIDENTIAL`](Self::CONFIDENTIAL), so discovery never advertises it, and
+    /// gated on the experimental feature, so a client registered for it while the
+    /// flag is off fails closed rather than falling back to something weaker.
+    AttestJwt,
 }
 
 impl ClientAuthMethod {
@@ -174,6 +182,7 @@ impl ClientAuthMethod {
             ClientAuthMethod::PrivateKeyJwt => "private_key_jwt",
             ClientAuthMethod::ClientSecretJwt => "client_secret_jwt",
             ClientAuthMethod::None => "none",
+            ClientAuthMethod::AttestJwt => "attest_jwt_client_auth",
         }
     }
 
@@ -188,6 +197,7 @@ impl ClientAuthMethod {
             "private_key_jwt" => Some(ClientAuthMethod::PrivateKeyJwt),
             "client_secret_jwt" => Some(ClientAuthMethod::ClientSecretJwt),
             "none" => Some(ClientAuthMethod::None),
+            "attest_jwt_client_auth" => Some(ClientAuthMethod::AttestJwt),
             _ => None,
         }
     }
@@ -416,6 +426,114 @@ pub async fn authenticate_client(
     };
 
     authenticate_presented(state, scope, &presented).await
+}
+
+/// Authenticate a client instance by ATTESTATION (issue #133, PROTOTYPE).
+///
+/// A separate entry point rather than a sixth arm of [`authenticate_client`], because the
+/// credential does not arrive where the others do: an attestation and its proof ride two
+/// dedicated HEADERS, not the `Authorization` header and not the form. Threading two more
+/// `Option<&str>` through [`ClientAuthInputs`] would touch every construction site of a struct
+/// nine grants build, to carry a pair only one path can use.
+///
+/// What it shares with the others is everything that matters: the same scoped auth-record
+/// lookup, the same enforcement of the client's ONE registered method, the same opaque
+/// [`ClientAuthError::InvalidClient`] on the wire, and the same out-of-band diagnostic. That is
+/// what "plugs into the client-auth seam" has to mean; a parallel path that answered
+/// differently would be a second authentication surface with its own failure modes.
+///
+/// REFUSES WHEN NO REGISTRY IS INSTALLED, which is the default and is what keeps the method
+/// unreachable rather than merely unadvertised. The boot path installs one only when the
+/// experimental acknowledgment names the exact draft revision.
+///
+/// # Errors
+///
+/// [`ClientAuthError::InvalidClient`] for every failure, uniformly: an unknown client, a
+/// client registered for another method, a feature that is off, an attestation that does not
+/// verify, and a proof signed by the wrong key are indistinguishable on the wire. A caller
+/// that could tell them apart would have an oracle for how far a forged attestation got.
+pub async fn authenticate_attested(
+    state: &OidcState,
+    scope: Scope,
+    presented_client_id: &str,
+    attestation: &str,
+    proof: &str,
+) -> Result<AuthenticatedClient, ClientAuthError> {
+    // Never a Basic attempt: these credentials do not use the Authorization header, so the
+    // 401 + WWW-Authenticate shape RFC 6749 mandates for Basic does not apply here.
+    let via_basic = false;
+    let method_str = crate::attestation_client_auth::ATTESTATION_AUTH_METHOD;
+
+    macro_rules! fail {
+        ($reason:expr) => {{
+            record_diagnostic(
+                state,
+                scope,
+                presented_client_id,
+                method_str,
+                $reason,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            return Err(ClientAuthError::InvalidClient { via_basic });
+        }};
+    }
+
+    let Some(registry) = state.attesters() else {
+        // The feature is off, or on with no attester configured. Both authenticate nobody, and
+        // both look identical from outside, which is the point.
+        fail!(ClientAuthDiagnosticReason::MethodMismatch);
+    };
+
+    let Ok(client_id) = ClientId::parse_in_scope(presented_client_id, &scope) else {
+        fail!(ClientAuthDiagnosticReason::UnknownClient);
+    };
+    let record = match state
+        .store()
+        .scoped(scope)
+        .clients()
+        .auth_record(&client_id)
+        .await
+    {
+        Ok(record) => record,
+        Err(StoreError::NotFound) => fail!(ClientAuthDiagnosticReason::UnknownClient),
+        // A transient store fault is not an authentication decision.
+        Err(_) => return Err(ClientAuthError::InvalidClient { via_basic }),
+    };
+
+    // The client's ONE registered method, enforced exactly as every other path enforces it: a
+    // client registered for `client_secret_basic` cannot authenticate this way even holding a
+    // perfectly good attestation, and the reverse.
+    if ClientAuthMethod::parse(&record.auth_method) != Some(ClientAuthMethod::AttestJwt) {
+        fail!(ClientAuthDiagnosticReason::MethodMismatch);
+    }
+
+    let Ok(_attested) = crate::attestation_client_auth::authenticate_attested_client(
+        attestation,
+        proof,
+        presented_client_id,
+        state.issuer_base(),
+        registry,
+        state.env().clock(),
+    ) else {
+        // WHICH check refused is diagnostic only. The variants are deliberately collapsed
+        // here rather than mapped one-to-one onto reasons, because every one of them means
+        // the same thing to a caller and the reason lands in a record an operator reads.
+        fail!(ClientAuthDiagnosticReason::AssertionInvalid);
+    };
+    {
+        Ok(AuthenticatedClient {
+            client_id: presented_client_id.to_owned(),
+            auth_method: ClientAuthMethod::AttestJwt,
+            allow_bearer_tokens: record.allow_bearer_tokens,
+            grant_types: record.grant_types.clone(),
+            token_exchange_impersonation_allowed: record.token_exchange_impersonation_allowed,
+            token_exchange_refresh_allowed: record.token_exchange_refresh_allowed,
+        })
+    }
 }
 
 /// Authenticate a client for the GLOBAL revocation and introspection endpoints
@@ -731,10 +849,12 @@ fn authenticate_secret(
                 Err(SecretAuthError::BadSecret)
             }
         }
-        // Unreachable: the caller only routes secret methods here.
-        ClientAuthMethod::PrivateKeyJwt | ClientAuthMethod::ClientSecretJwt => {
-            Err(SecretAuthError::MethodMismatch)
-        }
+        // Unreachable: the caller only routes secret methods here. `AttestJwt` is
+        // listed rather than swept into a wildcard so a future method has to be
+        // routed deliberately instead of silently landing in the secret path.
+        ClientAuthMethod::PrivateKeyJwt
+        | ClientAuthMethod::ClientSecretJwt
+        | ClientAuthMethod::AttestJwt => Err(SecretAuthError::MethodMismatch),
     }
 }
 

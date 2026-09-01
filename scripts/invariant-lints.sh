@@ -128,7 +128,13 @@ scan time-via-env 'SystemTime::now|Instant::now' 12
 # so a real `rand` crate path is caught while an identifier that merely ENDS in "rand"
 # (for example a `Brand::` associated call) is not a false positive.
 scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::' 1
-scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 11
+# 11 -> 13: the two attestation media types (issue #133). Both are dictated by
+# draft-ietf-oauth-attestation-based-client-auth, which is what the rule's own text names as
+# the exemption: a FOREIGN media type is not an IronAuth profile, so there is no `TokenTyp`
+# declaration for it to be stamped from and inventing one would put a peer's spelling into the
+# enum the verifier reads. Two markers, one per test file, each on the single `sign_jws` call
+# site that file mints through.
+scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 13
 
 # Rule fetcher-in-integration-tests: no integration test constructs a REAL `Fetcher`.
 #

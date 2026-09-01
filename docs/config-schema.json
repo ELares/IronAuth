@@ -189,6 +189,21 @@
       },
       "type": "object"
     },
+    "AttestationClientAuthConfig": {
+      "additionalProperties": false,
+      "description": "Which attesters this deployment trusts for attestation-based client authentication\n(issue #133, PROTOTYPE, `draft-ietf-oauth-attestation-based-client-auth`).\n\nEMPTY BY DEFAULT, and empty means the method authenticates nobody. That is the correct\ndefault rather than a placeholder: the attester is the party that decides which `client_id`\nan instance may claim, so a deployment that trusted \"whoever signed\" would let anyone who\ncan mint a JWT become any client. There is no wildcard and no \"any valid signature\" mode.\n\nThe section is inert unless the `attestation-client-auth` experimental feature is\nacknowledged. Both conditions are required and neither implies the other: the flag says the\noperator accepts a draft-stage wire format, the list says whose attestations they believe.",
+      "properties": {
+        "attesters": {
+          "default": [],
+          "description": "The trusted attesters, by issuer identifier.",
+          "items": {
+            "$ref": "#/$defs/TrustedAttesterConfig"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "AuditRetentionConfig": {
       "additionalProperties": false,
       "description": "Audit retention settings (issue #109).\n\nOFF by default and off again without a DSN, so a deployment that never opens this\nsection deletes nothing. That default direction is deliberate: the failure mode of\nretention being off is a larger table, and the failure mode of it being on by\naccident is a destroyed audit trail. Only one of those is recoverable.",
@@ -926,6 +941,13 @@
             "trusted_contact_enabled": false
           },
           "description": "The advanced-recovery-modes policy (issue #82, PR 3): the three mode sub-toggles under\nthe single `advanced-recovery` experimental ack, the trusted-contact confirmation\nthreshold, and the registered IDV providers. Consulted only when the\n`advanced-recovery` experimental feature is enabled AND acknowledged. See\n[`AdvancedRecoveryConfig`]."
+        },
+        "attestation_client_auth": {
+          "$ref": "#/$defs/AttestationClientAuthConfig",
+          "default": {
+            "attesters": []
+          },
+          "description": "Attestation-based client authentication (issue #133, PROTOTYPE). Empty by default, and\ninert unless the `attestation-client-auth` experimental feature is acknowledged."
         },
         "authorization_code_ttl_secs": {
           "default": 60,
@@ -2703,6 +2725,23 @@
       },
       "type": "object"
     },
+    "TrustedAttesterConfig": {
+      "additionalProperties": false,
+      "description": "One attester this deployment trusts (issue #133).",
+      "properties": {
+        "issuer": {
+          "default": "",
+          "description": "The attester's issuer identifier, matched EXACTLY against the attestation's `iss`.\n\nExactly, because this is what selects the key set an attestation is verified against.\nA prefix or suffix match would let an issuer the operator did not name select the keys\nof one they did.",
+          "type": "string"
+        },
+        "jwks": {
+          "default": "",
+          "description": "The attester's public JWKS, inline as JSON.\n\nINLINE rather than a `jwks_uri`, and that is a prototype decision worth stating: a URI\nmeans a fetch, a cache, a rotation policy and an SSRF surface, all of which are\ngraduation work. Inline keys mean an attester's rotation is a config change, which is\nthe right trade while the wire format itself is a draft.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "UsersConfig": {
       "additionalProperties": false,
       "description": "User lifecycle settings (issue #52).\n\nScheduling an offboarding is a management write the API already accepts; this section\ngates the worker that EXECUTES one when its instant arrives.",
@@ -2900,6 +2939,9 @@
           "idv_providers": [],
           "required_confirmations": 1,
           "trusted_contact_enabled": false
+        },
+        "attestation_client_auth": {
+          "attesters": []
         },
         "authorization_code_ttl_secs": 60,
         "authorization_details_types": [],

@@ -22,9 +22,9 @@ use ironauth_admin::webhook_delivery::{
 };
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, Config, FEDCM_FEATURE,
-    FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded,
-    ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
+    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE, Config,
+    FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE,
+    Loaded, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
     RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, WASM_HOOKS_FEATURE,
     WebhooksConfig,
 };
@@ -574,7 +574,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
 // positional booleans threaded through two call sites, where any two could be swapped
 // silently. A state machine would model a composition these do not have.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy)]
+// No longer `Copy`: the attester registry is an `Arc`, and a registry that could be copied
+// bit-for-bit would be a second handle nobody meant to create. Cloning is explicit at the one
+// call site that needs it.
+#[derive(Debug, Clone)]
 struct DataPlaneSurfaces {
     /// The experimental Global Token Revocation receiver (issue #36).
     global_revocation: bool,
@@ -582,6 +585,10 @@ struct DataPlaneSurfaces {
     fedcm: bool,
     /// The agent token vault (issue #132), armed only through the exploratory ladder.
     agent_vault: bool,
+    /// The attesters trusted for attestation-based client authentication (issue #133), or
+    /// `None` when the draft is unacknowledged or no attester parses. `None` leaves the state
+    /// without a registry, and the seam then refuses before reading anything a caller sent.
+    attesters: Option<Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>>,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
     /// The experimental org-scoped-clients surface (issue #103, milestone M10).
@@ -615,6 +622,10 @@ impl DataPlaneSurfaces {
             global_revocation: features.is_enabled(config, GLOBAL_TOKEN_REVOCATION_FEATURE),
             fedcm: features.is_enabled(config, FEDCM_FEATURE),
             agent_vault: features.is_enabled(config, AGENT_TOKEN_VAULT_FEATURE),
+            // Not a bool, because "on" is not enough: the method also needs at least one
+            // attester the deployment trusts, and the two conditions are independent. Resolved
+            // HERE so every experimental surface is decided in one place.
+            attesters: build_attester_registry(features, config),
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
@@ -1404,6 +1415,17 @@ async fn build_oidc_plane(
     .with_risk_signals_enabled(surfaces.risk_signals)
     .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
     .with_first_party_challenge_enabled(surfaces.first_party_challenge)
+    // Attestation-based client authentication (issue #133, PROTOTYPE). ONE plane, and
+    // deliberately not routed through the shared cross-plane capture: the management API
+    // authenticates no client instances, so declaring it there would have meant an
+    // `AdminState` builder storing a registry nothing on that plane reads -- a layer with no
+    // caller, which is the shape that mechanism exists to prevent rather than to produce.
+    //
+    // `None` (the default, and any deployment that has not acknowledged the draft) leaves the
+    // state without a registry, and the seam then refuses before reading anything a caller
+    // sent. So an unacknowledged deployment does not merely fail to advertise the method: it
+    // cannot reach it.
+    .with_optional_attesters(surfaces.attesters.clone())
     .with_flows_enabled(surfaces.flows)
     .with_hosted_pages_enabled(surfaces.hosted_pages)
     .with_diagnostics(&config.diagnostics)
@@ -1631,6 +1653,50 @@ async fn build_oidc_plane(
         discovery,
         jwks,
     })
+}
+
+/// Build the trusted-attester registry, or `None` (issue #133, PROTOTYPE).
+///
+/// TWO conditions, and neither implies the other: the experimental feature must be
+/// acknowledged at its exact draft revision, AND at least one attester must be configured and
+/// parse. An acknowledged flag with an empty or unusable list installs NOTHING rather than an
+/// empty registry, so the seam refuses at the first check instead of at the last, and an
+/// operator reading the log learns which of the two they are missing.
+///
+/// An attester whose JWKS yields no usable key is dropped with a warning rather than failing
+/// the boot: one bad entry among several should not take a deployment down, and an entry that
+/// verifies nothing would sit in the registry refusing silently at every authentication.
+fn build_attester_registry(
+    features: &FeatureRegistry,
+    config: &Config,
+) -> Option<Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>> {
+    if !features.is_enabled(config, ATTESTATION_CLIENT_AUTH_FEATURE) {
+        return None;
+    }
+    let mut registry = ironauth_oidc::attestation_client_auth::AttesterRegistry::new();
+    for attester in &config.oidc.attestation_client_auth.attesters {
+        if let Some(trusted) = ironauth_oidc::attestation_client_auth::TrustedAttester::from_jwks(
+            &attester.issuer,
+            attester.jwks.as_bytes(),
+        ) {
+            registry = registry.with(trusted);
+        } else {
+            tracing::warn!(
+                issuer = %attester.issuer,
+                "attestation-based client authentication (issue #133): this attester's JWKS \
+                 yielded no usable key, so it is NOT trusted; attestations naming it are refused"
+            );
+        }
+    }
+    if registry.is_empty() {
+        tracing::warn!(
+            "attestation-based client authentication (issue #133) is acknowledged but no \
+             attester is trusted, so the method authenticates nobody; configure \
+             `oidc.attestation_client_auth.attesters`"
+        );
+        return None;
+    }
+    Some(Arc::new(registry))
 }
 
 /// The federation runtime over an injected fetcher builder (issues #75 and #674).
