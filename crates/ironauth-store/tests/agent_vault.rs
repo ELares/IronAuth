@@ -1690,3 +1690,124 @@ async fn the_data_plane_can_write_a_refreshed_credential_and_cannot_insert_a_new
         "the data plane must not be able to create a connection"
     );
 }
+
+/// The data plane may SPEND an approval and may do nothing else to one (issue #132).
+///
+/// Found by review before it ran anywhere: spending happens at the TOKEN DOOR, which runs on
+/// the data-plane role, and 0179 deliberately withheld UPDATE from that role. So the consume
+/// would have been refused by Postgres at the last step of every approved sensitive exchange,
+/// AFTER the human said yes. The grant that fixes it is exactly what 0179 withheld, so it is
+/// paired with a policy admitting one transition, and this test is what proves the pairing is
+/// not just the grant.
+#[tokio::test]
+async fn the_data_plane_may_spend_an_approval_and_may_not_grant_itself_one() {
+    let db = TestDatabase::start().await;
+    let env = ironauth_env::Env::system();
+    let scope = db.seed_scope(&env).await;
+    let agent = seed_agent(&db, &env, scope).await;
+    let now = now_micros(&env);
+    let control = db.control_store().scoped(scope);
+
+    // An approval a human APPROVED, narrowed. Narrowed on purpose: consuming a row that
+    // carries `approved_details` is what the details-only-when-approved CHECK refused, so a
+    // test that approved without narrowing would pass against the unrelaxed constraint.
+    let id = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, id, TEST_DIGEST, now)
+        .await
+        .expect("raise");
+    control
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .decide(
+            &env,
+            &id,
+            true,
+            Some(&requested_details()),
+            "operator",
+            now + 1,
+        )
+        .await
+        .expect("approve it, narrowed");
+
+    // THE DATA PLANE spends it. This is the write the token door performs.
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .agent_vault_approvals()
+        .consume(&env, &id, now + 2)
+        .await
+        .expect("the data plane may spend an approval a human granted");
+
+    let spent = db
+        .store()
+        .scoped(scope)
+        .agent_vault_approvals()
+        .get(&id)
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(spent.state, "consumed");
+    assert!(
+        !spent.authorizes(now + 3),
+        "and a spent approval authorizes nothing further"
+    );
+    assert!(
+        spent.approved_details.is_some(),
+        "while keeping what the human agreed to, which is the evidence"
+    );
+
+    // Spending it AGAIN finds nothing to spend, so two concurrent exchanges cannot both issue.
+    assert!(
+        matches!(
+            db.store()
+                .scoped(scope)
+                .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                .agent_vault_approvals()
+                .consume(&env, &id, now + 4)
+                .await,
+            Err(ironauth_store::StoreError::NotFound)
+        ),
+        "an approval is spent once"
+    );
+
+    // AND THE TRANSITION IT MAY NOT MAKE. Without this the grant above would have handed the
+    // data plane back exactly what 0179 withheld: the ability to approve its own action.
+    let pending = AgentVaultApprovalId::generate(&env, &scope);
+    raise(&db, &env, &control, &agent, pending, OTHER_DIGEST, now)
+        .await
+        .expect("raise a second, undecided");
+
+    let mut tx = db.app_pool().begin().await.expect("app transaction");
+    for (key, value) in [
+        ("ironauth.tenant_id", scope.tenant().to_string()),
+        ("ironauth.environment_id", scope.environment().to_string()),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(key)
+            .bind(&value)
+            .execute(&mut *tx)
+            .await
+            .expect("bind the scope");
+    }
+    let self_approved = sqlx::query(
+        "UPDATE agent_vault_approvals \
+         SET state = 'approved', decided_at = now(), decided_by = 'self' WHERE id = $1",
+    )
+    .bind(pending.to_string())
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        self_approved.is_err() || self_approved.expect("checked").rows_affected() == 0,
+        "the data plane must not be able to approve a pending action"
+    );
+
+    // Nor un-spend one, which would make a single decision reusable.
+    let reopened = sqlx::query("UPDATE agent_vault_approvals SET state = 'approved' WHERE id = $1")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await;
+    assert!(
+        reopened.is_err() || reopened.expect("checked").rows_affected() == 0,
+        "the data plane must not be able to re-open a spent approval"
+    );
+}

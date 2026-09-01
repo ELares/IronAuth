@@ -4475,8 +4475,7 @@ impl ActingMds3BlobCacheRepo<'_> {
                        fetched_at = EXCLUDED.fetched_at, verified_at = EXCLUDED.verified_at, \
                        updated_at = EXCLUDED.updated_at \
                      WHERE EXCLUDED.blob_no > mds3_blob_cache.blob_no \
-                     RETURNING id, requires_approval, \
-                               refresh_token_endpoint IS NOT NULL AS can_refresh",
+                     RETURNING id",
         )
         .bind(candidate_id.to_string())
         .bind(scope.tenant().to_string())
@@ -73179,7 +73178,7 @@ impl ActingAgentVaultRepo<'_> {
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                              $13, $14, $15, \
                              CASE WHEN $15::bytea IS NULL THEN NULL ELSE $7 END, \
-                             $16, \
+                             COALESCE($16, false), \
                              $10, \
                              CASE WHEN $11::bigint IS NULL THEN NULL ELSE \
                                  TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
@@ -73197,14 +73196,15 @@ impl ActingAgentVaultRepo<'_> {
                          refresh_client_secret_sealed = EXCLUDED.refresh_client_secret_sealed, \
                          refresh_client_secret_dek_version = \
                              EXCLUDED.refresh_client_secret_dek_version, \
-                         requires_approval = COALESCE(EXCLUDED.requires_approval, \
+                         requires_approval = COALESCE($16, \
                              agent_vault_connections.requires_approval), \
                          granted_scopes = EXCLUDED.granted_scopes, \
                          expires_at = EXCLUDED.expires_at, \
                          state = 'active', \
                          last_error = NULL, \
                          updated_at = EXCLUDED.updated_at \
-                     RETURNING id",
+                     RETURNING id, requires_approval, \
+                               refresh_token_endpoint IS NOT NULL AS can_refresh",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -73516,19 +73516,17 @@ impl VaultApproval {
     /// different kind of guarantee anyway. Reading the deadline HERE makes the timeout a
     /// property of every read rather than of a job having run, which is what
     /// "denial or timeout issues no tokens" needs.
+    ///
+    /// `consumed` is excluded by the state test, and that is the point of spending the row:
+    /// the human decided one ACTION, so it authorizes one exchange, and a second one asks
+    /// again. `expired` and `denied` are excluded for the reasons their names give.
+    ///
+    /// THE EXCHANGE CALLS THIS. It used to inline `live && state == "approved"`, which left
+    /// this function with no production caller while four tests read as the proof of the
+    /// rule -- and left the inline copy as the one that had to learn about `consumed`.
     #[must_use]
     pub fn authorizes(&self, now_micros: i64) -> bool {
         self.state == "approved" && now_micros < self.expires_at_unix_micros
-    }
-
-    /// Whether the credential this approval authorized has already been handed over.
-    ///
-    /// A spent approval is not a denial and not a timeout: the human said yes and the yes was
-    /// used. Asking again raises a new request, so a second exchange of the same action costs
-    /// a second human decision, which is what deciding an ACTION means.
-    #[must_use]
-    pub fn is_consumed(&self) -> bool {
-        self.state == "consumed"
     }
 }
 
@@ -73847,6 +73845,77 @@ impl ActingAgentVaultApprovalRepo<'_> {
         .await
     }
 
+    /// Retire a pending request whose deadline has passed.
+    ///
+    /// A timeout is the ABSENCE of a decision, and until this existed nothing anywhere wrote
+    /// `expired`, so a request nobody answered stayed `pending` for ever and kept occupying
+    /// the one pending slot its action has. The agent's next attempt inserted, lost to the
+    /// unique index, re-read the winner and was handed a `202 approval_pending` whose deadline
+    /// was already in the past -- permanently, for that action. No approver could clear it
+    /// either: the queue excludes expired rows and `decide` refuses them.
+    ///
+    /// LAZY rather than swept. A reaper would be a second thing that has to have run for the
+    /// answer to be right, and the point of reading the deadline on every read was to avoid
+    /// exactly that. This runs on the path that would otherwise deadlock, which is the only
+    /// path that needs it.
+    ///
+    /// `decided_by` stays NULL and that is the honest record: nobody decided this, the clock
+    /// did. `decided_at` is set because `agent_vault_approvals_decision_paired` requires it of
+    /// every non-pending state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope or the row was not a timed-out
+    /// pending one; [`StoreError::Database`] on a persistence failure.
+    pub async fn retire_timed_out(
+        &self,
+        env: &Env,
+        id: &AgentVaultApprovalId,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentVaultApprovalRetired,
+                target: &id,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE agent_vault_approvals \
+                     SET state = 'expired', \
+                         decided_at = TIMESTAMPTZ 'epoch' \
+                             + ($4::text || ' microseconds')::interval \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND state = 'pending' \
+                       AND expires_at <= TIMESTAMPTZ 'epoch' \
+                           + ($4::text || ' microseconds')::interval",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(now_micros)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                if affected == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some("outcome=expired"),
+        )
+        .await
+    }
+
     /// Mark an approval SPENT, at the moment the credential it authorized is handed over.
     ///
     /// Scoped to a row that is still `approved`, so a double issue cannot spend it twice and a
@@ -73875,7 +73944,7 @@ impl ActingAgentVaultApprovalRepo<'_> {
                 scope,
                 acting: &self.acting,
                 env,
-                action: Action::AgentVaultApprovalDecided,
+                action: Action::AgentVaultApprovalConsumed,
                 target: &id,
             },
             async move |tx| {

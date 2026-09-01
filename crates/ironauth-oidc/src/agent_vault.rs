@@ -128,9 +128,14 @@ async fn refresh_connection(
             "this connection was read without its refresh configuration",
         ));
     };
+    // NOT a `Provider` failure, which marks: nothing about the connection has gone wrong, it
+    // simply cannot renew, and the row must not be taken out of service for it. It is also not
+    // reachable in practice -- the paired CHECK ties the endpoint's presence to the whole
+    // configuration and `can_refresh` gates the caller -- but a connection whose provider
+    // returned no refresh token is a legitimate shape, so the arm answers rather than panics.
     let Some(refresh_token) = connection.refresh_token.as_deref() else {
-        return Err(RefreshFailure::Provider(
-            "this connection stored no refresh token",
+        return Err(RefreshFailure::Deployment(
+            "this connection stored no refresh token and must be re-established",
         ));
     };
     let Some(federation) = state.federation() else {
@@ -181,7 +186,19 @@ async fn refresh_connection(
             .fetch(http)
             .await
             .map_err(|_| RefreshFailure::Transport("the provider could not be reached"))?;
-        if !response.status().is_success() {
+        // WHICH non-2xx says the credential is bad. A 4xx does: the provider read the refresh
+        // token and would not spend it. A 429 or a 5xx does not -- it is rate limiting, a
+        // gateway mid-deploy, a maintenance window -- and marking on those was the same defect
+        // the transport split fixed, arriving one layer higher: one 502 took the connection
+        // out of service permanently, because a failed connection is refused before the
+        // refresh block ever runs again.
+        let status = response.status();
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(RefreshFailure::Transport(
+                "the provider could not complete the refresh",
+            ));
+        }
+        if !status.is_success() {
             return Err(RefreshFailure::Provider("the provider refused the refresh"));
         }
         let body: serde_json::Value = serde_json::from_slice(response.body())
@@ -200,7 +217,18 @@ async fn refresh_connection(
             .get("refresh_token")
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| refresh_token.to_owned(), ToOwned::to_owned);
-        let expires_in = body.get("expires_in").and_then(serde_json::Value::as_i64);
+        // A provider that does not say gets an ASSUMED lifetime, not an unbounded one. `NULL`
+        // in this column means "does not expire", so writing the absence straight through made
+        // a refreshed connection immortal in IronAuth's eyes: it would never refresh again, and
+        // the agent would learn the credential was dead from the provider rather than from
+        // here, which is exactly the failure the refresh exists to prevent. Refreshing sooner
+        // than necessary costs one request; believing a dead token is live costs the agent its
+        // whole reach.
+        let expires_in = body
+            .get("expires_in")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|seconds| *seconds > 0)
+            .or(Some(ASSUMED_DOWNSTREAM_LIFETIME_SECS));
         Ok(RefreshedCredential {
             access_token,
             refresh_token,
@@ -284,6 +312,15 @@ struct RefreshedCredential {
     expires_in_secs: Option<i64>,
 }
 
+/// What a refreshed credential's lifetime is assumed to be when the provider does not say.
+///
+/// `expires_in` is OPTIONAL in RFC 6749 section 5.1, and a stored `NULL` expiry means "does not
+/// expire", so passing the absence through made a refreshed connection immortal here and
+/// therefore never refreshed again. An hour is the common default across the providers this
+/// targets, and being wrong in this direction costs one extra refresh rather than an agent's
+/// reach.
+const ASSUMED_DOWNSTREAM_LIFETIME_SECS: i64 = 3_600;
+
 /// The digest that binds an approval to ONE action.
 ///
 /// Over the CANONICAL serialization: `serde_json::Value` keeps object keys ordered, so two
@@ -320,6 +357,13 @@ const APPROVAL_WINDOW_MICROS: i64 = 60 * 60 * 1_000_000;
 /// Eight, because it is far above what a working agent does (an agent waiting on eight
 /// unanswered human decisions is already stuck) and far below what hides a request in a
 /// bounded queue.
+///
+/// The check is a COUNT then an insert, so N concurrent exchanges can each read seven and each
+/// insert: the true ceiling is eight plus the concurrency of one burst, not eight exactly. That
+/// is deliberate rather than overlooked. Closing it needs a lock or a serialisable retry on
+/// every raise, and the property being defended is "one agent cannot fill a human's queue",
+/// which a handful of extra rows does not threaten. It is stated here because a reader who
+/// took the constant as exact would be wrong.
 const MAX_PENDING_APPROVALS_PER_AGENT: i64 = 8;
 
 /// The `202` a sensitive exchange gets while it waits on a human.
@@ -754,11 +798,16 @@ pub async fn exchange(
         // (which excludes expired rows) and undecidable (the decision refuses them too), while
         // an approved row past its deadline answered 403 forever. Both were permanent, and
         // neither raised a replacement.
+        // THROUGH the store's own predicate, not a copy of it. This used to inline
+        // `live && state == "approved"`, which left `VaultApproval::authorizes` with no
+        // production caller at all: four store tests read as the proof of the approval rule
+        // while pinning a function nothing ran, and the two copies could drift -- `authorizes`
+        // predates `consumed` and the inline copy was the one that had to learn about it.
         let live = existing
             .as_ref()
             .is_some_and(|approval| now_micros < approval.expires_at_unix_micros);
         match existing {
-            Some(approval) if live && approval.state == "approved" => {
+            Some(approval) if approval.authorizes(now_micros) => {
                 // What the approver AGREED to, which may be narrower than what was asked. An
                 // approval that stated nothing means "exactly what was asked", so the request
                 // is echoed rather than the field being dropped: a caller that received no
@@ -790,10 +839,29 @@ pub async fn exchange(
                     "this action was not approved",
                 );
             }
-            // Nothing, nothing still live, or an approval already SPENT: raise one. This is
-            // the arm that makes a timeout recoverable rather than terminal, and the one that
-            // makes a second exchange of the same action cost a second human decision.
-            _ => {
+            // Nothing, or nothing still live: raise one. This is the arm that makes a timeout
+            // recoverable rather than terminal.
+            other => {
+                // A timed-out PENDING row must leave `pending` first. The uniqueness index is
+                // partial on that state and carries no deadline term, so a request nobody
+                // answered keeps its action's one slot for ever: the next attempt inserts,
+                // loses to the index, re-reads the winner, and is handed a `202` whose
+                // deadline is already in the past -- permanently. The approver cannot clear it
+                // either, because the queue excludes expired rows and `decide` refuses them.
+                //
+                // Retiring is lazy, done by the request that would otherwise deadlock, so no
+                // sweeper has to have run for the answer to be right. A failure to retire is
+                // not fatal here: the raise below then loses to the index and the caller is
+                // told to keep waiting, which is what it would have been told anyway.
+                if let Some(stale) = other
+                    .filter(|approval| approval.state == "pending")
+                    .map(|approval| approval.id)
+                {
+                    let _ = acting_for_approval(&state, scope, request_actor, correlation)
+                        .agent_vault_approvals()
+                        .retire_timed_out(state.env(), &stale, now_micros)
+                        .await;
+                }
                 // HOW MANY an agent may have waiting at once. Without this the queue is a
                 // surface one agent can fill: the unique index is per action, the action is
                 // agent-chosen JSON, so N distinct detail objects are N pending rows. Raise
@@ -1024,6 +1092,14 @@ pub async fn exchange(
     // hand over the credential and hope -- is the same over-grant this closes, and the update
     // is scoped to a still-approved row, so the only way it fails is a concurrent exchange
     // having spent it first, which is exactly when nothing further should be issued.
+    //
+    // BEFORE the exchange row, and the ordering has a losing case either way: if the audit
+    // write then fails, the approval is spent and nothing was issued, so the agent needs a
+    // second human decision for an exchange that never happened. That is the safe direction.
+    // The other order spends nothing when the audit fails and therefore issues nothing either,
+    // but it opens the window where the credential leaves against an approval still marked
+    // approved -- an over-grant, which is what this whole gate exists to prevent. A wasted
+    // human decision is recoverable; an unrecorded, unspent hand-over is not.
     if let Some(approval_id) = approved_for.as_deref() {
         let parsed = ironauth_store::AgentVaultApprovalId::parse_in_scope(approval_id, &scope);
         let spent = match parsed {

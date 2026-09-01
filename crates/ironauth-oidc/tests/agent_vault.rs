@@ -798,6 +798,10 @@ enum Downstream {
     KeepsTheRefreshToken,
     /// `invalid_grant`: the stored refresh token is spent or revoked.
     Refuses,
+    /// A rate limit or a gateway fault: says nothing about the credential.
+    Faults(u16),
+    /// A fresh access token with NO `expires_in`, which RFC 6749 section 5.1 permits.
+    NamesNoLifetime,
 }
 
 /// The DNS name the provider's certificate is minted for, and the host the stored token
@@ -848,6 +852,8 @@ async fn provider(behaviour: Downstream) -> Provider {
             r#"{"access_token":"fresh-access-token","expires_in":3600}"#,
         ),
         Downstream::Refuses => (400, r#"{"error":"invalid_grant"}"#),
+        Downstream::Faults(code) => (code, r#"{"error":"temporarily_unavailable"}"#),
+        Downstream::NamesNoLifetime => (200, r#"{"access_token":"fresh-access-token"}"#),
     };
     let target = TestTlsTarget::start(&identity, status, body.as_bytes().to_vec()).await;
     Provider { identity, target }
@@ -888,6 +894,34 @@ fn with_provider_at(harness: &mut Harness, provider: &Provider, addr: std::net::
         std::time::Duration::from_secs(30),
     ));
     harness.install_federation(runtime);
+}
+
+/// Push an approval's deadline into the past, as the OWNER.
+///
+/// Directly, because there is no route that does it: a timeout is the absence of a decision,
+/// so the only way to reach the timed-out state is for time to pass.
+async fn expire_approval(harness: &Harness, approval: &str) {
+    sqlx::query(
+        "UPDATE agent_vault_approvals /* query-audit-allow: owner test write */ \
+         SET expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(approval)
+    .execute(harness.db().owner_pool())
+    .await
+    .expect("age the approval");
+}
+
+/// The organization an agent belongs to, for the queue read.
+async fn organization_of(harness: &Harness, agent: &AgentPrincipalId) -> OrganizationId {
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .agents()
+        .get(agent)
+        .await
+        .expect("read the agent")
+        .organization_id
 }
 
 /// Age a connection's stored credential to an hour ago, as the OWNER.
@@ -1359,5 +1393,174 @@ async fn a_provider_that_cannot_be_reached_leaves_the_connection_usable() {
     assert_eq!(
         still.state, "active",
         "a network blip must not take the connection out of service"
+    );
+}
+
+#[tokio::test]
+async fn an_action_nobody_answered_can_be_asked_again_after_it_times_out() {
+    // THE DEADLOCK. The pending-uniqueness index is partial on `state = 'pending'` and carries
+    // no deadline term, and nothing anywhere wrote `expired`, so a request nobody answered kept
+    // its action's one slot for ever: the next attempt inserted, lost to the index, re-read the
+    // winner and was handed a 202 whose deadline was already in the past -- permanently. The
+    // approver could not clear it either, because the queue excludes expired rows and `decide`
+    // refuses them.
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    let (_client, bearer, agent) = sensitive_fixture(&harness).await;
+
+    let (_, raised) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    let first = json(&raised)["approval_id"]
+        .as_str()
+        .expect("an approval")
+        .to_owned();
+
+    // Nobody answers, and its deadline passes.
+    expire_approval(&harness, &first).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), ACTION_SMALL).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second = json(&body)["approval_id"]
+        .as_str()
+        .expect("an approval")
+        .to_owned();
+    assert_ne!(
+        second, first,
+        "a timed-out request must be replaceable, not permanent"
+    );
+    assert!(
+        json(&body)["expires_at"].as_i64().expect("a deadline")
+            > i64::try_from(
+                harness
+                    .state()
+                    .now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_secs()
+            )
+            .expect("fits"),
+        "and the new request's deadline is in the FUTURE: the defect handed back a live-looking \
+         202 whose deadline had already passed: {body}"
+    );
+
+    // The retired row left `pending`, so it no longer occupies the action's slot, and the new
+    // one is what an approver sees.
+    let queue = harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .agent_vault_approvals()
+        .pending_for_organization(
+            &organization_of(&harness, &agent).await,
+            now_micros(&harness),
+            50,
+        )
+        .await
+        .expect("list the queue")
+        .into_iter()
+        .map(|approval| approval.id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queue,
+        vec![second],
+        "the approver sees the live request and not the retired one"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_that_rate_limits_or_faults_leaves_the_connection_usable() {
+    // 429 and 5xx are not statements about the credential. Marking on them was the same defect
+    // the transport split fixed, one layer higher: a single 502 during a provider's deploy took
+    // the connection permanently out of service, because a failed connection is refused before
+    // the refresh block ever runs again.
+    for status in [429_u16, 502] {
+        let downstream = provider(Downstream::Faults(status)).await;
+        let mut harness = Harness::start_store_backed().await;
+        harness.enable_agent_vault();
+        with_provider(&mut harness, &downstream);
+
+        let (client, secret) = machine_client(&harness).await;
+        let agent = seed_agent(&harness, &client, &["google"]).await;
+        seed_expired_refreshable(&harness, &agent, "google").await;
+        let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+
+        let (answer, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+        assert_eq!(
+            answer,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a {status} is a retry, not a repair: {body}"
+        );
+        let still = harness
+            .db()
+            .control_store()
+            .scoped(harness.scope())
+            .agent_vault()
+            .connection(&agent, "google")
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(
+            still.state, "active",
+            "a {status} must not take the connection out of service"
+        );
+    }
+
+    // THE CONTROL, so the two above are not passing because nothing ever marks: a 400 is the
+    // provider reading the refresh token and refusing to spend it, and that DOES mark.
+    let refusing = provider(Downstream::Refuses).await;
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    with_provider(&mut harness, &refusing);
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_expired_refreshable(&harness, &agent, "google").await;
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+    let (answer, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(answer, StatusCode::CONFLICT, "a 400 marks: {body}");
+    assert_eq!(
+        harness
+            .db()
+            .control_store()
+            .scoped(harness.scope())
+            .agent_vault()
+            .connection(&agent, "google")
+            .await
+            .expect("read")
+            .expect("exists")
+            .state,
+        "failed"
+    );
+}
+
+#[tokio::test]
+async fn a_refreshed_credential_whose_provider_named_no_lifetime_still_expires() {
+    // `NULL` expiry means "does not expire", so writing the provider's silence straight through
+    // made a refreshed connection immortal HERE and therefore never refreshed again: the agent
+    // would learn the credential was dead from the provider rather than from IronAuth, which is
+    // the failure the refresh exists to prevent.
+    let downstream = provider(Downstream::NamesNoLifetime).await;
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_agent_vault();
+    with_provider(&mut harness, &downstream);
+
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_expired_refreshable(&harness, &agent, "google").await;
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
+
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let stored = harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .agent_vault()
+        .connection(&agent, "google")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(
+        stored.expires_at_unix_micros.is_some(),
+        "a credential with no stated lifetime still gets one, or it is never refreshed again"
     );
 }

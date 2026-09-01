@@ -172,7 +172,93 @@ ALTER TABLE agent_vault_approvals
     ADD CONSTRAINT agent_vault_approvals_state_closed
     CHECK (state IN ('pending', 'approved', 'denied', 'expired', 'consumed'));
 
+-- And a CONSUMED row keeps what was agreed.
+--
+-- `agent_vault_approvals_details_only_when_approved` reads
+-- `approved_details IS NULL OR state = 'approved'`, so moving an approval that carried a
+-- NARROWED set to `consumed` violated it: every spend of exactly the approvals worth narrowing
+-- would have failed. Nulling the set on the way through would have satisfied the constraint
+-- and lost the record of what the human agreed to, at the moment it was acted on, which is the
+-- one moment it matters.
+--
+-- Widening the constraint is safe because `approved_details` is not what grants anything:
+-- `VaultApproval::authorizes` requires `state = 'approved'`, so a consumed row authorizes
+-- nothing no matter what it carries. What it carries is evidence.
+ALTER TABLE agent_vault_approvals
+    DROP CONSTRAINT agent_vault_approvals_details_only_when_approved;
+
+ALTER TABLE agent_vault_approvals
+    ADD CONSTRAINT agent_vault_approvals_details_only_when_approved
+    CHECK ((approved_details IS NULL) OR (state IN ('approved', 'consumed')));
+
 COMMENT ON COLUMN agent_vault_approvals.state IS
     'pending | approved | denied | expired | consumed. A closed set: an unknown state would be '
     'a request nothing can decide and nothing can time out. `consumed` means the credential it '
     'authorized has been handed over, so it authorizes nothing further (issue #132).';
+
+-- The data plane may SPEND an approval, and may do nothing else to one.
+--
+-- Spending happens at the token door, which runs on `ironauth_app`, and 0179 granted that role
+-- SELECT and INSERT only: withholding UPDATE was how "an agent may raise an approval and may
+-- not decide one" was enforced. So the consume introduced above would have been refused by
+-- Postgres at the last step of every approved sensitive exchange -- after the human had said
+-- yes -- and the exchange would report the approval as already used. Found by review before it
+-- ran anywhere.
+--
+-- The grant alone would give back exactly what 0179 withheld: with plain UPDATE the data plane
+-- could move a pending row to approved and hand itself the credential. So the grant is paired
+-- with a RESTRICTIVE policy that admits ONE transition, approved -> consumed, and the same
+-- reasoning as 0179 applies to the word RESTRICTIVE: `agent_vault_approvals_scope` has no FOR
+-- clause and no TO clause, so a permissive narrowing would be OR'd with a check the offending
+-- update already satisfies and would constrain nothing.
+--
+-- USING is what the row must look like BEFORE (approved, and its decision already recorded),
+-- WITH CHECK what it must look like AFTER (consumed, with the decision and the approved set
+-- unchanged). Together they mean the data plane cannot approve, cannot deny, cannot un-consume,
+-- cannot re-open, and cannot alter what was agreed on the way through.
+-- ONE policy for both transitions, not two.
+--
+-- Restrictive policies for the same command are AND'd with each other, so a second
+-- `AS RESTRICTIVE ... FOR UPDATE` naming the other transition would mean every update had to
+-- satisfy BOTH, and the two are mutually exclusive: the pair would admit nothing at all. This
+-- is the same combination rule that makes a restrictive policy the right tool in the first
+-- place, applied in the direction that bites.
+--
+-- It may RETIRE a request nobody answered.
+--
+-- Without this, a timed-out request blocks its own action for ever. The pending-uniqueness
+-- index is partial on `state = 'pending'` and carries no deadline term, so a row nobody decided
+-- stays pending and keeps occupying the slot: the agent's next attempt inserts, loses to the
+-- index, re-reads the winner, and is handed a `202 approval_pending` whose deadline is already
+-- in the past -- for ever. The approver cannot clear it either, because the queue excludes
+-- expired rows and `decide` refuses them. Nothing anywhere writes `'expired'`, so nothing
+-- reaps it.
+--
+-- Retiring is not a decision and grants nothing: `expired` authorizes nothing, carries no
+-- approved details, and only ever replaces a row whose own deadline has already passed. The
+-- policy says so in the USING clause, so the data plane cannot retire a LIVE pending row to
+-- dodge a wait it does not like.
+--
+-- `decided_at` has to be set, because `agent_vault_approvals_decision_paired` requires it of
+-- every non-pending state. `decided_by` stays NULL, and that is the honest record: nobody
+-- decided this, the clock did.
+CREATE POLICY agent_vault_approvals_app_retires_only ON agent_vault_approvals
+    AS RESTRICTIVE
+    FOR UPDATE TO ironauth_app
+    USING (
+        tenant_id = current_setting('ironauth.tenant_id', true)
+        AND environment_id = current_setting('ironauth.environment_id', true)
+        AND (
+            (state = 'approved' AND decided_at IS NOT NULL)
+            OR (state = 'pending' AND expires_at <= now())
+        )
+    )
+    WITH CHECK (
+        tenant_id = current_setting('ironauth.tenant_id', true)
+        AND environment_id = current_setting('ironauth.environment_id', true)
+        AND state IN ('consumed', 'expired')
+        AND decided_at IS NOT NULL
+        AND (approved_details IS NULL OR state = 'consumed')
+    );
+
+GRANT UPDATE ON agent_vault_approvals TO ironauth_app;
