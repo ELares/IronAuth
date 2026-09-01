@@ -3769,6 +3769,11 @@ export interface components {
         /** @description One registered agent principal (issue #130). */
         AgentView: {
             /**
+             * @description The OAuth client this agent obtains tokens through, or absent before it is bound.
+             *     An unbound agent is listable, auditable, and revocable; it simply has no door.
+             */
+            client_id?: string | null;
+            /**
              * Format: int64
              * @description Creation time, milliseconds since the Unix epoch.
              */
@@ -3784,8 +3789,8 @@ export interface components {
             /** @description The lifecycle state: `active`, `suspended` or `revoked`. */
             state: string;
             /**
-             * @description The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;
-             *     the issuance check and its audited denial are the follow-up half of #130.
+             * @description The DECLARED tool scopes: the complete set this agent may ask for. ENFORCED at every
+             *     token door; a request naming anything outside it is refused and the denial audited.
              */
             tool_scopes: string[];
         };
@@ -7109,6 +7114,14 @@ export interface components {
         };
         /** @description The body to register an agent inside an organization (issue #130). */
         RegisterAgentRequest: {
+            /**
+             * @description The OAuth client this agent obtains tokens through. OPTIONAL, and settable ONLY here:
+             *     there is no rebind route yet, so an agent registered without one stays unable to
+             *     obtain tokens until it is registered again with a client. It remains listable,
+             *     auditable, and revocable throughout, which is why the column is nullable rather than
+             *     required, but "register now and bind later" is not a workflow this surface offers.
+             */
+            client_id?: string | null;
             /** @description The operator-facing label. */
             display_name: string;
             /**

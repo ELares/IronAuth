@@ -27272,6 +27272,13 @@
           "created_at_unix_ms"
         ],
         "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client this agent obtains tokens through, or absent before it is bound.\nAn unbound agent is listable, auditable, and revocable; it simply has no door."
+          },
           "created_at_unix_ms": {
             "type": "integer",
             "format": "int64",
@@ -27302,7 +27309,7 @@
             "items": {
               "type": "string"
             },
-            "description": "The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;\nthe issuance check and its audited denial are the follow-up half of #130."
+            "description": "The DECLARED tool scopes: the complete set this agent may ask for. ENFORCED at every\ntoken door; a request naming anything outside it is refused and the denial audited."
           }
         }
       },
@@ -32785,6 +32792,13 @@
           "tool_scopes"
         ],
         "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client this agent obtains tokens through. OPTIONAL, and settable ONLY here:\nthere is no rebind route yet, so an agent registered without one stays unable to\nobtain tokens until it is registered again with a client. It remains listable,\nauditable, and revocable throughout, which is why the column is nullable rather than\nrequired, but \"register now and bind later\" is not a workflow this surface offers."
+          },
           "display_name": {
             "type": "string",
             "description": "The operator-facing label."

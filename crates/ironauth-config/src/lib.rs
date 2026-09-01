@@ -6925,6 +6925,12 @@ pub const RESERVED_ENRICHMENT_CLAIMS: &[&str] = &[
     "iss",
     "jti",
     "nbf",
+    // The agent principal claims (issue #130). An external enrichment service that could
+    // supply these could forge the attribution the agent model exists to provide, so they
+    // are reserved here for the same reason they are protected at the mint.
+    "agent_id",
+    "agent_linked_user",
+    "agent_organization",
     "nonce",
     "org_id",
     "permissions",

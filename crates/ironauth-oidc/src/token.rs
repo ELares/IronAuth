@@ -1123,6 +1123,178 @@ struct CodeExchangeSession {
 /// [`TokenError::ServerError`] on a store fault. Never degraded to "no roles": on a mint path
 /// that is a silent authorization downgrade indistinguishable from an identity that
 /// legitimately holds none.
+/// Truncate caller-controlled text before it becomes an audit detail.
+///
+/// The scope on a token request is whatever the caller sent. Writing it verbatim lets one
+/// request put an unbounded string into `audit_log.detail`, which is a row every export and
+/// every SIEM ingest then carries. The bound is generous enough that a real scope set is
+/// never cut and small enough that a hostile one cannot be a payload.
+fn bounded(detail: &str) -> String {
+    const MAX: usize = 512;
+    if detail.len() <= MAX {
+        return detail.to_owned();
+    }
+    let mut cut = MAX;
+    while !detail.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &detail[..cut])
+}
+
+/// What an agent-bound issuance carries into the token (issue #130).
+///
+/// Owned rather than borrowed because it outlives the store read that produced it and is
+/// threaded through a mint request built later.
+#[allow(
+    clippy::struct_field_names,
+    reason = "every field IS an identifier, and the suffix is what says so. \
+    Dropping it would leave `agent`, `linked_user` and `organization` naming ids \
+    that read as the objects themselves"
+)]
+pub(crate) struct GatedAgent {
+    /// The `agp_` principal.
+    pub agent_id: String,
+    /// The user it acts for.
+    pub linked_user_id: String,
+    /// The organization it acts inside.
+    pub organization_id: String,
+    /// The client it came through, so the issuance row is attributed to the same actor the
+    /// denial row is.
+    pub client_id: String,
+}
+
+/// Record that an agent obtained a token, auditing `agent_token.issue` (issue #130).
+///
+/// Separate from [`gate_agent_issuance`] and called AFTER the mint, deliberately: the gate
+/// runs before anything is signed so a refusal costs nothing, while this row must describe a
+/// token that actually exists. Writing it at gate time would claim an issuance that a later
+/// failure never produced.
+///
+/// Best effort. A token has already been minted and handed to a caller by the time this runs,
+/// so failing the request here would deny a credential the client now holds, which is worse
+/// than a missing row. The failure is logged instead.
+pub(crate) async fn record_agent_issuance(
+    state: &OidcState,
+    scope: Scope,
+    agent: &GatedAgent,
+    granted_scope: Option<&str>,
+) {
+    let Ok(agent_id) = ironauth_store::AgentPrincipalId::parse_in_scope(&agent.agent_id, &scope)
+    else {
+        return;
+    };
+    // The SAME actor the denial row carries. A fresh random service id per issuance would
+    // make every issue row attributable to a different actor that never existed, so an
+    // investigator could not join an agent's issuances to its denials, and the two halves of
+    // one incident would look like unrelated events.
+    let Ok(client_id) = ClientId::parse_in_scope(&agent.client_id, &scope) else {
+        return;
+    };
+    let actor = crate::util::client_service_actor(StoredClientId::Registered(&client_id));
+    if let Err(error) = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .agents()
+        .record_token_issued(
+            state.env(),
+            &agent_id,
+            &bounded(granted_scope.unwrap_or("")),
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            "an agent token was issued but its audit row could not be written; the token is \
+             live and the trail is missing it"
+        );
+    }
+}
+
+/// The AGENT GATE (issue #130): resolve the agent behind this client and decide whether it
+/// may have what it asked for.
+///
+/// Called by EVERY door that mints under a machine principal -- `client_credentials`,
+/// `jwt_bearer`, and token exchange -- because a gate on one door is not a gate. The three
+/// build the same mint request, so a check placed in only one of them would leave the other
+/// two as an unenforced path to the same token, which is how a control ends up bypassable
+/// while its tests pass.
+///
+/// Returns `None` for a client that is not an agent, which is the ordinary machine identity
+/// and the common case.
+///
+/// # Errors
+///
+/// [`TokenError::UnauthorizedClient`] for an agent that is suspended or revoked;
+/// [`TokenError::InvalidScope`] for a request naming a tool the agent never declared. Both
+/// write an `agent_token.deny` row naming the reason BEFORE returning, because a refusal
+/// nobody can find afterwards cannot be shown to have happened.
+pub(crate) async fn gate_agent_issuance(
+    state: &OidcState,
+    scope: Scope,
+    client_id_str: &str,
+    requested_scope: Option<&str>,
+) -> Result<Option<GatedAgent>, TokenError> {
+    // A client id that does not parse in this scope cannot be bound to an agent of it, so
+    // there is nothing to gate. Not an error: the caller has its own answer for a bad client.
+    let Ok(client_id) = ClientId::parse_in_scope(client_id_str, &scope) else {
+        return Ok(None);
+    };
+    let Some(agent) = state
+        .store()
+        .scoped(scope)
+        .agents()
+        .for_client(client_id_str)
+        .await
+        .map_err(map_store_error)?
+    else {
+        return Ok(None);
+    };
+    let acting = state.store().scoped(scope).acting(
+        crate::util::client_service_actor(StoredClientId::Registered(&client_id)),
+        CorrelationId::generate(state.env()),
+    );
+    // SUSPENDED AND REVOKED BOTH REFUSE. The difference between them is for the operator
+    // reading the list, not for this door: a suspended agent obtains no tokens while staying
+    // listable, and revocation blocks new issuance outright.
+    if !agent.can_obtain_tokens() {
+        acting
+            .agents()
+            .record_token_denied(state.env(), &agent.id, &agent.state)
+            .await
+            .map_err(map_store_error)?;
+        return Err(TokenError::UnauthorizedClient);
+    }
+    // PER-TOOL ENFORCEMENT. Every requested scope token must be one the agent DECLARED. An
+    // absent scope asks for nothing, which is not a widening, so it passes and the token
+    // carries no tool at all -- the correct answer to asking for none.
+    let requested: Vec<&str> = requested_scope
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    let undeclared = agent.undeclared_tools(&requested);
+    if !undeclared.is_empty() {
+        // Names EVERY undeclared tool rather than the first, so a caller fixes the request
+        // once instead of being sent round the loop one tool at a time.
+        acting
+            .agents()
+            .record_token_denied(
+                state.env(),
+                &agent.id,
+                &format!("undeclared:{}", undeclared.join(",")),
+            )
+            .await
+            .map_err(map_store_error)?;
+        return Err(TokenError::InvalidScope);
+    }
+    Ok(Some(GatedAgent {
+        agent_id: agent.id.to_string(),
+        linked_user_id: agent.linked_user_id.to_string(),
+        organization_id: agent.organization_id.to_string(),
+        client_id: client_id_str.to_owned(),
+    }))
+}
+
 pub(crate) async fn resolve_workload_org_and_roles(
     state: &OidcState,
     scope: Scope,

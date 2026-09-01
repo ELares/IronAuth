@@ -71900,15 +71900,53 @@ pub struct AgentRecord {
     pub display_name: String,
     /// The lifecycle state: `active`, `suspended` or `revoked`.
     pub state: String,
-    /// The DECLARED tool scopes: what this agent may ask for.
+    /// The DECLARED tool scopes: the complete set this agent may ask for.
     ///
-    /// Recorded here and NOT yet enforced. The issuance path that checks a request against
-    /// this set, and audits the denial, is the follow-up half of #130. Documented as
-    /// declaration rather than as a control so nothing downstream reads a guarantee that
-    /// does not exist yet.
+    /// ENFORCED at issuance: a request naming anything outside this set is refused and the
+    /// denial audited. The set lives here rather than in a token so an agent cannot widen
+    /// its own reach by asking for more.
     pub tool_scopes: Vec<String>,
+    /// The OAuth client this agent obtains tokens through, or [`None`] before it is bound.
+    ///
+    /// An unbound agent is registered, listable, auditable, and revocable; it simply has no
+    /// door to come through, which is the same answer a suspended one gets.
+    pub client_id: Option<String>,
     /// Creation time in microseconds since the Unix epoch (the pagination key).
     pub created_at_unix_micros: i64,
+}
+
+impl AgentRecord {
+    /// Whether this agent may currently obtain tokens.
+    ///
+    /// ACTIVE ONLY. Suspended and revoked both answer `false`, and the distinction between
+    /// them is for the operator reading the list, not for the issuance path: a caller that
+    /// had to remember which states were live would eventually forget one.
+    #[must_use]
+    pub fn can_obtain_tokens(&self) -> bool {
+        self.state == "active"
+    }
+
+    /// Whether `tool` is inside this agent's declared set.
+    ///
+    /// EXACT membership, never a prefix or a wildcard. A set that matched by prefix would
+    /// make `files` grant `files.delete`, which is the widening the set exists to prevent.
+    #[must_use]
+    pub fn declares_tool(&self, tool: &str) -> bool {
+        self.tool_scopes.iter().any(|declared| declared == tool)
+    }
+
+    /// Every requested tool that this agent did NOT declare, in request order.
+    ///
+    /// Returns the whole set rather than the first, so the audited denial can name
+    /// everything the caller must fix instead of sending them round the loop once per tool.
+    #[must_use]
+    pub fn undeclared_tools<'a>(&self, requested: &[&'a str]) -> Vec<&'a str> {
+        requested
+            .iter()
+            .filter(|tool| !self.declares_tool(tool))
+            .copied()
+            .collect()
+    }
 }
 
 /// Everything registering an agent needs.
@@ -71924,6 +71962,8 @@ pub struct NewAgent<'a> {
     pub display_name: &'a str,
     /// The declared tool scopes.
     pub tool_scopes: &'a [String],
+    /// The OAuth client this agent obtains tokens through, or [`None`] to leave it unbound.
+    pub client_id: Option<&'a str>,
 }
 
 /// The READ side of the agent principal surface, for this scope.
@@ -71957,7 +71997,7 @@ impl AgentRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, \
+            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, client_id, \
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
              FROM agents WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
@@ -71970,7 +72010,58 @@ impl AgentRepo<'_> {
         agent_from_row(&row, &self.scope)
     }
 
-    /// The agents acting inside one organization, oldest first.
+    /// The agent bound to `client_id` in this scope, if any.
+    ///
+    /// The ISSUANCE lookup: the token endpoint knows which client is at the door and needs to
+    /// know whether that door belongs to an agent. [`None`] for a client that is an ordinary
+    /// machine identity, which is the common case and must stay a cheap answer rather than an
+    /// error.
+    ///
+    /// A LIVE agent wins over a revoked one on the same client, and a revoked one is still
+    /// returned when it is all there is. Both halves matter and they pull in opposite
+    /// directions:
+    ///
+    /// - The partial unique index excludes revoked rows so a client can be bound to a
+    ///   REPLACEMENT after its agent is revoked. Without that, responding to a compromise
+    ///   would permanently retire the client too.
+    /// - But a revoked agent must still RESOLVE, because the gate refuses what it resolves.
+    ///   Filtering revoked rows out here instead would make a revoked agent's client answer
+    ///   "not an agent" and receive an ORDINARY machine token: revocation would hand the
+    ///   client MORE reach than it had, which is the opposite of what revoking means. Caught
+    ///   by `a_revoked_agent_obtains_no_token` when this query filtered rather than ordered.
+    ///
+    /// The index guarantees at most one live row, so the ordering is a tie-break among
+    /// revoked rows only, and it is deterministic.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. A client with no agent is
+    /// `Ok(None)`, never an error.
+    pub async fn for_client(&self, client_id: &str) -> Result<Option<AgentRecord>, StoreError> {
+        // Through `begin_scoped`, like every other read of this table. The row-level policy
+        // reads the scope from session settings, so a query on the bare pool matches NOTHING
+        // and the gate silently answers "not an agent" for every agent there is.
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, client_id, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
+             FROM agents \
+             WHERE client_id = $1 AND tenant_id = $2 AND environment_id = $3 \
+             ORDER BY (state <> 'revoked') DESC, created_at DESC \
+             LIMIT 1",
+        )
+        .bind(client_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| agent_from_row(row, &self.scope))
+            .transpose()
+    }
+
+    /// List the agents acting inside one organization, oldest first.
     ///
     /// EVERY state, including suspended and revoked. Criterion 1 asks an org admin to list all
     /// agents acting for their organization and criterion 5 asks that a suspended one remain
@@ -71992,7 +72083,7 @@ impl AgentRepo<'_> {
         let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, \
+            "SELECT id, organization_id, linked_user_id, display_name, state, tool_scopes, client_id, \
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros \
              FROM agents \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
@@ -72050,6 +72141,7 @@ impl ActingAgentRepo<'_> {
         let linked_user_id = *spec.linked_user_id;
         let display_name = spec.display_name.to_owned();
         let tool_scopes = spec.tool_scopes.to_vec();
+        let client_id = spec.client_id.map(str::to_owned);
         let mut record = None;
         write_audited(
             AuditedWrite {
@@ -72064,12 +72156,12 @@ impl ActingAgentRepo<'_> {
                 let row = sqlx::query(
                     "INSERT INTO agents \
                      (id, tenant_id, environment_id, organization_id, linked_user_id, \
-                      display_name, state, tool_scopes, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, \
+                      display_name, state, tool_scopes, client_id, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $9, \
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
                              TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval) \
                      RETURNING id, organization_id, linked_user_id, display_name, state, \
-                               tool_scopes, \
+                               tool_scopes, client_id, \
                                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint \
                                    AS created_at_micros",
                 )
@@ -72081,6 +72173,7 @@ impl ActingAgentRepo<'_> {
                 .bind(&display_name)
                 .bind(&tool_scopes)
                 .bind(created_at_micros)
+                .bind(client_id.as_deref())
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(|error| match &error {
@@ -72100,6 +72193,85 @@ impl ActingAgentRepo<'_> {
         )
         .await?;
         record.ok_or(StoreError::NotFound)
+    }
+
+    /// Record that a token was ISSUED to this agent, auditing `agent_token.issue`.
+    ///
+    /// Audit-only: the issuance itself is the token endpoint's, and nothing here mutates a
+    /// row. It exists so the trail can answer "what did this agent obtain, and when" without
+    /// reading every machine token ever minted, which is the question the issue's attribution
+    /// criterion is really asking. `granted` is the scope actually minted, not the requested
+    /// one, so a narrowed grant is visible as what it was.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent id is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn record_token_issued(
+        &self,
+        env: &Env,
+        id: &AgentPrincipalId,
+        granted: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let detail = format!("granted={granted}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentTokenIssue,
+                target: id,
+            },
+            async |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// Record that a token request from this agent was REFUSED, auditing `agent_token.deny`.
+    ///
+    /// This row is what makes the declared tool set a CONTROL rather than a record: a refusal
+    /// nobody can find afterwards cannot be shown to have happened. `reason` names why, so
+    /// the trail distinguishes an agent that was turned off from one that reached past what
+    /// it declared, which are different incidents with different responses.
+    ///
+    /// Written in its OWN transaction, deliberately: the request it describes is being
+    /// refused, so there is no successful write to ride along with, and a denial that rolled
+    /// back with the refusal would be exactly the missing evidence this exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent id is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn record_token_denied(
+        &self,
+        env: &Env,
+        id: &AgentPrincipalId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let detail = format!("reason={reason}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope: self.scope,
+                acting: &self.acting,
+                env,
+                action: Action::AgentTokenDeny,
+                target: id,
+            },
+            async |_tx| Ok(()),
+            false,
+            Some(&detail),
+        )
+        .await
     }
 
     /// Set an agent's lifecycle state, auditing `agent.state.set`.
@@ -72157,7 +72329,7 @@ impl ActingAgentRepo<'_> {
                      WHERE id = $3 AND tenant_id = $4 AND environment_id = $5 \
                        AND (state <> 'revoked' OR $1 = 'revoked') \
                      RETURNING id, organization_id, linked_user_id, display_name, state, \
-                               tool_scopes, \
+                               tool_scopes, client_id, \
                                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint \
                                    AS created_at_micros",
                 )
@@ -72195,6 +72367,7 @@ fn agent_from_row(row: &sqlx::postgres::PgRow, scope: &Scope) -> Result<AgentRec
         display_name: row.get("display_name"),
         state: row.get("state"),
         tool_scopes: row.get("tool_scopes"),
+        client_id: row.get("client_id"),
         created_at_unix_micros: row.get("created_at_micros"),
     })
 }

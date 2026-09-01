@@ -837,6 +837,11 @@ async fn mint_and_persist(
     // Resolved BEFORE the mint, through the one shared helper (issue #126).
     let (workload_org, workload_roles) =
         crate::token::resolve_workload_org_and_roles(state, scope, principal).await?;
+    // And the agent gate (issue #130), through ITS one shared helper. This door mints the
+    // same request `client_credentials` does, so leaving it ungated would be an unenforced
+    // path to the very token the declared tool set exists to bound.
+    let agent =
+        crate::token::gate_agent_issuance(state, scope, client_id_str, requested_scope).await?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,
@@ -855,6 +860,11 @@ async fn mint_and_persist(
             custom_claims: &no_custom,
             // A mapped federated identity acts for itself: no `act` chain (issue #125).
             act: None,
+            // The GATE applies here; the identity claims do NOT. This door mints for the FEDERATED
+            // principal the assertion mapped to, not for the agent, so stamping `agent_id` on it
+            // would assert that the token belongs to an agent when its own `sub` says otherwise.
+            // The agent is the actor at this door, and RFC 8693 `act` is where an actor belongs.
+            agent: None,
         },
         &target,
     )
@@ -920,6 +930,10 @@ async fn mint_and_persist(
         .await
         .map_err(map_store_error)?;
 
+    // The issuance row, AFTER the token exists (issue #130).
+    if let Some(agent) = &agent {
+        crate::token::record_agent_issuance(state, scope, agent, requested_scope).await;
+    }
     Ok(jwt_bearer_response(&minted, expires_in, requested_scope))
 }
 

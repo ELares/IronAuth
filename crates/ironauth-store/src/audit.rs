@@ -775,6 +775,24 @@ pub enum Action {
     /// controls an incident responder reaches for, and finding them under a generic update
     /// means reading every update to know whether one happened.
     AgentStateSet,
+    /// A token was ISSUED to an agent principal (issue #130).
+    ///
+    /// The wire name is `agent_token.*`, NOT `agent.token.*`. The OCSF class is chosen from
+    /// the domain before the first dot, so `agent.` would file a token issuance into the
+    /// ACCOUNT CHANGE stream beside registration and revocation. Issuance belongs with the
+    /// other token domains in AUTHENTICATION, and issue #130 asks for stream separation by
+    /// name, so the domain has to be the one that separates them.
+    ///
+    /// Its own action rather than a dimension of the generic machine issuance, because the
+    /// question an investigator brings to an agent is "what did it do, and for whom" and the
+    /// answer has to be findable without reading every token ever minted.
+    AgentTokenIssue,
+    /// A token request from an agent was REFUSED (issue #130).
+    ///
+    /// The audited denial the declared tool set exists to produce. A control that refuses
+    /// silently cannot be shown to have refused, so this is the row that makes the set
+    /// enforceable rather than merely recorded, and its detail names the reason.
+    AgentTokenDeny,
     /// A short-lived access token was issued under the JWT bearer assertion grant
     /// (issue #26): a validated external assertion was exchanged for a token under
     /// the mapped identity. No refresh token accompanies it (RFC 7521 4.1).
@@ -1657,6 +1675,8 @@ impl Action {
             }
             Action::AgentRegister => "agent.register",
             Action::AgentStateSet => "agent.state.set",
+            Action::AgentTokenIssue => "agent_token.issue",
+            Action::AgentTokenDeny => "agent_token.deny",
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
             Action::TokenExchangeIssue => "token_exchange.issue",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",

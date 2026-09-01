@@ -1910,8 +1910,8 @@ mod tests {
         // RESERVED_ENRICHMENT_CLAIMS is covered by the mint fold could be removed with
         // nothing red.
         assert_eq!(
-            checked, 51,
-            "the three lists are 26 + 5 + 20; a link was dropped from the chain"
+            checked, 57,
+            "the three lists are 29 + 5 + 23; a link was dropped from the chain"
         );
     }
 
@@ -1949,6 +1949,9 @@ mod tests {
         "permissions_status",
         "act",
         "authorization_details",
+        "agent_id",
+        "agent_linked_user",
+        "agent_organization",
     ];
 
     /// Every name in that list is refused when a hook returns it.
