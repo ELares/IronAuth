@@ -104,7 +104,8 @@ an agent's linked user is validated to exist in the environment, not to be a mem
 organization the agent belongs to. An operator who links a user from organization B to an
 agent in organization A puts B's user id on A's stream. Requiring membership at registration
 is the fix, and it is a behaviour change to an already-shipped route rather than something
-this attribution should paper over. The
-organization and the subject are carried on the audit row and rendered into the shipped OCSF
+this attribution should paper over.
+
+The organization and the subject are carried on the audit row and rendered into the shipped OCSF
 event as typed `resources` entries; they are deliberately **not** part of what the audit chain
 seals, because adding a field to that would invalidate every entry already sealed.

@@ -2652,8 +2652,9 @@ impl IsolationProbe for UpstreamTokenReadProbe {
 /// for, so a cross-boundary read is a map of another tenant's automation.
 ///
 /// The id is scoped, so for every foreign id the refusal happens at the PARSE and the query is
-/// never reached. That is the house pattern (thirteen sibling probes do the same) and it is
-/// worth being exact about: this probe measures that a foreign scoped id cannot be turned into
+/// never reached. That is the house pattern -- most probes in this file refuse a foreign id at
+/// the parse, by this idiom or through the repository's `parse_id` -- and it is worth being
+/// exact about: this probe measures that a foreign scoped id cannot be turned into
 /// an addressable one, not that the query behind it filters. The `for_client` probe beside it
 /// is the one that reaches a query.
 struct AgentReadProbe;
@@ -2704,16 +2705,24 @@ impl IsolationProbe for AgentForClientProbe {
     ) -> BoxProbeFuture<'a> {
         Box::pin(async move {
             match store.scoped(caller).agents().for_client(foreign_id).await {
-                // `Err` counts as a LEAK, not a denial, and collapsing the two hid the very
-                // thing this probe exists to find. `for_client` decodes its row through
-                // `agent_from_row`, which parses the id, organization and linked user IN THE
-                // CALLER's SCOPE and maps any mismatch to `NotFound`. So an error means a row
-                // CAME BACK and failed to decode -- which is the leak signature: the tenant
-                // predicate and row-level security both let a foreign row through, and only
-                // the id decode stopped it. Written as one arm with `Ok(Some(_))` because it
-                // is the same finding, not because the bodies happen to match.
-                Ok(Some(_)) | Err(_) => ProbeOutcome::Leaked,
                 Ok(None) => ProbeOutcome::Denied,
+                // `NotFound` counts as a LEAK, and collapsing every `Err` into `Denied` hid
+                // the very thing this probe exists to find. `for_client` decodes its row
+                // through `agent_from_row`, which parses the id, organization and linked user
+                // IN THE CALLER's SCOPE and maps any mismatch to `NotFound`. So that error
+                // means a row CAME BACK and failed to decode: the tenant predicate and
+                // row-level security both let a foreign row through and only the id decode
+                // stopped it.
+                // `Ok(Some(_))` and `NotFound` are ONE arm because they are one finding: a
+                // foreign row that decoded, and a foreign row that did not. Both mean the
+                // tenant predicate and row-level security let it through.
+                Ok(Some(_)) | Err(crate::error::StoreError::NotFound) => ProbeOutcome::Leaked,
+                // Any OTHER error is a database fault, not an isolation result. `ProbeOutcome`
+                // has no third variant, so reporting it either way would be a lie: as a leak
+                // it makes the harness cry wolf on a dropped connection, and as a denial it
+                // reports a probe that never ran as a probe that passed. It panics instead,
+                // which is what an unrunnable security check deserves.
+                Err(other) => panic!("the agents.for_client probe could not run: {other}"),
             }
         })
     }
