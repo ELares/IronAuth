@@ -10,10 +10,16 @@ repository.workspace = true
 
 [dependencies]
 # The public plane router this crate builds is merged onto the server's public
-# plane via Server::mount_public, mirroring how ironauth-oidc mounts. Only the
-# routing core is needed (no json/query/form extractors), so the workspace axum
-# stays at default-features = false.
-axum = { workspace = true }
+# plane via Server::mount_public, mirroring how ironauth-oidc mounts. No body
+# extractors are needed (no json/query/form), so the workspace axum stays at
+# default-features = false.
+#
+# `tokio` gates `ConnectInfo<SocketAddr>`, which the management proxy has to NAME
+# in order to carry it across the extension clear the path-parameter fix requires
+# (issue #90). The server installs it on both planes, and dropping it would leave a
+# future IP-keyed rate limiter attributing every console request to nothing. The
+# same feature is enabled in ironauth-oidc for the same extractor.
+axum = { workspace = true, features = ["tokio"] }
 # The same-origin management proxy (issue #90, PR 2) forwards a /admin/api/* request
 # to the in-process management Router by driving it as a tower Service (oneshot). Only
 # the ServiceExt utility surface is needed; no network client is pulled, so the proxy

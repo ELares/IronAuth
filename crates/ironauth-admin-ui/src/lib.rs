@@ -54,10 +54,12 @@
 //!   identifiers, and the browser only ever holds the short lived `at+jwt` it
 //!   obtains through the Authorization Code + PKCE login.
 
+use std::net::SocketAddr;
+
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{Extensions, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use rust_embed::RustEmbed;
@@ -153,10 +155,17 @@ pub fn router(management: Option<Router>, config: RuntimeConfig) -> Router {
     Router::new()
         .route(MOUNT_PREFIX, get(serve_index))
         .route("/admin/", get(serve_index))
-        // ONE handler owns every deeper path so the static-asset serving and the
-        // `/admin/api/*` proxy never register overlapping catch-all routes (which
-        // axum would reject). The handler dispatches on the raw path. `any` so the
-        // proxy can carry every method; the serving branch answers only GET.
+        // ONE handler owns every deeper path and dispatches on the raw path. `any` so
+        // the proxy can carry every method; the serving branch answers only GET.
+        //
+        // This is NOT because axum would reject the alternative. Measured against the
+        // pinned axum 0.8 and matchit 0.8, both a sibling catch-all at
+        // `/admin/api/{*rest}` and a `nest_service("/admin/api", management)` construct
+        // fine, and the nested form needs no extension clearing in the proxy at all
+        // because axum scopes the inner match itself. That is the better shape and is
+        // worth moving to; it is deliberately not bundled into a fix whose whole point
+        // is to stop the console 500ing, because it changes how every `/admin` path is
+        // matched and the single-handler dispatch is what the surrounding tests pin.
         .route("/admin/{*path}", any(serve_or_proxy))
         .with_state(UiState { management, config })
 }
@@ -235,6 +244,44 @@ async fn proxy_to_management(management: Router, request: Request) -> Response {
         return (StatusCode::BAD_REQUEST, Body::empty()).into_response();
     };
     parts.uri = uri;
+    // Drop the OUTER router's state before re-dispatching. `/admin/{*path}` captured
+    // one path parameter and left it in the extensions; axum ADDS the inner router's
+    // captures to that set rather than replacing it, so a management handler taking
+    // `Path<(tenant, environment)>` is handed THREE parameters and fails the arity
+    // check with "Wrong number of path arguments". Every parameterised management
+    // route is unreachable through the console until this is cleared, which is nearly
+    // the whole console: the five parameterless routes (`/v1/tenants`, `/v1/me`,
+    // `/v1/operators`, `/v1/resource-types`, and
+    // `/v1/interop/signing-recommendations`) are all that survive, out of 190.
+    //
+    // CLEARING IS THE ONLY TOOL AVAILABLE. `UrlParams` is `pub(crate)` in axum, so
+    // `extensions.remove::<UrlParams>()`, which is what this actually wants, cannot be
+    // written outside that crate. The clear is therefore wholesale, and what a request
+    // legitimately carries has to be lifted across it BY NAME.
+    //
+    // `ConnectInfo<SocketAddr>` is the one such value today. The server installs it on
+    // both planes (`into_make_service_with_connect_info`), and it is the non-forgeable
+    // peer address that the DCR and device endpoints already key their rate limits on.
+    // Nothing behind THIS proxy reads it yet, which is exactly why dropping it would be
+    // invisible: the management plane's rate limiter is still a placeholder, and the
+    // real per-tenant one is later ops work. If that limiter keys on client IP the way
+    // the two public-plane ones do, a silently dropped `ConnectInfo` would collapse all
+    // console traffic into one bucket with no error and no failing test. Carried, not
+    // dropped, and `both_directions_of_the_extension_clear_are_pinned` fails if either
+    // half of that changes.
+    //
+    // Everything ELSE the outer stack inserts is deliberately dropped, and was
+    // enumerated rather than assumed: `ClientContext` (`ironauth-server`'s
+    // observability layer) is unreachable, since `ironauth-admin` does not depend on
+    // that crate; `MatchedPath` is read on the OUTER request before dispatch and the
+    // inner router inserts its own. The management router's own extractors read
+    // HEADERS (the bearer principal, the declared entry path), and headers are
+    // forwarded verbatim.
+    let connect_info = parts.extensions.get::<ConnectInfo<SocketAddr>>().copied();
+    parts.extensions = Extensions::new();
+    if let Some(connect_info) = connect_info {
+        parts.extensions.insert(connect_info);
+    }
     // A Router's Service error is Infallible, so this await never yields an Err.
     management
         .oneshot(Request::from_parts(parts, body))
@@ -395,9 +442,12 @@ fn content_type(path: &str) -> HeaderValue {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::{CONTENT_SECURITY_POLICY, RuntimeConfig, escape_attribute, router};
     use axum::Router;
     use axum::body::Body;
+    use axum::extract::{ConnectInfo, Path};
     use axum::http::{Request, StatusCode, header};
     use axum::routing::any;
     use http_body_util::BodyExt;
@@ -521,6 +571,112 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&body),
             "POST /v1/tenants?limit=2 auth=Bearer at.jwt.token"
+        );
+    }
+
+    /// A stand-in management router whose route takes TWO path parameters.
+    ///
+    /// Two is not the dominant management shape (a count of the `Path<..>` extractors
+    /// in `ironauth-admin` gives 136 three-parameter routes to 90 two-parameter ones
+    /// and 9 single-parameter ones), but the leak adds exactly one capture at EVERY
+    /// arity, so any parameterised route reproduces it. `echo_management` above
+    /// matches a catch-all and extracts nothing, so it cannot observe a leaked
+    /// parameter; that is precisely why the proxy's arity failure never showed up in
+    /// these tests.
+    fn parameterised_management() -> Router {
+        Router::new().route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}",
+            any(
+                |Path((tenant, environment)): Path<(String, String)>| async move {
+                    format!("tenant={tenant} environment={environment}")
+                },
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn proxies_a_management_route_that_carries_path_parameters() {
+        // The outer `/admin/{*path}` match leaves its own capture in the request
+        // extensions, and axum ADDS the inner router's captures to that set rather
+        // than replacing it. Forwarding the parts unchanged therefore hands a handler
+        // taking two parameters a set of three, and axum answers 500 with "Wrong
+        // number of path arguments". Only the five PARAMETERLESS management routes
+        // survived that, out of 190: every nested view
+        // (environments, users, clients, organizations) was a 500, while the same
+        // routes answered 200 on the management plane directly.
+        let router = router(Some(parameterised_management()), RuntimeConfig::default());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/tenants/ten_a/environments/env_b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_string(response).await,
+            "tenant=ten_a environment=env_b",
+            "each parameter reaches the handler with its own value"
+        );
+    }
+
+    /// A management router that reports what SURVIVED the proxy's extension clear.
+    ///
+    /// `ConnectInfo` is taken as a REQUIRED extractor rather than an `Option`, so its
+    /// loss is a 500 rather than a string the assertion has to notice. That is the
+    /// stronger shape here: the test cannot pass by reading "absent" and comparing it
+    /// to an expectation somebody later relaxed.
+    fn extension_reporting_management() -> Router {
+        Router::new().route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}",
+            any(
+                |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                 Path((tenant, environment)): Path<(String, String)>| async move {
+                    format!("tenant={tenant} environment={environment} peer={peer}")
+                },
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn both_directions_of_the_extension_clear_are_pinned() {
+        // The review found that the test above cannot observe this, and it is right:
+        // it asserts the PATH PARAMETERS, which are the one thing the clear removes
+        // and the inner router then re-supplies. Everything else the outer stack put
+        // in extensions could be silently dropped with the suite still green.
+        //
+        // So this pins BOTH halves at once, on one request:
+        //
+        //   - `ConnectInfo<SocketAddr>` SURVIVES. The server installs it on both
+        //     planes, and the public plane's DCR and device endpoints already key
+        //     rate limits on it. Nothing behind this proxy reads it yet, which is why
+        //     its loss would be invisible until a per-tenant limiter lands and
+        //     attributes every console request to nothing.
+        //   - `UrlParams` does NOT survive. The handler takes exactly two parameters
+        //     and gets exactly its two, so the outer `/admin/{*path}` capture was
+        //     removed rather than added to.
+        //
+        // A blanket `parts.extensions = Extensions::new()` fails the first assertion;
+        // forwarding the parts unchanged fails the second.
+        let router = router(
+            Some(extension_reporting_management()),
+            RuntimeConfig::default(),
+        );
+        let peer: SocketAddr = "203.0.113.7:52814".parse().expect("a socket address");
+        let mut request = Request::builder()
+            .uri("/admin/api/v1/tenants/ten_a/environments/env_b")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+
+        let response = router.oneshot(request).await.expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_string(response).await,
+            "tenant=ten_a environment=env_b peer=203.0.113.7:52814",
+            "the peer address is carried across the clear and the outer capture is not"
         );
     }
 
