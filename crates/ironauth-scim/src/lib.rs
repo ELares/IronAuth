@@ -17,8 +17,10 @@
 #![forbid(unsafe_code)]
 
 mod filter;
+mod path;
 mod resource;
 
+pub use path::{PathError, ResourceRef, ResourceType, parse_resource_path};
 pub use resource::ScimUser;
 
 pub use filter::{
