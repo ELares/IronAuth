@@ -5249,7 +5249,10 @@ fn serve_capture_sink(listener: std::net::TcpListener, sink: std::sync::Arc<capt
 /// # Errors
 ///
 /// A message naming the step that failed.
-fn write_dev_config(database_url: &str, bind: &str) -> Result<std::path::PathBuf, String> {
+fn write_dev_config(
+    database_url: &str,
+    bind: &str,
+) -> Result<(std::path::PathBuf, String), String> {
     let management_bind = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .map(|addr| format!("127.0.0.1:{}", addr.port()))
@@ -5264,7 +5267,9 @@ fn write_dev_config(database_url: &str, bind: &str) -> Result<std::path::PathBuf
         dev::dev_config_toml(database_url, bind, &management_bind),
     )
     .map_err(|error| format!("cannot write {}: {error}", config_path.display()))?;
-    Ok(config_path)
+    // The bind travels back out with the path: it is chosen HERE, ephemerally, so no caller
+    // can derive it, and the banner has to print it for the management API to be reachable.
+    Ok((config_path, management_bind))
 }
 
 /// Print what a developer needs to drive a flow against the emulator.
@@ -5273,7 +5278,7 @@ fn write_dev_config(database_url: &str, bind: &str) -> Result<std::path::PathBuf
 /// URL is SCOPED, so it cannot be constructed without the seeded tenant and environment, and
 /// an emulator that seeds a client without saying which one has made the developer read the
 /// database to use it.
-fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
+fn print_dev_scope(bind: &str, management_bind: &str, scope: &dev::SeededScope) {
     println!(
         "ironauth dev: issuer http://{bind}/t/{}/e/{}",
         scope.tenant, scope.environment
@@ -5291,6 +5296,12 @@ fn print_dev_scope(bind: &str, scope: &dev::SeededScope) {
         scope.machine_identity, scope.workload_client
     );
     println!("ironauth dev: operator token {}", dev::DEV_OPERATOR_TOKEN);
+    // The management plane, whose port is EPHEMERAL and therefore underivable. Printing the
+    // operator token while withholding the address it authenticates to left the management
+    // API unreachable against the emulator: the credential was published and the door was
+    // not. Anything that drives a management route (registering a client through DCR needs
+    // an initial access token minted there) has to read this line.
+    println!("ironauth dev: management http://{management_bind}");
     println!(
         "ironauth dev: user {} / {}",
         dev::DEV_USER_IDENTIFIER,
@@ -5499,6 +5510,16 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
     };
 
+    // BEFORE the banner, not merely before the boot: the management bind is chosen HERE,
+    // ephemerally, and the banner has to print it.
+    let (config_path, management_bind) = match write_dev_config(&database_url, &bind) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("ironauth dev: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // BEFORE seeding: the connector seeded below points at this provider's address, which
     // does not exist until it binds.
     let upstream_issuer = start_fake_upstream(seed);
@@ -5507,21 +5528,13 @@ fn dev_command(args: &mut impl Iterator<Item = String>) -> ExitCode {
     // already managed by whatever manages it.
     if let Some(bin_dir) = &dev_bin_dir {
         match prepare_dev_schema(bin_dir, &database_url, seed, upstream_issuer.as_deref()) {
-            Ok(scope) => print_dev_scope(&bind, &scope),
+            Ok(scope) => print_dev_scope(&bind, &management_bind, &scope),
             Err(error) => {
                 eprintln!("ironauth dev: {error}");
                 return ExitCode::FAILURE;
             }
         }
     }
-
-    let config_path = match write_dev_config(&database_url, &bind) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("ironauth dev: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     // Deterministic secrets, installed BEFORE the server boots. The guard above has already
     // refused a non-loopback bind, which is what makes this safe to do at all.

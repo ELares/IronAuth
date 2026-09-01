@@ -1,0 +1,20 @@
+{
+  "name": "@ironauth/mcp-sample",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A sample MCP resource server secured by IronAuth (issue #129): the thing the MCP authorization conformance bundle is measured against.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "tsc && node --test \"dist/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1315,6 +1315,31 @@ jobs:
       - name: a real login, end to end
         run: scripts/bff-live.sh
 
+  mcp-conformance:
+    # Issue #129: the MCP authorization conformance bundle, against a REAL IronAuth.
+    #
+    # Every item the published page claims is measured here, and the page is GENERATED from
+    # what this writes. A conformance page written by hand drifts from the tests that support
+    # it, and the drift is invisible because both halves look fine on their own; this lane is
+    # what makes that impossible, because the page is regenerated and diffed on every run.
+    #
+    # Two sample resource servers run, not one. A token minted for the first verifies against
+    # the second on every check except the audience: same issuer, same signing key, same type,
+    # unexpired. Only the audience separates them, so a bundle with one server could not tell
+    # whether that check existed at all.
+    name: mcp conformance (real emulator, two resource servers, generated page)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: the checklist, end to end, and the page it generates
+        run: scripts/mcp-conformance.sh
+
   mobile-verify:
     # Issue #116 criterion 7: the AppAuth mobile path.
     #
