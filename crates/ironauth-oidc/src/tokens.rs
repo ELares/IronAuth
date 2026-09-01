@@ -972,6 +972,15 @@ pub struct ClientCredentialsMintRequest<'a> {
     /// issuer-set only: `roles` is in [`PROTECTED_ACCESS_TOKEN_CLAIMS`] so a custom claim
     /// cannot self-assert one.
     pub roles: Option<&'a BTreeSet<String>>,
+    /// The AGENT principal this token is issued to, or `None` for an ordinary machine
+    /// identity (issue #130).
+    ///
+    /// Carried as claims so a downstream system and the audit trail can attribute the action
+    /// to the agent AND to the human and organization it acts for. `sub` stays the stable
+    /// service-account principal, because that is what the client resolves to on every
+    /// issuance and changing it would break every existing consumer; the agent identity sits
+    /// beside it rather than replacing it.
+    pub agent: Option<AgentTokenIdentity<'a>>,
     /// The custom claims to embed: the per-client static ones, AFTER this client's
     /// declarative mapping and its deployed hook have shaped them (issue #113 criterion 1).
     ///
@@ -1049,6 +1058,21 @@ pub struct ClientCredentialsMintRequest<'a> {
 /// name never shadows one). `roles` is in that set, so a stored
 /// `custom_token_claims` of `{"roles":["admin"]}` is DROPPED, not emitted. Claims
 /// hygiene otherwise mirrors the code flow: no PII.
+/// The agent principal identity a token carries (issue #130).
+///
+/// All three together or none: an agent id with no linked user is exactly the
+/// unattributable principal this issue exists to prevent, and a consumer that had to handle
+/// a partial set would have to decide what a missing half meant.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentTokenIdentity<'a> {
+    /// The `agt_` principal this token was issued to.
+    pub agent_id: &'a str,
+    /// The user the agent acts FOR.
+    pub linked_user_id: &'a str,
+    /// The organization the agent acts INSIDE.
+    pub organization_id: &'a str,
+}
+
 pub(crate) fn build_client_credentials_access_token_claims(
     request: &ClientCredentialsMintRequest<'_>,
     iat: i64,
@@ -1078,6 +1102,17 @@ pub(crate) fn build_client_credentials_access_token_claims(
         }
         if let Some(roles) = request.roles {
             object.insert("roles".to_owned(), json!(roles));
+        }
+        // The agent principal (issue #130), BESIDE the machine identity rather than instead
+        // of it. In the same block and for the same reason: before the custom-claims merge,
+        // so a client-configured claim of the same name cannot displace it.
+        if let Some(agent) = &request.agent {
+            object.insert("agent_id".to_owned(), json!(agent.agent_id));
+            object.insert("agent_linked_user".to_owned(), json!(agent.linked_user_id));
+            object.insert(
+                "agent_organization".to_owned(),
+                json!(agent.organization_id),
+            );
         }
     }
     // Merge the per-client static custom claims. A custom claim can NEVER override a
@@ -2799,6 +2834,7 @@ mod tests {
                 hostile.clone(),
             ),
             act: None,
+            agent: None,
         };
         let cc_claims = build_client_credentials_access_token_claims(
             &cc_request,
@@ -2871,6 +2907,7 @@ mod tests {
             oauth_scope: Some("api"),
             custom_claims: empty_mapped_extra(),
             act: None,
+            agent: None,
         };
         let claims = build_client_credentials_access_token_claims(
             &request,
@@ -3058,6 +3095,7 @@ mod tests {
             oauth_scope: None,
             custom_claims: custom,
             act: None,
+            agent: None,
         }
     }
 

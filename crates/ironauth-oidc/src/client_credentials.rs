@@ -201,6 +201,12 @@ async fn mint_and_persist(
     let subject = principal.to_string();
     let client_id_str = client_id.to_string();
 
+    // THE AGENT GATE (issue #130), through the ONE shared helper every door that mints a
+    // machine token calls. Resolved BEFORE anything is minted, so a refusal costs no signing
+    // and leaves no token behind. `None` for an ordinary machine identity.
+    let agent =
+        crate::token::gate_agent_issuance(state, scope, &client_id_str, requested_scope).await?;
+
     // The per-client STATIC custom claims (fail-open: a malformed stored config
     // under-claims rather than failing issuance; the protected-claim guard is in the
     // mint regardless).
@@ -265,6 +271,11 @@ async fn mint_and_persist(
             custom_claims: &custom_claims,
             // A machine token acts for itself: never an `act` chain (issue #125).
             act: None,
+            agent: agent.as_ref().map(|a| tokens::AgentTokenIdentity {
+                agent_id: a.agent_id.as_str(),
+                linked_user_id: a.linked_user_id.as_str(),
+                organization_id: a.organization_id.as_str(),
+            }),
         },
         &target,
     )
@@ -317,6 +328,10 @@ async fn mint_and_persist(
         .await
         .map_err(map_store_error)?;
 
+    // The issuance row, AFTER the token exists (issue #130).
+    if let Some(agent) = &agent {
+        crate::token::record_agent_issuance(state, scope, agent, requested_scope).await;
+    }
     Ok(client_credentials_response(
         &minted,
         expires_in,

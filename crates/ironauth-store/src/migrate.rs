@@ -1412,6 +1412,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0176_agents.sql"),
         },
+        Migration {
+            version: 177,
+            name: "agent_client_binding",
+            // EXPAND: a nullable column plus its indexes and key. The previous binary never
+            // selects it, so a rollback leaves every agent simply unbound.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0177_agent_client_binding.sql"),
+        },
     ]
 }
 

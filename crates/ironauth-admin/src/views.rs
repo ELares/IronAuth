@@ -504,9 +504,13 @@ pub struct AgentView {
     pub display_name: String,
     /// The lifecycle state: `active`, `suspended` or `revoked`.
     pub state: String,
-    /// The DECLARED tool scopes: what this agent may ask for. Recorded, not yet enforced;
-    /// the issuance check and its audited denial are the follow-up half of #130.
+    /// The DECLARED tool scopes: the complete set this agent may ask for. ENFORCED at every
+    /// token door; a request naming anything outside it is refused and the denial audited.
     pub tool_scopes: Vec<String>,
+    /// The OAuth client this agent obtains tokens through, or absent before it is bound.
+    /// An unbound agent is listable, auditable, and revocable; it simply has no door.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// Creation time, milliseconds since the Unix epoch.
     pub created_at_unix_ms: i64,
 }
@@ -522,6 +526,7 @@ impl AgentView {
             display_name: record.display_name,
             state: record.state,
             tool_scopes: record.tool_scopes,
+            client_id: record.client_id,
             created_at_unix_ms: ms(record.created_at_unix_micros),
         }
     }
@@ -540,6 +545,11 @@ pub struct AgentList {
 /// The body to register an agent inside an organization (issue #130).
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RegisterAgentRequest {
+    /// The OAuth client this agent obtains tokens through. OPTIONAL: an agent is useful
+    /// before it has one, and binding a client is what turns it into something that can hold
+    /// a credential, which is a decision worth making explicitly.
+    #[serde(default)]
+    pub client_id: Option<String>,
     /// The user this agent acts FOR (a `usr_` id in this environment).
     #[schema(example = "usr_...")]
     pub linked_user_id: String,

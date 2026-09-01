@@ -23,7 +23,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
-    AgentPrincipalId, CorrelationId, NewAgent, ResolvedIdempotencyWrite, StoreError, UserId,
+    AgentPrincipalId, ClientId, CorrelationId, NewAgent, ResolvedIdempotencyWrite, StoreError,
+    UserId,
 };
 
 use crate::auth::{ManagementPermission, Principal};
@@ -128,6 +129,18 @@ pub async fn register_agent(
         ));
     }
 
+    // A named client must EXIST in this scope. The schema's composite key would refuse a
+    // cross-scope or absent one anyway, but that arrives as a 23503 inside the write, which
+    // renders as a 500; the caller deserves the uniform not-found instead.
+    let client_id = match &request.client_id {
+        Some(raw) => {
+            let parsed = ClientId::parse_in_scope(raw, &scope).map_err(|_| ApiError::NotFound)?;
+            state.store().scoped(scope).clients().get(&parsed).await?;
+            Some(parsed.to_string())
+        }
+        None => None,
+    };
+
     // AN EMPTY TOOL SET IS REFUSED, rather than registered as an agent that can do nothing.
     // The schema permits it (an empty array is a valid bound), so the refusal lives here: an
     // agent with no declared tools is almost always a caller that forgot the field, and
@@ -184,6 +197,7 @@ pub async fn register_agent(
                 organization_id: &org_id,
                 linked_user_id: &linked_user_id,
                 display_name: &display_name,
+                client_id: client_id.as_deref(),
                 tool_scopes: &request.tool_scopes,
             },
             created_at_micros,

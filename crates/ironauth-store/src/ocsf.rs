@@ -131,6 +131,11 @@ impl AuditStream {
 /// makes that safe: an action whose domain appears in no table fails the sweep by name, so
 /// the tables cannot silently fall behind the action list.
 const AUTHENTICATION_DOMAINS: &[&str] = &[
+    // Issuance to an AGENT principal (issue #130). Its own domain rather than a dimension of
+    // `token`, so a SIEM can separate the agent stream without parsing a detail field, which
+    // is the stream separation the issue asks for. Deliberately NOT `agent`, which is the
+    // ACCOUNT CHANGE domain registration and revocation use.
+    "agent_token",
     "auth",
     "authorization_code",
     "credential",

@@ -355,6 +355,11 @@ async fn issue(
     // Resolved BEFORE the mint, through the one shared helper (issue #126).
     let (workload_org, workload_roles) =
         crate::token::resolve_workload_org_and_roles(state, scope, &subject.subject).await?;
+    // And the agent gate (issue #130), through ITS one shared helper. Issue #130 names token
+    // exchange as an issuance path for an agent, so it has to be gated by the same set: a
+    // control that only one of three doors applies is not a control.
+    let agent =
+        crate::token::gate_agent_issuance(state, scope, client_id_str, granted_scope).await?;
     let (minted, expires_in) = tokens::mint_client_credentials_access_token(
         state,
         signer,
@@ -386,6 +391,11 @@ async fn issue(
             // a decision. What separates the two is identity, not origin.
             custom_claims: &custom_claims,
             act: decision.act.as_ref(),
+            agent: agent.as_ref().map(|a| tokens::AgentTokenIdentity {
+                agent_id: a.agent_id.as_str(),
+                linked_user_id: a.linked_user_id.as_str(),
+                organization_id: a.organization_id.as_str(),
+            }),
         },
         &target,
     )
@@ -452,6 +462,10 @@ async fn issue(
             map_store_error(error)
         })?;
 
+    // The issuance row, AFTER the token exists (issue #130).
+    if let Some(agent) = &agent {
+        crate::token::record_agent_issuance(state, scope, agent, granted_scope).await;
+    }
     Ok(response(&minted, expires_in, granted_scope))
 }
 

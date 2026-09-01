@@ -883,6 +883,13 @@ name = "client_credentials"
 path = "tests/client_credentials.rs"
 required-features = ["testing"]
 
+# Agent principals at the token doors (issue #130): the agent identity a token carries, the
+# per-tool enforcement, and the audited denial. Over a real database.
+[[test]]
+name = "agent_issuance"
+path = "tests/agent_issuance.rs"
+required-features = ["testing"]
+
 # RFC 8707 resource indicators (issue #28): URI validation, per-client allowlist
 # rejection with invalid_target, multi-resource authorization narrowed at the token
 # endpoint, refresh downscoping (and expansion rejection), cross-resource replay
