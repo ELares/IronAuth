@@ -113,6 +113,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "setAgentState",
     "setOrgDefaultRole",
     "setOrgGroupParent",
+    "storeAgentVaultConnection",
     "unassignOrgGroupRole",
     "unassignOrgMembershipRole",
     "unassignOrgRolePermission",
@@ -154,6 +155,10 @@ const UNATTRIBUTED_CEILING: usize = 0;
 /// function and reads that function plus the same-file functions it calls, which is the
 /// granularity `org_confinement_surface.rs` already uses for the confinement fence.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    (
+        "storeAgentVaultConnection",
+        include_str!("../src/agents.rs"),
+    ),
     ("registerAgent", include_str!("../src/agents.rs")),
     ("setAgentState", include_str!("../src/agents.rs")),
     (
