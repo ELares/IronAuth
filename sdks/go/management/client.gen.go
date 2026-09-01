@@ -379,6 +379,13 @@ func (c *Client) CreateWebhookEndpoint(tenant_id string, environment_id string, 
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints", query, body)
 }
 
+// DecideAgentVaultApproval performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision.
+//
+// Decide one held action (issue #132, criterion 4).
+func (c *Client) DecideAgentVaultApproval(tenant_id string, environment_id string, organization_id string, approval_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/agent-approvals/" + escape(approval_id) + "/decision", query, body)
+}
+
 // DeleteBrand performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/brands/{slug}.
 //
 // Delete a per-environment brand by slug.
@@ -1028,6 +1035,13 @@ func (c *Client) LiftBan(tenant_id string, environment_id string, query url.Valu
 // Link an external id to a user.
 func (c *Client) LinkUserExternalId(tenant_id string, environment_id string, user_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/external-id", query, body)
+}
+
+// ListAgentVaultApprovals performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals.
+//
+// The approvals awaiting a decision in this organization (issue #132, criterion 4).
+func (c *Client) ListAgentVaultApprovals(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/agent-approvals", query, nil)
 }
 
 // ListAgents performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents.

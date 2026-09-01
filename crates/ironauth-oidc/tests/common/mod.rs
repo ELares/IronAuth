@@ -1525,6 +1525,18 @@ impl Harness {
         self.state = state;
     }
 
+    /// Install a FEDERATION runtime and rebuild the protocol router.
+    ///
+    /// The vault's refresh (issue #132) dereferences an operator-supplied token endpoint
+    /// through the SSRF-hardened fetcher, so a test that means to exercise it has to give the
+    /// harness a runtime whose dialer reaches an in-process provider. Without one the refresh
+    /// answers "this deployment cannot reach a provider", which is correct and untestable.
+    pub fn install_federation(&mut self, runtime: Arc<ironauth_oidc::FederationRuntime>) {
+        let state = self.state.clone().with_federation(runtime);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// Install the custom (declarative) journey source (issue #92, PR 4) and rebuild the protocol
     /// router, so a `custom` flow resolves its compiled transition table. Preserves any previously
     /// installed hashing pool and the flows toggle.

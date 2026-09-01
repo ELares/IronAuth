@@ -36,8 +36,8 @@ use crate::pagination::{ListQuery, Pagination};
 use crate::response::json;
 use crate::state::AdminState;
 use crate::views::{
-    AgentList, AgentView, RegisterAgentRequest, SetAgentStateRequest, StoreVaultConnectionRequest,
-    VaultConnectionView,
+    AgentList, AgentView, DecideVaultApprovalRequest, RegisterAgentRequest, SetAgentStateRequest,
+    StoreVaultConnectionRequest, VaultApprovalList, VaultApprovalView, VaultConnectionView,
 };
 
 /// The states an operator may set. `revoked` is terminal; the store refuses to move out of it.
@@ -468,6 +468,13 @@ fn agent_registered_event(
         (status = 404, description = "Not found, or another organization's agent", body = ErrorBody)
     )
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "twelve lines over the pedantic bound. The body is the acceptance in order: \
+    resolve the organization, address the agent, validate every field the schema constrains \
+    so an operator error is a 400 rather than a 500, seal, store. Splitting it would put a \
+    validation in a function a future edit could reach the store without calling"
+)]
 pub async fn store_agent_vault_connection(
     State(state): State<AdminState>,
     principal: Principal,
@@ -536,6 +543,35 @@ pub async fn store_agent_vault_connection(
     // accepted second values (and a far wider negative band) that multiply cleanly and then
     // raise 22008 at `TIMESTAMPTZ 'epoch' + interval`, which renders as a 500 -- an operator's
     // bad request reported as a server fault, which is what the check was added to stop.
+    // The refresh configuration, validated at the EDGE rather than left to the schema. The
+    // endpoint must be https because the server dereferences it with a refresh token in the
+    // body; the schema checks that too, and a violation there would surface as a 23514 and
+    // render as a 500 -- an operator's bad request reported as a server fault.
+    let refresh_parts = match request.refresh.as_ref() {
+        None => None,
+        Some(refresh) => {
+            let endpoint = require_non_empty(&refresh.token_endpoint, "refresh.token_endpoint")?;
+            if !endpoint.starts_with("https://") || endpoint.len() > 2048 {
+                return Err(ApiError::BadRequest(
+                    "refresh.token_endpoint must be an https URL of at most 2048 characters"
+                        .to_owned(),
+                ));
+            }
+            Some((
+                endpoint,
+                require_non_empty(&refresh.client_id, "refresh.client_id")?,
+                require_non_empty(&refresh.client_secret, "refresh.client_secret")?,
+            ))
+        }
+    };
+    let refresh_config = refresh_parts.as_ref().map(|(endpoint, client, secret)| {
+        ironauth_store::VaultRefreshConfig {
+            token_endpoint: endpoint,
+            client_id: client,
+            client_secret: secret,
+        }
+    });
+
     let expires_at_micros = match request.expires_at {
         None => None,
         Some(seconds) => Some(
@@ -577,6 +613,8 @@ pub async fn store_agent_vault_connection(
                 refresh_token,
                 granted_scopes: &request.granted_scopes,
                 expires_at_unix_micros: expires_at_micros,
+                requires_approval: request.requires_approval,
+                refresh: refresh_config,
             },
             state.now_unix_micros(),
             pending
@@ -605,11 +643,16 @@ pub async fn store_agent_vault_connection(
         // The id the ROW has, returned by the write. Minting one and reporting it was the
         // defect: on a re-store the row keeps its first id, so the operator was handed one
         // nothing could address and a later `mark_failed` on it would answer not-found.
-        id: stored_id.to_string(),
+        id: stored_id.id.to_string(),
         agent_id: id.to_string(),
         provider,
         granted_scopes: request.granted_scopes,
         state: "active".to_owned(),
+        // Read out of the ROW, not echoed from the request. On a re-store that omits
+        // `requires_approval` the stored value wins, so echoing the request would report the
+        // gate as off in exactly the case where the operator most needs to see it is on.
+        requires_approval: stored_id.requires_approval,
+        can_refresh: stored_id.can_refresh,
     })
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -641,6 +684,250 @@ fn provider_is_shaped(provider: &str) -> bool {
         && provider
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The approvals awaiting a decision in this organization (issue #132, criterion 4).
+///
+/// THE APPROVER's QUEUE. Migration 0179 created an index for it and nothing read it, and an
+/// approval surface nobody can list is a table that fills up rather than a control: the
+/// exchange raises a request and blocks, and without this the human it is waiting for has no
+/// way to learn that it is waiting.
+///
+/// Timed-out rows are excluded. A decision after the deadline cannot take effect -- a timeout
+/// issues no tokens, exactly as a denial does -- so presenting one would be asking for a
+/// decision that changes nothing.
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals",
+    operation_id = "listAgentVaultApprovals",
+    tag = "organizations",
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The approvals awaiting a decision, oldest first", body = VaultApprovalList),
+        (status = 401, description = "Missing or invalid credential", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Organization not found, or the environment is absent or soft-deleted", body = ErrorBody)
+    )
+)]
+pub async fn list_agent_vault_approvals(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::Read)?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
+
+    // Asking for one MORE than will be shown is how `truncated` is answered without a second
+    // count query: if the extra row came back there is more waiting than this page carries.
+    let mut pending = state
+        .store()
+        .management()
+        .agent_vault_approvals(scope)
+        .pending_for_organization(&org_id, state.now_unix_micros(), APPROVAL_QUEUE_LIMIT + 1)
+        .await?;
+    let truncated = pending.len() > usize_limit();
+    pending.truncate(usize_limit());
+
+    let items: Vec<VaultApprovalView> = pending
+        .into_iter()
+        .map(|approval| VaultApprovalView {
+            id: approval.id.to_string(),
+            agent_id: approval.agent_id.to_string(),
+            provider: approval.provider,
+            expires_at: approval.expires_at_unix_micros / 1_000_000,
+            requested_details: approval.requested_details,
+        })
+        .collect();
+
+    let body_string = serde_json::to_string(&VaultApprovalList { items, truncated })
+        .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body_string))
+}
+
+/// How many pending approvals one listing carries.
+///
+/// A queue is not a report: an approver answers the oldest requests, and a response that grows
+/// with the table is a denial-of-service an agent can cause by raising requests. There is no
+/// cursor here because there is nothing to page THROUGH -- deciding a request removes it from
+/// this list -- so the bound is a bound, and the response says when it was reached rather than
+/// looking complete.
+const APPROVAL_QUEUE_LIMIT: i64 = 200;
+
+/// The same bound as a `usize`, without a cast that could truncate on a 16-bit target.
+fn usize_limit() -> usize {
+    usize::try_from(APPROVAL_QUEUE_LIMIT).unwrap_or(usize::MAX)
+}
+
+/// Decide one held action (issue #132, criterion 4).
+///
+/// The out-of-band half the criterion names. Until this exists the exchange blocks for ever,
+/// which is a denial nobody made rather than an approval flow.
+///
+/// TERMINAL both ways. The store refuses to decide a row that is already decided, so a second
+/// call answers not-found rather than overwriting an approval with a denial or the reverse:
+/// an approver who changes their mind revokes the agent, which is a different and louder act.
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision",
+    operation_id = "decideAgentVaultApproval",
+    tag = "organizations",
+    request_body = DecideVaultApprovalRequest,
+    params(
+        ("tenant_id" = String, Path, description = "The tenant identifier"),
+        ("environment_id" = String, Path, description = "The environment identifier"),
+        ("organization_id" = String, Path, description = "The organization identifier"),
+        ("approval_id" = String, Path, description = "The approval identifier")
+    ),
+    security(("bearer" = [])),
+    responses(
+        (status = 204, description = "Decided"),
+        (status = 400, description = "Malformed request", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credential, or a lapsed sudo elevation", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
+        (status = 404, description = "Not found, another organization's approval, or already decided", body = ErrorBody)
+    )
+)]
+pub async fn decide_agent_vault_approval(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, approval_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_organizations`.
+    // An UNRESTRICTED credential passes unchanged.
+    principal.require_permission(ManagementPermission::WriteOrganizations)?;
+    // Approving a sensitive action is at least as privileged as changing an agent's state.
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+
+    // Address the target FIRST and enforce the NESTING, exactly as the agent routes do: an
+    // approval whose agent belongs to a different organization, presented under this one's
+    // path, is the uniform not-found. Without this an operator scoped to one organization
+    // could approve another's sensitive action.
+    let approvals = state.store().management().agent_vault_approvals(scope);
+    let id = ironauth_store::AgentVaultApprovalId::parse_in_scope(&approval_id, &scope)
+        .map_err(|_| ApiError::NotFound)?;
+    let approval = approvals.get(&id).await?.ok_or(ApiError::NotFound)?;
+    let agent = state
+        .store()
+        .scoped(scope)
+        .agents()
+        .get(&approval.agent_id)
+        .await?;
+    if agent.organization_id != org_id {
+        return Err(ApiError::NotFound);
+    }
+
+    let request: DecideVaultApprovalRequest = parse_json(&body)?;
+    let pending = vault_approval_decided_event(
+        &state,
+        scope,
+        &id,
+        &approval.agent_id,
+        &org_id,
+        &approval.provider,
+        request.approve,
+        &principal.actor().id_string(),
+    );
+    state
+        .store()
+        .management()
+        .acting(actor, CorrelationId::generate(state.env()))
+        .in_organization(org_id)
+        .agent_vault_approvals_acting(scope)
+        .decide_with_event(
+            state.env(),
+            &id,
+            request.approve,
+            request.approved_details.as_ref(),
+            &principal.actor().id_string(),
+            state.now_unix_micros(),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await
+        .map_err(|error| match error {
+            // Already decided: the store refuses to move out of a terminal state, and the
+            // caller is told the same thing it would be told about an approval that is not
+            // there. Both mean "this will not be changing".
+            StoreError::NotFound => ApiError::NotFound,
+            other => other.into(),
+        })?;
+
+    Ok(json(StatusCode::NO_CONTENT, String::new()))
+}
+
+/// The event an approval DECISION emits (issue #132, criterion 4).
+///
+/// Names the outcome and never the credential: an approval decides whether a sensitive action
+/// may proceed, and it never touches the downstream token.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct value the caller has already resolved; a struct \
+    would move the parameter list rather than shorten it"
+)]
+fn vault_approval_decided_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    approval_id: &ironauth_store::AgentVaultApprovalId,
+    agent_id: &AgentPrincipalId,
+    organization_id: &ironauth_store::OrganizationId,
+    provider: &str,
+    approve: bool,
+    decided_by: &str,
+) -> Option<crate::events::PendingEvent> {
+    let id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = agent_id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &id,
+        "agent.vault_approval_decided",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "approval_id": approval_id.to_string(),
+            "agent_id": subject,
+            "organization_id": organization_id.to_string(),
+            "provider": provider,
+            "outcome": if approve { "approved" } else { "denied" },
+            "decided_by": decided_by,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id,
+        subject,
+        envelope,
+    })
 }
 
 /// The event storing a downstream vault connection emits (issue #132).

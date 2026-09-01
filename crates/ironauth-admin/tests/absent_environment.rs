@@ -1440,6 +1440,12 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             }))),
         },
         Case {
+            label: "agents.decideAgentVaultApproval",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/agent-approvals/ava_absent/decision"),
+            body: Some(body_of(&serde_json::json!({ "approve": true }))),
+        },
+        Case {
             label: "memberships.createServiceAccountMembership",
             method: "POST",
             path: format!("{base}/organizations/{org}/service-account-memberships"),

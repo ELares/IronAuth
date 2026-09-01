@@ -129,6 +129,7 @@ fn operation_ids_are_the_stable_set() {
             "createUser",
             "createUserPersonalAccessToken",
             "createWebhookEndpoint",
+            "decideAgentVaultApproval",
             "deleteBrand",
             "deleteBrandFavicon",
             "deleteBrandLogo",
@@ -222,6 +223,7 @@ fn operation_ids_are_the_stable_set() {
             "grantTokenHookSecret",
             "liftBan",
             "linkUserExternalId",
+            "listAgentVaultApprovals",
             "listAgents",
             "listBans",
             "listBrands",
@@ -636,6 +638,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/migration/progress",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
@@ -729,6 +732,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration-runs/{run_id}/abandon",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/migration/verify-credential",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
@@ -900,7 +904,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        277,
+        279,
         "the documented route count is pinned"
     );
 

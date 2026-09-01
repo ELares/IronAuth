@@ -107,10 +107,12 @@ pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 /// hands an agent a third-party token. They are useless apart, and an operator reasoning
 /// about "may an agent hold a Google token" is asking one question, not two.
 ///
-/// Deliberately NOT claiming refresh. An earlier version of this sentence said the flag
-/// also turned on "the refresh that keeps one alive", and no refresh exists: nothing reads
-/// a stored refresh token, and this text is the operator-facing description of what the
-/// flag does.
+/// The refresh and the approval gate ride the SAME flag, and both are now real. This
+/// sentence has been wrong in both directions: it first claimed a refresh that did not
+/// exist, was corrected to deny one, and the denial outlived the code. It is the
+/// operator-facing description of what the flag does, so it says what the flag does today
+/// -- store a downstream credential, hand it to a declared agent, renew it at the provider
+/// when it expires, and block a sensitive exchange on a human approval.
 pub const AGENT_TOKEN_VAULT_FEATURE: &str = "agent-token-vault";
 
 /// The experimental `ack` version for the agent token vault (issue #132). It is
@@ -548,8 +550,12 @@ impl FeatureRegistry {
              credentials (Google, GitHub) that an agent exchanges its IronAuth token for, \
              scoped to what the agent DECLARED and audited on every exchange. Contents are \
              sealed with the per-tenant key hierarchy, so a raw database dump yields no \
-             usable third-party credential. EXPLORATORY: this makes IronAuth the custodian \
-             of another party's credential, and the storage and exchange shapes are early.",
+             usable third-party credential. A connection configured with a token endpoint \
+             and downstream client credentials RENEWS itself when the stored credential \
+             expires, and one an operator marked sensitive BLOCKS the exchange on an \
+             out-of-band human approval bound to the exact action requested. EXPLORATORY: \
+             this makes IronAuth the custodian of another party's credential, and the \
+             storage, exchange, refresh and approval shapes are early.",
             AGENT_TOKEN_VAULT_VERSION,
             "crates/ironauth-oidc/CHANGELOG.md",
         ));

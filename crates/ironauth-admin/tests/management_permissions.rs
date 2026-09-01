@@ -142,6 +142,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteOrganizations,
     ),
     ("listAgents", ManagementPermission::Read),
+    // The agent VAULT approvals. Deciding whether an agent may spend a stored credential is a
+    // change to what that agent can reach outside IronAuth, so it sits with the rest of the
+    // organization-scoped writes; the approver's queue is a read.
+    ("listAgentVaultApprovals", ManagementPermission::Read),
+    (
+        "decideAgentVaultApproval",
+        ManagementPermission::WriteOrganizations,
+    ),
     ("deleteMembership", ManagementPermission::WriteOrganizations),
     ("listMemberships", ManagementPermission::Read),
     // The ordered event feed and the usage export (issue #107). Both are environment-scoped
@@ -890,6 +898,11 @@ const PERMISSION_PROVEN: &[&str] = &[
     "getAuthzenConfiguration",
     "authzenEvaluation",
     "authzenEvaluations",
+    // The agent vault (issue #132). `delegated_admin.rs` drives a read-only credential at all
+    // three and asserts the two writes are refused BY NAME; the queue is reached.
+    "storeAgentVaultConnection",
+    "listAgentVaultApprovals",
+    "decideAgentVaultApproval",
 ];
 
 /// Not every unproven operation CAN be proven the same way.
@@ -908,7 +921,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 196 operations declare a required permission and 52 have that permission proven. The other
+/// 218 operations declare a required permission and 74 have that permission proven. The other
 /// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
 /// number rather than a shrug.
 ///
@@ -922,8 +935,8 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// This pin may only improve: `PERMISSION_PROVEN` may grow, and the ratio may not get worse
 /// without somebody editing this assertion and noticing what they are doing.
 ///
-/// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 145` ratchet below can no longer fail on
-/// its own: 216 minus 71 is always 145. (It read "166 minus 22", then "171 minus 27", then
+/// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
+/// its own: 218 minus 74 is always 144. (It read "166 minus 22", then "171 minus 27", then
 /// "210 minus 66" -- each of them stale, and the last of them stale in a doc paragraph that
 /// says in the same breath that this is the hazard, while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
@@ -943,17 +956,17 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        216,
+        218,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        71,
+        74,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
     assert!(
-        unproven <= 145,
+        unproven <= 144,
         "the number of operations whose specific permission is UNPROVEN rose to {unproven}.          It may only fall. Add a `delegated_admin.rs` test that drives a credential holding a          different permission and asserts the refusal names the required one, then list the          operation in PERMISSION_PROVEN"
     );
 }

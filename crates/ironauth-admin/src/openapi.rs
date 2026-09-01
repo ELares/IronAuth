@@ -248,6 +248,8 @@ use crate::views::{
         crate::agents::list_agents,
         crate::agents::set_agent_state,
         crate::agents::store_agent_vault_connection,
+        crate::agents::list_agent_vault_approvals,
+        crate::agents::decide_agent_vault_approval,
         crate::memberships::create_membership,
         crate::memberships::create_service_account_membership,
         crate::memberships::list_memberships,

@@ -797,13 +797,32 @@ pub enum Action {
     /// are the same event to an investigator asking "what happened to that request", and
     /// splitting them would put half the answer in a different stream.
     ///
-    /// A TIMEOUT emits nothing, and this said it did. Nothing writes state `expired`: an
-    /// approval that is never answered simply stops authorizing when its deadline passes,
-    /// which `VaultApproval::authorizes` computes from the row rather than from an event. So
-    /// the absence of a decision row IS the timeout, and an investigator has to read it that
-    /// way. A sweeper that expired the row and emitted this action would make the trail
-    /// self-describing; there is no sweeper.
+    /// A HUMAN decision only. The two things that also end an approval's life get their own
+    /// actions, because an investigator filtering this one is asking "who let an agent do
+    /// what", and an answer that mixes in rows the agent's own request produced is the wrong
+    /// answer: see [`Action::AgentVaultApprovalConsumed`] and
+    /// [`Action::AgentVaultApprovalRetired`].
     AgentVaultApprovalDecided,
+    /// An approved action was SPENT: the credential it authorized was handed over (issue
+    /// #132).
+    ///
+    /// Distinct from the decision, and the distinction is the actor. The decision's actor is
+    /// the human who made it; this row's actor is the AGENT, because the agent's request is
+    /// what spends it. Recording both under one action would put the agent's own action into
+    /// the stream an investigator reads to find out who authorized it.
+    ///
+    /// One of these follows at most one `approval_decided`, which is what makes an approval
+    /// single-use readable in the trail rather than inferable from the absence of a second
+    /// exchange.
+    AgentVaultApprovalConsumed,
+    /// A pending action was RETIRED because nobody answered it in time (issue #132).
+    ///
+    /// A timeout is the absence of a decision, so this is not a decision and its `decided_by`
+    /// is empty. It exists because the row has to leave `pending`: the pending-uniqueness
+    /// index is partial on that state, so a request nobody answered would otherwise block its
+    /// own action for ever. Retirement is lazy, performed by the next request for that action,
+    /// so the trail shows it at the moment it mattered rather than at the moment a sweeper ran.
+    AgentVaultApprovalRetired,
     /// An agent EXCHANGED its IronAuth token for a stored downstream credential (issue #132).
     ///
     /// The row an investigator asks for first after a third-party incident: which agent got
@@ -1704,6 +1723,8 @@ impl Action {
             Action::AgentVaultStore => "agent_vault.store",
             Action::AgentVaultApprovalRequested => "agent_vault.approval_requested",
             Action::AgentVaultApprovalDecided => "agent_vault.approval_decided",
+            Action::AgentVaultApprovalConsumed => "agent_vault.approval_consumed",
+            Action::AgentVaultApprovalRetired => "agent_vault.approval_retired",
             Action::AgentVaultExchange => "agent_vault.exchange",
             Action::AgentVaultFailed => "agent_vault.failed",
             Action::AgentTokenIssue => "agent_token.issue",

@@ -587,6 +587,54 @@ pub struct StoreVaultConnectionRequest {
     /// provider stated no expiry, not that the token never expires.
     #[serde(default)]
     pub expires_at: Option<i64>,
+
+    /// Whether exchanging for this credential is a SENSITIVE action that blocks on an
+    /// out-of-band approval (issue #132, criterion 4).
+    ///
+    /// The OPERATOR's decision, taken here because they are the one establishing the
+    /// connection and they are the one who knows what reaching it can do. It is deliberately
+    /// not the agent's: the gate used to run when the agent's exchange request named
+    /// `authorization_details`, so a denied agent omitted the field and received the
+    /// credential anyway.
+    ///
+    /// ABSENT MEANS LEAVE IT AS IT IS, which is not what the sibling `refresh` field does and
+    /// is deliberate. This route is a PUT, so the natural reading is "replace"; but the
+    /// natural OPERATION is replacing an expired access token, and under replace-semantics
+    /// that turned the approval gate off on a sensitive connection without saying so. Sending
+    /// `false` still makes a connection ordinary; on a first store, absent means the same as
+    /// `false`.
+    #[serde(default)]
+    pub requires_approval: Option<bool>,
+
+    /// How this connection refreshes itself, when it can (issue #132, criterion 3).
+    ///
+    /// Absent means it cannot: an expired credential then has to be re-established rather than
+    /// renewed, and the exchange says so distinctly rather than reporting a failure. Present,
+    /// all three parts are required, because a partially configured refresh fails at the
+    /// provider rather than at the edge.
+    ///
+    /// This route is a PUT and replaces the whole connection, so omitting this field on a
+    /// re-store CLEARS an existing refresh configuration rather than leaving it alone. That is
+    /// the same semantics the access and refresh tokens already have here, and it is stated
+    /// because the consequence differs: a cleared token is obviously gone, a cleared refresh
+    /// configuration is invisible until the credential expires.
+    #[serde(default)]
+    pub refresh: Option<VaultRefreshRequest>,
+}
+
+/// What refreshing a stored credential at its provider needs (issue #132, criterion 3).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct VaultRefreshRequest {
+    /// The provider's token endpoint. `https` only: this URL is dereferenced by the server
+    /// with a refresh token in the body, so a plaintext one puts the credential on the wire.
+    #[schema(example = "https://oauth2.googleapis.com/token")]
+    pub token_endpoint: String,
+    /// The DOWNSTREAM OAuth client the credential was issued to. Not an IronAuth client: it is
+    /// chosen by whoever ran the consent flow at the provider.
+    pub client_id: String,
+    /// That client's secret. Sealed before the row exists, under its own purpose tag, and
+    /// never returned.
+    pub client_secret: String,
 }
 
 /// What an operator is told about a stored connection.
@@ -609,6 +657,80 @@ pub struct VaultConnectionView {
     pub granted_scopes: Vec<String>,
     /// `active` or `failed`.
     pub state: String,
+    /// Whether reaching this connection blocks on an out-of-band approval.
+    ///
+    /// Reported because the flag was WRITE-ONLY: an operator could set a connection sensitive
+    /// and had no way to read back whether it still was, which is the worst property for a
+    /// control to have. Nothing else on this surface answers "is this gated".
+    pub requires_approval: bool,
+    /// Whether this connection can renew itself when its credential expires.
+    ///
+    /// The configuration itself is never reported: the client secret is sealed and the
+    /// endpoint and client id are the operator's own input. What an operator cannot otherwise
+    /// tell is whether the connection will renew or has to be re-established, and that is the
+    /// question this answers.
+    pub can_refresh: bool,
+}
+
+/// One approval awaiting a decision, as the approver sees it (issue #132).
+///
+/// Carries what was REQUESTED and nothing that was granted: a pending row has granted nothing
+/// yet, and a field for it here would be a place for a caller to read a decision that has not
+/// been made.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VaultApprovalView {
+    /// The approval identifier.
+    #[schema(example = "ava_...")]
+    pub id: String,
+    /// The agent whose action is held.
+    #[schema(example = "agp_...")]
+    pub agent_id: String,
+    /// The downstream provider the held action targets.
+    #[schema(example = "google")]
+    pub provider: String,
+    /// When the request stops being answerable, in seconds since the epoch. After this a
+    /// decision can no longer take effect: a timeout issues no tokens.
+    pub expires_at: i64,
+    /// What the agent ASKED to do (RFC 9396 authorization details).
+    ///
+    /// The thing being approved. It was stored by migration 0179 "verbatim so the approver is
+    /// shown the request rather than a summary of it" and then read by nothing, so the queue
+    /// said "this agent wants google" and an operator narrowed it blind. Two different pending
+    /// actions on one provider were indistinguishable.
+    #[schema(value_type = Object)]
+    pub requested_details: serde_json::Value,
+}
+
+/// A page of approvals awaiting a decision.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VaultApprovalList {
+    /// The approvals, oldest first.
+    pub items: Vec<VaultApprovalView>,
+    /// Whether more are waiting than this listing carries.
+    ///
+    /// The listing is bounded, and a bounded list that does not say so reads as the whole
+    /// queue: an approver would answer 200 requests and believe they were done. There is no
+    /// cursor to continue from because deciding a request removes it from the queue, so the
+    /// way to see the rest is to answer some of these.
+    pub truncated: bool,
+}
+
+/// The body deciding one held action (issue #132).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct DecideVaultApprovalRequest {
+    /// `true` to approve, `false` to deny. Both are decisions and both are terminal.
+    pub approve: bool,
+    /// What the approver AGREES to, which may be narrower than what was requested.
+    ///
+    /// Optional, and its absence on an approval means "exactly what was asked". Present, it is
+    /// the set that takes effect: an approver who narrows a request must have the narrowed set
+    /// be the one that applies, or the approval surface is decoration.
+    ///
+    /// Ignored on a denial, because a denial grants nothing and a set attached to one would be
+    /// a permission nobody can act on sitting in a row that says no.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub approved_details: Option<serde_json::Value>,
 }
 
 /// The body to set an agent's lifecycle state (issue #130).

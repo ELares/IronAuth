@@ -148,6 +148,49 @@
             "minLength": 1,
             "type": "string"
           },
+          "approval_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "decided_by": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "outcome": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "provider": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_id",
+          "agent_id",
+          "organization_id",
+          "provider",
+          "outcome",
+          "decided_by"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "agent.vault_approval_decided"
+    },
+    {
+      "domain": "agent",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "minLength": 1,
+            "type": "string"
+          },
           "organization_id": {
             "minLength": 1,
             "type": "string"

@@ -670,10 +670,41 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // An approver DECIDED a held action (issue #132, criterion 4).
+        //
+        // Carries WHO decided, which is the question an integrator watching this actually
+        // asks. An earlier version of this comment claimed it carried "what was agreed to"
+        // and the schema had no such property, with `additionalProperties: false` making one
+        // unaddable without a version bump -- so the sentence described an event that could
+        // not exist. What was agreed to stays out deliberately: it is the approver's narrowed
+        // authorization details, it can be large, and it is on the audit row and in the
+        // exchange response for the parties that need it.
+        //
+        // Never the credential, which an approval never touches.
+        "agent.vault_approval_decided",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "approval_id": {"type": "string", "minLength": 1},
+                "agent_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "provider": {"type": "string", "minLength": 1},
+                "outcome": {"type": "string", "minLength": 1},
+                "decided_by": {"type": "string", "minLength": 1}
+            },
+            "required": [
+                "approval_id", "agent_id", "organization_id", "provider", "outcome",
+                "decided_by"
+            ]
+        }"#,
+    ),
+    (
         // An operator gave an agent a downstream third-party credential (issue #132). It
-        // carries the connection, the agent, the organization and the PROVIDER, and no part
-        // of the credential: an event naming the secret would put it in every integrator's
-        // stream, which is the opposite of what sealing it at rest is for.
+        // carries the agent, the organization and the PROVIDER, and no part of the
+        // credential: an event naming the secret would put it in every integrator's stream,
+        // which is the opposite of what sealing it at rest is for.
         "agent.vault_connection_stored",
         1,
         r#"{

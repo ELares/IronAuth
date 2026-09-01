@@ -100,6 +100,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrganizationApiKey",
     "createProjectGrant",
     "createServiceAccountMembership",
+    "decideAgentVaultApproval",
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
@@ -159,6 +160,7 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
         "storeAgentVaultConnection",
         include_str!("../src/agents.rs"),
     ),
+    ("decideAgentVaultApproval", include_str!("../src/agents.rs")),
     ("registerAgent", include_str!("../src/agents.rs")),
     ("setAgentState", include_str!("../src/agents.rs")),
     (
