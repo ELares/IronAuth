@@ -3914,6 +3914,12 @@ impl OidcState {
     /// # Errors
     ///
     /// `Err(())` for every rejection above (uniform, no oracle).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is an independent input the caller has already resolved, \
+        and the newest one (the endpoint's own htu) is the whole point: bundling them into a \
+        struct would move the parameter list rather than shorten it"
+    )]
     pub(crate) async fn verify_dpop_presentation(
         &self,
         scope: &Scope,
@@ -3921,6 +3927,12 @@ impl OidcState {
         scheme: crate::dpop::PresentedScheme,
         proof: Option<&str>,
         htm: &str,
+        // The endpoint's OWN normalized URL. A parameter rather than a constant, because a
+        // shared `htu` is a shared binding: a proof minted for one resource would validate at
+        // another, which is the replay the field exists to prevent. This was
+        // `normalized_htu_for_userinfo` inline, which was right while userinfo was the only
+        // caller and silently wrong the moment a second endpoint reused the function.
+        htu: &str,
         token: &str,
     ) -> Result<(), crate::dpop::DpopPresentationFailure> {
         use crate::dpop::{DpopPresentationFailure, PresentedScheme};
@@ -3950,14 +3962,12 @@ impl OidcState {
         };
 
         // The proof must carry the ath of the EXACT presented token string, and match
-        // the userinfo htu, the request method, and the freshness window. The htu is the
-        // deployment-root userinfo URL (never the per-environment issuer).
+        // the CALLER's htu, the request method, and the freshness window.
         let now = self.now();
-        let htu = crate::dpop::normalized_htu_for_userinfo(self);
         let ath = access_token_hash(token);
         let expected = DpopExpectations {
             htm,
-            htu: &htu,
+            htu,
             iat_leeway: crate::dpop::DPOP_IAT_LEEWAY,
             iat_skew: crate::dpop::DPOP_IAT_SKEW,
             ath: Some(&ath),

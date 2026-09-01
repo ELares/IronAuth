@@ -567,8 +567,8 @@ pub struct RegisterAgentRequest {
 /// whole reason the route exists: an operator who has completed a downstream OAuth dance on
 /// the agent's behalf has a token in hand and nowhere to put it, and a vault nothing can
 /// write to is a vault that is always empty. The request body is the one place a downstream
-/// secret is ever accepted, so it is `no-store` on the way in and never echoed on the way
-/// out.
+/// secret is ever accepted, and it is never echoed on the way out: the response type has no
+/// field for a token.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct StoreVaultConnectionRequest {
     /// The downstream provider this credential is for. It must be a tool the agent DECLARED:

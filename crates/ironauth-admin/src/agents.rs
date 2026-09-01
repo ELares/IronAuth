@@ -427,10 +427,15 @@ fn agent_registered_event(
 /// before it is accepted, in this order, and each refuses with the uniform not-found rather
 /// than a distinguishing error:
 ///
-///   1. the organization must be live and the caller must reach it (`resolve_live_org`);
-///   2. the agent must belong to THAT organization, so an agent of a sibling organization
-///      presented under this path cannot be given a credential;
-///   3. the provider must be inside the agent's DECLARED tool set. An agent that never
+///   1. the organization must be live and the caller must reach it (`resolve_live_org`), and
+///      an unreachable one is the uniform not-found;
+///   2. the agent must belong to THAT organization, also the uniform not-found, so an agent
+///      of a sibling organization presented under this path cannot be given a credential;
+///   3. the provider must be shaped as the column requires and must be inside the agent's
+///      DECLARED tool set. This one is a 400 NAMING the provider, not a not-found: the caller
+///      is an authenticated operator who has already been shown the agent, so there is
+///      nothing left to withhold and telling them which tool is undeclared is the difference
+///      between a fixable error and a guess. An agent that never
 ///      declared `google` cannot be handed a Google credential, because the exchange would
 ///      refuse to hand it back and the row would be a third-party secret nobody can reach --
 ///      stored, sealed, and permanently orphaned.
@@ -490,6 +495,20 @@ pub async fn store_agent_vault_connection(
     let request: StoreVaultConnectionRequest = parse_json(&body)?;
     let provider = require_non_empty(&request.provider, "provider")?;
     let access_token = require_non_empty(&request.access_token, "access_token")?;
+    // The SHAPE the column accepts, checked HERE rather than left to the schema.
+    //
+    // `0178`'s `agent_vault_connections_provider_shaped` requires a lowercase identifier, and
+    // an agent's declared tool set does not: registration checks only that each entry is
+    // non-blank, so an agent may legitimately declare `Google` or `mail.read`. Passing one of
+    // those through would violate the CHECK, surface as a 23514, and render as a 500 -- an
+    // operator error reported as a server fault. The store's own `mark_failed` truncates at
+    // the edge for exactly this reason two functions away.
+    if !provider_is_shaped(&provider) {
+        return Err(ApiError::BadRequest(
+            "provider must be a lowercase identifier: it may contain only a-z, 0-9, `_` and              `-`, must start with a letter or digit, and must be at most 64 characters"
+                .to_owned(),
+        ));
+    }
     if !agent.declares_tool(&provider) {
         return Err(ApiError::BadRequest(format!(
             "the agent has not declared the tool {provider}, so it could never exchange for \
@@ -502,7 +521,32 @@ pub async fn store_agent_vault_connection(
     };
     let refresh_token = refresh_token.as_deref();
 
-    let connection_id = AgentVaultConnectionId::generate(state.env(), &scope);
+    // The EXISTING connection's id when there is one, and a fresh id only when there is not.
+    //
+    // `store_connection` upserts on (tenant, environment, agent, provider) and does NOT update
+    // `id`, so minting unconditionally meant that re-storing a refreshed credential answered
+    // 200 with an id the table does not contain, published that id on every integrator's
+    // stream, and pointed the audit row at it. A later `mark_failed` on the id the operator
+    // was just handed would answer not-found: they could not mark the connection they had
+    // just stored. Read without opening the sealed columns, which is the point of
+    // `connection_id` existing rather than `connection().map(..)`.
+    let expires_at_micros = match request.expires_at {
+        None => None,
+        Some(seconds) => Some(seconds.checked_mul(1_000_000).ok_or_else(|| {
+            ApiError::BadRequest("expires_at is too large to represent as an instant".to_owned())
+        })?),
+    };
+
+    let connection_id = match state
+        .store()
+        .scoped(scope)
+        .agent_vault()
+        .connection_id(&id, &provider)
+        .await?
+    {
+        Some(existing) => existing,
+        None => AgentVaultConnectionId::generate(state.env(), &scope),
+    };
     let pending = vault_connection_event(&state, scope, &connection_id, &id, &org_id, &provider);
     // The CONTROL store: writes to the vault are control-plane, and the data-plane role holds
     // no INSERT on this table.
@@ -521,7 +565,13 @@ pub async fn store_agent_vault_connection(
                 access_token: &access_token,
                 refresh_token,
                 granted_scopes: &request.granted_scopes,
-                expires_at_unix_micros: request.expires_at.map(|seconds| seconds * 1_000_000),
+                // `checked_mul`, because `expires_at` is OPERATOR INPUT and this was the only
+                // unguarded seconds-to-micros multiply in the crate. In debug it panicked
+                // inside an axum handler; in release it wrapped, and a crafted value wrapped
+                // to a PLAUSIBLE future expiry, silently extending how long a stored
+                // credential stays usable. An unrepresentable instant is a bad request, which
+                // is what it is.
+                expires_at_unix_micros: expires_at_micros,
             },
             state.now_unix_micros(),
             pending
@@ -537,9 +587,15 @@ pub async fn store_agent_vault_connection(
     // existing row for this (agent, provider) and returns it to `active`, so these are the
     // values the row now holds.
     //
-    // The view carries no secret, and the response is `no-store` because the REQUEST that
-    // reached it did carry one: an intermediary that cached this exchange would be caching
-    // the one place a downstream credential crosses the wire in plaintext.
+    // The view carries NO SECRET, which is the property that matters here: there is no field
+    // on `VaultConnectionView` for a token, so one cannot be added without somebody writing
+    // it into a struct whose name says it is what the operator sees.
+    //
+    // Deliberately NOT claiming `no-store`. An earlier version of this comment did, and the
+    // response does not carry that header: `crate::response::json` sets `Content-Type` only,
+    // and the server's backstop deliberately imposes no cache directive. The body has nothing
+    // worth caching, so this is a corrected sentence rather than a missing header -- but a
+    // comment asserting a header that is not sent is how the next reader stops checking.
     let body_string = serde_json::to_string(&VaultConnectionView {
         id: connection_id.to_string(),
         agent_id: id.to_string(),
@@ -549,6 +605,23 @@ pub async fn store_agent_vault_connection(
     })
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
+}
+
+/// Whether `provider` matches the shape migration 0178's CHECK constraint requires.
+///
+/// The SAME rule, written once in each language because the schema cannot validate a request
+/// before it reaches the database and the handler cannot enforce a column constraint. They
+/// are pinned together by `the_route_and_the_schema_agree_on_what_a_provider_looks_like`.
+fn provider_is_shaped(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider.len() <= 64
+        && provider
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && provider
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// The event storing a downstream vault connection emits (issue #132).
@@ -613,4 +686,63 @@ fn agent_state_event(
         subject,
         envelope,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_is_shaped;
+
+    /// The route's provider check and the SCHEMA's agree on what a provider looks like.
+    ///
+    /// Two implementations of one rule, in two languages, which is exactly the situation a
+    /// review found broken: the route accepted anything non-blank and the column requires a
+    /// lowercase identifier, so `Google` reached the database, violated the CHECK, and
+    /// surfaced as a 500. Pinning them together is the only thing that keeps the two honest,
+    /// and the migration is frozen so the Rust is the half that can move.
+    ///
+    /// The regex is read FROM the migration rather than restated here, so a future edit to
+    /// either side fails this rather than passing against a copy of itself.
+    #[test]
+    fn the_route_and_the_schema_agree_on_what_a_provider_looks_like() {
+        const MIGRATION: &str =
+            include_str!("../../ironauth-store/migrations/0178_agent_token_vault.sql");
+        assert!(
+            MIGRATION.contains("provider ~ '^[a-z0-9][a-z0-9_-]*$'"),
+            "the schema's shape rule moved; the route's copy of it below has to move too"
+        );
+        assert!(
+            MIGRATION.contains("char_length(provider) <= 64"),
+            "the schema's length bound moved"
+        );
+
+        for accepted in [
+            "google",
+            "github",
+            "slack",
+            "g",
+            "0",
+            "a_b-c",
+            &"a".repeat(64),
+        ] {
+            assert!(
+                provider_is_shaped(accepted),
+                "the schema accepts {accepted:?}, so the route must too"
+            );
+        }
+        for refused in [
+            "",              // empty
+            "Google",        // uppercase
+            "mail.read",     // a dot, which a tool scope may legitimately contain
+            "slack api",     // a space
+            "_leading",      // the schema requires a leading alnum
+            "-leading",      //
+            &"a".repeat(65), // over the length bound
+        ] {
+            assert!(
+                !provider_is_shaped(refused),
+                "the schema refuses {refused:?}, so the route must refuse it FIRST: reaching \
+                 the column turns an operator's bad request into a 500"
+            );
+        }
+    }
 }

@@ -42,27 +42,62 @@ fn basic_header(client_id: &str, secret: &str) -> String {
     format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}")))
 }
 
-/// Mint a real client-credentials access token through the token endpoint.
+/// A confidential client and its secret, so a token can be minted from it LATER.
+///
+/// The two are separate on purpose. The agent claims a token carries are set at MINT time,
+/// by the gate resolving an agent for the presenting client, so a token minted before the
+/// agent row exists carries no `agent_id` at all. Every test that means to reach a fence
+/// PAST fence one therefore has to seed the agent first and mint second, and an earlier
+/// version of this file did it the other way round: three tests looked like they measured
+/// fence two and the connection lookup, and every one of them was refused at fence one.
+async fn machine_client(harness: &Harness) -> (ClientId, String) {
+    harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await
+}
+
+/// Mint a real client-credentials access token for `client`.
 ///
 /// A REAL token, not a hand-built one: every fence below has to be measured against a
 /// credential that is otherwise perfectly good, or it passes against a handler with no fence.
-async fn machine_token(harness: &Harness) -> (ClientId, String) {
-    let (client, secret) = harness
-        .create_confidential_client(ClientAuthMethod::Basic)
-        .await;
+async fn machine_token(
+    harness: &Harness,
+    client: &ClientId,
+    secret: &str,
+    scope: Option<&str>,
+) -> String {
     let client_id = client.to_string();
+    let body_form = match scope {
+        Some(scope) => form(&[("grant_type", "client_credentials"), ("scope", scope)]),
+        None => form(&[("grant_type", "client_credentials")]),
+    };
     let (status, _headers, body) = harness
-        .token_with_auth(
-            &form(&[("grant_type", "client_credentials")]),
-            Some(&basic_header(&client_id, &secret)),
-        )
+        .token_with_auth(&body_form, Some(&basic_header(&client_id, secret)))
         .await;
     assert_eq!(status, StatusCode::OK, "machine issuance: {body}");
-    let access = json(&body)["access_token"]
+    json(&body)["access_token"]
         .as_str()
         .expect("access_token")
-        .to_owned();
-    (client, access)
+        .to_owned()
+}
+
+/// The `agent_id` claim a token carries, or `None`.
+///
+/// Read from the token rather than assumed. A test that means to exercise a fence past fence
+/// one asserts on this FIRST, so "the fixture reached the state it describes" is measured
+/// rather than hoped for.
+fn agent_claim(harness: &Harness, client: &ClientId, token: &str) -> Option<String> {
+    let verified = ironauth_jose::verify(
+        token,
+        &harness.access_token_policy(&client.to_string()),
+        &common::verify_clock(),
+    )
+    .expect("at+jwt verifies");
+    verified
+        .claims()
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 /// Seed an organization, a user, and an agent bound to `client`, returning the agent id.
@@ -237,9 +272,22 @@ async fn a_token_that_names_no_agent_reaches_no_vault() {
     let mut harness = Harness::start_store_backed().await;
     harness.enable_agent_vault();
 
-    let (_client, bearer) = machine_token(&harness).await;
+    let (client, secret) = machine_client(&harness).await;
+    let bearer = machine_token(&harness, &client, &secret, None).await;
+    // The fixture reached the state this test describes: no agent is bound to this client, so
+    // the token names none. Asserted rather than assumed, because it is the whole premise.
+    assert_eq!(
+        agent_claim(&harness, &client, &bearer),
+        None,
+        "an ordinary machine token names no agent"
+    );
+
     let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "RFC 6750 section 3.1 pairs invalid_token with 401"
+    );
     assert_eq!(
         json(&body)["error"],
         "invalid_token",
@@ -260,9 +308,18 @@ async fn an_undeclared_provider_is_refused_even_though_the_connection_exists() {
     let mut harness = Harness::start_store_backed().await;
     harness.enable_agent_vault();
 
-    let (client, bearer) = machine_token(&harness).await;
+    let (client, secret) = machine_client(&harness).await;
+    // The agent EXISTS before the token is minted, or the token carries no `agent_id` and the
+    // request dies at fence one having measured nothing about the declared set.
     let agent = seed_agent(&harness, &client, &["github"]).await;
     seed_connection(&harness, &agent, "google").await;
+    let bearer = machine_token(&harness, &client, &secret, Some("github")).await;
+    assert_eq!(
+        agent_claim(&harness, &client, &bearer).as_deref(),
+        Some(agent.to_string().as_str()),
+        "the token names the agent, so the request reaches fence two"
+    );
+
     let (status, _) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
     assert_ne!(
         status,
@@ -273,18 +330,52 @@ async fn an_undeclared_provider_is_refused_even_though_the_connection_exists() {
 }
 
 #[tokio::test]
-async fn a_missing_credential_is_not_an_error_a_prober_can_read() {
-    // The anti-oracle. An absent connection and a connection for another agent must answer
-    // the same thing, or the endpoint reports which agents hold which providers.
+async fn a_missing_credential_answers_exactly_as_another_agents_does() {
+    // THE ANTI-ORACLE, measured at the connection layer rather than upstream of it.
+    //
+    // An earlier version of this test used a token that named no agent, so both requests were
+    // refused at fence one and the assertion compared two identical refusals produced before
+    // any lookup ran. It would have passed against an endpoint that reported, in full detail,
+    // which agents hold which providers.
+    //
+    // Two agents. The asking one DECLARES `google` and holds no connection; the other one
+    // holds a `google` connection. If the two answers differ, the endpoint reports whether a
+    // provider exists somewhere it cannot be reached from.
     let mut harness = Harness::start_store_backed().await;
     harness.enable_agent_vault();
 
-    let (_client, bearer) = machine_token(&harness).await;
-    let (absent, _) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
-    let (other, _) = exchange(&harness, Some(&bearer), r#"{"provider":"github"}"#).await;
+    let (asking_client, asking_secret) = machine_client(&harness).await;
+    let asking_agent = seed_agent(&harness, &asking_client, &["google", "github"]).await;
+
+    let (other_client, _other_secret) = machine_client(&harness).await;
+    let other_agent = seed_agent(&harness, &other_client, &["google"]).await;
+    seed_connection(&harness, &other_agent, "google").await;
+
+    let bearer = machine_token(
+        &harness,
+        &asking_client,
+        &asking_secret,
+        Some("google github"),
+    )
+    .await;
     assert_eq!(
-        absent, other,
-        "two providers the caller cannot reach answer identically"
+        agent_claim(&harness, &asking_client, &bearer).as_deref(),
+        Some(asking_agent.to_string().as_str()),
+        "the token names the asking agent, so both requests reach the connection lookup"
+    );
+
+    // `google` exists, for somebody else. `github` exists for nobody.
+    let (someone_elses, _) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    let (nobodys, _) = exchange(&harness, Some(&bearer), r#"{"provider":"github"}"#).await;
+    assert_eq!(
+        someone_elses, nobodys,
+        "a provider another agent holds and one nobody holds must answer identically, or the \
+         endpoint discloses which agents hold which providers"
+    );
+    assert_ne!(
+        someone_elses,
+        StatusCode::OK,
+        "and neither of them hands anything over"
     );
 }
 
@@ -296,7 +387,8 @@ async fn a_malformed_body_is_refused_without_reaching_the_store() {
     let mut harness = Harness::start_store_backed().await;
     harness.enable_agent_vault();
 
-    let (_client, bearer) = machine_token(&harness).await;
+    let (client, secret) = machine_client(&harness).await;
+    let bearer = machine_token(&harness, &client, &secret, None).await;
     let (status, _) = exchange(&harness, Some(&bearer), "not json at all").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
@@ -309,34 +401,42 @@ async fn a_malformed_body_is_refused_without_reaching_the_store() {
 }
 
 #[tokio::test]
-async fn no_credential_leaves_without_an_audit_row() {
-    // The property that makes a vault better than no vault: IronAuth is the custodian of
-    // somebody else's credential, and a hand-over with no record is the thing that makes
-    // custody worse than not holding it. Asserted on the audit ROW rather than on the status.
+async fn a_successful_exchange_hands_over_the_credential_and_audits_it() {
+    // THE HAPPY PATH, which nothing exercised at all, and the property that makes a vault
+    // better than no vault: IronAuth is the custodian of somebody else's credential, and a
+    // hand-over with no record is what makes custody worse than not holding it.
+    //
+    // An earlier version of this test branched on the status it got, which meant it could not
+    // fail: a 401 took the `else` arm and asserted that nothing had been handed over, which
+    // was true because nothing had been attempted. The status is now asserted.
     let mut harness = Harness::start_store_backed().await;
     harness.enable_agent_vault();
 
-    let (_client, bearer) = machine_token(&harness).await;
-    let (status, _) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    let (client, secret) = machine_client(&harness).await;
+    let agent = seed_agent(&harness, &client, &["google"]).await;
+    seed_connection(&harness, &agent, "google").await;
+    // `scope=google` because the third fence requires the provider to be inside the TOKEN's
+    // granted scope as well as inside the agent's declared set.
+    let bearer = machine_token(&harness, &client, &secret, Some("google")).await;
 
-    let vault_events: Vec<String> = audit_actions(&harness)
-        .await
-        .into_iter()
-        .filter(|action| action.starts_with("agent_vault."))
-        .collect();
-    if status == StatusCode::OK {
-        assert!(
-            vault_events
-                .iter()
-                .any(|action| action == "agent_vault.exchange"),
-            "a successful exchange is audited, got {vault_events:?}"
-        );
-    } else {
-        assert!(
-            !vault_events
-                .iter()
-                .any(|action| action == "agent_vault.exchange"),
-            "nothing was handed over, so nothing claims it was: {vault_events:?}"
-        );
-    }
+    let (status, body) = exchange(&harness, Some(&bearer), r#"{"provider":"google"}"#).await;
+    assert_eq!(status, StatusCode::OK, "the exchange succeeds: {body}");
+    let parsed = json(&body);
+    assert_eq!(parsed["provider"], "google");
+    assert_eq!(
+        parsed["access_token"], "downstream-access-token",
+        "the DOWNSTREAM credential is what comes back, not the IronAuth token"
+    );
+    assert!(
+        parsed.get("refresh_token").is_none(),
+        "and the refresh token, which the caller has no use for, never leaves"
+    );
+
+    assert!(
+        audit_actions(&harness)
+            .await
+            .iter()
+            .any(|action| action == "agent_vault.exchange"),
+        "the hand-over is audited"
+    );
 }

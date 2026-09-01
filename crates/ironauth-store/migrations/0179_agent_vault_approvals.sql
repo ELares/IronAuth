@@ -101,7 +101,17 @@ CREATE POLICY agent_vault_approvals_scope ON agent_vault_approvals
 -- as long as `decided_at` is set, and `..._details_only_when_approved` then accepts any
 -- `approved_details` on it. Before this policy the only thing standing between an agent and
 -- its own approval was a hardcoded 'pending' literal in one Rust function.
+-- AS RESTRICTIVE, and that word is the whole policy. A permissive policy (the default) is
+-- combined with the other permissive ones for the same command by OR, and
+-- `agent_vault_approvals_scope` above has no FOR clause (so ALL) and no TO clause (so
+-- PUBLIC, which includes ironauth_app), and its WITH CHECK is the bare scope predicate. A
+-- permissive narrowing would therefore be OR'd with a check the offending INSERT already
+-- satisfies, and would constrain exactly nothing: an already-approved row would be admitted
+-- through the other disjunct. A RESTRICTIVE policy is AND'd instead, which is the only way to
+-- narrow. The same construction, for the same reason, is in 0100 for the control plane's
+-- one-reserved-name write.
 CREATE POLICY agent_vault_approvals_app_raises_only ON agent_vault_approvals
+    AS RESTRICTIVE
     FOR INSERT TO ironauth_app
     WITH CHECK (
         tenant_id = current_setting('ironauth.tenant_id', true)

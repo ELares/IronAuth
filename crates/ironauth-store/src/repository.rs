@@ -72565,6 +72565,47 @@ impl AgentVaultRepo<'_> {
     /// because "this agent has a broken Google connection" and "this agent has no Google
     /// connection" are different answers and only one of them is worth telling an operator.
     ///
+    /// The ID of the connection this agent holds for `provider`, opening no secret.
+    ///
+    /// Exists so a CALLER can name the row it is about to replace. `store_connection` upserts
+    /// on `(tenant, environment, agent, provider)` and does NOT update `id`, so a caller that
+    /// minted a fresh id and then re-stored an existing connection would hold an id the table
+    /// does not contain: its response, its event and its audit target would all name a row
+    /// nobody can address, and a later `mark_failed` on it would answer not-found.
+    ///
+    /// Deliberately NOT `connection().map(|c| c.id)`: that opens the sealed access token to
+    /// throw it away, and this is asked precisely on the path where the stored credential is
+    /// about to be replaced.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the agent is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn connection_id(
+        &self,
+        agent_id: &AgentPrincipalId,
+        provider: &str,
+    ) -> Result<Option<AgentVaultConnectionId>, StoreError> {
+        if agent_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM agent_vault_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(agent_id.to_string())
+        .bind(provider)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|(id,)| AgentVaultConnectionId::parse_in_scope(&id, &self.scope))
+            .transpose()
+            .map_err(|_| StoreError::NotFound)
+    }
+
     /// The REFRESH token is opened only when `with_refresh` is set.
     ///
     /// It was opened unconditionally, and nothing in the shipped binary reads it: the exchange

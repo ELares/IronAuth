@@ -187,26 +187,53 @@ pub async fn exchange(
             "the token does not verify",
         );
     };
-    if crate::userinfo::enforce_dpop(
+    if let Err(failure) = crate::userinfo::enforce_dpop_outcome(
         &state,
         &scope,
         expected_jkt,
         &presented,
         method.as_str(),
+        // THIS endpoint's URL, not UserInfo's. The verifier used to hardcode the userinfo
+        // `htu`, which would have meant two things at once: a compliant client binding its
+        // proof to `/agent/vault/exchange` is refused forever, and a proof minted for
+        // `POST /userinfo` validates here. An `htu` shared between two resources is not a
+        // binding between either of them and its proof.
+        &crate::dpop::normalized_htu_for_agent_vault(&state),
         bearer,
     )
     .await
-    .is_err()
     {
-        // Collapsed to the uniform refusal (RFC 9449 section 7.1). The nonce-retry outcome is
-        // deliberately NOT surfaced here: this endpoint issues no DPoP nonce challenges of
-        // its own, and inventing one would tell a caller to retry against a server-side
-        // requirement that is not in force.
-        return refuse(
-            StatusCode::UNAUTHORIZED,
-            "invalid_token",
-            "the token does not verify",
-        );
+        // The NONCE CHALLENGE is carried through rather than collapsed. A deployment with
+        // `require_dpop_nonce` on has already ISSUED and RECORDED a nonce by the time this
+        // returns, and answering a bare 401 would burn one per attempt and lock out every
+        // compliant client permanently: it is being told to retry and given nothing to retry
+        // with. Every OTHER failure collapses to the uniform refusal (RFC 9449 section 7.1),
+        // which is the anti-oracle.
+        return match failure {
+            crate::userinfo::DpopRefusal::NeedsNonce { nonce } => (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (header::CACHE_CONTROL, "no-store".to_owned()),
+                    (axum::http::HeaderName::from_static("dpop-nonce"), nonce),
+                    (
+                        header::WWW_AUTHENTICATE,
+                        "DPoP error=\"use_dpop_nonce\", \
+                         error_description=\"Authorization server requires nonce in DPoP proof\""
+                            .to_owned(),
+                    ),
+                ],
+                Json(serde_json::json!({
+                    "error": "use_dpop_nonce",
+                    "error_description": "retry with the DPoP nonce this response carries",
+                })),
+            )
+                .into_response(),
+            crate::userinfo::DpopRefusal::Rejected => refuse(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "the token does not verify",
+            ),
+        };
     }
 
     // FENCE ONE: the token must name an agent. A token without `agent_id` belongs to an

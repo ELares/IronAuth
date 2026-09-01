@@ -1882,10 +1882,15 @@ export interface paths {
          *     before it is accepted, in this order, and each refuses with the uniform not-found rather
          *     than a distinguishing error:
          *
-         *       1. the organization must be live and the caller must reach it (`resolve_live_org`);
-         *       2. the agent must belong to THAT organization, so an agent of a sibling organization
-         *          presented under this path cannot be given a credential;
-         *       3. the provider must be inside the agent's DECLARED tool set. An agent that never
+         *       1. the organization must be live and the caller must reach it (`resolve_live_org`), and
+         *          an unreachable one is the uniform not-found;
+         *       2. the agent must belong to THAT organization, also the uniform not-found, so an agent
+         *          of a sibling organization presented under this path cannot be given a credential;
+         *       3. the provider must be shaped as the column requires and must be inside the agent's
+         *          DECLARED tool set. This one is a 400 NAMING the provider, not a not-found: the caller
+         *          is an authenticated operator who has already been shown the agent, so there is
+         *          nothing left to withhold and telling them which tool is undeclared is the difference
+         *          between a fixable error and a guess. An agent that never
          *          declared `google` cannot be handed a Google credential, because the exchange would
          *          refuse to hand it back and the row would be a third-party secret nobody can reach --
          *          stored, sealed, and permanently orphaned.
@@ -8282,8 +8287,8 @@ export interface components {
          *     whole reason the route exists: an operator who has completed a downstream OAuth dance on
          *     the agent's behalf has a token in hand and nowhere to put it, and a vault nothing can
          *     write to is a vault that is always empty. The request body is the one place a downstream
-         *     secret is ever accepted, so it is `no-store` on the way in and never echoed on the way
-         *     out.
+         *     secret is ever accepted, and it is never echoed on the way out: the response type has no
+         *     field for a token.
          */
         StoreVaultConnectionRequest: {
             /** @description The downstream access token. Sealed before it is written; never returned. */

@@ -238,7 +238,16 @@ async fn resolve(
     let cnf =
         Confirmation::from_claims(verified.claims()).map_err(|_| UserInfoError::InvalidToken)?;
     let expected_jkt = confirmation_jkt(cnf.as_ref())?;
-    enforce_dpop(state, &scope, expected_jkt, &presented, method, token).await?;
+    enforce_dpop(
+        state,
+        &scope,
+        expected_jkt,
+        &presented,
+        method,
+        &crate::dpop::normalized_htu_for_userinfo(state),
+        token,
+    )
+    .await?;
 
     // The granted scope drives which claim sets are released (Core 5.4). UserInfo
     // requires the openid scope (Core 5.3.1); its absence is insufficient_scope.
@@ -308,6 +317,7 @@ async fn resolve_opaque(
         active.dpop_jkt.as_deref(),
         presented,
         method,
+        &crate::dpop::normalized_htu_for_userinfo(state),
         token,
     )
     .await?;
@@ -531,8 +541,48 @@ pub(crate) async fn enforce_dpop(
     expected_jkt: Option<&str>,
     presented: &Presented,
     method: &str,
+    // The endpoint's own normalized URL. See `verify_dpop_presentation`: two endpoints sharing
+    // one `htu` share no binding, so a caller that is not UserInfo passes its own.
+    htu: &str,
     token: &str,
 ) -> Result<(), UserInfoError> {
+    enforce_dpop_outcome(state, scope, expected_jkt, presented, method, htu, token)
+        .await
+        .map_err(|failure| match failure {
+            DpopRefusal::Rejected => UserInfoError::InvalidTokenDpop,
+            // Carried through rather than collapsed: this is the one DPoP outcome the
+            // client is meant to act on rather than be told nothing about.
+            DpopRefusal::NeedsNonce { nonce } => UserInfoError::UseDpopNonce { nonce },
+        })
+}
+
+/// Why a `DPoP` presentation was refused, for a caller that is not `UserInfo`.
+///
+/// Two outcomes and not one. A caller that collapsed them would answer a bare 401 to a client
+/// that has done nothing wrong and is being told to retry with a nonce it was never given,
+/// which is a permanent lockout that burns a server-issued nonce per attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DpopRefusal {
+    /// The uniform refusal: a bound token presented as a bearer, a missing, invalid or
+    /// replayed proof, a thumbprint mismatch, or a `DPoP` presentation of an unbound token.
+    Rejected,
+    /// The presentation must be retried carrying this server-issued nonce (RFC 9449 8).
+    NeedsNonce {
+        /// The value for the `DPoP-Nonce` response header.
+        nonce: String,
+    },
+}
+
+/// [`enforce_dpop`] without the `UserInfo` error mapping, for a caller that renders its own.
+pub(crate) async fn enforce_dpop_outcome(
+    state: &OidcState,
+    scope: &Scope,
+    expected_jkt: Option<&str>,
+    presented: &Presented,
+    method: &str,
+    htu: &str,
+    token: &str,
+) -> Result<(), DpopRefusal> {
     state
         .verify_dpop_presentation(
             scope,
@@ -540,14 +590,13 @@ pub(crate) async fn enforce_dpop(
             presented.scheme,
             presented.proof.as_deref(),
             method,
+            htu,
             token,
         )
         .await
         .map_err(|failure| match failure {
-            DpopPresentationFailure::Rejected => UserInfoError::InvalidTokenDpop,
-            // Carried through rather than collapsed: this is the one DPoP outcome the
-            // client is meant to act on rather than be told nothing about.
-            DpopPresentationFailure::NeedsNonce { nonce } => UserInfoError::UseDpopNonce { nonce },
+            DpopPresentationFailure::Rejected => DpopRefusal::Rejected,
+            DpopPresentationFailure::NeedsNonce { nonce } => DpopRefusal::NeedsNonce { nonce },
         })
 }
 
