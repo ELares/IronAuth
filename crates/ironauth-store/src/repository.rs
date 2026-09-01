@@ -49748,21 +49748,6 @@ impl OrgGroupRepo<'_> {
         .await
     }
 
-    /// The permissions a SERVICE ACCOUNT resolves in an organization (issue #99,
-    /// criterion 3).
-    ///
-    /// The same statement, the same closure, the same depth bound and the same tail as the
-    /// user resolution above; only the principal differs. That is the point of the criterion:
-    /// a service account passes the SAME permission checks rather than a parallel set of
-    /// them, so there is one definition of what a membership grants and it cannot drift
-    /// between principal kinds.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NotFound`] if the organization or the principal is out of this scope;
-    /// [`StoreError::Database`] on a persistence failure. A store fault is never swallowed
-    /// into an empty set: on the mint path that is a silent authorization downgrade that
-    /// looks exactly like a principal who legitimately holds nothing.
     /// The effective ROLE slugs a service account holds in one organization (issue #126).
     ///
     /// The exact sibling of [`Self::effective_permissions_for_service_account`], and of
@@ -49799,7 +49784,10 @@ impl OrgGroupRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::NotFound`] if the organization or the principal is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure. A store fault is never swallowed
+    /// into an empty set: on the mint path that is a silent authorization downgrade that
+    /// looks exactly like a principal who legitimately holds nothing.
     pub async fn effective_permissions_for_service_account(
         &self,
         organization_id: &OrganizationId,

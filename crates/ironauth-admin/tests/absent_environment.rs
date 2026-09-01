@@ -1390,6 +1390,11 @@ fn personal_access_token_cases(base: &str) -> Vec<Case> {
     ]
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat table of cases, one per operation. Splitting it would hide \
+    which operations are covered behind a second function call"
+)]
 fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids {
         user,

@@ -4401,7 +4401,7 @@ async fn the_caller_endpoint_reports_only_the_presenting_credential() {
     );
 }
 
-/// `management.write_config` is required to relax a client out of the DPoP posture (#124).
+/// `management.write_config` is required to relax a client out of the `DPoP` posture (#124).
 ///
 /// This route TURNS OFF a security control: `allowed: true` means the client's access tokens
 /// stop being sender-constrained and become replayable by whoever steals them. So the

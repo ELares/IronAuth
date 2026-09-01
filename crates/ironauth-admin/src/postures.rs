@@ -22,7 +22,7 @@
 //!   posture (issue #124). `enforce_public_client_dpop` reads it on every token request from
 //!   a public client, and its own doc comment explains why the hatch is per client: "a vendor
 //!   SDK the operator does not control", "a native app shipped before the operator adopted
-//!   this posture". Both of those describe AppAuth exactly, which supports no DPoP at all.
+//!   this posture". Both of those describe `AppAuth` exactly, which supports no `DPoP` at all.
 //!   `set_allow_bearer_tokens` existed with its audit action and column, and MEASURED, its
 //!   only callers anywhere were three lines in `ironauth-oidc/tests/common/mod.rs`. So the
 //!   hatch the enforcement documents could be opened by the test suite and by nobody else,
@@ -146,7 +146,7 @@ pub async fn set_client_par_requirement(
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetClientBearerTokensRequest {
     /// Whether this public client may receive UNBOUND bearer tokens. `false`, the default
-    /// for every client, means it must present a DPoP proof at the token endpoint.
+    /// for every client, means it must present a `DPoP` proof at the token endpoint.
     pub allowed: bool,
 }
 
@@ -340,7 +340,7 @@ pub async fn set_auto_link_posture(
 /// Requiring pushed authorization requests hardens that client's authorize leg, so a consumer
 /// mirroring client hardening posture acts on it. One type with the boolean rather than a
 /// required/not-required pair, matching the other two-direction flags in this registry.
-/// The event a per-client DPoP exemption change emits (issue #124).
+/// The event a per-client `DPoP` exemption change emits (issue #124).
 ///
 /// Emitted for the RELAXING direction and the tightening one alike: an integrator watching
 /// for security-posture changes needs "this client stopped being sender-constrained" most,

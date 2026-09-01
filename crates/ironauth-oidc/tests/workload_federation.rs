@@ -1984,6 +1984,12 @@ async fn an_inline_key_set_carrying_private_material_is_refused() {
 /// Every step here goes through the MANAGEMENT API, because a criterion satisfied only by
 /// seeding rows is one an operator cannot reproduce.
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every step goes through the management API rather than seeding rows, \
+    which is the point of the test; the length is the cost of that and shortening \
+    it by seeding would weaken what it proves"
+)]
 async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
     let h = Harness::start().await;
     let router = management_plane(&h).await;
@@ -1998,7 +2004,11 @@ async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
         &serde_json::json!({ "display_name": "Deployers" }),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "create the organization: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create the organization: {body}"
+    );
     let org = json(&body)["id"].as_str().expect("an org id").to_owned();
 
     let (status, body) = manage_post(
@@ -2015,13 +2025,19 @@ async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
     // principle and be given none in practice.
     let (status, body) = manage_post(
         &router,
-        &format!("{}/organizations/{org}/service-account-memberships", base(&h)),
+        &format!(
+            "{}/organizations/{org}/service-account-memberships",
+            base(&h)
+        ),
         "sva-membership",
         &serde_json::json!({ "service_account_id": identity }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "bind the identity: {body}");
-    let membership = json(&body)["id"].as_str().expect("a membership id").to_owned();
+    let membership = json(&body)["id"]
+        .as_str()
+        .expect("a membership id")
+        .to_owned();
     assert_eq!(
         json(&body)["service_account_id"].as_str(),
         Some(identity.as_str()),
@@ -2074,11 +2090,23 @@ async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
         &format!("{}/organizations/{org}/memberships/{membership}", base(&h)),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "remove the membership: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "remove the membership: {body}"
+    );
 
     let (status, body) = authenticate(&h, "jti-roles-after", GATE_VALUE).await;
-    assert_eq!(status, StatusCode::OK, "the exchange still succeeds: {body}");
-    let claims = jwt_payload(json(&body)["access_token"].as_str().expect("an access token"));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the exchange still succeeds: {body}"
+    );
+    let claims = jwt_payload(
+        json(&body)["access_token"]
+            .as_str()
+            .expect("an access token"),
+    );
     assert_eq!(
         claims["sub"].as_str(),
         Some(identity.as_str()),
@@ -2089,4 +2117,3 @@ async fn a_federated_token_carries_the_machine_identitys_organization_roles() {
         "a removed membership must take its organization and roles with it: {claims}"
     );
 }
-
