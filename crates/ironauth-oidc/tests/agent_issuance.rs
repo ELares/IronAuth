@@ -61,41 +61,14 @@ async fn seed_agent(harness: &Harness, client: &ClientId, tool_scopes: &[&str]) 
     }
 }
 
-/// Move a seeded agent to `state`, as the control plane would.
+/// Move a seeded agent to `state`, through the SHARED harness helper.
 ///
-/// THROUGH THE REPOSITORY, not a raw UPDATE, and the difference is the whole reason
-/// `revoking_an_agent_revokes_its_grants_and_leaves_the_clients_human_grants_alone` exists.
-/// This helper used to be `UPDATE agents SET state = $1` against the owner pool, which is
-/// exactly what the control plane does NOT do: `ActingAgentRepo::set_state` revokes the
-/// agent's outstanding grants in the SAME transaction as the state change, and a raw column
-/// write cannot cascade. So the test asserting the cascade could never pass, and its own
-/// message said why -- "setting the state alone only blocks the NEXT issuance" -- while the
-/// helper's comment claimed it was acting as the control plane.
-///
-/// Two of the three callers only need the next issuance blocked and were unaffected either
-/// way; the third needs the cascade, which is the one that was red.
+/// A thin wrapper rather than a second copy. This file had its own `set_state` doing a raw
+/// `UPDATE agents SET state = $1`, and the harness had an identical one: two copies of the same
+/// false "as the control plane would" comment, one file apart. The cascade test below was red
+/// against both. One implementation now, in `common/mod.rs`, which is where the reasoning lives.
 async fn set_state(harness: &Harness, id: &AgentPrincipalId, state: &str) {
-    let env = harness.env().clone();
-    let now = i64::try_from(
-        env.clock()
-            .now_utc()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("after epoch")
-            .as_micros(),
-    )
-    .expect("fits i64");
-    harness
-        .db()
-        .control_store()
-        .scoped(harness.scope())
-        .acting(
-            harness.db().test_actor(&env),
-            ironauth_store::CorrelationId::generate(&env),
-        )
-        .agents()
-        .set_state(&env, id, state, now, None)
-        .await
-        .expect("set agent state");
+    harness.set_agent_state(id, state).await;
 }
 
 /// Every audit action recorded in the harness scope, with its detail.
