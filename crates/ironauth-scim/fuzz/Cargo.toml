@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for ironauth-scim (issue #135). Deliberately NOT a
+# workspace member (the empty [workspace] table below detaches it): its libFuzzer
+# dependency needs a nightly toolchain and must not constrain the stable workspace
+# or enter the cargo-deny graph, mirroring the root fuzz/ crate and the sibling
+# per-crate harnesses.
+#
+# Issue #135's Verification section asks for these two by name: "Fuzz targets for
+# the filter parser and PATCH path parser, running continuously in CI fuzz jobs."
+# Both parsers read text a provisioning client sends verbatim over the public
+# plane, which is the whole reason the filter is parsed rather than interpolated.
+[package]
+name = "ironauth-scim-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ironauth-scim = { path = ".." }
+# The evaluator takes a rendered resource, so a target that only parsed would leave the
+# recursive half of the walk untouched.
+serde_json = "1"
+
+[[bin]]
+name = "scim_filter"
+path = "fuzz_targets/scim_filter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scim_patch_path"
+path = "fuzz_targets/scim_patch_path.rs"
+test = false
+doc = false
+bench = false

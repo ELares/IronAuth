@@ -1,0 +1,16 @@
+/target
+/Cargo.lock
+artifacts/
+
+# Generated libFuzzer corpus entries (issue #419). `cargo fuzz run` writes a new file per
+# interesting input straight into this directory, so a local fuzzing session leaves the
+# tree full of stageable binary blobs and the runner has to clean up by hand before
+# committing.
+#
+# The CURATED seeds are kept, and the rule is exact rather than approximate: every corpus
+# entry this repository tracks is named `seed_*` (20 of them here, verified), and libFuzzer
+# names what it generates after the hash of the contents, so the two populations cannot
+# collide. Adding a new seed therefore needs no `git add -f`.
+corpus/**
+!corpus/**/
+!corpus/**/seed_*

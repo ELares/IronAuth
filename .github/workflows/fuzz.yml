@@ -45,6 +45,10 @@ jobs:
         include:
           - dir: crates/ironauth-jose
             target: verify_jws
+          - dir: crates/ironauth-scim
+            target: scim_filter
+          - dir: crates/ironauth-scim
+            target: scim_patch_path
           - dir: crates/ironauth-fetch
             target: fetch_validation
           - dir: crates/ironauth-store

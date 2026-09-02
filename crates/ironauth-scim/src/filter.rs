@@ -1248,3 +1248,109 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod seed_corpus_tests {
+    //! The committed fuzz seeds must stay VALID inputs.
+    //!
+    //! A seed exists to start libFuzzer from something that reaches the interesting code:
+    //! random bytes almost never parse as a filter, so without seeds the evaluator behind the
+    //! parser is barely explored. A seed that stops parsing is therefore not a test failure in
+    //! the fuzz job -- it is silent loss of coverage there, which nothing else would report.
+    //!
+    //! This lives in the crate rather than in the fuzz harness because the fuzz harness is not
+    //! a workspace member and does not run in the ordinary test lane.
+
+    use std::path::{Path, PathBuf};
+
+    fn seeds(target: &str) -> Vec<(String, String)> {
+        let dir: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/corpus")
+            .join(target);
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("the {target} corpus directory exists: {error}"))
+        {
+            let path = entry.expect("a corpus entry").path();
+            let name = path
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy()
+                .into_owned();
+            // Only the CURATED seeds. libFuzzer names what it generates after the hash of its
+            // contents and `.gitignore` keeps those out of the tree, but a developer who has
+            // run the fuzzer locally has them on disk, and they are not expected to parse.
+            if !name.starts_with("seed_") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            out.push((name, text));
+        }
+        out
+    }
+
+    #[test]
+    fn every_committed_filter_seed_still_parses() {
+        let seeds = seeds("scim_filter");
+        assert!(
+            seeds.len() >= 12,
+            "the filter seed corpus must not have shrunk: {}",
+            seeds.len()
+        );
+        for (name, text) in seeds {
+            assert!(
+                super::parse_filter(&text).is_ok(),
+                "{name} no longer parses, so the fuzzer starts from a dead seed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_committed_patch_path_seed_still_parses() {
+        let seeds = seeds("scim_patch_path");
+        assert!(
+            seeds.len() >= 8,
+            "the patch-path seed corpus must not have shrunk: {}",
+            seeds.len()
+        );
+        for (name, text) in seeds {
+            assert!(
+                crate::parse_patch_path(&text).is_ok(),
+                "{name} no longer parses, so the fuzzer starts from a dead seed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_seeds_reach_the_evaluator_and_not_only_the_parser() {
+        // A corpus of seeds that all parse but all evaluate to the same answer explores one
+        // branch. This asserts the seeds disagree: at least one matches the sample resource
+        // and at least one does not, so the evaluator's two outcomes are both entered from the
+        // starting corpus rather than only after the fuzzer has mutated its way there.
+        let resource = serde_json::json!({
+            "userName": "alice@example.test",
+            "active": true,
+            "externalId": "00u1",
+            "emails": [{"type": "work", "value": "alice@example.test"}],
+            "meta": {"resourceType": "User"},
+        });
+        let (mut matched, mut missed) = (0, 0);
+        for (_, text) in seeds("scim_filter") {
+            let Ok(filter) = super::parse_filter(&text) else {
+                continue;
+            };
+            if super::matches(&filter, &resource) {
+                matched += 1;
+            } else {
+                missed += 1;
+            }
+        }
+        assert!(matched > 0, "no seed matches the sample resource");
+        assert!(
+            missed > 0,
+            "every seed matches, so no negative branch is seeded"
+        );
+    }
+}
