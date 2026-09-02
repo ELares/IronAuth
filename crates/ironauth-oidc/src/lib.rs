@@ -141,6 +141,7 @@ mod magic_link;
 pub mod mds3_sync;
 pub mod message_sender;
 mod migration;
+pub mod native_sso;
 mod pages;
 mod par;
 mod password;

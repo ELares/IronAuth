@@ -719,6 +719,8 @@ async fn mint_assertion(
         // Permissions (issue #98) are inert here for the same two reasons: an ID token
         // only, and no organization context.
         permissions: None,
+        // Native SSO (issue #133): a FedCM assertion returns no device secret, so its ID token is unbound and cannot be redeemed.
+        ds_hash: None,
         at_hash: None,
         c_hash: None,
         extra_claims: &extra_claims,

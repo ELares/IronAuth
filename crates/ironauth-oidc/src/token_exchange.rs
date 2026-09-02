@@ -114,7 +114,7 @@ pub async fn token_exchange_grant(
     resources: &[String],
 ) -> Result<Response, TokenError> {
     // 1. The request has to be COHERENT before anything is authenticated.
-    let subject_token = check_request_shape(&params)?;
+    let subject_token = check_request_shape(&params, state.native_sso_enabled())?;
 
     // 2-3. Authenticate the client and run the shared grant-restriction seam.
     let (scope, authenticated, client_id) =
@@ -137,11 +137,13 @@ pub async fn token_exchange_grant(
 
     // 5. Revalidate BOTH presented tokens IN FULL. Nothing below reads a field from an
     //    unverified payload; see the module docs for why this is the whole point.
-    let subject = revalidated(state, scope, subject_token).await?;
-    let actor = match params.actor_token.as_deref() {
-        Some(token) => Some(revalidated(state, scope, token).await?),
-        None => None,
-    };
+    //
+    //    NATIVE SSO (issue #133, PROTOTYPE) revalidates a DIFFERENT pair, because its subject is
+    //    an ID token rather than an access token: `revalidated` resolves a stored access token
+    //    and would refuse one. It is still a full verification -- signature, this issuer, the
+    //    ID-token media type, unexpired, and the audience taken from the STORED device-secret
+    //    row rather than from the token -- and nothing below reads an unverified field either.
+    let (subject, actor) = revalidate_both(state, scope, &params, subject_token).await?;
 
     // 6. FENCE EVERY principal this exchange would give authority to (issue #52's
     //    invariant, and the mint registry in docs/design/USER-BOUND-MINT-SITES.md).
@@ -634,13 +636,27 @@ async fn authenticate_for_exchange(
 /// to trade) or a refresh token (already redeemable by its own grant, under its own
 /// rotation policy) from becoming a second, less-guarded path to what the first path
 /// controls.
-fn check_request_shape(params: &TokenParams) -> Result<&str, TokenError> {
+fn check_request_shape(params: &TokenParams, native_sso_armed: bool) -> Result<&str, TokenError> {
     let subject_token = required(params.subject_token.as_deref(), "subject_token is required")?;
     let subject_type = required(
         params.subject_token_type.as_deref(),
         "subject_token_type is required",
     )?;
-    if subject_type != type_uri::ACCESS_TOKEN {
+    // NATIVE SSO (issue #133, PROTOTYPE) is the ONE relaxation of the rule below, and it is
+    // JOINT. An ID token becomes an acceptable subject only when a device secret is presented
+    // as the actor in the same request, because `ds_hash` binds the two and neither is a
+    // credential alone. Admitting an ID token subject on its own -- for a request that merely
+    // got the actor type wrong, say -- would be exactly the confused-deputy hole the paragraph
+    // below describes, reached through the prototype instead of directly.
+    //
+    // This is the only check in this function that depends on anything other than the caller's
+    // own parameters, and what it depends on is deployment CONFIG rather than stored state: an
+    // unarmed deployment answers precisely as main does. That an armed one answers differently
+    // discloses that the operator turned a documented feature on, which is the same disclosure
+    // every other experimental surface here accepts.
+    let native_sso_pair = native_sso_armed
+        && crate::native_sso::is_native_sso_pair(subject_type, params.actor_token_type.as_deref());
+    if !native_sso_pair && subject_type != type_uri::ACCESS_TOKEN {
         return Err(TokenError::InvalidRequest(
             "subject_token_type must name an access token".to_owned(),
         ));
@@ -657,6 +673,10 @@ fn check_request_shape(params: &TokenParams) -> Result<&str, TokenError> {
         (None, Some(_)) => Err(TokenError::InvalidRequest(
             "actor_token is required with actor_token_type".to_owned(),
         )),
+        // The Native SSO pair carries a DEVICE SECRET as its actor, which is the other half of
+        // the same relaxation. Admitted only together with the ID-token subject above: the two
+        // are checked as one condition, never independently.
+        (Some(_), Some(_)) if native_sso_pair => Ok(subject_token),
         (Some(_), Some(actor_type)) if actor_type != type_uri::ACCESS_TOKEN => Err(
             TokenError::InvalidRequest("actor_token_type must name an access token".to_owned()),
         ),
@@ -723,6 +743,136 @@ async fn revalidated(
         audience: claims.aud.into_iter().collect(),
         act: claims.act,
     })
+}
+
+/// Revalidate the presented tokens, by whichever of the two shapes this request is.
+///
+/// Split out of `token_exchange_grant` only because the two shapes together push it past the
+/// crate's function-length lint. The BRANCH is the interesting part: a Native SSO pair takes the
+/// ID-token path and everything else takes the access-token one, and no request takes both.
+///
+/// # Errors
+///
+/// Whatever the chosen revalidation returns; both answer the uniform `invalid_grant`.
+async fn revalidate_both(
+    state: &OidcState,
+    scope: Scope,
+    params: &TokenParams,
+    subject_token: &str,
+) -> Result<(ValidatedToken, Option<ValidatedToken>), TokenError> {
+    if let Some(subject) = native_sso_subject(state, scope, params, subject_token).await? {
+        // The device secret IS the actor and it is not an exchangeable token, so there is no
+        // second `ValidatedToken` here. Returning one would put the secret into the `act` chain.
+        return Ok((subject, None));
+    }
+    let subject = revalidated(state, scope, subject_token).await?;
+    let actor = match params.actor_token.as_deref() {
+        Some(token) => Some(revalidated(state, scope, token).await?),
+        None => None,
+    };
+    Ok((subject, actor))
+}
+
+/// Redeem a Native SSO (ID token, device secret) pair into an exchangeable subject (issue #133).
+///
+/// `Ok(None)` when this is not a Native SSO request, which leaves the ordinary path untouched.
+///
+/// # The order is the security argument
+///
+/// The DEVICE SECRET is redeemed first, and everything after it is checked against the row that
+/// redemption returned rather than against the presented token:
+///
+/// 1. the secret's SHA-256 finds a live, unrevoked, unexpired row -- or there is nothing here;
+/// 2. the ID token is verified against the audience THAT ROW names, so the presenter cannot
+///    choose which audience its token is judged against;
+/// 3. `ds_hash` in the verified token must be the hash of the secret actually presented, which
+///    is what makes the two halves one credential rather than two independent bearer tokens;
+/// 4. the token's subject must be the person the row is for.
+///
+/// Reversing 1 and 2 -- reading `aud` out of the token to pick the audience to verify against --
+/// would be a check the caller controls both sides of.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidGrant`], uniformly. Which half of the pair was wrong is exactly what an
+/// attacker probing this endpoint wants to learn, so the refusals are indistinguishable on the
+/// wire; the reason goes to the log.
+async fn native_sso_subject(
+    state: &OidcState,
+    scope: Scope,
+    params: &TokenParams,
+    subject_token: &str,
+) -> Result<Option<ValidatedToken>, TokenError> {
+    if !state.native_sso_enabled() {
+        return Ok(None);
+    }
+    let Some(subject_type) = params.subject_token_type.as_deref() else {
+        return Ok(None);
+    };
+    if !crate::native_sso::is_native_sso_pair(subject_type, params.actor_token_type.as_deref()) {
+        return Ok(None);
+    }
+    // From here the request IS a Native SSO attempt, so every exit is a refusal rather than a
+    // fall-through: letting a malformed one drop into the ordinary path would hand an ID token
+    // to `revalidated`, which is the door this prototype must never open by accident.
+    let presented_secret = required(
+        params.actor_token.as_deref(),
+        "actor_token is required with actor_token_type",
+    )?;
+
+    let digest = crate::native_sso::storage_digest(presented_secret);
+    let now_micros = crate::util::epoch_micros(state.now());
+    let record = state
+        .store()
+        .scoped(scope)
+        .native_sso_device_secrets()
+        .redeem(&digest, now_micros)
+        .await
+        .map_err(|_| TokenError::ServerError)?
+        .ok_or(TokenError::InvalidGrant)?;
+
+    let verified = state
+        .verify_native_sso_id_token(&scope, &record.issued_to_client_id, subject_token)
+        .await
+        .map_err(|()| TokenError::InvalidGrant)?;
+
+    crate::native_sso::admit(
+        subject_type,
+        params.actor_token_type.as_deref(),
+        verified
+            .claims()
+            .get(crate::native_sso::DS_HASH_CLAIM)
+            .and_then(Value::as_str),
+        verified.algorithm(),
+        presented_secret,
+    )
+    .map_err(|refusal| {
+        tracing::debug!(?refusal, "a native SSO pair was refused");
+        TokenError::InvalidGrant
+    })?;
+
+    // The person. The row records the LOCAL subject and the token carries the PUBLIC one, which
+    // are the same string today and are documented as free to diverge, so the comparison goes
+    // through the same derivation the mint used rather than comparing the two directly.
+    let token_subject = verified
+        .claims()
+        .subject()
+        .ok_or(TokenError::InvalidGrant)?;
+    if token_subject != state.resolve_public_subject(&record.subject) {
+        return Err(TokenError::InvalidGrant);
+    }
+
+    Ok(Some(ValidatedToken {
+        subject: record.subject,
+        // The client the ID token was issued to, which is what makes this a DELEGATION to the
+        // presenting sibling rather than a downscope of its own token.
+        client_id: Some(record.issued_to_client_id),
+        // A Native SSO bootstrap carries no scope of its own: the sibling asks for what it
+        // needs and the ordinary scope policy decides, exactly as it would for any exchange.
+        scope: std::collections::BTreeSet::new(),
+        audience: std::collections::BTreeSet::new(),
+        act: None,
+    }))
 }
 
 /// Everything the transaction-token branch needs from the exchange (issue #133).

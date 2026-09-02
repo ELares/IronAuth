@@ -6,6 +6,41 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Experimental: Native SSO for mobile apps (issue #133)
+
+A PROTOTYPE of OpenID Connect Native SSO for Mobile Apps 1.0 Implementer's Draft 2, off by
+default behind the `native-sso` feature. A vendor's apps on one device share a sign-in without a
+shared browser session: app A asks for the `device_sso` scope and receives a DEVICE SECRET beside
+its tokens, app B presents that secret together with app A's ID token through RFC 8693, and
+receives its own tokens for the same person.
+
+**Why an ID token is not enough, and why this may relax the rule that says so.** An ID token is
+an authentication receipt, not a credential: it is audienced to one client, it is frequently
+logged, and this deployment's exchange refuses one as a `subject_token` because a tradeable
+receipt is a confused deputy. `ds_hash` is what changes that: the ID token carries the hash of
+the device secret it was issued beside, so a stolen token is inert without the secret and a
+stolen secret is inert without the matching token. The relaxation is therefore JOINT -- a request
+naming the ID-token subject type WITHOUT the device-secret actor type is not a partially formed
+Native SSO exchange, it is exactly the request the ordinary rule refuses, and it is refused.
+
+**The order of checks is the security argument.** The device secret is redeemed FIRST, and
+everything after is checked against the row that redemption returned: the ID token is verified
+against the audience THAT ROW names, not one read out of the token, so the presenter cannot
+choose which audience its token is judged against. Then `ds_hash`, then the subject.
+
+**Revoking severs the SSO set.** The row hangs off the SIGN-IN rather than off the app that asked,
+so logging out revokes every live secret from that session in the same operation that revokes the
+session and its refresh families. That is not a detail: the ID token's `sid` is PER-CLIENT by
+design, so keying the secret on it would have severed only the app that happened to ask and left
+its siblings minting -- the criterion failing silently while the revocation appeared to succeed.
+
+**Known limits, recorded in `docs/experimental/native-sso.md`:** the device secret is a BEARER
+credential and the draft's DPoP-binding question is open and unanswered here; nothing binds it to
+the device beyond the name; its lifetime is clamped at thirty days at the mint rather than
+configured, because an operator-set year would be a year-long key to every sibling app's tokens;
+it is returned ONCE and only its digest is stored; and there is no rotation on redemption, so a
+leaked secret is good until the session ends.
+
 ### Experimental: identity chaining and ID-JAG, the receiving side (issue #133)
 
 A PROTOTYPE of `draft-ietf-oauth-identity-chaining-16` and

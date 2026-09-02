@@ -59,6 +59,7 @@ attestation-client-auth ATTESTATION_CLIENT_AUTH_VERSION docs/experimental/attest
 authzen-agent-profile AUTHZEN_AGENT_PROFILE_VERSION docs/experimental/authzen-agent-profile.md
 transaction-tokens TRANSACTION_TOKENS_VERSION docs/experimental/transaction-tokens.md
 identity-chaining IDENTITY_CHAINING_VERSION docs/experimental/identity-chaining.md
+native-sso NATIVE_SSO_VERSION docs/experimental/native-sso.md
 ROWS
     echo
     echo "Each is EXPERIMENTAL and off by default; enabling one requires an acknowledgment"
@@ -131,5 +132,17 @@ cargo test -p ironauth-oidc --features testing --test jwt_bearer id_jag
 # And the BOOT wiring: armed by ITS OWN acknowledgment, refusing the boot on a missing or stale
 # one, and not armed by another prototype's.
 cargo test -p ironauth --bin ironauth identity_chaining
+echo
+echo "== native SSO =="
+# The BINDING: that the pair is required, that an unbound ID token is refused, and that a secret
+# from another sign-in does not open a token. Needs no database.
+cargo test -p ironauth-oidc --test native_sso
+# And END TO END: that the endpoints reach the binding, that an unarmed deployment issues
+# neither a secret nor a ds_hash, and that neither half of the pair works alone. Needs a
+# database.
+cargo test -p ironauth-oidc --features testing --test native_sso_flow
+# And the BOOT wiring: armed by ITS OWN acknowledgment, refusing the boot on a missing or stale
+# one, and not armed by another prototype's.
+cargo test -p ironauth --bin ironauth native_sso
 echo
 echo "experimental-prototypes: all pinned prototypes passed at the revisions above"

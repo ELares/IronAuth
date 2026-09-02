@@ -2142,6 +2142,18 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm Native SSO (issue #133, PROTOTYPE).
+    ///
+    /// Two behaviours turn on together: a code exchange granted `device_sso` returns a device
+    /// secret and stamps its `ds_hash` on the ID token, and the token exchange accepts that
+    /// pair as a subject. Off, no ID token carries the claim and the exchange refuses an
+    /// ID-token subject exactly as it does on main.
+    pub fn install_native_sso(&mut self) {
+        let state = self.state.clone().with_native_sso_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
     /// and an optional `Authorization` header (for a `client_secret_basic` client).
     pub async fn par(
