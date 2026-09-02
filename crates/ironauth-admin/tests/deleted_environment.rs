@@ -68,8 +68,8 @@
 //! fourteen handler modules and twelve URL groups, none of them the organization subtree
 //! this file drives. The whole-prefix version of this sweep is
 //! `live_surface::every_environment_scoped_write_refuses_a_soft_deleted_environment`,
-//! which drives all seventy five documented environment-scoped writes rather than the
-//! twenty two here. This file stays, and is not redundant with it, because it pins two
+//! which drives all the documented environment-scoped writes rather than the
+//! organization-addressed ones here. This file stays, and is not redundant with it, because it pins two
 //! things that one does not pin as far. It requires EVERY read in its subtree to NAME its
 //! rows rather than merely to answer 200, where the whole-prefix sweep requires that of a
 //! named subset (`getUser`, `listUsers` and `listUserConsents`) and compares only the
@@ -80,7 +80,7 @@
 //!
 //! Everything here is driven at the DEFAULT configuration, in which sudo mode is off.
 //! With sudo mode armed, `sudo::require_fresh_privilege` runs BEFORE the environment
-//! precondition in all twenty two writes, so a caller whose elevation has lapsed is
+//! precondition in every write it drives, so a caller whose elevation has lapsed is
 //! answered 401 `insufficient_user_authentication` and the environment is never read at
 //! all. The property that matters survives that, because an ABSENT environment answers a
 //! lapsed elevation identically and the two therefore stay indistinguishable; what does
@@ -281,7 +281,7 @@ async fn seed_row(h: &Harness, path: &str, key: &str, body: &str, what: &str) ->
 /// `unassignOrgRolePermission`, `clearOrgDefaultRole`) addressed a relation that had
 /// never been created and would have answered the uniform not-found with the fence
 /// removed. Neutering the fence at each of those five call sites left the sweep GREEN.
-/// Seeding the relations is what makes all twenty two writes discriminating.
+/// Seeding the relations is what makes every write case discriminating.
 struct Fixture {
     base: String,
     org: String,
@@ -601,9 +601,12 @@ impl Fixture {
                     requested_details: &serde_json::json!([{ "type": "google", "actions": ["send"] }]),
                     // 64 lowercase hex characters, which is what the column accepts.
                     action_digest: &"a1".repeat(32),
-                    // Far enough out that the row is still PENDING when the cases run: a
-                    // timed-out approval retires itself lazily and would leave the listing
-                    // case reading an empty queue.
+                    // Far enough out that the row is still PENDING when the cases run. The
+                    // listing does not retire anything -- `pending_for_organization` is a
+                    // plain SELECT filtered on `expires_at > now`, and the only caller of
+                    // `retire_timed_out` is the data-plane exchange this suite never drives --
+                    // so an expired row would simply not be returned and the listing case
+                    // would read an empty queue.
                     expires_at_unix_micros: i64::from(u32::MAX) * 1_000_000,
                 },
             )
@@ -733,7 +736,7 @@ impl Fixture {
     }
 
     /// The reads over the organization itself and its ROLES. Split from
-    /// [`Fixture::group_and_membership_read_cases`] only because the eleven together
+    /// [`Fixture::group_and_membership_read_cases`] only because they together
     /// exceed the crate's function-length lint.
     fn organization_read_cases(&self) -> Vec<Case> {
         let Self {
@@ -834,7 +837,7 @@ impl Fixture {
     }
 
     /// The reads over the organization's GROUP forest and its memberships. Split from
-    /// [`Fixture::organization_read_cases`] only because the eleven together exceed the
+    /// [`Fixture::organization_read_cases`] only because they together exceed the
     /// crate's function-length lint.
     fn group_and_membership_read_cases(&self) -> Vec<Case> {
         let Self {
@@ -917,11 +920,16 @@ impl Fixture {
     /// The four AGENT writes (issues #130, #132).
     ///
     /// All four are amending rather than destructive, and the ORDER inside this vector is the
-    /// order they run in. It matters twice. `storeAgentVaultConnection` refuses a provider
-    /// the agent has not declared and refuses one that is not a lowercase identifier, so it
-    /// names the single tool the seed declared. And `setAgentState` goes to `suspended`
-    /// rather than `revoked`: revocation is TERMINAL, so a revoking case would leave every
-    /// later case in the live pass addressing a dead agent.
+    /// order they run in. `storeAgentVaultConnection` refuses a provider the agent has not
+    /// declared and refuses one that is not a lowercase identifier, so it names the single
+    /// tool the seed declared.
+    ///
+    /// `setAgentState` goes to `suspended` rather than `revoked` because suspension is the
+    /// REVERSIBLE state and revocation additionally revokes the agent's grants. Nothing later
+    /// in the sweep addresses this agent today -- the destructive writes are all grants,
+    /// roles, groups, memberships and the organization -- so `revoked` would answer 200 here
+    /// too; the choice is about not having the sweep leave a terminal row behind, not about
+    /// a case that would break.
     fn agent_write_cases(&self) -> Vec<Case> {
         let Self {
             base,
@@ -1278,7 +1286,7 @@ async fn drive(h: &Harness, case: &Case, key: &str) -> (StatusCode, HeaderMap, S
 /// The identifiers a read's answer failed to carry, if any.
 ///
 /// A substring match over the rendered body, which is enough and is uniform across the
-/// eleven read shapes (a page under `items`, a bare object, and the effective-roles view
+/// read shapes (a page under `items`, a bare object, and the effective-roles view
 /// under `roles`). The identifiers are freshly generated per run and appear nowhere else
 /// in a response, so a hit is the row.
 fn missing_ids<'a>(body: &str, expected: &'a [String]) -> Vec<&'a str> {
@@ -1524,7 +1532,7 @@ async fn every_organization_nested_write_refuses_a_soft_deleted_environment() {
     }
     // Second, all of the refusals carry the SAME headers as each other, down to the
     // middleware's stamp. That is what rules out one route adding or dropping a header
-    // the other twenty one do not, which no comparison against the bare rendered error
+    // the others do not, which no comparison against the bare rendered error
     // could see (the router's rate-limit layer stamps headers the renderer never emits).
     for (label, fields) in &refusals {
         assert_eq!(
@@ -1692,14 +1700,19 @@ async fn a_soft_deleted_environment_answers_a_write_exactly_as_an_absent_one_doe
     assert_eq!(deleted_body, malformed_body);
 }
 
-/// The SEVEN organization-addressed writes that carry an Idempotency-Key (the three
-/// creates and the four assigns), each with a request that succeeds against a freshly
-/// seeded [`Fixture`] and against no other case in this test.
+/// The organization-addressed keyed writes this test drives, each with a request that
+/// succeeds against a freshly seeded [`Fixture`] and against no other case in this test.
 ///
-/// The count is the one `org_context::resolve_live_org` states in prose. It is derived
-/// here rather than asserted against the contract, because "carries an Idempotency-Key"
-/// is a property of the handler and the document records it only as a `422` response and
-/// a header parameter; the seven are the routes that call `idempotency::replay_if_stored`.
+/// NOT all of them, and that used to be claimed here: "the SEVEN ... are the routes that call
+/// `idempotency::replay_if_stored`". That is false. The committed contract records the
+/// `Idempotency-Key` header per operation, and FOURTEEN organization-addressed operations carry
+/// it. The seven were never derived from anything, so the number could not notice the six it
+/// was missing.
+///
+/// It is derived now: `the_keyed_write_list_is_measured_against_the_contract` reads the header
+/// out of the document, subtracts what this list drives, and pins the remainder EXACTLY. The
+/// gap is a number in an assertion that fails when it moves, rather than a sentence claiming
+/// there is no gap.
 fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
     let Fixture {
         base,
@@ -1710,6 +1723,7 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
         spare_membership,
         spare_user,
         spare_permission,
+        member_user,
         ..
     } = fixture;
     let spare_role_ref = serde_json::json!({ "role_id": spare_role }).to_string();
@@ -1749,7 +1763,134 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             format!("{base}/groups/{group}/members"),
             serde_json::json!({ "membership_id": spare_membership }).to_string(),
         ),
+        // Added with the agent cases, because this change is what brings `registerAgent` into
+        // the sweep: a keyed write reaching the surface without reaching the replay fence is
+        // the gap the derived assertion below exists to make visible.
+        (
+            "agents.registerAgent",
+            format!("{base}/agents"),
+            serde_json::json!({
+                "linked_user_id": member_user,
+                "display_name": "Replay bot",
+                "tool_scopes": ["google"],
+            })
+            .to_string(),
+        ),
     ]
+}
+
+/// The keyed-write list is measured against the CONTRACT, not asserted in prose.
+///
+/// The document records `Idempotency-Key` as a header parameter per operation, so "which
+/// organization-addressed writes are keyed" is derivable, and the list above is therefore
+/// checkable. Two directions, and the second is the one that matters:
+///
+/// 1. everything the list drives really is a keyed organization operation, so a stale entry
+///    fails rather than quietly testing a route that no longer takes a key;
+/// 2. the operations NOT driven are pinned EXACTLY. A hand-written list with no such pin
+///    silently stops covering the surface every time a keyed route is added, which is what
+///    happened here: the doc claimed seven were all of them while six went undriven.
+///
+/// The remainder is a pin, not an aspiration. Driving the other six needs seed rows this
+/// fixture does not have (an API key, a service-account membership, a second organization to
+/// disable), and inventing them is a bigger change than the one that found this. Adding a
+/// keyed route without driving it now fails HERE, with its name in the message.
+#[test]
+fn the_keyed_write_list_is_measured_against_the_contract() {
+    const ORGANIZATION_PREFIX_LOCAL: &str = ORGANIZATION_PREFIX;
+    // MEASURED, not chosen: the contract records 14 and this list drives 8. Both halves come
+    // out of the assertion below, so neither is a number anybody typed from memory.
+    const UNDRIVEN: usize = 6;
+    let doc: Value = serde_json::from_str(COMMITTED_SPEC).expect("the committed spec parses");
+    let mut keyed: BTreeSet<String> = BTreeSet::new();
+    for (template, entries) in doc["paths"].as_object().expect("paths") {
+        if !template.starts_with(ORGANIZATION_PREFIX_LOCAL) {
+            continue;
+        }
+        for (_method, entry) in entries.as_object().expect("operations") {
+            let carries_key =
+                entry["parameters"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|parameter| {
+                        parameter["in"] == "header"
+                            && parameter["name"]
+                                .as_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case("Idempotency-Key"))
+                    });
+            if carries_key {
+                keyed.insert(
+                    entry["operationId"]
+                        .as_str()
+                        .expect("every operation carries an id")
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    assert!(
+        !keyed.is_empty(),
+        "the scan found no keyed organization operation at all, which is a broken scan rather \
+         than a clean result"
+    );
+
+    // A scan that found nothing to subtract would pass direction 2 vacuously.
+    let fixture = replay_fixture();
+    let driven: BTreeSet<String> = keyed_writes(&fixture)
+        .iter()
+        .map(|(label, _, _)| {
+            label
+                .split_once('.')
+                .expect("every label is module.operationId")
+                .1
+                .to_owned()
+        })
+        .collect();
+
+    let unknown: Vec<&String> = driven.difference(&keyed).collect();
+    assert!(
+        unknown.is_empty(),
+        "these entries name operations the contract does not record as keyed organization \
+         writes: {unknown:?}"
+    );
+
+    let undriven: Vec<&String> = keyed.difference(&driven).collect();
+    assert_eq!(
+        undriven.len(),
+        UNDRIVEN,
+        "the contract records {} keyed organization operations and this test drives {}. If a \
+         keyed route was ADDED, either drive it or raise the pin in the same change and say \
+         why; if one was removed, lower it. Not driven: {undriven:?}",
+        keyed.len(),
+        driven.len()
+    );
+}
+
+/// A [`Fixture`] with placeholder ids, for the database-free checks.
+///
+/// The keyed-write list only needs the SHAPE of each request, and building it needs a fixture.
+/// The ids never reach a database here.
+fn replay_fixture() -> Fixture {
+    Fixture {
+        base: "/v1/tenants/ten_x/environments/env_x/organizations/org_x".to_owned(),
+        org: "org_x".to_owned(),
+        role: "rol_x".to_owned(),
+        spare_role: "rol_y".to_owned(),
+        group: "grp_x".to_owned(),
+        child_group: "grp_y".to_owned(),
+        membership: "omb_x".to_owned(),
+        spare_membership: "omb_y".to_owned(),
+        spare_user: "usr_x".to_owned(),
+        permission: "prm_x".to_owned(),
+        spare_permission: "prm_y".to_owned(),
+        spare_client: "cli_y".to_owned(),
+        grant: "pgt_x".to_owned(),
+        member_user: "usr_m".to_owned(),
+        agent: "agp_x".to_owned(),
+        approval: "ava_x".to_owned(),
+        service_account: "sva_x".to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -1757,7 +1898,7 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
     // The ORDERING the fence inherits, pinned rather than merely observed.
     //
     // `org_context::resolve_live_org` runs the environment precondition, and every one of
-    // the seven keyed writes calls it AFTER its idempotency replay. That ordering is what
+    // the keyed writes it drives calls it AFTER its idempotency replay. That ordering is what
     // keeps a retry of a request that ALREADY SUCCEEDED from turning into a 404 the
     // client cannot tell from "my write never landed", and it is the whole reason the
     // precondition was put inside the resolution each handler already called rather than
@@ -1771,7 +1912,8 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
     //
     // Issue #409 established the same pin for the environment-scoped surface in
     // `tests/absent_environment.rs::a_replay_survives_the_environment_going_away`, on one
-    // route. This drives all SEVEN of the organization-addressed keyed writes, and adds
+    // route. This drives EIGHT of the fourteen organization-addressed keyed writes (the
+    // remainder is pinned by `the_keyed_write_list_is_measured_against_the_contract`), and adds
     // the FRESH-key control that one has no room for: without it a replay returning 201
     // is equally consistent with there being no fence at all.
     let h = Harness::start(50).await;
@@ -1924,4 +2066,41 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
         ],
         "and it still resolves every grant path created while the environment was live"
     );
+}
+
+/// The case counts the prose used to state as numerals, measured.
+///
+/// # Why this exists
+///
+/// This file carried at least six hand-written counts ("all twenty two writes", "the other
+/// twenty one", "the eleven together", "the seven keyed writes"). Every one of them was
+/// written when it was true and none of them was derived, so adding cases moved the surface
+/// and left the sentences behind: by the time a reviewer measured, the writes were 28 and the
+/// reads 13, and this change would have made it 32 and 15 without touching a word.
+///
+/// The prose no longer states them. This does, so the numbers exist in exactly one place and
+/// a change that moves them fails here rather than quietly making a paragraph wrong.
+#[test]
+fn the_case_counts_are_pinned_where_they_can_be_measured() {
+    const WRITES: usize = 32;
+    const READS: usize = 15;
+
+    let cases = replay_fixture_cases();
+    let writes = cases
+        .iter()
+        .filter(|case| matches!(case.intent, Intent::Write))
+        .count();
+    let reads = cases.len() - writes;
+    assert_eq!(
+        (writes, reads),
+        (WRITES, READS),
+        "the sweep drives {writes} writes and {reads} reads, not {WRITES} and {READS}. Update \
+         these two constants in the change that moves them; nothing else in this file states \
+         a count any more."
+    );
+}
+
+/// Every case, built against placeholder ids. See [`replay_fixture`].
+fn replay_fixture_cases() -> Vec<Case> {
+    replay_fixture().cases()
 }
