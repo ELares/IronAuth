@@ -52,7 +52,7 @@ async fn seed(db: &TestDatabase, env: &Env, scope: Scope) -> String {
             env,
             NewScimConnection {
                 id: &id,
-                organization_id: &org.to_string(),
+                organization_id: &org,
                 display_name: "Okta production",
                 provider: "okta",
                 token_digest: &digest_of(&token),
