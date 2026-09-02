@@ -16,6 +16,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::{Harness, REDIRECT_URI, form, json};
 use ironauth_config::OidcConfig;
+use ironauth_oidc::transaction_tokens::TRANSACTION_TOKEN_TYPE;
 use ironauth_oidc::{ClientAuthMethod, GrantType};
 use ironauth_store::ClientId;
 use serde_json::Value;
@@ -1034,7 +1035,6 @@ async fn the_mapping_reaches_an_exchanged_token() {
 // receive a signed assertion naming that person. Nothing in the mint's own suite could see it.
 // ===========================================================================
 
-const TRANSACTION_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:txn_token";
 const TRUST_DOMAIN: &str = "internal.example.test";
 
 #[tokio::test]
@@ -1200,9 +1200,14 @@ async fn a_transaction_token_request_naming_a_target_is_refused_rather_than_igno
     let (client, secret) = exchanging_client(&harness).await;
     let own = access_token_for(&harness, &client, &secret).await;
 
+    // A target the subject token ALREADY CARRIES, so `decide` permits it and the branch is
+    // what refuses. The first version named a stranger, which `decide_exchange` rejects as
+    // `AudienceWidened` -> `invalid_target` before the branch is reached: the test asserted the
+    // right code for the wrong reason and passed with the branch's check deleted.
+    let own_audience = client.to_string();
     for (name, value) in [
-        ("audience", "https://api.example.test"),
-        ("resource", "https://api.example.test"),
+        ("audience", own_audience.as_str()),
+        ("resource", own_audience.as_str()),
     ] {
         let (status, body) = exchange(
             &harness,
@@ -1250,7 +1255,14 @@ async fn a_transaction_token_request_still_runs_the_agent_gate() {
     harness.install_transaction_token_domain(TRUST_DOMAIN);
     let (client, secret) = exchanging_client(&harness).await;
     let own = access_token_for(&harness, &client, &secret).await;
-    let agent = harness.seed_agent_for_client(&client, &["deploy"]).await;
+    // DECLARING EXACTLY WHAT THE SUBJECT TOKEN CARRIES. The gate refuses any requested scope
+    // outside the declared set, and with no `scope` parameter the decided scope IS the subject
+    // token's (`openid profile`), so an agent declaring `deploy` would have failed the control
+    // below with `invalid_scope` -- and the test would have measured the scope rule instead of
+    // the revocation it is named for.
+    let agent = harness
+        .seed_agent_for_client(&client, &["openid", "profile"])
+        .await;
 
     // The control: while the agent is live, the exchange issues.
     let (status, body) = exchange(
@@ -1288,9 +1300,25 @@ async fn a_transaction_token_request_still_runs_the_agent_gate() {
         body.get("access_token").is_none(),
         "and nothing is issued: {body}"
     );
+    // The denial NAMES the state that refused. A bare count cannot tell "refused because
+    // revoked" from "refused because the scope was undeclared", and both write to this action.
+    let rows = harness.audit_rows_for_action("agent_token.deny").await;
     assert!(
-        harness.count_audit_action("agent_token.deny").await >= 1,
-        "and the denial is recorded, as it is on every other door"
+        rows.iter()
+            .any(|row| row.detail.as_deref() == Some("reason=revoked")),
+        "the denial names the state that refused: {rows:?}"
+    );
+
+    // AND THE SUCCESSFUL MINT IS ATTRIBUTED TO THE AGENT. `docs/agents.md` says every one of
+    // the four issuance paths is attributed to the agent's organization and linked user, so a
+    // per-organization SIEM stream delivers them. The branch ran the gate and threw away the
+    // agent it returned, so a revoked agent's DENIAL reached that stream while a successful
+    // mint reached nothing -- for the one credential that is neither revocable nor
+    // introspectable, and whose audit row the change itself calls the only record it exists.
+    assert_eq!(
+        harness.count_audit_action("agent_token.issue").await,
+        1,
+        "the control's mint is attributed to the agent, exactly as the other three doors are"
     );
 }
 

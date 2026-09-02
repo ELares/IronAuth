@@ -37,7 +37,13 @@
 //! | `txn` | a fresh id | the transaction every hop shares |
 //! | `rctx` | the authenticated client | which workload asked for THIS token |
 //! | `azd` | the exchange's DECIDED scope | what THIS request was authorized to do |
+//! | `act` | the exchange's decision, for a DELEGATION | who is acting for the subject |
 //! | `purp` | NOT SET by the exchange path | see below |
+//!
+//! An ABSENT `act` is ambiguous by design: it means a downscope OR an impersonation, because
+//! RFC 8693 section 1.1 defines impersonation as the actor not being distinguishable in the
+//! token. A verifier cannot tell the two apart, and is not meant to; the audit row's `mode=`
+//! is where that distinction lives, which is why the row records it.
 //! | `iat`, `exp` | the clock | short, and bounded here rather than configured |
 //!
 //! `sub` comes from the token the exchange REVALIDATED, never from a claim read out of an
@@ -68,8 +74,8 @@
 //! Stated plainly so nothing here reads as finished.
 //!
 //! - **`azd` is the exchange's decided scope, not RFC 9396 authorization details.** The draft's
-//!   `azd` is a rich object describing what was authorized; this carries what IronAuth actually
-//!   knows about the original request. A deployment making decisions on `azd` would need the
+//!   `azd` is a rich object describing what was authorized; this carries the narrowed scope this
+//!   exchange settled on, which is what THIS request may do. A deployment making decisions on `azd` would need the
 //!   richer shape, and the edge would need to have carried it in.
 //! - **No replay recording, and no `txn` reuse across a call chain.** Every request mints a
 //!   fresh transaction id, so two hops of one logical transaction get two ids. The draft's model
@@ -355,16 +361,17 @@ pub async fn issue_transaction_token(
 /// an access token would have a credential with entirely different reach, and the field is how
 /// it can tell without parsing the token.
 fn transaction_token_response(token: &str) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-    (
-        axum::http::StatusCode::OK,
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        axum::Json(json!({
+    // Through `token_ok`, the shared success shape every other token-endpoint response uses.
+    // The hand-rolled version set `Cache-Control` and dropped `Pragma: no-cache`, which RFC
+    // 6749 section 5.1 requires alongside it -- a second spelling of "the token response" that
+    // had already drifted from the first on its first outing.
+    crate::token::token_ok(
+        &json!({
             "access_token": token,
             "issued_token_type": TRANSACTION_TOKEN_TYPE,
             "token_type": "N_A",
             "expires_in": MAX_LIFETIME_SECS,
-        })),
+        })
+        .to_string(),
     )
-        .into_response()
 }

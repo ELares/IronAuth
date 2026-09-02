@@ -258,16 +258,6 @@ fn every_machine_token_door_runs_the_agent_gate() {
         ("token.rs", include_str!("../src/token.rs")),
         ("backchannel.rs", include_str!("../src/backchannel.rs")),
     ];
-    /// Every mint-request TYPE that carries a user subject.
-    ///
-    /// Keying the scan on `ClientCredentialsMintRequest {` alone made it blind to exactly the
-    /// regression it exists to catch: the transaction-token branch (issue #133) returned from
-    /// `token_exchange.rs` before the gate, and because that file still contained both strings
-    /// the scan stayed green while a revoked agent's client could mint through the new path.
-    const MINT_REQUESTS: &[&str] = &[
-        "ClientCredentialsMintRequest {",
-        "TransactionTokenRequest {",
-    ];
     const DOORS: &[(&str, &str)] = &[
         (
             "client_credentials.rs",
@@ -305,23 +295,16 @@ fn every_machine_token_door_runs_the_agent_gate() {
         );
     }
 
-    // A DOOR THAT MINTS SOMETHING ELSE: every mint-request type, not just the one this test
-    // was written around. See `MINT_REQUESTS` above for what that missed.
-    for (name, source) in DOORS.iter().chain(CRATE_SOURCES.iter()) {
-        for request in MINT_REQUESTS {
-            if source.contains(request) {
-                assert!(
-                    source.contains("gate_agent_issuance("),
-                    "{name} builds {request} without running the agent gate"
-                );
-            }
-        }
-    }
-
-    // The transaction-token branch lives in `token_exchange.rs` and calls the gate ITSELF
-    // rather than reaching `issue()`. Pinned by NAME because the file-level check above is
-    // satisfied by the one call `issue()` already makes: a scan that only asks "does this file
-    // mention the gate" cannot tell one caller from two, and one of the two is the whole point.
+    // AND `token_exchange.rs` HAS TWO MINTING PATHS, each of which must run the gate for
+    // itself: the ordinary one through `issue()` and the transaction-token branch (issue #133),
+    // which returns before `issue()` is reached. The file-level check above cannot express
+    // that -- it is satisfied by either call alone, which is exactly why the branch shipped
+    // ungated and this scan stayed green.
+    //
+    // A COUNT rather than a set of file names, because the property is "how many minting paths
+    // gate themselves", and the transaction-token request is BUILT in `transaction_tokens.rs`
+    // while the gate belongs to its CALLER. Listing that module beside the doors would assert
+    // the gate lives where it must not.
     let exchange = include_str!("../src/token_exchange.rs");
     assert_eq!(
         exchange.matches("gate_agent_issuance(").count(),

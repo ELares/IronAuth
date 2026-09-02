@@ -23,6 +23,12 @@ rather than defaulting it: a default trust domain is one nobody chose. Both that
 acknowledgment are required, and neither implies the other; with either missing, the requested
 type is refused exactly as any unknown URI is.
 
+`act` rides in the token for a DELEGATION, naming the party acting for the subject -- delegation
+is the only exchange mode with no per-client policy flag, so that claim is its whole
+accountability control. It is deliberately absent for an IMPERSONATION (RFC 8693 section 1.1),
+which makes an absent `act` ambiguous between the two; the audit row's `mode=` is where that
+distinction lives.
+
 **Known limits, recorded in `docs/experimental/transaction-tokens.md`:** `azd` carries the
 exchange's DECIDED (narrowed) scope rather than RFC 9396 authorization details, there is no
 replacement flow

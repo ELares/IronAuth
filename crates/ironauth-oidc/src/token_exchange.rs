@@ -725,17 +725,11 @@ async fn revalidated(
     })
 }
 
-/// The transaction-token branch of the exchange (issue #133, PROTOTYPE).
+/// Everything the transaction-token branch needs from the exchange (issue #133).
 ///
-/// Its own function so `token_exchange_grant` stays readable, and because what it does is worth
-/// naming: it runs the ONE control the shared `issue()` path would have run for it, and then
-/// mints something `issue()` cannot.
-///
-/// # Errors
-///
-/// [`TokenError::InvalidTarget`] when the request also named a target;
-/// [`TokenError::UnauthorizedClient`] or [`TokenError::InvalidScope`] from the agent gate; and
-/// whatever the mint or its audit write returns.
+/// A struct rather than nine positional arguments, four of which are references to string-ish
+/// things: a transposed pair would mint a token naming the wrong client or gate the wrong
+/// scope while compiling cleanly.
 struct TransactionTokenBranch<'a> {
     /// The environment's issuer entry, for its signer.
     entry: &'a std::sync::Arc<crate::issuer::IssuerEntry>,
@@ -753,6 +747,17 @@ struct TransactionTokenBranch<'a> {
     mode: ExchangeMode,
 }
 
+/// The transaction-token branch of the exchange (issue #133, PROTOTYPE).
+///
+/// Its own function so `token_exchange_grant` stays readable, and because what it does is worth
+/// naming: it runs the ONE control the shared `issue()` path would have run for it, and then
+/// mints something `issue()` cannot.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidTarget`] when the request also named a target;
+/// [`TokenError::UnauthorizedClient`] or [`TokenError::InvalidScope`] from the agent gate; and
+/// whatever the mint or its audit write returns.
 async fn transaction_token(
     state: &OidcState,
     scope: Scope,
@@ -790,15 +795,11 @@ async fn transaction_token(
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    crate::token::gate_agent_issuance(
-        state,
-        scope,
-        client_id_str,
-        (!granted.is_empty()).then_some(granted.as_str()),
-    )
-    .await?;
+    let granted_scope = (!granted.is_empty()).then_some(granted.as_str());
+    let agent =
+        crate::token::gate_agent_issuance(state, scope, client_id_str, granted_scope).await?;
 
-    crate::transaction_tokens::issue_transaction_token(
+    let response = crate::transaction_tokens::issue_transaction_token(
         state,
         scope,
         entry,
@@ -815,7 +816,16 @@ async fn transaction_token(
             act: decision.act.as_ref(),
         },
     )
-    .await
+    .await?;
+
+    // The AGENT ISSUANCE row, after the token exists, exactly as the other three doors write
+    // it. The gate's return value used to be discarded, so a revoked agent's DENIAL was
+    // attributed to its organization and linked user while a successful mint was attributed to
+    // nobody -- and `docs/agents.md` promises a per-organization stream carries both.
+    if let Some(agent) = &agent {
+        crate::token::record_agent_issuance(state, scope, agent, granted_scope).await;
+    }
+    Ok(response)
 }
 
 /// A stable label for an exchange mode, for a log line and an audit detail.

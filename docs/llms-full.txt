@@ -643,7 +643,7 @@ enabled even when absent from `[features]`, and can be turned off with
 | `risk-signals` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Third-party risk-signal ingestion (issue #82): a signed Security Event Token (JWS) authenticated ingestion endpoint verified per-source through the hardened JOSE core, plus the #79 risk-engine path that folds a subject's fresh external signals in as WEIGHTED policy inputs that structurally can never be a verdict. EXPLORATORY: the ingestion wire contract and the CAEP/SSF alignment are early and may break between releases. |
 | `sample-experimental` | experimental | no | 0.1.0-exp.1 | crates/ironauth-config/CHANGELOG.md | Sample experimental flag exercising the acknowledgment gate; gates no behavior. |
 | `signup-quarantine` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Signup fraud review queue (issue #82): a register-path hook that QUARANTINES a risky signup (a disposable-domain block or a failed proof-of-work challenge) instead of blocking it, so a false positive stays recoverable. A quarantined account CAN authenticate but with limited privileges (consent is always shown and every sensitive scope is stripped from any grant), and an admin releases, rejects, or extends the case through the management review queue. EXPLORATORY: the quarantine model is early and may break between releases. |
-| `transaction-tokens` | experimental | no | draft-ietf-oauth-transaction-tokens-09 | crates/ironauth-oidc/CHANGELOG.md | Transaction tokens (issue #133, draft-ietf-oauth-transaction-tokens): a short-lived signed JWT scoped to ONE request inside ONE trust domain, carrying the person, the workload asking, and what the original request was authorized to do -- so an internal hop needs neither the user's own access token nor an unsigned header. Requested through RFC 8693 token exchange. PROTOTYPE: the wire format is an IETF draft, `azd` carries the exchange's DECIDED (narrowed) scope rather than RFC 9396 authorization details, authorization details, there is no replacement flow so each request mints its own transaction id, and NOTHING is minted until a trust domain is configured, because a token with no audience has nowhere it may be spent. |
+| `transaction-tokens` | experimental | no | draft-ietf-oauth-transaction-tokens-09 | crates/ironauth-oidc/CHANGELOG.md | Transaction tokens (issue #133, draft-ietf-oauth-transaction-tokens): a short-lived signed JWT scoped to ONE request inside ONE trust domain, carrying the person, the workload asking, and what the original request was authorized to do -- so an internal hop needs neither the user's own access token nor an unsigned header. Requested through RFC 8693 token exchange. PROTOTYPE: the wire format is an IETF draft, `azd` carries the exchange's DECIDED (narrowed) scope rather than RFC 9396 authorization details, there is no replacement flow so each request mints its own transaction id, and NOTHING is minted until a trust domain is configured, because a token with no audience has nowhere it may be spent. |
 | `wasm-hooks` | experimental | no | 0.1.0-exp.1 | crates/ironauth-hooks/CHANGELOG.md | In-process WASM component hooks that shape token claims (issue #114): a deny-by-default capability sandbox with fuel, memory, deadline and host-resource bounds. EXPERIMENTAL because the WIT interface may still move before the decade-ABI commitment; a hook is a compiled artifact built against it. |
 
 ---
@@ -9013,6 +9013,7 @@ A transaction token is a short-lived signed JWT scoped to **one transaction insi
 | `txn` | a fresh id | the transaction every hop shares |
 | `rctx` | the authenticated client | which workload asked for this token (see the deviation below) |
 | `azd` | the exchange's **decided** scope | what *this* request was authorized to do |
+| `act` | the exchange's decision, for a **delegation** | who is acting for the subject |
 | `purp` | **not set** | see below |
 | `iat`, `exp` | the clock | at most five minutes |
 
@@ -9045,6 +9046,8 @@ subject_token_type=urn:ietf:params:oauth:token-type:access_token
 requested_token_type=urn:ietf:params:oauth:token-type:txn_token
 ```
 
+**An absent `act` is ambiguous, deliberately.** It means a downscope **or** an impersonation: RFC 8693 §1.1 defines impersonation as the actor not being distinguishable in the token. A service in the trust domain cannot tell the two apart and is not meant to -- the audit row's `mode=` is where that distinction lives, which is why the row records it. An impersonated transaction token is traceable only through that row.
+
 **`audience` and `resource` are refused, not ignored.** A transaction token's audience is the trust domain, so a request that also names a target asked for two different things. It answers `invalid_target`, which is what the ordinary exchange answers for an unregistered one -- silently ignoring a narrowing request would leave the caller believing it constrained something it did not.
 
 **`purp` is not set.** The draft defines the claim and defines no request parameter that carries it, and the only free string a caller can send on this endpoint is `scope`, which means *narrow to this* everywhere else here. Reading it as a purpose would make one parameter mean two things depending on the requested token type. A graduation that wants `purp` should define a parameter for it.
@@ -9053,6 +9056,7 @@ requested_token_type=urn:ietf:params:oauth:token-type:txn_token
 
 ## Deviations from the draft, stated
 
+- **`act` rides in the token for a delegation** and is deliberately absent for an impersonation, per RFC 8693 §1.1. Delegation is the only exchange mode with no per-client policy flag, so `act` is its whole accountability control.
 - **`rctx` is `{"workload": "<client id>"}`**, which is IronAuth's shape, not one the draft prescribes. The draft leaves the requester context's contents to the deployment; this is the smallest thing that answers "which workload asked".
 - **`azd` is `{"scope": [...]}`** carrying the exchange's decided scope, where the draft's `azd` is a rich object describing what was authorized.
 - **`purp` is never set** (see above).

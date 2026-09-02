@@ -2472,6 +2472,18 @@ impl Harness {
         client: &ClientId,
         tool_scopes: &[&str],
     ) -> ironauth_store::AgentPrincipalId {
+        self.seed_agent_returning(client, tool_scopes).await.0
+    }
+
+    /// The same, handing back the linked user and the organization too.
+    ///
+    /// `agent_issuance.rs` needs both to assert an issued token names them, and had its own
+    /// copy of these two INSERTs. One fixture, two shapes.
+    pub async fn seed_agent_returning(
+        &self,
+        client: &ClientId,
+        tool_scopes: &[&str],
+    ) -> (ironauth_store::AgentPrincipalId, String, String) {
         let scope = self.scope;
         let organization = ironauth_store::OrganizationId::generate(&self.env, &scope);
         sqlx::query(
@@ -2505,7 +2517,7 @@ impl Harness {
         .execute(self.db.owner_pool())
         .await
         .expect("seed agent");
-        id
+        (id, linked.to_string(), organization.to_string())
     }
 
     /// Move a seeded agent to `state`, as the control plane would.

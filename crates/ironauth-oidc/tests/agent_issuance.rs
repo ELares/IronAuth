@@ -22,7 +22,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::{Harness, form, json, verify_clock};
 use ironauth_jose::verify;
 use ironauth_oidc::ClientAuthMethod;
-use ironauth_store::{AgentPrincipalId, ClientId, OrganizationId};
+use ironauth_store::{AgentPrincipalId, ClientId};
 
 /// A standard-padded Basic credential of `client_id:client_secret`.
 fn basic_header(client_id: &str, secret: &str) -> String {
@@ -50,52 +50,14 @@ struct SeededAgent {
 }
 
 async fn seed_agent(harness: &Harness, client: &ClientId, tool_scopes: &[&str]) -> SeededAgent {
-    let env = harness.env();
-    let scope = harness.scope();
-    // The organization row directly: `organizations()` is a CONTROL-plane repository and
-    // this suite drives the data plane. The agent's foreign key needs the row to exist, not
-    // the management route that usually creates it.
-    let organization = OrganizationId::generate(env, &scope);
-    sqlx::query(
-        "INSERT INTO organizations /* query-audit-allow: owner test seed */ \
-         (id, tenant_id, environment_id, display_name) VALUES ($1, $2, $3, 'agent org')",
-    )
-    .bind(organization.to_string())
-    .bind(scope.tenant().to_string())
-    .bind(scope.environment().to_string())
-    .execute(harness.db().owner_pool())
-    .await
-    .expect("seed organization");
-    let user = harness.seed_unique_user().await;
-    let linked_user = ironauth_store::UserId::parse_in_scope(&user, &scope).expect("user id");
-
-    // The agent row directly, for the same reason the organization is: registering an agent
-    // is a CONTROL-plane write and the data-plane role this suite runs as holds only SELECT
-    // on `agents`. That split is the design, not an obstacle -- the token doors must be able
-    // to READ an agent and must not be able to create one -- so the fixture writes as the
-    // owner rather than the suite asking for a privilege the gate should never have.
-    let id = AgentPrincipalId::generate(env, &scope);
-    let tools: Vec<String> = tool_scopes.iter().map(|t| (*t).to_owned()).collect();
-    sqlx::query(
-        "INSERT INTO agents /* query-audit-allow: owner test seed */ \
-         (id, tenant_id, environment_id, organization_id, linked_user_id, display_name, \
-          state, tool_scopes, client_id) \
-         VALUES ($1, $2, $3, $4, $5, 'deploy bot', 'active', $6, $7)",
-    )
-    .bind(id.to_string())
-    .bind(scope.tenant().to_string())
-    .bind(scope.environment().to_string())
-    .bind(organization.to_string())
-    .bind(linked_user.to_string())
-    .bind(&tools)
-    .bind(client.to_string())
-    .execute(harness.db().owner_pool())
-    .await
-    .expect("seed agent");
+    // Through the SHARED fixture. This file had its own copy of the same two INSERTs, and two
+    // copies of a fixture drift: the newer one was written for a different suite and threw away
+    // the linked user and organization this one asserts on.
+    let (id, linked_user, organization) = harness.seed_agent_returning(client, tool_scopes).await;
     SeededAgent {
         id,
-        linked_user: linked_user.to_string(),
-        organization: organization.to_string(),
+        linked_user,
+        organization,
     }
 }
 
