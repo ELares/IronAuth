@@ -309,6 +309,24 @@ struct Fixture {
     spare_client: String,
     /// Seeded live: the target of the withdrawal case.
     grant: String,
+    /// The user behind `membership`, so the agent cases can link a user who is a MEMBER of
+    /// this organization.
+    ///
+    /// `register_agent` does NOT require that today: it checks only that the user exists in
+    /// the scope. These cases link a member anyway, because an agent acting for someone with
+    /// no standing in the organization is the thing that check would be added for, and a case
+    /// that depends on its absence would start failing the day it arrives.
+    member_user: String,
+    /// An agent registered in this organization (issue #130), linked to `member_user`.
+    /// Declares one tool, `google`, because storing a vault connection refuses a provider
+    /// the agent never declared and refuses one that is not a lowercase identifier.
+    agent: String,
+    /// A PENDING vault approval for `agent` (issue #132), seeded through the store because
+    /// nothing on the management plane raises one: an approval is raised by the agent's own
+    /// token exchange when it names a sensitive action. The listing case names this row and
+    /// the decision case answers it, in that order, because a decided approval leaves the
+    /// pending queue.
+    approval: String,
     /// The REAL service-account principal of `spare_client`, minted rather than made
     /// up. An absent `sva_` id answers the uniform not-found at a HEALTHY environment
     /// too, which would leave the soft-deleted fence unmeasurable through the
@@ -420,6 +438,8 @@ impl Fixture {
 
         let (spare_client, grant, service_account) =
             Self::seed_project_grant(h, tenant, environment, &base, &role, key).await;
+        let (agent, approval) = Self::seed_agent(h, tenant, environment, &base, &user, key).await;
+        let member_user = user.clone();
 
         let fixture = Self {
             base,
@@ -435,6 +455,9 @@ impl Fixture {
             spare_permission,
             spare_client,
             grant,
+            member_user,
+            agent,
+            approval,
             service_account,
         };
         fixture.seed_relations(h, key).await;
@@ -514,6 +537,79 @@ impl Fixture {
             .expect("mint the service-account principal")
             .to_string();
         (spare_client, grant, service_account)
+    }
+
+    /// An agent in this organization and one PENDING approval for it (issues #130, #132).
+    ///
+    /// The agent goes through the API, so the seed drives the same path a caller would and a
+    /// broken registration surfaces here rather than as a puzzling 404 in a later case. It
+    /// declares exactly one tool, `google`, because storing a vault connection refuses a
+    /// provider the agent never declared AND refuses one that is not a lowercase identifier,
+    /// so the declared tool and the connection case's provider have to be the same shaped
+    /// string.
+    ///
+    /// The APPROVAL goes through the store, and that is not a shortcut: nothing on the
+    /// management plane raises one. An approval is raised by the AGENT's own token exchange
+    /// when it names a sensitive action, which is a data-plane path this suite does not
+    /// drive. The queue's listing and decision routes are management-plane, so the row has to
+    /// exist before either can address it.
+    ///
+    /// Split out from [`Fixture::seed`] for the same reason [`Fixture::seed_project_grant`]
+    /// is: the crate's function-length lint.
+    async fn seed_agent(
+        h: &Harness,
+        tenant: &str,
+        environment: &str,
+        base: &str,
+        linked_user: &str,
+        key: &str,
+    ) -> (String, String) {
+        let agent = seed_row(
+            h,
+            &format!("{base}/agents"),
+            &format!("{key}-agt"),
+            &serde_json::json!({
+                "linked_user_id": linked_user,
+                "display_name": "Deploy bot",
+                "tool_scopes": ["google"],
+            })
+            .to_string(),
+            "agent",
+        )
+        .await;
+
+        let scope = Scope::new(
+            TenantId::parse(tenant).expect("tenant id"),
+            EnvironmentId::parse(environment).expect("environment id"),
+        );
+        let sys = Env::system();
+        let approval = ironauth_store::AgentVaultApprovalId::generate(&sys, &scope);
+        h.store()
+            .scoped(scope)
+            .acting(
+                ActorRef::service(ServiceId::generate(&sys)),
+                CorrelationId::generate(&sys),
+            )
+            .agent_vault_approvals()
+            .request(
+                &sys,
+                ironauth_store::NewVaultApproval {
+                    id: &approval,
+                    agent_id: &ironauth_store::AgentPrincipalId::parse_in_scope(&agent, &scope)
+                        .expect("the registered agent id parses in scope"),
+                    provider: "google",
+                    requested_details: &serde_json::json!([{ "type": "google", "actions": ["send"] }]),
+                    // 64 lowercase hex characters, which is what the column accepts.
+                    action_digest: &"a1".repeat(32),
+                    // Far enough out that the row is still PENDING when the cases run: a
+                    // timed-out approval retires itself lazily and would leave the listing
+                    // case reading an empty queue.
+                    expires_at_unix_micros: i64::from(u32::MAX) * 1_000_000,
+                },
+            )
+            .await
+            .expect("seed a pending vault approval");
+        (agent, approval.to_string())
     }
 
     /// Bind the entities together, so every WITHDRAWAL case has something live to
@@ -599,7 +695,41 @@ impl Fixture {
     fn read_cases(&self) -> Vec<Case> {
         let mut cases = self.organization_read_cases();
         cases.extend(self.group_and_membership_read_cases());
+        cases.extend(self.agent_read_cases());
         cases
+    }
+
+    /// The two AGENT listings (issues #130, #132), each naming the row it must still carry.
+    ///
+    /// Both come BEFORE the writes, and for the approvals queue that ordering is load
+    /// bearing: `listAgentVaultApprovals` returns the approvals AWAITING a decision, and
+    /// `decideAgentVaultApproval` below answers this very row. Run the other way round, the
+    /// listing would read an empty queue and the case would prove nothing.
+    fn agent_read_cases(&self) -> Vec<Case> {
+        let Self {
+            base,
+            agent,
+            approval,
+            ..
+        } = self;
+        vec![
+            Case {
+                label: "agents.listAgents",
+                method: "GET",
+                path: format!("{base}/agents"),
+                body: None,
+                intent: Intent::Read(vec![agent.clone()]),
+                live: StatusCode::OK,
+            },
+            Case {
+                label: "agents.listAgentVaultApprovals",
+                method: "GET",
+                path: format!("{base}/agent-approvals"),
+                body: None,
+                intent: Intent::Read(vec![approval.clone()]),
+                live: StatusCode::OK,
+            },
+        ]
     }
 
     /// The reads over the organization itself and its ROLES. Split from
@@ -780,7 +910,77 @@ impl Fixture {
     fn amending_write_cases(&self) -> Vec<Case> {
         let mut cases = self.amending_group_write_cases();
         cases.extend(self.amending_role_write_cases());
+        cases.extend(self.agent_write_cases());
         cases
+    }
+
+    /// The four AGENT writes (issues #130, #132).
+    ///
+    /// All four are amending rather than destructive, and the ORDER inside this vector is the
+    /// order they run in. It matters twice. `storeAgentVaultConnection` refuses a provider
+    /// the agent has not declared and refuses one that is not a lowercase identifier, so it
+    /// names the single tool the seed declared. And `setAgentState` goes to `suspended`
+    /// rather than `revoked`: revocation is TERMINAL, so a revoking case would leave every
+    /// later case in the live pass addressing a dead agent.
+    fn agent_write_cases(&self) -> Vec<Case> {
+        let Self {
+            base,
+            agent,
+            approval,
+            member_user,
+            ..
+        } = self;
+        vec![
+            Case {
+                // A SECOND agent for the SAME member. `agents` has no uniqueness on
+                // `linked_user_id`, so this is a 201 rather than a conflict against the row
+                // the seed already created.
+                label: "agents.registerAgent",
+                method: "POST",
+                path: format!("{base}/agents"),
+                body: Some(
+                    serde_json::json!({
+                        "linked_user_id": member_user,
+                        "display_name": "Second bot",
+                        "tool_scopes": ["google"],
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
+                label: "agents.storeAgentVaultConnection",
+                method: "PUT",
+                path: format!("{base}/agents/{agent}/vault-connections"),
+                body: Some(
+                    serde_json::json!({
+                        "provider": "google",
+                        "access_token": "downstream-access-token",
+                        "granted_scopes": ["send"],
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::OK,
+            },
+            Case {
+                label: "agents.decideAgentVaultApproval",
+                method: "POST",
+                path: format!("{base}/agent-approvals/{approval}/decision"),
+                body: Some(serde_json::json!({ "approve": true }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "agents.setAgentState",
+                method: "PUT",
+                path: format!("{base}/agents/{agent}/state"),
+                body: Some(serde_json::json!({ "state": "suspended" }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::OK,
+            },
+        ]
     }
 
     /// The amending writes over the organization's GROUP forest.
@@ -1134,6 +1334,9 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         spare_permission: "prm_y".to_owned(),
         spare_client: "cli_y".to_owned(),
         grant: "pgt_x".to_owned(),
+        member_user: "usr_m".to_owned(),
+        agent: "agp_x".to_owned(),
+        approval: "ava_x".to_owned(),
         service_account: "sva_x".to_owned(),
     };
     let cases = fixture.cases();

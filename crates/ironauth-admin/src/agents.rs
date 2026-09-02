@@ -70,9 +70,12 @@ const SETTABLE_STATES: [&str; 3] = ["active", "suspended", "revoked"];
 #[allow(
     clippy::too_many_lines,
     reason = "one line over the pedantic bound. The body is the registration in order: \
-    resolve the live organization, check the linked user is in it, parse and bound the \
-    declared tool set, insert, audit. Splitting it would separate the membership check \
-    from the insert it gates, which is the seam that must not be easy to skip"
+    resolve the live organization, check the linked user EXISTS in this scope, parse and \
+    bound the declared tool set, insert, audit. Splitting it would separate the existence \
+    check from the insert it gates, which is the seam that must not be easy to skip. It is \
+    an EXISTENCE check and not a membership one: nothing here requires the linked user to \
+    be a member of the organization the agent acts inside, and an earlier version of this \
+    very comment said otherwise"
 )]
 pub async fn register_agent(
     State(state): State<AdminState>,
