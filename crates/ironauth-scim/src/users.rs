@@ -31,12 +31,11 @@
 //! (migration 0184), keyed by connection, and this module never reads or writes the
 //! environment-wide column.
 //!
-//! # What is NOT here yet
+//! # Mounted, behind a config flag
 //!
-//! The BOOT MOUNT. Groups ship beside this module in `groups.rs` and are mounted by
-//! `scim_router` alongside these routes; what the binary does not yet do is serve that router.
-//! Mounting it, behind its config flag and with `ScimLimits` plumbed from configuration, is
-//! the next slice, and is deliberately done ONCE for the whole surface.
+//! `crates/ironauth/src/main.rs` serves this router on the public plane when `scim.enabled`
+//! is set, with the page and scan bounds plumbed from `[scim]`. While it is off nothing under
+//! `/scim/v2` is mounted and every such path is a uniform 404.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};

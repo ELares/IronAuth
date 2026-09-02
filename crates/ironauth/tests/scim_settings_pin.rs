@@ -17,7 +17,9 @@
 //! of these numbers read "`scim_settings_pin.rs` in the `ironauth` crate asserts the two
 //! agree, because this crate cannot see that one" -- and a reviewer found that no such file
 //! existed. The pattern had been copied from `outbox_settings_pin.rs` without the pin. So
-//! the numbers agreed only by coincidence, under a sentence saying they were checked.
+//! the numbers agreed only by coincidence, under a sentence saying they were checked. (For
+//! `max_scan` "coincidence" is too strong -- the SCIM side is derived from the store's list
+//! cap -- but `max_results` is two hand-written literals and nothing compared them.)
 //!
 //! # What drifting would actually cost
 //!
@@ -55,14 +57,15 @@ fn neither_default_exceeds_the_bound_that_makes_the_refusal_reachable() {
     // but nothing refuses the SCIM crate's own default -- it is what every deployment that
     // never opens the section, and every test in that crate, actually runs on.
     let cap = usize::try_from(ironauth_store::MANAGEMENT_LIST_HARD_CAP).expect("a small cap");
-    assert!(
-        ironauth_scim::ScimLimits::default().max_scan <= cap,
-        "the SCIM crate's default scan bound exceeds the store's list cap, so the tooMany \
-         refusal is unreachable and a large listing truncates silently"
-    );
+    // NOT asserted on the SCIM side: `ScimLimits::default().max_scan` IS a const-eval of
+    // `MANAGEMENT_LIST_HARD_CAP`, so `cap <= cap` is a tautology with both sides tracing to
+    // one constant. A reviewer caught that, and it also corrects this file's header: the two
+    // defaults do not agree by coincidence on this field, the SCIM side is DERIVED from the
+    // store cap. The config side is a hand-written literal and is the one that can drift.
     assert!(
         ironauth_config::ScimConfig::default().max_scan as usize <= cap,
-        "the configured default scan bound exceeds the store's list cap"
+        "the configured default scan bound exceeds the store's list cap, so the tooMany \
+         refusal is unreachable and a large listing truncates silently"
     );
     // And a page can be filled, which is the other half validate_scim enforces.
     assert!(ironauth_scim::ScimLimits::default().max_results >= 1);

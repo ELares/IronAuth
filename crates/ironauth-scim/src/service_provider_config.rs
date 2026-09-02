@@ -473,11 +473,16 @@ mod payload_bound_tests {
         // request limit, or the bulk surface would advertise a payload size the router refuses
         // before the bulk validator ever sees it -- an advertised capability no request can
         // use, which is the defect class this document exists to avoid.
-        assert!(
-            BulkLimits::default().max_payload_bytes <= crate::server::MAX_REQUEST_BYTES,
-            "the advertised bulk payload bound ({}) exceeds what the router accepts ({})",
+        // EQUALITY, because that is what the prose claims. An earlier version asserted only
+        // `<=`, which stays green while `BulkLimits` drops to 512 KiB and the sentence saying
+        // they are "the same figure" becomes false. The direction the `<=` guarded still
+        // matters and is implied: the bulk bound cannot exceed what the router accepts, or the
+        // document would advertise a payload no request can deliver.
+        assert_eq!(
             BulkLimits::default().max_payload_bytes,
-            crate::server::MAX_REQUEST_BYTES
+            crate::server::MAX_REQUEST_BYTES,
+            "the advertised bulk payload bound and the router's body limit are the same \
+             figure written twice; they have drifted"
         );
     }
 }

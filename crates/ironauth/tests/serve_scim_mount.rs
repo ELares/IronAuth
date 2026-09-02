@@ -97,8 +97,10 @@ fn write_config(db: &TestDatabase, scim_enabled: bool, label: &str) -> std::path
     std::fs::write(
         &path,
         format!(
-            "[database]\nurl = \"{}\"\n\n\
+            "[database]\nurl = \"{}\"\n\
+             master_key = \"serve-scim-mount-suite-master-key\"\n\n\
              [server]\nbind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\n\n\
+             [oidc]\nenabled = true\n\n\
              [scim]\nenabled = {scim_enabled}\n",
             db.app_url(),
         ),
@@ -219,6 +221,28 @@ fn the_mounted_scim_surface_answers_on_the_public_plane() {
             .contains("SCIM 2.0 inbound provisioning mounted"),
         "the boot must SAY it mounted, so an operator can tell: {}",
         process.log()
+    );
+    // THE COMPOSITION IS ASSERTED, not just described. A previous revision of this file
+    // claimed in a comment that the OIDC plane was enabled too and never changed the config
+    // that writes it, so the sole test of the mount ran on a plane where SCIM was the only
+    // extension -- and a commit message cited "booting both planes together" as evidence for a
+    // property nothing in the tree exercised. A log assertion is what stops a comment and a
+    // config disagreeing again.
+    assert!(
+        process
+            .log()
+            .contains("OIDC provider, discovery, and per-environment JWKS mounted"),
+        "the OIDC plane must be mounted beside SCIM, or this test is not exercising the \
+         router composition production runs: {}",
+        process.log()
+    );
+    // And the sibling surface still answers, which is what a merged router breaking would show.
+    let discovery = get(port, "/.well-known/openid-configuration");
+    assert!(process.alive(), "the binary died; log:\n{}", process.log());
+    assert!(
+        discovery.starts_with("HTTP/1.1 "),
+        "the OIDC discovery surface stopped answering once SCIM was merged beside it: \
+         {discovery}"
     );
 }
 

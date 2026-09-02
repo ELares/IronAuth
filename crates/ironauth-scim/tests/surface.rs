@@ -469,3 +469,63 @@ async fn a_body_over_the_limit_is_refused_as_a_scim_document() {
         "a body under the limit must reach a handler"
     );
 }
+
+#[tokio::test]
+async fn many_concurrent_valid_requests_are_all_served() {
+    // A previous revision bounded the pre-authentication credential check with a 32-permit
+    // semaphore and `try_acquire`. A reviewer drove 64 concurrent requests carrying the SAME
+    // VALID token and got 32 answers and 32 refusals in a third of a second against an idle
+    // database: a provisioning surface refusing provisioning, with the 503 that
+    // `AuthRefusal::Unavailable` documents as the answer clients back off on.
+    //
+    // The bound was also incapable of doing what it claimed. `Store::connect` caps the pool at
+    // 16 connections, so database work in flight was already bounded at HALF the semaphore's
+    // size and the semaphore could never be the binding constraint.
+    //
+    // This is the regression test for that: concurrency well past both numbers, every request
+    // carrying a valid credential, and every one of them served.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed(&db, &env, scope).await;
+
+    // ONE state, as the boot path builds, so the requests genuinely contend.
+    let state = ScimState::new(
+        db.store().clone(),
+        env.clone(),
+        ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    let mut inflight = Vec::new();
+    for _ in 0..64 {
+        let state = state.clone();
+        let token = token.clone();
+        inflight.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri("/scim/v2/ServiceProviderConfig")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request builds");
+            scim_router(state)
+                .oneshot(request)
+                .await
+                .expect("router answers")
+                .status()
+        }));
+    }
+    let mut served = 0;
+    let mut refused = Vec::new();
+    for task in inflight {
+        let status = task.await.expect("the request task completes");
+        if status == StatusCode::OK {
+            served += 1;
+        } else {
+            refused.push(status);
+        }
+    }
+    assert_eq!(
+        served, 64,
+        "every request carried a valid credential and must be served; refusals: {refused:?}"
+    );
+}

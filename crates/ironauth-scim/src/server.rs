@@ -44,13 +44,30 @@ use serde_json::json;
 
 use crate::service_provider_config::{ScimLimits, ServiceProviderConfig};
 
-/// How many unauthenticated credential checks may be in flight at once.
-///
-/// Sized for a provisioning surface rather than an interactive one: Okta and Entra open a
-/// small connection pool and sync in batches, so a legitimate deployment never approaches
-/// this. It is a backstop against an unauthenticated caller choosing how much database work
-/// this surface does, not a throughput knob.
-const MAX_INFLIGHT_CREDENTIAL_CHECKS: usize = 32;
+// WHERE THE PRE-AUTHENTICATION BOUND ACTUALLY LIVES, and why there is no semaphore here.
+//
+// Every request reaches `scim_connections().authenticate` before anything is authenticated:
+// a well-formed but invented bearer token costs one store round trip. That is by design --
+// the digest lookup IS the authentication -- and it means an unauthenticated caller
+// influences how much database work this surface does.
+//
+// A previous revision of this file bounded that with a 32-permit semaphore and `try_acquire`.
+// It was wrong twice over, and a reviewer measured both. The pool `Store::connect` builds
+// caps connections at 16, so database work in flight was ALREADY bounded at half the
+// semaphore's size and the semaphore could never be the binding constraint -- the number was
+// chosen without reading the one beside it. And because `try_acquire` refuses rather than
+// queues, 64 concurrent requests carrying the SAME VALID TOKEN got 32 answers and 32 refusals
+// in 0.34 seconds against an idle database: a provisioning surface refusing provisioning. The
+// refusal was a 503, which `AuthRefusal::Unavailable` documents as the answer clients back off
+// on, so the mitigation would have converted a burst into cross-tenant identity-provider
+// backoff that any caller could trigger on demand with 32 open connections.
+//
+// So the bound is the connection pool, which is a real bound on the real resource, and the
+// gap that remains is honest: the public plane applies no rate limit of its own (verified --
+// `ironauth-server` installs a panic catcher, a header backstop and observation, and nothing
+// else). Closing that needs a dimension, and the only one available before authentication is
+// the scope the caller's own token declares. That is a decision to make alongside the
+// credential-minting route, not a number to guess at here.
 
 /// The largest request body this surface accepts.
 ///
@@ -121,25 +138,6 @@ struct ScimStateInner {
     env: ironauth_env::Env,
     limits: ScimLimits,
     uniqueness: UniquenessMode,
-    /// How many credential checks may be in flight at once.
-    ///
-    /// # The pre-authentication path is a database amplifier
-    ///
-    /// Every request here reaches `scim_connections().authenticate` before anything has been
-    /// authenticated: a syntactically well-formed but invented bearer token gets a store round
-    /// trip. That is by design -- the digest lookup IS the authentication -- but it means an
-    /// unauthenticated caller chooses how much database work this surface does, and a reviewer
-    /// pointed out that the public plane applies no rate limit, no concurrency limit and no
-    /// timeout of its own.
-    ///
-    /// A SEMAPHORE rather than a rate limit, deliberately. A rate limit needs a dimension, and
-    /// the only dimension available before authentication is the scope the token DECLARES --
-    /// which the caller supplies, so budgeting by it lets one caller spread load across
-    /// invented scopes and starve nothing but itself. Bounding concurrency needs no dimension
-    /// and is correct whatever the eventual answer is: it caps the database work in flight,
-    /// and a caller that exceeds it gets the same 503 an outage produces rather than a
-    /// refusal implying its credential is wrong.
-    credential_checks: Arc<tokio::sync::Semaphore>,
 }
 
 impl ScimState {
@@ -162,9 +160,6 @@ impl ScimState {
                 env,
                 limits,
                 uniqueness,
-                credential_checks: Arc::new(tokio::sync::Semaphore::new(
-                    MAX_INFLIGHT_CREDENTIAL_CHECKS,
-                )),
             }),
         }
     }
@@ -441,14 +436,6 @@ async fn authenticate(
             .as_micros(),
     )
     .map_err(|_| AuthRefusal::Unknown)?;
-    // BOUNDED. See `ScimStateInner::credential_checks`: this is the one store call an
-    // unauthenticated caller can reach, so the number of them in flight is capped rather than
-    // left to whatever arrives.
-    let _permit = state
-        .inner
-        .credential_checks
-        .try_acquire()
-        .map_err(|_| AuthRefusal::Unavailable)?;
     let found = state
         .inner
         .store
@@ -466,8 +453,14 @@ async fn authenticate(
 /// Mint a SCIM bearer token for a connection: `{scim_id}.{secret}`.
 ///
 /// The id half makes the token self-scoping (see [`authenticate`]); the secret half is what
-/// makes it a credential. Returned once by the management surface that creates the connection
-/// and stored nowhere: only the SHA-256 of the whole string is written.
+/// makes it a credential. Returned once by whatever creates the connection, and stored
+/// nowhere: only the SHA-256 of the whole string is written.
+///
+/// NO SHIPPED CALLER creates one today. An earlier version of this sentence said "the
+/// management surface that creates the connection", and there is none: `ironauth-admin`
+/// contains no reference to SCIM and the published management API has no SCIM path. The
+/// minting route belongs with the self-service portal that owns SCIM token lifecycle, and
+/// until it lands a connection can only be created from inside the process.
 #[must_use]
 pub fn mint_token(id: &ironauth_store::ScimConnectionId, secret: &str) -> String {
     format!("{id}.{secret}")

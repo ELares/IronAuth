@@ -37,9 +37,11 @@ ironauth-oidc.workspace = true
 # under /admin when admin_spa.enabled is set. It embeds its assets with
 # rust-embed and owns no store connection, so the musl static lane holds.
 ironauth-admin-ui.workspace = true
-# The SCIM 2.0 inbound surface (issue #135). Declares only ironauth-store, ironauth-env,
-# axum, serde, serde_json and sha2, so no HTTP client or TLS crate enters the binary graph
-# and the static musl lane is unaffected.
+# The SCIM 2.0 inbound surface (issue #135). Its dependencies are already in this binary's
+# graph and none of them is an HTTP client or a TLS stack, so the static musl lane is
+# unaffected. The set is deliberately not enumerated here: an earlier version listed six
+# crates by name and a seventh was added two commits later, which is what a list beside the
+# thing it describes does.
 ironauth-scim.workspace = true
 ironauth-jose.workspace = true
 # The tenant/environment quota engine (issue #50): the boot path builds one
@@ -133,15 +135,15 @@ required-features = ["testing"]
 name = "serve_retention_boot"
 required-features = ["testing"]
 
-# The SCIM mount suite (issue #135) boots the COMPILED binary for the same reason the
-# retention one does: `server.mount_public(scim_router(...))` is a single line in `serve`,
-# and no in-process test can observe whether a deployed process serves that surface. The
-# boot-wiring tests prove the STATE assembles; only this proves it is reachable.
 # The SCIM defaults, pinned across ironauth-config and ironauth-scim (issue #135). Neither
 # crate can see the other, so this is the only place the two Default impls can be compared.
 [[test]]
 name = "scim_settings_pin"
 
+# The SCIM mount suite (issue #135) boots the COMPILED binary for the same reason the
+# retention one does: `server.mount_public(scim_router(...))` is a single line in `serve`,
+# and no in-process test can observe whether a deployed process serves that surface. The
+# boot-wiring tests prove the STATE assembles; only this proves it is reachable.
 [[test]]
 name = "serve_scim_mount"
 required-features = ["testing"]
