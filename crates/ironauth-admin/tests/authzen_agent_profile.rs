@@ -51,6 +51,10 @@ struct Fixture {
     user: String,
     agent: String,
     other_org: String,
+    /// The `tool.deploy.call` permission row, created ONCE. Permissions are environment
+    /// scoped, so the second organization attaches this same row to its own role rather than
+    /// creating a duplicate slug, which the unique index refuses.
+    permission: String,
 }
 
 impl Fixture {
@@ -93,6 +97,7 @@ impl Fixture {
             &json!({ "slug": "operator", "display_name": "Operator" }),
         )
         .await;
+        let mut deploy_permission = String::new();
         for tool in [DECLARED_AND_PERMITTED, PERMITTED_NOT_DECLARED] {
             let permission = created(
                 h,
@@ -101,6 +106,9 @@ impl Fixture {
                 &json!({ "slug": format!("tool.{tool}.call"), "display_name": tool }),
             )
             .await;
+            if tool == DECLARED_AND_PERMITTED {
+                deploy_permission.clone_from(&permission);
+            }
             let (status, _, body) = h
                 .post(
                     &format!("{base}/organizations/{organization}/roles/{role}/permissions"),
@@ -148,6 +156,7 @@ impl Fixture {
             user,
             agent,
             other_org,
+            permission: deploy_permission,
         }
     }
 
@@ -170,9 +179,18 @@ impl Fixture {
     /// The control for the confinement test: it proves the person's grants reach the other
     /// organization, so a denial for the AGENT there is about the agent.
     fn ask_as_user(&self, org: &str) -> Value {
+        // THE TOOL RIDES THE TYPE for a `user` subject, because that arm joins
+        // `{resource.type}.{action.name}` and does not read `resource.id` at all. So
+        // `tool.deploy` + `call` is the same slug the agent arm builds from `tool` + `deploy`
+        // + `call`, which is what lets this ask the same question as the human. Asking with
+        // type `tool` and id `deploy` would join `tool.call`, a permission nobody grants, and
+        // the control would deny for a reason that has nothing to do with the confinement.
+        //
+        // A resource type carrying a dot is the surface's own idiom: the neighbouring suite
+        // asks about `billing.invoice` the same way.
         json!({
             "subject": { "type": "user", "id": self.user },
-            "resource": { "type": "tool", "id": DECLARED_AND_PERMITTED },
+            "resource": { "type": format!("tool.{DECLARED_AND_PERMITTED}") },
             "action": { "name": "call" },
             "context": { "organization_id": org },
         })
@@ -189,21 +207,16 @@ impl Fixture {
             &json!({ "slug": "operator", "display_name": "Operator" }),
         )
         .await;
-        let permission = created(
-            h,
-            &format!("{base}/permissions"),
-            "ap-other-perm",
-            &json!({
-                "slug": format!("tool.{DECLARED_AND_PERMITTED}.call"),
-                "display_name": "call deploy elsewhere",
-            }),
-        )
-        .await;
+        // The permission the fixture ALREADY created. Permissions are environment-scoped
+        // (`UNIQUE (tenant_id, environment_id, kind, slug)`), not organization-scoped, so
+        // creating the same slug again for the second organization is a 409 and the fixture
+        // dies before the assertion it exists for. What differs per organization is the ROLE
+        // and the assignment, not the permission.
         let (status, _, body) = h
             .post(
                 &format!("{base}/organizations/{other}/roles/{role}/permissions"),
                 "ap-other-attach",
-                &json!({ "permission_id": permission }).to_string(),
+                &json!({ "permission_id": self.permission }).to_string(),
             )
             .await;
         assert!(status.is_success(), "attach in the other org: {body}");
@@ -299,7 +312,7 @@ async fn the_decision_is_the_intersection_of_the_declared_set_and_the_humans_per
 }
 
 #[tokio::test]
-async fn a_suspended_agent_is_denied_while_its_human_is_unchanged() {
+async fn a_suspended_agent_is_denied_while_its_human_still_holds_the_permission() {
     // #130 criterion 5 draws this split at the token door: a suspended agent obtains no token
     // and stays listable. The PDP has to draw it the same way, or an operator who suspends an
     // agent finds the tool calls still authorized.
@@ -338,6 +351,14 @@ async fn a_suspended_agent_is_denied_while_its_human_is_unchanged() {
         )
         .await,
         "a suspended agent authorizes nothing"
+    );
+
+    // The name's second clause, asserted rather than implied: the HUMAN is untouched, so what
+    // changed is the agent and not a grant that quietly disappeared.
+    assert!(
+        f.evaluate(&h, "ap-human-unchanged", &f.ask_as_user(&f.organization))
+            .await,
+        "the person is unchanged, so the denial above is the agent's state"
     );
 }
 
@@ -497,9 +518,12 @@ async fn an_agent_whose_human_can_no_longer_authenticate_is_denied() {
         .await
     );
 
+    // POST, not PUT: `setUserState` is registered `post` and takes a required idempotency
+    // key. The sibling AGENT state route IS a `put`, which is what made the copy look right.
     let (status, _, body) = h
-        .put(
+        .post(
             &format!("{}/users/{}/state", f.base(), f.user),
+            "ap-block-human",
             &json!({ "state": "blocked" }).to_string(),
         )
         .await;

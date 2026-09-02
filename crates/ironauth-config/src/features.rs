@@ -878,7 +878,7 @@ impl std::error::Error for FeatureValidationError {}
 mod tests {
     use super::*;
 
-    fn config_with_features(toml_features: &str) -> Config {
+    pub(super) fn config_with_features(toml_features: &str) -> Config {
         let input = format!("[features]\n{toml_features}");
         crate::Config::from_toml_str(&input, "test.toml")
             .expect("test config parses")
@@ -1454,14 +1454,14 @@ mod attestation_default_posture_tests {
         // where the gate had been deleted, because the operator did set `enabled = true` and
         // `is_enabled` says so. What stops them is that the process does not start.
         let enabled_no_ack =
-            toml_config("[features]\nauthzen-agent-profile = { enabled = true }\n");
+            super::tests::config_with_features("authzen-agent-profile = { enabled = true }");
         assert!(
             registry.validate(&enabled_no_ack).is_err(),
             "enabling without acknowledging the version must refuse the boot"
         );
 
-        let wrong_ack = toml_config(
-            "[features]\nauthzen-agent-profile = { enabled = true, ack = \"0.0.1\" }\n",
+        let wrong_ack = super::tests::config_with_features(
+            "authzen-agent-profile = { enabled = true, ack = \"0.0.1\" }",
         );
         assert!(
             registry.validate(&wrong_ack).is_err(),
@@ -1469,9 +1469,8 @@ mod attestation_default_posture_tests {
              version bump invalidate acknowledgments in the wild"
         );
 
-        let armed = toml_config(&format!(
-            "[features]\nauthzen-agent-profile = {{ enabled = true, ack = \
-             \"{AUTHZEN_AGENT_PROFILE_VERSION}\" }}\n"
+        let armed = super::tests::config_with_features(&format!(
+            "authzen-agent-profile = {{ enabled = true, ack = \"{AUTHZEN_AGENT_PROFILE_VERSION}\" }}"
         ));
         assert!(registry.validate(&armed).is_ok(), "the correct ack boots");
         assert!(
@@ -1479,13 +1478,6 @@ mod attestation_default_posture_tests {
             "the control: the correct ack arms it, so the refusals above are about the ack and \
              not about a flag nothing can turn on"
         );
-    }
-
-    /// Parse a config from TOML, panicking on an invalid one.
-    fn toml_config(toml: &str) -> Config {
-        Config::from_toml_str(toml, "<features test>")
-            .expect("valid config")
-            .config
     }
 
     /// The acknowledgment version IS the draft revision.

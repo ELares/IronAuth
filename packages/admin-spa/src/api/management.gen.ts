@@ -4086,7 +4086,11 @@ export interface components {
         };
         /** @description The `AuthZEN` subject: who is asking. */
         AuthzenSubject: {
-            /** @description The `usr_` or `sva_` identifier, matching the declared type. */
+            /**
+             * @description The `usr_` or `sva_` identifier, matching the declared type. A deployment that has
+             *     acknowledged the agent tool profile (issue #133) also accepts an `agp_` identifier for
+             *     its `agent` subject type.
+             */
             id: string;
             /**
              * @description `user` or `service_account`. Any other type is refused rather than treated as a user.

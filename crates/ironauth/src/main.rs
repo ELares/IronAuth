@@ -865,9 +865,10 @@ async fn build_admin_state(
             // feature is registered through `builtin()`. There is no such test -- the nearest
             // guard, `unknown_feature_name_refuses_to_boot`, tests the other direction -- and
             // the argument stands without it, because both calls run the same function.
-            let state = state.with_agent_tool_profile_enabled(
-                FeatureRegistry::builtin().is_enabled(config, AUTHZEN_AGENT_PROFILE_FEATURE),
-            );
+            let state = state.with_agent_tool_profile_enabled(agent_tool_profile_armed(
+                &FeatureRegistry::builtin(),
+                config,
+            ));
             Some(state)
         }
         Err(error) => {
@@ -1673,6 +1674,18 @@ async fn build_oidc_plane(
         discovery,
         jwks,
     })
+}
+
+/// Whether the `AuthZEN` agent tool profile is armed (issue #133, PROTOTYPE).
+///
+/// A named function rather than an inline `is_enabled` inside `build_admin_state`, for the same
+/// reason `build_attester_registry` is one: that function needs a live store, so nothing inside
+/// it can be tested, and the wiring is exactly what a mistake here would be. Substituting a
+/// DIFFERENT experimental feature's constant at the call site would arm a live PDP subject type
+/// off an unrelated acknowledgment, and every other test in this change would still pass -- the
+/// config-crate test proves the REGISTRY, not what reads it.
+fn agent_tool_profile_armed(features: &FeatureRegistry, config: &Config) -> bool {
+    features.is_enabled(config, AUTHZEN_AGENT_PROFILE_FEATURE)
 }
 
 /// Build the trusted-attester registry, or `None` (issue #133, PROTOTYPE).
@@ -6353,6 +6366,46 @@ mod tests {
     /// make the seam refuse at its last check instead of its first, which looks identical from
     /// outside and is a different thing to debug -- and would leave a `Some` in the state that
     /// a later reader could take as "the method is armed".
+    /// The agent tool profile is armed by ITS OWN acknowledgment and no other (issue #133).
+    ///
+    /// The third case is the one that matters. The first two are satisfied by any
+    /// implementation that returns `false` by default, and would hold if the call site read a
+    /// different experimental feature's constant -- which would arm a LIVE authorization
+    /// subject type off an acknowledgment for something else entirely.
+    #[test]
+    fn the_agent_tool_profile_is_armed_by_its_own_acknowledgment() {
+        let features = FeatureRegistry::builtin();
+
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            !agent_tool_profile_armed(&features, &bare),
+            "off in a default deployment"
+        );
+
+        let armed = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             authzen-agent-profile = { enabled = true, ack = \"0.1.0-exp.1\" }\n",
+        );
+        assert!(
+            agent_tool_profile_armed(&features, &armed),
+            "its own acknowledgment arms it"
+        );
+
+        // ANOTHER experimental feature, acknowledged. This must NOT arm the profile, and it is
+        // the only case that distinguishes "reads the right flag" from "reads a flag".
+        let other = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = { enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }\n",
+        );
+        assert!(
+            !agent_tool_profile_armed(&features, &other),
+            "an acknowledgment for a different prototype must not arm this one"
+        );
+    }
+
     #[test]
     fn the_attester_registry_needs_the_ack_and_an_attester() {
         let jwks = ironauth_jose::JwkSet::from_signing_keys([

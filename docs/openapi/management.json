@@ -28044,7 +28044,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "The `usr_` or `sva_` identifier, matching the declared type."
+            "description": "The `usr_` or `sva_` identifier, matching the declared type. A deployment that has\nacknowledged the agent tool profile (issue #133) also accepts an `agp_` identifier for\nits `agent` subject type."
           },
           "type": {
             "type": "string",

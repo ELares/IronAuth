@@ -17,9 +17,17 @@
 //!
 //! # Mapping a resource and an action onto a permission slug
 //!
-//! `AuthZEN` names a `resource.type` and an `action.name`; `IronAuth` grants permission SLUGS. The
-//! mapping is `"{resource.type}.{action.name}"`, so type `billing.invoice` with action `read`
-//! asks about `billing.invoice.read`.
+//! `AuthZEN` names a `resource.type` and an `action.name`; `IronAuth` grants permission SLUGS. For
+//! a `user` or `service_account` subject the mapping is `"{resource.type}.{action.name}"`, so type
+//! `billing.invoice` with action `read` asks about `billing.invoice.read`.
+//!
+//! The AGENT TOOL PROFILE (issue #133, experimental) maps
+//! `"{resource.type}.{resource.id}.{action.name}"` instead, because it requires the type to be
+//! `tool` and the tool is the resource INSTANCE: under the two-part join every tool would share
+//! the slug `tool.{action}`, and the permission could not distinguish `deploy` from `destroy`.
+//! Stated HERE as well as at the arm, because this paragraph is the first thing a reader of this
+//! module meets and an unconditional sentence about the mapping is now false for one of the
+//! three subject types.
 //!
 //! # Why a DELETED environment stops deciding
 //!
@@ -86,7 +94,9 @@ pub struct AuthzenSubject {
     /// universal. See `docs/experimental/authzen-agent-profile.md`.
     #[serde(rename = "type")]
     pub subject_type: String,
-    /// The `usr_` or `sva_` identifier, matching the declared type.
+    /// The `usr_` or `sva_` identifier, matching the declared type. A deployment that has
+    /// acknowledged the agent tool profile (issue #133) also accepts an `agp_` identifier for
+    /// its `agent` subject type.
     pub id: String,
 }
 
