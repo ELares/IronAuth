@@ -218,6 +218,11 @@ pub(crate) const PROTECTED_ACCESS_TOKEN_CLAIMS: &[&str] = &[
     "at_hash",
     "c_hash",
     "sid",
+    // Native SSO (issue #133 PROTOTYPE): `ds_hash` binds an ID token to the device secret it
+    // was issued beside, and it is the ONLY reason the token exchange may accept an ID token as
+    // a subject token at all. A client that could write it would bind a token to a secret IT
+    // chose and redeem the pair for a sibling's tokens, which is the binding exactly inverted.
+    "ds_hash",
     // Organization context (issue #94): the DURABLE org_id is resolved from an
     // authoritative membership check and issuer-set only; a client custom claim must
     // never self-assert an organization context.
@@ -409,6 +414,11 @@ pub struct IssuedTokens {
     /// back so the ASYNC caller can record the operator-visible event. The claim
     /// shape is already decided and already signed by the time this is seen.
     pub permission_budget: PermissionBudgetOutcome,
+    /// The Native SSO device secret minted beside these tokens (issue #133, PROTOTYPE), if any.
+    ///
+    /// The PLAINTEXT, travelling to the response and nowhere else: only its digest was stored.
+    /// [`None`] unless the prototype is armed and this exchange was granted `device_sso`.
+    pub device_secret: Option<String>,
 }
 
 /// One access token minted on its own (the refresh grant), plus the two things the
@@ -551,6 +561,14 @@ pub struct MintRequest<'a> {
     /// endpoint always passes [`None`]: a token-endpoint ID token never carries
     /// `at_hash`.
     pub at_hash: Option<&'a str>,
+    /// The device-secret hash for a Native SSO ID token (issue #133, PROTOTYPE).
+    ///
+    /// [`None`] everywhere except a code exchange that just minted a device secret, which is
+    /// what keeps every other ID token this deployment issues unbound and therefore
+    /// unredeemable at the exchange. `mint_id_token` passes [`None`] for the same reason it
+    /// passes `at_hash: None`: the front-channel response types return no device secret, so an
+    /// ID token there has nothing to be bound to.
+    pub ds_hash: Option<&'a str>,
     /// The authorization-code hash for a hybrid ID token (issue #17). The code
     /// flow always passes [`None`]: it never carries `c_hash`.
     pub c_hash: Option<&'a str>,
@@ -744,6 +762,9 @@ pub(crate) fn build_id_token_claims(
     // at_hash / c_hash: dormant seams for the front-channel/hybrid path (#17).
     // The token endpoint passes None for both, so a token-endpoint ID token
     // carries neither.
+    if let Some(ds_hash) = request.ds_hash {
+        claims["ds_hash"] = json!(ds_hash);
+    }
     if let Some(at_hash) = request.at_hash {
         claims["at_hash"] = json!(at_hash);
     }
@@ -1323,6 +1344,9 @@ pub fn mint(
         id_jti,
         expires_in_secs: access_ttl_secs,
         permission_budget,
+        // The device secret is minted by the CALLER, before this, because its hash has to be in
+        // `request.ds_hash` by the time the ID token is signed. It is attached there.
+        device_secret: None,
     })
 }
 
@@ -2240,6 +2264,8 @@ mod tests {
             org_id: None,
             roles: None,
             permissions: None,
+            // Native SSO (issue #133): a unit fixture, so its ID token is unbound and cannot be redeemed.
+            ds_hash: None,
             at_hash: None,
             c_hash: None,
             extra_claims: empty_extra(),
@@ -3203,6 +3229,7 @@ mod tests {
             "cnf": { "jkt": "evil-thumbprint" },
             "at_hash": "evil-at-hash",
             "c_hash": "evil-c-hash",
+            "ds_hash": "evil-ds-hash",
             "sid": "evil-session",
             // The RFC 8693 actor claim (issue #101): a forged impersonator on a token the
             // attacker obtained honestly, which is an audit forgery rather than a privilege
@@ -3274,6 +3301,7 @@ mod tests {
             "cnf",
             "at_hash",
             "c_hash",
+            "ds_hash",
             "sid",
             "org_id",
             "roles",
@@ -3317,6 +3345,7 @@ mod tests {
             "cnf",
             "at_hash",
             "c_hash",
+            "ds_hash",
             "sid",
             "org_id",
             "roles",

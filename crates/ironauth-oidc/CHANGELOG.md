@@ -6,6 +6,58 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Experimental: Native SSO for mobile apps (issue #133)
+
+A PROTOTYPE of OpenID Connect Native SSO for Mobile Apps 1.0 Implementer's Draft 2, off by
+default behind the `native-sso` feature. A vendor's apps on one device share a sign-in without a
+shared browser session: app A asks for the `device_sso` scope and receives a DEVICE SECRET beside
+its tokens, app B presents that secret together with app A's ID token through RFC 8693, and
+receives its own tokens for the same person.
+
+**Why an ID token is not enough, and why this may relax the rule that says so.** An ID token is
+an authentication receipt, not a credential: it is audienced to one client, it is frequently
+logged, and this deployment's exchange refuses one as a `subject_token` because a tradeable
+receipt is a confused deputy. `ds_hash` is what changes that: the ID token carries the hash of
+the device secret it was issued beside, so a stolen token is inert without the secret and a
+stolen secret is inert without the matching token. The relaxation is therefore JOINT -- a request
+naming the ID-token subject type WITHOUT the device-secret actor type is not a partially formed
+Native SSO exchange, it is exactly the request the ordinary rule refuses, and it is refused.
+
+**The order of checks is the security argument.** The device secret is redeemed FIRST, and
+everything after is checked against the row that redemption returned: the ID token is verified
+against the audience THAT ROW names, not one read out of the token, so the presenter cannot
+choose which audience its token is judged against. Then `ds_hash`, then the subject.
+
+**Ending the session severs the SSO set, by ANY route.** The row hangs off the SIGN-IN rather
+than off the app that asked, and redemption JOINS `sessions` applying the SAME liveness predicate
+`SessionRepo::get` uses, clause for clause -- revoked, ended, superseded, absolute expiry, the
+IDLE window, and the impersonation cap -- so ANY route that sets `revoked_at`, `ended_at` or
+`superseded_by`, or lets the session pass its absolute or idle expiry, severs it. Stated as the
+rule rather than a list, because an earlier draft enumerated six routes and two were wrong: a
+risk decision revokes nothing (it refuses a NEW sign-in) and a password change deliberately
+preserves the session it is made from. RP-initiated logout additionally sweeps the rows eagerly; that sweep is an optimisation
+and the join is the control, because a control remembered at six call sites is one that will be
+forgotten at the seventh. The row keys on the UNDERLYING session id and not the ID token's `sid`,
+which is per-client by design: keying on `sid` would have severed only the app that happened to
+ask while the revocation reported success.
+
+**It does not ride the impersonation flag.** By shape a bootstrap is an impersonation -- another
+client's token, no actor recorded -- so deriving that mode would have made a mobile SSO feature
+require `token_exchange_impersonation_allowed` on every sibling app, and that flag lets an app
+present ANY client's token for ANY subject. A bootstrap gets its own `ExchangeMode` instead,
+constructible only after the device secret matched the ID token's `ds_hash`.
+
+**Known limits, recorded in `docs/experimental/native-sso.md`:** the device secret is a BEARER
+credential and the draft's DPoP-binding question is open and unanswered here; nothing binds it to
+the device beyond the name; its lifetime is clamped at thirty days at the mint rather than
+configured, because an operator-set year would be a year-long key to every sibling app's tokens;
+it is returned ONCE and only its digest is stored; there is no rotation on redemption, so a
+leaked secret is good until the session ends; a re-authentication ORPHANS the row, because
+session rotation does not carry it; and REDEMPTION IS UNGATED per client -- removing the
+impersonation flag removed the only control on the redeeming side and nothing replaced it, so
+any confidential client registered for the exchange can redeem a secret it obtains. A graduation
+must add a per-client gate.
+
 ### Experimental: identity chaining and ID-JAG, the receiving side (issue #133)
 
 A PROTOTYPE of `draft-ietf-oauth-identity-chaining-16` and

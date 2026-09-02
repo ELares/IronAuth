@@ -90,18 +90,18 @@ use crate::id::{
     FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId,
     GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
     KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageId,
-    MessageTemplateId, MigrationRunId, MigrationRunRecordId, OperatorId, OrgAuthPolicyId,
-    OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId, OrgMembershipId,
-    OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId, OutboxMessageId,
-    PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId, PushedRequestId,
-    RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId, RecoveryFlowId,
-    RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId, RefreshTokenId,
-    ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId, RiskSignalId, RoutingRuleId,
-    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
-    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId, OperatorId,
+    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
+    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
+    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
+    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
+    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
+    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
+    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -159,6 +159,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> AgentVaultRepo<'a> {
         AgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The Native SSO device secrets for this scope (issue #133, PROTOTYPE).
+    ///
+    /// Both halves live here, unlike the agent tables next door: a device secret is minted and
+    /// redeemed at the TOKEN endpoint, so routing either through the control plane would put an
+    /// operator in the middle of a sign-in.
+    #[must_use]
+    pub fn native_sso_device_secrets(&self) -> NativeSsoDeviceSecretRepo<'a> {
+        NativeSsoDeviceSecretRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -74251,5 +74264,224 @@ mod audit_delivery_dimension_tests {
             different_action.canonical(),
             "a field the chain DOES seal still changes the canonical form"
         );
+    }
+}
+
+/// A stored Native SSO device secret, WITHOUT the secret (issue #133, PROTOTYPE).
+///
+/// There is no field for the plaintext and there is deliberately no way to get one. The secret
+/// is returned once to the app that asked and only its digest is written, so a read of this
+/// table cannot yield a credential that mints tokens for an entire app family.
+#[derive(Debug, Clone)]
+pub struct NativeSsoDeviceSecret {
+    /// The row id (`nsd_`).
+    pub id: NativeSsoDeviceSecretId,
+    /// The person the secret speaks for.
+    pub subject: String,
+    /// The sign-in it came from: the UNDERLYING session id, NOT the ID token's per-client
+    /// `sid`. Redemption joins `sessions` on it, which is what makes the set severable by any
+    /// route that ends the session.
+    pub session_id: String,
+    /// The client that asked for `device_sso`. Audit, not a control: any sibling may redeem.
+    pub issued_to_client_id: String,
+    /// The scope the original sign-in was granted, which a sibling's exchange narrows from.
+    pub granted_scope: String,
+    /// When it stops being redeemable.
+    pub expires_at_unix_micros: i64,
+    /// Whether it has been revoked.
+    pub revoked: bool,
+}
+
+/// Everything minting a device secret needs (issue #133, PROTOTYPE).
+pub struct NewNativeSsoDeviceSecret<'a> {
+    /// The row id the caller minted.
+    pub id: &'a NativeSsoDeviceSecretId,
+    /// The person.
+    pub subject: &'a str,
+    /// The sign-in: the UNDERLYING session id, never the ID token's per-client `sid`.
+    pub session_id: &'a str,
+    /// The client that asked.
+    pub issued_to_client_id: &'a str,
+    /// SHA-256 of the secret. THE DIGEST, never the secret.
+    pub secret_hash: &'a [u8],
+    /// The scope the sign-in was GRANTED, so a sibling has something to narrow from.
+    pub granted_scope: &'a str,
+    /// When it was issued, from the APPLICATION clock. The ordering constraints compare
+    /// against this rather than the row's `created_at`, so both sides come from one clock.
+    pub issued_at_unix_micros: i64,
+    /// When it stops being redeemable.
+    pub expires_at_unix_micros: i64,
+}
+
+/// The Native SSO device secrets for one scope (issue #133, PROTOTYPE).
+pub struct NativeSsoDeviceSecretRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl NativeSsoDeviceSecretRepo<'_> {
+    /// Record a freshly minted device secret.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure, which includes a digest that is not 32 bytes (the column's CHECK).
+    pub async fn mint(&self, spec: NewNativeSsoDeviceSecret<'_>) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO native_sso_device_secrets \
+                 (id, tenant_id, environment_id, subject, session_id, issued_to_client_id, \
+                  secret_hash, granted_scope, issued_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 microsecond'), \
+                     TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 microsecond'))",
+        )
+        .bind(spec.id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(spec.subject)
+        .bind(spec.session_id)
+        .bind(spec.issued_to_client_id)
+        .bind(spec.secret_hash)
+        .bind(spec.granted_scope)
+        .bind(spec.issued_at_unix_micros)
+        .bind(spec.expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The LIVE secret whose digest matches, or `None`.
+    ///
+    /// "Live" is checked in SQL rather than by the caller: a redemption path that read the row
+    /// and then compared timestamps in Rust would be one refactor away from forgetting the
+    /// comparison, and the failure mode is a revoked device secret that still mints tokens.
+    ///
+    /// AND IT INCLUDES THE SESSION, which is the half that turns "revoking severs the set" from
+    /// a hope into a fact. The explicit `revoke_session_set` sweep runs on RP-initiated logout
+    /// only; every OTHER way a session ends -- an operator revoking it in the console, a bulk
+    /// revoke, revoke-all, global token revocation, or the session passing its absolute or idle
+    /// expiry -- touches no row in this table. Without this join, each of those would leave a live
+    /// family-wide credential behind a sign-out that reported success, redeemable for up to
+    /// thirty days, minting access tokens that are not session bound and therefore survive
+    /// every later revocation for their full lifetime.
+    ///
+    /// So the sweep is now an optimisation and this join is the control. That is the right way
+    /// round: a control that has to be remembered at six call sites is a control that will be
+    /// forgotten at the seventh.
+    ///
+    /// THE PREDICATE IS THE SAME ONE `SessionRepo::get` USES, clause for clause, and that is
+    /// not decoration. The first version checked only revocation, ending, supersession and the
+    /// absolute expiry -- it omitted the IDLE window and the impersonation cap. A session that
+    /// idled out is dead to every other reader in this system, so the person is signed out,
+    /// while this call still called it live and kept minting for the remaining life of the ID
+    /// token. Any liveness check that is written out by hand beside an authoritative one drifts
+    /// from it in exactly the clauses nobody was thinking about.
+    ///
+    /// The lookup is BY DIGEST over a unique index, which is what makes it constant-work in the
+    /// VALUE of the presented secret: there is no prefix match, no scan, and no comparison that
+    /// exits earlier for a secret that shares more leading bytes with a stored one.
+    ///
+    /// It is NOT constant-work overall, and the earlier wording claimed that: a wrong digest
+    /// misses the index, while a revoked or expired one hits it, fetches the tuple and
+    /// evaluates the session join. That difference is not a function of the secret's value, so
+    /// it leaks nothing about the secret; it is measurable as "some secret once existed", which
+    /// the row's existence already is.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn redeem(
+        &self,
+        secret_hash: &[u8],
+        now_micros: i64,
+    ) -> Result<Option<NativeSsoDeviceSecret>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT d.id, d.subject, d.session_id, d.issued_to_client_id, d.granted_scope, \
+                    (EXTRACT(EPOCH FROM d.expires_at) * 1000000)::bigint AS expires_us \
+             FROM native_sso_device_secrets d \
+             JOIN sessions s \
+               ON s.id = d.session_id \
+              AND s.tenant_id = d.tenant_id \
+              AND s.environment_id = d.environment_id \
+             WHERE d.tenant_id = $1 AND d.environment_id = $2 AND d.secret_hash = $3 \
+               AND d.revoked_at IS NULL \
+               AND d.expires_at > TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+               AND s.revoked_at IS NULL AND s.ended_at IS NULL AND s.superseded_by IS NULL \
+               AND COALESCE(s.absolute_expires_at, s.expires_at) > \
+                   TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+               AND (s.idle_expires_at IS NULL OR s.idle_expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
+               AND (s.impersonation_expires_at IS NULL OR s.impersonation_expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond'))",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(secret_hash)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let stored_id: String = row.get("id");
+        Ok(Some(NativeSsoDeviceSecret {
+            id: NativeSsoDeviceSecretId::parse_in_scope(&stored_id, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            subject: row.get("subject"),
+            session_id: row.get("session_id"),
+            issued_to_client_id: row.get("issued_to_client_id"),
+            granted_scope: row.get("granted_scope"),
+            expires_at_unix_micros: row.get("expires_us"),
+            revoked: false,
+        }))
+    }
+
+    /// SEVER THE SSO SET: revoke every live device secret from one sign-in.
+    ///
+    /// Returns how many were revoked, so a caller can record it and a test can tell a severing
+    /// that happened from one that matched nothing.
+    ///
+    /// `revoked_at` is `GREATEST(issued_at, now)` rather than `now`, because this is ONE update
+    /// covering every row of a session and the clock is the LOGGING-OUT node's. On a node whose
+    /// clock trails the minting node's, a plain `now` violates `revocation_after_issuance` and
+    /// aborts the entire statement -- and the caller swallows that as a warning, so a sweep
+    /// that severed nothing would look like one that had nothing to sever.
+    ///
+    /// Keyed on the SESSION rather than on the secret, because that is what "the SSO set" means:
+    /// one sign-in can have handed out several secrets (an app asks again after reinstalling),
+    /// and revoking the one you happen to hold while leaving its siblings live would sever
+    /// nothing. Signing a person out has to end the family's ability to bootstrap, or the
+    /// sign-out is decoration.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke_session_set(
+        &self,
+        session_id: &str,
+        now_micros: i64,
+    ) -> Result<u64, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = sqlx::query(
+            "UPDATE native_sso_device_secrets \
+             SET revoked_at = GREATEST( \
+                     issued_at, \
+                     TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
+             WHERE tenant_id = $1 AND environment_id = $2 AND session_id = $3 \
+               AND revoked_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(session_id)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 }

@@ -683,6 +683,8 @@ async fn mint_device_tokens(
             // the device grant passes NO RFC 8707 resource, so its target's
             // `permission_claims` is false by construction.
             permissions: None,
+            // Native SSO (issue #133): the device flow returns no device secret, so its ID token is unbound and cannot be redeemed.
+            ds_hash: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

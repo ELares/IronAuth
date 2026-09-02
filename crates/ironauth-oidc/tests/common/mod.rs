@@ -2142,6 +2142,37 @@ impl Harness {
         self.state = state;
     }
 
+    /// Revoke every session for `subject`, the way an operator or a risk decision does.
+    ///
+    /// Deliberately NOT RP-initiated logout: that path runs an explicit device-secret sweep,
+    /// and a test using it would pass even if the sweep were the only thing severing the set.
+    /// This route touches no row in `native_sso_device_secrets`, so what it measures is the
+    /// session join inside `redeem`.
+    pub async fn revoke_every_session_for(&self, subject: &str) {
+        let (actor, corr) = self.seeding_actor();
+        let user = ironauth_store::UserId::parse_in_scope(subject, &self.scope)
+            .expect("the subject parses as a user id in this scope");
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .sessions()
+            .revoke_all_for_user(&self.env, &user, false, None)
+            .await
+            .expect("revoke every session for the subject");
+    }
+
+    /// Arm Native SSO (issue #133, PROTOTYPE).
+    ///
+    /// Two behaviours turn on together: a code exchange granted `device_sso` returns a device
+    /// secret and stamps its `ds_hash` on the ID token, and the token exchange accepts that
+    /// pair as a subject. Off, no ID token carries the claim and the exchange refuses an
+    /// ID-token subject exactly as it does on main.
+    pub fn install_native_sso(&mut self) {
+        let state = self.state.clone().with_native_sso_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
     /// and an optional `Authorization` header (for a `client_secret_basic` client).
     pub async fn par(
@@ -3234,6 +3265,33 @@ impl Harness {
         self.grant_consent_scoped(&subject, client_id, Some(scope))
             .await;
         let cookie = self.session_cookie(&subject).await;
+        let query = format!(
+            "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
+            enc(REDIRECT_URI),
+            enc(scope)
+        );
+        let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+        location_param(&headers, "code").expect("code in redirect")
+    }
+
+    /// Issue a code for `client_id` granting `scope`, for a SUBJECT THE CALLER NAMES.
+    ///
+    /// The unnamed variant seeds a fresh user every call, which is right for most suites and
+    /// wrong for any negative that has to vary ONE dimension. A Native SSO test presenting a
+    /// device secret beside another sign-in's ID token, built on the fresh-user helper, differs
+    /// in the person AND the binding, so the subject check refuses it and the `ds_hash` check
+    /// under test is never reached: the two controls shadow each other and deleting either
+    /// leaves the suite green.
+    pub async fn issue_code_for_subject(
+        &self,
+        client_id: &str,
+        subject: &str,
+        scope: &str,
+    ) -> String {
+        self.grant_consent_scoped(subject, client_id, Some(scope))
+            .await;
+        let cookie = self.session_cookie(subject).await;
         let query = format!(
             "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
             enc(REDIRECT_URI),

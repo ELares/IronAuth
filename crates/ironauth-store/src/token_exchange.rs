@@ -46,6 +46,21 @@ pub enum ExchangeMode {
     /// The actor becomes indistinguishable from the subject. The actor is NOT recorded in the
     /// token, which is exactly why it is dangerous.
     Impersonation,
+    /// A Native SSO bootstrap (issue #133, PROTOTYPE): a sibling app on the same device trades
+    /// the family's ID token plus its device secret for its own tokens.
+    ///
+    /// Its OWN mode rather than one of the three above, and that is the point. By shape it
+    /// looks like an impersonation -- another client's token, no actor recorded -- so it would
+    /// otherwise be default-denied unless the operator set `token_exchange_impersonation_
+    /// allowed` on every sibling app. That flag is not scoped to this feature: once set, the
+    /// app may present ANY client's token for ANY subject. Making a device-secret bootstrap
+    /// require the broadest privilege in the exchange, in order to do something far narrower,
+    /// would be a worse trade than the feature is worth.
+    ///
+    /// What authorizes it instead is the DEVICE SECRET, which the caller verified against the
+    /// ID token's `ds_hash` before this mode can be constructed at all. This variant is
+    /// reachable only from that path.
+    NativeSsoBootstrap,
 }
 
 /// Why an exchange was refused.
@@ -136,6 +151,11 @@ pub fn decide_exchange(
 
     // Default deny. An operator turns this on per client; nothing about holding a valid token
     // implies it.
+    //
+    // `NativeSsoBootstrap` is deliberately NOT folded in here. It is impersonation-shaped, and
+    // routing it through this flag would mean arming a mobile SSO feature by granting every
+    // sibling app the right to present any client's token for any subject. Its authorization is
+    // the device secret, checked before the mode exists; see the variant's doc.
     if request.mode == ExchangeMode::Impersonation && !impersonation_allowed {
         return Err(ExchangeDenial::ImpersonationNotAllowed);
     }
@@ -163,7 +183,17 @@ pub fn decide_exchange(
     // Audience narrows by exactly the same rule, and for the same reason: an exchange that
     // could add an audience would let a token minted for one service be traded for one that
     // another service accepts.
-    let audience = if request.requested_audience.is_empty() {
+    //
+    // A NATIVE SSO BOOTSTRAP is the one mode this rule does not describe. It is not narrowing an
+    // existing token's audience: the sibling is receiving its OWN first token, so app A's
+    // audience is not a ceiling on it, it is simply somebody else's. Constraining to it gave the
+    // sibling a token audienced to APP A -- exactly the shape impersonation is gated for -- and
+    // made every `audience`/`resource` the sibling named an `invalid_target`, so it could never
+    // obtain a usable token at all. Its audience is resolved for the REQUESTING client by the
+    // caller, from the same resource-indicator path any other first issuance uses.
+    let audience = if request.mode == ExchangeMode::NativeSsoBootstrap {
+        request.requested_audience.clone()
+    } else if request.requested_audience.is_empty() {
         request.subject_audience.clone()
     } else {
         let widened: BTreeSet<String> = request
@@ -203,6 +233,66 @@ mod tests {
             actor_present: mode == ExchangeMode::Delegation,
             mode,
         }
+    }
+
+    #[test]
+    fn a_native_sso_bootstrap_needs_no_actor_and_records_none() {
+        // The mode exists to avoid riding the impersonation flag, so the two properties that
+        // keep it from BEING an impersonation are pinned here, in the crate whose whole value
+        // is being decidable without a database.
+        let input = request(ExchangeMode::NativeSsoBootstrap);
+        assert!(!input.actor_present, "a bootstrap presents no actor TOKEN");
+        let grant =
+            decide_exchange(&input, false).expect("a bootstrap needs no impersonation flag");
+        assert!(
+            !grant.records_actor,
+            "and records no `act`: the device secret is not a party acting for the person"
+        );
+        assert_eq!(
+            grant.scope,
+            set(&["read", "write", "admin"]),
+            "an omitted scope inherits the sign-in's, exactly as every other mode does"
+        );
+    }
+
+    #[test]
+    fn a_native_sso_bootstrap_is_refused_when_an_actor_token_rides_along() {
+        // The biconditional still holds for the new mode. A bootstrap carrying an actor token
+        // is a request contradicting itself, and admitting it would put the DEVICE SECRET in
+        // the `act` chain.
+        let mut input = request(ExchangeMode::NativeSsoBootstrap);
+        input.actor_present = true;
+        assert_eq!(
+            decide_exchange(&input, false),
+            Err(ExchangeDenial::ModeTokenMismatch)
+        );
+    }
+
+    #[test]
+    fn a_native_sso_bootstrap_is_not_bounded_by_the_subject_tokens_audience() {
+        // THE FIX FOR A REAL DEFECT. A bootstrap is not narrowing an existing token: the
+        // sibling receives its OWN first token, so app A's audience is somebody else's rather
+        // than a ceiling. Constraining to it gave the sibling a token audienced to APP A and
+        // turned every target it named into an `invalid_target`.
+        let mut input = request(ExchangeMode::NativeSsoBootstrap);
+        input.requested_audience = set(&["api-of-its-own"]);
+        let grant = decide_exchange(&input, false).expect("its own audience is not a widening");
+        assert_eq!(grant.audience, set(&["api-of-its-own"]));
+
+        // And with none named the decision carries none, so the caller keeps the audience it
+        // resolved for the requesting client rather than overwriting it with an empty set.
+        let none = decide_exchange(&request(ExchangeMode::NativeSsoBootstrap), false)
+            .expect("no target named is not a widening either");
+        assert!(none.audience.is_empty());
+
+        // The rule is UNCHANGED for every other mode: a downscope naming an audience the
+        // subject lacks is still a widening.
+        let mut downscope = request(ExchangeMode::Downscope);
+        downscope.requested_audience = set(&["api-of-its-own"]);
+        assert_eq!(
+            decide_exchange(&downscope, false),
+            Err(ExchangeDenial::AudienceWidened(set(&["api-of-its-own"])))
+        );
     }
 
     #[test]

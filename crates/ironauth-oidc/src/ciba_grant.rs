@@ -395,6 +395,8 @@ async fn mint_ciba_tokens(
             org_id: None,
             roles: None,
             permissions: None,
+            // Native SSO (issue #133): CIBA returns no device secret, so its ID token is unbound and cannot be redeemed.
+            ds_hash: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

@@ -1028,8 +1028,78 @@ async fn resolve_code_exchange_sid(
         .map_err(|_| TokenError::ServerError)?;
     Ok(CodeExchangeSession {
         sid: Some(sid),
+        session_id: Some(session_id),
         impersonation: session.impersonation,
     })
+}
+
+/// Mint and store a Native SSO device secret, when this exchange calls for one (issue #133).
+///
+/// Returns the PLAINTEXT, once. It is stamped into the ID token as a hash and returned to the
+/// client in the token response, and it is never stored: only its SHA-256 digest is written, so
+/// a read of that table cannot yield a credential for a whole app family.
+///
+/// # The three conditions
+///
+/// The flag, the granted scope, and a live SSO session. The scope is the GRANTED one rather than
+/// the requested one, because `device_sso` has to survive whatever narrowing consent and policy
+/// applied: a client that asked for it and was not granted it must not receive a secret. And a
+/// grant with no session has nothing to bind a secret to, which is not an error -- it simply is
+/// not a Native SSO sign-in.
+///
+/// # Errors
+///
+/// [`TokenError::ServerError`] if the secret cannot be persisted. Failing CLOSED matters here:
+/// returning a secret the store never recorded would hand the client a credential that can never
+/// be redeemed and can never be revoked, because there is no row to revoke.
+async fn mint_device_secret(
+    state: &OidcState,
+    scope: Scope,
+    bindings: &CodeBindings,
+    session: &CodeExchangeSession,
+) -> Result<Option<String>, TokenError> {
+    if !state.native_sso_enabled()
+        || !crate::native_sso::wants_device_secret(bindings.oauth_scope.as_deref())
+    {
+        return Ok(None);
+    }
+    let Some(session_id) = session.session_id.as_ref() else {
+        return Ok(None);
+    };
+    let secret = crate::client_auth::generate_secret(state.env());
+    let digest = crate::native_sso::storage_digest(&secret);
+    let id = ironauth_store::NativeSsoDeviceSecretId::generate(state.env(), &scope);
+    let now = epoch_micros(state.now());
+    state
+        .store()
+        .scoped(scope)
+        .native_sso_device_secrets()
+        .mint(ironauth_store::NewNativeSsoDeviceSecret {
+            id: &id,
+            subject: &bindings.subject,
+            // The UNDERLYING session, not the per-client `sid`. See `CodeExchangeSession`.
+            session_id: &session_id.to_string(),
+            issued_to_client_id: &bindings.client_id,
+            secret_hash: &digest,
+            // The GRANTED scope, so a sibling redeeming this secret has something to
+            // narrow from. Without it the bootstrap presents an empty subject scope and
+            // the exchange refuses it outright, which would make the whole feature
+            // unreachable rather than merely unscoped.
+            granted_scope: bindings.oauth_scope.as_deref().unwrap_or_default(),
+            // Both sides of the row's ordering CHECKs come from THIS clock. A Postgres
+            // `now()` default on the other side would compare two unrelated timelines.
+            issued_at_unix_micros: now,
+            expires_at_unix_micros: now
+                .saturating_add(crate::native_sso::DEVICE_SECRET_TTL_SECS * 1_000_000),
+        })
+        .await
+        .map_err(|error| {
+            // Logged rather than swallowed: this fails the sign-in with a 500, and the operator
+            // needs to know it was the device-secret write and not the token mint.
+            tracing::error!(%error, "native SSO device secret could not be recorded");
+            TokenError::ServerError
+        })?;
+    Ok(Some(secret))
 }
 
 /// What the code-exchange session read answers (issues #32 and #101).
@@ -1042,6 +1112,16 @@ async fn resolve_code_exchange_sid(
 struct CodeExchangeSession {
     /// The front-channel `sid`, absent when the grant has no SSO session.
     sid: Option<String>,
+    /// The UNDERLYING SSO session, absent when the grant has none.
+    ///
+    /// Distinct from `sid` on purpose, and Native SSO (issue #133) is what forced the
+    /// distinction into the open. `sid` comes from `ensure_sid` and is stable per
+    /// (client, session) and DIFFERENT for every client, which is what stops one relying
+    /// party correlating a person across another's tokens. The SSO set a device secret
+    /// belongs to spans the whole app family, so keying it on `sid` would sever only the app
+    /// that happened to ask and leave its siblings minting -- a criterion failing silently,
+    /// with the revocation appearing to succeed.
+    session_id: Option<ironauth_store::SessionId>,
     /// The impersonation the session was started under, absent on an ordinary session.
     impersonation: Option<ironauth_store::SessionImpersonation>,
 }
@@ -1613,7 +1693,7 @@ async fn mint_tokens(
     // session is still live: a code minted before a revoke and redeemed after it is an
     // invalid_grant, never a live token bound to a dead session.
     let session = resolve_code_exchange_sid(state, scope, bindings).await?;
-    let sid = session.sid;
+    let sid = session.sid.clone();
     let sid = sid.as_deref();
     // Resolve the effective organization roles (issue #97) FRESH from the store, in
     // the org context frozen onto the grant. Fresh, not frozen: unlike `org_id` this
@@ -1655,6 +1735,26 @@ async fn mint_tokens(
     // per-client pairwise configuration is client-registration state a later issue
     // persists (see OidcState::resolve_public_subject).
     let subject = state.resolve_public_subject(&bindings.subject);
+
+    // NATIVE SSO (issue #133, PROTOTYPE): mint the device secret BEFORE the ID token, because
+    // the token has to carry its hash. Three conditions, all required:
+    //
+    //   * the prototype is armed,
+    //   * the GRANTED scope (not the requested one) includes `device_sso`,
+    //   * the grant has a live SSO session, since the secret is bound to one.
+    //
+    // With any of them absent this is `None` and every ID token stays unbound, which is what
+    // keeps the exchange's relaxation unreachable for the tokens this deployment has already
+    // issued.
+    let device_secret = mint_device_secret(state, scope, bindings, &session).await?;
+    let ds_hash_value = device_secret.as_ref().map(|secret| {
+        crate::native_sso::ds_hash(
+            id_token_signer
+                .map_or_else(|| signer.algorithm(), ironauth_jose::SigningKey::algorithm),
+            secret,
+        )
+    });
+
     // The access-token target (format, audience set, and lifetime) was resolved from
     // the RFC 8707 resource indicators by the caller (issue #28/#29). No resource
     // resolves to the environment default (the client id as audience), keeping the
@@ -1706,6 +1806,9 @@ async fn mint_tokens(
             // never carries c_hash; the front-channel/hybrid path (#17) supplies
             // them. Both are absent here by construction.
             at_hash: None,
+            // The Native SSO binding (issue #133), present ONLY when a device secret was just
+            // minted beside this token. This is the one door that sets it.
+            ds_hash: ds_hash_value.as_deref(),
             c_hash: None,
             extra_claims,
             id_token_signer,
@@ -1722,6 +1825,11 @@ async fn mint_tokens(
         target,
     )
     .map_err(|()| TokenError::ServerError)?;
+    // Carry the device secret out to the response. `tokens::mint` cannot know it: the secret
+    // has to exist BEFORE the ID token is signed, because the token carries its hash.
+    let mut minted = minted;
+    minted.device_secret = device_secret;
+    let minted = minted;
     // The budget verdict, recorded AFTER the mint and off its critical path (issue
     // #98). Best effort: a failed write never affects the token, which already carries
     // `permissions_status` if anything was withheld.
@@ -2008,6 +2116,12 @@ pub(crate) fn token_response(
     }
     if let Some(refresh_token) = refresh_token {
         body["refresh_token"] = serde_json::json!(refresh_token);
+    }
+    // NATIVE SSO (issue #133, PROTOTYPE): the device secret, returned ONCE and never again.
+    // Only its digest was stored, so a client that loses it has to sign in again -- which is
+    // the correct outcome for a credential that speaks for a whole app family.
+    if let Some(device_secret) = &minted.device_secret {
+        body["device_secret"] = serde_json::json!(device_secret);
     }
     token_ok(&body.to_string())
 }
@@ -2839,6 +2953,9 @@ async fn mint_refresh_access(
             // rather than replayed, for the same reason and one step more sharply: a
             // permission names an API capability.
             permissions: permissions.as_ref(),
+            // Native SSO (issue #133): the refresh path mints no ID token at all, so there is
+            // nothing to bind. A device secret is minted only at the CODE exchange.
+            ds_hash: None,
             at_hash: None,
             c_hash: None,
             extra_claims: &extra_claims,

@@ -1425,6 +1425,8 @@ async fn mint_front_channel_id_token(
         // Permissions (issue #98) likewise ride the ACCESS token only, so they are
         // inert on the front channel for exactly the reason above.
         permissions: None,
+        // Native SSO (issue #133): the front channel returns no device secret, so its ID token is unbound and cannot be redeemed.
+        ds_hash: None,
         at_hash: None,
         c_hash: c_hash.as_deref(),
         extra_claims: &extra_claims,
