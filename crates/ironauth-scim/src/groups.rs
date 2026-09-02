@@ -151,14 +151,18 @@ async fn membership_of(
 ///
 /// One function, so a fourth caller cannot reintroduce it.
 ///
-/// # What this means for a group at the bound
+/// # This refuses a READ; growing a group past the bound is refused elsewhere
 ///
-/// A group cannot be grown PAST the bound, because the write's own response renders the group
-/// and that render is one of the reads being bounded. So the bound is effectively a maximum
-/// group size for this surface, and a group that somehow exceeds it (an operator built it
-/// through the admin API, or the bound was lowered) is unreadable and unmodifiable here until
-/// the bound is raised. That is the honest failure: the alternative is a 200 carrying a
-/// members array that is missing people, which a provisioning client acts on by removing them.
+/// An earlier version of this comment claimed a group could not be grown past the bound
+/// "because the write's own response renders the group". That is false: the render runs after
+/// the writes have committed, so it refuses the RESPONSE and keeps the rows. A reviewer drove
+/// it -- a `PATCH` adding three members at a bound of two answered `tooMany` with all three
+/// members landed, and the organization's whole `GET /Groups` then failed permanently.
+///
+/// Growing a group past the bound is refused by [`resolve_members`] and [`set_members`], both
+/// of which check the RESULTING size before writing anything. This function is the read-side
+/// half, for a group that exceeds the bound anyway: one built through the admin API, or one
+/// that fitted until the bound was lowered.
 async fn member_bindings(
     state: &ScimState,
     auth: &Authenticated,
@@ -184,13 +188,33 @@ async fn member_bindings(
 }
 
 /// Render a stored group as a SCIM group resource.
+///
+/// # `with_members` is false for the LISTING, and that is a decision rather than a shortcut
+///
+/// RFC 7644 section 3.4.2 lets a provider return a subset of attributes in a list response,
+/// and a listing that carried every group's full membership is O(groups x members) of work a
+/// caller chooses the size of -- the same unbounded read `max_scan` exists to bound, multiplied
+/// by the number of groups.
+///
+/// It also removes a failure a reviewer reached: with members rendered, ONE group over the
+/// bound made the organization's entire `GET /Groups` answer `tooMany` permanently, because
+/// the per-group refusal propagated out of the listing. A client cannot enumerate groups it
+/// cannot see, so a single oversized group hid every other group in the organization.
+///
+/// A single-resource `GET /Groups/{id}` carries members, bounded, which is where a client
+/// reads them.
 async fn group_resource(
     state: &ScimState,
     auth: &Authenticated,
     record: &OrgGroupRecord,
+    with_members: bool,
 ) -> Result<Value, Response> {
     let scoped = state.store().scoped(auth.scope);
-    let bindings = member_bindings(state, auth, &record.id).await?;
+    let bindings = if with_members {
+        member_bindings(state, auth, &record.id).await?
+    } else {
+        Vec::new()
+    };
     let mut members = Vec::with_capacity(bindings.len());
     for binding in &bindings {
         // A binding names a MEMBERSHIP; SCIM wants the person. A membership removed since
@@ -205,16 +229,23 @@ async fn group_resource(
             "type": "User",
         }));
     }
-    Ok(json!({
+    let mut body = json!({
         "schemas": [GROUP_SCHEMA],
         "id": record.id.to_string(),
         "displayName": record.display_name,
-        "members": members,
         "meta": {
             "resourceType": "Group",
             "location": format!("/scim/v2/Groups/{}", record.id),
         },
-    }))
+    });
+    // OMITTED, not empty, when members were not read. An empty array is a positive claim that
+    // the group has no members, which a provisioning client acts on by removing everybody;
+    // an absent attribute is RFC 7644 section 3.4.2's "the provider returned a subset", which
+    // is what actually happened.
+    if with_members {
+        body["members"] = Value::Array(members);
+    }
+    Ok(body)
 }
 
 /// `POST /scim/v2/Groups`.
@@ -318,7 +349,7 @@ async fn rendered_group(
     raw_id: &str,
 ) -> Result<Value, Response> {
     let record = addressed_group(state, auth, raw_id).await?;
-    group_resource(state, auth, &record).await
+    group_resource(state, auth, &record, true).await
 }
 
 /// Resolve every member id to a membership in this credential's organization, de-duplicated.
@@ -339,6 +370,17 @@ async fn resolve_members(
     auth: &Authenticated,
     wanted: &[ScimMember],
 ) -> Result<Vec<OrgMembershipId>, Response> {
+    // BEFORE anything is written, and before the caller creates a group to put them in. A
+    // request naming more members than one request may examine cannot be served, and finding
+    // that out after the group exists is what left an orphan group behind whose every retry
+    // was a 409.
+    if wanted.len() > state.limits().scan_bound() {
+        return Err(scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("tooMany"),
+            "this request names more members than one request may examine",
+        ));
+    }
     let mut resolved: Vec<OrgMembershipId> = Vec::with_capacity(wanted.len());
     for member in wanted {
         // EVERY member id goes through the same gate a direct /Users request would: the user
@@ -374,6 +416,29 @@ async fn set_members(
         .management()
         .acting(auth.actor, CorrelationId::generate(&env));
 
+    // The RESULTING size, which `resolve_members` cannot know: an `add` of two members to a
+    // group that already holds the bound takes it over. Computed before any write, so the
+    // refusal leaves the group exactly as it was.
+    let arriving = wanted
+        .iter()
+        .filter(|membership| {
+            !existing
+                .iter()
+                .any(|binding| binding.membership_id == **membership)
+        })
+        .count();
+    let resulting = if replace {
+        wanted.len()
+    } else {
+        existing.len() + arriving
+    };
+    if resulting > state.limits().scan_bound() {
+        return Err(scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("tooMany"),
+            "this change would leave the group with more members than one request may examine",
+        ));
+    }
     let mut keep = Vec::with_capacity(wanted.len());
     for membership in wanted.iter().copied() {
         if existing
@@ -926,7 +991,7 @@ pub(crate) async fn list_groups(
     }
     let mut matched = Vec::new();
     for group in &groups {
-        let resource = match group_resource(&state, &auth, group).await {
+        let resource = match group_resource(&state, &auth, group, false).await {
             Ok(resource) => resource,
             Err(response) => return response,
         };

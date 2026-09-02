@@ -41,7 +41,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::identifier::IdentifierType;
+use ironauth_store::identifier::{IdentifierType, canonicalize_identifier};
 use ironauth_store::{
     CorrelationId, NewMembership, NewUserIdentifier, OffboardingSchedule, OrgMembershipId,
     ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId, UserState,
@@ -242,24 +242,40 @@ pub(crate) async fn create_user(
     let env = state.env().clone();
     let scope = auth.scope;
     let store = state.store();
-    let user_id = match refuse_a_duplicate(&state, &auth, &parsed, kind).await {
-        // A person this credential once held, brought back. Their account, identifier row and
-        // externalId mapping all still exist, so there is nothing to create: the response is a
-        // 201 naming the id they already had, which is what the client's stored reference
-        // points at.
-        Ok(Some(readmitted)) => {
-            return match rendered_user(&state, &auth, &readmitted).await {
-                Ok(body) => created(&readmitted, &body),
-                Err(response) => response,
-            };
-        }
-        Ok(None) => UserId::generate(&env, &scope),
+    // DECIDE FIRST, then write. Everything that can refuse this request -- a duplicate handle,
+    // an externalId already bound to a different value, a person this organization does not
+    // get to bring back -- is settled before a single row is written.
+    let plan = match plan_create(&state, &auth, &parsed, kind).await {
+        Ok(plan) => plan,
         Err(response) => return response,
     };
-    if let Err(response) = land_account(&state, &auth, &user_id, &parsed, kind).await {
-        return response;
-    }
-    if let Some(external_id) = parsed.external_id.as_deref() {
+    let readmitted = matches!(plan, CreatePlan::Readmit(_));
+    let user_id = match plan {
+        CreatePlan::Fresh => {
+            let fresh = UserId::generate(&env, &scope);
+            if let Err(response) = land_account(&state, &auth, &fresh, &parsed, kind).await {
+                return response;
+            }
+            fresh
+        }
+        // A person this organization once held, brought back. Their account and identifier row
+        // still exist, so only the membership is recreated, and the response names the id they
+        // already had -- which is what the client's stored reference points at.
+        CreatePlan::Readmit(known) => {
+            if let Err(response) = restore_membership(&state, &auth, &known).await {
+                return response;
+            }
+            known
+        }
+    };
+    // The externalId bind runs on BOTH paths. An earlier version returned early on a re-admit
+    // and so never bound the key the request carried: a re-admit answered 201 carrying no
+    // externalId at all, or carrying the OLD one, and the client had no route to the key it
+    // sent. `plan_create` has already refused the case where the two disagree, so this either
+    // binds a first key or finds the same one already bound.
+    if let Some(external_id) = parsed.external_id.as_deref()
+        && external_id_of(&state, &auth, &user_id).await.is_none()
+    {
         let mapping_id = ScimExternalIdId::generate(&env, &scope);
         if let Err(error) = store
             .scoped(scope)
@@ -270,13 +286,15 @@ pub(crate) async fn create_user(
             return store_failure(&error);
         }
     }
-    // `active: false` on a create is a real thing an identity provider sends for a staged
-    // user, so it is applied rather than ignored: an account created disabled must not be able
-    // to sign in between the create and the deactivate the client would otherwise have to send.
-    if !parsed.active
-        && let Err(error) = set_active(&state, &auth, &user_id, false).await
-    {
-        return error;
+    // `active` is applied on BOTH paths too. `active: false` on a create is a real thing an
+    // identity provider sends for a staged user, and the early return on the re-admit path
+    // discarded it: a re-created person came back ENABLED however the request asked, which is
+    // the one thing this branch exists to prevent. A re-admit also has to clear the `false`
+    // activation row its own deactivation left behind, so it writes even when active is true.
+    if readmitted || !parsed.active {
+        if let Err(response) = set_active(&state, &auth, &user_id, parsed.active).await {
+            return response;
+        }
     }
     match rendered_user(&state, &auth, &user_id).await {
         Ok(body) => created(&user_id, &body),
@@ -304,149 +322,175 @@ fn created(user_id: &UserId, body: &Value) -> Response {
         .into_response()
 }
 
-/// Refuse a create that would duplicate somebody this credential can already see.
+/// What a create is going to do, decided before anything is written.
+#[derive(Debug)]
+enum CreatePlan {
+    /// Nobody here matches: mint a new account.
+    Fresh,
+    /// Somebody this organization previously held: bring them back with their original id.
+    Readmit(UserId),
+}
+
+/// Decide whether a create is a fresh account, a re-admit, or a refusal.
 ///
-/// Split out of [`create_user`] so the two conflict rules sit together and can be read against
-/// each other: they are the same kind of decision made about two different namespaces.
-async fn refuse_a_duplicate(
+/// PURE: it reads and refuses, and writes nothing. That is the fix for a defect this function
+/// had in two forms across two review rounds -- deciding and writing in the same pass left
+/// half-applied creates behind whenever the second half refused.
+///
+/// # The duplicate rule, and why it does not consult the uniqueness mode
+///
+/// A create makes an ACCOUNT row, and `users_identifier_bidx_unique` (migration 0028) is
+/// `UNIQUE (tenant_id, environment_id, identifier_bidx)` -- one account per login handle per
+/// ENVIRONMENT, whatever `UniquenessMode` is configured. That mode governs `user_identifiers`,
+/// the additional identifiers an account may carry; it cannot make a second account for a
+/// handle the environment already has. So the refusal is unconditional, and what the
+/// existence-oracle concern actually requires is that a foreign handle be refused
+/// INDISTINGUISHABLY from one held here, which it is.
+async fn plan_create(
     state: &ScimState,
     auth: &Authenticated,
     parsed: &ScimUser,
     kind: IdentifierType,
-) -> Result<Option<UserId>, Response> {
+) -> Result<CreatePlan, Response> {
     let store = state.store();
     let scope = auth.scope;
-    // Duplicate detection BEFORE the write, so a collision answers 409 without having created
-    // an account. `add` refuses the same collision under the partial unique index, which is
-    // what makes this a fast path rather than the check: two concurrent creates both pass here
-    // and one loses there.
-    //
-    // UNCONDITIONAL, and NOT because the uniqueness mode is ignored. A create makes an ACCOUNT
-    // row, and `users_identifier_bidx_unique` (migration 0028) is
-    // `UNIQUE (tenant_id, environment_id, identifier_bidx)` -- one account per login handle per
-    // ENVIRONMENT, whatever `UniquenessMode` is configured. That mode governs
-    // `user_identifiers`, the additional identifiers an account may carry; it cannot make a
-    // second account for a handle the environment already has.
-    //
-    // Round 1 read this as an existence oracle and asked for a mode-aware check. The oracle
-    // reading is right and the mode-aware fix was wrong: its org-scoped arm let a create
-    // proceed to `register_passwordless`, which then failed on that unique constraint, so the
-    // caller learned the same fact through a 500 instead of a 409. What is actually required
-    // is that the refusal a foreign handle produces be INDISTINGUISHABLE from the one a handle
-    // held here produces, which it is: the same status, the same scimType, the same detail,
-    // and nothing naming an organization or a person.
-    //
-    // A person this organization previously held is the one case that is not a conflict, and
-    // `readmit` below is gated on a fact only this organization could have created.
-    match store
+    let found = store
         .scoped(scope)
         .user_identifiers()
         .resolve(kind, &parsed.user_name)
         .await
-    {
-        Ok(found) if !found.is_empty() => {
+        .map_err(|error| store_failure(&error))?;
+    if !found.is_empty() {
+        for resolution in &found {
+            // THE RESOLUTION MUST BE THE PERSON WHOSE HANDLE THIS IS. Under `OrgScoped` and
+            // `NonUnique`, `user_identifiers` can hold this handle as a SECONDARY identifier of
+            // somebody whose account handle is something else entirely -- and a reviewer built
+            // exactly that: Initech asked for `alice@example.test` and got a 201 naming BOB,
+            // because bob carried alice's handle as a second identifier and Initech had
+            // previously deactivated bob. Nothing crossed an organization, but every later
+            // group push and role assignment for alice would have landed on bob, and alice
+            // would never have been provisioned.
+            //
+            // Compared on the CANONICAL form, because that is what "the same person's handle"
+            // means everywhere else on this surface.
+            let record = store
+                .scoped(scope)
+                .users()
+                .get(&resolution.user_id)
+                .await
+                .map_err(|error| store_failure(&error))?;
+            if canonicalize_identifier(identifier_kind(&record.identifier), &record.identifier)
+                != parsed.canonical_identifier()
             {
-                // A RE-ADMIT rather than a conflict, when the person this names is somebody
-                // this credential once held and no longer does. DELETE removes the membership
-                // but nothing releases the identifier row or this connection's externalId
-                // mapping (0184 grants no DELETE there, deliberately), so without this every
-                // route back was closed: a reviewer deleted a person and found the re-POST
-                // answered 409 in all three spellings, PATCH answered 404, and an Okta rehire
-                // was unrecoverable through SCIM.
-                for resolution in &found {
-                    if let Some(user) = readmit(state, auth, &resolution.user_id).await? {
-                        return Ok(Some(user));
-                    }
-                }
-                return Err(scim_error(
-                    StatusCode::CONFLICT,
-                    Some("uniqueness"),
-                    "a user with this userName already exists",
-                ));
+                continue;
+            }
+            if readmittable(state, auth, &resolution.user_id).await? {
+                external_id_must_agree(state, auth, &resolution.user_id, parsed).await?;
+                return Ok(CreatePlan::Readmit(resolution.user_id));
             }
         }
-        Ok(_) => {}
-        Err(error) => return Err(store_failure(&error)),
+        return Err(scim_error(
+            StatusCode::CONFLICT,
+            Some("uniqueness"),
+            "a user with this userName already exists",
+        ));
     }
-    // MAJOR: the externalId conflict is checked BEFORE anything is written. `bind` runs after
-    // three committed writes, so a duplicate externalId used to answer 409 having already
-    // created the account, its identifier row and its organization membership -- the client was
-    // told nothing was created and the organization gained a member. The index below is still
-    // the authority for a concurrent pair; this is what stops the ordinary retry.
-    if let Some(external_id) = parsed.external_id.as_deref() {
-        match store
-            .scoped(scope)
-            .scim_external_ids()
-            .resolve(&auth.connection.id, external_id)
-            .await
-        {
-            Ok(Some(known)) => {
-                // The same re-admit, through the externalId door: this connection's own key
-                // for somebody it once provisioned is exactly how an identity provider names a
-                // rehire.
-                if let Some(user) = readmit(state, auth, &known).await? {
-                    return Ok(Some(user));
-                }
-                return Err(scim_error(
-                    StatusCode::CONFLICT,
-                    Some("uniqueness"),
-                    "this connection has already provisioned a user with this externalId",
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(store_failure(&error)),
-        }
+    let Some(external_id) = parsed.external_id.as_deref() else {
+        return Ok(CreatePlan::Fresh);
+    };
+    match store
+        .scoped(scope)
+        .scim_external_ids()
+        .resolve(&auth.connection.id, external_id)
+        .await
+        .map_err(|error| store_failure(&error))?
+    {
+        // This connection's own key for somebody it once provisioned is exactly how an
+        // identity provider names a rehire.
+        Some(known) if readmittable(state, auth, &known).await? => Ok(CreatePlan::Readmit(known)),
+        Some(_) => Err(scim_error(
+            StatusCode::CONFLICT,
+            Some("uniqueness"),
+            "this connection has already provisioned a user with this externalId",
+        )),
+        None => Ok(CreatePlan::Fresh),
     }
-    Ok(None)
 }
 
-/// Re-admit a person this credential once held, or [`None`] if they are still a live member.
+/// Whether a create may bring this person back into the credential's organization.
 ///
-/// Returns `Some(user)` only when the person is genuinely absent from this organization, which
-/// is the case a create is entitled to fix. A person who IS still a member is a real duplicate
-/// and the caller falls through to the 409.
+/// BOTH halves are required and each is load bearing.
 ///
-/// # This is not a way to reach somebody else's user
+/// The activation row is what says this organization once held them: only this surface writes
+/// that table, only for the organization on the credential, and only when that organization
+/// deactivated or deleted the person. Without it, a re-admit conditioned on membership alone
+/// would let any credential take another organization's live user by naming their handle --
+/// which an earlier version did.
 ///
-/// The person was found either by an identifier this credential is allowed to create, or by
-/// THIS connection's own externalId mapping. In both cases the credential has already
-/// demonstrated it knows who they are, and the re-admit binds them into the credential's own
-/// organization and nowhere else -- the same write an ordinary create makes.
-async fn readmit(
+/// The membership check is what stops a re-admit being a no-op that reports success: a person
+/// this organization deactivated but still HOLDS is a live resource, and a create naming them
+/// is an ordinary duplicate, not a rehire.
+async fn readmittable(
     state: &ScimState,
     auth: &Authenticated,
     user: &UserId,
-) -> Result<Option<UserId>, Response> {
-    let env = state.env().clone();
+) -> Result<bool, Response> {
     let scoped = state.store().scoped(auth.scope);
-    // THE GATE, and it is the whole safety of this path. "Not currently a member" is NOT
-    // enough: it is true of every user in the environment, so re-admitting on that alone lets
-    // any credential pull another organization's live user into its own by POSTing their
-    // handle. That is a cross-organization write, and an earlier version of this function had
-    // it -- caught by the environment-wide duplicate test answering 201.
-    //
-    // The activation row is the right key because only THIS surface writes it, only for THIS
-    // organization, and only when this organization deactivated or deleted the person. So an
-    // absent row (which reads as active) means this organization never held them, and a
-    // present false row means it did.
     if scoped
         .scim_activation()
         .is_active(&auth.connection.organization_id, user)
         .await
         .map_err(|error| store_failure(&error))?
     {
-        return Ok(None);
+        return Ok(false);
     }
     let member = scoped
         .org_memberships()
         .exists(&auth.connection.organization_id, user)
         .await
         .map_err(|error| store_failure(&error))?;
-    if member {
-        return Ok(None);
+    Ok(!member)
+}
+
+/// Refuse a re-admit whose `externalId` disagrees with the one already bound.
+///
+/// The mapping table holds no UPDATE and no DELETE grant, so a key that is already bound
+/// cannot be moved. Answering 201 anyway -- which an earlier version did -- hands the client a
+/// resource carrying a key it did not send and no route to the one it did.
+async fn external_id_must_agree(
+    state: &ScimState,
+    auth: &Authenticated,
+    user: &UserId,
+    parsed: &ScimUser,
+) -> Result<(), Response> {
+    let (Some(wanted), Some(existing)) = (
+        parsed.external_id.as_deref(),
+        external_id_of(state, auth, user).await,
+    ) else {
+        return Ok(());
+    };
+    if wanted == existing {
+        return Ok(());
     }
+    Err(scim_error(
+        StatusCode::CONFLICT,
+        Some("mutability"),
+        "this connection already knows this person by a different externalId, which cannot be \
+         repointed",
+    ))
+}
+
+/// Bind a re-admitted person back into the credential's organization.
+async fn restore_membership(
+    state: &ScimState,
+    auth: &Authenticated,
+    user: &UserId,
+) -> Result<(), Response> {
+    let env = state.env().clone();
     let membership_id = OrgMembershipId::generate(&env, &auth.scope);
-    scoped
+    state
+        .store()
+        .scoped(auth.scope)
         .acting(auth.actor, CorrelationId::generate(&env))
         .org_memberships()
         .create(
@@ -461,12 +505,8 @@ async fn readmit(
             None,
         )
         .await
-        .map_err(|error| store_failure(&error))?;
-    // A re-admitted person is ACTIVE. The activation row from their deactivation is still
-    // there and still says false, and leaving it would make the create answer 201 with
-    // `active: false` -- a person the client believes it just provisioned who cannot sign in.
-    set_active(state, auth, user, true).await?;
-    Ok(Some(*user))
+        .map(|_| ())
+        .map_err(|error| store_failure(&error))
 }
 
 /// Register the account, bind it into the credential's organization, and index its login
@@ -488,9 +528,16 @@ async fn readmit(
 /// committed. A reviewer drove it: the surface worked in exactly one of the three configured
 /// modes, and the mode-aware duplicate check above it could never be reached in the other two.
 ///
-/// The membership therefore comes second and the identifier third. What a partial failure
-/// leaves behind is now a member with no login identifier, which the next create of the same
-/// person resolves as absent and retries.
+/// The membership therefore comes second and the identifier third.
+///
+/// WHAT A PARTIAL FAILURE LEAVES BEHIND, said accurately: an account row and a membership, with
+/// no login identifier. An earlier version of this comment claimed the next create "resolves as
+/// absent and retries", and a reviewer showed that is false -- `resolve` reads
+/// `user_identifiers` and finds nothing, so the retry mints a fresh id and then collides with
+/// `users_identifier_bidx_unique` on the account row, answering 409 forever. The orphan is
+/// reachable only by id, and clearing it is an operator action. That is a worse outcome than
+/// the old order's orphan account, and it is still the right trade: the old order did not
+/// leave an orphan occasionally, it failed EVERY create under `OrgScoped`.
 async fn land_account(
     state: &ScimState,
     auth: &Authenticated,
@@ -674,9 +721,20 @@ async fn reconcile_account_state(
                 at_unix_micros: None,
                 wake_payload: None,
             },
-            // NOT a hard kill. Ending live sessions is the deprovisioning CASCADE, which the
-            // issue puts in another piece of work; doing half of it here would make the
-            // cascade's own tests pass against a behaviour it does not own.
+            // `hard_kill: false`, and what that does and does not mean is worth being exact
+            // about, because an earlier version of this comment had it backwards.
+            //
+            // The transition ITSELF already ends the cascade's main body:
+            // `UserState::Disabled` is `ends_sessions()`, so `set_state` revokes every live
+            // session and every non-offline refresh family in the same transaction and
+            // publishes to the session-ended fan-out. A SCIM deactivate therefore does stop
+            // the person authenticating, today, without this flag.
+            //
+            // What `hard_kill` would additionally revoke is the OFFLINE refresh families and
+            // their grants -- the long-lived consent an application holds to act for the
+            // person while they are away. Whether a provisioning client's deactivate should
+            // reach that far, and within what documented SLO, is the deprovisioning-cascade
+            // issue's decision rather than this surface's, so it is left alone here.
             false,
             None,
         )

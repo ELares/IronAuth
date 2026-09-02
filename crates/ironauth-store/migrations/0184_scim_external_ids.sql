@@ -66,7 +66,9 @@ CREATE TABLE scim_external_ids (
 -- externalId). It does NOT by itself stop a retried provisioning run from creating a duplicate
 -- person -- the account, its identifier row and its organization membership are written before
 -- the bind, so a create that reached this index having already committed those would answer
--- 409 with the person created anyway. The handler therefore resolves the externalId BEFORE it
+-- 409 with the person created anyway. (Those three writes are the account row, its
+-- organization membership and its login identifier; the ORDER among them is the handler's and
+-- has changed since, so this names the set rather than the sequence.) The handler therefore resolves the externalId BEFORE it
 -- writes anything, and this index is the authority for the concurrent pair that both pass that
 -- check.
 --

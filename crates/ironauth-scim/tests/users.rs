@@ -1736,10 +1736,11 @@ async fn a_deleted_person_can_be_provisioned_again() {
             "the same handle and the same key",
             json!({"userName": "alice@example.test", "externalId": "00u1alice"}),
         ),
-        (
-            "the same handle and a new key",
-            json!({"userName": "alice@example.test", "externalId": "00u2alice"}),
-        ),
+        // A NEW key for a person this connection already knows by another one is NOT here: it
+        // is a 409 `mutability`, because the mapping cannot be repointed, and
+        // `a_re_admit_with_a_different_external_id_is_refused_rather_than_silently_kept`
+        // drives it. An earlier version of this test asserted 201 for that shape and so
+        // encoded the defect: the client was handed a resource carrying a key it did not send.
         (
             "a new handle and the old key",
             json!({"userName": "alice2@example.test", "externalId": "00u1alice"}),
@@ -1761,6 +1762,14 @@ async fn a_deleted_person_can_be_provisioned_again() {
         // The SAME id they had: a re-admit is the person coming back, not a second account,
         // and the client's stored reference points at the old id.
         assert_eq!(parsed["id"], json!(alice.as_str()), "{what}: {answer}");
+        // And the STORED handle, not the requested one. A rename cannot be applied here for
+        // the same reason `replace_user` refuses one, so the response says what the person is
+        // actually called rather than echoing what was asked for.
+        assert_eq!(
+            parsed["userName"],
+            json!("alice@example.test"),
+            "{what}: {answer}"
+        );
         // And ACTIVE, because the deactivation their delete recorded must not survive the
         // re-admit: a 201 carrying `active: false` is a person the client believes it just
         // provisioned who cannot sign in.
@@ -1926,4 +1935,324 @@ async fn a_provisioning_client_cannot_lift_an_administrative_block() {
             .expect("read the account state"),
         Some(ironauth_store::UserState::Active)
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// REVIEW ROUND 3.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_re_admit_honours_the_active_flag_and_the_external_id_it_carries() {
+    // BLOCKER. The re-admit branch returned before the `active` apply and before the
+    // externalId bind, so a staged re-create came back ENABLED however the request asked, and
+    // a re-admit carrying a key bound nothing: the client was handed a resource with no
+    // externalId at all, or with the OLD one, and no route to the key it sent.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    // (a) a person provisioned with NO key, re-created WITH one and staged inactive.
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        Some(json!({"userName": "bob@example.test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let bob = serde_json::from_str::<Value>(&body).expect("a resource")["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    let (status, _) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{bob}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        Some(json!({
+            "userName": "bob@example.test",
+            "externalId": "00uBOB",
+            "active": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["id"], json!(bob.as_str()), "{body}");
+    assert_eq!(
+        parsed["externalId"],
+        json!("00uBOB"),
+        "the key the request carried must be bound: {body}"
+    );
+    assert_eq!(
+        parsed["active"],
+        json!(false),
+        "a staged re-create must not enable the account: {body}"
+    );
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&bob)
+            .await
+            .expect("read the account state"),
+        Some(ironauth_store::UserState::Disabled),
+        "and the account itself is disabled, not merely rendered so"
+    );
+}
+
+#[tokio::test]
+async fn a_re_admit_with_a_different_external_id_is_refused_rather_than_silently_kept() {
+    // BLOCKER, the other half. The mapping table holds no UPDATE and no DELETE grant, so a key
+    // that is bound cannot be moved. Answering 201 anyway handed the client a resource
+    // carrying a key it did not send, with no route to the one it did -- and the repairing PUT
+    // then answered 409.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    let carol = provision(&db, &env, &okta.token, "carol@example.test", "00uOLD").await;
+    let (status, _) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{carol}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        Some(json!({"userName": "carol@example.test", "externalId": "00uNEW"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("mutability"), "{body}");
+
+    // The control: the SAME key succeeds, so the refusal is the disagreement and not a
+    // re-admit that never works when a key is present.
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        Some(json!({"userName": "carol@example.test", "externalId": "00uOLD"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["id"], json!(carol.as_str()), "{body}");
+    assert_eq!(parsed["externalId"], json!("00uOLD"), "{body}");
+}
+
+#[tokio::test]
+async fn a_re_admit_names_the_person_whose_handle_was_asked_for() {
+    // BLOCKER. Under `OrgScoped` and `NonUnique`, `user_identifiers` can hold a handle as a
+    // SECONDARY identifier of somebody whose account handle is something else. The re-admit
+    // loop took the first resolution without checking, so a reviewer asked for
+    // `alice@example.test` and got a 201 naming BOB. Nothing crossed an organization, but
+    // every later group push and role assignment for alice would have landed on bob.
+    for mode in [
+        ironauth_store::identifier::UniquenessMode::OrgScoped,
+        ironauth_store::identifier::UniquenessMode::NonUnique,
+    ] {
+        let db = TestDatabase::start().await;
+        let env = Env::system();
+        let scope = db.seed_scope(&env).await;
+        let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+        let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+        // Globex holds alice. Initech holds bob.
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&globex.token),
+            Some(json!({"userName": "alice@example.test"})),
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{mode:?}: {body}");
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&initech.token),
+            Some(json!({"userName": "bob@example.test"})),
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{mode:?}: {body}");
+        let bob = serde_json::from_str::<Value>(&body).expect("a resource")["id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+        let bob_id = db
+            .store()
+            .scoped(scope)
+            .users()
+            .parse_id(&bob)
+            .expect("a user id");
+
+        // An operator gives bob alice's handle as a SECOND identifier, which this mode allows.
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .user_identifiers()
+            .add(
+                &env,
+                ironauth_store::NewUserIdentifier {
+                    id: &ironauth_store::UserIdentifierId::generate(&env, &scope),
+                    user_id: &bob_id,
+                    identifier_type: ironauth_store::IdentifierType::Email,
+                    raw: "alice@example.test",
+                    verified: false,
+                    mode,
+                    org: Some(&initech.organization.to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("a second identifier for bob");
+
+        // Initech deactivates and deletes bob, then asks for ALICE.
+        let (status, _) = call_configured(
+            &db,
+            &env,
+            "DELETE",
+            &format!("/scim/v2/Users/{bob}"),
+            Some(&initech.token),
+            None,
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{mode:?}");
+
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&initech.token),
+            Some(json!({"userName": "alice@example.test"})),
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{mode:?}: asking for alice must never answer with bob: {body}"
+        );
+        assert!(!body.contains(bob.as_str()), "{mode:?}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_deactivated_member_is_a_conflict_rather_than_a_re_admit() {
+    // The membership half of `readmittable`, which a reviewer showed was vacuous: deleting it
+    // left all 107 tests green. A person this organization deactivated but still HOLDS is a
+    // live resource -- a client reactivates them with `active: true`, and a create naming them
+    // is an ordinary duplicate.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let frank = provision(&db, &env, &okta.token, "frank@example.test", "00uFRANK").await;
+
+    // Deactivate WITHOUT deleting, which keeps the membership.
+    let (status, _) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{frank}"),
+        Some(&okta.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        Some(json!({"userName": "frank@example.test", "externalId": "00uFRANK"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // THE SPECIFIC refusal, not merely a 409. Removing the membership half of `readmittable`
+    // makes this a re-admit whose `restore_membership` then collides with the live membership
+    // and answers its own 409, so a bare status assertion passes under the mutation it exists
+    // to catch. The detail distinguishes the duplicate refusal from the collision.
+    assert!(
+        body.contains("a user with this userName already exists"),
+        "refused as a duplicate rather than by a collision downstream: {body}"
+    );
+    // And the person is untouched: still deactivated, not reactivated by a re-admit that ran.
+    let (_, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{frank}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["active"], json!(false), "{body}");
+
+    // And exactly ONE membership, so a re-admit that ran anyway would show up here.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{frank}"),
+        Some(&okta.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": true}],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "reactivation is the route back: {body}"
+    );
+    let (_, body) = call(&db, &env, "GET", "/scim/v2/Users", Some(&okta.token), None).await;
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(1), "{body}");
 }

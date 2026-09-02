@@ -958,3 +958,236 @@ async fn a_group_create_answers_the_location_of_the_group_it_created() {
     let parsed: Value = serde_json::from_str(&body).expect("a resource");
     assert_eq!(parsed["meta"]["location"], json!(location.as_str()));
 }
+
+#[tokio::test]
+async fn a_group_cannot_be_grown_past_the_scan_bound() {
+    // BLOCKER. The refusal was on the RESPONSE RENDER, which runs after the writes commit, so
+    // a reviewer added three members at a bound of two, got a 400, and found all three landed
+    // -- and the organization's whole `GET /Groups` then failed permanently. The same shape on
+    // `POST /Groups` created the group and made every retry a 409.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let tight = ScimLimits {
+        max_scan: 2,
+        ..ScimLimits::default()
+    };
+    let roomy = ScimLimits {
+        max_scan: 10,
+        ..ScimLimits::default()
+    };
+
+    let mut people = Vec::new();
+    for who in ["a", "b", "c"] {
+        let id = provision(&db, &env, &token, &format!("{who}@example.test")).await;
+        people.push(json!({"value": id}));
+    }
+
+    // A create naming more members than the bound creates NOTHING.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Groups",
+        Some(&token),
+        Some(json!({"displayName": "Engineering", "members": people})),
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("tooMany"), "{body}");
+    let (_, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Groups",
+        Some(&token),
+        None,
+        roomy,
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(
+        parsed["totalResults"],
+        json!(0),
+        "a refused create must leave no group behind: {body}"
+    );
+
+    // An ADD that would take an existing group past the bound adds NOBODY.
+    let group = make_group(&db, &env, &token, "Engineering").await;
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": people}]),
+        )),
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        None,
+        roomy,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(
+        parsed["members"].as_array().map(Vec::len),
+        Some(0),
+        "no member may have landed: {body}"
+    );
+
+    // Filling the group exactly TO the bound works, so the refusals above are the bound and
+    // not a member add that never works.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": people[..2]}]),
+        )),
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(members(&db, &env, &token, &group).await.len(), 2);
+
+    // THE INCREMENTAL CASE, which the request-size check above cannot catch: ONE more member
+    // is within the bound as a request and takes the group over it as a result. Only the
+    // resulting-size check sees this, and without it a group grows past the bound one member
+    // at a time.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": [people[2].clone()]}]),
+        )),
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("tooMany"), "{body}");
+    assert_eq!(
+        members(&db, &env, &token, &group).await.len(),
+        2,
+        "the refused member must not have landed"
+    );
+
+    // And re-adding a member the group ALREADY holds is not growth, so it is not refused: the
+    // check counts arrivals, not the size of the request.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": [people[0].clone()]}]),
+        )),
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(members(&db, &env, &token, &group).await.len(), 2);
+}
+
+#[tokio::test]
+async fn one_oversized_group_does_not_hide_the_rest_of_the_listing() {
+    // BLOCKER, the other half. `list_groups` rendered every group's members, so ONE group over
+    // the bound made the whole listing answer `tooMany` permanently: a client could not
+    // enumerate the groups it CAN see because of one it cannot.
+    //
+    // The listing now omits `members` entirely (RFC 7644 section 3.4.2 permits a subset), which
+    // removes the failure and the O(groups x members) read with it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let roomy = ScimLimits {
+        max_scan: 10,
+        ..ScimLimits::default()
+    };
+    let tight = ScimLimits {
+        max_scan: 2,
+        ..ScimLimits::default()
+    };
+
+    let big = make_group(&db, &env, &token, "Everyone").await;
+    let small = make_group(&db, &env, &token, "Admins").await;
+    let mut people = Vec::new();
+    for who in ["a", "b", "c"] {
+        let id = provision(&db, &env, &token, &format!("{who}@example.test")).await;
+        people.push(json!({"value": id}));
+    }
+    let (status, _) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{big}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": people}]),
+        )),
+        roomy,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Under the tighter bound the big group exceeds it. The listing still answers, and names
+    // BOTH groups.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Groups",
+        Some(&token),
+        None,
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(2), "{body}");
+    assert!(
+        body.contains("Everyone") && body.contains("Admins"),
+        "{body}"
+    );
+    // And it does NOT claim either group is empty: an empty members array is a positive claim
+    // a provisioning client acts on by removing everybody.
+    for resource in parsed["Resources"].as_array().expect("resources") {
+        assert!(
+            resource.get("members").is_none(),
+            "the listing must omit members rather than send an empty array: {resource}"
+        );
+    }
+
+    // The small group is still fully readable on its own, which is where members are read.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Groups/{small}"),
+        Some(&token),
+        None,
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["members"], json!([]), "{body}");
+}

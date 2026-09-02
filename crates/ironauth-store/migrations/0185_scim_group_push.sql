@@ -31,16 +31,25 @@
 --
 -- A group binding confers roles only through `org_group_roles`, and this migration grants the
 -- data plane NOTHING on that table. So the strongest true statement about what a compromised
--- data-plane path gains here is: it may create a group, and it may put existing members of an
--- organization into groups of that organization. It may NOT attach a role to a group, so it
--- cannot manufacture a privilege that an operator has not already attached to some group.
+-- data-plane path gains here is: it may CREATE a group, RENAME one, SOFT-DELETE one, and put
+-- existing members of an organization into groups of that organization. It may NOT attach a
+-- role to a group, so it cannot manufacture a privilege an operator has not already attached
+-- to some group.
+--
+-- The soft-delete half is named explicitly because it is the sharpest of the four and the
+-- easiest to miss: `deleted_at` is in the UPDATE list below, and `ActingOrgGroupRepo::delete`
+-- is an UPDATE of exactly that column, so `DELETE /scim/v2/Groups/{id}` works and REMOVES
+-- every role its group conferred. That is a real reduction in privilege a compromised
+-- data-plane path can cause, and it is the price of serving RFC 7644 section 3.6 on this
+-- plane. It cannot GRANT anything, which is the property that matters.
 --
 -- The column scoping keeps the 0087/0088 containment property intact. `organization_id`,
 -- `parent_id`, `slug`, `group_id`, `membership_id` and the scope columns are all ABSENT from
 -- every UPDATE list below, so a row whose containment was checked when it was written can
--- never be repointed afterwards. DELETE is still granted to nobody.
+-- never be repointed afterwards. The SQL DELETE verb is still granted to nobody -- removal is
+-- the soft delete named above, so a removed group stays auditable.
 
--- `org_groups`: create and rename. `slug` is deliberately NOT in the UPDATE list, so the
+-- `org_groups`: create, rename and soft-delete. `slug` is deliberately NOT in the UPDATE list, so the
 -- stable name a token claim carries stays immutable exactly as 0087 made it, and a SCIM
 -- rename moves the label only. `parent_id` is likewise absent: this surface creates flat
 -- groups, and a data-plane path that could reparent one could graft a group under a
@@ -106,9 +115,13 @@ GRANT INSERT ON org_group_members TO ironauth_app;
 --
 -- A `false` row here is that record, and it is exactly the right key for it: only the SCIM
 -- surface writes this table, only for the organization on the credential, and only when that
--- organization deactivated or deleted the person. So a create naming somebody with a `false`
--- row is a RE-ADMIT, and a create naming anybody else -- including another organization's live
--- user -- is the ordinary conflict. Conditioning the re-admit on "not currently a member"
+-- organization deactivated or deleted the person.
+--
+-- BOTH halves are required. A create naming somebody with a `false` row AND no membership in
+-- this organization is a RE-ADMIT; a create naming somebody this organization still HOLDS is
+-- the ordinary conflict even when their row says false, because a deactivated member is a live
+-- resource that a client reactivates with `active: true` rather than re-creates. A create
+-- naming anybody else -- including another organization's live user -- is likewise a conflict. Conditioning the re-admit on "not currently a member"
 -- instead would be true of every user in the environment and would let any credential take
 -- another organization's user by naming their handle.
 --
