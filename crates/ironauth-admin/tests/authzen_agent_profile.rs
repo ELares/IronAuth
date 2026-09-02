@@ -31,6 +31,13 @@ use common::Harness;
 use serde_json::{Value, json};
 
 /// The tool the agent DECLARES and its human is permitted for: the allow.
+///
+/// The permission a tool maps to is `tool.{tool}.{action}`, PER TOOL. The first version of the
+/// profile joined `{resource.type}.{action}`, which for a profile that requires the type to be
+/// `tool` is the constant `tool.call` for every tool there is -- so the human's half could not
+/// tell `deploy` from `destroy`, only the declared set could, and the middle row of this
+/// fixture was not expressible. That is what made the whole intersection an intersection with a
+/// constant.
 const DECLARED_AND_PERMITTED: &str = "deploy";
 /// DECLARED by the agent, and its human holds no permission for it.
 const DECLARED_NOT_PERMITTED: &str = "destroy";
@@ -41,6 +48,7 @@ struct Fixture {
     tenant: String,
     environment: String,
     organization: String,
+    user: String,
     agent: String,
     other_org: String,
 }
@@ -69,7 +77,10 @@ impl Fixture {
             h,
             &format!("{base}/users"),
             "ap-user",
-            &json!({ "email": "operator@example.test" }),
+            // `identifier`, which is what this surface takes. `email` is not a field it knows,
+            // so the create would have failed and the fixture would have panicked before any
+            // assertion ran -- the shape that shipped twice in this series already.
+            &json!({ "identifier": "agent-operator@example.test" }),
         )
         .await;
 
@@ -87,7 +98,7 @@ impl Fixture {
                 h,
                 &format!("{base}/permissions"),
                 &format!("ap-perm-{tool}"),
-                &json!({ "slug": format!("tool.{tool}"), "display_name": tool }),
+                &json!({ "slug": format!("tool.{tool}.call"), "display_name": tool }),
             )
             .await;
             let (status, _, body) = h
@@ -134,6 +145,7 @@ impl Fixture {
             tenant,
             environment,
             organization,
+            user,
             agent,
             other_org,
         }
@@ -151,6 +163,65 @@ impl Fixture {
             "action": { "name": "call" },
             "context": { "organization_id": org },
         })
+    }
+
+    /// The same question, asked as the HUMAN rather than as the agent.
+    ///
+    /// The control for the confinement test: it proves the person's grants reach the other
+    /// organization, so a denial for the AGENT there is about the agent.
+    fn ask_as_user(&self, org: &str) -> Value {
+        json!({
+            "subject": { "type": "user", "id": self.user },
+            "resource": { "type": "tool", "id": DECLARED_AND_PERMITTED },
+            "action": { "name": "call" },
+            "context": { "organization_id": org },
+        })
+    }
+
+    /// Give the linked user the SAME permission in the other organization.
+    async fn grant_in_other_org(&self, h: &Harness) {
+        let base = self.base();
+        let other = &self.other_org;
+        let role = created(
+            h,
+            &format!("{base}/organizations/{other}/roles"),
+            "ap-other-role",
+            &json!({ "slug": "operator", "display_name": "Operator" }),
+        )
+        .await;
+        let permission = created(
+            h,
+            &format!("{base}/permissions"),
+            "ap-other-perm",
+            &json!({
+                "slug": format!("tool.{DECLARED_AND_PERMITTED}.call"),
+                "display_name": "call deploy elsewhere",
+            }),
+        )
+        .await;
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{other}/roles/{role}/permissions"),
+                "ap-other-attach",
+                &json!({ "permission_id": permission }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "attach in the other org: {body}");
+        let membership = created(
+            h,
+            &format!("{base}/organizations/{other}/memberships"),
+            "ap-other-membership",
+            &json!({ "user_id": self.user }),
+        )
+        .await;
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{other}/memberships/{membership}/roles"),
+                "ap-other-membership-role",
+                &json!({ "role_id": role }).to_string(),
+            )
+            .await;
+        assert!(status.is_success(), "assign in the other org: {body}");
     }
 
     async fn evaluate(&self, h: &Harness, key: &str, body: &Value) -> bool {
@@ -278,6 +349,18 @@ async fn an_agent_of_another_organization_is_denied_rather_than_answered() {
     let h = Harness::start_with_agent_tool_profile(50, true).await;
     let f = Fixture::build(&h).await;
 
+    // THE HUMAN IS A MEMBER OF THE OTHER ORGANIZATION TOO, holding the same permission there.
+    // Without that, the ask denies through the CEILING -- an empty permission set for a
+    // non-member -- and this test passes with the confinement check deleted. The confinement is
+    // the only thing that can deny once the human's grants are present on both sides.
+    f.grant_in_other_org(&h).await;
+    assert!(
+        f.evaluate(&h, "ap-control-other-org", &f.ask_as_user(&f.other_org))
+            .await,
+        "the control: the HUMAN can do this in the other organization, so a denial below is \
+         about the agent's confinement and not about the grants"
+    );
+
     assert!(
         !f.evaluate(
             &h,
@@ -296,8 +379,12 @@ async fn an_agent_that_does_not_exist_is_denied_rather_than_reported_missing() {
     let h = Harness::start_with_agent_tool_profile(50, true).await;
     let f = Fixture::build(&h).await;
 
+    // A WELL-FORMED id that names nothing, built by flipping the last character of a real one.
+    // `agp_{env}_absent` is not parseable in scope, so it was refused at the parser with a 400
+    // and never reached the not-found branch this test is named for -- the documented
+    // anti-oracle had no test at all.
     let absent = json!({
-        "subject": { "type": "agent", "id": format!("agp_{}_absent", f.environment) },
+        "subject": { "type": "agent", "id": flip_last(&f.agent) },
         "resource": { "type": "tool", "id": DECLARED_AND_PERMITTED },
         "action": { "name": "call" },
         "context": { "organization_id": f.organization },
@@ -377,4 +464,95 @@ async fn with_the_profile_off_an_agent_subject_is_refused_exactly_as_before() {
     let (unknown_status, unknown_response) = f.refuse(&h, "ap-unknown", &unknown).await;
     assert_eq!(unknown_status, status);
     assert_eq!(unknown_response, response);
+}
+
+/// A well-formed scoped id that names nothing, from one that names something.
+///
+/// A scoped id carries a fixed-width base64 payload, so an id built by hand
+/// (`agp_{env}_absent`) is refused by the PARSER rather than reaching the not-found branch.
+/// Flipping the last payload character keeps the shape and changes the identity.
+fn flip_last(id: &str) -> String {
+    let mut chars: Vec<char> = id.chars().collect();
+    let last = chars.len() - 1;
+    chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
+    chars.into_iter().collect()
+}
+
+#[tokio::test]
+async fn an_agent_whose_human_can_no_longer_authenticate_is_denied() {
+    // "An agent cannot outlive the revocation of the person it acts for" was true only of
+    // DELETION and of membership removal: the effective-permission closure filters
+    // `deleted_at IS NULL` and an active membership and reads `users.state` nowhere, so an
+    // operator who BLOCKED someone left that person's agent fully authorized here.
+    let h = Harness::start_with_agent_tool_profile(50, true).await;
+    let f = Fixture::build(&h).await;
+
+    // The control: it allows while the person is active, so the denial below is the STATE.
+    assert!(
+        f.evaluate(
+            &h,
+            "ap-human-before",
+            &f.ask(&f.organization, DECLARED_AND_PERMITTED)
+        )
+        .await
+    );
+
+    let (status, _, body) = h
+        .put(
+            &format!("{}/users/{}/state", f.base(), f.user),
+            &json!({ "state": "blocked" }).to_string(),
+        )
+        .await;
+    assert!(status.is_success(), "block the human: {body}");
+
+    assert!(
+        !f.evaluate(
+            &h,
+            "ap-human-after",
+            &f.ask(&f.organization, DECLARED_AND_PERMITTED)
+        )
+        .await,
+        "a blocked person's agent authorizes nothing, or the ceiling is not a ceiling"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_agent_is_denied_as_a_suspended_one_is() {
+    // `revoked` is the other non-live state, and the doc claims both. Suspension alone was
+    // tested, so `can_obtain_tokens` could have been written as `state != "suspended"` with
+    // everything still green.
+    let h = Harness::start_with_agent_tool_profile(50, true).await;
+    let f = Fixture::build(&h).await;
+
+    assert!(
+        f.evaluate(
+            &h,
+            "ap-revoke-before",
+            &f.ask(&f.organization, DECLARED_AND_PERMITTED)
+        )
+        .await
+    );
+
+    let (status, _, body) = h
+        .put(
+            &format!(
+                "{}/organizations/{}/agents/{}/state",
+                f.base(),
+                f.organization,
+                f.agent
+            ),
+            &json!({ "state": "revoked" }).to_string(),
+        )
+        .await;
+    assert!(status.is_success(), "revoke the agent: {body}");
+
+    assert!(
+        !f.evaluate(
+            &h,
+            "ap-revoke-after",
+            &f.ask(&f.organization, DECLARED_AND_PERMITTED)
+        )
+        .await,
+        "a revoked agent authorizes nothing"
+    );
 }

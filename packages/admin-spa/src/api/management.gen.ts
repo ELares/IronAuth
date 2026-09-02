@@ -4070,13 +4070,15 @@ export interface components {
         /** @description The `AuthZEN` resource: what is being reached. */
         AuthzenResource: {
             /**
-             * @description The instance identifier. Accepted because `AuthZEN` 1.0 defines it and a `PEP` will
-             *     send it, and NOT consulted: `IronAuth` grants permissions per organization, not per
-             *     instance, so a decision that varied by instance would be answering a question this
-             *     model cannot decide.
+             * @description The instance identifier. Not consulted for a `user` or `service_account` subject:
+             *     `IronAuth` grants permissions per organization, not per instance, so a decision that
+             *     varied by instance would be answering a question this model cannot decide.
              *
-             *     The allow is the honest spelling of that. Reading the field into a discard to quiet the
-             *     lint would read like the value participates in something.
+             *     CONSULTED for the agent tool profile (issue #133), where it names the TOOL. That is not
+             *     an exception smuggled in: `tool/deploy` and `tool/destroy` are two resources rather than
+             *     one resource with two ids, and a profile that ignored the id could only ever answer
+             *     "may this agent call SOME tool". The sentence above stays true of the two subject types
+             *     it describes, and this one says where it stops.
              */
             id?: string | null;
             /** @description The resource type, the first half of the permission slug. */
@@ -4086,7 +4088,16 @@ export interface components {
         AuthzenSubject: {
             /** @description The `usr_` or `sva_` identifier, matching the declared type. */
             id: string;
-            /** @description `user` or `service_account`. Any other type is refused rather than treated as a user. */
+            /**
+             * @description `user` or `service_account`. Any other type is refused rather than treated as a user.
+             *
+             *     A deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)
+             *     also decides `agent`, which asks whether an agent may call a named tool. It is
+             *     deliberately absent from this sentence's list because the CONTRACT does not offer it:
+             *     it is off in every deployment that has not opted in, and a published description naming
+             *     a type most servers refuse would be worse than one that stops where support is
+             *     universal. See `docs/experimental/authzen-agent-profile.md`.
+             */
             type: string;
         };
         /** @description An environment's stored account-linking posture. */
@@ -8378,6 +8389,24 @@ export interface components {
             refresh?: null | components["schemas"]["VaultRefreshRequest"];
             /** @description The downstream refresh token, when the provider issued one. Sealed too. */
             refresh_token?: string | null;
+            /**
+             * @description Whether exchanging for this credential is a SENSITIVE action that blocks on an
+             *     out-of-band approval (issue #132, criterion 4).
+             *
+             *     The OPERATOR's decision, taken here because they are the one establishing the
+             *     connection and they are the one who knows what reaching it can do. It is deliberately
+             *     not the agent's: the gate used to run when the agent's exchange request named
+             *     `authorization_details`, so a denied agent omitted the field and received the
+             *     credential anyway.
+             *
+             *     ABSENT MEANS LEAVE IT AS IT IS, which is not what the sibling `refresh` field does and
+             *     is deliberate. This route is a PUT, so the natural reading is "replace"; but the
+             *     natural OPERATION is replacing an expired access token, and under replace-semantics
+             *     that turned the approval gate off on a sensitive connection without saying so. Sending
+             *     `false` still makes a connection ordinary; on a first store, absent means the same as
+             *     `false`.
+             */
+            requires_approval?: boolean | null;
         };
         /** @description The identifier a mapping creation minted. */
         SubjectMappingCreated: {
@@ -9279,6 +9308,15 @@ export interface components {
         VaultApprovalList: {
             /** @description The approvals, oldest first. */
             items: components["schemas"]["VaultApprovalView"][];
+            /**
+             * @description Whether more are waiting than this listing carries.
+             *
+             *     The listing is bounded, and a bounded list that does not say so reads as the whole
+             *     queue: an approver would answer 200 requests and believe they were done. There is no
+             *     cursor to continue from because deciding a request removes it from the queue, so the
+             *     way to see the rest is to answer some of these.
+             */
+            truncated: boolean;
         };
         /**
          * @description One approval awaiting a decision, as the approver sees it (issue #132).
@@ -9304,10 +9342,20 @@ export interface components {
              * @example ava_...
              */
             id: string;
-            /** @description The downstream provider the action is against. */
+            /**
+             * @description The downstream provider the held action targets.
+             * @example google
+             */
             provider: string;
-            /** @description `pending`, `approved` or `denied`. */
-            state: string;
+            /**
+             * @description What the agent ASKED to do (RFC 9396 authorization details).
+             *
+             *     The thing being approved. It was stored by migration 0179 "verbatim so the approver is
+             *     shown the request rather than a summary of it" and then read by nothing, so the queue
+             *     said "this agent wants google" and an operator narrowed it blind. Two different pending
+             *     actions on one provider were indistinguishable.
+             */
+            requested_details: Record<string, never>;
         };
         /**
          * @description What an operator is told about a stored connection.
@@ -9322,6 +9370,15 @@ export interface components {
              * @example agp_...
              */
             agent_id: string;
+            /**
+             * @description Whether this connection can renew itself when its credential expires.
+             *
+             *     The configuration itself is never reported: the client secret is sealed and the
+             *     endpoint and client id are the operator's own input. What an operator cannot otherwise
+             *     tell is whether the connection will renew or has to be re-established, and that is the
+             *     question this answers.
+             */
+            can_refresh: boolean;
             /** @description What the provider granted. */
             granted_scopes: string[];
             /**
@@ -9334,6 +9391,14 @@ export interface components {
              * @example google
              */
             provider: string;
+            /**
+             * @description Whether reaching this connection blocks on an out-of-band approval.
+             *
+             *     Reported because the flag was WRITE-ONLY: an operator could set a connection sensitive
+             *     and had no way to read back whether it still was, which is the worst property for a
+             *     control to have. Nothing else on this surface answers "is this gated".
+             */
+            requires_approval: boolean;
             /** @description `active` or `failed`. */
             state: string;
         };

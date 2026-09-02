@@ -66,15 +66,24 @@ use crate::state::AdminState;
 
 /// The resource type an agent tool check asks about (issue #133).
 ///
-/// One spelling, referenced by the arm that requires it and by the slug the linked user's
-/// permission is looked up under, so "the resource type" and "the first half of the permission
-/// slug" cannot drift apart.
+/// ONE spelling, referenced both by the arm that requires it and by the slug the linked user's
+/// permission is looked up under, so "the resource type this profile answers for" and "the
+/// first segment of the permission it checks" cannot drift apart. The first version claimed
+/// that and then built the slug from `resource.resource_type`, which is the caller's string:
+/// equal to the constant only because the arm above had just refused everything else.
 const AGENT_TOOL_RESOURCE_TYPE: &str = "tool";
 
 /// The `AuthZEN` subject: who is asking.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AuthzenSubject {
     /// `user` or `service_account`. Any other type is refused rather than treated as a user.
+    ///
+    /// A deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)
+    /// also decides `agent`, which asks whether an agent may call a named tool. It is
+    /// deliberately absent from this sentence's list because the CONTRACT does not offer it:
+    /// it is off in every deployment that has not opted in, and a published description naming
+    /// a type most servers refuse would be worse than one that stops where support is
+    /// universal. See `docs/experimental/authzen-agent-profile.md`.
     #[serde(rename = "type")]
     pub subject_type: String,
     /// The `usr_` or `sva_` identifier, matching the declared type.
@@ -89,7 +98,7 @@ pub struct AuthzenResource {
     pub resource_type: String,
     /// The instance identifier. Not consulted for a `user` or `service_account` subject:
     /// `IronAuth` grants permissions per organization, not per instance, so a decision that
-    /// varied by instance would be answering a question that model cannot decide.
+    /// varied by instance would be answering a question this model cannot decide.
     ///
     /// CONSULTED for the agent tool profile (issue #133), where it names the TOOL. That is not
     /// an exception smuggled in: `tool/deploy` and `tool/destroy` are two resources rather than
@@ -549,15 +558,56 @@ async fn decide_agent_tool(
     }
     // Suspended and revoked agents are DENIED while staying listable and auditable, which is
     // the same split #130 criterion 5 draws at the token door.
-    if agent.state != "active" {
-        return Ok(false);
-    }
-    if !agent.tool_scopes.iter().any(|declared| declared == tool) {
+    //
+    // Through the RECORD's own predicates, not inline literals. `can_obtain_tokens`'s doc says
+    // "a caller that had to remember which states were live would eventually forget one", and
+    // an inline `state != "active"` here was exactly that caller; `declares_tool` carries the
+    // exact-membership rule (never a prefix, or `files` would grant `files.delete`).
+    if !agent.can_obtain_tokens() || !agent.declares_tool(tool) {
         return Ok(false);
     }
 
-    // The CEILING: what the person this agent acts for can do here.
-    let slug = format!("{}.{}", resource.resource_type, action.name);
+    // THE PERSON must be able to authenticate. Found by review: the effective-permission
+    // closure filters `users.deleted_at IS NULL` and an ACTIVE membership, and reads
+    // `users.state` nowhere -- so an operator who BLOCKED or DISABLED someone left that
+    // person's agent fully authorized here, and "an agent cannot outlive the revocation of the
+    // person it acts for" was true only of deletion and of membership removal.
+    //
+    // `can_authenticate` rather than `== Active`, because it is the same predicate the login
+    // path fences on, and a second spelling of "which states are live" is the drift the
+    // paragraph above is about. It admits scheduled-offboarding, which is correct: that person
+    // can still sign in, so their agent may still act until the worker offboards them.
+    let human = match state
+        .store()
+        .scoped(scope)
+        .users()
+        .get(&agent.linked_user_id)
+        .await
+    {
+        Ok(record) => record,
+        // Deleted between the agent read and this one, or never there. A deny, for the same
+        // reason an absent agent is: a PDP answers decisions, not questions about existence.
+        Err(ironauth_store::StoreError::NotFound) => return Ok(false),
+        Err(_) => return Err(ApiError::Internal),
+    };
+    if !human.state.can_authenticate() {
+        return Ok(false);
+    }
+
+    // The CEILING: what the person this agent acts for can do WITH THIS TOOL.
+    //
+    // PER TOOL, and the first version was not: it joined `{resource.type}.{action.name}`, the
+    // same mapping the other two subject types use, which for a profile that requires
+    // `resource.type == "tool"` is the constant `tool.{action}` for every tool there is. So the
+    // human's half could not distinguish `deploy` from `destroy`, only `tool_scopes` could, and
+    // the "declared but not permitted" case this profile exists to deny was not expressible.
+    // The intersection was an intersection with a constant.
+    //
+    // The tool is the resource INSTANCE, so it belongs in the slug: `tool.deploy.call` is a
+    // different permission from `tool.destroy.call`, which is what lets an operator grant a
+    // person one and not the other. That is a longer slug than the other subject types produce
+    // and deliberately so -- they ask about a resource TYPE, this asks about an instance.
+    let slug = format!("{}.{tool}.{}", AGENT_TOOL_RESOURCE_TYPE, action.name);
     let held = state
         .store()
         .management()

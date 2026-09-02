@@ -1401,7 +1401,8 @@ mod tests {
 #[cfg(test)]
 mod attestation_default_posture_tests {
     use super::{
-        ATTESTATION_CLIENT_AUTH_FEATURE, ATTESTATION_CLIENT_AUTH_VERSION, FeatureRegistry,
+        ATTESTATION_CLIENT_AUTH_FEATURE, ATTESTATION_CLIENT_AUTH_VERSION,
+        AUTHZEN_AGENT_PROFILE_FEATURE, AUTHZEN_AGENT_PROFILE_VERSION, FeatureRegistry,
     };
     use crate::Config;
 
@@ -1427,6 +1428,64 @@ mod attestation_default_posture_tests {
             config.oidc.attestation_client_auth.attesters.is_empty(),
             "and no attester is trusted, so even an acknowledged flag would authenticate nobody"
         );
+    }
+
+    /// The `AuthZEN` agent tool profile is experimental and OFF by default (issue #133).
+    ///
+    /// The flag's whole purpose is that this prototype adds a subject type to a LIVE
+    /// authorization endpoint, so "off unless acknowledged at exactly this version" is the
+    /// property, and nothing asserted it. Four cases, because three of the four ways to get it
+    /// wrong look identical from a single assertion: default, enabled-without-an-ack,
+    /// enabled-with-the-WRONG-ack, and the one that works.
+    ///
+    /// `builtin()`, not `new()`: an empty registry reports every feature disabled, so the
+    /// first three would hold against a flag that ships default-on.
+    #[test]
+    fn the_authzen_agent_profile_is_experimental_and_off_by_default() {
+        let registry = FeatureRegistry::builtin();
+        assert!(
+            !registry.is_enabled(&Config::default(), AUTHZEN_AGENT_PROFILE_FEATURE),
+            "off in a default deployment"
+        );
+
+        // The ack gate is `validate`, which REFUSES TO BOOT, not `is_enabled`, which reports
+        // the toggle. That distinction matters and the first draft of this test had it wrong:
+        // asserting `!is_enabled` for an unacknowledged flag would have passed against a build
+        // where the gate had been deleted, because the operator did set `enabled = true` and
+        // `is_enabled` says so. What stops them is that the process does not start.
+        let enabled_no_ack =
+            toml_config("[features]\nauthzen-agent-profile = { enabled = true }\n");
+        assert!(
+            registry.validate(&enabled_no_ack).is_err(),
+            "enabling without acknowledging the version must refuse the boot"
+        );
+
+        let wrong_ack = toml_config(
+            "[features]\nauthzen-agent-profile = { enabled = true, ack = \"0.0.1\" }\n",
+        );
+        assert!(
+            registry.validate(&wrong_ack).is_err(),
+            "an ack for another version is not an ack for this one, which is what makes a \
+             version bump invalidate acknowledgments in the wild"
+        );
+
+        let armed = toml_config(&format!(
+            "[features]\nauthzen-agent-profile = {{ enabled = true, ack = \
+             \"{AUTHZEN_AGENT_PROFILE_VERSION}\" }}\n"
+        ));
+        assert!(registry.validate(&armed).is_ok(), "the correct ack boots");
+        assert!(
+            registry.is_enabled(&armed, AUTHZEN_AGENT_PROFILE_FEATURE),
+            "the control: the correct ack arms it, so the refusals above are about the ack and \
+             not about a flag nothing can turn on"
+        );
+    }
+
+    /// Parse a config from TOML, panicking on an invalid one.
+    fn toml_config(toml: &str) -> Config {
+        Config::from_toml_str(toml, "<features test>")
+            .expect("valid config")
+            .config
     }
 
     /// The acknowledgment version IS the draft revision.

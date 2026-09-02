@@ -857,9 +857,14 @@ async fn build_admin_state(
             // meaning here", which is the same answer it gave before this existed.
             //
             // `builtin()` rather than a registry threaded in: it is the ONE production
-            // constructor and a test pins that every shipped feature is registered through it,
-            // so a second call cannot disagree with the first. Threading one through would add
-            // a parameter to this function for a value it can derive.
+            // constructor, so a second call builds the same registry from the same static
+            // registrations and cannot disagree with the first. Threading one through would
+            // add a parameter to this function for a value it can derive.
+            //
+            // An earlier version of this comment claimed a test pins that every shipped
+            // feature is registered through `builtin()`. There is no such test -- the nearest
+            // guard, `unknown_feature_name_refuses_to_boot`, tests the other direction -- and
+            // the argument stands without it, because both calls run the same function.
             let state = state.with_agent_tool_profile_enabled(
                 FeatureRegistry::builtin().is_enabled(config, AUTHZEN_AGENT_PROFILE_FEATURE),
             );

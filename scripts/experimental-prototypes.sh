@@ -82,6 +82,9 @@ echo "== AuthZEN agent tool profile =="
 # The intersection, the confinement, the suspended-agent denial, and the OFF posture. Needs a
 # database.
 cargo test -p ironauth-admin --features testing --test authzen_agent_profile
+# And the flag: off by default, and an ack for the wrong version refuses the BOOT rather than
+# quietly leaving it off. Needs no database.
+cargo test -p ironauth-config authzen
 
 echo
 echo "experimental-prototypes: all pinned prototypes passed at the revisions above"

@@ -8897,13 +8897,28 @@ of tools than that person could reach, so **both** halves must hold:
 
 - the **agent** must declare the tool. `tool_scopes` is the operator's statement of what this
   machine may do, and a tool outside it is refused however privileged its human is.
-- the **linked user** must hold the mapped permission -- `{resource.type}.{action.name}`, the same
-  pure join the other two subject types use, resolved through the same `effective_permissions`
-  the token claims are built from. A second copy of that walk would be a second set of answers.
+- the **linked user** must hold the mapped permission, resolved through the same
+  `effective_permissions` the token claims are built from. A second copy of that walk would be a
+  second set of answers.
+
+The permission is **`tool.{tool}.{action}`**, per tool, and that is a departure from the
+`{resource.type}.{action.name}` join the other two subject types use. It has to be: this profile
+requires `resource.type` to be `tool`, so that join is the constant `tool.{action}` for every
+tool there is, and the human's half could not tell `deploy` from `destroy`. The first
+implementation did exactly that, which made the intersection an intersection with a constant and
+left `tool_scopes` as the only thing distinguishing tools. The tool is the resource **instance**,
+so it belongs in the slug.
 
 Either half alone is a different and wrong question. Checking only the declared set lets a
 revoked human's agent keep working; checking only the human lets an agent call every tool its
 person could.
+
+**What "revoked human" means here.** The effective-permission closure filters deleted users and
+inactive memberships and reads `users.state` nowhere, so the ceiling alone would leave a
+**blocked** or **disabled** person's agent fully authorized. The profile therefore reads the
+linked user and denies unless `can_authenticate()` -- the same predicate the login path fences
+on. That admits `scheduled_offboarding`, which is correct: that person can still sign in, so
+their agent may still act until the worker offboards them.
 
 An agent that is **suspended or revoked** is denied while staying listable and auditable, which is
 the split issue #130 criterion 5 draws at the token door. An agent belonging to **another
