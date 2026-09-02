@@ -4,9 +4,21 @@
   "method": "PATCH",
   "patch_path": "members",
   "body": {
-    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "schemas": [
+      "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+    ],
     "Operations": [
-      { "op": "add", "path": "members", "value": [{ "value": "usr_2c9a8b" }] }
+      {
+        "op": "add",
+        "path": "members",
+        "value": [
+          {
+            "value": "usr_2c9a8b"
+          }
+        ]
+      }
     ]
-  }
+  },
+  "expect_status": 200,
+  "expect_why": "Entra's bare-path member add"
 }

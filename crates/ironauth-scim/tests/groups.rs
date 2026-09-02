@@ -1063,6 +1063,41 @@ async fn a_group_cannot_be_grown_past_the_scan_bound() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(members(&db, &env, &token, &group).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_group_cannot_be_grown_past_the_bound_one_member_at_a_time() {
+    // The request-size check cannot catch this: ONE more member is within the bound as a
+    // REQUEST and takes the group over it as a RESULT. Only the resulting-size check in
+    // `set_members` sees it, and without that check a group grows past the bound one member at
+    // a time -- which is how a real sync adds people.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let tight = ScimLimits {
+        max_scan: 2,
+        ..ScimLimits::default()
+    };
+    let group = make_group(&db, &env, &token, "Engineering").await;
+    let mut people = Vec::new();
+    for who in ["a", "b", "c"] {
+        let id = provision(&db, &env, &token, &format!("{who}@example.test")).await;
+        people.push(json!({"value": id}));
+    }
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": people[..2]}]),
+        )),
+        tight,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "filling to the bound works: {body}");
 
     // THE INCREMENTAL CASE, which the request-size check above cannot catch: ONE more member
     // is within the bound as a request and takes the group over it as a result. Only the

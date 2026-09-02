@@ -5,7 +5,9 @@
   "patch_path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
   "filter": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber eq \"701984\"",
   "body": {
-    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "schemas": [
+      "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+    ],
     "Operations": [
       {
         "op": "replace",
@@ -13,5 +15,7 @@
         "value": "701984"
       }
     ]
-  }
+  },
+  "expect_status": 400,
+  "expect_why": "GAP: the enterprise extension is published in the schema document but not parsed onto the resource, so this attribute is refused. Widening it changes this number."
 }

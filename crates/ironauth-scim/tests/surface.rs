@@ -268,3 +268,123 @@ async fn the_discovery_documents_report_what_the_server_enforces() {
         );
     }
 }
+
+/// Whether a mounted handler answered, for the reachability sweep.
+///
+/// The discriminator is the CONTENT TYPE, not the status. This surface answers `404` for an
+/// absent resource on purpose -- that is the uniform not-found the whole IDOR design rests on
+/// -- so "not 404" cannot mean "mounted": a mounted route and an unmounted one would look
+/// identical for an id nobody holds. Every handler here answers `application/scim+json`,
+/// including on its errors, and axum's own no-route 404 answers no content type at all. That
+/// is the only signal that separates them.
+async fn answered_by_a_handler(
+    db: &TestDatabase,
+    env: &Env,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+) -> bool {
+    let state = ScimState::new(
+        db.store().clone(),
+        env.clone(),
+        ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/scim+json");
+    let request = match body {
+        Some(body) => builder.body(Body::from(body.to_owned())),
+        None => builder.body(Body::empty()),
+    }
+    .expect("request builds");
+    let response = scim_router(state)
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/scim+json"))
+}
+
+#[tokio::test]
+async fn every_advertised_capability_is_reachable_and_every_unadvertised_one_is_not() {
+    // THE ASSERTION THE UNIT GUARD CANNOT MAKE. `nothing_is_advertised_that_this_crate_cannot_
+    // enforce` compares the document against the names of functions in this crate, which is a
+    // fact about the crate rather than about what a caller can reach -- and an audit found it
+    // asserting `bulk: supported` justified by `validate_bulk` while `scim_router` mounts no
+    // `/Bulk` at all. A client reading that document would batch its provisioning run and get
+    // axum's bare 404, not even a SCIM error.
+    //
+    // So this drives each capability through the REAL router and asks only "did a handler run":
+    // anything that is not `404 Not Found` means the route exists, whatever it then decides
+    // about the request. That is the weakest question that distinguishes a mounted route from
+    // an absent one, and it is deliberately weak -- the behaviour of each route is asserted by
+    // its own suite, not here.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed(&db, &env, scope).await;
+
+    let (status, body) = get(&db, &env, "/scim/v2/ServiceProviderConfig", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let document: serde_json::Value = serde_json::from_str(&body).expect("the config document");
+
+    // (advertised flag, method, path, body) for every capability the document names.
+    let patch_body = r#"{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations":[{"op":"replace","path":"active","value":false}]}"#;
+    let probes: Vec<(&str, &str, String, Option<&str>)> = vec![
+        (
+            "patch",
+            "PATCH",
+            "/scim/v2/Users/usr_nobody".to_owned(),
+            Some(patch_body),
+        ),
+        (
+            "filter",
+            "GET",
+            "/scim/v2/Users?filter=userName%20eq%20%22a%22".to_owned(),
+            None,
+        ),
+        (
+            "bulk",
+            "POST",
+            "/scim/v2/Bulk".to_owned(),
+            Some(
+                r#"{"schemas":["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],"Operations":[]}"#,
+            ),
+        ),
+    ];
+    for (capability, method, path, request_body) in probes {
+        let advertised = document[capability]["supported"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("{capability} carries a supported flag"));
+        let mounted = answered_by_a_handler(&db, &env, method, &path, &token, request_body).await;
+        assert_eq!(
+            advertised,
+            mounted,
+            "{capability}: the document says supported={advertised} and the router \
+             {} it",
+            if mounted { "serves" } else { "does not serve" }
+        );
+    }
+
+    // BOTH CONTROLS, because the discriminator is the thing most likely to be wrong here.
+    //
+    // A path nothing mounts must read as unmounted:
+    assert!(
+        !answered_by_a_handler(&db, &env, "GET", "/scim/v2/Nothing", &token, None).await,
+        "an unmounted path must not look like a handler answered"
+    );
+    // And a MOUNTED route must read as mounted even when it answers 404, which is exactly the
+    // case that defeats a status-based discriminator: this id belongs to nobody.
+    assert!(
+        answered_by_a_handler(&db, &env, "GET", "/scim/v2/Users/usr_nobody", &token, None).await,
+        "a mounted route answering its uniform 404 must still read as mounted"
+    );
+}

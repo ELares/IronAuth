@@ -4,9 +4,16 @@
   "method": "PATCH",
   "patch_path": "members[value eq \"usr_2c9a8b\"]",
   "body": {
-    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "schemas": [
+      "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+    ],
     "Operations": [
-      { "op": "remove", "path": "members[value eq \"usr_2c9a8b\"]" }
+      {
+        "op": "remove",
+        "path": "members[value eq \"usr_2c9a8b\"]"
+      }
     ]
-  }
+  },
+  "expect_status": 200,
+  "expect_why": "the filtered removal Okta group push sends"
 }

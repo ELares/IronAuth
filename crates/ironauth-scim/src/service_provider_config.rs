@@ -204,7 +204,19 @@ impl ServiceProviderConfig {
             // Supported because `parse_patch_path` exists and every operation goes through it.
             patch: Supported { supported: true },
             bulk: BulkConfig {
-                supported: true,
+                // FALSE, and the reason is the whole point of this document.
+                //
+                // `validate_bulk` exists and the limits below are real, but there is NO
+                // `/Bulk` ROUTE in `scim_router`. A client reading `supported: true` sends
+                // `POST /scim/v2/Bulk` and gets axum's bare 404 -- not even a SCIM error --
+                // and a provisioning run that batched its work would simply fail. An audit
+                // caught this: the guard that was supposed to stop it asserted `supported ==
+                // true` justified by the NAME of a parser, which is a fact about the crate
+                // rather than about what a caller can reach.
+                //
+                // The limits stay populated because they are what the eventual route will
+                // enforce, and RFC 7644 section 4 lets a provider advertise them either way.
+                supported: false,
                 max_operations: limits.bulk.max_operations,
                 max_payload_size: limits.bulk.max_payload_bytes,
             },
@@ -390,9 +402,24 @@ mod tests {
         // without. A future edit that flips a flag has to come back here and say which code
         // makes it true.
         let document = rendered(ScimLimits::default());
-        assert_eq!(document["patch"]["supported"], true, "parse_patch_path");
-        assert_eq!(document["bulk"]["supported"], true, "validate_bulk");
-        assert_eq!(document["filter"]["supported"], true, "parse_filter");
+        // Each of these names the ROUTE that makes it true, not the parser that would serve
+        // one. That distinction is the finding this test exists to have caught and did not:
+        // it asserted `bulk: true` justified by `validate_bulk`, which is a function in this
+        // crate, while `scim_router` mounts no `/Bulk` at all. A capability is what a caller
+        // can REACH. `every_advertised_capability_is_reachable` in tests/surface.rs drives
+        // them through the real router, which is the assertion this one cannot make.
+        assert_eq!(
+            document["patch"]["supported"], true,
+            "PATCH /Users/{{id}} and /Groups/{{id}} are mounted"
+        );
+        assert_eq!(
+            document["bulk"]["supported"], false,
+            "no /Bulk route is mounted; validate_bulk is a parser, not a capability"
+        );
+        assert_eq!(
+            document["filter"]["supported"], true,
+            "GET /Users and /Groups accept ?filter="
+        );
         assert_eq!(
             document["changePassword"]["supported"], false,
             "no SCIM write in this crate sets a password"
