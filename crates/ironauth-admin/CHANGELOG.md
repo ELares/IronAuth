@@ -6,6 +6,33 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Experimental: the AuthZEN agent tool profile (issue #133)
+
+A PROTOTYPE answering `may this agent call this tool` on the AuthZEN PDP, off by default behind
+the `authzen-agent-profile` feature. The decision is the INTERSECTION of the tools the operator
+declared for the agent and the permissions the person it acts for holds in the organization;
+either half alone is a different question, and dropping one lets an agent either outlive its
+human's revocation or reach every tool that human could. The permission is `tool.{tool}.{action}`,
+PER TOOL: the `{type}.{action}` join the other subject types use is a constant here, because this
+profile requires the type to be `tool`. The linked user must also be able to AUTHENTICATE, since
+the permission closure reads no lifecycle state and a blocked person's agent would otherwise
+stay authorized.
+
+`resource.id` names the tool, and this is the one profile on that surface that reads it.
+Suspended and revoked agents are denied while staying listable; an agent of another organization,
+or one that does not exist, is denied rather than reported missing.
+
+**With the flag off, an `agent` subject draws the same refusal an unrecognised type has always
+drawn, byte for byte.** That is deliberate: this prototype widens a LIVE authorization surface
+rather than adding a dark one, so an unarmed deployment must not be able to tell from the answer
+that the type means anything here.
+
+Limits are recorded in `docs/experimental/authzen-agent-profile.md`: the action name is
+unconstrained, a batch re-resolves the human's permissions per entry, and the AARP direction is
+not started.
+
+### Earlier unreleased work
+
 - **Every message carrying a real `MessageId` failed to compose (issue #111).** `boundary_for`
   built `ironauth-{message_id}`, which is 77 characters against RFC 2046's 70-character cap, so
   `multipart_alternative` refused it and `compose` returned `mime_failed` -- for any message with
@@ -1252,29 +1279,4 @@ range per docs/RELEASING.md.
     naming it keeps a resolvable target. For tenants and environments `audit_log`
     really does carry a foreign key to the retained row; for a management key it
     does not, and the retention is an application rule.
-
-### Experimental: the AuthZEN agent tool profile (issue #133)
-
-A PROTOTYPE answering `may this agent call this tool` on the AuthZEN PDP, off by default behind
-the `authzen-agent-profile` feature. The decision is the INTERSECTION of the tools the operator
-declared for the agent and the permissions the person it acts for holds in the organization;
-either half alone is a different question, and dropping one lets an agent either outlive its
-human's revocation or reach every tool that human could. The permission is `tool.{tool}.{action}`,
-PER TOOL: the `{type}.{action}` join the other subject types use is a constant here, because this
-profile requires the type to be `tool`. The linked user must also be able to AUTHENTICATE, since
-the permission closure reads no lifecycle state and a blocked person's agent would otherwise
-stay authorized.
-
-`resource.id` names the tool, and this is the one profile on that surface that reads it.
-Suspended and revoked agents are denied while staying listable; an agent of another organization,
-or one that does not exist, is denied rather than reported missing.
-
-**With the flag off, an `agent` subject draws the same refusal an unrecognised type has always
-drawn, byte for byte.** That is deliberate: this prototype widens a LIVE authorization surface
-rather than adding a dark one, so an unarmed deployment must not be able to tell from the answer
-that the type means anything here.
-
-Limits are recorded in `docs/experimental/authzen-agent-profile.md`: the action name is
-unconstrained, a batch re-resolves the human's permissions per entry, and the AARP direction is
-not started.
 

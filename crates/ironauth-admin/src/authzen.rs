@@ -84,7 +84,8 @@ const AGENT_TOOL_RESOURCE_TYPE: &str = "tool";
 /// The `AuthZEN` subject: who is asking.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AuthzenSubject {
-    /// `user` or `service_account`. Any other type is refused rather than treated as a user.
+    /// `user` or `service_account`. Any other type is refused rather than treated as a user,
+    /// except as noted below.
     ///
     /// A deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)
     /// also decides `agent`, which asks whether an agent may call a named tool. It is
@@ -507,6 +508,19 @@ async fn decide(
 /// checking only the declared set lets a revoked human's agent keep working, and checking only
 /// the human lets an agent call every tool its person could.
 ///
+/// # A tool name that can never be permitted
+///
+/// The ceiling slug has to pass the permission-slug grammar: lowercase ASCII segments of
+/// `[a-z0-9_-]`, at least two of them, at most 63 characters in total. `tool_scopes` is checked
+/// only for a non-empty array of non-blank strings, so `getWeather`, `fs:read`, `files/read`,
+/// `Deploy`, or any name long enough to push `tool.{tool}.{action}` past 63 characters
+/// REGISTERS fine and can never be granted: the permission that would allow it cannot be
+/// created, so this answers `false` for ever with nothing on any surface saying why.
+///
+/// That is the strongest limit on this prototype and it is recorded rather than smoothed over.
+/// Constraining `tool_scopes` to the segment grammar would fix it and is a change to the GA
+/// agent surface, which a prototype does not get to make.
+///
 /// # Where the tool name comes from
 ///
 /// `resource.id`, with `resource.type` required to be `tool`. That is the one place on this
@@ -587,20 +601,26 @@ async fn decide_agent_tool(
     // path fences on, and a second spelling of "which states are live" is the drift the
     // paragraph above is about. It admits scheduled-offboarding, which is correct: that person
     // can still sign in, so their agent may still act until the worker offboards them.
-    let human = match state
+    //
+    // THROUGH `state_for_subject`, which reads one column, NOT through `users().get()`. That
+    // read unwraps the scope DEK and opens the person's sealed identifier and external id, all
+    // of which this would discard to look at one enum -- on a decision path a batch calls once
+    // per entry. And it requires the platform master key, which the management plane attaches
+    // only when one is configured: without it `get` returns `StoreError::Encryption`, so every
+    // `agent` subject would answer 500 while `user` and `service_account` kept deciding.
+    // `state_for_subject` is the accessor written for exactly this, and it is the one the login
+    // path's own lifecycle re-check uses.
+    //
+    // `None` covers absent, deleted, and out of scope, and all three are a DENY for the same
+    // reason an absent agent is: a PDP answers decisions, not questions about existence.
+    let live = state
         .store()
         .scoped(scope)
         .users()
-        .get(&agent.linked_user_id)
+        .state_for_subject(&agent.linked_user_id.to_string())
         .await
-    {
-        Ok(record) => record,
-        // Deleted between the agent read and this one, or never there. A deny, for the same
-        // reason an absent agent is: a PDP answers decisions, not questions about existence.
-        Err(ironauth_store::StoreError::NotFound) => return Ok(false),
-        Err(_) => return Err(ApiError::Internal),
-    };
-    if !human.state.can_authenticate() {
+        .map_err(|_| ApiError::Internal)?;
+    if !live.is_some_and(|state| state.can_authenticate()) {
         return Ok(false);
     }
 

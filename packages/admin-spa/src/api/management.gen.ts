@@ -4093,7 +4093,8 @@ export interface components {
              */
             id: string;
             /**
-             * @description `user` or `service_account`. Any other type is refused rather than treated as a user.
+             * @description `user` or `service_account`. Any other type is refused rather than treated as a user,
+             *     except as noted below.
              *
              *     A deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)
              *     also decides `agent`, which asks whether an agent may call a named tool. It is

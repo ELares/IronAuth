@@ -85,6 +85,10 @@ cargo test -p ironauth-admin --features testing --test authzen_agent_profile
 # And the flag: off by default, and an ack for the wrong version refuses the BOOT rather than
 # quietly leaving it off. Needs no database.
 cargo test -p ironauth-config authzen
+# And the BOOT wiring: armed by ITS OWN acknowledgment and not by another prototype's. The lane
+# made this exact omission for attestation four lines above; the filter is `agent_tool_profile`,
+# and it lives in a different package from the registry test.
+cargo test -p ironauth --bin ironauth agent_tool_profile
 
 echo
 echo "experimental-prototypes: all pinned prototypes passed at the revisions above"

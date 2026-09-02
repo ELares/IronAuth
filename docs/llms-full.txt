@@ -8922,7 +8922,7 @@ their agent may still act until the worker offboards them.
 
 An agent that is **suspended or revoked** is denied while staying listable and auditable, which is
 the split issue #130 criterion 5 draws at the token door. An agent belonging to **another
-organization**, or to none, is denied -- not reported missing: a PDP answers decisions, and
+organization** is denied -- not reported missing: a PDP answers decisions, and
 distinguishing "no such agent" from "not allowed" would tell a caller which agent ids are real.
 
 ## Where the tool name comes from
@@ -8955,6 +8955,13 @@ authorization surface rather than adding a dark one.
 
 ## What a graduation still needs
 
+- **A tool name that is not a legal permission-slug segment can never be permitted.** The
+  ceiling slug must pass the permission grammar (lowercase ASCII `[a-z0-9_-]` segments, at least
+  two, at most 63 characters total), while `tool_scopes` is validated only for a non-empty array
+  of non-blank strings. So `getWeather`, `fs:read`, `files/read` and `Deploy` all register fine
+  and can never be granted: this answers `false` for ever and nothing says why. Fixing it means
+  constraining `tool_scopes` on the GA agent surface, which a prototype does not get to change.
+  It is the strongest limit here.
 - **The action name is not constrained.** `tool.call` and `tool.anything-else` are equally valid
   slugs, so the profile answers for a permission an operator may never have intended to define.
   A graduation should either pin the action set or document the slug space explicitly.

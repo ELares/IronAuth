@@ -538,6 +538,22 @@ async fn an_agent_whose_human_can_no_longer_authenticate_is_denied() {
         .await,
         "a blocked person's agent authorizes nothing, or the ceiling is not a ceiling"
     );
+
+    // AND THE GRANTS ARE UNTOUCHED, which is what makes the denial above about the STATE.
+    // Blocking cascades sessions and refresh families, not memberships, and the permission
+    // closure joins `users` only on `deleted_at IS NULL` -- so the human still resolves the
+    // permission. Without this the test's discrimination rests entirely on a property of code
+    // it never touches, and a cascade that started removing memberships would make it pass for
+    // the wrong reason.
+    assert!(
+        f.evaluate(
+            &h,
+            "ap-human-still-granted",
+            &f.ask_as_user(&f.organization)
+        )
+        .await,
+        "the person still HOLDS the permission, so what denied the agent is the lifecycle state"
+    );
 }
 
 #[tokio::test]

@@ -28048,7 +28048,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`user` or `service_account`. Any other type is refused rather than treated as a user.\n\nA deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)\nalso decides `agent`, which asks whether an agent may call a named tool. It is\ndeliberately absent from this sentence's list because the CONTRACT does not offer it:\nit is off in every deployment that has not opted in, and a published description naming\na type most servers refuse would be worse than one that stops where support is\nuniversal. See `docs/experimental/authzen-agent-profile.md`."
+            "description": "`user` or `service_account`. Any other type is refused rather than treated as a user,\nexcept as noted below.\n\nA deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)\nalso decides `agent`, which asks whether an agent may call a named tool. It is\ndeliberately absent from this sentence's list because the CONTRACT does not offer it:\nit is off in every deployment that has not opted in, and a published description naming\na type most servers refuse would be worse than one that stops where support is\nuniversal. See `docs/experimental/authzen-agent-profile.md`."
           }
         }
       },

@@ -6358,14 +6358,6 @@ mod tests {
         );
     }
 
-    /// The attester registry needs BOTH conditions, and neither implies the other
-    /// (issue #133, criterion 6).
-    ///
-    /// Three cases rather than two, because the interesting one is the middle: an operator who
-    /// acknowledges the draft and configures nobody. Installing an EMPTY registry there would
-    /// make the seam refuse at its last check instead of its first, which looks identical from
-    /// outside and is a different thing to debug -- and would leave a `Some` in the state that
-    /// a later reader could take as "the method is armed".
     /// The agent tool profile is armed by ITS OWN acknowledgment and no other (issue #133).
     ///
     /// The third case is the one that matters. The first two are satisfied by any
@@ -6406,6 +6398,14 @@ mod tests {
         );
     }
 
+    /// The attester registry needs BOTH conditions, and neither implies the other
+    /// (issue #133, criterion 6).
+    ///
+    /// Three cases rather than two, because the interesting one is the middle: an operator who
+    /// acknowledges the draft and configures nobody. Installing an EMPTY registry there would
+    /// make the seam refuse at its last check instead of its first, which looks identical from
+    /// outside and is a different thing to debug -- and would leave a `Some` in the state that
+    /// a later reader could take as "the method is armed".
     #[test]
     fn the_attester_registry_needs_the_ack_and_an_attester() {
         let jwks = ironauth_jose::JwkSet::from_signing_keys([
