@@ -60,6 +60,11 @@ cargo test -p ironauth-oidc --test attestation_client_auth
 cargo test -p ironauth-oidc --features testing --test attestation_token_endpoint
 # The default-posture proof: the flag is off and the section is empty in `Config::default()`.
 cargo test -p ironauth-config attestation
+# And the BOOT path: both conditions required, neither sufficient, a duplicate issuer dropped.
+# The filter is `attester`, not `attestation`: the test is
+# `tests::the_attester_registry_needs_the_ack_and_an_attester` in a different package, and the
+# lane ran `-p ironauth-config attestation` believing it covered this. It matched nothing.
+cargo test -p ironauth --bin ironauth attester
 
 echo
 echo "experimental-prototypes: all pinned prototypes passed at the revisions above"

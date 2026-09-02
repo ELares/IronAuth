@@ -2092,8 +2092,9 @@ impl Harness {
 
     /// Install the trusted attesters and rebuild the protocol router (issue #133).
     ///
-    /// With none installed -- the default -- the seam refuses before reading anything the
-    /// caller sent, which is what a test of the default posture drives.
+    /// With none installed -- the default -- the client-credentials grant IGNORES the two
+    /// headers and answers as though they were not present, which is what a test of the
+    /// default posture drives.
     pub fn install_attesters(
         &mut self,
         registry: Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>,

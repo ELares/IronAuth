@@ -587,7 +587,9 @@ struct DataPlaneSurfaces {
     agent_vault: bool,
     /// The attesters trusted for attestation-based client authentication (issue #133), or
     /// `None` when the draft is unacknowledged or no attester parses. `None` leaves the state
-    /// without a registry, and the seam then refuses before reading anything a caller sent.
+    /// without a registry, and the client-credentials grant then IGNORES the two headers
+    /// entirely: the request answers exactly as it would without them, which is a stronger
+    /// property than "the seam refuses" and the one an unarmed deployment needs.
     attesters: Option<Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>>,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
@@ -1422,9 +1424,9 @@ async fn build_oidc_plane(
     // caller, which is the shape that mechanism exists to prevent rather than to produce.
     //
     // `None` (the default, and any deployment that has not acknowledged the draft) leaves the
-    // state without a registry, and the seam then refuses before reading anything a caller
-    // sent. So an unacknowledged deployment does not merely fail to advertise the method: it
-    // cannot reach it.
+    // state without a registry, and the grant then IGNORES the two headers entirely rather
+    // than refusing on them. So an unacknowledged deployment does not merely fail to advertise
+    // the method: a request carrying these headers is answered as though they were not there.
     .with_optional_attesters(surfaces.attesters.clone())
     .with_flows_enabled(surfaces.flows)
     .with_hosted_pages_enabled(surfaces.hosted_pages)
@@ -1660,8 +1662,10 @@ async fn build_oidc_plane(
 /// TWO conditions, and neither implies the other: the experimental feature must be
 /// acknowledged at its exact draft revision, AND at least one attester must be configured and
 /// parse. An acknowledged flag with an empty or unusable list installs NOTHING rather than an
-/// empty registry, so the seam refuses at the first check instead of at the last, and an
-/// operator reading the log learns which of the two they are missing.
+/// empty registry. `None` is what makes the grant IGNORE the two headers; an empty registry
+/// would instead be a `Some` that a later reader could take as "the method is armed", and the
+/// refusal would move from the caller into a seam whose own guard then never runs. An operator
+/// reading the log learns which of the two conditions they are missing.
 ///
 /// An attester whose JWKS yields no usable key is dropped with a warning rather than failing
 /// the boot: one bad entry among several should not take a deployment down, and an entry that
@@ -1695,6 +1699,11 @@ fn build_attester_registry(
             &attester.issuer,
             attester.jwks.as_bytes(),
         ) {
+            // Recorded only once it PARSED. Inserting above the parse meant a first block with
+            // an unusable JWKS burned the issuer, so a second block carrying the good keys was
+            // skipped with a warning saying only the first key set is used -- when none was,
+            // and the registry ended empty.
+            seen.insert(attester.issuer.as_str());
             registry = registry.with(trusted);
         } else {
             tracing::warn!(
@@ -6424,9 +6433,14 @@ mod tests {
              issuer = \"https://attester.example.test\"\n\
              jwks = '{jwks}'\n"
         ));
-        assert!(
-            build_attester_registry(&features, &duplicated).is_some(),
-            "a duplicate issuer is an operator mistake, not a boot failure"
+        let deduped = build_attester_registry(&features, &duplicated)
+            .expect("a duplicate issuer is an operator mistake, not a boot failure");
+        assert_eq!(
+            deduped.len(),
+            1,
+            "the duplicate is DROPPED rather than registered behind the first, which is what \
+             the warning tells the operator; asserting only that something was registered is \
+             satisfied identically with the dedupe deleted"
         );
     }
 

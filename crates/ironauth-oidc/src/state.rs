@@ -529,9 +529,10 @@ pub struct OidcState {
     federation: Option<Arc<crate::federation::FederationRuntime>>,
     // The attesters this deployment trusts for attestation-based client authentication
     // (issue #133, PROTOTYPE). Default: `None`, which is what makes the method unreachable
-    // rather than merely unadvertised: with no registry installed the seam refuses before it
-    // looks at anything the caller sent, so a client registered for the method while the
-    // experimental flag is off fails closed rather than falling back to something weaker.
+    // rather than merely unadvertised: with no registry installed the client-credentials
+    // grant IGNORES the two headers, so a request carrying them is answered as though they
+    // were not there and a client registered for the method while the flag is off fails closed
+    // rather than falling back to something weaker.
     attesters: Option<Arc<crate::attestation_client_auth::AttesterRegistry>>,
 }
 
@@ -1084,7 +1085,8 @@ impl OidcState {
     /// least one attester is configured, so "installed" and "usable" are the same condition.
     /// With none installed -- the default, and the default this build ships -- the method
     /// authenticates nobody: it is not in `ClientAuthMethod::ALL`, so discovery never
-    /// advertises it, and the seam refuses before reading the presented JWTs.
+    /// advertises it, and the client-credentials grant ignores the two headers rather than
+    /// reading the JWTs they carry.
     #[must_use]
     pub fn with_attesters(
         mut self,

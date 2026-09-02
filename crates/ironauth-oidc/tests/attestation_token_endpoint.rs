@@ -11,8 +11,9 @@
 //!
 //! What this adds is the part only the endpoint can answer:
 //!
-//! - the DEFAULT POSTURE: no attesters installed, so an otherwise perfect pair authenticates
-//!   nobody and the answer is the same opaque `invalid_client` every other failure gives;
+//! - the DEFAULT POSTURE: no attesters installed, so the grant IGNORES the two headers and an
+//!   otherwise perfect pair authenticates nobody, with the same opaque `invalid_client` every
+//!   other failure gives;
 //! - the client's ONE registered method is enforced, so a `client_secret_basic` client cannot
 //!   authenticate this way and an `attest_jwt_client_auth` client cannot present a secret;
 //! - the method is NOT advertised, so discovery does not offer what no registered client can
@@ -167,11 +168,18 @@ async fn an_attested_instance_gets_a_token_from_the_client_credentials_grant() {
 
 #[tokio::test]
 async fn the_default_posture_authenticates_nobody_even_with_a_perfect_pair() {
-    // THE DEFAULT, and the reason the prototype is safe to ship dark: no registry installed,
-    // so the seam refuses before it reads anything the caller sent. The pair here is the SAME
-    // one the test above authenticates with, which is what makes this about the posture rather
-    // than about a broken fixture.
-    let harness = Harness::start().await;
+    // THE DEFAULT, and the reason the prototype is safe to ship dark.
+    //
+    // WITH ITS OWN CONTROL, because the first version passed with the whole prototype deleted:
+    // with no registry the attestation path IGNORES the request and it falls through to the
+    // ordinary one, where an `attest_jwt_client_auth` client presenting no secret is refused
+    // for an unrelated reason. That test was about `ClientAuthMethod::parse` returning
+    // something the secret path does not handle, not about the posture.
+    //
+    // So both halves run here against the SAME pair, the same client and the same clock, and
+    // the only difference is whether the registry is installed. That difference has to change
+    // the answer, or the prototype is not what is deciding.
+    let mut harness = Harness::start().await;
     let attester_key = key("attester-kid", 11);
     let instance = key("instance-kid", 22);
 
@@ -182,28 +190,32 @@ async fn the_default_posture_authenticates_nobody_even_with_a_perfect_pair() {
         .to_string();
     let audience = harness.issuer().to_owned();
     let now = now_secs(&harness);
+    let attestation = attestation(&attester_key, &instance, &client, &audience, now);
+    let proof = proof(&instance, &client, &audience, now);
 
-    let (status, _headers, body) = harness
-        .token_attested(
-            &cc_form(&client),
-            Some(&attestation(
-                &attester_key,
-                &instance,
-                &client,
-                &audience,
-                now,
-            )),
-            Some(&proof(&instance, &client, &audience, now)),
-        )
+    let (unarmed, _headers, unarmed_body) = harness
+        .token_attested(&cc_form(&client), Some(&attestation), Some(&proof))
         .await;
     assert_eq!(
-        status,
+        unarmed,
         axum::http::StatusCode::UNAUTHORIZED,
-        "with no attester trusted, nobody authenticates: {body}"
+        "with no attester trusted, nobody authenticates: {unarmed_body}"
     );
     assert!(
-        body.contains("invalid_client"),
-        "and it is the same opaque refusal every other failure gives: {body}"
+        unarmed_body.contains("invalid_client"),
+        "and it is the same opaque refusal every other failure gives: {unarmed_body}"
+    );
+
+    // The control: arm it, change nothing else, and the identical request succeeds.
+    harness.install_attesters(registry(&attester_key));
+    let (armed, _headers, armed_body) = harness
+        .token_attested(&cc_form(&client), Some(&attestation), Some(&proof))
+        .await;
+    assert_eq!(
+        armed,
+        axum::http::StatusCode::OK,
+        "the same pair, with the registry installed, must succeed -- or the refusal above says \
+         nothing about the posture: {armed_body}"
     );
 }
 
@@ -360,6 +372,30 @@ async fn one_header_without_the_other_is_not_an_attestation_attempt() {
         only_attestation, only_proof,
         "and the two halves answer identically, so neither is an oracle"
     );
+
+    // THE CONTROL, without which this passes whether or not the guard exists: delete the
+    // both-headers requirement and read each header as an empty string, and the seam answers
+    // `MissingHeader` for both, which is the same 401. What makes the guard observable is that
+    // BOTH headers together succeed for the same client, so each refusal above is attributable
+    // to the missing half rather than to anything else.
+    let (both, _h, both_body) = harness
+        .token_attested(
+            &cc_form(&client),
+            Some(&attestation(
+                &attester_key,
+                &instance,
+                &client,
+                &audience,
+                now,
+            )),
+            Some(&proof(&instance, &client, &audience, now)),
+        )
+        .await;
+    assert_eq!(
+        both,
+        axum::http::StatusCode::OK,
+        "the pair succeeds, so each half alone failing is about the half: {both_body}"
+    );
 }
 
 #[tokio::test]
@@ -367,6 +403,13 @@ async fn discovery_does_not_advertise_the_prototype_method() {
     // A method discovery offers is one a client may register for, and no client should
     // register for a draft surface that is off in every deployment that has not opted in.
     // `ClientAuthMethod::ALL` is the single source discovery reads.
+    //
+    // The harness builds its discovery state from `OidcConfig::default()` rather than from the
+    // config the router was built over, which it does not retain. That is sound for THIS
+    // assertion and worth saying rather than leaving implicit:
+    // `token_endpoint_auth_methods_supported` is sourced from `ClientAuthMethod::ALL`, a
+    // static, so no config could change it. A test asserting a config-derived capability off
+    // this router would be reading the wrong document.
     let mut harness = Harness::start().await;
     harness.install_attesters(registry(&key("attester-kid", 11)));
 

@@ -96,13 +96,21 @@ async fn attested_client(
     // to be helped along: treating it as one would give an unauthenticated prober a way to
     // tell the method's presence from its absence, because the request would take a different
     // path and could answer differently.
+    // NON-EMPTY, for the same reason the four form inputs below are checked that way: an
+    // empty header is not a credential, and treating `OAuth-Client-Attestation:` with no value
+    // as an attempt made an armed deployment answer 400 to a `client_secret_basic` client that
+    // happened to send one. The seam itself already calls an empty string `MissingHeader`, so
+    // reading it as present here made the caller disagree with what it calls.
+    let header = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
     let (Some(attestation), Some(proof)) = (
-        headers
-            .get(crate::attestation_client_auth::ATTESTATION_HEADER)
-            .and_then(|value| value.to_str().ok()),
-        headers
-            .get(crate::attestation_client_auth::ATTESTATION_POP_HEADER)
-            .and_then(|value| value.to_str().ok()),
+        header(crate::attestation_client_auth::ATTESTATION_HEADER),
+        header(crate::attestation_client_auth::ATTESTATION_POP_HEADER),
     ) else {
         return Ok(None);
     };

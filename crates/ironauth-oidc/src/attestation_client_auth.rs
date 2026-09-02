@@ -114,6 +114,13 @@ pub const ATTESTATION_HEADER: &str = "OAuth-Client-Attestation";
 /// The header carrying the client instance's proof of possession.
 pub const ATTESTATION_POP_HEADER: &str = "OAuth-Client-Attestation-PoP";
 
+/// The optional `application/` prefix a media type may carry.
+///
+/// Named rather than a literal `12` at the strip site: `ironauth_jose` compares the same prefix
+/// through its own private constant, and a hardcoded length in a hand-rolled copy that has
+/// already drifted once from that comparison is the drift's next opportunity.
+const APPLICATION_PREFIX: &str = "application/";
+
 /// The media type of the client attestation JWT.
 pub const ATTESTATION_TYP: &str = "oauth-client-attestation+jwt";
 
@@ -205,6 +212,17 @@ impl AttesterRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.attesters.is_empty()
+    }
+
+    /// How many attesters are registered.
+    ///
+    /// Exists for the boot path's duplicate-issuer test, which could otherwise only assert
+    /// that SOMETHING was registered -- satisfied identically with the dedupe deleted. A count
+    /// is the smallest thing that distinguishes "one attester, the duplicate dropped" from
+    /// "two entries, the second shadowing nothing".
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.attesters.len()
     }
 }
 
@@ -418,9 +436,9 @@ fn media_type_is(header_typ: Option<&str>, expected: &str) -> bool {
         return false;
     };
     let stripped = candidate
-        .get(..12)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("application/"))
-        .map_or(candidate, |_| &candidate[12..]);
+        .get(..APPLICATION_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(APPLICATION_PREFIX))
+        .map_or(candidate, |_| &candidate[APPLICATION_PREFIX.len()..]);
     stripped.eq_ignore_ascii_case(expected)
 }
 

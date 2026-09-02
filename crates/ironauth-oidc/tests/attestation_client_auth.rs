@@ -548,3 +548,64 @@ fn the_method_name_is_spelled_the_same_in_all_three_places() {
         "the prototype method must not be advertised"
     );
 }
+
+#[test]
+fn the_application_prefix_is_optional_and_case_insensitive() {
+    // The prefix handling had NO test, which is how it shipped stripping two literal spellings
+    // where `TokenTyp::matches` compares case-insensitively -- refusing a conforming attester
+    // that sent `Application/...` while the helper's own doc claimed parity. The replacement
+    // can be broken the same way (a wrong length, a wrong literal, an inverted filter) with
+    // every other test in this file still green, so these are the cases that hold it.
+    let f = fixture();
+    for spelling in [
+        "oauth-client-attestation+jwt",
+        "application/oauth-client-attestation+jwt",
+        "Application/oauth-client-attestation+jwt",
+        "APPLICATION/OAUTH-CLIENT-ATTESTATION+JWT",
+    ] {
+        let attestation = jwt(
+            &f.attester_key,
+            spelling,
+            &json!({
+                "iss": ATTESTER,
+                "sub": CLIENT,
+                "aud": AUDIENCE,
+                "iat": NOW - 10,
+                "exp": NOW + 600,
+                "cnf": { "jwk": public_jwk(&f.instance_key) },
+            }),
+        );
+        assert!(
+            authenticate(&f, &attestation, &proof(&f)).is_ok(),
+            "the media type {spelling:?} is the attestation's, however it is spelled"
+        );
+    }
+
+    // And the refusals the prefix handling must NOT swallow: a bare `application/`, and a type
+    // that merely starts with the right letters. Without these, a helper that returned true
+    // for anything carrying the prefix would pass the four cases above.
+    for wrong in [
+        "application/",
+        "application/oauth-client-attestation-pop+jwt",
+        "applicationoauth-client-attestation+jwt",
+        "x-application/oauth-client-attestation+jwt",
+    ] {
+        let attestation = jwt(
+            &f.attester_key,
+            wrong,
+            &json!({
+                "iss": ATTESTER,
+                "sub": CLIENT,
+                "aud": AUDIENCE,
+                "iat": NOW - 10,
+                "exp": NOW + 600,
+                "cnf": { "jwk": public_jwk(&f.instance_key) },
+            }),
+        );
+        assert_eq!(
+            authenticate(&f, &attestation, &proof(&f)),
+            Err(AttestationRejection::TypMismatch),
+            "the media type {wrong:?} is not the attestation's"
+        );
+    }
+}
