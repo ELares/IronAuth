@@ -50,6 +50,17 @@ revisions() {
     fi
     printf '  %-28s %-52s %s\n' \
         'authzen-agent-profile' "$authzen" 'docs/experimental/authzen-agent-profile.md'
+
+    local txn
+    txn=$(grep -A1 'pub const TRANSACTION_TOKENS_VERSION' \
+        crates/ironauth-config/src/features.rs | grep -oE '"[^"]+"' | tr -d '"')
+    if [ -z "$txn" ]; then
+        echo "experimental-prototypes: could not read the pinned revision for" \
+             "transaction-tokens out of crates/ironauth-config/src/features.rs." >&2
+        exit 1
+    fi
+    printf '  %-28s %-52s %s\n' \
+        'transaction-tokens' "$txn" 'docs/experimental/transaction-tokens.md'
     echo
     echo "Each is EXPERIMENTAL and off by default; enabling one requires an acknowledgment"
     echo "equal to the revision above, so a draft bump invalidates it deliberately."
@@ -89,6 +100,17 @@ cargo test -p ironauth-config authzen
 # made this exact omission for attestation four lines above; the filter is `agent_tool_profile`,
 # and it lives in a different package from the registry test.
 cargo test -p ironauth --bin ironauth agent_tool_profile
+
+echo
+echo "== transaction tokens =="
+# What the token carries, the refusal without a trust domain, the lifetime clamp, and that it
+# does not verify as an access token. Needs no database.
+cargo test -p ironauth-oidc --test transaction_tokens
+# And the EXCHANGE: that the branch sits after every policy check, that an unarmed deployment
+# answers as it does for any unknown URI, and that the audit row is written. Needs a database.
+cargo test -p ironauth-oidc --features testing --test token_exchange transaction
+# And the BOOT wiring: the ack AND a domain, and another prototype's ack arming nothing.
+cargo test -p ironauth --bin ironauth transaction_token
 
 echo
 echo "experimental-prototypes: all pinned prototypes passed at the revisions above"

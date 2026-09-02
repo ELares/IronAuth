@@ -515,6 +515,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `oidc.totp_issuer` | string or unset | unset | The issuer label shown in an authenticator app (the `issuer=` parameter of the `otpauth://` provisioning URI, issue #69). When unset, it is DERIVED at enrollment from the serving scope, which is the correct default for a single-brand deployment. A true per-tenant override rides the tenant-policy pipeline. |
 | `oidc.totp_period_secs` | integer | `30` | The TOTP time-step period in seconds (issue #69). The RFC 6238 default (30) is what every authenticator app assumes; changing it requires an app that honors the `period=` parameter. Must be in 15..=60. |
 | `oidc.totp_recovery_code_count` | integer | `10` | The number of one-time recovery codes minted at MFA enrollment (issue #69). The default (10) sits in the accepted 8..=16 range. A per-tenant override within that bound rides the tenant-policy pipeline. |
+| `oidc.transaction_token_trust_domain` | string | `""` | The trust domain transaction tokens are minted for (issue #133, PROTOTYPE). |
 | `oidc.trusted_device_idle_secs` | integer | `604800` | The idle window of a remembered device, in seconds (issue #71): an unused device expires after this, while an actively used one lives to the absolute max age. Must be at least `OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS` (3600) and no greater than [`OidcConfig::trusted_device_max_age_secs`] (a boot-time [`ConfigError::Invalid`] otherwise, since an idle window wider than the absolute cap is meaningless); the default (604800) is seven days. |
 | `oidc.trusted_device_max_age_secs` | integer | `2592000` | The absolute maximum age of a remembered device, in seconds (issue #71): past it the device never skips again and must re-prove a second factor. Bounded to `OIDC_TRUSTED_DEVICE_MIN_MAX_AGE_SECS..=OIDC_TRUSTED_DEVICE_MAX_MAX_AGE_SECS` (3600..=2592000), so a misconfiguration cannot extend trust indefinitely; the default (2592000) is the NIST SP 800-63B reauthentication ceiling of 30 days. |
 | `oidc.trusted_device_revoke_on_password_change` | boolean | `true` | Whether a password change or reset INVALIDATES the subject's remembered devices (issue #71). On by default: a credential change is a strong signal that trust should be re-established, so every remembered device is revoked server-side. A tenant that separates device trust from password lifecycle can turn it off. Only consulted when [`OidcConfig::trusted_devices_enabled`] is on. |
@@ -642,6 +643,7 @@ enabled even when absent from `[features]`, and can be turned off with
 | `risk-signals` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Third-party risk-signal ingestion (issue #82): a signed Security Event Token (JWS) authenticated ingestion endpoint verified per-source through the hardened JOSE core, plus the #79 risk-engine path that folds a subject's fresh external signals in as WEIGHTED policy inputs that structurally can never be a verdict. EXPLORATORY: the ingestion wire contract and the CAEP/SSF alignment are early and may break between releases. |
 | `sample-experimental` | experimental | no | 0.1.0-exp.1 | crates/ironauth-config/CHANGELOG.md | Sample experimental flag exercising the acknowledgment gate; gates no behavior. |
 | `signup-quarantine` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Signup fraud review queue (issue #82): a register-path hook that QUARANTINES a risky signup (a disposable-domain block or a failed proof-of-work challenge) instead of blocking it, so a false positive stays recoverable. A quarantined account CAN authenticate but with limited privileges (consent is always shown and every sensitive scope is stripped from any grant), and an admin releases, rejects, or extends the case through the management review queue. EXPLORATORY: the quarantine model is early and may break between releases. |
+| `transaction-tokens` | experimental | no | draft-ietf-oauth-transaction-tokens-09 | crates/ironauth-oidc/CHANGELOG.md | Transaction tokens (issue #133, draft-ietf-oauth-transaction-tokens): a short-lived signed JWT scoped to ONE request inside ONE trust domain, carrying the person, the workload asking, and what the original request was authorized to do -- so an internal hop needs neither the user's own access token nor an unsigned header. Requested through RFC 8693 token exchange. PROTOTYPE: the wire format is an IETF draft, `azd` carries the exchange's DECIDED (narrowed) scope rather than RFC 9396 authorization details, there is no replacement flow so each request mints its own transaction id, and NOTHING is minted until a trust domain is configured, because a token with no audience has nowhere it may be spent. |
 | `wasm-hooks` | experimental | no | 0.1.0-exp.1 | crates/ironauth-hooks/CHANGELOG.md | In-process WASM component hooks that shape token claims (issue #114): a deny-by-default capability sandbox with fuel, memory, deadline and host-resource bounds. EXPERIMENTAL because the WIT interface may still move before the decade-ABI commitment; a hook is a compiled artifact built against it. |
 
 ---
@@ -8971,6 +8973,101 @@ authorization surface rather than adding a dark one.
 - **The AARP direction is not started.** The Access Request and Approval Profile is the other half
   of the agent story the issue names, and the vault's approval flow (issue #132) is where it would
   compose.
+
+---
+
+# Transaction tokens (PROTOTYPE)
+
+Source: docs/experimental/transaction-tokens.md
+
+# Transaction tokens (PROTOTYPE)
+
+**Draft:** `draft-ietf-oauth-transaction-tokens-09`
+**Feature flag:** `transaction-tokens`, EXPERIMENTAL
+**Acknowledgment version:** `draft-ietf-oauth-transaction-tokens-09`
+**Status:** prototype. Requested through RFC 8693 token exchange; refused as an unsupported token type unless armed.
+
+## The problem it exists for
+
+A request enters a trust domain at the edge, authenticated as a person. It then fans out across a dozen internal services, and each hop needs three things the original access token cannot carry together: **which person**, **which workload is asking now**, and **what the original request was authorized to do**.
+
+The usual answers are all bad:
+
+| approach | what it loses |
+|---|---|
+| pass the user's access token inward | every service becomes a confused deputy holding a credential good at the edge |
+| mint service-to-service tokens | the person |
+| pass an unsigned header | everything, the moment one hop is compromised |
+
+A transaction token is a short-lived signed JWT scoped to **one transaction inside one trust domain**, carrying all three.
+
+## What it mints
+
+`typ: txn_token` (the draft's media type; it carries no `+jwt` suffix, which is the draft's choice), with:
+
+| claim | from | why |
+|---|---|---|
+| `iss` | this environment's issuer | who signed it |
+| `aud` | the configured trust domain | where it may be spent, and nowhere else |
+| `sub` | the **revalidated** subject token | which person the request is for |
+| `txn` | a fresh id | the transaction every hop shares |
+| `rctx` | the authenticated client | which workload asked for this token (see the deviation below) |
+| `azd` | the exchange's **decided** scope | what *this* request was authorized to do |
+| `act` | the exchange's decision, for a **delegation** | who is acting for the subject |
+| `purp` | **not set** | see below |
+| `iat`, `exp` | the clock | at most five minutes |
+
+`sub` comes from a token the exchange **verified in full**, never from a claim read out of an unverified payload. That is the token-exchange module's central invariant, and this composes on it rather than beside it.
+
+## The audience is the whole security story
+
+A transaction token is intra-domain **by construction**: it names the trust domain as its audience, and a service outside that domain has no reason to accept it. That is the only thing standing between "a short-lived internal assertion" and "a bearer credential that escaped".
+
+So the audience is operator-configured and **required**. With none set, the token type is refused rather than minted against a default, because **a default trust domain is a trust domain nobody chose.**
+
+## Turning it on
+
+```toml
+[features]
+transaction-tokens = { enabled = true, ack = "draft-ietf-oauth-transaction-tokens-09" }
+
+[oidc]
+transaction_token_trust_domain = "internal.example.com"
+```
+
+Two conditions, neither implying the other. The flag says the operator accepts a draft-stage wire format; the domain says where these tokens may be spent. **With either missing, the requested token type is refused exactly as any unknown URI is** -- so a deployment that has not opted in cannot tell from the answer that the type means anything here.
+
+Then, on the token endpoint:
+
+```
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+subject_token=<the user's access token>
+subject_token_type=urn:ietf:params:oauth:token-type:access_token
+requested_token_type=urn:ietf:params:oauth:token-type:txn_token
+```
+
+**An absent `act` is ambiguous, deliberately.** It means a downscope **or** an impersonation: RFC 8693 §1.1 defines impersonation as the actor not being distinguishable in the token. A service in the trust domain cannot tell the two apart and is not meant to -- the audit row's `mode=` is where that distinction lives, which is why the row records it. An impersonated transaction token is traceable only through that row.
+
+**`audience` and `resource` are refused, not ignored.** A transaction token's audience is the trust domain, so a request that also names a target asked for two different things. It answers `invalid_target`, which is what the ordinary exchange answers for an unregistered one -- silently ignoring a narrowing request would leave the caller believing it constrained something it did not.
+
+**`purp` is not set.** The draft defines the claim and defines no request parameter that carries it, and the only free string a caller can send on this endpoint is `scope`, which means *narrow to this* everywhere else here. Reading it as a purpose would make one parameter mean two things depending on the requested token type. A graduation that wants `purp` should define a parameter for it.
+
+**The acknowledgment version is the draft revision itself.** A draft bump invalidates every acknowledgment in the wild, so a routine IronAuth upgrade can refuse to boot for a deployment that enabled this. That is the flag working.
+
+## Deviations from the draft, stated
+
+- **`act` rides in the token for a delegation** and is deliberately absent for an impersonation, per RFC 8693 §1.1. Delegation is the only exchange mode with no per-client policy flag, so `act` is its whole accountability control.
+- **`rctx` is `{"workload": "<client id>"}`**, which is IronAuth's shape, not one the draft prescribes. The draft leaves the requester context's contents to the deployment; this is the smallest thing that answers "which workload asked".
+- **`azd` is `{"scope": [...]}`** carrying the exchange's decided scope, where the draft's `azd` is a rich object describing what was authorized.
+- **`purp` is never set** (see above).
+
+## What a graduation still needs
+
+- **`azd` is the exchange's decided scope, not RFC 9396 authorization details.** The draft's `azd` is a rich object describing what was authorized; this carries the narrowed scope this exchange settled on -- what *this* request may do, not everything the subject token held. A deployment making decisions on `azd` would need the richer shape, and the edge would have to carry it in.
+- **No replacement flow, so `txn` is not shared across a call chain.** The draft's model is that the first hop mints and later hops request a **replacement** carrying the same `txn`. Here every request mints a fresh id, so two hops of one logical transaction get two ids and nothing correlates them.
+- **No `sub_id`.** The draft allows a structured subject identifier (RFC 9493); this carries the plain `sub` the subject token carried.
+- **One trust domain per PROCESS, shared by every tenant.** The domain is a single config field read once at boot, while the issuer is per (tenant, environment), so every tenant this process serves mints with the same `aud`. For a multi-tenant deployment that is the wrong axis and it is the first thing a graduation has to change.
+- **No replay recording and no revocation.** A transaction token is bearer and unrevocable for its lifetime; the five-minute cap is the whole mitigation, which is why it is clamped at the mint rather than configured.
 
 ---
 

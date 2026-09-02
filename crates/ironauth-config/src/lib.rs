@@ -41,7 +41,7 @@ pub use features::{
     GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
     ORG_SCOPED_CLIENTS_FEATURE, RISK_SIGNALS_FEATURE, RISK_SIGNALS_VERSION,
     SIGNUP_QUARANTINE_FEATURE, SIGNUP_QUARANTINE_VERSION, SUPPORTED_FIRST_PARTY_DRAFT,
-    WASM_HOOKS_FEATURE,
+    TRANSACTION_TOKENS_FEATURE, TRANSACTION_TOKENS_VERSION, WASM_HOOKS_FEATURE,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
@@ -2904,6 +2904,17 @@ pub struct OidcConfig {
     /// stored data) to suppress it. See [`FederationConfig`].
     pub federation: FederationConfig,
 
+    /// The trust domain transaction tokens are minted for (issue #133, PROTOTYPE).
+    ///
+    /// EMPTY by default, and empty means the token type is refused rather than minted against a
+    /// default: a transaction token names its trust domain as its audience, and that audience
+    /// is the only thing standing between "a short-lived internal assertion" and "a bearer
+    /// credential that escaped". A default trust domain is one nobody chose.
+    ///
+    /// Inert unless the `transaction-tokens` experimental feature is acknowledged. Both
+    /// conditions are required and neither implies the other.
+    pub transaction_token_trust_domain: String,
+
     /// Attestation-based client authentication (issue #133, PROTOTYPE). Empty by default, and
     /// inert unless the `attestation-client-auth` experimental feature is acknowledged.
     pub attestation_client_auth: AttestationClientAuthConfig,
@@ -3400,6 +3411,7 @@ impl Default for OidcConfig {
             claims_enrichment: ClaimsEnrichmentConfig::default(),
             federation: FederationConfig::default(),
             attestation_client_auth: AttestationClientAuthConfig::default(),
+            transaction_token_trust_domain: String::new(),
             fedcm: FedcmConfig::default(),
             webauthn_enabled: true,
             webauthn_rp_id: None,

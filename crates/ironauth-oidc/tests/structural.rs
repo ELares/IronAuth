@@ -294,4 +294,22 @@ fn every_machine_token_door_runs_the_agent_gate() {
              asserts it runs the agent gate; add it to DOORS above and gate it"
         );
     }
+
+    // AND `token_exchange.rs` HAS TWO MINTING PATHS, each of which must run the gate for
+    // itself: the ordinary one through `issue()` and the transaction-token branch (issue #133),
+    // which returns before `issue()` is reached. The file-level check above cannot express
+    // that -- it is satisfied by either call alone, which is exactly why the branch shipped
+    // ungated and this scan stayed green.
+    //
+    // A COUNT rather than a set of file names, because the property is "how many minting paths
+    // gate themselves", and the transaction-token request is BUILT in `transaction_tokens.rs`
+    // while the gate belongs to its CALLER. Listing that module beside the doors would assert
+    // the gate lives where it must not.
+    let exchange = include_str!("../src/token_exchange.rs");
+    assert_eq!(
+        exchange.matches("gate_agent_issuance(").count(),
+        2,
+        "token_exchange.rs has two minting paths -- the ordinary one through `issue()` and the \
+         transaction-token branch -- and each must run the agent gate for itself"
+    );
 }

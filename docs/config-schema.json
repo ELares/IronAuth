@@ -1629,6 +1629,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "transaction_token_trust_domain": {
+          "default": "",
+          "description": "The trust domain transaction tokens are minted for (issue #133, PROTOTYPE).\n\nEMPTY by default, and empty means the token type is refused rather than minted against a\ndefault: a transaction token names its trust domain as its audience, and that audience\nis the only thing standing between \"a short-lived internal assertion\" and \"a bearer\ncredential that escaped\". A default trust domain is one nobody chose.\n\nInert unless the `transaction-tokens` experimental feature is acknowledged. Both\nconditions are required and neither implies the other.",
+          "type": "string"
+        },
         "trusted_device_idle_secs": {
           "default": 604800,
           "description": "The idle window of a remembered device, in seconds (issue #71): an unused device\nexpires after this, while an actively used one lives to the absolute max age. Must\nbe at least `OIDC_TRUSTED_DEVICE_MIN_IDLE_SECS` (3600) and no greater than\n[`OidcConfig::trusted_device_max_age_secs`] (a boot-time [`ConfigError::Invalid`]\notherwise, since an idle window wider than the absolute cap is meaningless); the\ndefault (604800) is seven days.",
@@ -3125,6 +3130,7 @@
         "totp_issuer": null,
         "totp_period_secs": 30,
         "totp_recovery_code_count": 10,
+        "transaction_token_trust_domain": "",
         "trusted_device_idle_secs": 604800,
         "trusted_device_max_age_secs": 2592000,
         "trusted_device_revoke_on_password_change": true,

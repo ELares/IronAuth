@@ -187,6 +187,23 @@ pub async fn token_exchange_grant(
     let mut requested_audience = space_set(params.audience.as_deref());
     requested_audience.extend(resources.iter().cloned());
 
+    // WANTS A TRANSACTION TOKEN (issue #133, PROTOTYPE), and can have one: the draft is
+    // acknowledged and a trust domain is configured. Resolved here so the decision below runs
+    // with the txn URI HIDDEN from the type negotiator, which would otherwise refuse it as
+    // unsupported before any policy ran.
+    //
+    // Hiding it is what makes every control apply. The first version returned BEFORE `decide`,
+    // and `decide` is the only place the impersonation policy, the registered-grant list and
+    // the confidential-client requirement are enforced -- so a PUBLIC client registered for
+    // another grant could present somebody else's access token and receive a signed assertion
+    // naming that person, which every service in the trust domain accepts. On main the same
+    // request is `invalid_grant`. With the type hidden, the negotiator settles the ordinary
+    // access-token type, every refusal fires exactly as it does for any other exchange, and the
+    // decision's NARROWED scope is what the transaction token then carries.
+    let wants_transaction_token = params.requested_token_type.as_deref()
+        == Some(crate::transaction_tokens::TRANSACTION_TOKEN_TYPE)
+        && state.transaction_token_domain().is_some();
+
     let policy = ClientGrantPolicy {
         allowed: registered_grants(&authenticated.grant_types),
         confidential: authenticated.auth_method != ClientAuthMethod::None,
@@ -214,7 +231,11 @@ pub async fn token_exchange_grant(
             actor_present: actor.is_some(),
             mode,
         },
-        requested_type: params.requested_token_type.as_deref(),
+        requested_type: if wants_transaction_token {
+            None
+        } else {
+            params.requested_token_type.as_deref()
+        },
         existing_act: subject.act.as_ref(),
         actor_subject: actor.as_ref().map(|token| token.subject.as_str()),
     })
@@ -231,6 +252,24 @@ pub async fn token_exchange_grant(
             "a client is configured for exchanged refresh tokens, which this grant does not issue"
         );
         return Err(TokenError::ServerError);
+    }
+
+    // The transaction token, now that every control has run and the scope is the NARROWED one.
+    if wants_transaction_token {
+        return transaction_token(
+            state,
+            scope,
+            &TransactionTokenBranch {
+                entry: &entry,
+                client_id: &client_id,
+                client_id_str: &client_id_str,
+                subject: &subject,
+                decision: &decision,
+                requested_audience: &requested_audience,
+                mode,
+            },
+        )
+        .await;
     }
 
     issue(
@@ -684,6 +723,122 @@ async fn revalidated(
         audience: claims.aud.into_iter().collect(),
         act: claims.act,
     })
+}
+
+/// Everything the transaction-token branch needs from the exchange (issue #133).
+///
+/// A struct rather than nine positional arguments, four of which are references to string-ish
+/// things: a transposed pair would mint a token naming the wrong client or gate the wrong
+/// scope while compiling cleanly.
+struct TransactionTokenBranch<'a> {
+    /// The environment's issuer entry, for its signer.
+    entry: &'a std::sync::Arc<crate::issuer::IssuerEntry>,
+    /// The authenticated client, as a scoped id for the audit row.
+    client_id: &'a ironauth_store::ClientId,
+    /// The same client as a string, for the token's `rctx` and the gate.
+    client_id_str: &'a str,
+    /// The revalidated subject token.
+    subject: &'a ValidatedToken,
+    /// What the exchange decided: the narrowed scope and the actor chain.
+    decision: &'a ironauth_store::token_exchange_decision::ExchangeDecision,
+    /// Any target the caller named, which this profile refuses rather than ignores.
+    requested_audience: &'a std::collections::BTreeSet<String>,
+    /// Downscope, delegation or impersonation.
+    mode: ExchangeMode,
+}
+
+/// The transaction-token branch of the exchange (issue #133, PROTOTYPE).
+///
+/// Its own function so `token_exchange_grant` stays readable, and because what it does is worth
+/// naming: it runs the ONE control the shared `issue()` path would have run for it, and then
+/// mints something `issue()` cannot.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidTarget`] when the request also named a target;
+/// [`TokenError::UnauthorizedClient`] or [`TokenError::InvalidScope`] from the agent gate; and
+/// whatever the mint or its audit write returns.
+async fn transaction_token(
+    state: &OidcState,
+    scope: Scope,
+    branch: &TransactionTokenBranch<'_>,
+) -> Result<Response, TokenError> {
+    let TransactionTokenBranch {
+        entry,
+        client_id,
+        client_id_str,
+        subject,
+        decision,
+        requested_audience,
+        mode,
+    } = *branch;
+    // A transaction token's audience is the TRUST DOMAIN, so a caller that also named a target
+    // asked for two different things. REFUSED rather than resolved: the ordinary path would
+    // have answered `invalid_target` for an unregistered one, and silently ignoring a narrowing
+    // request is the same class of defect as reading `scope` as a purpose -- the caller
+    // believes it constrained something it did not.
+    if !requested_audience.is_empty() {
+        return Err(TokenError::InvalidTarget);
+    }
+
+    // THE AGENT GATE (issue #130), which the first fold left behind while closing the other
+    // three controls. It is a control, not enrichment: a SUSPENDED or REVOKED agent's client is
+    // refused `unauthorized_client`, a scope the agent never declared is `invalid_scope`, and
+    // both write an `agent_token.deny` row. Without it, adding a requested token type to a
+    // request that was refused turned it into a 200 carrying a signed assertion.
+    //
+    // Against the DECIDED scope, which is what the token will carry, so the agent is gated on
+    // exactly what it is about to be given.
+    let granted = decision
+        .scope
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let granted_scope = (!granted.is_empty()).then_some(granted.as_str());
+    let agent =
+        crate::token::gate_agent_issuance(state, scope, client_id_str, granted_scope).await?;
+
+    let response = crate::transaction_tokens::issue_transaction_token(
+        state,
+        scope,
+        entry,
+        &crate::transaction_tokens::ExchangeInputs {
+            client_id,
+            requester: client_id_str,
+            subject: &subject.subject,
+            authorization_context: &decision.scope,
+            // The MODE and the actor chain. Delegation is the mode with no per-client policy
+            // flag: its only accountability control is that `act` rides in the issued token, so
+            // dropping it made a delegation indistinguishable from a downscope in the token,
+            // the log AND the audit row.
+            mode: mode_label(mode),
+            act: decision.act.as_ref(),
+        },
+    )
+    .await?;
+
+    // The AGENT ISSUANCE row, after the token exists, exactly as the other three doors write
+    // it. The gate's return value used to be discarded, so a revoked agent's DENIAL was
+    // attributed to its organization and linked user while a successful mint was attributed to
+    // nobody -- and `docs/agents.md` promises a per-organization stream carries both.
+    if let Some(agent) = &agent {
+        crate::token::record_agent_issuance(state, scope, agent, granted_scope).await;
+    }
+    Ok(response)
+}
+
+/// A stable label for an exchange mode, for a log line and an audit detail.
+///
+/// The transaction-token path needs it because neither the token nor a grant carries the mode
+/// for that credential: a delegation and a downscope would otherwise be indistinguishable in
+/// every record, and impersonation is default-denied precisely because it has to be traceable.
+fn mode_label(mode: ExchangeMode) -> &'static str {
+    match mode {
+        ExchangeMode::Downscope => "downscope",
+        ExchangeMode::Delegation => "delegation",
+        ExchangeMode::Impersonation => "impersonation",
+    }
 }
 
 /// Record a refusal out of band and return the OPAQUE wire error.

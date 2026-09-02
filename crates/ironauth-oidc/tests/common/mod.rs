@@ -2120,6 +2120,17 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm transaction tokens for the harness by installing a trust domain (issue #133).
+    ///
+    /// The boot path resolves "the draft is acknowledged AND a domain is configured" to one
+    /// `Option`, and installing a domain is what that resolves to. With none installed -- the
+    /// default -- the exchange refuses the requested type exactly as it refuses any unknown URI.
+    pub fn install_transaction_token_domain(&mut self, domain: &str) {
+        let state = self.state.clone().with_transaction_token_domain(domain);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
     /// and an optional `Authorization` header (for a `client_secret_basic` client).
     pub async fn par(
@@ -2448,6 +2459,78 @@ impl Harness {
         });
         self.seed_user(&format!("user-{id}@example.test"), SEED_PASSWORD)
             .await
+    }
+
+    /// Seed an ACTIVE agent bound to `client`, declaring `tool_scopes`.
+    ///
+    /// The rows go in as the OWNER, and that is the design rather than a shortcut: registering
+    /// an agent is a control-plane write, and the data-plane role these suites run as holds
+    /// only SELECT on `agents`. A fixture that asked for INSERT would be asking for a privilege
+    /// the token doors must never have.
+    pub async fn seed_agent_for_client(
+        &self,
+        client: &ClientId,
+        tool_scopes: &[&str],
+    ) -> ironauth_store::AgentPrincipalId {
+        self.seed_agent_returning(client, tool_scopes).await.0
+    }
+
+    /// The same, handing back the linked user and the organization too.
+    ///
+    /// `agent_issuance.rs` needs both to assert an issued token names them, and had its own
+    /// copy of these two INSERTs. One fixture, two shapes.
+    pub async fn seed_agent_returning(
+        &self,
+        client: &ClientId,
+        tool_scopes: &[&str],
+    ) -> (ironauth_store::AgentPrincipalId, String, String) {
+        let scope = self.scope;
+        let organization = ironauth_store::OrganizationId::generate(&self.env, &scope);
+        sqlx::query(
+            "INSERT INTO organizations /* query-audit-allow: owner test seed */ \
+             (id, tenant_id, environment_id, display_name) VALUES ($1, $2, $3, 'agent org')",
+        )
+        .bind(organization.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("seed organization");
+
+        let user = self.seed_unique_user().await;
+        let linked = ironauth_store::UserId::parse_in_scope(&user, &scope).expect("user id");
+        let id = ironauth_store::AgentPrincipalId::generate(&self.env, &scope);
+        let tools: Vec<String> = tool_scopes.iter().map(|tool| (*tool).to_owned()).collect();
+        sqlx::query(
+            "INSERT INTO agents /* query-audit-allow: owner test seed */ \
+             (id, tenant_id, environment_id, organization_id, linked_user_id, display_name, \
+              state, tool_scopes, client_id) \
+             VALUES ($1, $2, $3, $4, $5, 'deploy bot', 'active', $6, $7)",
+        )
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(organization.to_string())
+        .bind(linked.to_string())
+        .bind(&tools)
+        .bind(client.to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("seed agent");
+        (id, linked.to_string(), organization.to_string())
+    }
+
+    /// Move a seeded agent to `state`, as the control plane would.
+    pub async fn set_agent_state(&self, id: &ironauth_store::AgentPrincipalId, state: &str) {
+        sqlx::query(
+            "UPDATE agents /* query-audit-allow: owner test write */ SET state = $1 \
+             WHERE id = $2",
+        )
+        .bind(state)
+        .bind(id.to_string())
+        .execute(self.db.owner_pool())
+        .await
+        .expect("set the agent state");
     }
 
     /// Record `subject`'s consent to `client_id` in the harness scope for the broad
