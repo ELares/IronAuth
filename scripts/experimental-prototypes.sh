@@ -114,8 +114,15 @@ echo "== identity chaining / ID-JAG (receiving side) =="
 cargo test -p ironauth-oidc --test identity_chaining
 # And the GRANT: that it reaches those rules, that every ordinary jwt-bearer refusal still
 # fires, and that the assertion's scope is not a way past the machine-grant floor or the
-# presenting client's allowlist. Needs a database. The filter is `id_jag`, which is what the
-# tests in that suite are named; `identity_chaining` would match only the harness installer.
+# presenting client's allowlist. Needs a database.
+#
+# The filter is `id_jag`, and every one of the five grant tests is NAMED for it. That is not a
+# convention, it is the lane's coverage: the first version of this line matched exactly ONE of
+# them -- the unarmed-posture test, the only one that still passes with the whole prototype
+# deleted -- so the lane was green having exercised none of the checks it names above. A test
+# in `structural.rs` now fails if an ID-JAG test is added without the substring, because a
+# filter and a naming convention with nothing holding them together drift the moment someone
+# writes the obvious name. `identity_chaining` was the alternative and matches ZERO tests.
 cargo test -p ironauth-oidc --features testing --test jwt_bearer id_jag
 # And the BOOT wiring: armed by ITS OWN acknowledgment, refusing the boot on a missing or stale
 # one, and not armed by another prototype's.

@@ -368,10 +368,11 @@ impl FeatureRegistry {
              ACCEPTS an identity assertion minted in another trust domain and presented as an \
              RFC 7523 authorization grant, so a user who signed in there reaches an API here \
              without either domain trusting the other's access tokens. Layered ON the \
-             jwt-bearer grant, adding three checks and removing none: the ID-JAG media type, \
-             the assertion naming the presenting client, and the assertion's scope as a \
-             ceiling. PROTOTYPE: two IETF drafts, the REQUESTING side is not built, `jti` \
-             stays optional as RFC 7523 has it, and trust is per ISSUER rather than per \
+             jwt-bearer grant, adding four checks and removing none: the ID-JAG media type, a \
+             CONFIDENTIAL presenting client, the assertion naming that client, and the \
+             assertion's scope as a ceiling. PROTOTYPE: two IETF drafts, the REQUESTING side \
+             is not built, `jti` stays optional as RFC 7523 has it, the flag is process-global \
+             rather than per (tenant, environment), and trust is per ISSUER rather than per \
              (issuer, domain) -- so an issuer registered for workload federation can present \
              identity assertions once this is on, which is the sharpest edge here.",
             IDENTITY_CHAINING_VERSION,

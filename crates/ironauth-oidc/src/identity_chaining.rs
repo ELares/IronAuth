@@ -21,7 +21,9 @@
 //! Identity chaining composes the answer out of two RFCs this deployment already implements. The
 //! requesting app exchanges its token at A for an **identity assertion** naming the user and
 //! scoped to B (RFC 8693), then presents that assertion at B as an authorization grant (RFC
-//! 7523). B never sees A's access token, and A never issues a credential valid at B.
+//! 7523). B never sees A's access token, and A never issues a token valid at B's RESOURCES:
+//! the assertion authorizes nothing by itself, it only says who signed in and which client may
+//! present it.
 //!
 //! # Why this is layered ON the jwt-bearer grant rather than beside it
 //!
@@ -79,14 +81,27 @@ pub const ID_JAG_TYP: &str = "oauth-id-jag+jwt";
 
 /// Why an identity assertion was refused, beyond the ordinary grant's own refusals.
 ///
-/// Carried for the caller to map onto the grant's uniform wire error. The client sees the same
-/// `invalid_grant` every other assertion failure produces: a caller that learned which of these
-/// fired would know how far a forged assertion got.
+/// The client sees the same `invalid_grant` every other assertion failure produces: a caller
+/// that learned which of these fired would know how far a forged assertion got. The caller maps
+/// each variant onto its OWN `ClientAuthDiagnosticReason` for the out-of-band sink, so an
+/// operator can separate an interception from a misconfigured issuer even though the wire
+/// cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityAssertionRefusal {
     /// The assertion does not carry the ID-JAG media type, so it is an ordinary bearer
     /// assertion being presented as an identity one.
     NotAnIdentityAssertion,
+    /// The presenting client is PUBLIC, so it authenticated with nothing but its own
+    /// non-secret identifier.
+    ///
+    /// This is what makes [`Self::ClientMismatch`] mean anything. The ordinary jwt-bearer
+    /// grant permits a public presenting client deliberately -- the assertion IS the
+    /// authorization grant, so no client credential is required for a WORKLOAD to trade one.
+    /// An identity assertion speaks for a PERSON and is bound to the client it was minted
+    /// for, and for a `none` client "authenticating as `cli_x`" is typing `cli_x` into the
+    /// form. Anyone who intercepted the assertion could satisfy the binding for free, and the
+    /// assertion would be exactly the bearer token the binding exists to stop it being.
+    PresenterNotConfidential,
     /// The assertion names no client, or names a different one than the presenter.
     ClientMismatch,
     /// The assertion carries no scope, so there is no ceiling and nothing to issue against.
@@ -101,29 +116,42 @@ pub enum IdentityAssertionRefusal {
 /// the whole point of checking `typ` after verification is that the signature covers it.
 #[must_use]
 pub fn is_identity_assertion(verified: &VerifiedToken) -> bool {
-    media_type_is(verified.token_typ(), ID_JAG_TYP)
+    ironauth_jose::foreign_media_type_is(verified.token_typ(), ID_JAG_TYP)
 }
 
 /// The extra checks an identity assertion must pass, on top of everything the ordinary
 /// assertion grant already enforced.
 ///
-/// `presenting_client` is the client that authenticated at the token endpoint, and
-/// `requested_scope` is what it asked for. The assertion's own `scope` is the ceiling.
+/// `presenting_client` is the client that authenticated at the token endpoint,
+/// `presenter_is_confidential` says whether that authentication proved anything beyond
+/// possession of the client's public identifier, and `requested_scope` is what it asked for.
+/// The assertion's own `scope` is the ceiling.
 ///
 /// Returns the scope the token may carry: the assertion's set when the request named none, or
 /// the request's when it named a subset. NEVER the union, and never the request's alone.
 ///
 /// # Errors
 ///
-/// [`IdentityAssertionRefusal`], for diagnostics. Every variant is the same uniform refusal on
-/// the wire.
+/// [`IdentityAssertionRefusal`]. Every variant is the same uniform refusal on the wire; the
+/// caller records a distinct out-of-band reason per variant.
 pub fn admit(
     verified: &VerifiedToken,
     presenting_client: &str,
+    presenter_is_confidential: bool,
     requested_scope: Option<&str>,
 ) -> Result<Vec<String>, IdentityAssertionRefusal> {
     if !is_identity_assertion(verified) {
         return Err(IdentityAssertionRefusal::NotAnIdentityAssertion);
+    }
+
+    // THE BINDING BELOW HAS TO COST SOMETHING. A public client authenticates by naming
+    // itself, so an interceptor satisfies `client_id` by sending the id printed in the
+    // assertion it just stole. Refusing a public presenter is what turns the next check from a
+    // spelling requirement into a control. It is checked HERE, after the media type, so an
+    // ordinary bearer assertion from a public client -- which this grant permits on purpose --
+    // is untouched.
+    if !presenter_is_confidential {
+        return Err(IdentityAssertionRefusal::PresenterNotConfidential);
     }
 
     // BOUND TO THE PRESENTER. The draft names the client the assertion is for, so one
@@ -166,20 +194,4 @@ pub fn admit(
         return Err(IdentityAssertionRefusal::ScopeExceedsAssertion);
     }
     Ok(requested)
-}
-
-/// Compare a media type, with the optional and case-insensitive `application/` prefix.
-///
-/// The same comparison `attestation_client_auth` performs, for the same reason: `TokenTyp` names
-/// only profiles IronAuth mints, and this one is a foreign party's.
-fn media_type_is(header_typ: Option<&str>, expected: &str) -> bool {
-    const APPLICATION_PREFIX: &str = "application/";
-    let Some(candidate) = header_typ else {
-        return false;
-    };
-    let stripped = candidate
-        .get(..APPLICATION_PREFIX.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(APPLICATION_PREFIX))
-        .map_or(candidate, |_| &candidate[APPLICATION_PREFIX.len()..]);
-    stripped.eq_ignore_ascii_case(expected)
 }

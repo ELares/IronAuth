@@ -39,6 +39,10 @@ const LOCAL_AUDIENCE: &str = "https://ironauth.domain-b.example/t/acme/e/prod";
 const PRESENTER: &str = "cli_the_calling_app";
 const USER: &str = "alice@domain-a.example";
 const NOW: u64 = 1_800_000_000;
+/// Whether the presenter authenticated with a real credential. Every case below says yes
+/// except `a_public_presenter_cannot_spend_an_identity_assertion`, which is the whole point of
+/// the parameter: the client binding is only a control if satisfying it costs something.
+const CONFIDENTIAL: bool = true;
 
 fn key() -> SigningKey {
     SigningKey::ed25519_from_seed(Some("idp-kid".to_owned()), &[19_u8; 32]).expect("a key")
@@ -90,6 +94,12 @@ fn claims(client: &str, scope: Option<&str>) -> Value {
     body
 }
 
+/// The assertion as an honest IdP mints it.
+///
+/// The media type comes from `ID_JAG_TYP` rather than a literal, so this fixture alone would
+/// keep passing if the constant were redefined. The literal spellings are pinned in
+/// `an_ordinary_bearer_assertion_is_not_an_identity_assertion` below and again in
+/// `tests/jwt_bearer.rs`, which re-spells it deliberately; do not remove either.
 fn honest() -> VerifiedToken {
     assertion(
         ID_JAG_TYP,
@@ -102,7 +112,7 @@ fn an_honest_identity_assertion_is_admitted_with_the_scope_it_authorized() {
     let verified = honest();
     assert!(is_identity_assertion(&verified));
     assert_eq!(
-        admit(&verified, PRESENTER, None),
+        admit(&verified, PRESENTER, CONFIDENTIAL, None),
         Ok(vec!["orders.read".to_owned(), "orders.write".to_owned()]),
         "with no request of its own, the client gets exactly what the assertion authorized"
     );
@@ -120,7 +130,7 @@ fn an_ordinary_bearer_assertion_is_not_an_identity_assertion() {
             "{typ} is not the media type"
         );
         assert_eq!(
-            admit(&verified, PRESENTER, None),
+            admit(&verified, PRESENTER, CONFIDENTIAL, None),
             Err(IdentityAssertionRefusal::NotAnIdentityAssertion)
         );
     }
@@ -137,13 +147,43 @@ fn an_ordinary_bearer_assertion_is_not_an_identity_assertion() {
 }
 
 #[test]
+fn a_public_presenter_cannot_spend_an_identity_assertion() {
+    // What makes the client binding below a control rather than a spelling requirement. A
+    // public client authenticates by naming itself, so an interceptor reads the bound client id
+    // off the stolen assertion and sends it: the binding costs nothing and the assertion is a
+    // bearer token again.
+    let verified = honest();
+    assert_eq!(
+        admit(&verified, PRESENTER, false, None),
+        Err(IdentityAssertionRefusal::PresenterNotConfidential),
+        "an assertion perfect in every other way is refused to a public presenter"
+    );
+
+    // The control: the SAME assertion, presented by a client that authenticated.
+    assert!(
+        admit(&verified, PRESENTER, CONFIDENTIAL, None).is_ok(),
+        "and admitted once the presenter proved it is that client"
+    );
+
+    // The check runs AFTER the media type, so an ordinary bearer assertion from a public
+    // client -- which this grant permits deliberately -- is refused as "not an identity
+    // assertion" rather than for the presenter. That ordering is what keeps the ordinary path
+    // untouched.
+    let ordinary = assertion("JWT", &claims(PRESENTER, Some("orders.read")));
+    assert_eq!(
+        admit(&ordinary, PRESENTER, false, None),
+        Err(IdentityAssertionRefusal::NotAnIdentityAssertion)
+    );
+}
+
+#[test]
 fn an_assertion_naming_another_client_is_refused() {
     // THE INTERCEPTION. The draft binds the assertion to the client that will present it, so
     // one captured by another client of this same deployment is inert. Without this the
     // assertion is a bearer token for whoever holds it.
     let verified = assertion(ID_JAG_TYP, &claims("cli_someone_else", Some("orders.read")));
     assert_eq!(
-        admit(&verified, PRESENTER, None),
+        admit(&verified, PRESENTER, CONFIDENTIAL, None),
         Err(IdentityAssertionRefusal::ClientMismatch)
     );
 
@@ -151,7 +191,7 @@ fn an_assertion_naming_another_client_is_refused() {
     // the binding left out rather than contradicted.
     let unbound = assertion(ID_JAG_TYP, &claims("", Some("orders.read")));
     assert_eq!(
-        admit(&unbound, PRESENTER, None),
+        admit(&unbound, PRESENTER, CONFIDENTIAL, None),
         Err(IdentityAssertionRefusal::ClientMismatch)
     );
 }
@@ -165,7 +205,7 @@ fn the_assertions_scope_is_a_ceiling_and_not_a_default() {
 
     // A subset is honoured.
     assert_eq!(
-        admit(&verified, PRESENTER, Some("orders.read")),
+        admit(&verified, PRESENTER, CONFIDENTIAL, Some("orders.read")),
         Ok(vec!["orders.read".to_owned()])
     );
 
@@ -173,11 +213,16 @@ fn the_assertions_scope_is_a_ceiling_and_not_a_default() {
     // a check that only looked at the first scope, or that intersected instead of refusing,
     // would pass this partially.
     assert_eq!(
-        admit(&verified, PRESENTER, Some("orders.read admin")),
+        admit(
+            &verified,
+            PRESENTER,
+            CONFIDENTIAL,
+            Some("orders.read admin")
+        ),
         Err(IdentityAssertionRefusal::ScopeExceedsAssertion)
     );
     assert_eq!(
-        admit(&verified, PRESENTER, Some("admin")),
+        admit(&verified, PRESENTER, CONFIDENTIAL, Some("admin")),
         Err(IdentityAssertionRefusal::ScopeExceedsAssertion)
     );
 
@@ -185,12 +230,12 @@ fn the_assertions_scope_is_a_ceiling_and_not_a_default() {
     // Treating it as "everything the mapping allows" is exactly the widening above.
     let scopeless = assertion(ID_JAG_TYP, &claims(PRESENTER, None));
     assert_eq!(
-        admit(&scopeless, PRESENTER, None),
+        admit(&scopeless, PRESENTER, CONFIDENTIAL, None),
         Err(IdentityAssertionRefusal::NoScope)
     );
     let empty = assertion(ID_JAG_TYP, &claims(PRESENTER, Some("   ")));
     assert_eq!(
-        admit(&empty, PRESENTER, None),
+        admit(&empty, PRESENTER, CONFIDENTIAL, None),
         Err(IdentityAssertionRefusal::NoScope),
         "whitespace is not a scope"
     );

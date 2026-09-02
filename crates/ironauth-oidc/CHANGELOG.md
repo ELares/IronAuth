@@ -21,11 +21,23 @@ the required `sub` and `exp`, the single-use `jti`, the REGISTERED subject mappi
 auto-provisioned), the principal's lifecycle fence, and the scope policy. A prototype sitting
 beside the grant would have had to restate all eight, and the one it forgot would be the hole.
 
-The three: the header `typ` must be `oauth-id-jag+jwt`, or an issuer registered to federate a
-workload could speak for a PERSON; `client_id` must name the presenting client, or the assertion
-is a bearer token for whoever intercepts it; and `scope` must be present and BOUNDS what is
-issued, or a local subject mapping could widen what the authoritative domain granted. An
-assertion carrying no scope is refused rather than read as "everything the mapping allows".
+The four: the header `typ` must be `oauth-id-jag+jwt`, or an issuer registered to federate a
+workload could speak for a PERSON; the presenting client must be CONFIDENTIAL; `client_id` must
+name that client, or the assertion is a bearer token for whoever intercepts it; and `scope` must
+be present and BOUNDS what is issued, or a local subject mapping could widen what the
+authoritative domain granted. An assertion carrying no scope is refused rather than read as
+"everything the mapping allows".
+
+**Why confidential.** This grant permits a PUBLIC presenting client on purpose -- the assertion
+is the authorization grant, so a workload needs no credential of its own -- and for a public
+client, "authenticating as `cli_x`" is typing `cli_x` into the form. An interceptor reads the
+bound client id off the stolen assertion and sends it, so the binding costs nothing and the
+assertion is the bearer token that binding exists to stop it being. The ordinary path is
+untouched: a public client still trades a plain bearer assertion.
+
+Each refusal records its OWN reason in the client-authentication diagnostics sink while the wire
+answer stays the uniform `invalid_grant`, so an operator can separate an interception from a
+misconfigured issuer and a caller cannot.
 
 **The ceiling is not a second way in.** When the client requests nothing, the assertion's scope
 becomes the granted scope -- and that string was written by a foreign issuer, so it is validated
@@ -42,8 +54,10 @@ reads. That is the unchanged posture and it is also the reason the flag exists.
 rather than per (issuer, trust domain), so an issuer registered for workload federation can
 present identity assertions once this is on, which is the sharpest edge here; `jti` stays
 optional as RFC 7523 has it; RFC 9396 `authorization_details` and RFC 9493 `sub_id` are not
-read; and an identity assertion produces the same audit shape as an ordinary one, so nothing in
-the log says which tokens came through this path.
+read; a MINTED token carries no marker saying it came from an identity assertion (the refusals
+are distinguished, the successes are not); and the flag is process-global rather than per
+(tenant, environment), so arming it changes what an already-live grant accepts for every tenant
+this process serves.
 
 ### Experimental: transaction tokens (issue #133)
 

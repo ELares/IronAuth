@@ -95,18 +95,19 @@ use ironauth_jose::{
 };
 use ironauth_store::FederatedSource;
 use ironauth_store::{
-    ClientAuthDiagnosticReason, ClientCredentialsAccess, ClientId, CorrelationId,
-    ExternalAssertionIssuerRecord, GrantId, IssueClientCredentials, JtiOutcome,
+    ClientAuthDiagnosticReason, ClientCredentialsAccess, ClientId, ClientScopePolicy,
+    CorrelationId, ExternalAssertionIssuerRecord, GrantId, IssueClientCredentials, JtiOutcome,
     NewClientAuthDiagnostic, NewOpaqueAccessToken, Scope, StoredClientId, UserId,
 };
 use serde_json::Value;
 
 use crate::client_auth::{
-    self, ASYMMETRIC_ALGS, AssertionReject, ClientAuthError, ClientAuthInputs,
+    self, ASYMMETRIC_ALGS, AssertionReject, ClientAuthError, ClientAuthInputs, ClientAuthMethod,
     map_assertion_reject, parse_presented, peek_assertion_header,
 };
 use crate::client_credentials::{M2mScopeRefusal, load_scope_policy, validate_m2m_scope};
 use crate::error::TokenError;
+use crate::identity_chaining::IdentityAssertionRefusal;
 use crate::state::OidcState;
 use crate::token::{TokenParams, map_store_error, token_ok};
 use crate::tokens::{self, ClientCredentialsMintRequest, MintedAccessToken};
@@ -187,6 +188,12 @@ pub async fn jwt_bearer_grant(
         &authenticated,
         crate::registry::GrantType::JwtBearer,
     )?;
+    // Whether the presenter proved anything beyond possession of its own PUBLIC identifier.
+    // Read from the authentication that just happened rather than from a second registry
+    // lookup, so it cannot describe a different row than the one that authenticated. Only the
+    // identity-chaining path consults it (issue #133): the ordinary grant permits a public
+    // presenting client on purpose, because there the assertion IS the authorization grant.
+    let presenter_is_confidential = authenticated.auth_method != ClientAuthMethod::None;
     let client_id_str = authenticated.client_id;
 
     // 3. Validate the requested `scope` against the SHARED machine-grant policy
@@ -197,10 +204,11 @@ pub async fn jwt_bearer_grant(
     //    applies is the PRESENTING one, which is the client this token is minted for.
     //    Do this BEFORE touching the assertion so an out-of-policy scope never spends
     //    the assertion's single-use jti, which is why the allowlist read sits here too
-    //    rather than later. That ordering is also why the allowlist refusal cannot
+    //    rather than later. (Step 5b judges a second scope against the SAME policy after
+    //    the assertion is verified; see there for why that ordering is sound.) That ordering is also why the allowlist refusal cannot
     //    answer `invalid_scope`: nothing has authenticated the caller yet on this
     //    grant. `resolve_machine_scope` owns that mapping.
-    let requested_scope = resolve_machine_scope(
+    let (requested_scope, scope_policy) = resolve_machine_scope(
         state,
         scope,
         &client_id_str,
@@ -219,6 +227,7 @@ pub async fn jwt_bearer_grant(
         scope,
         assertion,
         &client_id_str,
+        presenter_is_confidential,
         requested_scope.as_deref(),
     )
     .await
@@ -251,13 +260,13 @@ pub async fn jwt_bearer_grant(
     //  and the probing attack step 3's ordering exists to prevent needs the latter.
     let granted_scope = match mapped.id_jag_scope.as_ref() {
         Some(admitted) => {
-            resolve_machine_scope(
+            judge_machine_scope(
                 state,
                 scope,
                 &client_id_str,
-                via_basic,
-                Some(admitted.join(" ").as_str()),
                 assertion,
+                Some(admitted.join(" ").as_str()),
+                &scope_policy,
             )
             .await?
         }
@@ -295,6 +304,13 @@ pub async fn jwt_bearer_grant(
 /// caller could separate an allowlisted scope from a non-allowlisted one one request
 /// at a time and read the client's operator-written configuration off the wire.
 ///
+/// ONE CALLER BREAKS THAT ORDERING, DELIBERATELY. The identity-chaining path (issue #133)
+/// judges a SECOND scope -- the assertion's ceiling -- after the assertion is verified and its
+/// `jti` spent, because the ceiling is not knowable before then, so an out-of-policy ceiling
+/// does cost its `jti`. It does not reopen the oracle: reaching it needs the flag armed, a
+/// verified assertion from a REGISTERED issuer, and a CONFIDENTIAL presenter, none of which a
+/// caller holding no credential and a garbage assertion has.
+///
 /// So an allowlist refusal joins this grant's uniform `invalid_grant` and records
 /// [`ClientAuthDiagnosticReason::ScopeNotAllowlisted`] out of band through the SAME
 /// [`record_diagnostic`] channel every other jwt-bearer failure uses: the operator
@@ -322,7 +338,7 @@ async fn resolve_machine_scope(
     via_basic: bool,
     requested: Option<&str>,
     assertion: &str,
-) -> Result<Option<String>, TokenError> {
+) -> Result<(Option<String>, ClientScopePolicy), TokenError> {
     let presenting_id = state
         .store()
         .scoped(scope)
@@ -330,7 +346,30 @@ async fn resolve_machine_scope(
         .parse_id(client_id)
         .map_err(|_| TokenError::InvalidClient { via_basic })?;
     let policy = load_scope_policy(state, scope, &presenting_id, via_basic).await?;
-    match validate_m2m_scope(requested, &policy) {
+    let granted =
+        judge_machine_scope(state, scope, client_id, assertion, requested, &policy).await?;
+    Ok((granted, policy))
+}
+
+/// Judge `requested` against an ALREADY LOADED policy, mapping each refusal to this grant's
+/// wire answer and its out-of-band reason.
+///
+/// Split from [`resolve_machine_scope`] so the identity-chaining path (issue #133) can judge a
+/// SECOND scope -- the assertion's ceiling -- against the policy step 3 already read, instead
+/// of reading it again. A second read is a second thing that can disagree with the first: the
+/// client row can be deleted between them, and the caller, which has already authenticated,
+/// would receive `invalid_client` (with a `WWW-Authenticate: Basic` re-prompt for credentials
+/// it just proved) at a point where its assertion's single-use `jti` is already spent, so
+/// retrying is impossible. One read, one policy, one verdict per request.
+async fn judge_machine_scope(
+    state: &OidcState,
+    scope: Scope,
+    client_id: &str,
+    assertion: &str,
+    requested: Option<&str>,
+    policy: &ClientScopePolicy,
+) -> Result<Option<String>, TokenError> {
+    match validate_m2m_scope(requested, policy) {
         Ok(granted) => Ok(granted),
         Err(M2mScopeRefusal::Floor) => Err(TokenError::InvalidScope),
         Err(M2mScopeRefusal::Allowlist) => {
@@ -372,12 +411,16 @@ struct MappedFederation {
     issuer: String,
     /// The external subject, before mapping.
     subject: String,
-    /// The scope an IDENTITY ASSERTION authorized, when this was one and the prototype is armed
-    /// (issue #133).
+    /// The scope an admitted IDENTITY ASSERTION allows this token to carry (issue #133).
     ///
-    /// `None` for an ordinary bearer assertion, and for an identity assertion on a deployment
-    /// that has not acknowledged the drafts -- which is main's behaviour unchanged, because the
-    /// prototype only ever ADDS refusals.
+    /// The assertion's own set when the client named no scope, or the client's subset when it
+    /// named one. Never the union: `admit` refuses a request reaching outside the assertion
+    /// rather than intersecting it, so a client is never told it holds something it does not.
+    ///
+    /// `None` for an ordinary bearer assertion, and on any deployment where the flag is not
+    /// ENABLED, which is what the caller reads: an acknowledged-but-disabled deployment gets
+    /// `None` too, and that is main's behaviour unchanged, because the prototype only ever
+    /// ADDS refusals.
     id_jag_scope: Option<Vec<String>>,
 }
 
@@ -386,6 +429,7 @@ async fn validate_and_map(
     scope: Scope,
     assertion: &str,
     presenting_client: &str,
+    presenter_is_confidential: bool,
     requested_scope: Option<&str>,
 ) -> Result<MappedFederation, JwtBearerError> {
     // Peek the UNVERIFIED `iss` to find WHICH registered issuer to verify against.
@@ -503,14 +547,20 @@ async fn validate_and_map(
     let id_jag_scope = if state.identity_chaining_enabled()
         && crate::identity_chaining::is_identity_assertion(&verified)
     {
-        match crate::identity_chaining::admit(&verified, presenting_client, requested_scope) {
+        match crate::identity_chaining::admit(
+            &verified,
+            presenting_client,
+            presenter_is_confidential,
+            requested_scope,
+        ) {
             Ok(admitted) => Some(admitted),
-            Err(refusal) => {
-                tracing::debug!(?refusal, "an identity assertion was refused");
-                return Err(JwtBearerError::Reject(
-                    ClientAuthDiagnosticReason::AssertionInvalid,
-                ));
-            }
+            // Each refusal gets its OWN reason in the out-of-band sink. The wire answer stays
+            // the one uniform `invalid_grant`, but an operator has to be able to separate an
+            // assertion minted for a different client -- an interception, and the only one of
+            // these worth paging on -- from an issuer that forgot to set `scope`. Folding them
+            // into the generic `AssertionInvalid` told the operator nothing the grant's other
+            // seventeen reasons would not have.
+            Err(refusal) => return Err(JwtBearerError::Reject(diagnose_refusal(refusal))),
         }
     } else {
         None
@@ -522,6 +572,30 @@ async fn validate_and_map(
         subject,
         id_jag_scope,
     })
+}
+
+/// The out-of-band reason for each identity-assertion refusal (issue #133, PROTOTYPE).
+///
+/// A function rather than an inline `match` so the exhaustiveness is visible: adding a refusal
+/// without deciding what an operator should see fails the build here.
+fn diagnose_refusal(refusal: IdentityAssertionRefusal) -> ClientAuthDiagnosticReason {
+    match refusal {
+        // Not an identity assertion at all. Reachable only if `admit` is called without the
+        // `is_identity_assertion` guard the caller applies, so it keeps the coarse reason.
+        IdentityAssertionRefusal::NotAnIdentityAssertion => {
+            ClientAuthDiagnosticReason::AssertionInvalid
+        }
+        IdentityAssertionRefusal::PresenterNotConfidential => {
+            ClientAuthDiagnosticReason::IdentityAssertionPresenterPublic
+        }
+        IdentityAssertionRefusal::ClientMismatch => {
+            ClientAuthDiagnosticReason::IdentityAssertionClientMismatch
+        }
+        IdentityAssertionRefusal::NoScope => ClientAuthDiagnosticReason::IdentityAssertionNoScope,
+        IdentityAssertionRefusal::ScopeExceedsAssertion => {
+            ClientAuthDiagnosticReason::IdentityAssertionScopeExceeded
+        }
+    }
 }
 
 /// Spend the OPTIONAL single-use `jti` (RFC 7523 makes it optional on the

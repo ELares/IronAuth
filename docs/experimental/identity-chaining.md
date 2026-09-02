@@ -34,17 +34,28 @@ An ID-JAG **is** an RFC 7523 assertion grant. So this is not a new door. It is t
 
 **Then** the three ID-JAG checks. They add refusals and remove none, which is the whole reason for building it this way: a prototype that sat beside the grant would have had to re-implement all eight, and the one it forgot would be the hole.
 
-## The three checks
+## The four checks
 
 | check | without it |
 |---|---|
 | the header `typ` is `oauth-id-jag+jwt` | an issuer registered to federate a CI workload could present an assertion that speaks for a **person** |
+| the presenting client is **confidential** | see below: the binding beneath it costs an interceptor nothing |
 | `client_id` names the presenting client | the assertion is a bearer token for whoever intercepts it |
 | `scope` is present, and bounds what is issued | a **local** subject mapping could widen what the **authoritative** domain granted |
 
+### Why the presenting client must be confidential
+
+This grant permits a **public** presenting client deliberately: the assertion is the authorization grant, so a workload trading one needs no client credential of its own. That is correct for a workload assertion and wrong for an identity assertion, and the difference is what the client binding is for.
+
+For a public client, "authenticating as `cli_x`" is **typing `cli_x` into the form**. An interceptor reads the bound client id off the stolen assertion and sends it. The binding is satisfied for free, and the assertion is exactly the bearer token the binding exists to stop it being.
+
+So an identity assertion requires a presenter that **proved** it is the named client. The ordinary jwt-bearer path is untouched: a public client still trades a plain bearer assertion, because there nothing claims to bind one.
+
 The media type is compared with the optional and case-insensitive `application/` prefix, the same comparison the attestation prototype performs, for the same reason: `TokenTyp` names only profiles IronAuth mints and this one is a foreign party's.
 
-An assertion carrying **no** `scope` is refused rather than treated as "everything the mapping allows". That default is the widening the third check exists to stop.
+An assertion carrying **no** `scope` is refused rather than treated as "everything the mapping allows". That default is the widening the last check exists to stop.
+
+Each refusal records its **own** reason in the client-authentication diagnostics sink, while the wire answer stays the one uniform `invalid_grant` every assertion failure gives. An operator has to be able to separate an assertion minted for a different client, which is an interception and the only one of these worth paging on, from an issuer that forgot to set `scope`. A caller must not.
 
 ## The assertion's scope is a ceiling, never a second way in
 
@@ -67,7 +78,12 @@ That is stated plainly because it is the sharp edge, not a footnote. It is also 
 identity-chaining = { enabled = true, ack = "draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04" }
 ```
 
-One condition, unlike the transaction-token prototype next door: there is nothing to configure, because the trust is already expressed by the registered external issuer and the registered subject mapping this grant has always required.
+One flag, unlike the transaction-token prototype next door, which also needs a trust domain. But **it is not true that there is nothing to configure**, and the two things to set are the ones that bound what a foreign issuer can cause this deployment to mint:
+
+1. **The presenting client must be confidential.** A public client cannot present an identity assertion at all, so the app that will do this needs a real `token_endpoint_auth_method`.
+2. **Set that client's scope allowlist.** With no allowlist row a client may hold any scope outside the machine-grant floor, so an assertion authorizing `admin:all` mints a token carrying `admin:all`. That is not an escalation over what the client could already obtain by asking plainly, but it does move the choice of scope from your client to the remote issuer, and the allowlist is what takes it back.
+
+The trust in the issuer itself is already expressed by the registered external issuer and the registered subject mapping this grant has always required.
 
 The acknowledgment pins **both** drafts, so either one moving invalidates every acknowledgment in the wild and a routine upgrade refuses to boot for a deployment that enabled this. That is the flag working.
 
@@ -84,4 +100,5 @@ Nothing is mounted and nothing is advertised. The only visible sign that it is a
 - **Trust is per ISSUER, not per (issuer, trust domain).** This is the sharpest edge here. An external issuer registered for **workload** federation can, once the flag is on, present identity assertions that speak for people -- because the registration says "we trust this issuer" and nothing narrows that to a purpose. A graduation needs the registration to say which of the two an issuer may do.
 - **No `sub_id`.** RFC 9493 structured subject identifiers are not read; the plain `sub` is matched against the registered mapping, which is what the ordinary grant has always done.
 - **The requesting side.** See above.
-- **No per-assertion audit distinction.** An identity assertion and an ordinary one produce the same audit shape, so an operator reading the log cannot tell that a token was minted from a chained identity. The startup line says the mode is armed; nothing says which tokens came through it.
+- **No per-assertion audit distinction on the SUCCESS path.** A token minted from an identity assertion and one minted from an ordinary assertion produce the same audit shape, so an operator reading the log cannot tell which came through this path. The refusals are distinguished (each records its own diagnostic reason); the mints are not.
+- **The flag is process-global, not per (tenant, environment).** Every other experimental surface here is resolved the same way, but it matters more for this one: arming it changes what an already-live grant accepts for every tenant this process serves, rather than mounting a route that only its own callers reach.

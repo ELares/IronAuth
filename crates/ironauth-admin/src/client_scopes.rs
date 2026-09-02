@@ -34,7 +34,11 @@
 //! and checks the scope before the assertion is touched, so `invalid_scope` there
 //! would let an unauthenticated caller read back the allowlist WRITTEN THROUGH THIS
 //! ENDPOINT one scope token at a time. `client_credentials` requires client
-//! authentication (RFC 6749 4.4), so its only reader is the client itself. The
+//! authentication (RFC 6749 4.4), so its only reader is the client itself. (The
+//! identity-chaining prototype, issue #133, adds a SECOND allowlist check on the
+//! jwt-bearer grant that runs after the assertion is verified; it records the same
+//! reason and is reachable only by a confidential client, so it is not an
+//! unauthenticated oracle either.) The
 //! `DISALLOWED_M2M_SCOPES` floor keeps `invalid_scope` on both, because it is a public
 //! compile-time constant rather than anything an operator configured here.
 //!

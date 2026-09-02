@@ -1690,11 +1690,19 @@ async fn build_oidc_plane(
     }
     if surfaces.identity_chaining {
         // Worth announcing more than a new route is, and the reason is the difference between
-        // this prototype and its neighbours: it mounts NOTHING. It adds three refusals inside
-        // an existing grant, so an operator reading their route table cannot see that it is on,
-        // and the only place the state change is visible at all is this line.
+        // this prototype and its neighbours: it mounts NOTHING. It adds refusals inside an
+        // existing grant, so an operator reading their route table cannot see that it is on,
+        // and this line is the only sign of it AT BOOT. (The behaviour is visible at runtime:
+        // /token refuses assertions it previously accepted, and an admitted one carries the
+        // assertion scope.)
         tracing::info!(
-            "experimental identity chaining / ID-JAG receiving side armed (issue #133,              draft-ietf-oauth-identity-chaining-16 +              draft-ietf-oauth-identity-assertion-authz-grant-04): the jwt-bearer grant now              ADMITS an identity assertion from another trust domain, subject to its media type,              its client binding and its scope as a ceiling; no route is mounted and every              ordinary jwt-bearer refusal still applies; the wire shape may change between              releases"
+            "experimental identity chaining / ID-JAG receiving side armed (issue #133, \
+             draft-ietf-oauth-identity-chaining-16 + \
+             draft-ietf-oauth-identity-assertion-authz-grant-04): the jwt-bearer grant now \
+             ADMITS an identity assertion from another trust domain, subject to its media \
+             type, a CONFIDENTIAL presenting client, its client binding and its scope as a \
+             ceiling; no route is mounted and every ordinary jwt-bearer refusal still \
+             applies; the wire shape may change between releases"
         );
     }
     Some(OidcPlane {
@@ -6507,16 +6515,26 @@ mod tests {
             "off in a default deployment"
         );
 
-        // The acknowledgment is written out LITERALLY rather than interpolated from
-        // `IDENTITY_CHAINING_VERSION`. Interpolating it would make this assertion true for
-        // whatever the constant happens to say, including a silently bumped revision -- and the
-        // whole point of an acknowledgment is that the operator typed that exact string. The
-        // constant is pinned against these same two revisions in the module's own suite.
+        // TWO assertions, because "armed" is two facts and `identity_chaining_armed` answers
+        // only one of them. `is_enabled` reads the toggle and NOTHING else; the acknowledgment
+        // is enforced by `validate`, which fails the BOOT. Asserting only the arming left the
+        // ack string in this TOML decorative -- replacing it with nonsense kept the test green,
+        // which a mutation confirmed. The pair below is what jointly means "acknowledged at its
+        // pinned revision, and armed".
+        //
+        // The ack is written LITERALLY rather than interpolated from
+        // `IDENTITY_CHAINING_VERSION`: interpolating it would make this true for whatever the
+        // constant happens to say, including a silently bumped revision, and the whole point of
+        // an acknowledgment is that the operator typed that exact string.
         let armed = config(
             "[admin]\nbootstrap_operator_token = \"t\"\n\
              [features]\n\
              identity-chaining = { enabled = true, ack = \
              \"draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04\" }\n",
+        );
+        assert!(
+            features.validate(&armed).is_ok(),
+            "this exact acknowledgment string is the one the ladder accepts"
         );
         assert!(
             identity_chaining_armed(&features, &armed),

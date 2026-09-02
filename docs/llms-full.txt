@@ -639,6 +639,7 @@ enabled even when absent from `[features]`, and can be turned off with
 | `fedcm` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | IdP-side FedCM (W3C Federated Credential Management): the origin-level /.well-known/web-identity, the config file, the accounts endpoint, and the id-assertion endpoint, plus Login Status headers. EXPLORATORY: browser support is Chrome only (Firefox paused, Safari absent) and the spec is a moving W3C draft. Redirect flows are UNAFFECTED. Graduates only on Firefox shipping or real embedding demand. |
 | `first-party-challenge` | experimental | no | draft-ietf-oauth-first-party-apps-03 | crates/ironauth-oidc/CHANGELOG.md | OAuth 2.0 Authorization Challenge Endpoint (issue #93, draft-ietf-oauth-first-party-apps): a browserless first-party native login surface. A first-party native client POSTs credentials, the endpoint drives the login flow to completion in one request and mints an authorization code the ordinary token endpoint redeems (no redirect_uri). EXPLORATORY: the draft was in WG Last Call at implementation time and the wire shape may break between releases. |
 | `global-token-revocation` | experimental | no | draft-parecki-oauth-global-token-revocation-01 | crates/ironauth-oidc/CHANGELOG.md | Global Token Revocation receiver (Okta Universal Logout shape, draft-parecki-oauth-global-token-revocation): a strongly-authenticated, subject-scoped revoke-everything endpoint. EXPERIMENTAL: the draft is not yet WG-adopted and the wire shape may break between releases. |
+| `identity-chaining` | experimental | no | draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04 | crates/ironauth-oidc/CHANGELOG.md | Identity chaining and ID-JAG, the RECEIVING side (issue #133): this deployment ACCEPTS an identity assertion minted in another trust domain and presented as an RFC 7523 authorization grant, so a user who signed in there reaches an API here without either domain trusting the other's access tokens. Layered ON the jwt-bearer grant, adding four checks and removing none: the ID-JAG media type, a CONFIDENTIAL presenting client, the assertion naming that client, and the assertion's scope as a ceiling. PROTOTYPE: two IETF drafts, the REQUESTING side is not built, `jti` stays optional as RFC 7523 has it, the flag is process-global rather than per (tenant, environment), and trust is per ISSUER rather than per (issuer, domain) -- so an issuer registered for workload federation can present identity assertions once this is on, which is the sharpest edge here. |
 | `org-scoped-clients` | experimental | no | 0.1.0-exp.1 | crates/ironauth-store/CHANGELOG.md | Organization-owned OAuth clients (issue #103): a client whose owner is an organization rather than the environment, managed through that organization's surface. EXPLORATORY: this is a schema-forward bet on a capability the ecosystem tracks as open everywhere and nobody ships, and the ownership model may change between releases. |
 | `risk-signals` | experimental | no | 0.1.0-exp.1 | crates/ironauth-oidc/CHANGELOG.md | Third-party risk-signal ingestion (issue #82): a signed Security Event Token (JWS) authenticated ingestion endpoint verified per-source through the hardened JOSE core, plus the #79 risk-engine path that folds a subject's fresh external signals in as WEIGHTED policy inputs that structurally can never be a verdict. EXPLORATORY: the ingestion wire contract and the CAEP/SSF alignment are early and may break between releases. |
 | `sample-experimental` | experimental | no | 0.1.0-exp.1 | crates/ironauth-config/CHANGELOG.md | Sample experimental flag exercising the acknowledgment gate; gates no behavior. |
@@ -7590,7 +7591,7 @@ an environment they cannot legitimately reach.
 | Tampering | A `PUT` whose body would be refused on its own merits used to probe a client the caller cannot address | The client is resolved as a client of THIS environment BEFORE the body is parsed at all, so a malformed body, a body omitting the required field, and a body carrying an unmatchable entry all answer on the ADDRESS. Asserted byte for byte against the never-registered reference |
 | Tampering | A write that matches no row reported as a success | `rows_affected() == 0` is converted to `NotFound` in the store. With the scope predicates gone, forced row-level security makes the statement match zero rows and report success, so this check is the write path's last line of defence. Pinned directly by a test that addresses a well-formed id of the caller's own scope naming no row |
 | Information disclosure | The endpoints used to enumerate a sibling environment's clients one id at a time | Uniform not-found across every shape: absent, another environment's (a client that genuinely EXISTS there, so the probe is not passing because nothing was found), malformed, and carrying another resource type's prefix. Asserted BYTE for byte against the never-registered reference, on BOTH verbs. The store-level fence is additionally covered by a registered cross-scope IDOR probe pair (`client_scope_policies.get` and `client_scope_policies.set`) with planted foreign victims in both a foreign tenant and a foreign environment |
-| Information disclosure | The TOKEN ENDPOINT used to enumerate a client's allowlist with no credential at all | The jwt-bearer grant is the exposed one and it is fenced by the WIRE ANSWER. That grant deliberately permits a PUBLIC (`none`) presenting client, because the assertion is the authorization grant, and it runs the scope check BEFORE the assertion is touched so an out-of-policy request cannot spend a single-use `jti`. Together those put a caller holding NO credential and a garbage assertion at the allowlist check. An `invalid_scope` refusal there would separate an allowlisted scope from a non-allowlisted one one request at a time, and unlike the two-valued answer that predates this column, what it reads out is PER-CLIENT, OPERATOR-WRITTEN configuration. So an allowlist refusal on that grant returns this grant's uniform `invalid_grant` and records `scope_not_allowlisted` out of band through the same diagnostics channel every other jwt-bearer failure uses: the operator learns exactly what happened, the caller learns nothing. Proved as a DIFFERENTIAL, not asserted: the same garbage assertion with an allowlisted and a non-allowlisted scope must answer byte for byte alike in status, body, AND headers, while the diagnostics prove the server took two different paths. The FLOOR keeps its spec-exact `invalid_scope`, deliberately and as the one exception, because `DISALLOWED_M2M_SCOPES` is a public compile-time constant identical for every client and every deployment. `client_credentials` is not exposed at all and is unchanged: RFC 6749 4.4 requires client authentication, so the only reader of that grant's `invalid_scope` is the client whose allowlist it is |
+| Information disclosure | The TOKEN ENDPOINT used to enumerate a client's allowlist with no credential at all | The jwt-bearer grant is the exposed one and it is fenced by the WIRE ANSWER. That grant deliberately permits a PUBLIC (`none`) presenting client, because the assertion is the authorization grant, and it runs the scope check BEFORE the assertion is touched so an out-of-policy request cannot spend a single-use `jti`. (The identity-chaining prototype, issue #133, judges a SECOND scope -- the assertion's own ceiling -- after verification, so an out-of-policy ceiling does spend the `jti`; that path needs the flag armed, a verified assertion from a registered issuer AND a confidential presenting client, so the unauthenticated caller this row is about never reaches it.) Together those put a caller holding NO credential and a garbage assertion at the allowlist check. An `invalid_scope` refusal there would separate an allowlisted scope from a non-allowlisted one one request at a time, and unlike the two-valued answer that predates this column, what it reads out is PER-CLIENT, OPERATOR-WRITTEN configuration. So an allowlist refusal on that grant returns this grant's uniform `invalid_grant` and records `scope_not_allowlisted` out of band through the same diagnostics channel every other jwt-bearer failure uses: the operator learns exactly what happened, the caller learns nothing. Proved as a DIFFERENTIAL, not asserted: the same garbage assertion with an allowlisted and a non-allowlisted scope must answer byte for byte alike in status, body, AND headers, while the diagnostics prove the server took two different paths. The FLOOR keeps its spec-exact `invalid_scope`, deliberately and as the one exception, because `DISALLOWED_M2M_SCOPES` is a public compile-time constant identical for every client and every deployment. `client_credentials` is not exposed at all and is unchanged: RFC 6749 4.4 requires client authentication, so the only reader of that grant's `invalid_scope` is the client whose allowlist it is |
 | Information disclosure | THREE addressing failures here where most surfaces have four | Recorded rather than papered over: `clients` carries no `deleted_at`, so there is no soft-deleted state to make uniform. A deleted client is simply absent and reads exactly like one never registered |
 | Repudiation | An unattributed change to what a machine client may request | A distinct audit action, `client.allowed_scopes.set`, written in the same transaction as the column change through the store's audited-write primitive. One action for the set and the clear alike, because ADR 0002 makes the stored column binding and a separate `clear` action would invite reconstructing the state by folding the audit stream. Asserted as a multiset, and a REFUSED write (the 42501, the 404, the sudo challenge) is asserted to write none |
 | Denial of service | An unbounded allowlist stored on a client | Uncapped, matching `allowed_resources`, which has never had a cap either. What bounds it is the management API's request body size limit. A large allowlist costs a linear membership scan per requested scope token on the machine-grant path, over a set an OPERATOR wrote, so it is a self-inflicted cost with no cross-tenant reach |
@@ -8973,6 +8974,117 @@ authorization surface rather than adding a dark one.
 - **The AARP direction is not started.** The Access Request and Approval Profile is the other half
   of the agent story the issue names, and the vault's approval flow (issue #132) is where it would
   compose.
+
+---
+
+# Identity chaining and ID-JAG, the receiving side (PROTOTYPE)
+
+Source: docs/experimental/identity-chaining.md
+
+# Identity chaining and ID-JAG, the receiving side (PROTOTYPE)
+
+**Drafts:** `draft-ietf-oauth-identity-chaining-16`, `draft-ietf-oauth-identity-assertion-authz-grant-04`
+**Feature flag:** `identity-chaining`, EXPERIMENTAL
+**Acknowledgment version:** `draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04`
+**Status:** prototype, and the **receiving** half only. This deployment accepts an identity assertion minted elsewhere. It does not yet request one.
+
+## The problem it exists for
+
+A person signs in to domain A. They then need to reach an API in domain B, and B does not trust A's access tokens -- nor should it, because an access token is a bearer credential minted for A's own resources with A's own lifetime and A's own revocation.
+
+The alternatives are all worse:
+
+| approach | what it costs |
+|---|---|
+| B trusts A's access tokens | B accepts a credential minted for someone else's resources, revoked on someone else's schedule |
+| the user signs in again at B | a second identity for the same person, and a second thing to deprovision |
+| a shared service account | the person disappears; every audit row in B says "the integration" |
+
+Identity chaining splits it in two. A mints an **identity assertion** naming the user and the client that will present it; B accepts that assertion as an RFC 7523 authorization grant and mints its **own** token, under its **own** local identity, with its own lifetime and its own revocation. Neither domain trusts the other's tokens; B trusts A's *assertions about who signed in*, which is a far smaller thing.
+
+## How it is built: layered ON the jwt-bearer grant, not beside it
+
+An ID-JAG **is** an RFC 7523 assertion grant. So this is not a new door. It is three extra checks inside the door that already exists, and they run **last** -- after every ordinary control:
+
+1. the issuer is registered and enabled,
+2. the signature verifies against that issuer's keys,
+3. the audience is this deployment,
+4. `sub` and `exp` are present and `exp` is in the future,
+5. the `jti`, if present, has not been seen,
+6. the subject has a **registered** mapping to a local principal (nothing is auto-provisioned),
+7. the mapped principal passes its lifecycle fence,
+8. the requested scope passes the machine-grant floor and the presenting client's allowlist.
+
+**Then** the three ID-JAG checks. They add refusals and remove none, which is the whole reason for building it this way: a prototype that sat beside the grant would have had to re-implement all eight, and the one it forgot would be the hole.
+
+## The four checks
+
+| check | without it |
+|---|---|
+| the header `typ` is `oauth-id-jag+jwt` | an issuer registered to federate a CI workload could present an assertion that speaks for a **person** |
+| the presenting client is **confidential** | see below: the binding beneath it costs an interceptor nothing |
+| `client_id` names the presenting client | the assertion is a bearer token for whoever intercepts it |
+| `scope` is present, and bounds what is issued | a **local** subject mapping could widen what the **authoritative** domain granted |
+
+### Why the presenting client must be confidential
+
+This grant permits a **public** presenting client deliberately: the assertion is the authorization grant, so a workload trading one needs no client credential of its own. That is correct for a workload assertion and wrong for an identity assertion, and the difference is what the client binding is for.
+
+For a public client, "authenticating as `cli_x`" is **typing `cli_x` into the form**. An interceptor reads the bound client id off the stolen assertion and sends it. The binding is satisfied for free, and the assertion is exactly the bearer token the binding exists to stop it being.
+
+So an identity assertion requires a presenter that **proved** it is the named client. The ordinary jwt-bearer path is untouched: a public client still trades a plain bearer assertion, because there nothing claims to bind one.
+
+The media type is compared with the optional and case-insensitive `application/` prefix, the same comparison the attestation prototype performs, for the same reason: `TokenTyp` names only profiles IronAuth mints and this one is a foreign party's.
+
+An assertion carrying **no** `scope` is refused rather than treated as "everything the mapping allows". That default is the widening the last check exists to stop.
+
+Each refusal records its **own** reason in the client-authentication diagnostics sink, while the wire answer stays the one uniform `invalid_grant` every assertion failure gives. An operator has to be able to separate an assertion minted for a different client, which is an interception and the only one of these worth paging on, from an issuer that forgot to set `scope`. A caller must not.
+
+## The assertion's scope is a ceiling, never a second way in
+
+`scope` on the assertion says what the authoritative domain authorized. The presenting client's request, when it makes one, is intersected with it, and a request naming anything outside it is **refused** rather than quietly narrowed -- a client told it holds `admin` when it holds `read:orders` will act on the wrong belief.
+
+When the client requests nothing, the assertion's scope becomes the granted scope, and **it is then validated exactly as a plainly requested scope is**: through the same function, against the same machine-grant floor and the same per-client allowlist, answering the same errors. That string was written by a foreign issuer, and without this an identity assertion would be a way to obtain scopes the very same client is refused when it asks plainly.
+
+The one visible difference from a plainly requested scope is ordering. The ceiling is not known until the assertion is verified, so this check runs **after** the single-use `jti` is spent, and an out-of-policy assertion costs its `jti`. That is the right way round: the scope here is the foreign issuer's claim, not a string the caller varies per request, so the probing attack that the ordinary ordering prevents does not apply.
+
+## With the flag off
+
+An assertion carrying the ID-JAG media type is treated **exactly as it is on main today**: an ordinary bearer assertion from a trusted issuer. `typ` is not a separator the ordinary path reads, so none of the three checks apply and none of the three refusals fire.
+
+That is stated plainly because it is the sharp edge, not a footnote. It is also why the flag exists: the three checks are the entire difference between an identity assertion and a bearer one, and an operator has to opt into them.
+
+## Turning it on
+
+```toml
+[features]
+identity-chaining = { enabled = true, ack = "draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04" }
+```
+
+One flag, unlike the transaction-token prototype next door, which also needs a trust domain. But **it is not true that there is nothing to configure**, and the two things to set are the ones that bound what a foreign issuer can cause this deployment to mint:
+
+1. **The presenting client must be confidential.** A public client cannot present an identity assertion at all, so the app that will do this needs a real `token_endpoint_auth_method`.
+2. **Set that client's scope allowlist.** With no allowlist row a client may hold any scope outside the machine-grant floor, so an assertion authorizing `admin:all` mints a token carrying `admin:all`. That is not an escalation over what the client could already obtain by asking plainly, but it does move the choice of scope from your client to the remote issuer, and the allowlist is what takes it back.
+
+The trust in the issuer itself is already expressed by the registered external issuer and the registered subject mapping this grant has always required.
+
+The acknowledgment pins **both** drafts, so either one moving invalidates every acknowledgment in the wild and a routine upgrade refuses to boot for a deployment that enabled this. That is the flag working.
+
+Nothing is mounted and nothing is advertised. The only visible sign that it is armed is a startup log line, which is why that line exists.
+
+## Deviations from the drafts, stated
+
+- **The receiving side only.** The requesting half -- this deployment exchanging its own token at a *foreign* authorization server to obtain an assertion -- is not built. A full chain needs both halves and this is one.
+- **`jti` stays optional**, as RFC 7523 has it and as this grant has always had it. The ID-JAG draft leans on `jti` for single use; an assertion presented without one gets no replay protection here. Requiring it on identity assertions specifically would be a defensible tightening and is deliberately not done in a prototype, because it changes what a conformant issuer may send.
+- **No `authorization_details`.** The draft carries RFC 9396 authorization details alongside `scope`; only `scope` is read.
+
+## What a graduation still needs
+
+- **Trust is per ISSUER, not per (issuer, trust domain).** This is the sharpest edge here. An external issuer registered for **workload** federation can, once the flag is on, present identity assertions that speak for people -- because the registration says "we trust this issuer" and nothing narrows that to a purpose. A graduation needs the registration to say which of the two an issuer may do.
+- **No `sub_id`.** RFC 9493 structured subject identifiers are not read; the plain `sub` is matched against the registered mapping, which is what the ordinary grant has always done.
+- **The requesting side.** See above.
+- **No per-assertion audit distinction on the SUCCESS path.** A token minted from an identity assertion and one minted from an ordinary assertion produce the same audit shape, so an operator reading the log cannot tell which came through this path. The refusals are distinguished (each records its own diagnostic reason); the mints are not.
+- **The flag is process-global, not per (tenant, environment).** Every other experimental surface here is resolved the same way, but it matters more for this one: arming it changes what an already-live grant accepts for every tenant this process serves, rather than mounting a route that only its own callers reach.
 
 ---
 

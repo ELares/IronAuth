@@ -114,13 +114,6 @@ pub const ATTESTATION_HEADER: &str = "OAuth-Client-Attestation";
 /// The header carrying the client instance's proof of possession.
 pub const ATTESTATION_POP_HEADER: &str = "OAuth-Client-Attestation-PoP";
 
-/// The optional `application/` prefix a media type may carry.
-///
-/// Named rather than a literal `12` at the strip site: `ironauth_jose` compares the same prefix
-/// through its own private constant, and a hardcoded length in a hand-rolled copy that has
-/// already drifted once from that comparison is the drift's next opportunity.
-const APPLICATION_PREFIX: &str = "application/";
-
 /// The media type of the client attestation JWT.
 pub const ATTESTATION_TYP: &str = "oauth-client-attestation+jwt";
 
@@ -328,7 +321,7 @@ pub fn authenticate_attested_client(
 
     let attestation = verify(attestation, &attestation_policy, clock)
         .map_err(|_| AttestationRejection::AttestationInvalid)?;
-    if !media_type_is(attestation.token_typ(), ATTESTATION_TYP) {
+    if !ironauth_jose::foreign_media_type_is(attestation.token_typ(), ATTESTATION_TYP) {
         return Err(AttestationRejection::TypMismatch);
     }
 
@@ -361,7 +354,7 @@ pub fn authenticate_attested_client(
 
     let proof =
         verify(proof, &proof_policy, clock).map_err(|_| AttestationRejection::ProofInvalid)?;
-    if !media_type_is(proof.token_typ(), ATTESTATION_POP_TYP) {
+    if !ironauth_jose::foreign_media_type_is(proof.token_typ(), ATTESTATION_POP_TYP) {
         return Err(AttestationRejection::TypMismatch);
     }
     // The policy already matched `iss` exactly against the attested client, so this
@@ -417,29 +410,6 @@ fn attestation_algorithms() -> Vec<JwsAlgorithm> {
         JwsAlgorithm::Rs256,
         JwsAlgorithm::Ps256,
     ]
-}
-
-/// Whether a verified header's `typ` names `expected`.
-///
-/// Case-insensitive with an optional `application/` prefix, per RFC 7515 section 4.1.9
-/// and RFC 2045 section 5.1, matching how [`ironauth_jose::TokenTyp`] compares its own.
-/// An ABSENT `typ` never matches: the draft requires both media types explicitly, so
-/// its absence is a token that did not come from a conforming minter.
-fn media_type_is(header_typ: Option<&str>, expected: &str) -> bool {
-    // The `application/` prefix is OPTIONAL and case-insensitive, which is what
-    // `ironauth_jose::TokenTyp::matches` does with `eq_ignore_ascii_case`. The first version
-    // stripped two literal spellings, `application/` and `APPLICATION/`, so a conforming
-    // attester sending `Application/oauth-client-attestation+jwt` was refused -- fail-closed,
-    // and still a second hand-rolled copy of a vetted comparison that had already drifted from
-    // it in the doc comment claiming parity.
-    let Some(candidate) = header_typ else {
-        return false;
-    };
-    let stripped = candidate
-        .get(..APPLICATION_PREFIX.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(APPLICATION_PREFIX))
-        .map_or(candidate, |_| &candidate[APPLICATION_PREFIX.len()..]);
-    stripped.eq_ignore_ascii_case(expected)
 }
 
 /// The `iss` of an UNVERIFIED compact JWS, for attester SELECTION only.

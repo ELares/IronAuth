@@ -189,7 +189,7 @@ pub use mint::{
 };
 pub use policy::{
     ExpectedTyp, JwsAlgorithm, KeyError, KeyFamily, PolicyError, TokenTyp, TrustedKey,
-    VerificationCaps, VerificationPolicy,
+    VerificationCaps, VerificationPolicy, foreign_media_type_is,
 };
 pub use redact::{Redacted, wipe};
 pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key};

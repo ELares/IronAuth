@@ -12275,13 +12275,39 @@ pub enum ClientAuthDiagnosticReason {
     /// names no registered subject-mapping rule (or the rule's optional claim gate
     /// did not match): the subject is rejected, never auto-provisioned (issue #26).
     AssertionSubjectUnmapped,
+    /// An ID-JAG identity assertion was presented by a PUBLIC client (issue #133).
+    ///
+    /// The assertion names the client it was minted for, and that binding is what stops an
+    /// intercepted assertion being spendable. For a `none` client, authenticating as
+    /// `cli_x` is typing `cli_x` into the form, so the binding costs an interceptor nothing
+    /// and the assertion is a bearer token again. The ordinary jwt-bearer grant permits a
+    /// public presenting client on purpose (the assertion IS the authorization grant); an
+    /// identity assertion cannot, because it speaks for a person.
+    IdentityAssertionPresenterPublic,
+    /// An ID-JAG identity assertion named a different client than the one presenting it
+    /// (issue #133).
+    ///
+    /// Recorded distinctly because this is the only one of these an operator should be
+    /// paged on: an assertion minted for another client reaching this endpoint is an
+    /// interception, not a misconfiguration.
+    IdentityAssertionClientMismatch,
+    /// An ID-JAG identity assertion carried no `scope` (issue #133), so it authorized
+    /// nothing and there was no ceiling to issue against. A misconfigured issuer.
+    IdentityAssertionNoScope,
+    /// An ID-JAG identity assertion was presented with a requested `scope` reaching
+    /// outside what the assertion authorized (issue #133). The local client asked for more
+    /// than the authoritative domain granted.
+    IdentityAssertionScopeExceeded,
     /// A JWT bearer assertion grant request named a `scope` outside the PRESENTING
     /// client's configured per-client allowlist (issue #98).
     ///
     /// This one exists so the wire can stay uniform. That grant permits a PUBLIC
     /// presenting client and runs the scope check before the assertion is touched,
     /// so an `invalid_scope` answer would let an unauthenticated caller enumerate
-    /// operator-written configuration one scope token at a time. The refusal is the
+    /// operator-written configuration one scope token at a time. (The identity-chaining
+    /// prototype, issue #133, records this reason from a second, LATER check as well;
+    /// that one is reachable only by a confidential client presenting a verified
+    /// assertion, so it is not an unauthenticated oracle.) The refusal is the
     /// uniform `invalid_grant` and the specific reason lands HERE instead. The
     /// `client_credentials` grant records nothing like this and does not need to:
     /// it answers `invalid_scope` only after the client has authenticated as the
@@ -12368,6 +12394,16 @@ impl ClientAuthDiagnosticReason {
             }
             ClientAuthDiagnosticReason::AssertionIssuerUntrusted => "assertion_issuer_untrusted",
             ClientAuthDiagnosticReason::AssertionSubjectUnmapped => "assertion_subject_unmapped",
+            ClientAuthDiagnosticReason::IdentityAssertionPresenterPublic => {
+                "identity_assertion_presenter_public"
+            }
+            ClientAuthDiagnosticReason::IdentityAssertionClientMismatch => {
+                "identity_assertion_client_mismatch"
+            }
+            ClientAuthDiagnosticReason::IdentityAssertionNoScope => "identity_assertion_no_scope",
+            ClientAuthDiagnosticReason::IdentityAssertionScopeExceeded => {
+                "identity_assertion_scope_exceeded"
+            }
             ClientAuthDiagnosticReason::ScopeNotAllowlisted => "scope_not_allowlisted",
             ClientAuthDiagnosticReason::PrincipalNotAuthenticatable => {
                 "principal_not_authenticatable"
