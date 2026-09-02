@@ -5484,10 +5484,21 @@ async fn org_groups_carries_its_isolation_indexes_and_least_privilege_grants() {
         ("metadata", true),
         ("updated_at", true),
         ("deleted_at", true),
-        // THE TWO THAT ARE NOT GRANTED, and the reason this block still has teeth. `slug` is
-        // the stable name a token claim carries, so a data plane that could move it could
-        // move what a claim means. `parent_id` decides ancestry, and a data plane that could
-        // reparent a group could graft it under a role-bearing ancestor and inherit its roles.
+        // THE TWO THAT ARE NOT GRANTED. `slug` is the stable name a token claim carries, so a
+        // data plane that could move it could move what a claim means -- and that one is
+        // complete, because `slug` is absent from the INSERT statement's own concerns only in
+        // the sense that a new group's slug is the caller's to choose, which it always was.
+        //
+        // `parent_id` is NARROWER THAN IT LOOKS, and saying so is the point. Withholding
+        // UPDATE on it stops a group being REPARENTED in place. It does not stop the same
+        // outcome being reached by creation: 0185 grants `INSERT ON org_groups` table-wide,
+        // the shared INSERT names `parent_id`, and the effective-role closure walks upward, so
+        // the data-plane role could create a group under a role-bearing parent and bind a
+        // membership to it. Nothing on that plane does -- the SCIM handler always passes
+        // `parent_id: None` -- but that is a HANDLER invariant, and this block is about what
+        // the ROLE can point at. A reviewer measured the gap; it is recorded here rather than
+        // closed, because narrowing 0185's INSERT is a change to a shipped migration's intent
+        // and belongs with the SCIM group-push work that owns it.
         ("slug", false),
         ("parent_id", false),
     ] {
@@ -5897,22 +5908,32 @@ async fn the_org_join_tables_carry_their_isolation_indexes_and_least_privilege_g
             role_has_table_privilege(pool, "ironauth_app", table, "SELECT").await,
             "the data-plane role must hold SELECT on {table} (the resolution read)"
         );
-        // It never CREATES or REPOINTS a row on any of them, in any grant shape. The
-        // table-wide probe cannot see a COLUMN-scoped grant, which is a real way for
-        // the data plane to gain a write while every table-wide assertion stays
-        // green, so every column is swept too.
         // It REPOINTS a row on none of them, and CREATES one on exactly the table SCIM group
         // push binds through. Migration 0185 granted `org_group_members` INSERT for that
         // surface, which is mounted on the PUBLIC plane, so this loop's blanket "no INSERT on
-        // any of the three" was false the day it shipped and was RED on main. It is asserted
-        // per table now, in both directions, so a fourth table quietly gaining INSERT still
-        // fails here.
+        // any of the three" was false the day it shipped and was RED on main.
+        //
+        // Asserted per table now, in both directions, and in BOTH GRANT SHAPES. The
+        // table-wide probe cannot see a column-scoped grant, and a review measured that:
+        // `GRANT INSERT (id, tenant_id, environment_id, organization_id, group_id, role_id)
+        // ON org_group_roles` left this test green while handing the data plane the ability to
+        // grant roles. The column sweep below is what catches it.
+        //
+        // NOT a claim about a FOURTH table: this loop iterates a hand-written list of three,
+        // so a table added later is not examined here at all. `the_narrowed_tables_...` and
+        // `the_remaining_tables_...` are where a new table's grants get written down.
         let data_plane_may_bind = table == "org_group_members";
         assert_eq!(
             role_has_table_privilege(pool, "ironauth_app", table, "INSERT").await,
             data_plane_may_bind,
             "the data plane's INSERT on {table} must be present exactly when a public-plane \
              surface creates a row in it"
+        );
+        assert_eq!(
+            role_has_any_column_privilege(pool, "ironauth_app", table, "INSERT").await,
+            data_plane_may_bind,
+            "the data plane's COLUMN-scoped INSERT on {table} must agree with the table-wide \
+             answer; a column-scoped grant is invisible to the probe above"
         );
         assert!(
             !role_has_table_privilege(pool, "ironauth_app", table, "REFERENCES").await,
@@ -8223,6 +8244,79 @@ async fn the_remaining_tables_grant_the_data_plane_only_their_mutable_columns() 
             .await;
         assert_permission_denied(result, &format!("{table}.{column}"));
     }
+}
+
+/// The three tables migration 0186 narrowed grant the data plane EXACTLY the columns their
+/// writers name, enumerated from the catalog rather than probed one at a time.
+///
+/// A review measured why this has to be an exact set.
+/// `the_data_plane_holds_no_table_wide_update_on_any_table` reads
+/// `information_schema.table_privileges`, so it is blind to the
+/// COLUMN-scoped form by construction -- and the column-scoped form is the likelier regression,
+/// because it is the form 0186 itself uses. Three separate widenings, each granting exactly a
+/// capability 0186's header says in prose that it withholds, left all four store suites green:
+///
+/// ```sql
+///   GRANT UPDATE (decided_by) ON agent_vault_approvals
+///   GRANT UPDATE (refresh_token_endpoint, refresh_client_id, refresh_client_secret_sealed,
+///                 refresh_client_secret_dek_version) ON agent_vault_connections
+///   GRANT UPDATE (session_id, subject, granted_scope) ON native_sso_device_secrets
+/// ```
+///
+/// A prose withholding nothing checks is a sentence. `writable_columns` is what makes it a
+/// property, and its own doc names this defect: a hand-written list of columns NOT to be
+/// writable stops covering a column the table gains later, and is easy to write so that it
+/// omits the ones that matter.
+#[tokio::test]
+async fn the_narrowed_tables_grant_the_data_plane_exactly_their_writers_columns() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+    for (table, expected) in [
+        // `refresh_stored_credential` names all eight; `mark_failed` names three of them.
+        // Absent: the row's identity, and the whole refresh CONFIGURATION -- the downstream
+        // OAuth client and its sealed secret, which a data plane that could repoint could use
+        // to redirect a refresh to a server it chose.
+        (
+            "agent_vault_connections",
+            vec![
+                "state",
+                "last_error",
+                "expires_at",
+                "updated_at",
+                "access_token_sealed",
+                "access_token_dek_version",
+                "refresh_token_sealed",
+                "refresh_token_dek_version",
+            ],
+        ),
+        // `retire_timed_out` names both; `consume` names `state`. Absent: `decided_by` and
+        // `approved_details`, which belong to the control-plane decide.
+        ("agent_vault_approvals", vec!["state", "decided_at"]),
+        // `revoke_session_set` names one column; `mint` is an INSERT and `redeem` a SELECT.
+        ("native_sso_device_secrets", vec!["revoked_at"]),
+    ] {
+        let mut writable = writable_columns(pool, "ironauth_app", table).await;
+        writable.sort();
+        let mut expected: Vec<String> = expected.into_iter().map(str::to_owned).collect();
+        expected.sort();
+        assert_eq!(
+            writable, expected,
+            "the data plane's UPDATE on {table} must be exactly the columns its own statements \
+             name. Anything extra is a capability nothing exercises, which is the shape the \
+             issue #31 lesson is about; anything missing fails at RUNTIME with 42501."
+        );
+    }
+
+    // The CONTROL, and it is the one this whole file's helper doc warns about: an empty sweep
+    // would satisfy every assertion above. The control plane holds a WIDER set on the same
+    // tables, so the helper is answering rather than returning nothing.
+    assert!(
+        writable_columns(pool, "ironauth_control", "agent_vault_approvals")
+            .await
+            .contains(&"decided_by".to_owned()),
+        "the column sweep reports a real answer: the CONTROL plane holds the decided_by \
+         write the data plane is denied above"
+    );
 }
 
 #[tokio::test]

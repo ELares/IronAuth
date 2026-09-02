@@ -901,11 +901,24 @@ fn with_provider_at(harness: &mut Harness, provider: &Provider, addr: std::net::
 /// Directly, because there is no route that does it: a timeout is the absence of a decision,
 /// so the only way to reach the timed-out state is for time to pass.
 async fn expire_approval(harness: &Harness, approval: &str) {
+    // AGED AGAINST THE HARNESS CLOCK, not the database's `now()`, and the difference is not
+    // cosmetic: this harness runs on a clock pinned at the UNIX epoch, so `now() - 1 minute`
+    // wrote a deadline fifty-six years in the FUTURE as the code reads it. The row stayed live
+    // and pending, the caller took the `pending_response` arm, and the test failed asserting
+    // the second approval id differed from the first -- while the retire path it exists to
+    // drive was never entered at all. Measured: `expires_at=1788390133692354`,
+    // `harness_now=0`.
+    //
+    // `seed_expired_refreshable` already does it this way (`now - 3_600_000_000`). Two clocks
+    // in one fixture is the defect; there is one now.
+    let deadline = now_micros(harness) - 60_000_000;
     sqlx::query(
         "UPDATE agent_vault_approvals /* query-audit-allow: owner test write */ \
-         SET expires_at = now() - interval '1 minute' WHERE id = $1",
+         SET expires_at = TIMESTAMPTZ 'epoch' + ($2::text || ' microseconds')::interval \
+         WHERE id = $1",
     )
     .bind(approval)
+    .bind(deadline)
     .execute(harness.db().owner_pool())
     .await
     .expect("age the approval");
@@ -930,16 +943,23 @@ async fn organization_of(harness: &Harness, agent: &AgentPrincipalId) -> Organiz
 /// `active` and clears `last_error`: re-storing to make a credential expire would also undo
 /// whatever the test was about to observe.
 async fn expire_connection(harness: &Harness, agent: &AgentPrincipalId, provider: &str) {
+    // The HARNESS clock, for the reason `expire_approval` gives. Against the database's
+    // `now()` this wrote an expiry decades ahead of the clock the refresh path reads, so the
+    // credential was never stale, no refresh was attempted, and
+    // `a_provider_that_cannot_be_reached_leaves_the_connection_usable` answered 200 with the
+    // token from its own control pass instead of dialling the dead provider at all.
     let scope = harness.scope();
+    let expired = now_micros(harness) - 3_600_000_000;
     sqlx::query(
         "UPDATE agent_vault_connections /* query-audit-allow: owner test write */ \
-         SET expires_at = now() - interval '1 hour' \
+         SET expires_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
          WHERE tenant_id = $1 AND environment_id = $2 AND agent_id = $3 AND provider = $4",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind(agent.to_string())
     .bind(provider)
+    .bind(expired)
     .execute(harness.db().owner_pool())
     .await
     .expect("age the stored credential");
@@ -1058,7 +1078,10 @@ async fn a_provider_that_omits_a_rotated_refresh_token_keeps_the_stored_one() {
         .control_store()
         .scoped(harness.scope())
         .agent_vault()
-        .connection(&agent, "google")
+        // `connection_with_refresh`, not `connection`. The plain reader deliberately does not
+        // open the refresh token -- its own doc says so -- so it answers `None` for that field
+        // whatever the row holds, and this assertion was unsatisfiable against it.
+        .connection_with_refresh(&agent, "google")
         .await
         .expect("read")
         .expect("the connection is still there");

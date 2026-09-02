@@ -57,13 +57,33 @@ GRANT UPDATE (
 -- 0181's RESTRICTIVE policy already bounds which rows it may touch and which states it may
 -- write; what it did not bound is which COLUMNS, and the two answers are independent.
 --
--- `decided_by` is deliberately ABSENT. It records WHO approved, and it is written only by the
--- control-plane decide. A data plane holding UPDATE on it could rewrite the approver of an
--- approval it is otherwise permitted to consume, which is the audit trail for a sensitive
--- action naming somebody who never made the decision. The policy cannot express that: its
--- WITH CHECK constrains state and decided_at and says nothing about decided_by.
+-- The union of the two data-plane statements and nothing else:
+--
+--   `retire_timed_out` (repository.rs)   SET state, decided_at
+--   `consume`          (repository.rs)   SET state
+--
+-- `decide_with_event` is the third statement against this table and it is CONTROL plane only --
+-- its one caller is `ironauth-admin`'s agent surface, through `management()`. Its SET list
+-- names `state, approved_details, decided_by, decided_at`, and an earlier draft of this grant
+-- took that list and hand-dropped `decided_by`, which is self-contradictory: if `decide` ran
+-- here, dropping a column it names would break it, and since it does not, `approved_details`
+-- had no business in the list either. A reviewer measured that removing it leaves every store
+-- suite green.
+--
+-- TWO COLUMNS ARE THEREFORE ABSENT, and both matter.
+--
+-- `decided_by` records WHO approved. A data plane holding UPDATE on it could rewrite the
+-- approver of an approval it is otherwise permitted to consume, so the audit trail for a
+-- sensitive action would name somebody who never made the decision.
+--
+-- `approved_details` records WHAT the approver agreed to, which may be narrower than what was
+-- requested. 0181's RESTRICTIVE policy does not protect it: its WITH CHECK reads
+-- `(approved_details IS NULL OR state = 'consumed')` and never compares against the OLD row, so
+-- on the approved -> consumed transition any value passes. 0181's own prose one screen above
+-- says the check keeps "the decision and the approved set unchanged"; the predicate does not
+-- say that, and the column grant is what actually holds it.
 REVOKE UPDATE ON agent_vault_approvals FROM ironauth_app;
-GRANT UPDATE (state, decided_at, approved_details) ON agent_vault_approvals TO ironauth_app;
+GRANT UPDATE (state, decided_at) ON agent_vault_approvals TO ironauth_app;
 
 -- ---------------------------------------------------------------------------------------
 -- native_sso_device_secrets (0182).

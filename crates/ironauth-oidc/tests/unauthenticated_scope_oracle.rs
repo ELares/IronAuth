@@ -182,6 +182,23 @@ fn cases() -> Vec<Case> {
         // anything up, so a live and a ghost scope must be one answer. Driving it with a
         // real client_id instead would measure the cross-scope refusal, which
         // `scoped_authorize.rs` owns, and would say nothing about the ghost case.
+        // The CIBA approval page (issue #128). DRIVEN rather than excluded, even though it is
+        // session gated like the account pages: it is cheap to drive, and an exclusion is a
+        // promise about a code path while a case is a measurement of the answer. It shipped
+        // neither, which is what
+        // `every_scope_routed_path_is_either_driven_or_excluded_with_a_reason` caught, and
+        // main was red on it.
+        //
+        // With no cookie, `resolve_session` answers None before any scope-dependent read, so a
+        // live scope and one that never existed must both be the sign-in notice.
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/backchannel",
+            query: "",
+            method: "GET",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::UNAUTHORIZED,
+        },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/authorize",
             query: "",
