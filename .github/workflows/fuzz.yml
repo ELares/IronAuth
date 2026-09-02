@@ -17,14 +17,19 @@ on:
   # nightly lane, and adding a second nightly compile detected nothing new. The gap was never
   # "nothing compiles these"; it was "nothing compiles these BEFORE a merge".
   #
-  # Path-filtered, because building eight detached crates with a sanitizer is not cheap and
-  # only these paths can break one.
+  # NOT path-filtered, and that is a deliberate reversal. The first version filtered on
+  # `fuzz/**` and `crates/*/fuzz/**`, which is the SAME two-shape enumeration this PR removed
+  # from the build loop one commit earlier -- a fuzz crate at any other path would not have
+  # started the workflow at all, so the `find` that was added to catch it would never run. A
+  # reviewer planted one at `tools/oddplace/fuzz` and confirmed the trigger missed it.
+  #
+  # The filter was also wrong about what can break a build: a crate's own `Cargo.toml`, the
+  # workspace manifest and `Cargo.lock` all can, and none were listed.
+  #
+  # And a filtered `paths:` cannot be a REQUIRED check: GitHub leaves it permanently pending
+  # on any PR that misses the filter, which blocks the merge instead of gating it. Running on
+  # every pull request costs one compile job and is the only shape that can actually gate.
   pull_request:
-    paths:
-      - "fuzz/**"
-      - "crates/*/fuzz/**"
-      - "crates/*/src/**"
-      - ".github/workflows/fuzz.yml"
   schedule:
     # Nightly, off-peak; arbitrary minute to avoid the top-of-hour herd.
     - cron: "27 4 * * *"
@@ -73,18 +78,31 @@ jobs:
           # `scripts/fuzz-matrix-freshness.sh` walks rather than enumerates for the same
           # reason, and says so.
           found=0
+          broken=""
           while IFS= read -r manifest; do
             crate_dir="$(dirname "$(dirname "$manifest")")"
             echo "::group::$crate_dir"
-            (cd "$crate_dir" && cargo fuzz build)
+            # EVERY crate is attempted. `set -e` would abort at the first failure and the log
+            # would name one offender while the rest stayed unknown, which is a poor report
+            # for a check whose whole job is to say which targets do not build.
+            if ! (cd "$crate_dir" && cargo fuzz build); then
+              broken="$broken $crate_dir"
+            fi
             echo "::endgroup::"
             found=$((found + 1))
           done < <(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
                           -not -path '*/target/*' | sort)
-          # A walk that found nothing would pass silently, which is the failure this job is
-          # supposed to be immune to.
-          if [ "$found" -lt 2 ]; then
-            echo "found only $found fuzz crates; the walk is wrong" >&2
+          # The floor is the count the freshness gate reports, not a token 2: a floor of 2
+          # tolerates the walk silently dropping six of the eight crates, which is most of the
+          # way back to finding nothing.
+          expected="$(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
+                            -not -path '*/target/*' | wc -l | tr -d ' ')"
+          if [ "$found" -ne "$expected" ] || [ "$found" -lt 8 ]; then
+            echo "walked $found fuzz crates, expected at least 8 (found $expected)" >&2
+            exit 1
+          fi
+          if [ -n "$broken" ]; then
+            echo "these fuzz crates do not build:$broken" >&2
             exit 1
           fi
           echo "built $found fuzz crates"
@@ -93,9 +111,14 @@ jobs:
     name: fuzz ${{ matrix.target }}
     # NOT on pull requests: eighteen targets at five minutes each is a nightly lane, not a
     # merge gate. `build` above is the part that gates.
-    if: github.event_name != 'pull_request'
-    # AFTER the build job, so eighteen targets do not each spend five minutes discovering
-    # that the tree does not compile.
+    #
+    # `!cancelled()` rather than a bare event check, because `needs: build` otherwise carries
+    # an implicit `success()`: one crate failing to build would skip ALL EIGHTEEN legs, so a
+    # single dead target would stop seventeen healthy parsers being fuzzed that night. That is
+    # a strictly worse version of the failure this PR exists to fix, and `fail-fast: false`
+    # below says the opposite is intended. The ordering is kept for the log; the suppression
+    # is not.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30

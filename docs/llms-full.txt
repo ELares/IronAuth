@@ -36,7 +36,9 @@ to pick an open issue in the current milestone and say so on the issue.
   first two sets differ in either direction; it is deliberately static, needing
   no nightly toolchain and no `cargo-fuzz` install, which means it cannot see the
   third. The `build` job in `fuzz.yml` covers that: it runs `cargo fuzz build`
-  over every fuzz crate on every pull request touching one.
+  over every fuzz crate, on every pull request. It is deliberately NOT path
+  filtered, because a filter is itself an enumeration of where a fuzz crate may
+  live, and that is the assumption both gaps below came from.
   Both checks exist because both gaps have shipped. Targets were registered and
   never listed (issue #419, seven of them); and a target was registered, listed,
   and had never compiled, so the parser it uniquely covered was reported as
