@@ -795,3 +795,12 @@ required-features = ["testing"]
 name = "audit_entry_path"
 path = "tests/audit_entry_path.rs"
 required-features = ["testing"]
+
+# The AuthZEN AGENT TOOL PROFILE (issue #133, PROTOTYPE): the intersection of an agent's
+# declared tools and its linked user's effective permissions, the organization confinement, the
+# suspended-agent denial, and the OFF posture answering exactly as an unrecognised subject type
+# always has. Over a real database.
+[[test]]
+name = "authzen_agent_profile"
+path = "tests/authzen_agent_profile.rs"
+required-features = ["testing"]

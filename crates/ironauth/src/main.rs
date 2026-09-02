@@ -22,11 +22,11 @@ use ironauth_admin::webhook_delivery::{
 };
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE, Config,
-    FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE,
-    Loaded, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
-    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, WASM_HOOKS_FEATURE,
-    WebhooksConfig,
+    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE,
+    AUTHZEN_AGENT_PROFILE_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
+    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, ORG_SCOPED_CLIENTS_FEATURE,
+    OidcConfig, OutboxConfig, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
+    ScreeningProvider, WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -850,6 +850,25 @@ async fn build_admin_state(
             // Domain verification (issue #96): without a resolver the verify endpoint
             // answers 503 rather than reporting a domain unverified.
             let state = arm_domain_verification(state, env);
+            // The AuthZEN AGENT TOOL PROFILE (issue #133, PROTOTYPE). ONE plane: the PDP is a
+            // management-API surface and the data plane has no AuthZEN endpoint, so this is
+            // deliberately not a shared cross-plane value. Off unless the draft is
+            // acknowledged, and off is not "the endpoint refuses" but "the subject type has no
+            // meaning here", which is the same answer it gave before this existed.
+            //
+            // `builtin()` rather than a registry threaded in: it is the ONE production
+            // constructor, so a second call builds the same registry from the same static
+            // registrations and cannot disagree with the first. Threading one through would
+            // add a parameter to this function for a value it can derive.
+            //
+            // An earlier version of this comment claimed a test pins that every shipped
+            // feature is registered through `builtin()`. There is no such test -- the nearest
+            // guard, `unknown_feature_name_refuses_to_boot`, tests the other direction -- and
+            // the argument stands without it, because both calls run the same function.
+            let state = state.with_agent_tool_profile_enabled(agent_tool_profile_armed(
+                &FeatureRegistry::builtin(),
+                config,
+            ));
             Some(state)
         }
         Err(error) => {
@@ -1655,6 +1674,18 @@ async fn build_oidc_plane(
         discovery,
         jwks,
     })
+}
+
+/// Whether the `AuthZEN` agent tool profile is armed (issue #133, PROTOTYPE).
+///
+/// A named function rather than an inline `is_enabled` inside `build_admin_state`, for the same
+/// reason `build_attester_registry` is one: that function needs a live store, so nothing inside
+/// it can be tested, and the wiring is exactly what a mistake here would be. Substituting a
+/// DIFFERENT experimental feature's constant at the call site would arm a live PDP subject type
+/// off an unrelated acknowledgment, and every other test in this change would still pass -- the
+/// config-crate test proves the REGISTRY, not what reads it.
+fn agent_tool_profile_armed(features: &FeatureRegistry, config: &Config) -> bool {
+    features.is_enabled(config, AUTHZEN_AGENT_PROFILE_FEATURE)
 }
 
 /// Build the trusted-attester registry, or `None` (issue #133, PROTOTYPE).
@@ -6324,6 +6355,46 @@ mod tests {
         assert!(
             select_control_dsn(&cfg).is_none(),
             "production without the control DSN must refuse to mount"
+        );
+    }
+
+    /// The agent tool profile is armed by ITS OWN acknowledgment and no other (issue #133).
+    ///
+    /// The third case is the one that matters. The first two are satisfied by any
+    /// implementation that returns `false` by default, and would hold if the call site read a
+    /// different experimental feature's constant -- which would arm a LIVE authorization
+    /// subject type off an acknowledgment for something else entirely.
+    #[test]
+    fn the_agent_tool_profile_is_armed_by_its_own_acknowledgment() {
+        let features = FeatureRegistry::builtin();
+
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            !agent_tool_profile_armed(&features, &bare),
+            "off in a default deployment"
+        );
+
+        let armed = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             authzen-agent-profile = { enabled = true, ack = \"0.1.0-exp.1\" }\n",
+        );
+        assert!(
+            agent_tool_profile_armed(&features, &armed),
+            "its own acknowledgment arms it"
+        );
+
+        // ANOTHER experimental feature, acknowledged. This must NOT arm the profile, and it is
+        // the only case that distinguishes "reads the right flag" from "reads a flag".
+        let other = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = { enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }\n",
+        );
+        assert!(
+            !agent_tool_profile_armed(&features, &other),
+            "an acknowledgment for a different prototype must not arm this one"
         );
     }
 

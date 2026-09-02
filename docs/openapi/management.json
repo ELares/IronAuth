@@ -28026,7 +28026,7 @@
               "string",
               "null"
             ],
-            "description": "The instance identifier. Accepted because `AuthZEN` 1.0 defines it and a `PEP` will\nsend it, and NOT consulted: `IronAuth` grants permissions per organization, not per\ninstance, so a decision that varied by instance would be answering a question this\nmodel cannot decide.\n\nThe allow is the honest spelling of that. Reading the field into a discard to quiet the\nlint would read like the value participates in something."
+            "description": "The instance identifier. Not consulted for a `user` or `service_account` subject:\n`IronAuth` grants permissions per organization, not per instance, so a decision that\nvaried by instance would be answering a question this model cannot decide.\n\nCONSULTED for the agent tool profile (issue #133), where it names the TOOL. That is not\nan exception smuggled in: `tool/deploy` and `tool/destroy` are two resources rather than\none resource with two ids, and a profile that ignored the id could only ever answer\n\"may this agent call SOME tool\". The sentence above stays true of the two subject types\nit describes, and this one says where it stops."
           },
           "type": {
             "type": "string",
@@ -28044,11 +28044,11 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "The `usr_` or `sva_` identifier, matching the declared type."
+            "description": "The `usr_` or `sva_` identifier, matching the declared type. A deployment that has\nacknowledged the agent tool profile (issue #133) also accepts an `agp_` identifier for\nits `agent` subject type."
           },
           "type": {
             "type": "string",
-            "description": "`user` or `service_account`. Any other type is refused rather than treated as a user."
+            "description": "`user` or `service_account`. Any other type is refused rather than treated as a user,\nexcept as noted below.\n\nA deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)\nalso decides `agent`, which asks whether an agent may call a named tool. It is\ndeliberately absent from this sentence's list because the CONTRACT does not offer it:\nit is off in every deployment that has not opted in, and a published description naming\na type most servers refuse would be worse than one that stops where support is\nuniversal. See `docs/experimental/authzen-agent-profile.md`."
           }
         }
       },

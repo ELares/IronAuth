@@ -17,9 +17,17 @@
 //!
 //! # Mapping a resource and an action onto a permission slug
 //!
-//! `AuthZEN` names a `resource.type` and an `action.name`; `IronAuth` grants permission SLUGS. The
-//! mapping is `"{resource.type}.{action.name}"`, so type `billing.invoice` with action `read`
-//! asks about `billing.invoice.read`.
+//! `AuthZEN` names a `resource.type` and an `action.name`; `IronAuth` grants permission SLUGS. For
+//! a `user` or `service_account` subject the mapping is `"{resource.type}.{action.name}"`, so type
+//! `billing.invoice` with action `read` asks about `billing.invoice.read`.
+//!
+//! The AGENT TOOL PROFILE (issue #133, experimental) maps
+//! `"{resource.type}.{resource.id}.{action.name}"` instead, because it requires the type to be
+//! `tool` and the tool is the resource INSTANCE: under the two-part join every tool would share
+//! the slug `tool.{action}`, and the permission could not distinguish `deploy` from `destroy`.
+//! Stated HERE as well as at the arm, because this paragraph is the first thing a reader of this
+//! module meets and an unconditional sentence about the mapping is now false for one of the
+//! three subject types.
 //!
 //! # Why a DELETED environment stops deciding
 //!
@@ -51,7 +59,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use ironauth_store::{OrganizationId, ServiceAccountId, UserId};
+use ironauth_store::{AgentPrincipalId, OrganizationId, ServiceAccountId, UserId};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -64,13 +72,32 @@ use crate::org_context::{
 use crate::response::json;
 use crate::state::AdminState;
 
+/// The resource type an agent tool check asks about (issue #133).
+///
+/// ONE spelling, referenced both by the arm that requires it and by the slug the linked user's
+/// permission is looked up under, so "the resource type this profile answers for" and "the
+/// first segment of the permission it checks" cannot drift apart. The first version claimed
+/// that and then built the slug from `resource.resource_type`, which is the caller's string:
+/// equal to the constant only because the arm above had just refused everything else.
+const AGENT_TOOL_RESOURCE_TYPE: &str = "tool";
+
 /// The `AuthZEN` subject: who is asking.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AuthzenSubject {
-    /// `user` or `service_account`. Any other type is refused rather than treated as a user.
+    /// `user` or `service_account`. Any other type is refused rather than treated as a user,
+    /// except as noted below.
+    ///
+    /// A deployment that has acknowledged the `authzen-agent-profile` prototype (issue #133)
+    /// also decides `agent`, which asks whether an agent may call a named tool. It is
+    /// deliberately absent from this sentence's list because the CONTRACT does not offer it:
+    /// it is off in every deployment that has not opted in, and a published description naming
+    /// a type most servers refuse would be worse than one that stops where support is
+    /// universal. See `docs/experimental/authzen-agent-profile.md`.
     #[serde(rename = "type")]
     pub subject_type: String,
-    /// The `usr_` or `sva_` identifier, matching the declared type.
+    /// The `usr_` or `sva_` identifier, matching the declared type. A deployment that has
+    /// acknowledged the agent tool profile (issue #133) also accepts an `agp_` identifier for
+    /// its `agent` subject type.
     pub id: String,
 }
 
@@ -80,14 +107,15 @@ pub struct AuthzenResource {
     /// The resource type, the first half of the permission slug.
     #[serde(rename = "type")]
     pub resource_type: String,
-    /// The instance identifier. Accepted because `AuthZEN` 1.0 defines it and a `PEP` will
-    /// send it, and NOT consulted: `IronAuth` grants permissions per organization, not per
-    /// instance, so a decision that varied by instance would be answering a question this
-    /// model cannot decide.
+    /// The instance identifier. Not consulted for a `user` or `service_account` subject:
+    /// `IronAuth` grants permissions per organization, not per instance, so a decision that
+    /// varied by instance would be answering a question this model cannot decide.
     ///
-    /// The allow is the honest spelling of that. Reading the field into a discard to quiet the
-    /// lint would read like the value participates in something.
-    #[allow(dead_code)]
+    /// CONSULTED for the agent tool profile (issue #133), where it names the TOOL. That is not
+    /// an exception smuggled in: `tool/deploy` and `tool/destroy` are two resources rather than
+    /// one resource with two ids, and a profile that ignored the id could only ever answer
+    /// "may this agent call SOME tool". The sentence above stays true of the two subject types
+    /// it describes, and this one says where it stops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
@@ -442,6 +470,12 @@ async fn decide(
                 .await
                 .map_err(|_| ApiError::Internal)?
         }
+        // THE AGENT TOOL PROFILE (issue #133, PROTOTYPE). Behind the experimental flag, so a
+        // deployment that has not acknowledged the draft sees the same refusal it saw before
+        // this existed rather than a new subject type appearing in its PDP.
+        "agent" if state.agent_tool_profile_enabled() => {
+            return decide_agent_tool(state, scope, org_id, subject, resource, action).await;
+        }
         // Refused, not defaulted. Treating an unrecognised type as a user would answer a
         // question about somebody else, and a PDP that guesses is worse than one that says no.
         _ => {
@@ -451,6 +485,166 @@ async fn decide(
             ));
         }
     };
+    Ok(held.contains(&slug))
+}
+
+/// May THIS AGENT call THIS TOOL (issue #133, the `AuthZEN` MCP tool-authorization profile).
+///
+/// # Why this is not the ordinary permission lookup with a different id
+///
+/// An agent is not a principal that holds permissions. It is a principal that acts FOR a
+/// person, with a narrower set of tools than that person could reach, and both halves have to
+/// hold for a call to be allowed:
+///
+/// - the AGENT must declare the tool. An agent's `tool_scopes` is the operator's statement of
+///   what this machine may do, and a tool outside it is refused however privileged its human
+///   is.
+/// - the LINKED USER must hold the mapped permission. An agent cannot exceed the person it
+///   acts for, so the human's effective permissions in this organization are the ceiling, and
+///   they are resolved through the SAME `effective_permissions` the token claims and the other
+///   two subject types use. A second copy of that walk would be a second set of answers.
+///
+/// The decision is the INTERSECTION. Either half alone is a different and wrong question:
+/// checking only the declared set lets a revoked human's agent keep working, and checking only
+/// the human lets an agent call every tool its person could.
+///
+/// # A tool name that can never be permitted
+///
+/// The ceiling slug has to pass the permission-slug grammar: lowercase ASCII segments of
+/// `[a-z0-9_-]`, at least two of them, at most 63 characters in total. `tool_scopes` is checked
+/// only for a non-empty array of non-blank strings, so `getWeather`, `fs:read`, `files/read`,
+/// `Deploy`, or any name long enough to push `tool.{tool}.{action}` past 63 characters
+/// REGISTERS fine and can never be granted: the permission that would allow it cannot be
+/// created, so this answers `false` for ever with nothing on any surface saying why.
+///
+/// That is the strongest limit on this prototype and it is recorded rather than smoothed over.
+/// Constraining `tool_scopes` to the segment grammar would fix it and is a change to the GA
+/// agent surface, which a prototype does not get to make.
+///
+/// # Where the tool name comes from
+///
+/// `resource.id`, with `resource.type` required to be `tool`. That is the one place on this
+/// surface where `resource.id` is consulted, and the field's own documentation says it is
+/// deliberately not -- so this profile says so explicitly rather than quietly making the
+/// sentence next door false. It is read here because the tool IS the instance: `tool/deploy`
+/// and `tool/destroy` are two resources, not one resource with two ids, and a profile that
+/// ignored the id could only ever answer "may this agent call SOME tool".
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] for a malformed subject id, a resource type that is not `tool`, or
+/// a missing tool name; [`ApiError::Internal`] on a store failure.
+async fn decide_agent_tool(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    org_id: &OrganizationId,
+    subject: &AuthzenSubject,
+    resource: &AuthzenResource,
+    action: &AuthzenAction,
+) -> Result<bool, ApiError> {
+    if resource.resource_type != AGENT_TOOL_RESOURCE_TYPE {
+        return Err(bad(
+            "resource_type_unsupported",
+            "an agent subject asks about resource.type `tool`",
+        ));
+    }
+    let tool = resource
+        .id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            bad(
+                "resource_id_required",
+                "resource.id names the tool, and an agent check without one has no answer",
+            )
+        })?;
+
+    let id = AgentPrincipalId::parse_in_scope(&subject.id, &scope).map_err(|_| {
+        bad(
+            "subject_unknown",
+            "the subject id is not an agent of this scope",
+        )
+    })?;
+    let agent = match state.store().scoped(scope).agents().get(&id).await {
+        Ok(agent) => agent,
+        // An agent that does not exist is a DENY, not an error. A PDP that distinguished
+        // "no such agent" from "not allowed" would answer a question about existence to a
+        // caller that is only entitled to a decision.
+        Err(ironauth_store::StoreError::NotFound) => return Ok(false),
+        Err(_) => return Err(ApiError::Internal),
+    };
+
+    // Confined to the organization the evaluation named, exactly as every other read on this
+    // surface is. Without it a PEP in organization A could ask about organization B's agent and
+    // get an answer computed from B's grants.
+    if &agent.organization_id != org_id {
+        return Ok(false);
+    }
+    // Suspended and revoked agents are DENIED while staying listable and auditable, which is
+    // the same split #130 criterion 5 draws at the token door.
+    //
+    // Through the RECORD's own predicates, not inline literals. `can_obtain_tokens`'s doc says
+    // "a caller that had to remember which states were live would eventually forget one", and
+    // an inline `state != "active"` here was exactly that caller; `declares_tool` carries the
+    // exact-membership rule (never a prefix, or `files` would grant `files.delete`).
+    if !agent.can_obtain_tokens() || !agent.declares_tool(tool) {
+        return Ok(false);
+    }
+
+    // THE PERSON must be able to authenticate. Found by review: the effective-permission
+    // closure filters `users.deleted_at IS NULL` and an ACTIVE membership, and reads
+    // `users.state` nowhere -- so an operator who BLOCKED or DISABLED someone left that
+    // person's agent fully authorized here, and "an agent cannot outlive the revocation of the
+    // person it acts for" was true only of deletion and of membership removal.
+    //
+    // `can_authenticate` rather than `== Active`, because it is the same predicate the login
+    // path fences on, and a second spelling of "which states are live" is the drift the
+    // paragraph above is about. It admits scheduled-offboarding, which is correct: that person
+    // can still sign in, so their agent may still act until the worker offboards them.
+    //
+    // THROUGH `state_for_subject`, which reads one column, NOT through `users().get()`. That
+    // read unwraps the scope DEK and opens the person's sealed identifier and external id, all
+    // of which this would discard to look at one enum -- on a decision path a batch calls once
+    // per entry. And it requires the platform master key, which the management plane attaches
+    // only when one is configured: without it `get` returns `StoreError::Encryption`, so every
+    // `agent` subject would answer 500 while `user` and `service_account` kept deciding.
+    // `state_for_subject` is the accessor written for exactly this, and it is the one the login
+    // path's own lifecycle re-check uses.
+    //
+    // `None` covers absent, deleted, and out of scope, and all three are a DENY for the same
+    // reason an absent agent is: a PDP answers decisions, not questions about existence.
+    let live = state
+        .store()
+        .scoped(scope)
+        .users()
+        .state_for_subject(&agent.linked_user_id.to_string())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if !live.is_some_and(|state| state.can_authenticate()) {
+        return Ok(false);
+    }
+
+    // The CEILING: what the person this agent acts for can do WITH THIS TOOL.
+    //
+    // PER TOOL, and the first version was not: it joined `{resource.type}.{action.name}`, the
+    // same mapping the other two subject types use, which for a profile that requires
+    // `resource.type == "tool"` is the constant `tool.{action}` for every tool there is. So the
+    // human's half could not distinguish `deploy` from `destroy`, only `tool_scopes` could, and
+    // the "declared but not permitted" case this profile exists to deny was not expressible.
+    // The intersection was an intersection with a constant.
+    //
+    // The tool is the resource INSTANCE, so it belongs in the slug: `tool.deploy.call` is a
+    // different permission from `tool.destroy.call`, which is what lets an operator grant a
+    // person one and not the other. That is a longer slug than the other subject types produce
+    // and deliberately so -- they ask about a resource TYPE, this asks about an instance.
+    let slug = format!("{}.{tool}.{}", AGENT_TOOL_RESOURCE_TYPE, action.name);
+    let held = state
+        .store()
+        .management()
+        .org_groups(scope)
+        .effective_permissions(org_id, &agent.linked_user_id, state.max_group_depth())
+        .await
+        .map_err(|_| ApiError::Internal)?;
     Ok(held.contains(&slug))
 }
 

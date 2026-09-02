@@ -243,6 +243,10 @@ struct Inner {
     // review-queue endpoints outside the experimental ack gate. Off by default; when off
     // every signup-quarantine review-queue endpoint answers a uniform 404.
     signup_quarantine_enabled: bool,
+    // The AuthZEN agent tool profile (issue #133, PROTOTYPE). Default false: an `agent`
+    // subject is then refused exactly as any unrecognised type is, so the endpoint does not
+    // reveal that the type has a meaning in this build.
+    agent_tool_profile_enabled: bool,
     // Whether the experimental advanced-recovery-modes surface is armed (issue #82, PR 3).
     // Resolved by the boot path from the strict config feature ladder (the
     // `advanced-recovery` experimental feature enabled AND acked at the exact version) and
@@ -377,6 +381,7 @@ impl AdminState {
                 sudo_mode_enabled: config.sudo_mode_enabled,
                 sudo_mode_window_secs: config.sudo_mode_window_secs,
                 signup_quarantine_enabled: false,
+                agent_tool_profile_enabled: false,
                 advanced_recovery_enabled: false,
                 admin_oidc_bridge: None,
                 signing_registry: None,
@@ -650,6 +655,30 @@ impl AdminState {
             inner.signup_quarantine_enabled = enabled;
         }
         self
+    }
+
+    /// Arm the `AuthZEN` AGENT TOOL PROFILE (issue #133, PROTOTYPE).
+    ///
+    /// A separate switch from the `AuthZEN` PDP itself, which is GA: this adds a new subject
+    /// TYPE (`agent`) to an endpoint operators already run, so a deployment that has not
+    /// acknowledged the draft has to keep seeing the refusal it saw before -- otherwise
+    /// shipping the prototype would silently widen a live authorization surface.
+    ///
+    /// When false (the default), an `agent` subject falls into the same
+    /// `subject_type_unsupported` refusal every other unrecognised type gets, so the endpoint
+    /// does not even reveal that the type has a meaning here.
+    #[must_use]
+    pub fn with_agent_tool_profile_enabled(mut self, enabled: bool) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.agent_tool_profile_enabled = enabled;
+        }
+        self
+    }
+
+    /// Whether the `AuthZEN` agent tool profile is armed (issue #133).
+    #[must_use]
+    pub fn agent_tool_profile_enabled(&self) -> bool {
+        self.inner.agent_tool_profile_enabled
     }
 
     /// Whether the experimental signup fraud-review-queue admin surface is armed (issue #82,

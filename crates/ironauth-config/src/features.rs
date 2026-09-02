@@ -101,6 +101,26 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the `AuthZEN` agent tool-authorization profile (issue #133,
+/// exploratory bet 5).
+///
+/// Separate from the `AuthZEN` PDP itself, which is GA. This flag adds a new subject TYPE to an
+/// endpoint operators already run, so shipping it unflagged would silently widen a live
+/// authorization surface: an `agent` subject that used to be refused as unrecognised would
+/// start returning decisions.
+pub const AUTHZEN_AGENT_PROFILE_FEATURE: &str = "authzen-agent-profile";
+
+/// The experimental `ack` version for the `AuthZEN` agent tool profile (issue #133).
+///
+/// A `0.1.0-exp.N` counter rather than a draft revision, and the difference from
+/// [`ATTESTATION_CLIENT_AUTH_VERSION`] is deliberate. That surface implements one IETF draft
+/// with a wire format the IETF may change, so the revision IS the thing being acknowledged.
+/// This one composes IronAuth's OWN model -- an agent's declared tools and its linked user's
+/// effective permissions -- onto the `AuthZEN` request shape, and the `AuthZEN` MCP profile draft
+/// does not dictate that composition. What may break here is our decision, not theirs, so the
+/// counter is ours.
+pub const AUTHZEN_AGENT_PROFILE_VERSION: &str = "0.1.0-exp.1";
+
 /// The registry name of the attestation-based client authentication prototype (issue #133,
 /// exploratory bet 4).
 ///
@@ -307,6 +327,22 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Registers the `AuthZEN` agent tool-authorization profile (issue #133, PROTOTYPE).
+    pub fn register_authzen_agent_profile(&mut self) {
+        self.register(Feature::experimental(
+            AUTHZEN_AGENT_PROFILE_FEATURE,
+            "AuthZEN agent tool-authorization profile (issue #133): the PDP answers \
+             `may this agent call this tool` for an AGENT principal, as the INTERSECTION of \
+             the tools the operator declared for that agent and the permissions the person it \
+             acts for holds in the organization. PROTOTYPE: it adds a subject type to a live \
+             authorization endpoint, the composition is IronAuth's rather than the AuthZEN MCP \
+             profile draft's, and an agent that is suspended, revoked, or in another \
+             organization is denied.",
+            AUTHZEN_AGENT_PROFILE_VERSION,
+            "crates/ironauth-admin/CHANGELOG.md",
+        ));
+    }
+
     /// Registers attestation-based client authentication (issue #133, PROTOTYPE).
     ///
     /// Its own registrar rather than a second `self.register` inside the vault's, which is
@@ -343,6 +379,7 @@ impl FeatureRegistry {
         registry.register_signup_quarantine();
         registry.register_agent_token_vault();
         registry.register_attestation_client_auth();
+        registry.register_authzen_agent_profile();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();
@@ -841,7 +878,7 @@ impl std::error::Error for FeatureValidationError {}
 mod tests {
     use super::*;
 
-    fn config_with_features(toml_features: &str) -> Config {
+    pub(super) fn config_with_features(toml_features: &str) -> Config {
         let input = format!("[features]\n{toml_features}");
         crate::Config::from_toml_str(&input, "test.toml")
             .expect("test config parses")
@@ -1364,7 +1401,8 @@ mod tests {
 #[cfg(test)]
 mod attestation_default_posture_tests {
     use super::{
-        ATTESTATION_CLIENT_AUTH_FEATURE, ATTESTATION_CLIENT_AUTH_VERSION, FeatureRegistry,
+        ATTESTATION_CLIENT_AUTH_FEATURE, ATTESTATION_CLIENT_AUTH_VERSION,
+        AUTHZEN_AGENT_PROFILE_FEATURE, AUTHZEN_AGENT_PROFILE_VERSION, FeatureRegistry,
     };
     use crate::Config;
 
@@ -1389,6 +1427,56 @@ mod attestation_default_posture_tests {
         assert!(
             config.oidc.attestation_client_auth.attesters.is_empty(),
             "and no attester is trusted, so even an acknowledged flag would authenticate nobody"
+        );
+    }
+
+    /// The `AuthZEN` agent tool profile is experimental and OFF by default (issue #133).
+    ///
+    /// The flag's whole purpose is that this prototype adds a subject type to a LIVE
+    /// authorization endpoint, so "off unless acknowledged at exactly this version" is the
+    /// property, and nothing asserted it. Four cases, because three of the four ways to get it
+    /// wrong look identical from a single assertion: default, enabled-without-an-ack,
+    /// enabled-with-the-WRONG-ack, and the one that works.
+    ///
+    /// `builtin()`, not `new()`: an empty registry reports every feature disabled, so the
+    /// first three would hold against a flag that ships default-on.
+    #[test]
+    fn the_authzen_agent_profile_is_experimental_and_off_by_default() {
+        let registry = FeatureRegistry::builtin();
+        assert!(
+            !registry.is_enabled(&Config::default(), AUTHZEN_AGENT_PROFILE_FEATURE),
+            "off in a default deployment"
+        );
+
+        // The ack gate is `validate`, which REFUSES TO BOOT, not `is_enabled`, which reports
+        // the toggle. That distinction matters and the first draft of this test had it wrong:
+        // asserting `!is_enabled` for an unacknowledged flag would have passed against a build
+        // where the gate had been deleted, because the operator did set `enabled = true` and
+        // `is_enabled` says so. What stops them is that the process does not start.
+        let enabled_no_ack =
+            super::tests::config_with_features("authzen-agent-profile = { enabled = true }");
+        assert!(
+            registry.validate(&enabled_no_ack).is_err(),
+            "enabling without acknowledging the version must refuse the boot"
+        );
+
+        let wrong_ack = super::tests::config_with_features(
+            "authzen-agent-profile = { enabled = true, ack = \"0.0.1\" }",
+        );
+        assert!(
+            registry.validate(&wrong_ack).is_err(),
+            "an ack for another version is not an ack for this one, which is what makes a \
+             version bump invalidate acknowledgments in the wild"
+        );
+
+        let armed = super::tests::config_with_features(&format!(
+            "authzen-agent-profile = {{ enabled = true, ack = \"{AUTHZEN_AGENT_PROFILE_VERSION}\" }}"
+        ));
+        assert!(registry.validate(&armed).is_ok(), "the correct ack boots");
+        assert!(
+            registry.is_enabled(&armed, AUTHZEN_AGENT_PROFILE_FEATURE),
+            "the control: the correct ack arms it, so the refusals above are about the ack and \
+             not about a flag nothing can turn on"
         );
     }
 

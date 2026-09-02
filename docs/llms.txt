@@ -28,6 +28,7 @@ both files and fails if either drifts.
 - [Edge verification](docs/edge-verification.md): Verifying an IronAuth token needs no IronAuth service, no SDK install, and no network call on
 - [The IronAuth exit guide](docs/exit-guide.md): One of IronAuth's three named covenants is **no unexportable data**: you can
 - [Attestation-based client authentication (PROTOTYPE)](docs/experimental/attestation-client-auth.md): A client instance that holds no registered secret authenticates with two JWTs carried in headers:
+- [AuthZEN agent tool profile (PROTOTYPE)](docs/experimental/authzen-agent-profile.md): Answers **may this agent call this tool** for an agent principal, on the AuthZEN PDP IronAuth
 - [IdP-side FedCM (experimental, issue #83)](docs/fedcm.md): IronAuth ships the IdP side of the W3C
 - [Verifying a signed log stream](docs/log-stream-verification.md): IronAuth can sign every batch it ships to a SIEM. This is how a consumer checks one, and
 - [Mobile: signing in over AppAuth](docs/mobile-appauth.md): IronAuth does not ship a mobile SDK. It documents a path over [AppAuth][appauth], which already
