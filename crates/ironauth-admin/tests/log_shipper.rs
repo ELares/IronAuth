@@ -1178,12 +1178,40 @@ async fn seed_agent_audit_rows(db: &TestDatabase, env: &Env, scope: Scope) -> Pl
 
     let user = ironauth_store::UserId::generate(env, &scope);
     sqlx::query(
+        // EIGHT columns, not three, five of them newly required. `password_hash` is NOT NULL
+        // since 0006, and 0028 added
+        // `identifier_bidx`, `identifier_sealed`, `claims_sealed` and `pii_dek_version` and made
+        // all four NOT NULL when it moved PII behind envelope encryption. The three-column form
+        // this used to be could never insert a row on any schema this repository has shipped: a
+        // seed that cannot run is a test that can only fail, and this one shipped that way
+        // because nothing ever ran it.
+        //
+        // The sealed values are placeholders. This row exists to be an audit SUBJECT, and
+        // nothing in these tests decrypts it; a real seal would need a DEK and would test the
+        // crypto rather than the thing under test.
         "INSERT INTO users /* query-audit-allow: owner test seed */ \
-         (id, tenant_id, environment_id) VALUES ($1, $2, $3)",
+         (id, tenant_id, environment_id, password_hash, \
+          identifier_bidx, identifier_sealed, claims_sealed, pii_dek_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
     )
     .bind(user.to_string())
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
+    .bind("not-a-real-hash")
+    // DERIVED from the id, not a constant: `users_identifier_bidx_unique` is UNIQUE over
+    // (tenant, environment, identifier_bidx), so a constant makes a second seeded user in one
+    // scope fail with an opaque 23505 from inside a fixture.
+    .bind(
+        user.to_string()
+            .as_bytes()
+            .iter()
+            .cycle()
+            .take(32)
+            .copied()
+            .collect::<Vec<u8>>(),
+    )
+    .bind(vec![0_u8; 16])
+    .bind(vec![0_u8; 16])
     .execute(db.owner_pool())
     .await
     .expect("seed user");
