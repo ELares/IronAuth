@@ -4040,12 +4040,12 @@ async fn every_ordinary_jwt_bearer_refusal_still_fires_on_an_identity_assertion(
         "client_id": client_id, "scope": "read:orders",
     });
     let payload = serde_json::to_vec(&unmapped_claims).expect("serialize");
-    let unmapped = sign_jws(
-        &key,
-        &payload,
-        &EmissionOptions::new().with_typ(ID_JAG_MEDIA_TYPE),
-    ) // invariant-allow: typ-via-declaration -- see `id_jag` above
-    .expect("sign");
+    // The options are bound to a `let` rather than built inline, so the marker cannot be
+    // separated from the call it exempts. Inline, rustfmt split this across four lines and
+    // carried the comment onto the closing paren, which the lint scans PER LINE: the exemption
+    // silently stopped applying and the rule fired in CI on a file that was clean locally.
+    let options = EmissionOptions::new().with_typ(ID_JAG_MEDIA_TYPE); // invariant-allow: typ-via-declaration -- see `id_jag` above
+    let unmapped = sign_jws(&key, &payload, &options).expect("sign");
     let (status, _h, resp) = present(&h, &client_id, &unmapped).await;
     assert_eq!(
         status,
