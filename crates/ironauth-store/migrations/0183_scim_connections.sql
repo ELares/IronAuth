@@ -7,13 +7,21 @@
 --
 -- WHY THE TOKEN IS SCOPED TO EXACTLY ONE ORGANIZATION, in the schema rather than in a handler.
 --
--- SCIM endpoints are a proven IDOR hot spot. Zitadel's CVE-2026-32130 was a SCIM auth bypass
--- through URL encoding, and Casdoor's CVE-2025-4210 was a SCIM authorization gap. The issue
+-- SCIM endpoints are a proven AUTHORIZATION hot spot, and the two shipped CVEs on this
+-- surface are both failures of the authenticate step rather than of the compare step:
+-- Zitadel's CVE-2026-32130 was an authentication BYPASS through URL encoding (CWE-288), and
+-- Casdoor's CVE-2025-4210 was a MISSING authorization check (CWE-285) on a route that
+-- consulted no credential at all. Neither is an IDOR, and this column does not fix either
+-- of them: a route that never authenticates has no credential for an organization to be
+-- bound to.
+--
+-- What this column does is remove the step where such a bug becomes cross-tenant. The issue
 -- asks that a token for org A be unusable against org B BY CONSTRUCTION, so the organization
 -- is a NOT NULL column on the credential itself: there is no request shape in which a
 -- connection names a second organization, because the connection has exactly one and the
 -- caller never supplies it. A handler that forgot to compare would still be reading rows
--- through a scoped, org-filtered query.
+-- through a scoped, org-filtered query. That is a precondition for the authenticated path
+-- being safe, not a defence against an unauthenticated one.
 --
 --   1. THE PLAINTEXT TOKEN IS NEVER STORED. `token_digest` holds the SHA-256 of the whole
 --      presented token and is the lookup key, exactly as `api_keys` (0123) and

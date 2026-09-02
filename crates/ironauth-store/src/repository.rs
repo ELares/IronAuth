@@ -74587,10 +74587,13 @@ impl ScimConnectionRepo<'_> {
     ///   row and then compared timestamps in Rust is one refactor away from forgetting to, and
     ///   the failure mode is a revoked provisioning credential that still provisions;
     /// * the row CARRIES its organization. The caller never supplies one, so there is no
-    ///   request shape in which a token reaches a second organization -- the IDOR class
-    ///   Casdoor's CVE-2025-4210 is, stated as a schema property rather than a handler
-    ///   discipline. (Not CVE-2026-32130, which is a MISSING-authentication bug: binding the
-    ///   organization to the credential does nothing for a route that never authenticates.)
+    ///   request shape in which a token reaches a second organization: cross-organization
+    ///   reach is a schema property here rather than a handler discipline. Note what this
+    ///   does NOT close. Both shipped SCIM CVEs the issue cites are authentication failures
+    ///   (CVE-2026-32130 a bypass by URL encoding, CVE-2025-4210 a route with no
+    ///   authorization check at all), and binding the organization to the credential does
+    ///   nothing for a route that never consults one. It is a precondition for the
+    ///   authenticated path being safe, not a fix for an unauthenticated one.
     ///
     /// AND THE ORGANIZATION MUST STILL BE LIVE. The join is not decoration: without it a
     /// credential kept provisioning into an organization that had been soft-deleted or

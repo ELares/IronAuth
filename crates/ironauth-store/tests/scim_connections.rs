@@ -4,10 +4,13 @@
 //!
 //! # What this file is about
 //!
-//! SCIM endpoints are a proven IDOR hot spot: Zitadel's CVE-2026-32130 was a SCIM auth bypass
-//! through URL encoding, and Casdoor's CVE-2025-4210 was a SCIM authorization gap. The issue
-//! asks that a token for organization A be unusable against organization B **by construction**,
-//! and this file is where that claim is measured rather than asserted.
+//! SCIM endpoints are a proven AUTHORIZATION hot spot, though not in the way a first reading
+//! of the issue's citations suggests: Zitadel's CVE-2026-32130 was an authentication BYPASS
+//! through URL encoding and Casdoor's CVE-2025-4210 a route carrying no authorization check,
+//! so both are failures to authenticate rather than failures to compare, and neither is an
+//! IDOR. What the issue asks for on top of authenticating is that a token for organization A
+//! be unusable against organization B **by construction**, and this file is where THAT claim
+//! is measured rather than asserted.
 //!
 //! The construction is that the organization is a column on the CREDENTIAL. A caller never
 //! supplies one, so there is no request shape in which a token names a second organization --
@@ -434,7 +437,7 @@ async fn every_scope_guard_refuses_a_foreign_id() {
 async fn revoking_a_handle_that_names_nothing_is_not_found() {
     // And it writes no audit row, which the shape of `revoke` now guarantees: an absent handle
     // returns before the audit write. The first version wrapped the UPDATE unconditionally, so
-    // revoking a handle that was never created still recorded `scim.connection_revoked`
+    // revoking a handle that was never created still recorded `scim_connection.revoked`
     // naming a connection that did not exist -- the opposite of "revocation is observable".
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -462,6 +465,26 @@ async fn revoking_a_handle_that_names_nothing_is_not_found() {
 /// outright, both left the whole suite green.
 async fn as_control(db: &TestDatabase, scope: Scope, sql: &str) -> Result<u64, sqlx::Error> {
     let mut tx = db.control_pool().begin().await?;
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(scope.tenant().to_string())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+    let affected = sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(affected)
+}
+
+/// Run one statement as `ironauth_app` -- the DATA plane role -- with this scope's RLS
+/// settings bound. The mirror of [`as_control`], and it exists for the mirror reason: the
+/// read grant and the absent write grants are enforced by Postgres, and a suite that only ever
+/// reads through the repository cannot tell a table the data plane may not write from one it
+/// may.
+async fn as_app(db: &TestDatabase, scope: Scope, sql: &str) -> Result<u64, sqlx::Error> {
+    let mut tx = db.app_pool().begin().await?;
     sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
         .bind(scope.tenant().to_string())
         .execute(&mut *tx)
@@ -518,6 +541,24 @@ async fn the_control_role_may_revoke_and_may_change_nothing_else() {
     .await
     .expect("revocation is the one permitted update");
     assert_eq!(affected, 1);
+
+    // The AFTER half of the policy, which the revoke above cannot exercise. `USING
+    // (revoked_at IS NULL)` admits a live row and `WITH CHECK (revoked_at IS NOT NULL)`
+    // requires the result to be revoked, so an update that TOUCHES a live row without
+    // revoking it is refused by the WITH CHECK half alone. A reviewer weakened that half to
+    // `true` and the whole suite stayed green; this is the statement that notices.
+    let live = connect(&db, &env, scope, &org, "scim_tok_touch").await;
+    let outcome = as_control(
+        &db,
+        scope,
+        &format!("UPDATE scim_connections SET updated_at = now() WHERE id = '{live}'"),
+    )
+    .await;
+    let error = outcome.expect_err("a live row may not be touched without being revoked");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "refused by the policy's WITH CHECK half, not by something else: {error}"
+    );
 
     // And it is ONE WAY. The grant cannot express this, because `revoked_at` is exactly the
     // column a revoke must write; the RESTRICTIVE policy is what does.
@@ -670,4 +711,158 @@ async fn a_credential_does_not_outlive_the_organization_it_provisions_into() {
             .is_none(),
         "a deleted organization takes its provisioning credentials with it"
     );
+}
+
+#[tokio::test]
+async fn a_credential_stops_working_when_its_organization_is_merely_disabled() {
+    // THE OTHER HALF of the liveness join, and it needs its own test because the two halves
+    // are not reachable through one action: `OrganizationRepo::delete` sets `deleted_at` and
+    // never touches `state`, so the soft-delete test above exercises `deleted_at IS NULL`
+    // alone. A reviewer deleted `AND o.state = 'active'` from `authenticate` and the entire
+    // suite stayed green -- an operator could disable an organization and its provisioning
+    // would carry on, which is exactly what the doc on `authenticate` promises it does not.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Suspended").await;
+    connect(&db, &env, scope, &org, "scim_tok_disabled").await;
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_disabled"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "live while the organization is active"
+    );
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .set_state(
+            &env,
+            &org,
+            ironauth_store::OrganizationState::Disabled,
+            None,
+        )
+        .await
+        .expect("disable the organization");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_disabled"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_none(),
+        "a disabled organization provisions nothing, exactly as a deleted one does not"
+    );
+}
+
+#[tokio::test]
+async fn the_data_plane_role_may_read_a_connection_and_may_not_write_one() {
+    // The migration calls this a privilege boundary: a provisioning credential that could
+    // mint another provisioning credential would be an escalation with no operator in the
+    // loop. A reviewer granted `ironauth_app` full INSERT, UPDATE and DELETE on the table and
+    // the suite stayed green, so the boundary was asserted in a comment and measured nowhere.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &org, "scim_tok_dataplane").await;
+
+    // Reading is granted, so the refusals below are the narrowing and not a role locked out
+    // of the table altogether.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_dataplane"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the data plane reads connections; that is how a SCIM request authenticates"
+    );
+
+    for (what, sql) in [
+        (
+            "mint a second credential",
+            format!(
+                "INSERT INTO scim_connections                  (id, tenant_id, environment_id, organization_id, display_name, provider,                   token_digest)                  VALUES ('{id}x', '{}', '{}', '{org}', 'minted', 'okta', '{}')",
+                scope.tenant(),
+                scope.environment(),
+                digest("attacker-minted"),
+            ),
+        ),
+        (
+            "swap the verifier",
+            format!(
+                "UPDATE scim_connections SET token_digest = '{}' WHERE id = '{id}'",
+                digest("attacker-chosen"),
+            ),
+        ),
+        (
+            "destroy the audit trail",
+            format!("DELETE FROM scim_connections WHERE id = '{id}'"),
+        ),
+    ] {
+        let outcome = as_app(&db, scope, &sql).await;
+        let error = outcome.expect_err(&format!("the data plane must not {what}"));
+        assert!(
+            error.to_string().contains("permission denied"),
+            "{what} is refused by the grant, not by something else: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_column_checks_refuse_a_malformed_digest_and_an_unknown_provider() {
+    // Both CHECK constraints were droppable with the suite still green. The digest one carries
+    // a security rationale (a truncated digest compares equal more often than a full one) and
+    // the provider one is promised by `create`'s own `# Errors` doc, so each was a sentence
+    // nothing measured.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+
+    for (what, provider, token_digest) in [
+        ("a digest that is not 64 hex characters", "okta", "abc123"),
+        (
+            "a digest with a non-hex character in it",
+            "okta",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ),
+        (
+            "a provider outside the closed vocabulary",
+            "google",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+    ] {
+        let outcome = db
+            .control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .scim_connections()
+            .create(
+                &env,
+                NewScimConnection {
+                    id: &ScimConnectionId::generate(&env, &scope),
+                    organization_id: &org,
+                    display_name: "Rejected",
+                    provider,
+                    token_digest,
+                    expires_at_unix_micros: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(ironauth_store::StoreError::Database(_))),
+            "{what} must be refused by the column CHECK, got {outcome:?}"
+        );
+    }
 }
