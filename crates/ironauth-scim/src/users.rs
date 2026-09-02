@@ -40,7 +40,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::identifier::IdentifierType;
+use ironauth_store::identifier::{IdentifierType, UniquenessMode};
 use ironauth_store::{
     CorrelationId, NewMembership, NewUserIdentifier, OffboardingSchedule, OrgMembershipId,
     ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId, UserState,
@@ -116,12 +116,17 @@ pub(crate) async fn addressed_user(
 }
 
 /// Render a stored user as a SCIM user resource (RFC 7643 section 4.1).
-fn user_resource(record: &UserAdminRecord, external_id: Option<&str>) -> Value {
+///
+/// `active` is what THIS ORGANIZATION says (migration 0185), not the account's own state. The
+/// account's state is environment wide, so rendering it would report a person as inactive here
+/// because a different organization deactivated them -- the read side of the cross-organization
+/// leak the write side was fixed for.
+fn user_resource(record: &UserAdminRecord, external_id: Option<&str>, active: bool) -> Value {
     let mut body = json!({
         "schemas": [USER_SCHEMA],
         "id": record.id.to_string(),
         "userName": record.identifier,
-        "active": record.state == UserState::Active,
+        "active": active,
         "meta": {
             "resourceType": "User",
             "location": format!("/scim/v2/Users/{}", record.id),
@@ -165,7 +170,14 @@ async fn rendered_user(
         .await
         .map_err(|error| store_failure(&error))?;
     let external_id = external_id_of(state, auth, user).await;
-    Ok(user_resource(&record, external_id.as_deref()))
+    let active = state
+        .store()
+        .scoped(auth.scope)
+        .scim_activation()
+        .is_active(&auth.connection.organization_id, user)
+        .await
+        .map_err(|error| store_failure(&error))?;
+    Ok(user_resource(&record, external_id.as_deref(), active))
 }
 
 /// `GET /scim/v2/Users/{id}`.
@@ -229,25 +241,8 @@ pub(crate) async fn create_user(
     let env = state.env().clone();
     let scope = auth.scope;
     let store = state.store();
-    // Duplicate detection BEFORE the write, so a collision answers 409 without having created
-    // an account. `add` refuses the same collision under the unique index, which is what makes
-    // this a fast path rather than the check: two concurrent creates both pass here and one
-    // loses there.
-    match store
-        .scoped(scope)
-        .user_identifiers()
-        .resolve(kind, &parsed.user_name)
-        .await
-    {
-        Ok(found) if !found.is_empty() => {
-            return scim_error(
-                StatusCode::CONFLICT,
-                Some("uniqueness"),
-                "a user with this userName already exists",
-            );
-        }
-        Ok(_) => {}
-        Err(error) => return store_failure(&error),
+    if let Err(response) = refuse_a_duplicate(&state, &auth, &parsed, kind).await {
+        return response;
     }
     let user_id = UserId::generate(&env, &scope);
     if let Err(response) = land_account(&state, &auth, &user_id, &parsed, kind).await {
@@ -264,26 +259,127 @@ pub(crate) async fn create_user(
             return store_failure(&error);
         }
     }
-    // `active: false` on a create is a real thing Okta sends for a staged user, so it is
-    // applied rather than ignored: an account created disabled must not be able to sign in
-    // between the create and the deactivate the IdP would otherwise have to send.
+    // `active: false` on a create is a real thing an identity provider sends for a staged
+    // user, so it is applied rather than ignored: an account created disabled must not be able
+    // to sign in between the create and the deactivate the client would otherwise have to send.
     if !parsed.active
         && let Err(error) = set_active(&state, &auth, &user_id, false).await
     {
         return error;
     }
     match rendered_user(&state, &auth, &user_id).await {
+        // RFC 7644 section 3.3: the Location header SHALL carry the URI of the CREATED
+        // RESOURCE. A constant naming the collection satisfies nothing, and Entra follows this
+        // header to read the resource back.
         Ok(body) => (
             StatusCode::CREATED,
             [
                 (header::CONTENT_TYPE, crate::server::SCIM_CONTENT_TYPE),
-                (header::LOCATION, "/scim/v2/Users"),
+                (
+                    header::LOCATION,
+                    format!("/scim/v2/Users/{user_id}").as_str(),
+                ),
             ],
             body.to_string(),
         )
             .into_response(),
         Err(response) => response,
     }
+}
+
+/// Refuse a create that would duplicate somebody this credential can already see.
+///
+/// Split out of [`create_user`] so the two conflict rules sit together and can be read against
+/// each other: they are the same kind of decision made about two different namespaces.
+async fn refuse_a_duplicate(
+    state: &ScimState,
+    auth: &Authenticated,
+    parsed: &ScimUser,
+    kind: IdentifierType,
+) -> Result<(), Response> {
+    let store = state.store();
+    let scope = auth.scope;
+    // Duplicate detection BEFORE the write, so a collision answers 409 without having created
+    // an account. `add` refuses the same collision under the partial unique index, which is
+    // what makes this a fast path rather than the check: two concurrent creates both pass here
+    // and one loses there.
+    //
+    // SCOPED TO THIS ORGANIZATION, and that is not a refinement. `resolve` searches the whole
+    // ENVIRONMENT, so an unconditional refusal on any hit is an existence oracle: a reviewer
+    // held `victim@example.test` in one organization, POSTed it from another's token, and got
+    // a 409 that distinguished a handle somebody in the environment holds from one nobody
+    // does. Under `OrgScoped` uniqueness it was also simply wrong -- the store would have
+    // accepted the second organization's copy, so SCIM could not provision one person into two
+    // organizations at all.
+    //
+    // So a hit is a conflict only when it is a conflict FOR THIS CALLER: under environment-wide
+    // uniqueness any hit is, and under org-scoped or non-unique it is one only if the person
+    // found is already a member here. Anything else falls through to `add`, whose index is the
+    // authority and which refuses the same case with the same status.
+    match store
+        .scoped(scope)
+        .user_identifiers()
+        .resolve(kind, &parsed.user_name)
+        .await
+    {
+        Ok(found) if !found.is_empty() => {
+            let conflicts = match state.uniqueness_mode() {
+                UniquenessMode::EnvironmentWide => true,
+                UniquenessMode::OrgScoped | UniquenessMode::NonUnique => {
+                    let mut here = false;
+                    for resolution in &found {
+                        match store
+                            .scoped(scope)
+                            .org_memberships()
+                            .exists(&auth.connection.organization_id, &resolution.user_id)
+                            .await
+                        {
+                            Ok(true) => {
+                                here = true;
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(error) => return Err(store_failure(&error)),
+                        }
+                    }
+                    here
+                }
+            };
+            if conflicts {
+                return Err(scim_error(
+                    StatusCode::CONFLICT,
+                    Some("uniqueness"),
+                    "a user with this userName already exists",
+                ));
+            }
+        }
+        Ok(_) => {}
+        Err(error) => return Err(store_failure(&error)),
+    }
+    // MAJOR: the externalId conflict is checked BEFORE anything is written. `bind` runs after
+    // three committed writes, so a duplicate externalId used to answer 409 having already
+    // created the account, its identifier row and its organization membership -- the client was
+    // told nothing was created and the organization gained a member. The index below is still
+    // the authority for a concurrent pair; this is what stops the ordinary retry.
+    if let Some(external_id) = parsed.external_id.as_deref() {
+        match store
+            .scoped(scope)
+            .scim_external_ids()
+            .resolve(&auth.connection.id, external_id)
+            .await
+        {
+            Ok(Some(_)) => {
+                return Err(scim_error(
+                    StatusCode::CONFLICT,
+                    Some("uniqueness"),
+                    "this connection has already provisioned a user with this externalId",
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(store_failure(&error)),
+        }
+    }
+    Ok(())
 }
 
 /// Register the account, index its login identifier, and bind it into the credential's
@@ -370,26 +466,89 @@ pub(crate) fn epoch_micros(state: &ScimState) -> i64 {
         .unwrap_or(0)
 }
 
-/// Move a user between the active and disabled lifecycle states.
+/// Set whether this credential's organization considers a person active.
 ///
-/// `active=false` maps to [`UserState::Disabled`] rather than blocked: the issue says so, and
-/// the two differ in operator INTENT, which a provisioning system does not have. A user
-/// already in the target state is left alone rather than transitioned, because the store
-/// refuses a no-op transition and an IdP re-sending a deactivate is ordinary traffic.
+/// # A SCIM deactivate must not reach another organization
+///
+/// The obvious implementation moves `users.state` to `Disabled`, and it is WRONG. That column
+/// is a property of the PERSON in the whole environment, not of one organization's view of
+/// them, so a token for organization B deactivating a shared person stops them signing in to
+/// organization A -- a cross-organization write through a door that never names organization
+/// A. A reviewer drove exactly that: Initech's token issued one `DELETE` and Globex's user
+/// could no longer authenticate.
+///
+/// So `active` is recorded PER ORGANIZATION (migration 0185), which is what a SCIM resource
+/// actually describes: a person as one organization sees them.
+///
+/// # The account state moves only when nothing else holds them active
+///
+/// A person deactivated by their LAST organization is genuinely offboarded, and leaving the
+/// account enabled would be the opposite failure: an identity provider that deactivated
+/// somebody would have left them able to sign in. So `users.state` moves exactly when no other
+/// organization still considers them active, in both directions, and neither direction can
+/// reach a person another organization holds.
+///
+/// # The membership STAYS, so reactivation works
+///
+/// Deactivating leaves the person a member and therefore addressable. Removing the membership
+/// would make the reactivating PATCH -- which an identity provider sends by resource id after
+/// a rehire or a sync blip -- answer the uniform 404, leaving the client with no way to undo
+/// its own deactivation. `DELETE` is the operation that removes the membership.
 async fn set_active(
     state: &ScimState,
     auth: &Authenticated,
     user: &UserId,
     active: bool,
 ) -> Result<(), Response> {
-    let store = state.store();
-    let record = store
-        .scoped(auth.scope)
+    let scoped = state.store().scoped(auth.scope);
+    scoped
+        .scim_activation()
+        .set_active(
+            &auth.connection.organization_id,
+            user,
+            active,
+            epoch_micros(state),
+        )
+        .await
+        .map_err(|error| store_failure(&error))?;
+    reconcile_account_state(state, auth, user).await
+}
+
+/// Move the account's own lifecycle state to match what its organizations now say.
+///
+/// Called after every change to a membership or an activation, and it asks ONE question: does
+/// any organization still consider this person active? The answer is computed from the whole
+/// relation rather than tracked incrementally, so a sequence of deactivations and
+/// reactivations in any order lands on the same state as the set of facts implies.
+async fn reconcile_account_state(
+    state: &ScimState,
+    auth: &Authenticated,
+    user: &UserId,
+) -> Result<(), Response> {
+    let env = state.env().clone();
+    let scoped = state.store().scoped(auth.scope);
+    let elsewhere = scoped
+        .scim_activation()
+        .active_elsewhere(&auth.connection.organization_id, user)
+        .await
+        .map_err(|error| store_failure(&error))?;
+    let here = scoped
+        .org_memberships()
+        .exists(&auth.connection.organization_id, user)
+        .await
+        .map_err(|error| store_failure(&error))?
+        && scoped
+            .scim_activation()
+            .is_active(&auth.connection.organization_id, user)
+            .await
+            .map_err(|error| store_failure(&error))?;
+    let should_be_active = here || elsewhere;
+    let record = scoped
         .users()
         .get(user)
         .await
         .map_err(|error| store_failure(&error))?;
-    let target = if active {
+    let target = if should_be_active {
         UserState::Active
     } else {
         UserState::Disabled
@@ -397,9 +556,14 @@ async fn set_active(
     if record.state == target {
         return Ok(());
     }
-    let env = state.env().clone();
-    store
-        .scoped(auth.scope)
+    // REACTIVATION is narrower than deactivation, deliberately. Moving somebody out of
+    // `Disabled` is fine, but a person sitting in `Blocked`, `Waitlisted` or
+    // `ScheduledOffboarding` is there because an operator or another subsystem put them there,
+    // and a provisioning client must not be able to lift that by sending `active: true`.
+    if should_be_active && record.state != UserState::Disabled {
+        return Ok(());
+    }
+    scoped
         .acting(auth.actor, CorrelationId::generate(&env))
         .users()
         .set_state(
@@ -607,10 +771,8 @@ pub(crate) async fn patch_user(
             "a PatchOp must carry at least one operation",
         );
     }
-    for operation in &parsed.operations {
-        if let Err(response) = apply_operation(&state, &auth, &user, operation).await {
-            return response;
-        }
+    if let Err(response) = apply_operations(&state, &auth, &user, &parsed.operations).await {
+        return response;
     }
     match rendered_user(&state, &auth, &user).await {
         Ok(body) => scim_json(StatusCode::OK, &body),
@@ -618,20 +780,64 @@ pub(crate) async fn patch_user(
     }
 }
 
-/// Apply one PATCH operation.
+/// What one PATCH operation asks this surface to change.
 ///
-/// # The two dialects, handled as one
+/// The normalized form BOTH vendor dialects reduce to. Okta sends
+/// `{"op":"replace","value":{"active":false}}` (no path, a whole object) and Entra sends
+/// `{"op":"Replace","path":"active","value":"False"}` (a path, a stringly boolean); neither
+/// shape survives past [`plan_operation`], so nothing downstream branches on the vendor.
+#[derive(Debug)]
+enum Change {
+    /// Set whether this credential's organization considers the person active.
+    Active(bool),
+    /// Point this connection's `externalId` at a value.
+    ExternalId(String),
+}
+
+/// `PATCH` is ATOMIC: everything is validated, then everything is applied.
 ///
-/// Okta sends `{"op":"replace","value":{"active":false}}` (no path, a whole object) and Entra
-/// sends `{"op":"Replace","path":"active","value":"False"}` (a path, a stringly boolean).
-/// Rather than branch on the vendor, both are normalized to the same
-/// (attribute, value) pairs and applied by one arm each.
-async fn apply_operation(
+/// RFC 7644 section 3.5.2 says a `PatchOp` "SHALL be treated as atomic. If a single operation
+/// encounters an error condition, the original SCIM resource MUST be restored". A loop that
+/// validated and applied one operation at a time violated that in a way a reviewer reached in
+/// one request: `[replace active=false, replace nickName]` answered 400 for the unsupported
+/// second operation and left the account deactivated by the first.
+///
+/// Two passes cannot give true rollback across the store, and this does not claim to: a
+/// failure in the middle of the APPLY pass still leaves earlier changes in place. What it
+/// removes is every reachable case, because the apply pass can only fail on a store error --
+/// every malformed, unsupported or ill-typed operation is refused before anything is written.
+async fn apply_operations(
     state: &ScimState,
     auth: &Authenticated,
     user: &UserId,
-    operation: &PatchOperation,
+    operations: &[PatchOperation],
 ) -> Result<(), Response> {
+    let mut planned = Vec::new();
+    for operation in operations {
+        planned.extend(plan_operation(operation)?);
+    }
+    for change in &planned {
+        match change {
+            Change::Active(active) => set_active(state, auth, user, *active).await?,
+            Change::ExternalId(external_id) => {
+                rebind_external_id(state, auth, user, Some(external_id.as_str())).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reduce one operation to the changes it asks for, refusing anything this surface cannot do.
+///
+/// The `Err` variant is a whole `Response`, which is large; boxing it would mean unboxing at
+/// the one call site that returns it, on a request path already doing database round trips.
+///
+/// Returns an EMPTY list for an operation that is well formed and asks for nothing this
+/// surface serves, which happens only inside a no-path object; a path naming an unserved
+/// attribute is refused, because a client that named one specifically is owed an answer rather
+/// than a silent success.
+#[allow(clippy::result_large_err)]
+fn plan_operation(operation: &PatchOperation) -> Result<Vec<Change>, Response> {
     let op = operation.op.to_ascii_lowercase();
     if op != "add" && op != "replace" && op != "remove" {
         return Err(scim_error(
@@ -656,15 +862,25 @@ async fn apply_operation(
             // attribute, and this slice serves none. Refusing names that; applying the
             // operation to the parent attribute would silently do the wrong thing.
             if path.sub_attribute().is_some() || path.selector().is_some() {
-                return Err(unsupported_attribute(raw));
+                return Err(unsupported_attribute(path.attribute()));
             }
             Some(path.attribute().to_ascii_lowercase())
         }
         None => None,
     };
-    match (attribute.as_deref(), operation.value.as_ref()) {
-        // Entra's shape: a path naming the attribute and a scalar value.
-        (Some("active"), Some(value)) => {
+    match (op.as_str(), attribute.as_deref()) {
+        // `remove` on an attribute this surface serves means "set it to its default".
+        // Answering "this surface does not serve the attribute active" to that, which an
+        // earlier version did, is a false sentence about a supported attribute.
+        ("remove", Some("active")) => Ok(vec![Change::Active(true)]),
+        (_, Some("active")) => {
+            let Some(value) = operation.value.as_ref() else {
+                return Err(scim_error(
+                    StatusCode::BAD_REQUEST,
+                    Some("invalidValue"),
+                    "active must carry a boolean value",
+                ));
+            };
             let Some(active) = scim_bool(value) else {
                 return Err(scim_error(
                     StatusCode::BAD_REQUEST,
@@ -672,13 +888,29 @@ async fn apply_operation(
                     "active must be a boolean",
                 ));
             };
-            set_active(state, auth, user, active).await
+            Ok(vec![Change::Active(active)])
         }
-        (Some("externalid"), Some(Value::String(external_id))) => {
-            rebind_external_id(state, auth, user, Some(external_id.as_str())).await
+        (_, Some("externalid")) => {
+            let Some(Value::String(external_id)) = operation.value.as_ref() else {
+                return Err(scim_error(
+                    StatusCode::BAD_REQUEST,
+                    Some("invalidValue"),
+                    "externalId must be a string",
+                ));
+            };
+            Ok(vec![Change::ExternalId(external_id.clone())])
         }
-        // Okta's shape: no path, a whole object whose members are the attributes to set.
-        (None, Some(Value::Object(members))) => {
+        (_, Some(other)) => Err(unsupported_attribute(other)),
+        // The no-path shape: a whole object whose members are the attributes to set.
+        (_, None) => {
+            let Some(Value::Object(members)) = operation.value.as_ref() else {
+                return Err(scim_error(
+                    StatusCode::BAD_REQUEST,
+                    Some("invalidValue"),
+                    "an operation with no path must carry an object value",
+                ));
+            };
+            let mut changes = Vec::new();
             for (name, value) in members {
                 match name.to_ascii_lowercase().as_str() {
                     "active" => {
@@ -689,49 +921,50 @@ async fn apply_operation(
                                 "active must be a boolean",
                             ));
                         };
-                        set_active(state, auth, user, active).await?;
+                        changes.push(Change::Active(active));
                     }
                     "externalid" => {
                         if let Value::String(external_id) = value {
-                            rebind_external_id(state, auth, user, Some(external_id.as_str()))
-                                .await?;
+                            changes.push(Change::ExternalId(external_id.clone()));
                         }
                     }
-                    // An attribute this surface does not serve is IGNORED inside a
-                    // no-path object, not refused. Okta sends whole resources here, most of
-                    // whose members are profile attributes; failing the request would make
-                    // every ordinary Okta update a 400.
+                    // An attribute this surface does not serve is IGNORED inside a no-path
+                    // object, not refused. A client sends whole resources here, most of whose
+                    // members are profile attributes, and failing would make every ordinary
+                    // update a 400.
                     _ => {}
                 }
             }
-            Ok(())
+            Ok(changes)
         }
-        (Some(other), _) => Err(unsupported_attribute(other)),
-        _ => Err(scim_error(
-            StatusCode::BAD_REQUEST,
-            Some("invalidValue"),
-            "the operation carries no value this surface can apply",
-        )),
     }
 }
 
 /// The refusal for an attribute this slice does not serve.
 fn unsupported_attribute(attribute: &str) -> Response {
+    // The PARSED attribute name, never the caller's raw path. The filter parser next door
+    // states the policy: "none carries the offending text, because echoing an attacker's input
+    // back into a response body is how a parser becomes a reflection gadget." A reviewer got a
+    // whole selector, script tags and a right-to-left override included, back verbatim. The
+    // attribute name is bounded by the grammar and carries no quoted literal.
+    let _ = attribute;
     scim_error(
         StatusCode::BAD_REQUEST,
         Some("invalidPath"),
-        &format!("this surface does not serve the attribute {attribute}"),
+        "this surface does not serve the attribute this operation names",
     )
 }
 
 /// `DELETE /scim/v2/Users/{id}` (RFC 7644 section 3.6).
 ///
-/// # Disable and unbind, never destroy
+/// # Unbind, and disable only what nothing else holds
 ///
-/// The account is moved to disabled and its membership in the credential's organization is
-/// removed. It is NOT deleted: one organization's provisioning system must not be able to
-/// destroy an account that other organizations in the same environment also hold, and after
-/// this call the user is exactly as reachable to those organizations as before.
+/// The membership in the credential's organization is removed, and the ACCOUNT is disabled
+/// only when that was the person's last live membership. It is never deleted. So an account
+/// other organizations in this environment also hold stays exactly as reachable to them as
+/// before, which an earlier version of this handler did not manage: it moved `users.state`
+/// unconditionally, and one organization's DELETE stopped a shared person signing in
+/// everywhere. See [`set_active`] for the rule and why both directions are conditioned on it.
 pub(crate) async fn delete_user(
     State(state): State<ScimState>,
     headers: HeaderMap,
@@ -745,24 +978,32 @@ pub(crate) async fn delete_user(
         Ok(user) => user,
         Err(response) => return response,
     };
-    if let Err(response) = set_active(&state, &auth, &user, false).await {
-        return response;
-    }
+    // DELETE and `active: false` are DIFFERENT acts here, and the difference is deliberate.
+    // RFC 7644 section 3.6 deletes the RESOURCE, so this removes the membership and the person
+    // stops being visible to this credential. A deactivate keeps the membership, because a
+    // client reactivates by resource id and an unaddressable person could never be reactivated.
     let env = state.env().clone();
-    let memberships = match state
-        .store()
-        .scoped(auth.scope)
-        .org_memberships()
-        .list_for_user(&user)
-        .await
-    {
+    let scoped = state.store().scoped(auth.scope);
+    let memberships = match scoped.org_memberships().list_for_user(&user).await {
         Ok(memberships) => memberships,
         Err(error) => return store_failure(&error),
     };
-    let acting = state
-        .store()
-        .scoped(auth.scope)
-        .acting(auth.actor, CorrelationId::generate(&env));
+    // The activation row is written FIRST and the membership removed second, so the account
+    // reconciliation below sees this organization as no longer holding the person by both
+    // measures. Writing it after the removal would leave a row for a membership that is gone.
+    if let Err(error) = scoped
+        .scim_activation()
+        .set_active(
+            &auth.connection.organization_id,
+            &user,
+            false,
+            epoch_micros(&state),
+        )
+        .await
+    {
+        return store_failure(&error);
+    }
+    let acting = scoped.acting(auth.actor, CorrelationId::generate(&env));
     for membership in memberships
         .iter()
         .filter(|membership| membership.organization_id == auth.connection.organization_id)
@@ -771,18 +1012,30 @@ pub(crate) async fn delete_user(
             return store_failure(&error);
         }
     }
+    if let Err(response) = reconcile_account_state(&state, &auth, &user).await {
+        return response;
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
 /// The query parameters `GET /scim/v2/Users` reads (RFC 7644 section 3.4.2).
+///
+/// # Every field is a STRING, and the numbers are parsed later
+///
+/// `Query<T>` is a `FromRequestParts` extractor, so it runs BEFORE the handler body and
+/// therefore before authentication. With typed fields, `?count=abc` answered a plain-text
+/// `400 Failed to deserialize query string` to a caller with no credential at all -- the one
+/// response on this surface that is neither a SCIM error document nor the uniform 401, and an
+/// answer an unauthenticated caller is not entitled to. Taking the raw strings makes the
+/// extractor infallible, so the first thing every request meets is still `authenticate`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListQuery {
     #[serde(default)]
     filter: Option<String>,
     #[serde(rename = "startIndex", default)]
-    start_index: Option<i64>,
+    start_index: Option<String>,
     #[serde(default)]
-    count: Option<i64>,
+    count: Option<String>,
 }
 
 impl ListQuery {
@@ -793,20 +1046,29 @@ impl ListQuery {
 
     /// The 1-based index of the first resource to return (RFC 7644 section 3.4.2.4).
     ///
-    /// Clamped up to 1 rather than refused: the RFC says a value less than 1 is interpreted
-    /// as 1, and refusing would fail a client that sent 0 meaning "the beginning".
+    /// Clamped up to 1 rather than refused: the RFC says a value less than 1 is interpreted as
+    /// 1, and refusing would fail a client that sent 0 meaning "the beginning". An
+    /// UNPARSEABLE value is also 1, for the reason in the struct docs: this runs after
+    /// authentication and a refusal here would be a fourth answer shape for a caller who at
+    /// worst mistyped a number.
     pub(crate) fn start_index(&self) -> i64 {
-        self.start_index.unwrap_or(1).max(1)
+        self.start_index
+            .as_deref()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// The requested page size, for [`ScimLimits::clamp_count`] to bound.
     ///
     /// A NEGATIVE count becomes zero rather than wrapping: `usize::try_from` on a negative
     /// fails, and mapping that failure to the default page size would turn "give me nothing"
-    /// into a full page.
+    /// into a full page. An unparseable value is `None`, which is the default page size --
+    /// the same answer a caller who sent no count at all gets.
     pub(crate) fn count(&self) -> Option<usize> {
-        self.count
-            .map(|count| usize::try_from(count.max(0)).unwrap_or(0))
+        let raw = self.count.as_deref()?;
+        let parsed = raw.parse::<i64>().ok()?;
+        Some(usize::try_from(parsed.max(0)).unwrap_or(0))
     }
 }
 
@@ -897,12 +1159,14 @@ async fn collect_matches(
         if !member {
             return Ok(Vec::new());
         }
-        let resource = rendered_user(state, auth, &candidate).await?;
-        return Ok(if crate::filter_matches(filter, &resource) {
-            vec![resource]
-        } else {
-            Vec::new()
-        });
+        // NO post-hoc filter re-check. The index answered the same question the filter asks,
+        // and the two do not agree on what "equal" means: the identifier seam canonicalizes
+        // (NFKC, case fold, whitespace and zero-width stripping) while the evaluator's string
+        // comparison only lowercases. A reviewer found the consequence -- a user stored as
+        // `admin` made `POST "ad min"` a 409 and `filter=userName eq "ad min"` an empty list,
+        // so a client sending that spelling could neither find the person nor create them.
+        // Re-checking here would be asking a weaker comparison to second-guess a stronger one.
+        return Ok(vec![rendered_user(state, auth, &candidate).await?]);
     }
     scan_members(state, auth, filter).await
 }
@@ -967,13 +1231,13 @@ async fn scan_members(
     // One row MORE than the bound, so reaching it is distinguishable from exactly filling it.
     // Asking for exactly `max_scan` and getting `max_scan` back cannot tell a full page from
     // the last page, and guessing either way is wrong half the time.
-    let probe = i64::try_from(state.limits().max_scan.saturating_add(1)).unwrap_or(i64::MAX);
+    let probe = i64::try_from(state.limits().scan_bound().saturating_add(1)).unwrap_or(i64::MAX);
     let memberships = scoped
         .org_memberships()
         .list_for_org(&auth.connection.organization_id, probe, None)
         .await
         .map_err(|error| store_failure(&error))?;
-    if memberships.len() > state.limits().max_scan {
+    if memberships.len() > state.limits().scan_bound() {
         return Err(scim_error(
             StatusCode::BAD_REQUEST,
             Some("tooMany"),
@@ -990,7 +1254,12 @@ async fn scan_members(
             continue;
         };
         let external_id = external_id_of(state, auth, &membership.user_id).await;
-        let resource = user_resource(&record, external_id.as_deref());
+        let active = scoped
+            .scim_activation()
+            .is_active(&auth.connection.organization_id, &membership.user_id)
+            .await
+            .map_err(|error| store_failure(&error))?;
+        let resource = user_resource(&record, external_id.as_deref(), active);
         if let Some(filter) = filter
             && !crate::filter_matches(filter, &resource)
         {

@@ -34,8 +34,15 @@ CREATE TABLE scim_external_ids (
     environment_id     text        NOT NULL,
     -- The connection whose namespace this mapping lives in.
     connection_id      text        NOT NULL,
-    -- The provisioning client's own identifier. Opaque to this server: it is compared byte for
-    -- byte and never parsed, because its shape is the IdP's business.
+    -- The provisioning client's own identifier. Never PARSED by this server: its shape is the
+    -- identity provider's business. Two paths compare it and they do not agree on case. The
+    -- indexed lookup below is byte exact (it is a btree probe on this column), while a
+    -- `filter=externalId eq ...` that falls through to the membership scan is evaluated by the
+    -- SCIM filter evaluator, which case-folds per RFC 7643 section 2.1. So a stored `okta-77`
+    -- is found by `OKTA-77` through the scan and not through the index. Recorded here rather
+    -- than asserted away: making them agree means choosing which relation is right for a
+    -- column the specification gives no uniqueness or case rule for, which is a decision this
+    -- table does not get to make alone.
     external_id        text        NOT NULL,
     -- The person it names here.
     user_id            text        NOT NULL,
@@ -54,9 +61,19 @@ CREATE TABLE scim_external_ids (
 
 -- THE NAMESPACE, as an index rather than a convention: one external id per connection.
 --
--- A second create with the same `externalId` is a CONFLICT the handler answers as SCIM 409,
--- which is what RFC 7644 section 3.3 requires and what stops a retried provisioning run from
--- creating a duplicate person.
+-- A second bind of the same `externalId` under one connection is a CONFLICT the handler answers
+-- as SCIM 409. What this index guarantees is exactly that: ONE mapping row per (connection,
+-- externalId). It does NOT by itself stop a retried provisioning run from creating a duplicate
+-- person -- the account, its identifier row and its organization membership are written before
+-- the bind, so a create that reached this index having already committed those would answer
+-- 409 with the person created anyway. The handler therefore resolves the externalId BEFORE it
+-- writes anything, and this index is the authority for the concurrent pair that both pass that
+-- check.
+--
+-- On the status: RFC 7644 section 3.3 gives 409 for a uniqueness violation, but RFC 7643
+-- section 3.1 puts no uniqueness constraint on `externalId`, so the 409 is this server's
+-- choice for its own per-connection namespace rather than something the specification
+-- requires.
 CREATE UNIQUE INDEX scim_external_ids_unique_per_connection
     ON scim_external_ids (tenant_id, environment_id, connection_id, external_id);
 
@@ -89,13 +106,19 @@ CREATE POLICY scim_external_ids_scope ON scim_external_ids
 -- capability with no caller.
 GRANT SELECT, INSERT ON scim_external_ids TO ironauth_app;
 
--- The CONTROL plane reads, so an operator can answer "what did this connection provision"
--- after it has been revoked.
+-- The CONTROL plane reads. NO CALLER YET: nothing on the management plane reads this table
+-- today, and by the standard this file applies three lines up (a DELETE grant would be "a
+-- capability with no caller") that makes this one too. It is granted anyway, and the reason is
+-- the precedent 0087 records: deferring a grant the design already knows it needs produced the
+-- 0027-then-0084 revoke-and-re-grant churn on `organizations`. The operator-facing question
+-- this answers -- "what did this connection provision" after it was revoked -- is owned by the
+-- self-service portal issue, and a SELECT confers no ability to change anything.
 GRANT SELECT ON scim_external_ids TO ironauth_control;
 
 COMMENT ON TABLE scim_external_ids IS
     'Issue #135: the provisioning client''s own identifier for a person, namespaced per SCIM '
     'connection because two IdPs can use the same externalId for different people.';
 COMMENT ON COLUMN scim_external_ids.external_id IS
-    'Issue #135: opaque to this server. Compared byte for byte and never parsed; its shape is '
-    'the identity provider''s business.';
+    'Issue #135: never parsed by this server; its shape is the identity provider''s business. '
+    'The indexed lookup compares it byte for byte and the filter scan case-folds it; see the '
+    'column comment in migration 0184 for why both exist.';

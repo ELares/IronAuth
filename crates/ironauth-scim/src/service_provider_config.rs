@@ -40,6 +40,13 @@ pub struct ScimLimits {
     /// reaching the bound is REFUSED (RFC 7644 section 3.4.2.2 `tooMany`) rather than silently
     /// truncated: a short page that looked complete would make a provisioning client
     /// deprovision every member it did not see.
+    ///
+    /// READ IT THROUGH [`ScimLimits::scan_bound`], never directly. The store will not return
+    /// more than [`MANAGEMENT_LIST_HARD_CAP`] rows from one list call, so a value above that
+    /// makes the refusal UNREACHABLE and turns the bound into exactly the silent truncation
+    /// the paragraph above says it prevents. That is not hypothetical: the first version of
+    /// this field defaulted to 10 000, and a reviewer seeded 1100 members and got a 200 with
+    /// `totalResults: 1001` and no indication the answer was partial.
     pub max_scan: usize,
 }
 
@@ -50,14 +57,53 @@ impl Default for ScimLimits {
             // What Okta and Entra page at, and small enough that a hostile `count` buys
             // nothing over an honest one.
             max_results: 200,
-            // Comfortably above any organization a single IdP provisions in practice, and
-            // far below an amount of per-request work a caller can choose.
-            max_scan: 10_000,
+            // The store's own list cap, which is the largest value that can ever be reached:
+            // see the field's docs.
+            max_scan: DEFAULT_MAX_SCAN,
         }
     }
 }
 
+/// The default scan bound: exactly what one store list call will return.
+///
+/// A `usize` conversion of an `i64` constant, done once here rather than at each use.
+/// `MANAGEMENT_LIST_HARD_CAP` is a small positive literal, so the fallback is unreachable and
+/// is a saturating floor rather than a panic.
+const DEFAULT_MAX_SCAN: usize = {
+    // `usize::try_from` is not const, so the conversion is written out. The negative guard is
+    // a saturating floor rather than a panic; the cap is a small positive literal in the store,
+    // so it is unreachable, and 0 refuses every scan rather than silently allowing an
+    // unbounded one.
+    //
+    // There is deliberately NO upper guard. An earlier version had `cap > usize::MAX as i64`,
+    // which is nonsense: that cast wraps to -1, so the comparison was always true and this
+    // constant evaluated to 0 -- which would have made `scan_bound` return 0 and refuse every
+    // list. Clippy found it, through `unnecessary_min_or_max` on the caller rather than here.
+    let cap = ironauth_store::MANAGEMENT_LIST_HARD_CAP;
+    if cap < 0 {
+        0
+    } else {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        {
+            cap as usize
+        }
+    }
+};
+
 impl ScimLimits {
+    /// The scan bound actually enforced: the configured value, or the store's list cap if that
+    /// is smaller.
+    ///
+    /// The `min` is the whole point. A caller can configure `max_scan` to anything, but the
+    /// store returns at most `MANAGEMENT_LIST_HARD_CAP` rows per list call, so a larger
+    /// configured value would leave `len() > bound` permanently false and the refusal
+    /// permanently dead. Clamping here makes the bound reachable BY CONSTRUCTION rather than
+    /// by whoever last edited the default.
+    #[must_use]
+    pub fn scan_bound(&self) -> usize {
+        self.max_scan.min(DEFAULT_MAX_SCAN)
+    }
+
     /// The page size to actually use for a client-requested `count`.
     ///
     /// Clamps rather than refuses: RFC 7644 section 3.4.2.4 says a provider MAY return fewer
@@ -268,6 +314,37 @@ mod tests {
                 "one byte over the advertised size must be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_scan_bound_can_never_exceed_what_one_store_list_call_returns() {
+        // THE PROPERTY THE CLAMP EXISTS FOR, and it cannot be driven through the HTTP surface:
+        // a test at a small bound exercises a `min` that is a no-op there, and a test at a
+        // large one would have to seed a thousand members. It is a pure function, so it is
+        // asserted directly.
+        //
+        // The defect this closes: `max_scan` defaulted to 10 000 while
+        // `OrgMembershipRepo::list_for_org` clamps its limit to `MANAGEMENT_LIST_HARD_CAP + 1`,
+        // so `len() > max_scan` was permanently false, the `tooMany` refusal was dead code, and
+        // 1100 seeded members answered 200 with `totalResults: 1001` and no sign the answer was
+        // partial. An identity provider reads that as the complete member list.
+        let cap = usize::try_from(ironauth_store::MANAGEMENT_LIST_HARD_CAP).expect("a small cap");
+        for configured in [1, 10, cap - 1, cap, cap + 1, 10_000, usize::MAX] {
+            let limits = ScimLimits {
+                max_scan: configured,
+                ..ScimLimits::default()
+            };
+            assert!(
+                limits.scan_bound() <= cap,
+                "a configured {configured} must not produce an unreachable bound"
+            );
+            // And it is a CLAMP, not a constant: a bound below the cap is honoured, or a
+            // deployment could not narrow the scan at all.
+            assert_eq!(limits.scan_bound(), configured.min(cap), "{configured}");
+        }
+        // The default is reachable, which is the case that actually ships.
+        assert!(ScimLimits::default().scan_bound() <= cap);
+        assert!(ScimLimits::default().scan_bound() > 0);
     }
 
     #[test]

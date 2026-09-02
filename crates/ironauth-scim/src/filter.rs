@@ -596,7 +596,10 @@ fn utf8_width(byte: u8) -> usize {
 ///
 /// A path that names no attribute of the resource does not match, for every operator except
 /// `ne`: "not equal to a value that is not there" is true, and a resource missing the
-/// attribute is genuinely not equal to it. That asymmetry is RFC 7644's, not this function's.
+/// attribute is genuinely not equal to it. RFC 7644 section 3.4.2.2 says only that a provider
+/// "SHALL treat the attribute as if there is no attribute value" and prescribes no such
+/// exception, so the asymmetry is the common implementation convention rather than something
+/// the specification requires.
 #[must_use]
 pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
     match filter {
@@ -604,8 +607,8 @@ pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
             let found = attribute_values(resource, path);
             if found.is_empty() {
                 // "not equal to a value that is not there" is true; every other operator is
-                // false against an attribute the resource does not carry. That asymmetry is
-                // RFC 7644's, not this function's.
+                // false against an attribute the resource does not carry. A convention rather
+                // than a requirement; see this function's docs.
                 return *op == CompareOp::NotEqual;
             }
             found.iter().any(|value_at| compare(value_at, *op, value))
@@ -651,10 +654,14 @@ pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
 /// emails.value ew "@example.com"` may be satisfied by two DIFFERENT addresses, while
 /// `emails[type eq "work" and value ew "@example.com"]` requires one address to be both.
 ///
-/// The schema URN half of a qualified path is IGNORED rather than matched. This surface
-/// serves one schema per resource type, so `urn:...:core:2.0:User:userName` and `userName`
-/// name the same thing; matching the URN would make a fully qualified filter (which Entra
-/// sends) miss the attribute it correctly named.
+/// The schema URN half of a qualified path is IGNORED rather than matched. A resource is
+/// rendered as ONE flat JSON object regardless of which schema declares each attribute, so
+/// there is nothing for a URN to select between: `urn:...:core:2.0:User:userName` and
+/// `userName` name the same member of the same object. (The surface does publish the
+/// enterprise User extension alongside the core schema, so "one schema per resource type"
+/// would be false; what is true is that one RESOURCE is one object here.) Matching the URN
+/// would make a fully qualified filter, which Entra sends for extension attributes, miss the
+/// attribute it correctly named.
 fn attribute_values<'a>(
     resource: &'a serde_json::Value,
     path: &AttributePath,
@@ -696,16 +703,29 @@ fn compare(found: &serde_json::Value, op: CompareOp, literal: &Value) -> bool {
             CompareOp::NotEqual => left != right,
             _ => false,
         },
+        // EXACT equality is the right relation here and `float_cmp` is wrong about this one.
+        // A filter is a SELECTION over values a client stored, not a measurement: an epsilon
+        // would make `count eq 3` also select 3.0000001, which no client asked for and which
+        // has no defensible width. The lint is what pushed an earlier version into
+        // `(left - right).abs() == 0.0`, a DIFFERENT relation that yields NaN once a
+        // non-finite value is involved -- so dodging the lint is how the bug got in.
+        #[allow(clippy::float_cmp)]
         (serde_json::Value::Number(left), Value::Number(right)) => {
             let Some(left) = left.as_f64() else {
                 return false;
             };
             match op {
-                // Bit-for-bit equality on the two f64s, which is what the JSON numbers
-                // actually are; no epsilon, because a filter is a selection over stored
-                // values rather than a measurement.
-                CompareOp::Equal => (left - right).abs() == 0.0,
-                CompareOp::NotEqual => (left - right).abs() != 0.0,
+                // DIRECT equality on the two f64s, no epsilon: a filter is a selection over
+                // stored values rather than a measurement. Written as `==` rather than as the
+                // `(left - right).abs() == 0.0` an earlier version used, which is a different
+                // relation once a non-finite value is involved: `parse_number` accepts `1e999`
+                // and `f64` parses it to infinity without error, so the LITERAL side can be
+                // infinite. (The resource side cannot: JSON has no infinity, so the
+                // both-infinite case that would make the subtraction NaN is unreachable. The
+                // direct comparison is simply the right relation and does not need that
+                // argument to hold.)
+                CompareOp::Equal => left == *right,
+                CompareOp::NotEqual => left != *right,
                 CompareOp::GreaterThan => left > *right,
                 CompareOp::GreaterOrEqual => left >= *right,
                 CompareOp::LessThan => left < *right,
@@ -795,6 +815,42 @@ mod evaluator_tests {
         assert!(holds(
             r#"emails.type eq "home" and emails.value ew "@example.com""#
         ));
+    }
+
+    #[test]
+    fn a_type_mismatch_satisfies_ne_and_nothing_else() {
+        // The arm the doc comment argues for at length, and which a reviewer mutated to
+        // `_ => true` with all 52 lib tests still green. A wrong TRUE here puts a resource in
+        // a list the client asked to exclude.
+        assert!(!holds(r#"active eq "true""#));
+        assert!(holds(r#"active ne "true""#));
+        assert!(!holds("userName gt 5"));
+        assert!(!holds("userName eq 5"));
+        assert!(holds("userName ne 5"));
+        assert!(!holds(r#"emails eq "alice@example.com""#));
+    }
+
+    #[test]
+    fn a_number_compares_directly_and_survives_an_overflowing_literal() {
+        // `1e999` parses to f64 infinity, and any client can send it. Only the LITERAL side
+        // can be infinite: JSON has no infinity, so `serde_json` cannot hold one on the
+        // resource side and a stored-infinity case is unreachable. The comparison is
+        // therefore always finite-against-possibly-infinite, which `==` and the ordering
+        // operators handle and which an epsilon would only blur.
+        let resource = serde_json::json!({"count": 3.0});
+        let holds_on =
+            |input: &str| matches(&parse_filter(input).expect("a valid filter"), &resource);
+        assert!(holds_on("count eq 3"));
+        assert!(!holds_on("count eq 4"));
+        assert!(holds_on("count gt 2"));
+        assert!(holds_on("count le 3"));
+        // The overflowing literal: a finite stored value is less than infinity, is not equal
+        // to it, and IS unequal to it. All three have to agree, because a comparison that
+        // yielded NaN internally would answer the opposite on the last two.
+        assert!(holds_on("count lt 1e999"));
+        assert!(!holds_on("count eq 1e999"));
+        assert!(holds_on("count ne 1e999"));
+        assert!(!holds_on("count gt 1e999"));
     }
 
     #[test]

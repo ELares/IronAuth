@@ -24,24 +24,60 @@ pub const ENTERPRISE_USER_SCHEMA: &str =
 /// The core `Group` schema URN.
 pub const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 
+/// How a provisioning client may write an attribute (RFC 7643 section 7).
+///
+/// A published `mutability` is a PROMISE, and the wrong one is worse than none: a client that
+/// reads `readWrite` and sends a change it will be refused has been told to make a request
+/// that cannot succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mutability {
+    /// Settable at creation and changeable afterwards.
+    ReadWrite,
+    /// Settable at CREATION and never afterwards. `userName` is this one: the identifier lives
+    /// on the account row, which this store gives no update path, so `replace_user` refuses a
+    /// changed `userName` with a 400. Publishing it as `readWrite` told every client the
+    /// opposite of what the surface does.
+    Immutable,
+}
+
+impl Mutability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mutability::ReadWrite => "readWrite",
+            Mutability::Immutable => "immutable",
+        }
+    }
+}
+
 /// One attribute definition, in the shape RFC 7643 section 7 gives it.
-fn attribute(name: &str, kind: &str, multi: bool, required: bool) -> Value {
+fn attribute(name: &str, kind: &str, multi: bool, required: bool, mutability: Mutability) -> Value {
     json!({
         "name": name,
         "type": kind,
         "multiValued": multi,
         "required": required,
         "caseExact": false,
-        // Every attribute this server publishes is readable and writable by the provisioning
-        // client. An attribute the client may not write does not belong in an inbound schema:
-        // it would advertise a field whose every write is silently dropped.
-        "mutability": "readWrite",
+        "mutability": mutability.as_str(),
         "returned": "default",
         "uniqueness": if name == "userName" { "server" } else { "none" },
     })
 }
 
 /// The schemas this server publishes, in the order `GET /Schemas` returns them.
+///
+/// # This document describes the TARGET surface, not only what this slice stores
+///
+/// `displayName`, `emails`, `name` and the three enterprise attributes are published and are
+/// not yet parsed by [`crate::ScimUser`], so a `PUT` carrying them drops them and a no-path
+/// PATCH object ignores them. That is a real gap between the document and the behaviour, and
+/// it is recorded here rather than hidden: the alternative, publishing only `userName`,
+/// `externalId` and `active`, would make a provisioning client's schema discovery report a
+/// surface no identity provider would attempt to use, and would have to be reverted attribute
+/// by attribute as each lands.
+///
+/// [`crate::schema::tests::the_user_schema_covers_every_attribute_the_model_parses`] checks the
+/// direction that MUST hold: everything the model parses is published. The reverse direction
+/// is deliberately not asserted, for the reason above.
 #[must_use]
 pub fn core_schemas() -> Vec<Value> {
     vec![
@@ -53,12 +89,12 @@ pub fn core_schemas() -> Vec<Value> {
                 // `userName` is the only REQUIRED attribute, per RFC 7643 section 4.1.1, and
                 // the only one with server uniqueness: it is what a provisioning client uses
                 // to mean "the same person".
-                attribute("userName", "string", false, true),
-                attribute("displayName", "string", false, false),
-                attribute("externalId", "string", false, false),
-                attribute("active", "boolean", false, false),
-                attribute("emails", "complex", true, false),
-                attribute("name", "complex", false, false),
+                attribute("userName", "string", false, true, Mutability::Immutable),
+                attribute("displayName", "string", false, false, Mutability::ReadWrite),
+                attribute("externalId", "string", false, false, Mutability::ReadWrite),
+                attribute("active", "boolean", false, false, Mutability::ReadWrite),
+                attribute("emails", "complex", true, false, Mutability::ReadWrite),
+                attribute("name", "complex", false, false, Mutability::ReadWrite),
             ],
         }),
         json!({
@@ -66,9 +102,9 @@ pub fn core_schemas() -> Vec<Value> {
             "name": "EnterpriseUser",
             "description": "Enterprise User",
             "attributes": [
-                attribute("employeeNumber", "string", false, false),
-                attribute("department", "string", false, false),
-                attribute("manager", "complex", false, false),
+                attribute("employeeNumber", "string", false, false, Mutability::ReadWrite),
+                attribute("department", "string", false, false, Mutability::ReadWrite),
+                attribute("manager", "complex", false, false, Mutability::ReadWrite),
             ],
         }),
         json!({
@@ -76,8 +112,8 @@ pub fn core_schemas() -> Vec<Value> {
             "name": "Group",
             "description": "Group",
             "attributes": [
-                attribute("displayName", "string", false, true),
-                attribute("members", "complex", true, false),
+                attribute("displayName", "string", false, true, Mutability::ReadWrite),
+                attribute("members", "complex", true, false, Mutability::ReadWrite),
             ],
         }),
     ]

@@ -5,7 +5,7 @@
 //! # What group push actually is
 //!
 //! Not a PUT of a group with its members. Okta and Entra create the group once and then send a
-//! long stream of PATCHes, one member at a time, in three different shapes. A server that
+//! long stream of `PATCH`es, one member at a time, in three different shapes. A server that
 //! served only the shape it was tested with would appear to work and would silently fail to
 //! add or remove people, which is the failure mode nobody notices until an offboarded employee
 //! still has access. So every shape is driven here, and each is asserted to have CHANGED the
@@ -166,10 +166,10 @@ async fn members(db: &TestDatabase, env: &Env, token: &str, group: &str) -> Vec<
     ids
 }
 
-fn patch(operations: Value) -> Value {
+fn patch(operations: &Value) -> Value {
     json!({
         "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-        "Operations": operations,
+        "Operations": operations.clone(),
     })
 }
 
@@ -202,7 +202,7 @@ async fn a_group_is_created_read_renamed_and_deleted() {
         &format!("/scim/v2/Groups/{group}"),
         Some(&token),
         Some(patch(
-            json!([{"op": "replace", "path": "displayName", "value": "Platform Team"}]),
+            &json!([{"op": "replace", "path": "displayName", "value": "Platform Team"}]),
         )),
     )
     .await;
@@ -259,7 +259,7 @@ async fn every_shape_a_provisioning_client_sends_changes_the_membership() {
         &format!("/scim/v2/Groups/{group}"),
         Some(&token),
         Some(patch(
-            json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
+            &json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
         )),
     )
     .await;
@@ -277,7 +277,7 @@ async fn every_shape_a_provisioning_client_sends_changes_the_membership() {
         &format!("/scim/v2/Groups/{group}"),
         Some(&token),
         Some(patch(
-            json!([{"op": "add", "path": "members", "value": [{"value": bob}]}]),
+            &json!([{"op": "add", "path": "members", "value": [{"value": bob}]}]),
         )),
     )
     .await;
@@ -293,7 +293,7 @@ async fn every_shape_a_provisioning_client_sends_changes_the_membership() {
         "PATCH",
         &format!("/scim/v2/Groups/{group}"),
         Some(&token),
-        Some(patch(json!([{
+        Some(patch(&json!([{
             "op": "remove",
             "path": format!("members[value eq \"{bob}\"]"),
         }]))),
@@ -313,7 +313,7 @@ async fn every_shape_a_provisioning_client_sends_changes_the_membership() {
         &format!("/scim/v2/Groups/{group}"),
         Some(&token),
         Some(patch(
-            json!([{"op": "remove", "path": "members", "value": [{"value": alice}]}]),
+            &json!([{"op": "remove", "path": "members", "value": [{"value": alice}]}]),
         )),
     )
     .await;
@@ -372,7 +372,7 @@ async fn re_adding_a_member_already_in_the_group_is_not_a_duplicate() {
             &format!("/scim/v2/Groups/{group}"),
             Some(&token),
             Some(patch(
-                json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
+                &json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
             )),
         )
         .await;
@@ -403,12 +403,12 @@ async fn a_group_cannot_hold_another_organizations_user() {
         (
             "PATCH",
             format!("/scim/v2/Groups/{group}"),
-            patch(json!([{"op": "add", "path": "members", "value": [{"value": victim}]}])),
+            patch(&json!([{"op": "add", "path": "members", "value": [{"value": victim}]}])),
         ),
         (
             "PATCH",
             format!("/scim/v2/Groups/{group}"),
-            patch(json!([{"op": "replace", "value": {"members": [{"value": victim}]}}])),
+            patch(&json!([{"op": "replace", "value": {"members": [{"value": victim}]}}])),
         ),
         (
             "POST",
@@ -447,7 +447,7 @@ async fn a_token_for_one_organization_reaches_none_of_another_organizations_grou
         &format!("/scim/v2/Groups/{theirs}"),
         Some(&globex),
         Some(patch(
-            json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
+            &json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
         )),
     )
     .await;
@@ -470,7 +470,7 @@ async fn a_token_for_one_organization_reaches_none_of_another_organizations_grou
             (
                 "PATCH",
                 Some(patch(
-                    json!([{"op": "replace", "path": "displayName", "value": "Hijacked"}]),
+                    &json!([{"op": "replace", "path": "displayName", "value": "Hijacked"}]),
                 )),
             ),
             ("DELETE", None),
@@ -554,7 +554,7 @@ async fn no_group_route_answers_without_a_credential() {
             "PATCH",
             format!("/scim/v2/Groups/{group}"),
             Some(patch(
-                json!([{"op": "replace", "path": "displayName", "value": "Hijacked"}]),
+                &json!([{"op": "replace", "path": "displayName", "value": "Hijacked"}]),
             )),
         ),
         ("DELETE", format!("/scim/v2/Groups/{group}"), None),

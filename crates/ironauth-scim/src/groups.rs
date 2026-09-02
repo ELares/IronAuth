@@ -150,7 +150,7 @@ async fn group_resource(
         .list_for_group(
             &auth.connection.organization_id,
             &record.id,
-            i64::try_from(state.limits().max_scan).unwrap_or(i64::MAX),
+            i64::try_from(state.limits().scan_bound()).unwrap_or(i64::MAX),
             None,
         )
         .await
@@ -292,7 +292,7 @@ async fn set_members(
         .list_for_group(
             &auth.connection.organization_id,
             group,
-            i64::try_from(state.limits().max_scan).unwrap_or(i64::MAX),
+            i64::try_from(state.limits().scan_bound()).unwrap_or(i64::MAX),
             None,
         )
         .await
@@ -365,7 +365,7 @@ async fn drop_members(
         .list_for_group(
             &auth.connection.organization_id,
             group,
-            i64::try_from(state.limits().max_scan).unwrap_or(i64::MAX),
+            i64::try_from(state.limits().scan_bound()).unwrap_or(i64::MAX),
             None,
         )
         .await
@@ -670,6 +670,11 @@ async fn apply_group_operation(
 }
 
 /// The member list an operation's value carries.
+///
+/// `Response` is a large error type, and boxing it here would mean unboxing it at every call
+/// site to return it: these are request-handling paths that build at most one response per
+/// request, so the size is paid once on a path that is already doing a database round trip.
+#[allow(clippy::result_large_err)]
 fn members_of(value: Option<&Value>) -> Result<Vec<ScimMember>, Response> {
     match value {
         None => Ok(Vec::new()),
@@ -767,7 +772,7 @@ pub(crate) async fn list_groups(
         }
     };
     // One row MORE than the bound, so reaching it is distinguishable from exactly filling it.
-    let probe = i64::try_from(state.limits().max_scan.saturating_add(1)).unwrap_or(i64::MAX);
+    let probe = i64::try_from(state.limits().scan_bound().saturating_add(1)).unwrap_or(i64::MAX);
     let groups = match state
         .store()
         .scoped(auth.scope)
@@ -778,7 +783,7 @@ pub(crate) async fn list_groups(
         Ok(groups) => groups,
         Err(error) => return store_failure(&error),
     };
-    if groups.len() > state.limits().max_scan {
+    if groups.len() > state.limits().scan_bound() {
         return scim_error(
             StatusCode::BAD_REQUEST,
             Some("tooMany"),

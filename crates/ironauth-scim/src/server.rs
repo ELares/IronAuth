@@ -186,17 +186,30 @@ pub(crate) enum AuthRefusal {
     Missing,
     /// A well-formed bearer token that matches no live connection.
     Unknown,
+    /// The credential could not be CHECKED, which is not the same as being invalid.
+    ///
+    /// A database outage answering 401 tells every identity provider that its credential has
+    /// stopped working. A well-behaved one then stops retrying and alerts an operator about a
+    /// revocation that did not happen, so an IronAuth outage becomes a customer-visible
+    /// credential incident. 503 says the true thing, and is what a client backs off on.
+    Unavailable,
 }
 
 impl AuthRefusal {
     /// The wire answer.
     ///
-    /// BOTH refusals answer 401 with the same body. A caller that could tell "no such token"
+    /// Both REFUSALS answer 401 with the same body. A caller that could tell "no such token"
     /// from "malformed header" learns nothing useful, but a caller that could tell "no such
     /// token" from "revoked token" learns that a token it holds was once valid -- which is
     /// exactly what an attacker testing a leaked credential wants to know.
     pub(crate) fn response(self) -> Response {
-        let _ = self;
+        if self == AuthRefusal::Unavailable {
+            return scim_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                "the credential could not be verified; retry later",
+            );
+        }
         scim_error(
             StatusCode::UNAUTHORIZED,
             None,
@@ -252,9 +265,11 @@ pub(crate) fn scim_json(status: StatusCode, body: &serde_json::Value) -> Respons
 
 /// The bearer token a request presents, or [`None`].
 ///
-/// Case-insensitive on the scheme per RFC 7235, and the token is taken VERBATIM: it is hashed
-/// whole, so trimming or decoding it here would make the digest depend on this parser rather
-/// than on what the caller sent.
+/// Case-insensitive on the scheme per RFC 7235. The token is taken as sent EXCEPT for the
+/// whitespace RFC 7235 allows between the scheme and the credential, which `split_once(' ')`
+/// leaves on the front when a caller sent more than one space. Nothing else is trimmed or
+/// decoded: the digest covers the whole remaining string, so any further normalization here
+/// would make it depend on this parser rather than on what the caller sent.
 fn presented_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
@@ -329,7 +344,9 @@ async fn authenticate(
         .scim_connections()
         .authenticate(&digest, now)
         .await
-        .map_err(|_| AuthRefusal::Unknown)?
+        // A STORE failure is not a bad credential; see `AuthRefusal::Unavailable`. Only the
+        // absent row below is.
+        .map_err(|_| AuthRefusal::Unavailable)?
         .ok_or(AuthRefusal::Unknown)?;
     Ok((scope, found))
 }

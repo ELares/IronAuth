@@ -1054,3 +1054,121 @@ async fn an_external_id_mapping_refuses_a_foreign_scope() {
         .await;
     assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
 }
+
+#[tokio::test]
+async fn a_second_external_id_for_the_same_person_is_refused() {
+    // The `scim_external_ids_by_user` unique index, which a reviewer replaced with a plain
+    // index leaving every suite green. It is what makes `external_id_for` a single answer: two
+    // rows for one (connection, user) would make "what does this connection call this person"
+    // ambiguous, and the read would return whichever the planner picked.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let okta = connect(&db, &env, scope, &org, "scim_tok_two_keys").await;
+    let alice = seed_user(&db, &env, scope, "alice@example.test").await;
+
+    db.store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1first",
+            &alice,
+        )
+        .await
+        .expect("the first key");
+
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1second",
+            &alice,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::Conflict)),
+        "one connection calls one person by ONE name, got {outcome:?}"
+    );
+
+    // The control: the first mapping is intact and readable, so the refusal above is the
+    // index rather than a bind that never works twice.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .scim_external_ids()
+            .external_id_for(&okta, &alice)
+            .await
+            .expect("read back"),
+        Some("00u1first".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_cross_scope_bind_is_refused_by_the_guard_before_any_write() {
+    // `bind`'s three-way scope guard, which a reviewer replaced with `if false` leaving every
+    // suite green. Each id is varied ALONE, so a guard that checked only one of the three is
+    // caught by the other two rather than hidden by them.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let here = db.seed_scope(&env).await;
+    let there = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, here, "Globex").await;
+    let okta = connect(&db, &env, here, &org, "scim_tok_scoped").await;
+    let alice = seed_user(&db, &env, here, "alice@example.test").await;
+
+    let foreign_org = seed_org(&db, &env, there, "Elsewhere").await;
+    let foreign_connection = connect(&db, &env, there, &foreign_org, "scim_tok_elsewhere").await;
+    let foreign_user = seed_user(&db, &env, there, "bob@example.test").await;
+
+    for (what, id, connection, user) in [
+        (
+            "a mapping id from another scope",
+            ScimExternalIdId::generate(&env, &there),
+            okta,
+            alice,
+        ),
+        (
+            "a connection from another scope",
+            ScimExternalIdId::generate(&env, &here),
+            foreign_connection,
+            alice,
+        ),
+        (
+            "a user from another scope",
+            ScimExternalIdId::generate(&env, &here),
+            okta,
+            foreign_user,
+        ),
+    ] {
+        let outcome = db
+            .store()
+            .scoped(here)
+            .scim_external_ids()
+            .bind(&id, &connection, "00u1cross", &user)
+            .await;
+        assert!(
+            matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+            "{what} must be refused, got {outcome:?}"
+        );
+    }
+
+    // The control: all three in scope binds, so the refusals above are the guard rather than a
+    // bind that never succeeds.
+    db.store()
+        .scoped(here)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &here),
+            &okta,
+            "00u1cross",
+            &alice,
+        )
+        .await
+        .expect("all three in scope");
+}

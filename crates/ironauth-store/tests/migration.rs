@@ -8790,3 +8790,81 @@ async fn the_hook_chain_read_is_bounded_and_keeps_the_prefix() {
          changes what every later hook is handed"
     );
 }
+
+/// Whether a UNIQUE index named `index` exists on `table`.
+///
+/// The uniqueness of an index is invisible to every functional assertion that does not
+/// deliberately write a duplicate, so it is asserted structurally as well: a reviewer replaced
+/// both of 0184's unique indexes with plain ones and the whole suite stayed green.
+async fn unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
+    sqlx::query(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM pg_catalog.pg_index i \
+            JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+            WHERE i.indrelid = $1::regclass AND c.relname = $2 AND i.indisunique \
+         ) AS present",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await
+    .expect("unique index lookup")
+    .get("present")
+}
+
+#[tokio::test]
+async fn the_two_scim_tables_carry_their_isolation_structurally() {
+    // WHY STRUCTURALLY. Every repository query on both tables also carries explicit
+    // `tenant_id`/`environment_id` predicates, so no test reachable through the repository can
+    // tell the RLS policy from its absence: a reviewer replaced 0184's policy with
+    // `USING (true) WITH CHECK (true)` and every suite stayed green. The policy is the defence
+    // that survives a future query that forgets the predicates, which is exactly the query no
+    // existing test drives, so it has to be asserted here or nowhere.
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    for (table, policy) in [
+        ("scim_connections", "scim_connections_scope"),
+        ("scim_external_ids", "scim_external_ids_scope"),
+    ] {
+        assert!(
+            rls_enabled_and_forced(pool, table).await,
+            "{table} must have row-level security ENABLED and FORCED, so the policy binds \
+             even for the table owner"
+        );
+        assert!(
+            policy_exists(pool, table, policy).await,
+            "{table} carries its (tenant, environment) isolation policy"
+        );
+        assert!(
+            check_constraint_exists(pool, table, &format!("{table}_scope_nonempty")).await,
+            "{table} carries the nonempty-scope CHECK every scoped table carries"
+        );
+    }
+
+    // The one-way revocation policy, which is RESTRICTIVE rather than permissive: two
+    // permissive policies are OR'd, so a narrowing policy that was not restrictive would widen
+    // rather than narrow.
+    assert!(
+        policy_exists(
+            pool,
+            "scim_connections",
+            "scim_connections_revoke_is_one_way"
+        )
+        .await,
+        "the one-way revocation policy is present"
+    );
+
+    // Both of 0184's indexes are UNIQUE, which is the whole of what they are for: one names a
+    // person once per connection, the other names one person by one key per connection.
+    for index in [
+        "scim_external_ids_unique_per_connection",
+        "scim_external_ids_by_user",
+    ] {
+        assert!(
+            unique_index_exists(pool, "scim_external_ids", index).await,
+            "{index} must be UNIQUE; a plain index of the same name serves reads identically \
+             and enforces nothing"
+        );
+    }
+}

@@ -66,3 +66,88 @@ GRANT INSERT ON org_group_members TO ironauth_app;
 -- as a control-plane one is. Nothing is added here, and nothing needs to be: a new policy
 -- would be a SECOND answer to a question 0087 and 0088 already answer, and two policies on one
 -- table are OR'd, so a permissive addition could only ever widen what they allow.
+
+-- ---------------------------------------------------------------------------------------
+-- WHETHER AN ORGANIZATION CONSIDERS A PERSON ACTIVE (issue #135).
+--
+-- WHY THIS TABLE EXISTS AT ALL.
+--
+-- SCIM's `active` is per RESOURCE, and a SCIM resource is a person AS THIS ORGANIZATION SEES
+-- THEM. IronAuth has two nearby things and neither is that:
+--
+--   * `users.state` is the person in the whole ENVIRONMENT. Mapping `active` onto it lets a
+--     credential for organization B stop a shared person signing in to organization A -- a
+--     cross-organization write through a door that never names organization A. That is not
+--     hypothetical: it is what the first version of this surface did, and a reviewer drove it
+--     with one DELETE.
+--   * `org_memberships.state` is the right SHAPE but its CHECK is a closed set of exactly
+--     ('active'), so there is no value meaning "a member this organization has deactivated",
+--     and widening that set would arm every existing reader that assumes a live membership is
+--     an active one.
+--
+-- WHY NOT JUST REMOVE THE MEMBERSHIP.
+--
+-- Because REACTIVATION has to work. Deactivate-then-reactivate is the second most common thing
+-- a provisioning client does after create (a rehire, or a sync blip), and it reactivates BY
+-- RESOURCE ID. If deactivating removed the membership the person would no longer be visible to
+-- the credential, the reactivating PATCH would answer the uniform 404, and the identity
+-- provider would be stuck with no way to undo its own deactivation. So deactivating leaves the
+-- membership in place and writes here instead, and the person stays addressable.
+--
+-- DELETE is a different act and keeps its own meaning: RFC 7644 section 3.6 deletes the
+-- resource, so it removes the membership and the person genuinely stops being visible. A
+-- client that wants them back POSTs them again, which is what a client does after a delete.
+--
+-- SCOPED TO THE ORGANIZATION, NOT THE CONNECTION. Two connections provisioning one
+-- organization must agree about who is active in it: a per-connection answer would let one
+-- identity provider report a person active while another reported them not, and nothing could
+-- say which the organization meant.
+CREATE TABLE IF NOT EXISTS scim_membership_activation (
+    tenant_id       text        NOT NULL,
+    environment_id  text        NOT NULL,
+    organization_id text        NOT NULL,
+    user_id         text        NOT NULL,
+    -- FALSE means this organization has deactivated the person. There is no row for the
+    -- ordinary case, so an absent row reads as active and provisioning a person writes
+    -- nothing here.
+    active          boolean     NOT NULL,
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (tenant_id, environment_id, organization_id, user_id),
+    CONSTRAINT scim_membership_activation_scope_nonempty
+        CHECK (tenant_id <> '' AND environment_id <> ''),
+    FOREIGN KEY (tenant_id) REFERENCES tenants (id),
+    FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
+);
+
+ALTER TABLE scim_membership_activation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scim_membership_activation FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY scim_membership_activation_scope ON scim_membership_activation
+    USING (
+        tenant_id = current_setting('ironauth.tenant_id', true)
+        AND environment_id = current_setting('ironauth.environment_id', true)
+    )
+    WITH CHECK (
+        tenant_id = current_setting('ironauth.tenant_id', true)
+        AND environment_id = current_setting('ironauth.environment_id', true)
+    );
+
+-- The DATA plane owns this table outright: SCIM is the only thing that writes it and the only
+-- thing that reads it. UPDATE is column-scoped to the two mutable columns, so the row's
+-- subject -- which organization, which person, which scope -- can never be repointed, exactly
+-- as 0087 and 0088 fence theirs. DELETE is granted to nobody: reactivating writes `true`
+-- rather than removing the row, so the fact that this organization once deactivated somebody
+-- is not erased by their coming back.
+GRANT SELECT, INSERT ON scim_membership_activation TO ironauth_app;
+GRANT UPDATE (active, updated_at) ON scim_membership_activation TO ironauth_app;
+
+-- The CONTROL plane reads, so the operator-facing question "who has this organization
+-- deactivated" has an answer. No caller yet; see the same note on 0184's control grant.
+GRANT SELECT ON scim_membership_activation TO ironauth_control;
+
+COMMENT ON TABLE scim_membership_activation IS
+    'Issue #135: whether ONE organization considers a person active, which is what SCIM''s '
+    '`active` means. Absent row = active. Deliberately not users.state (environment wide, so '
+    'one organization could disable a person for another) and not org_memberships.state '
+    '(closed CHECK set with no deactivated value).';

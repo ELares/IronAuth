@@ -43,6 +43,7 @@ fn now_micros(env: &Env) -> i64 {
 /// One organization and the SCIM token that provisions into it.
 struct Tenant {
     token: String,
+    organization: OrganizationId,
 }
 
 async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret: &str) -> Tenant {
@@ -73,7 +74,10 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret
         )
         .await
         .expect("create connection");
-    Tenant { token }
+    Tenant {
+        token,
+        organization: org,
+    }
 }
 
 /// Drive one request against the real router.
@@ -85,10 +89,23 @@ async fn call(
     token: Option<&str>,
     body: Option<Value>,
 ) -> (StatusCode, String) {
+    call_with(db, env, method, path, token, body, ScimLimits::default()).await
+}
+
+/// [`call`] with explicit limits, so a test can drive a bound rather than assert about it.
+async fn call_with(
+    db: &TestDatabase,
+    env: &Env,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    limits: ScimLimits,
+) -> (StatusCode, String) {
     let state = ScimState::new(
         db.store().clone(),
         env.clone(),
-        ScimLimits::default(),
+        limits,
         ironauth_store::identifier::UniquenessMode::EnvironmentWide,
     );
     let mut builder = Request::builder().method(method).uri(path);
@@ -111,6 +128,39 @@ async fn call(
         .await
         .expect("body");
     (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Bind an existing person into a second organization, through the store.
+///
+/// A shared person cannot be built by `POST`ing the same `userName` twice: under environment-wide
+/// uniqueness the second create is a 409, which is correct. In practice a person ends up in two
+/// organizations through an invitation accept or an operator, both of which write the
+/// membership directly, so that is what this does.
+async fn also_a_member_of(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    user: &ironauth_store::UserId,
+) {
+    let membership = ironauth_store::OrgMembershipId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_memberships(scope)
+        .create(
+            env,
+            ironauth_store::NewMembership {
+                id: &membership,
+                organization_id: organization,
+                user_id: user,
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("bind the person into the second organization");
 }
 
 /// Create a user through the surface and return its SCIM id.
@@ -137,6 +187,43 @@ async fn provision(
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let parsed: Value = serde_json::from_str(&body).expect("a SCIM resource");
     parsed["id"].as_str().expect("an id").to_owned()
+}
+
+/// Create a user and return its id AND the `Location` header, for the one test that pins it.
+async fn provision_with_location(
+    db: &TestDatabase,
+    env: &Env,
+    token: &str,
+    user_name: &str,
+) -> (String, String) {
+    let state = ScimState::new(
+        db.store().clone(),
+        env.clone(),
+        ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/scim/v2/Users")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/scim+json")
+        .body(Body::from(json!({"userName": user_name}).to_string()))
+        .expect("request builds");
+    let response = scim_router(state)
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let parsed: Value = serde_json::from_slice(&bytes).expect("a SCIM resource");
+    (parsed["id"].as_str().expect("an id").to_owned(), location)
 }
 
 #[tokio::test]
@@ -657,4 +744,703 @@ async fn no_resource_route_answers_without_a_credential() {
     .await;
     let parsed: Value = serde_json::from_str(&body).expect("a resource");
     assert_eq!(parsed["active"], json!(true), "{body}");
+}
+
+// ---------------------------------------------------------------------------------------
+// REVIEW ROUND 1. Each of these drives a defect a reviewer reached; each failed before the
+// fix it names.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_organization_larger_than_the_scan_bound_is_refused_rather_than_truncated() {
+    // BLOCKER. `max_scan` defaulted to 10 000 while the store returns at most 1001 rows from
+    // one list call, so `len() > max_scan` was permanently false and the refusal was dead
+    // code: 1100 seeded members answered 200 with totalResults 1001 and no sign the answer was
+    // partial. A full Okta sync against that reads it as the complete member list and
+    // deprovisions everybody it did not see.
+    //
+    // Driven at a SMALL bound rather than by seeding 1001 people: the bug was that the
+    // configured bound could exceed what the store returns, and `scan_bound` now clamps it, so
+    // any bound at or below the store's cap is reachable and three members prove the same
+    // arithmetic as a thousand.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let limits = ScimLimits {
+        max_scan: 2,
+        ..ScimLimits::default()
+    };
+
+    for who in ["a", "b"] {
+        provision(&db, &env, &okta.token, &format!("{who}@example.test"), who).await;
+    }
+    // AT the bound: answered, in full.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        None,
+        limits,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(2), "{body}");
+
+    // ONE over: refused, and named as such.
+    provision(&db, &env, &okta.token, "c@example.test", "c").await;
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        None,
+        limits,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("tooMany"), "{body}");
+
+    // And the bound is on the SCAN, not on the surface: the indexed filter still answers.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users?filter=userName%20eq%20%22a@example.test%22",
+        Some(&okta.token),
+        None,
+        limits,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(1), "{body}");
+}
+
+#[tokio::test]
+async fn deactivating_a_shared_person_does_not_reach_the_other_organization() {
+    // BLOCKER. `set_active` moved `users.state`, which is a property of the PERSON in the whole
+    // environment. A reviewer had Initech's token issue one DELETE and Globex's user could no
+    // longer sign in: a cross-organization write through a door that never names Globex.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+    let shared = provision(
+        &db,
+        &env,
+        &globex.token,
+        "shared@example.test",
+        "00u1shared",
+    )
+    .await;
+    let shared_id = db
+        .store()
+        .scoped(scope)
+        .users()
+        .parse_id(&shared)
+        .expect("a user id");
+    also_a_member_of(&db, &env, scope, &initech.organization, &shared_id).await;
+
+    // Initech deactivates. Globex must not notice.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{shared}"),
+        Some(&initech.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["active"], json!(false), "Initech's own view: {body}");
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{shared}"),
+        Some(&globex.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Globex lost the person: {body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(
+        parsed["active"],
+        json!(true),
+        "Globex's user was deactivated by another organization: {body}"
+    );
+    // And the ACCOUNT is still live, which is the half a status check would miss: the person
+    // has to be able to sign in to Globex.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&shared)
+            .await
+            .expect("read the account state"),
+        Some(ironauth_store::UserState::Active),
+        "one organization's deactivate must not disable a shared account"
+    );
+
+    // Initech's DELETE is the stronger act and must also not reach Globex.
+    let (status, _) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{shared}"),
+        Some(&initech.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{shared}"),
+        Some(&globex.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["active"], json!(true), "{body}");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&shared)
+            .await
+            .expect("read the account state"),
+        Some(ironauth_store::UserState::Active)
+    );
+}
+
+#[tokio::test]
+async fn a_deactivated_person_stays_addressable_and_can_be_reactivated() {
+    // The reason a deactivate keeps the membership. An identity provider reactivates BY
+    // RESOURCE ID after a rehire or a sync blip, so an implementation that removed the
+    // membership on deactivate would answer the uniform 404 to that PATCH and leave the client
+    // with no way to undo its own deactivation.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let alice = provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+
+    let deactivate = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": false}],
+    });
+    let reactivate = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": true}],
+    });
+
+    for (what, patch, expected) in [
+        ("deactivated", &deactivate, false),
+        ("reactivated", &reactivate, true),
+        // Twice each way: an identity provider retries, and a second deactivate of an already
+        // deactivated person must not fail.
+        ("deactivated again", &deactivate, false),
+        ("deactivated once more", &deactivate, false),
+        ("reactivated again", &reactivate, true),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "PATCH",
+            &format!("/scim/v2/Users/{alice}"),
+            Some(&okta.token),
+            Some(patch.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{what}: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a resource");
+        assert_eq!(parsed["active"], json!(expected), "{what}: {body}");
+
+        // Still addressable, and a fresh read agrees with the response.
+        let (status, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users/{alice}"),
+            Some(&okta.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{what} then read: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a resource");
+        assert_eq!(parsed["active"], json!(expected), "{what}: {body}");
+
+        // And the ACCOUNT follows, because this is the person's only organization.
+        let account = db
+            .store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&alice)
+            .await
+            .expect("read the account state");
+        let wanted = if expected {
+            ironauth_store::UserState::Active
+        } else {
+            ironauth_store::UserState::Disabled
+        };
+        assert_eq!(account, Some(wanted), "{what}");
+    }
+}
+
+#[tokio::test]
+async fn deactivating_the_last_organizations_member_does_disable_the_account() {
+    // The OTHER half of the rule, and the control for the test above: without it, the
+    // isolation fix would pass on an implementation that never disabled anybody, which is the
+    // opposite failure -- an identity provider that offboarded somebody would have left them
+    // able to sign in.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    let alone = provision(&db, &env, &globex.token, "alone@example.test", "00u1alone").await;
+    let (status, _) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{alone}"),
+        Some(&globex.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let state = db
+        .store()
+        .scoped(scope)
+        .users()
+        .state_for_subject(&alone)
+        .await
+        .expect("read the account state");
+    assert_eq!(
+        state,
+        Some(ironauth_store::UserState::Disabled),
+        "the person's last organization deactivating them offboards the account"
+    );
+}
+
+#[tokio::test]
+async fn a_create_does_not_reveal_whether_another_organization_holds_the_handle() {
+    // MAJOR. The duplicate pre-check searched the whole ENVIRONMENT, so a 409 told the caller
+    // that somebody somewhere holds the handle. Under environment-wide uniqueness the refusal
+    // is genuine -- the create really cannot succeed -- so what must not differ is the refusal
+    // a caller can ATTRIBUTE: the status and body for a handle held elsewhere are identical to
+    // the ones for a handle held here, and neither names an organization or a person.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+    provision(
+        &db,
+        &env,
+        &globex.token,
+        "victim@example.test",
+        "00u1victim",
+    )
+    .await;
+    provision(&db, &env, &initech.token, "mine@example.test", "00u1mine").await;
+
+    let (foreign_status, foreign_body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&initech.token),
+        Some(json!({"userName": "victim@example.test"})),
+    )
+    .await;
+    let (own_status, own_body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&initech.token),
+        Some(json!({"userName": "mine@example.test"})),
+    )
+    .await;
+    assert_eq!(
+        (foreign_status, foreign_body.as_str()),
+        (own_status, own_body.as_str()),
+        "a handle held by another organization must be refused exactly as one held here is"
+    );
+    assert!(
+        !foreign_body.contains("Globex") && !foreign_body.contains("victim"),
+        "the refusal names nothing about the other organization: {foreign_body}"
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_external_id_creates_nothing() {
+    // MAJOR. `bind` ran after three committed writes, so a duplicate externalId answered 409
+    // with the account, its identifier row and its organization membership already created:
+    // the client was told nothing was created and the organization gained a member.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    provision(&db, &env, &okta.token, "first@example.test", "shared-key").await;
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&okta.token),
+        Some(json!({"userName": "second@example.test", "externalId": "shared-key"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("uniqueness"), "{body}");
+
+    let (_, body) = call(&db, &env, "GET", "/scim/v2/Users", Some(&okta.token), None).await;
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(
+        parsed["totalResults"],
+        json!(1),
+        "a refused create must leave the organization exactly as it was: {body}"
+    );
+    // And the person it refused is not resolvable by handle either, so nothing partial landed.
+    let (_, body) = call(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users?filter=userName%20eq%20%22second@example.test%22",
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(0), "{body}");
+}
+
+#[tokio::test]
+async fn a_patch_that_cannot_be_completed_applies_none_of_it() {
+    // MAJOR. RFC 7644 section 3.5.2: a PatchOp "SHALL be treated as atomic. If a single
+    // operation encounters an error condition, the original SCIM resource MUST be restored."
+    // The loop validated and applied one operation at a time, so a reviewer sent
+    // [deactivate, unsupported] and got a 400 with the account deactivated.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let alice = provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [
+                {"op": "replace", "path": "active", "value": false},
+                {"op": "replace", "path": "nickName", "value": "al"},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(
+        parsed["active"],
+        json!(true),
+        "the first operation must not have been applied: {body}"
+    );
+
+    // The control: the SAME first operation, alone, does deactivate. Without it this test
+    // passes on a PATCH that never applies anything.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(
+        parsed["active"],
+        json!(false),
+        "the same operation ALONE does deactivate: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_create_door_and_the_read_door_agree_on_who_exists() {
+    // MAJOR. The indexed lookup canonicalizes (NFKC, case fold, whitespace and zero-width
+    // stripping) and the filter evaluator only lowercases, so the list re-checked the index's
+    // answer with a weaker comparison and threw it away. A reviewer found the deadlock: with
+    // `admin` stored, POST "ad min" was a 409 and filter=userName eq "ad min" was empty, so a
+    // client sending that spelling could neither find the person nor create them.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let admin = provision(&db, &env, &okta.token, "admin", "00u1admin").await;
+
+    for spelling in ["ad min", "  admin  ", "ADMIN", "Ad\u{200d}min"] {
+        // The create door says this person exists.
+        let (status, body) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&okta.token),
+            Some(json!({"userName": spelling})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{spelling:?}: {body}");
+
+        // So the read door must find them.
+        // Percent-encode every byte that is not an unreserved character, so the spelling
+        // reaches the handler exactly as written: the interesting cases are a space, a
+        // zero-width joiner and surrounding whitespace, none of which survive a raw query
+        // string.
+        let mut encoded = String::new();
+        for byte in spelling.as_bytes() {
+            if byte.is_ascii_alphanumeric() {
+                encoded.push(char::from(*byte));
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+        let (status, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users?filter=userName%20eq%20%22{encoded}%22"),
+            Some(&okta.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{spelling:?}: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a list");
+        assert_eq!(parsed["totalResults"], json!(1), "{spelling:?}: {body}");
+        assert_eq!(
+            parsed["Resources"][0]["id"],
+            json!(admin.as_str()),
+            "{spelling:?}: {body}"
+        );
+    }
+
+    // The control: a genuinely different handle is still not this person.
+    let (_, body) = call(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users?filter=userName%20eq%20%22admin2%22",
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(0), "{body}");
+}
+
+#[tokio::test]
+async fn a_create_answers_the_location_of_the_resource_it_created() {
+    // RFC 7644 section 3.3 says the Location header SHALL carry the URI of the CREATED
+    // RESOURCE. A constant naming the collection satisfies nothing, and Entra follows this
+    // header to read the resource back.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    let (id, location) =
+        provision_with_location(&db, &env, &okta.token, "alice@example.test").await;
+    assert_eq!(location, format!("/scim/v2/Users/{id}"));
+
+    // And following it reaches the resource, which is the only thing the header is for.
+    let (status, body) = call(&db, &env, "GET", &location, Some(&okta.token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["id"], json!(id.as_str()));
+    assert_eq!(parsed["meta"]["location"], json!(location.as_str()));
+}
+
+#[tokio::test]
+async fn an_external_id_is_never_read_across_connections() {
+    // The `AND connection_id = $3` in `external_id_for`, which a reviewer removed with every
+    // suite still green. Without it a read renders whichever connection's key happens to be
+    // stored for the person, which is the whole thing the per-connection namespace exists to
+    // prevent. Asserted on the RENDERED resource, because that is where the leak would show.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+    let shared = provision(
+        &db,
+        &env,
+        &globex.token,
+        "shared@example.test",
+        "globex-key",
+    )
+    .await;
+    let shared_id = db
+        .store()
+        .scoped(scope)
+        .users()
+        .parse_id(&shared)
+        .expect("a user id");
+    also_a_member_of(&db, &env, scope, &initech.organization, &shared_id).await;
+
+    // Initech records its OWN key for the same person, through its own credential.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{shared}"),
+        Some(&initech.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "externalId", "value": "initech-key"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (token, own, foreign) in [
+        (&globex.token, "globex-key", "initech-key"),
+        (&initech.token, "initech-key", "globex-key"),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users/{shared}"),
+            Some(token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a resource");
+        assert_eq!(parsed["externalId"], json!(own), "{body}");
+        assert!(!body.contains(foreign), "the other key leaked: {body}");
+    }
+
+    // Nor through the filter: each connection resolves only its own key, and neither resolves
+    // the other's even though both name the same person.
+    for (token, own, foreign) in [
+        (&globex.token, "globex-key", "initech-key"),
+        (&initech.token, "initech-key", "globex-key"),
+    ] {
+        for (key, expected) in [(own, 1), (foreign, 0)] {
+            let (status, body) = call(
+                &db,
+                &env,
+                "GET",
+                &format!("/scim/v2/Users?filter=externalId%20eq%20%22{key}%22"),
+                Some(token),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{key}: {body}");
+            let parsed: Value = serde_json::from_str(&body).expect("a list");
+            assert_eq!(parsed["totalResults"], json!(expected), "{key}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_query_string_does_not_answer_an_unauthenticated_caller() {
+    // `Query<T>` is a `FromRequestParts` extractor, so with typed fields it ran BEFORE
+    // authentication: `?count=abc` with no credential answered a plain-text 400 "Failed to
+    // deserialize query string", the one response on this surface that is neither a SCIM error
+    // document nor the uniform 401.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    for query in [
+        "?count=abc",
+        "?startIndex=notanumber",
+        "?count=-1&startIndex=",
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users{query}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{query}: {body}");
+        assert!(
+            body.contains("urn:ietf:params:scim:api:messages:2.0:Error"),
+            "{query}: {body}"
+        );
+    }
+
+    // Authenticated, the same values are tolerated rather than refused: a mistyped number is
+    // not a reason to fail a provisioning client's list.
+    provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+    for query in ["?count=abc", "?startIndex=notanumber"] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users{query}"),
+            Some(&okta.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a list");
+        assert_eq!(parsed["totalResults"], json!(1), "{query}: {body}");
+    }
 }
