@@ -30,7 +30,7 @@ A transaction token is a short-lived signed JWT scoped to **one transaction insi
 | `sub` | the **revalidated** subject token | which person the request is for |
 | `txn` | a fresh id | the transaction every hop shares |
 | `rctx` | the authenticated client | which workload asked for this token (see the deviation below) |
-| `azd` | the subject token's scopes | what the original request was authorized to do |
+| `azd` | the exchange's **decided** scope | what *this* request was authorized to do |
 | `purp` | **not set** | see below |
 | `iat`, `exp` | the clock | at most five minutes |
 
@@ -63,6 +63,8 @@ subject_token_type=urn:ietf:params:oauth:token-type:access_token
 requested_token_type=urn:ietf:params:oauth:token-type:txn_token
 ```
 
+**`audience` and `resource` are refused, not ignored.** A transaction token's audience is the trust domain, so a request that also names a target asked for two different things. It answers `invalid_target`, which is what the ordinary exchange answers for an unregistered one -- silently ignoring a narrowing request would leave the caller believing it constrained something it did not.
+
 **`purp` is not set.** The draft defines the claim and defines no request parameter that carries it, and the only free string a caller can send on this endpoint is `scope`, which means *narrow to this* everywhere else here. Reading it as a purpose would make one parameter mean two things depending on the requested token type. A graduation that wants `purp` should define a parameter for it.
 
 **The acknowledgment version is the draft revision itself.** A draft bump invalidates every acknowledgment in the wild, so a routine IronAuth upgrade can refuse to boot for a deployment that enabled this. That is the flag working.
@@ -75,7 +77,7 @@ requested_token_type=urn:ietf:params:oauth:token-type:txn_token
 
 ## What a graduation still needs
 
-- **`azd` is the subject token's scope set, not RFC 9396 authorization details.** The draft's `azd` is a rich object describing what was authorized; this carries what IronAuth actually knows about the original request. A deployment making decisions on `azd` would need the richer shape, and the edge would have to carry it in.
+- **`azd` is the exchange's decided scope, not RFC 9396 authorization details.** The draft's `azd` is a rich object describing what was authorized; this carries the narrowed scope this exchange settled on -- what *this* request may do, not everything the subject token held. A deployment making decisions on `azd` would need the richer shape, and the edge would have to carry it in.
 - **No replacement flow, so `txn` is not shared across a call chain.** The draft's model is that the first hop mints and later hops request a **replacement** carrying the same `txn`. Here every request mints a fresh id, so two hops of one logical transaction get two ids and nothing correlates them.
 - **No `sub_id`.** The draft allows a structured subject identifier (RFC 9493); this carries the plain `sub` the subject token carried.
 - **One trust domain per PROCESS, shared by every tenant.** The domain is a single config field read once at boot, while the issuer is per (tenant, environment), so every tenant this process serves mints with the same `aud`. For a multi-tenant deployment that is the wrong axis and it is the first thing a graduation has to change.

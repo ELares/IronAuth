@@ -1188,3 +1188,143 @@ fn unverified_claims(token: &str) -> Value {
         .expect("base64url");
     serde_json::from_slice(&bytes).expect("claims parse")
 }
+
+#[tokio::test]
+async fn a_transaction_token_request_naming_a_target_is_refused_rather_than_ignored() {
+    // A transaction token's audience is the trust domain, so `audience` and `resource` cannot
+    // also be honoured. Ignoring them silently is the same defect as reading `scope` as a
+    // purpose: the caller believes it constrained something it did not, and on the ordinary
+    // path an unregistered target is `invalid_target` rather than a token.
+    let mut harness = harness().await;
+    harness.install_transaction_token_domain(TRUST_DOMAIN);
+    let (client, secret) = exchanging_client(&harness).await;
+    let own = access_token_for(&harness, &client, &secret).await;
+
+    for (name, value) in [
+        ("audience", "https://api.example.test"),
+        ("resource", "https://api.example.test"),
+    ] {
+        let (status, body) = exchange(
+            &harness,
+            &client.to_string(),
+            &secret,
+            &[
+                ("subject_token", &own),
+                ("subject_token_type", ACCESS_TOKEN_TYPE),
+                ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+                (name, value),
+            ],
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "naming a {name} alongside a transaction-token request must be refused: {body}"
+        );
+        assert_eq!(body["error"], "invalid_target", "{body}");
+    }
+
+    // The control: the SAME request without a target succeeds, so the refusals are the target
+    // and not something else about the request.
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &own),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn a_transaction_token_request_still_runs_the_agent_gate() {
+    // THE SECOND BLOCKER, and the same shape as the first: the fold closed three controls and
+    // left this one. A client bound to a REVOKED agent was refused `unauthorized_client` on the
+    // ordinary path; adding `requested_token_type=...txn_token` turned that into a 200 carrying
+    // a signed assertion naming the user, with no `agent_token.deny` row.
+    let mut harness = harness().await;
+    harness.install_transaction_token_domain(TRUST_DOMAIN);
+    let (client, secret) = exchanging_client(&harness).await;
+    let own = access_token_for(&harness, &client, &secret).await;
+    let agent = harness.seed_agent_for_client(&client, &["deploy"]).await;
+
+    // The control: while the agent is live, the exchange issues.
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &own),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the control: {body}");
+
+    harness.set_agent_state(&agent, "revoked").await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &own),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a revoked agent's client must not mint a transaction token: {body}"
+    );
+    assert!(
+        body.get("access_token").is_none(),
+        "and nothing is issued: {body}"
+    );
+    assert!(
+        harness.count_audit_action("agent_token.deny").await >= 1,
+        "and the denial is recorded, as it is on every other door"
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_transaction_token_names_the_actor() {
+    // Delegation is the mode with no per-client policy flag: its only accountability control is
+    // that `act` names the party acting for the subject. Dropping it made a delegation
+    // indistinguishable from a downscope in the token, the log AND the audit row.
+    let mut harness = harness().await;
+    harness.install_transaction_token_domain(TRUST_DOMAIN);
+    let (client, secret) = exchanging_client(&harness).await;
+    let (other, other_secret) = exchanging_client(&harness).await;
+    let subject_token = access_token_for(&harness, &other, &other_secret).await;
+    let actor_token = access_token_for(&harness, &client, &secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &subject_token),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("actor_token", &actor_token),
+            ("actor_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a delegation is permitted: {body}");
+
+    let claims = unverified_claims(body["access_token"].as_str().expect("a token"));
+    assert!(
+        claims["act"].is_object(),
+        "a delegated transaction token names the actor, or a service in the trust domain \
+         cannot tell it from a downscope: {claims}"
+    );
+}

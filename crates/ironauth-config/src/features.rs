@@ -350,7 +350,8 @@ impl FeatureRegistry {
              person, the workload asking, and what the original request was authorized to do -- \
              so an internal hop needs neither the user's own access token nor an unsigned \
              header. Requested through RFC 8693 token exchange. PROTOTYPE: the wire format is \
-             an IETF draft, `azd` carries the subject token's scopes rather than RFC 9396 \
+             an IETF draft, `azd` carries the exchange's DECIDED (narrowed) scope rather \
+             than RFC 9396 authorization details, \
              authorization details, there is no replacement flow so each request mints its own \
              transaction id, and NOTHING is minted until a trust domain is configured, because \
              a token with no audience has nowhere it may be spent.",

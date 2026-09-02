@@ -36,7 +36,7 @@
 //! | `sub` | the REVALIDATED subject token | which person the request is for |
 //! | `txn` | a fresh id | the transaction every hop shares |
 //! | `rctx` | the authenticated client | which workload asked for THIS token |
-//! | `azd` | the subject token's scopes | what the original request was authorized to do |
+//! | `azd` | the exchange's DECIDED scope | what THIS request was authorized to do |
 //! | `purp` | NOT SET by the exchange path | see below |
 //! | `iat`, `exp` | the clock | short, and bounded here rather than configured |
 //!
@@ -67,7 +67,7 @@
 //!
 //! Stated plainly so nothing here reads as finished.
 //!
-//! - **`azd` is the subject token's scope set, not RFC 9396 authorization details.** The draft's
+//! - **`azd` is the exchange's decided scope, not RFC 9396 authorization details.** The draft's
 //!   `azd` is a rich object describing what was authorized; this carries what IronAuth actually
 //!   knows about the original request. A deployment making decisions on `azd` would need the
 //!   richer shape, and the edge would need to have carried it in.
@@ -145,6 +145,10 @@ pub struct TransactionTokenRequest<'a> {
     pub authorization_context: &'a [String],
     /// What this transaction is for, when the caller said.
     pub purpose: Option<&'a str>,
+    /// The actor chain, for a DELEGATION. Absent for a downscope and deliberately absent for an
+    /// impersonation, which RFC 8693 section 1.1 defines as the actor not being distinguishable
+    /// in the token; accountability for that mode is the audit row.
+    pub act: Option<&'a Value>,
     /// The transaction id every hop of this request shares.
     pub transaction_id: &'a str,
     /// Now, in seconds since the epoch.
@@ -193,6 +197,9 @@ pub fn mint(
         }
         claims.insert("purp".to_owned(), json!(purpose));
     }
+    if let Some(act) = request.act {
+        claims.insert("act".to_owned(), act.clone());
+    }
     claims.insert("iat".to_owned(), json!(request.now_unix_seconds));
     claims.insert(
         "exp".to_owned(),
@@ -226,6 +233,20 @@ pub struct ExchangeInputs<'a> {
     /// What this exchange was DECIDED to authorize: the narrowed scope, not the subject token's
     /// full set. A caller that asked for less must not receive a token asserting more.
     pub authorization_context: &'a std::collections::BTreeSet<String>,
+    /// Whether this was a downscope, a delegation, or an impersonation.
+    ///
+    /// Recorded in the audit row and the log line, because for a transaction token neither the
+    /// token nor a grant carries it otherwise. Impersonation in particular is default-denied
+    /// and, per issue #125, has to be recorded on every use.
+    pub mode: &'a str,
+    /// The actor chain the decision produced, present for a DELEGATION.
+    ///
+    /// Delegation is the mode with no per-client policy flag: its only accountability control
+    /// is that `act` rides in the issued token, naming the party acting for the subject. A
+    /// transaction token that dropped it would be indistinguishable from a downscope, so a
+    /// service in the trust domain could not tell "this request is Alice's" from "this request
+    /// is B acting for Alice".
+    pub act: Option<&'a serde_json::Value>,
 }
 
 /// Mint a transaction token and record that it was minted.
@@ -280,6 +301,7 @@ pub async fn issue_transaction_token(
             // would make one parameter mean two things depending on a token type, which is the
             // kind of overload a caller gets wrong once and an implementer never notices.
             purpose: None,
+            act: inputs.act,
             transaction_id: &transaction_id,
             now_unix_seconds: now,
             lifetime_secs: MAX_LIFETIME_SECS,
@@ -289,11 +311,17 @@ pub async fn issue_transaction_token(
 
     // BEFORE the token leaves. A record written afterwards is one a crash can lose while the
     // credential is already out, and this row is the only record that the token exists at all.
+    //
+    // Attributed to the CLIENT, through the same helper the sibling write one function away
+    // uses, not to a freshly generated service id. A throwaway actor means filtering the log by
+    // a compromised client's identity returns every other door's rows and none of these.
     state
         .store()
         .scoped(scope)
         .acting(
-            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(state.env())),
+            crate::util::client_service_actor(ironauth_store::StoredClientId::Registered(
+                inputs.client_id,
+            )),
             ironauth_store::CorrelationId::generate(state.env()),
         )
         .authorization()
@@ -302,6 +330,7 @@ pub async fn issue_transaction_token(
             inputs.client_id,
             inputs.subject,
             &transaction_id,
+            inputs.mode,
         )
         .await
         .map_err(|error| {
@@ -312,6 +341,8 @@ pub async fn issue_transaction_token(
     tracing::info!(
         client_id = %inputs.requester,
         txn = %transaction_id,
+        mode = inputs.mode,
+        delegated = inputs.act.is_some(),
         "transaction token issued (issue #133, PROTOTYPE)"
     );
     Ok(transaction_token_response(&token))

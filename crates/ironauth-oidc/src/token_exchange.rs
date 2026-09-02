@@ -256,15 +256,17 @@ pub async fn token_exchange_grant(
 
     // The transaction token, now that every control has run and the scope is the NARROWED one.
     if wants_transaction_token {
-        return crate::transaction_tokens::issue_transaction_token(
+        return transaction_token(
             state,
             scope,
-            &entry,
-            &crate::transaction_tokens::ExchangeInputs {
+            &TransactionTokenBranch {
+                entry: &entry,
                 client_id: &client_id,
-                requester: &client_id_str,
-                subject: &subject.subject,
-                authorization_context: &decision.scope,
+                client_id_str: &client_id_str,
+                subject: &subject,
+                decision: &decision,
+                requested_audience: &requested_audience,
+                mode,
             },
         )
         .await;
@@ -721,6 +723,112 @@ async fn revalidated(
         audience: claims.aud.into_iter().collect(),
         act: claims.act,
     })
+}
+
+/// The transaction-token branch of the exchange (issue #133, PROTOTYPE).
+///
+/// Its own function so `token_exchange_grant` stays readable, and because what it does is worth
+/// naming: it runs the ONE control the shared `issue()` path would have run for it, and then
+/// mints something `issue()` cannot.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidTarget`] when the request also named a target;
+/// [`TokenError::UnauthorizedClient`] or [`TokenError::InvalidScope`] from the agent gate; and
+/// whatever the mint or its audit write returns.
+struct TransactionTokenBranch<'a> {
+    /// The environment's issuer entry, for its signer.
+    entry: &'a std::sync::Arc<crate::issuer::IssuerEntry>,
+    /// The authenticated client, as a scoped id for the audit row.
+    client_id: &'a ironauth_store::ClientId,
+    /// The same client as a string, for the token's `rctx` and the gate.
+    client_id_str: &'a str,
+    /// The revalidated subject token.
+    subject: &'a ValidatedToken,
+    /// What the exchange decided: the narrowed scope and the actor chain.
+    decision: &'a ironauth_store::token_exchange_decision::ExchangeDecision,
+    /// Any target the caller named, which this profile refuses rather than ignores.
+    requested_audience: &'a std::collections::BTreeSet<String>,
+    /// Downscope, delegation or impersonation.
+    mode: ExchangeMode,
+}
+
+async fn transaction_token(
+    state: &OidcState,
+    scope: Scope,
+    branch: &TransactionTokenBranch<'_>,
+) -> Result<Response, TokenError> {
+    let TransactionTokenBranch {
+        entry,
+        client_id,
+        client_id_str,
+        subject,
+        decision,
+        requested_audience,
+        mode,
+    } = *branch;
+    // A transaction token's audience is the TRUST DOMAIN, so a caller that also named a target
+    // asked for two different things. REFUSED rather than resolved: the ordinary path would
+    // have answered `invalid_target` for an unregistered one, and silently ignoring a narrowing
+    // request is the same class of defect as reading `scope` as a purpose -- the caller
+    // believes it constrained something it did not.
+    if !requested_audience.is_empty() {
+        return Err(TokenError::InvalidTarget);
+    }
+
+    // THE AGENT GATE (issue #130), which the first fold left behind while closing the other
+    // three controls. It is a control, not enrichment: a SUSPENDED or REVOKED agent's client is
+    // refused `unauthorized_client`, a scope the agent never declared is `invalid_scope`, and
+    // both write an `agent_token.deny` row. Without it, adding a requested token type to a
+    // request that was refused turned it into a 200 carrying a signed assertion.
+    //
+    // Against the DECIDED scope, which is what the token will carry, so the agent is gated on
+    // exactly what it is about to be given.
+    let granted = decision
+        .scope
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::token::gate_agent_issuance(
+        state,
+        scope,
+        client_id_str,
+        (!granted.is_empty()).then_some(granted.as_str()),
+    )
+    .await?;
+
+    crate::transaction_tokens::issue_transaction_token(
+        state,
+        scope,
+        entry,
+        &crate::transaction_tokens::ExchangeInputs {
+            client_id,
+            requester: client_id_str,
+            subject: &subject.subject,
+            authorization_context: &decision.scope,
+            // The MODE and the actor chain. Delegation is the mode with no per-client policy
+            // flag: its only accountability control is that `act` rides in the issued token, so
+            // dropping it made a delegation indistinguishable from a downscope in the token,
+            // the log AND the audit row.
+            mode: mode_label(mode),
+            act: decision.act.as_ref(),
+        },
+    )
+    .await
+}
+
+/// A stable label for an exchange mode, for a log line and an audit detail.
+///
+/// The transaction-token path needs it because neither the token nor a grant carries the mode
+/// for that credential: a delegation and a downscope would otherwise be indistinguishable in
+/// every record, and impersonation is default-denied precisely because it has to be traceable.
+fn mode_label(mode: ExchangeMode) -> &'static str {
+    match mode {
+        ExchangeMode::Downscope => "downscope",
+        ExchangeMode::Delegation => "delegation",
+        ExchangeMode::Impersonation => "impersonation",
+    }
 }
 
 /// Record a refusal out of band and return the OPAQUE wire error.

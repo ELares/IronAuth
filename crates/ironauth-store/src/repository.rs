@@ -10339,7 +10339,10 @@ impl ActingAuthorizationRepo<'_> {
     /// cannot.
     ///
     /// So this writes the AUDIT ROW and nothing else, which is the honest record: a token was
-    /// minted, by this client, for this subject, under this transaction id. Without it a
+    /// minted, by this client, for this subject, under this transaction id, in this MODE. The
+    /// mode matters more here than on the ordinary path: that token carries `act` for a
+    /// delegation and a grant row for everything, while this one has neither, so the row is the
+    /// only place a delegation or an impersonation is distinguishable at all. Without it a
     /// deployment could not tell from any record that transaction tokens were being minted at
     /// all, which for a credential every service in the trust domain accepts is the first thing
     /// an investigator needs.
@@ -10354,11 +10357,12 @@ impl ActingAuthorizationRepo<'_> {
         client_id: &ClientId,
         subject: &str,
         transaction_id: &str,
+        mode: &str,
     ) -> Result<(), StoreError> {
         if client_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        let detail = format!("subject={subject} txn={transaction_id}");
+        let detail = format!("subject={subject} txn={transaction_id} mode={mode}");
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,

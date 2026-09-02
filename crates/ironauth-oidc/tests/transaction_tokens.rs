@@ -18,12 +18,11 @@
 //!
 //! No database.
 
-use ironauth_env::Env;
 use ironauth_jose::{ExpectedTyp, JwsAlgorithm, TokenTyp, TrustedKey, VerificationPolicy, verify};
 use ironauth_jose::{JwkSet, SigningKey};
 use ironauth_oidc::transaction_tokens::{
-    MAX_LIFETIME_SECS, TRANSACTION_TOKEN_TYPE, TRANSACTION_TOKENS_DRAFT, TransactionTokenRefusal,
-    TransactionTokenRequest, mint,
+    MAX_LIFETIME_SECS, MAX_PURPOSE_BYTES, TRANSACTION_TOKEN_TYPE, TRANSACTION_TOKENS_DRAFT,
+    TransactionTokenRefusal, TransactionTokenRequest, mint,
 };
 use serde_json::Value;
 
@@ -47,6 +46,17 @@ fn request<'a>(
     purpose: Option<&'a str>,
     lifetime: i64,
 ) -> TransactionTokenRequest<'a> {
+    request_with_act(trust_domain, context, purpose, lifetime, None)
+}
+
+/// The same, with an actor chain, for the delegation cases.
+fn request_with_act<'a>(
+    trust_domain: &'a str,
+    context: &'a [String],
+    purpose: Option<&'a str>,
+    lifetime: i64,
+    act: Option<&'a Value>,
+) -> TransactionTokenRequest<'a> {
     TransactionTokenRequest {
         issuer: ISSUER,
         trust_domain,
@@ -54,6 +64,7 @@ fn request<'a>(
         requester: WORKLOAD,
         authorization_context: context,
         purpose,
+        act,
         transaction_id: "txn_0001",
         now_unix_seconds: NOW,
         lifetime_secs: lifetime,
@@ -217,6 +228,55 @@ fn the_pinned_draft_revision_is_the_one_the_acknowledgment_names() {
         TRANSACTION_TOKEN_TYPE, "urn:ietf:params:oauth:token-type:txn_token",
         "the requested-type URI is the draft's"
     );
-    // The env seam is imported so this file cannot drift into using wall time.
-    let _ = Env::system();
+}
+
+#[test]
+fn a_delegation_carries_the_actor_chain_and_a_downscope_does_not() {
+    // Delegation is the mode with NO per-client policy flag: its only accountability control is
+    // that `act` names the party acting for the subject. A transaction token that dropped it
+    // would be indistinguishable from a downscope, so a service in the trust domain could not
+    // tell "this request is Alice's" from "this request is B acting for Alice".
+    let context = context();
+    let act = serde_json::json!({ "sub": "cli_delegate" });
+    let delegated = mint(
+        &key(),
+        &request_with_act(TRUST_DOMAIN, &context, None, 60, Some(&act)),
+    )
+    .expect("mints");
+    assert_eq!(
+        verified_claims(&delegated)["act"],
+        act,
+        "a delegation names the actor"
+    );
+
+    // The control: without one the claim is ABSENT rather than null, because RFC 8693 section
+    // 1.1 defines impersonation as the actor not being distinguishable in the token, and a
+    // present-but-empty `act` is a statement that there was one.
+    let plain = mint(&key(), &request(TRUST_DOMAIN, &context, None, 60)).expect("mints");
+    let claims = verified_claims(&plain);
+    assert!(claims.get("act").is_none(), "no actor, no claim: {claims}");
+}
+
+#[test]
+fn an_over_long_purpose_is_refused_rather_than_truncated() {
+    // `purp` is the only claim that could come from a caller rather than from verified state,
+    // and nothing caps a form field on this plane. Megabytes of it would produce a token past
+    // the verifier's own size cap that can therefore never verify. Refused, because a silently
+    // shortened purpose is a different statement from the one the caller made.
+    let context = context();
+    let long = "p".repeat(MAX_PURPOSE_BYTES + 1);
+    assert_eq!(
+        mint(&key(), &request(TRUST_DOMAIN, &context, Some(&long), 60)),
+        Err(TransactionTokenRefusal::PurposeTooLong)
+    );
+
+    // The control: exactly at the bound is accepted, so the refusal is the bound and not the
+    // presence of a purpose.
+    let at_bound = "p".repeat(MAX_PURPOSE_BYTES);
+    let token = mint(
+        &key(),
+        &request(TRUST_DOMAIN, &context, Some(&at_bound), 60),
+    )
+    .expect("a purpose at the bound mints");
+    assert_eq!(verified_claims(&token)["purp"], at_bound);
 }
