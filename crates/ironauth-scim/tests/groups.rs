@@ -65,6 +65,7 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret
                 token_digest: &digest_of(&token),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await
         .expect("create connection");

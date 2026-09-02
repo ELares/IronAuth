@@ -74748,7 +74748,20 @@ impl ActingScimConnectionRepo<'_> {
     /// reused a token rather than generating one) OR a handle already used, since `id` is
     /// unique too. [`StoreError::Database`] otherwise, including a provider outside the
     /// column's closed vocabulary.
-    pub async fn create(&self, env: &Env, spec: NewScimConnection<'_>) -> Result<(), StoreError> {
+    /// # `idempotency` is not optional in practice
+    ///
+    /// A retried create MINTS A SECOND CREDENTIAL: the secret is fresh, so its digest is fresh,
+    /// and the unique index that would otherwise catch a duplicate sees two different rows. The
+    /// caller believes it holds one token while the organization has two live connections, and
+    /// only one of them is in anybody's hands. Passing `None` is legal because the store cannot
+    /// know whether its caller has a request to be idempotent about, but the management surface
+    /// requires the header.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewScimConnection<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
         let NewScimConnection {
             id,
             organization_id,
@@ -74808,6 +74821,10 @@ impl ActingScimConnectionRepo<'_> {
                         error.into()
                     }
                 })?;
+                // IN THE SAME TRANSACTION as the row. A record written afterwards would leave
+                // a window in which the connection exists and the retry that created it can
+                // still mint a second one.
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,

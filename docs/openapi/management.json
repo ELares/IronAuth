@@ -17599,6 +17599,300 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections": {
+      "get": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`",
+        "operationId": "list_scim_connections",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The organization's SCIM connections",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimConnectionListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not read this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`",
+        "operationId": "create_scim_connection",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required idempotency key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScimConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "An idempotent replay; the token is not returned again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimConnectionCreated"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The connection, with its token, returned once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimConnectionCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or unknown provider",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not mint credentials for this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}": {
+      "delete": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`",
+        "operationId": "revoke_scim_connection",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "path",
+            "description": "The scim_ handle",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked, or already revoked"
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not revoke credentials for this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connection in this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
       "post": {
         "tags": [
@@ -29395,6 +29689,32 @@
           }
         }
       },
+      "CreateScimConnectionRequest": {
+        "type": "object",
+        "description": "What a create names.",
+        "required": [
+          "display_name",
+          "provider"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label, for telling two identity providers apart in a listing."
+          },
+          "expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional expiry, in milliseconds since the epoch."
+          },
+          "provider": {
+            "type": "string",
+            "description": "`okta`, `entra` or `generic`. The column carries a closed vocabulary, so anything else\nis refused by the database rather than stored and puzzled over later."
+          }
+        }
+      },
       "CreateServiceAccountMembershipRequest": {
         "type": "object",
         "description": "The body to bind a machine identity into an organization (issue #126).",
@@ -33665,6 +33985,91 @@
             "type": "integer",
             "format": "int32",
             "description": "Evaluation priority."
+          }
+        }
+      },
+      "ScimConnectionCreated": {
+        "type": "object",
+        "description": "The 201 of a create: the ONLY response that carries the token.",
+        "required": [
+          "id",
+          "display_name",
+          "token_already_issued"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret handle."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The bearer token, present exactly once. Absent on an idempotent replay."
+          },
+          "token_already_issued": {
+            "type": "boolean",
+            "description": "Whether the token was already issued on an earlier identical request.\n\nA replay cannot return the token -- nothing stores it -- so it says so rather than\nreturning a body that looks like a create with a missing field."
+          }
+        }
+      },
+      "ScimConnectionListView": {
+        "type": "object",
+        "description": "A page of connections.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScimConnectionView"
+            },
+            "description": "This organization's connections, revoked ones included."
+          }
+        }
+      },
+      "ScimConnectionView": {
+        "type": "object",
+        "description": "One connection, as the management surface renders it.\n\nNO DIGEST FIELD, and that is the type doing the work rather than the handler remembering:\n`ScimConnection` carries no plaintext and this view carries no digest, so a listing has\nnothing to leak even by accident.",
+        "required": [
+          "id",
+          "display_name",
+          "provider"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Expiry in milliseconds since the epoch, absent for a connection that does not expire."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret `scim_` handle. Every other operation names the connection by this."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Which vendor this connection is for: `okta`, `entra` or `generic`."
+          },
+          "revoked_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Revocation time in milliseconds since the epoch, absent while the connection is live."
           }
         }
       },

@@ -1997,6 +1997,7 @@ dependencies = [
  "ironauth-jose",
  "ironauth-journey",
  "ironauth-oidc",
+ "ironauth-scim",
  "ironauth-store",
  "serde",
  "serde_json",

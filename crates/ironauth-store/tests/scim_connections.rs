@@ -84,6 +84,7 @@ async fn connect(
                 token_digest: &digest(token),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await
         .expect("create the connection");
@@ -283,6 +284,7 @@ async fn an_expired_token_stops_authenticating_without_being_revoked() {
                 // One second in the past.
                 expires_at_unix_micros: Some(now - 1_000_000),
             },
+            None,
         )
         .await
         .expect("create");
@@ -364,6 +366,7 @@ async fn a_connection_cannot_be_bound_to_another_tenants_organization() {
                 token_digest: &digest("scim_tok_cross"),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await;
     assert!(
@@ -412,6 +415,7 @@ async fn every_scope_guard_refuses_a_foreign_id() {
                 token_digest: &digest("scim_tok_foreign_id"),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await;
     assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
@@ -861,6 +865,7 @@ async fn the_column_checks_refuse_a_malformed_digest_and_an_unknown_provider() {
                     token_digest,
                     expires_at_unix_micros: None,
                 },
+                None,
             )
             .await;
         assert!(
