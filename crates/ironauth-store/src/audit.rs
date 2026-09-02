@@ -1323,6 +1323,16 @@ pub enum Action {
     /// An API key or personal access token was REVOKED (issue #99). The row targets the
     /// `akey_` handle.
     ApiKeyRevoked,
+    /// An inbound SCIM connection was CREATED (issue #135). The row targets the `scim_`
+    /// handle, never the bearer token and never its digest.
+    ///
+    /// The detail carries the ORGANIZATION the connection is bound to, which is the only thing
+    /// about it that decides what it may provision. An operator reading this row without it
+    /// would have to join back to a table the credential may since have been revoked from.
+    ScimConnectionCreated,
+    /// An inbound SCIM connection was REVOKED (issue #135). The row targets the `scim_`
+    /// handle. The row is retained rather than deleted, so this action stays resolvable.
+    ScimConnectionRevoked,
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
     /// authorization after checking the permission and the justification. The row targets the
     /// `imp_` authorization.
@@ -1830,6 +1840,8 @@ impl Action {
             Action::ClientIdTokenAlgSet => "client.id_token_signed_response_alg.set",
             Action::ClientOwningOrganizationSet => "client.owning_organization.set",
             Action::ApiKeyCreated => "api_key.created",
+            Action::ScimConnectionCreated => "scim_connection.created",
+            Action::ScimConnectionRevoked => "scim_connection.revoked",
             Action::ApiKeyRevoked => "api_key.revoked",
             Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",

@@ -227,6 +227,16 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     "permission",
     "project_grant",
     "role",
+    // An inbound SCIM connection (issue #135) is a CREDENTIAL that grants provisioning rights
+    // over one organization, so creating or revoking one changes who may do what -- the same
+    // reason `api_key` is on this list rather than the entity-management one.
+    //
+    // `scim_connection`, NOT `scim`. This classifier keys on the text before the first dot, so
+    // registering the bare domain would file every later `scim.*` action here too -- and the
+    // provisioning actions the next slices add (`scim.user_provisioned`, `scim.group_updated`)
+    // are account-change and entity-management shaped. Wire strings freeze into the audit
+    // trail, so that mistake is not correctable afterwards.
+    "scim_connection",
     "scope",
     "admin",
     "credential_class",

@@ -97,8 +97,8 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
-    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    RiskSignalId, RoutingRuleId, ScimConnectionId, ScopeStepUpPolicyId, ServiceAccountId,
+    SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
     SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
     TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
     WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
@@ -159,6 +159,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> AgentVaultRepo<'a> {
         AgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The inbound SCIM connections for this scope (issue #135).
+    ///
+    /// READ side. Creating and revoking a connection mints or kills a credential that can
+    /// provision an organization, so both go through [`ScopedStore::acting`] and the CONTROL
+    /// plane; migration 0183 grants `ironauth_app` SELECT and nothing else.
+    #[must_use]
+    pub fn scim_connections(&self) -> ScimConnectionRepo<'a> {
+        ScimConnectionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1575,6 +1588,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> ActingAgentVaultRepo<'a> {
         ActingAgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of the inbound SCIM connections (issue #135).
+    ///
+    /// Creating one mints a credential that can write users and groups into an organization,
+    /// and revoking one kills it. Both are operator actions, which is why they live here and
+    /// why 0183 grants the data plane SELECT only.
+    #[must_use]
+    pub fn scim_connections(&self) -> ActingScimConnectionRepo<'a> {
+        ActingScimConnectionRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -74483,5 +74510,362 @@ impl NativeSsoDeviceSecretRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(result.rows_affected())
+    }
+}
+
+/// One inbound SCIM connection, WITHOUT its bearer token (issue #135).
+///
+/// There is no field for the plaintext and deliberately no way to obtain one. The token is
+/// returned once at creation and stored only as a digest, so a read of this table cannot yield
+/// a credential that provisions an organization.
+#[derive(Debug, Clone)]
+pub struct ScimConnection {
+    /// The non-secret handle (`scim_`).
+    pub id: ScimConnectionId,
+    /// THE boundary: the one organization this connection may provision into.
+    ///
+    /// Parsed IN SCOPE on the way out, so a row that somehow held a foreign organization fails
+    /// the read rather than handing a handler a boundary it would trust.
+    pub organization_id: OrganizationId,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// Which IdP this is for: `okta`, `entra` or `generic`.
+    pub provider: String,
+    /// When it stops authenticating, if ever.
+    pub expires_at_unix_micros: Option<i64>,
+    /// WHEN it was revoked, if it was.
+    ///
+    /// A timestamp rather than only the boolean below, because the question an operator asks
+    /// of this table is when a credential stopped working. `revoke`'s doc justifies preserving
+    /// the first `revoked_at`, and a boolean makes that property unobservable through the
+    /// public API -- so the justification could not be checked.
+    pub revoked_at_unix_micros: Option<i64>,
+    /// Whether it has been revoked.
+    pub revoked: bool,
+}
+
+/// Everything creating a SCIM connection needs (issue #135).
+pub struct NewScimConnection<'a> {
+    /// The handle the caller minted.
+    pub id: &'a ScimConnectionId,
+    /// The organization this connection provisions into, and the only one it ever can.
+    ///
+    /// A TYPED, scoped id rather than a string, and that is the whole slice's claim rather than
+    /// a style choice. The `organizations` foreign key is id-only, and Postgres referential
+    /// integrity checks BYPASS row-level security, so an untyped string resolved any globally
+    /// existing organization -- including one in another tenant. `NewAgent` and
+    /// `NewOrgMembershipRole` take the typed id for exactly this reason.
+    pub organization_id: &'a OrganizationId,
+    /// The operator-facing label.
+    pub display_name: &'a str,
+    /// `okta`, `entra` or `generic`. The column's CHECK is the closed vocabulary.
+    pub provider: &'a str,
+    /// SHA-256 hex of the bearer token. THE DIGEST, never the token.
+    pub token_digest: &'a str,
+    /// When it stops authenticating, from the APPLICATION clock.
+    pub expires_at_unix_micros: Option<i64>,
+}
+
+/// The inbound SCIM connections for one scope, read only (issue #135).
+pub struct ScimConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimConnectionRepo<'_> {
+    /// The LIVE connection whose token digest matches, or `None`.
+    ///
+    /// This is the SCIM surface's whole authentication step, and everything about its shape is
+    /// deliberate:
+    ///
+    /// * the lookup key is a DIGEST, so nothing about the secret itself is ever compared. A
+    ///   btree probe on `text` does exit early and its page accesses do depend on the value,
+    ///   so this is not constant-work in the literal sense an earlier version of this comment
+    ///   claimed; what holds is that the value being compared is one the caller already knows,
+    ///   and learning it back reveals nothing about the token it was derived from;
+    /// * liveness is checked in SQL rather than by the caller, because a handler that read the
+    ///   row and then compared timestamps in Rust is one refactor away from forgetting to, and
+    ///   the failure mode is a revoked provisioning credential that still provisions;
+    /// * the row CARRIES its organization. The caller never supplies one, so there is no
+    ///   request shape in which a token reaches a second organization: cross-organization
+    ///   reach is a schema property here rather than a handler discipline. Note what this
+    ///   does NOT close. Both shipped SCIM CVEs the issue cites are authentication failures
+    ///   (CVE-2026-32130 a bypass by URL encoding, CVE-2025-4210 a route with no
+    ///   authorization check at all), and binding the organization to the credential does
+    ///   nothing for a route that never consults one. It is a precondition for the
+    ///   authenticated path being safe, not a fix for an unauthenticated one.
+    ///
+    /// AND THE ORGANIZATION MUST STILL BE LIVE. The join is not decoration: without it a
+    /// credential kept provisioning into an organization that had been soft-deleted or
+    /// disabled, and `list_for_organization` went on reporting it healthy, so an operator who
+    /// deleted an organization was not told the provisioning into it continued.
+    /// `ApiKeyRepo::verify` -- the credential this table copies for its digest scheme, its
+    /// retention rule and its column-scoped grant -- has carried this join all along.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn authenticate(
+        &self,
+        token_digest: &str,
+        now_micros: i64,
+    ) -> Result<Option<ScimConnection>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                    (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us \
+             FROM scim_connections c \
+             JOIN organizations o ON o.id = c.organization_id \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.token_digest = $3 \
+               AND c.revoked_at IS NULL \
+               AND (c.expires_at IS NULL OR c.expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
+               AND o.deleted_at IS NULL AND o.state = 'active'",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(token_digest)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let stored_id: String = row.get("id");
+        Ok(Some(ScimConnection {
+            id: ScimConnectionId::parse_in_scope(&stored_id, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            organization_id: OrganizationId::parse_in_scope(
+                &row.get::<String, _>("organization_id"),
+                &self.scope,
+            )
+            .map_err(|_| StoreError::NotFound)?,
+            display_name: row.get("display_name"),
+            provider: row.get("provider"),
+            expires_at_unix_micros: row.get("expires_us"),
+            revoked_at_unix_micros: row.get("revoked_us"),
+            revoked: false,
+        }))
+    }
+
+    /// Every connection for one organization, oldest first.
+    ///
+    /// Revoked and expired rows are INCLUDED, unlike [`Self::authenticate`]. This is the
+    /// operator's inventory, and a revoked connection disappearing from it would make "this
+    /// credential was revoked at 14:02" indistinguishable from "no such credential" -- which is
+    /// the question an operator investigating a leak is actually asking.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+    ) -> Result<Vec<ScimConnection>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, organization_id, display_name, provider, \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
+                    (revoked_at IS NOT NULL) AS revoked \
+             FROM scim_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             ORDER BY created_at, id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let stored_id: String = row.get("id");
+                Ok(ScimConnection {
+                    id: ScimConnectionId::parse_in_scope(&stored_id, &self.scope)
+                        .map_err(|_| StoreError::NotFound)?,
+                    organization_id: OrganizationId::parse_in_scope(
+                        &row.get::<String, _>("organization_id"),
+                        &self.scope,
+                    )
+                    .map_err(|_| StoreError::NotFound)?,
+                    display_name: row.get("display_name"),
+                    provider: row.get("provider"),
+                    expires_at_unix_micros: row.get("expires_us"),
+                    revoked_at_unix_micros: row.get("revoked_us"),
+                    revoked: row.get("revoked"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The WRITE side of the inbound SCIM connections, for this scope and actor (issue #135).
+pub struct ActingScimConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingScimConnectionRepo<'_> {
+    /// Create a connection, auditing `scim_connection.created`.
+    ///
+    /// The caller has already generated the token and hashed it; only the DIGEST arrives here,
+    /// so there is no argument this function could log or store that would reveal a credential.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or the organization is out of this scope;
+    /// [`StoreError::Conflict`] on any unique violation: a digest already present (a caller
+    /// reused a token rather than generating one) OR a handle already used, since `id` is
+    /// unique too. [`StoreError::Database`] otherwise, including a provider outside the
+    /// column's closed vocabulary.
+    pub async fn create(&self, env: &Env, spec: NewScimConnection<'_>) -> Result<(), StoreError> {
+        let NewScimConnection {
+            id,
+            organization_id,
+            display_name,
+            provider,
+            token_digest,
+            expires_at_unix_micros,
+        } = spec;
+        // BOTH ids, not just the connection's. The organization guard is the one this slice
+        // exists for: without it a control-plane caller binds a credential to another tenant's
+        // organization and the foreign key waves it through, because RI does not see RLS.
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let organization_id = organization_id.to_string();
+        let display_name = display_name.to_owned();
+        let provider = provider.to_owned();
+        let token_digest = token_digest.to_owned();
+        let organization_detail = organization_id.clone();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScimConnectionCreated,
+                // The HANDLE, never the digest. A management audit row that named a verifier
+                // would put one into the log it exists to make readable.
+                target: &id,
+            },
+            async |tx| {
+                sqlx::query(
+                    "INSERT INTO scim_connections \
+                     (token_digest, id, tenant_id, environment_id, organization_id, \
+                      display_name, provider, expires_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                             CASE WHEN $8::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' \
+                                       + ($8::bigint * INTERVAL '1 microsecond') END)",
+                )
+                .bind(&token_digest)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&display_name)
+                .bind(&provider)
+                .bind(expires_at_unix_micros)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
+                Ok(())
+            },
+            false,
+            // The organization, which is what makes the row answerable on its own. It is an
+            // operator-safe scoped id and never attacker-controlled free text.
+            Some(&organization_detail),
+        )
+        .await
+    }
+
+    /// Revoke a connection by its handle, auditing `scim_connection.revoked`.
+    ///
+    /// Returns whether a live row was revoked.
+    ///
+    /// THREE OUTCOMES, and the first version collapsed them into one audit row each. An absent
+    /// handle is `NotFound`; an already-revoked one commits and audits NOTHING; only a live row
+    /// revoked writes the audit row. The first version wrapped the UPDATE in `write_audited`
+    /// unconditionally, so revoking a handle that was never created still wrote a
+    /// `scim_connection.revoked` row naming a connection that did not exist -- which is the
+    /// opposite of the "revocation is observable" property this table's design rests on. This
+    /// is `ApiKeyRepo::revoke`'s shape, for the same reason it has it.
+    ///
+    /// An already-revoked connection keeps its FIRST `revoked_at`, because the question an
+    /// operator asks here is when the credential stopped working, and a re-revocation that
+    /// moved the timestamp would answer it wrongly.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope or names no connection;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn revoke(
+        &self,
+        env: &Env,
+        id: &ScimConnectionId,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let changed = sqlx::query(
+            "UPDATE scim_connections \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL \
+             RETURNING id",
+        )
+        .bind(now_micros)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if changed.is_none() {
+            let exists = sqlx::query(
+                "SELECT 1 FROM scim_connections \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ScimConnectionRevoked,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 }
