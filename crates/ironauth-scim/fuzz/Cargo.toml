@@ -41,3 +41,10 @@ path = "fuzz_targets/scim_patch_path.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "scim_resource_path"
+path = "fuzz_targets/scim_resource_path.rs"
+test = false
+doc = false
+bench = false

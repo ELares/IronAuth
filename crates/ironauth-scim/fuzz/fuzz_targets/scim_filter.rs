@@ -28,22 +28,10 @@ fuzz_target!(|data: &[u8]| {
     let Ok(filter) = ironauth_scim::parse_filter(text) else {
         return;
     };
-    // A resource shaped like the ones this surface actually renders, plus a multi-valued
-    // attribute so `ValuePath` and dotted-path distribution are both exercised. A resource
-    // with only scalars would leave the recursive half of the evaluator untouched.
-    let resource = serde_json::json!({
-        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
-        "id": "usr_fuzz",
-        "userName": "alice@example.test",
-        "active": true,
-        "externalId": "00u1",
-        "emails": [
-            {"type": "work", "value": "alice@example.test", "primary": true},
-            {"type": "home", "value": "a@home.test"},
-        ],
-        "name": {"givenName": "Alice", "familyName": "Example"},
-        "meta": {"resourceType": "User"},
-    });
+    // THE SHARED resource, not a copy. `sample_user_resource` is exported by the crate and
+    // the seed test measures the corpus against the same object, so a change here cannot
+    // silently stop the test from describing what this target explores.
+    let resource = ironauth_scim::sample_user_resource();
     let _ = ironauth_scim::filter_matches(&filter, &resource);
     // And against a resource carrying NONE of those attributes, which is the absent-attribute
     // path every operator handles differently.

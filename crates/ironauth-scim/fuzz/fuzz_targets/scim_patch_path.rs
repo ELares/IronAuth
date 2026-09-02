@@ -9,9 +9,14 @@
 //! it is the one an attacker controls most directly: it arrives in a request BODY, so it is
 //! not length-bounded by a URL.
 //!
-//! The target also walks the SELECTOR when there is one. The selector is a `Filter`, and a
-//! path that parses while its selector panics on inspection is reachable from one request --
-//! which is exactly what `selected_member` in groups.rs does to decide who to remove.
+//! The target also EVALUATES the selector when there is one, which is a stronger walk than any
+//! consumer performs today and is deliberately so. `selected_member` in `groups.rs` destructures
+//! a selector shallowly -- it accepts only a top-level `Compare` on `value` with `eq` and
+//! rejects everything else -- and `users.rs` only asks whether a selector is present. Neither
+//! calls `filter_matches`. An earlier version of this comment said this mirrored
+//! `selected_member`, and it does not: it covers the whole tree that one refuses to look
+//! inside, which is the right thing to fuzz precisely because no consumer currently walks it
+//! and a future one would.
 //!
 //! Run locally: `cargo +nightly fuzz run scim_patch_path` from `crates/ironauth-scim/fuzz`.
 #![no_main]

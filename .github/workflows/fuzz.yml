@@ -22,6 +22,40 @@ permissions:
   contents: read
 
 jobs:
+  # BUILD EVERY TARGET, which is the check `scripts/fuzz-matrix-freshness.sh` structurally
+  # cannot make. That gate compares registration three ways -- [[bin]] entries, target files,
+  # matrix rows -- and never invokes cargo, deliberately, so it runs without a nightly
+  # toolchain. The gap that leaves is a target that is registered everywhere and does not
+  # COMPILE, and the repository shipped exactly that: a `scim_filter` target in the
+  # repository-root crate read a private field and matched non-exhaustively on an enum that
+  # had gained a variant, so `cargo fuzz build` failed on it and its scheduled lane could only
+  # ever have failed too. It sat listed-and-dead, and the parser it uniquely covered had
+  # therefore never been fuzzed at all.
+  #
+  # One job over every crate, not one per target: this is a compile check, it is cheap, and a
+  # failure here means the matrix below is lying about what it runs.
+  build:
+    name: build every fuzz target
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          set -euo pipefail
+          for manifest in fuzz/Cargo.toml crates/*/fuzz/Cargo.toml; do
+            [ -f "$manifest" ] || continue
+            crate_dir="$(dirname "$(dirname "$manifest")")"
+            echo "::group::$crate_dir"
+            (cd "$crate_dir" && cargo fuzz build)
+            echo "::endgroup::"
+          done
+
   fuzz:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
@@ -34,9 +68,12 @@ jobs:
         #
         # EVERY registered target belongs here. A target absent from this matrix has
         # never run, which is exactly how issue #418 sat undetected; keep this list
-        # equal to the union of `cargo fuzz list` over every `*/fuzz` crate. As of
-        # issue #135 that is 15 targets, matching the 15 `fuzz_targets/*.rs` files and
-        # the 15 `[[bin]]` entries.
+        # equal to the union of `cargo fuzz list` over every `*/fuzz` crate.
+        #
+        # The COUNT is deliberately not written here. It said 15 while the tree held 16,
+        # and then 18: a number in a comment beside the thing it counts is a number that
+        # drifts, and this one drifted twice. `scripts/fuzz-matrix-freshness.sh` computes
+        # it and prints it, which is the only version that cannot be wrong.
         #
         # That equality is ENFORCED, not merely documented here: the gate runs
         # `scripts/fuzz-matrix-freshness.sh`, which fails naming any target that is
@@ -49,6 +86,8 @@ jobs:
             target: scim_filter
           - dir: crates/ironauth-scim
             target: scim_patch_path
+          - dir: crates/ironauth-scim
+            target: scim_resource_path
           - dir: crates/ironauth-fetch
             target: fetch_validation
           - dir: crates/ironauth-store
@@ -83,11 +122,6 @@ jobs:
             target: claim_mapping
           - dir: crates/ironauth-connector
             target: connector_def
-          # SCIM filter grammar (issue #135). The filter parser runs on a query string
-          # an external provisioning connector chose, before any scope check narrows it,
-          # so a panic here is reachable by every SCIM client the deployment trusts.
-          - dir: .
-            target: scim_filter
     steps:
       - uses: actions/checkout@v7
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The

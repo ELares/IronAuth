@@ -39,5 +39,5 @@ pub use service_provider_config::{
 
 pub use filter::{
     AttributePath, CompareOp, Filter, FilterError, PresentOp, ScimErrorBody, Value,
-    matches as filter_matches, parse_filter,
+    matches as filter_matches, parse_filter, sample_user_resource,
 };

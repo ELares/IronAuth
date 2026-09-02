@@ -577,6 +577,34 @@ fn utf8_width(byte: u8) -> usize {
     }
 }
 
+/// The sample user resource the filter fuzz target evaluates against, and the one the seed
+/// test measures the corpus with.
+///
+/// EXPORTED so there is exactly ONE. The fuzz target and the test each had a hand-written
+/// copy, so a change to the target's resource -- dropping `emails`, say -- could not fail the
+/// test that claims to measure what the target explores. Two objects asserted about as though
+/// they were one is the defect class this crate keeps finding in its own prose.
+///
+/// Shaped like what `/Users` renders, plus a multi-valued attribute, because a resource of
+/// scalars leaves the recursive half of [`matches`] untouched.
+#[doc(hidden)]
+#[must_use]
+pub fn sample_user_resource() -> serde_json::Value {
+    serde_json::json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "id": "usr_fuzz",
+        "userName": "alice@example.test",
+        "active": true,
+        "externalId": "00u1",
+        "emails": [
+            {"type": "work", "value": "alice@example.test", "primary": true},
+            {"type": "home", "value": "a@home.test"},
+        ],
+        "name": {"givenName": "Alice", "familyName": "Example"},
+        "meta": {"resourceType": "User"},
+    })
+}
+
 /// Whether `resource` satisfies `filter` (RFC 7644 section 3.4.2.2).
 ///
 /// # Why the evaluator lives beside the parser
@@ -1308,10 +1336,29 @@ mod seed_corpus_tests {
     }
 
     #[test]
+    fn enough_patch_path_seeds_carry_a_selector_to_seed_that_branch() {
+        // The selector branch of `scim_patch_path` is unreachable from random input: a
+        // reviewer measured 2,000,000 random printable-ASCII strings producing 83,318 parsed
+        // PATCH paths and ZERO with a selector. So the only thing that ever enters it is a
+        // seed, and "some seed happens to have brackets" is not a property worth relying on
+        // without saying so here.
+        let with_selector = seeds("scim_patch_path")
+            .into_iter()
+            .filter_map(|(_, text)| crate::parse_patch_path(&text).ok())
+            .filter(|path| path.selector().is_some())
+            .count();
+        assert!(
+            with_selector >= 5,
+            "only {with_selector} seeds carry a value selector, so the branch that evaluates \
+             one is barely seeded"
+        );
+    }
+
+    #[test]
     fn every_committed_patch_path_seed_still_parses() {
         let seeds = seeds("scim_patch_path");
         assert!(
-            seeds.len() >= 8,
+            seeds.len() >= 13,
             "the patch-path seed corpus must not have shrunk: {}",
             seeds.len()
         );
@@ -1325,32 +1372,53 @@ mod seed_corpus_tests {
 
     #[test]
     fn the_filter_seeds_reach_the_evaluator_and_not_only_the_parser() {
-        // A corpus of seeds that all parse but all evaluate to the same answer explores one
-        // branch. This asserts the seeds disagree: at least one matches the sample resource
-        // and at least one does not, so the evaluator's two outcomes are both entered from the
-        // starting corpus rather than only after the fuzzer has mutated its way there.
-        let resource = serde_json::json!({
-            "userName": "alice@example.test",
-            "active": true,
-            "externalId": "00u1",
-            "emails": [{"type": "work", "value": "alice@example.test"}],
-            "meta": {"resourceType": "User"},
-        });
-        let (mut matched, mut missed) = (0, 0);
-        for (_, text) in seeds("scim_filter") {
-            let Ok(filter) = super::parse_filter(&text) else {
-                continue;
-            };
-            if super::matches(&filter, &resource) {
-                matched += 1;
-            } else {
-                missed += 1;
-            }
-        }
-        assert!(matched > 0, "no seed matches the sample resource");
+        // A reviewer measured what these seeds actually buy, and it is the whole value of the
+        // corpus: from an EMPTY corpus, 400k runs entered the recursive half of the evaluator
+        // (And / Or / Not / ValuePath) ZERO times, because uniform random bytes parse as a
+        // filter essentially never. From these seeds, 53 times.
+        //
+        // The first version of this test asserted only `matched > 0 && missed > 0`, and the
+        // same reviewer showed that passes against `json!({})`: one seed is a `not`, which is
+        // true of an empty object, and the other eleven are false. It measured "at least one
+        // seed is a negation", not "the seeds exercise a resource".
+        let resource = super::sample_user_resource();
+        let parsed: Vec<super::Filter> = seeds("scim_filter")
+            .into_iter()
+            .filter_map(|(_, text)| super::parse_filter(&text).ok())
+            .collect();
+        let matched = parsed
+            .iter()
+            .filter(|filter| super::matches(filter, &resource))
+            .count();
+        let missed = parsed.len() - matched;
+
+        // A FLOOR a degenerate resource cannot clear: against `json!({})` exactly one seed
+        // matches, against the real resource eleven do.
+        assert!(
+            matched >= 8,
+            "the sample resource is not exercising the seeds: only {matched} of {} match",
+            parsed.len()
+        );
         assert!(
             missed > 0,
             "every seed matches, so no negative branch is seeded"
+        );
+
+        // And the STRUCTURAL property the coverage measurement is really about: a corpus of
+        // nothing but flat comparisons would satisfy both counts above and still never enter
+        // the recursive walk.
+        assert!(
+            parsed
+                .iter()
+                .any(|filter| matches!(filter, super::Filter::ValuePath { .. })),
+            "no seed is a value path, so the sub-filter walk is unseeded"
+        );
+        assert!(
+            parsed.iter().any(|filter| matches!(
+                filter,
+                super::Filter::And(..) | super::Filter::Or(..) | super::Filter::Not(..)
+            )),
+            "no seed is a connective, so the recursive walk is unseeded"
         );
     }
 }
