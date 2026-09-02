@@ -2131,6 +2131,17 @@ impl Harness {
         self.state = state;
     }
 
+    /// Arm the identity-chaining / ID-JAG receiving side (issue #133, PROTOTYPE).
+    ///
+    /// Only `oidc_router`, unlike `install_attesters` next door: this prototype mounts no route
+    /// and advertises nothing, so there is no discovery document for a test to read. What it
+    /// changes is what an ALREADY MOUNTED grant admits, which is why its tests drive `/token`.
+    pub fn install_identity_chaining(&mut self) {
+        let state = self.state.clone().with_identity_chaining_enabled(true);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
     /// and an optional `Authorization` header (for a `client_secret_basic` client).
     pub async fn par(

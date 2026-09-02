@@ -313,3 +313,93 @@ fn every_machine_token_door_runs_the_agent_gate() {
          transaction-token branch -- and each must run the agent gate for itself"
     );
 }
+
+/// Every ID-JAG grant test carries the substring the CI lane filters on (issue #133).
+///
+/// # Why this exists
+///
+/// `scripts/experimental-prototypes.sh` selects the identity-chaining grant tests with the
+/// libtest filter `id_jag`. The first version of that line matched exactly ONE of the four --
+/// the unarmed-posture test, which is the only one that still passes with the entire prototype
+/// deleted. So the lane whose whole purpose is "this prototype works at its pinned revision"
+/// ran green having exercised none of the four checks, nor the floor-and-allowlist fix.
+///
+/// A filter and a naming convention are two artifacts describing each other with nothing in
+/// between. This is the thing in between: name an ID-JAG test without the substring and it
+/// fails here rather than being silently dropped from the lane.
+///
+/// The section is delimited in the source, so this measures what is actually in the file
+/// rather than a list somebody remembered to update.
+#[test]
+fn every_id_jag_grant_test_is_reachable_by_the_lane_filter() {
+    const FILTER: &str = "id_jag";
+    const MARKER: &str =
+        "// IDENTITY CHAINING / ID-JAG, the RECEIVING side (issue #133, PROTOTYPE).";
+    /// How many tests the ID-JAG section holds. Raised in the same change that adds one.
+    const EXPECTED: usize = 6;
+    let source = include_str!("jwt_bearer.rs");
+
+    let (_, section) = source
+        .split_once(MARKER)
+        .expect("the ID-JAG section marker is in tests/jwt_bearer.rs");
+    // Only items ATTRIBUTED as tests. The first version scanned every `async fn` in the
+    // section and counted the two local helpers as tests, which is a guard failing on
+    // something it was never measuring -- and worse, a guard that would have pushed a helper
+    // to be renamed to satisfy it.
+    let mut names: Vec<&str> = Vec::new();
+    let mut attributed = false;
+    for line in section.lines() {
+        let line = line.trim();
+        // `starts_with`, not equality: `#[tokio::test(flavor = "multi_thread")]` is the same
+        // attribute and an exact match would not see it, so such a test would vanish from the
+        // scan rather than fail it.
+        if line.starts_with("#[tokio::test") || line.starts_with("#[test") {
+            attributed = true;
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("async fn ")
+            .or_else(|| line.strip_prefix("fn "))
+        {
+            if attributed {
+                if let Some(name) = rest.split('(').next() {
+                    names.push(name);
+                }
+            }
+            attributed = false;
+        } else if !line.is_empty() && !line.starts_with("//") && !line.starts_with('#') {
+            attributed = false;
+        }
+    }
+
+    // A scan that found nothing must fail rather than pass vacuously: zero tests trivially
+    // satisfy "every test contains the filter", which is the exact shape of a guard that
+    // stopped measuring.
+    // The EXACT count, not a floor. A floor of four while the section held five let exactly
+    // one test disappear from the scan unnoticed, which is the same "guard that stopped
+    // measuring" this test exists to prevent -- one size smaller.
+    assert_eq!(
+        names.len(),
+        EXPECTED,
+        "the ID-JAG section names {} tests, not {EXPECTED}. If a test was ADDED, raise the \
+         count in the same change; if this dropped, the scan stopped seeing something: \
+         {names:?}",
+        names.len()
+    );
+
+    let unreachable: Vec<&&str> = names.iter().filter(|n| !n.contains(FILTER)).collect();
+    assert!(
+        unreachable.is_empty(),
+        "these ID-JAG tests do not contain `{FILTER}`, so the experimental-prototypes lane \
+         would not run them: {unreachable:?}"
+    );
+
+    // And the lane really does filter on that string. Pinning only the test names would leave
+    // the other half of the pair free to move.
+    let lane = include_str!("../../../scripts/experimental-prototypes.sh");
+    assert!(
+        lane.contains(&format!("--test jwt_bearer {FILTER}")),
+        "the lane no longer filters `--test jwt_bearer {FILTER}`; this guard is pinning the \
+         wrong string and the tests above prove nothing about what CI runs"
+    );
+}

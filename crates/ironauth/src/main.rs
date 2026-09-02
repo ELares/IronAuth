@@ -24,9 +24,10 @@ use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE,
     AUTHZEN_AGENT_PROFILE_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
-    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, ORG_SCOPED_CLIENTS_FEATURE,
-    OidcConfig, OutboxConfig, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
-    ScreeningProvider, TRANSACTION_TOKENS_FEATURE, WASM_HOOKS_FEATURE, WebhooksConfig,
+    FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, IDENTITY_CHAINING_FEATURE, Loaded,
+    ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
+    RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, TRANSACTION_TOKENS_FEATURE,
+    WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -595,6 +596,9 @@ struct DataPlaneSurfaces {
     /// draft is unacknowledged or no domain is configured. `None` leaves the requested token
     /// type refused exactly as any unknown one is.
     transaction_token_domain: Option<String>,
+    /// Whether the identity-chaining / ID-JAG receiving side is armed (issue #133). Off leaves
+    /// the jwt-bearer grant behaving exactly as it does without this prototype.
+    identity_chaining: bool,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
     /// The experimental org-scoped-clients surface (issue #103, milestone M10).
@@ -635,6 +639,7 @@ impl DataPlaneSurfaces {
             // Not a bool either: "armed" means the draft is acknowledged AND a trust domain is
             // set, and the domain is the value the mint needs. One resolution, one place.
             transaction_token_domain: transaction_token_domain(features, config),
+            identity_chaining: identity_chaining_armed(features, config),
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
@@ -1458,6 +1463,9 @@ async fn build_oidc_plane(
     // endpoint. `None` leaves the requested type refused as unsupported, which is what an
     // unarmed deployment already answers for any URI it does not implement.
     .with_optional_transaction_token_domain(surfaces.transaction_token_domain.clone())
+    // Identity chaining / ID-JAG (issue #133, PROTOTYPE). ONE plane: the jwt-bearer grant is a
+    // data-plane endpoint. Off leaves that grant behaving exactly as it does on main.
+    .with_identity_chaining_enabled(surfaces.identity_chaining)
     .with_flows_enabled(surfaces.flows)
     .with_hosted_pages_enabled(surfaces.hosted_pages)
     .with_diagnostics(&config.diagnostics)
@@ -1680,11 +1688,38 @@ async fn build_oidc_plane(
              may change between releases"
         );
     }
+    if surfaces.identity_chaining {
+        // Worth announcing more than a new route is, and the reason is the difference between
+        // this prototype and its neighbours: it mounts NOTHING. It adds refusals inside an
+        // existing grant, so an operator reading their route table cannot see that it is on,
+        // and this line is the only sign of it AT BOOT. (The behaviour is visible at runtime:
+        // /token refuses assertions it previously accepted, and an admitted one carries the
+        // assertion scope.)
+        tracing::info!(
+            "experimental identity chaining / ID-JAG receiving side armed (issue #133, \
+             draft-ietf-oauth-identity-chaining-16 + \
+             draft-ietf-oauth-identity-assertion-authz-grant-04): the jwt-bearer grant now \
+             ADMITS an identity assertion from another trust domain, subject to its media \
+             type, a CONFIDENTIAL presenting client, its client binding and its scope as a \
+             ceiling; no route is mounted and every ordinary jwt-bearer refusal still \
+             applies; the wire shape may change between releases"
+        );
+    }
     Some(OidcPlane {
         state,
         discovery,
         jwks,
     })
+}
+
+/// Whether the identity-chaining / ID-JAG receiving side is armed (issue #133, PROTOTYPE).
+///
+/// A named function for the same reason `agent_tool_profile_armed` is one: the boot path that
+/// would read it inline needs a live store, so the wiring -- which flag, which surface -- could
+/// not be tested, and substituting another prototype's constant would arm a live grant path off
+/// an unrelated acknowledgment.
+fn identity_chaining_armed(features: &FeatureRegistry, config: &Config) -> bool {
+    features.is_enabled(config, IDENTITY_CHAINING_FEATURE)
 }
 
 /// The trust domain transaction tokens are minted for, or `None` (issue #133, PROTOTYPE).
@@ -6463,12 +6498,105 @@ mod tests {
         );
     }
 
+    /// Identity chaining is armed by ITS OWN acknowledgment and no other (issue #133).
+    ///
+    /// The first case holds for any function that returns `false` by default. The POSITIVE
+    /// case and the last one are what pin it to THIS feature's constant: a function reading a
+    /// different prototype's fails both. Getting it wrong here is worse than for the surfaces
+    /// that mount a route: those fail visibly as a 404, whereas this one silently changes what
+    /// an ALREADY LIVE grant accepts, off an acknowledgment for something else.
+    #[test]
+    fn identity_chaining_is_armed_by_its_own_acknowledgment() {
+        let features = FeatureRegistry::builtin();
+
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            !identity_chaining_armed(&features, &bare),
+            "off in a default deployment"
+        );
+
+        // TWO assertions, because "armed" is two facts and `identity_chaining_armed` answers
+        // only one of them. `is_enabled` reads the toggle and NOTHING else; the acknowledgment
+        // is enforced by `validate`, which fails the BOOT. Asserting only the arming left the
+        // ack string in this TOML decorative -- replacing it with nonsense kept the test green,
+        // which a mutation confirmed. The pair below is what jointly means "acknowledged at its
+        // pinned revision, and armed".
+        //
+        // The ack is written LITERALLY rather than interpolated from
+        // `IDENTITY_CHAINING_VERSION`: interpolating it would make this true for whatever the
+        // constant happens to say, including a silently bumped revision, and the whole point of
+        // an acknowledgment is that the operator typed that exact string.
+        let armed = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             identity-chaining = { enabled = true, ack = \
+             \"draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04\" }\n",
+        );
+        assert!(
+            features.validate(&armed).is_ok(),
+            "this exact acknowledgment string is the one the ladder accepts"
+        );
+        assert!(
+            identity_chaining_armed(&features, &armed),
+            "its own acknowledgment at its own pinned revision arms it"
+        );
+
+        // Enabled but NOT acknowledged, and enabled with a STALE acknowledgment. Both are
+        // asserted against `validate`, not against `identity_chaining_armed`, because that is
+        // where the acknowledgment actually lives: `is_enabled` reads the toggle and nothing
+        // else, and the ladder refuses to BOOT on a missing or mismatched ack. Asserting
+        // "arms nothing" on the read would have been asserting the wrong function -- and the
+        // truth is the stronger one, since a process that will not start cannot half-arm.
+        for (case, toml) in [
+            (
+                "missing",
+                "[admin]\nbootstrap_operator_token = \"t\"\n\
+                 [features]\n\
+                 identity-chaining = { enabled = true }\n"
+                    .to_owned(),
+            ),
+            (
+                // An operator who accepted an earlier revision has not accepted this one, and
+                // the ack pins BOTH drafts, so either moving invalidates it.
+                "stale",
+                "[admin]\nbootstrap_operator_token = \"t\"\n\
+                 [features]\n\
+                 identity-chaining = { enabled = true, ack = \
+                 \"draft-ietf-oauth-identity-chaining-15+draft-ietf-oauth-identity-assertion-authz-grant-04\" }\n"
+                    .to_owned(),
+            ),
+        ] {
+            let cfg = config(&toml);
+            let error = features
+                .validate(&cfg)
+                .expect_err(&format!("a {case} acknowledgment must refuse the boot"));
+            assert!(
+                error.to_string().contains(IDENTITY_CHAINING_FEATURE),
+                "the {case} case must be refused by NAME, not by some other feature's \
+                 violation: {error}"
+            );
+        }
+
+        // A DIFFERENT prototype's acknowledgment, which is the case the three above cannot
+        // distinguish.
+        let other = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             transaction-tokens = { enabled = true, ack = \
+             \"draft-ietf-oauth-transaction-tokens-09\" }\n",
+        );
+        assert!(
+            !identity_chaining_armed(&features, &other),
+            "an acknowledgment for a different prototype must not arm this one"
+        );
+    }
+
     /// The agent tool profile is armed by ITS OWN acknowledgment and no other (issue #133).
     ///
-    /// The third case is the one that matters. The first two are satisfied by any
-    /// implementation that returns `false` by default, and would hold if the call site read a
-    /// different experimental feature's constant -- which would arm a LIVE authorization
-    /// subject type off an acknowledgment for something else entirely.
+    /// The first case is satisfied by any implementation that returns `false` by default. The
+    /// SECOND and the third are what pin it to this feature's constant: a call site reading a
+    /// different experimental feature's fails both, and would otherwise arm a LIVE
+    /// authorization subject type off an acknowledgment for something else entirely.
     #[test]
     fn the_agent_tool_profile_is_armed_by_its_own_acknowledgment() {
         let features = FeatureRegistry::builtin();
@@ -6489,8 +6617,9 @@ mod tests {
             "its own acknowledgment arms it"
         );
 
-        // ANOTHER experimental feature, acknowledged. This must NOT arm the profile, and it is
-        // the only case that distinguishes "reads the right flag" from "reads a flag".
+        // ANOTHER experimental feature, acknowledged. This must NOT arm the profile. Together
+        // with the positive case above it distinguishes "reads the right flag" from "reads a
+        // flag"; neither does so alone.
         let other = config(
             "[admin]\nbootstrap_operator_token = \"t\"\n\
              [features]\n\

@@ -916,6 +916,19 @@ const GARBAGE_ASSERTION: &str = "not.a.jwt";
 /// token cannot widen what that token may carry, so there is no data-plane door to
 /// write through even in a test.
 async fn set_allowlist(h: &Harness, allowed: Option<&[String]>) {
+    set_allowlist_for(h, h.client_id(), allowed).await;
+}
+
+/// Set an ARBITRARY client's per-client scope allowlist (issue #98).
+///
+/// Split out because the identity-chaining cases present as a CONFIDENTIAL client, which is
+/// never the harness's own: the armed path refuses a public presenter, so a test that needs
+/// both an allowlist and an admitted assertion needs them on the same non-default client.
+async fn set_allowlist_for(
+    h: &Harness,
+    client_id: &ironauth_store::ClientId,
+    allowed: Option<&[String]>,
+) {
     h.db()
         .control_store()
         .management()
@@ -924,7 +937,7 @@ async fn set_allowlist(h: &Harness, allowed: Option<&[String]>) {
             ironauth_store::CorrelationId::generate(h.env()),
         )
         .client_scope_policies(h.scope())
-        .set(h.env(), h.client_id(), allowed)
+        .set(h.env(), client_id, allowed)
         .await
         .expect("set the presenting client's scope allowlist");
 }
@@ -3757,4 +3770,521 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
         claims["sub"], MAPPED_PRINCIPAL,
         "the assertion above describes a token for the mapped principal: {claims}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// IDENTITY CHAINING / ID-JAG, the RECEIVING side (issue #133, PROTOTYPE).
+//
+// These live in THIS file rather than beside the module's own unit suite, and the reason is the
+// property they exist to prove. `tests/identity_chaining.rs` drives `admit` directly and answers
+// what the four checks accept; it cannot answer whether the grant reaches them, nor whether the
+// grant's OTHER controls still fire once it does. Layering a prototype onto a live grant is
+// exactly where a control gets routed around, and it happened here: the first draft handed the
+// mint the assertion's own scope claim, which the machine-grant floor and the presenting
+// client's allowlist had never seen.
+// ---------------------------------------------------------------------------------------------
+
+/// The ID-JAG media type, spelled here rather than imported, so a rename of the constant does
+/// not silently move what these tests present. The wire is the contract.
+const ID_JAG_MEDIA_TYPE: &str = "oauth-id-jag+jwt";
+
+/// Assert the refusal recorded OUT OF BAND, which is the only thing that separates one ID-JAG
+/// refusal from another.
+///
+/// Every one of them answers the same `400 invalid_grant` the ordinary grant answers, on
+/// purpose: a caller that could tell them apart would learn how far a forged assertion got. So
+/// a test asserting only the status and the error code cannot tell an interception from a
+/// forged signature, and would still pass if the ID-JAG path had short-circuited a check it
+/// was supposed to run in addition to. Every sibling test in this file that has to tell one
+/// `invalid_grant` from another pins the reason the same way; the ones asserting only the wire
+/// are the ones where the status IS the whole claim.
+async fn assert_refused_because(h: &Harness, client_id: &str, reason: &str) {
+    let seen: Vec<String> = h
+        .client_auth_diagnostics(client_id)
+        .await
+        .iter()
+        .map(|d| d.failure_reason.clone())
+        .collect();
+    assert!(
+        seen.iter().any(|r| r == reason),
+        "expected the out-of-band reason `{reason}`; the sink holds {seen:?}"
+    );
+}
+
+/// Present an ID-JAG assertion as a CONFIDENTIAL client, authenticating with Basic.
+///
+/// The armed path requires it: a public client authenticates by naming itself, so the
+/// assertion's `client_id` binding would cost an interceptor nothing.
+async fn present_confidential(
+    h: &Harness,
+    client_id: &str,
+    secret: &str,
+    assertion: &str,
+    scope: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"))
+    );
+    let mut fields = vec![("grant_type", JWT_BEARER_GRANT), ("assertion", assertion)];
+    if let Some(scope) = scope {
+        fields.push(("scope", scope));
+    }
+    let body = form(&fields);
+    h.token_with_auth(&body, Some(&auth)).await
+}
+
+/// Sign an ID-JAG-shaped assertion: an ordinary RFC 7523 assertion PLUS the media type in the
+/// header, the presenting client in `client_id`, and the authorized `scope`.
+fn id_jag(
+    key: &SigningKey,
+    aud: &str,
+    jti: &str,
+    client_id: &str,
+    scope: Option<&str>,
+    typ: &str,
+) -> String {
+    let mut claims = serde_json::json!({
+        "iss": EXTERNAL_ISSUER, "sub": EXTERNAL_SUBJECT, "aud": aud,
+        "exp": 3600, "iat": 0, "jti": jti, "client_id": client_id,
+    });
+    if let Some(scope) = scope {
+        claims["scope"] = serde_json::json!(scope);
+    }
+    let payload = serde_json::to_vec(&claims).expect("serialize claims");
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ(typ)).expect("sign assertion") // invariant-allow: typ-via-declaration -- a FOREIGN issuer's media type from an IETF draft, not an IronAuth token profile
+}
+
+#[tokio::test]
+async fn an_id_jag_assertion_is_an_ordinary_assertion_until_the_prototype_is_armed() {
+    // THE UNARMED POSTURE, and it is the honest one rather than a convenient one. `typ` is not
+    // a separator the ordinary path reads, so on a deployment that has not opted in, an
+    // assertion carrying the ID-JAG media type is exactly what it is on main today: an ordinary
+    // bearer assertion from a trusted issuer. None of the four checks apply -- and that is
+    // precisely why the flag exists, because those checks are the whole difference between an
+    // identity assertion and a bearer one.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+
+    // Naming ANOTHER client, and with no scope: two things the armed side refuses outright.
+    let token = id_jag(
+        &issuer_key(),
+        h.issuer(),
+        "jti-idjag-unarmed",
+        "cli_somebody_else",
+        None,
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unarmed, the media type means nothing and the ordinary grant issues: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn an_armed_deployment_admits_an_honest_id_jag_and_refuses_the_attacks() {
+    let mut h = Harness::start().await;
+    seed_trust(&h).await;
+    h.install_identity_chaining();
+    // A CONFIDENTIAL presenter, unlike every other test in this file. An identity assertion is
+    // bound to the client it was minted for, and that binding only means something if the
+    // presenter had to prove it IS that client: see
+    // `an_id_jag_is_refused_for_a_public_presenting_client`.
+    let (confidential, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let client_id = confidential.to_string();
+    let key = issuer_key();
+
+    // ADMITTED, and the token carries the scope the AUTHORITATIVE domain authorized rather than
+    // anything this deployment chose.
+    let honest = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-honest",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &honest, None).await;
+    assert_eq!(status, StatusCode::OK, "an honest assertion issues: {resp}");
+    assert_eq!(
+        json(&resp)["scope"],
+        "read:orders",
+        "the issued scope is the assertion's, not the client's default: {resp}"
+    );
+    let claims = jwt_payload(json(&resp)["access_token"].as_str().expect("a token"));
+    assert_eq!(
+        claims["sub"], MAPPED_PRINCIPAL,
+        "and it still speaks for the LOCALLY mapped principal: {claims}"
+    );
+
+    // THE INTERCEPTION: the same assertion, naming another client. Refused, with this grant's
+    // uniform answer -- the ID-JAG refusals join the existing wire contract rather than
+    // introducing a new error an attacker could use to tell them apart.
+    let stolen = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-stolen",
+        "cli_somebody_else",
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &stolen, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "identity_assertion_client_mismatch").await;
+
+    // AND AN ASSERTION BOUND TO NOBODY, which is refused for the same reason but recorded
+    // under a DIFFERENT one. Without this case the split between the two is untested end to
+    // end: collapsing `Unbound` back into `ClientMismatch` would leave every other test green
+    // while making the interception alert fire for an issuer that forgot to set the claim.
+    let unbound = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-unbound",
+        "",
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &unbound, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_grant",
+        "the wire cannot tell it from an interception: {resp}"
+    );
+    assert_refused_because(&h, &client_id, "identity_assertion_unbound").await;
+
+    // THE MISSING CEILING: an assertion with no scope authorizes nothing, so there is nothing to
+    // issue against. Treating it as "whatever the local mapping allows" is the widening the
+    // ceiling exists to stop.
+    let scopeless = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-scopeless",
+        &client_id,
+        None,
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &scopeless, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "identity_assertion_no_scope").await;
+
+    // THE OVERREACH: a request wider than the assertion. Refused rather than quietly narrowed,
+    // because a client that asked for `admin` and received `read:orders` has been told it holds
+    // something it does not.
+    let honest_again = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-overreach",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(
+        &h,
+        &client_id,
+        &secret,
+        &honest_again,
+        Some("read:orders admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "identity_assertion_scope_exceeded").await;
+}
+
+#[tokio::test]
+async fn the_media_type_alone_decides_whether_the_id_jag_rules_apply() {
+    // WHAT THE `typ` PARAMETER IS FOR, and until this case nothing varied it.
+    //
+    // Every other armed case differs from the honest one in something the ID-JAG rules judge,
+    // so all of them would still pass if the media type were ignored and the rules applied to
+    // every assertion. This is the converse: a client that could satisfy EVERY other check --
+    // confidential, named in the assertion, asking within its scope -- presents an assertion
+    // whose only difference is an ordinary `typ`. None of the rules may apply to it, and in
+    // particular the scope ceiling must not, or the prototype would be silently changing what
+    // the ordinary grant issues.
+    let mut h = Harness::start().await;
+    seed_trust(&h).await;
+    h.install_identity_chaining();
+    let (confidential, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let client_id = confidential.to_string();
+    let key = issuer_key();
+
+    // `JWT`, not the ID-JAG type, and carrying a `scope` claim of `read:orders`. If the
+    // ceiling applied, asking for `admin` would be refused as exceeding it.
+    let ordinary = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-typ-decides",
+        &client_id,
+        Some("read:orders"),
+        "JWT",
+    );
+    let (status, _h, resp) =
+        present_confidential(&h, &client_id, &secret, &ordinary, Some("admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an ordinary assertion is judged by the ordinary rules even when every ID-JAG \
+         condition happens to hold: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["scope"],
+        "admin",
+        "and it carries what the CLIENT asked for, with the assertion's scope claim ignored \
+         exactly as main ignores it: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn an_id_jag_is_refused_for_a_public_presenting_client() {
+    // THE CHECK THAT MAKES THE BINDING MEAN ANYTHING, and it was missing from the first version
+    // of this prototype.
+    //
+    // This grant permits a PUBLIC presenting client on purpose: the assertion is the
+    // authorization grant, so a workload trading one needs no client credential. But for a
+    // public client, "authenticating as `cli_x`" is typing `cli_x` into the form. An assertion
+    // is bound to the client it was minted for -- and an interceptor reads that client id off
+    // the assertion itself and sends it. The binding costs nothing, and the assertion is
+    // exactly the bearer token the binding exists to stop it being.
+    //
+    // So an identity assertion requires a presenter that PROVED it is that client. The same
+    // assertion is driven twice, differing only in who presents it.
+    let mut h = Harness::start().await;
+    let public_id = seed_trust(&h).await;
+    h.install_identity_chaining();
+    let key = issuer_key();
+
+    // Minted for the PUBLIC harness client, which is what an interceptor would replay.
+    let for_public = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-public",
+        &public_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &public_id, &for_public).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a public presenter must not be able to spend an identity assertion: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &public_id, "identity_assertion_presenter_public").await;
+
+    // And the CONTROL, which is what makes the refusal attributable to the presenter rather
+    // than to anything else about the assertion: the same shape, presented by a client that
+    // authenticated, is admitted.
+    let (confidential, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let cid = confidential.to_string();
+    let for_confidential = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-public-control",
+        &cid,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &cid, &secret, &for_confidential, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the identical assertion from a client that authenticated is admitted: {resp}"
+    );
+
+    // The ORDINARY grant is untouched: a public client still trades a plain bearer assertion,
+    // which is the posture this grant was built with and the reason the check above is scoped
+    // to identity assertions rather than applied to the whole door.
+    let ordinary = assertion(
+        &key,
+        EXTERNAL_ISSUER,
+        EXTERNAL_SUBJECT,
+        h.issuer(),
+        3600,
+        "jti-idjag-public-ordinary",
+    );
+    let (status, _h, resp) = present(&h, &public_id, &ordinary).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a public client still trades an ORDINARY assertion: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn an_id_jag_scope_is_not_a_way_past_the_floor_or_the_allowlist() {
+    // THE BYPASS THIS PROTOTYPE INTRODUCED AND CLOSED. When the client asks for nothing, the
+    // assertion's ceiling becomes the granted scope -- and that string is written by a FOREIGN
+    // issuer. If it went to the mint unexamined, an identity assertion would be a way to obtain
+    // scopes the very same client is refused when it asks plainly. Both of this grant's scope
+    // controls are driven through the assertion rather than through `scope`.
+    let mut h = Harness::start().await;
+    seed_trust(&h).await;
+    h.install_identity_chaining();
+    let (confidential, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let client_id = confidential.to_string();
+    set_allowlist_for(&h, &confidential, Some(&["read:orders".to_owned()])).await;
+    let key = issuer_key();
+
+    // THE ALLOWLIST (issue #98). The client may only ever hold `read:orders`; an assertion
+    // authorizing `admin` does not change that.
+    let past_allowlist = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-allowlist",
+        &client_id,
+        Some("admin"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) =
+        present_confidential(&h, &client_id, &secret, &past_allowlist, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the assertion must not carry the client past its own allowlist: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_grant",
+        "and it is refused with the same uniform answer a plain request gets: {resp}"
+    );
+    // THE ALLOWLIST is what refused, not one of the ID-JAG checks. Those answer the identical
+    // status and error, so without this the case would still pass if `admit` had refused for a
+    // reason that has nothing to do with the allowlist under test.
+    assert_refused_because(&h, &client_id, "scope_not_allowlisted").await;
+
+    // THE MACHINE-GRANT FLOOR (issue #23). `openid` and `offline_access` are out of policy on
+    // every machine grant because there is no interactive user; a foreign issuer asserting them
+    // does not create one.
+    let past_floor = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-floor",
+        &client_id,
+        Some("read:orders openid"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &past_floor, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the floor still applies to a scope the assertion authorized: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_scope",
+        "the floor answers invalid_scope, exactly as it does for a plainly requested one: {resp}"
+    );
+
+    // And the control case: within BOTH, it issues. Without this, every assertion above could be
+    // failing for a reason unrelated to scope.
+    let allowed = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-allowed",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &allowed, None).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(json(&resp)["scope"], "read:orders", "{resp}");
+}
+
+#[tokio::test]
+async fn every_ordinary_jwt_bearer_refusal_still_fires_on_an_id_jag() {
+    // The layering claim, stated as a test. An identity assertion is checked by the ID-JAG rules
+    // IN ADDITION TO the grant's own, never instead of them -- so an assertion that is perfect
+    // by ID-JAG's lights and broken by RFC 7523's is still refused. Each case is the honest
+    // assertion with exactly one ordinary property broken.
+    //
+    // Each case pins the ORDINARY reason out of band, and that is what makes it a test. Every
+    // ID-JAG refusal answers the same `400 invalid_grant` these do, so asserting only the wire
+    // would leave every case green even if the ID-JAG path had short-circuited the ordinary
+    // control for a reason of its own, which is precisely what this claims to exclude.
+    let mut h = Harness::start().await;
+    seed_trust(&h).await;
+    h.install_identity_chaining();
+    let (confidential, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let client_id = confidential.to_string();
+    let key = issuer_key();
+
+    // A BAD SIGNATURE: signed by a key the registered JWKS does not hold.
+    let forged = id_jag(
+        &wrong_key(),
+        h.issuer(),
+        "jti-idjag-forged",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &forged, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a forged signature: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "assertion_bad_signature").await;
+
+    // THE WRONG AUDIENCE: an assertion minted for somewhere else.
+    let misaudienced = id_jag(
+        &key,
+        "https://another.deployment.test",
+        "jti-idjag-aud",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) =
+        present_confidential(&h, &client_id, &secret, &misaudienced, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a wrong audience: {resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "assertion_audience_mismatch").await;
+
+    // A REPLAY: the single-use `jti` is spent by the first presentation, and carrying the ID-JAG
+    // media type does not exempt an assertion from that.
+    let once = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-replay",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &once, None).await;
+    assert_eq!(status, StatusCode::OK, "the first presentation: {resp}");
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &once, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the replay: {resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "replayed_jti").await;
+
+    // AN UNREGISTERED SUBJECT: no mapping, so no local principal to speak for. An identity
+    // assertion does not auto-provision one -- if it did, a trusted issuer could create
+    // identities here by asserting them.
+    let unmapped_claims = serde_json::json!({
+        "iss": EXTERNAL_ISSUER, "sub": "spiffe://cluster.test/ns/prod/sa/nobody",
+        "aud": h.issuer(), "exp": 3600, "iat": 0, "jti": "jti-idjag-unmapped",
+        "client_id": client_id, "scope": "read:orders",
+    });
+    let payload = serde_json::to_vec(&unmapped_claims).expect("serialize");
+    // The options are bound to a `let` rather than built inline, so the marker cannot be
+    // separated from the call it exempts. Inline, rustfmt split this across four lines and
+    // carried the comment onto the closing paren, which the lint scans PER LINE: the exemption
+    // silently stopped applying and the rule fired in CI on a file that was clean locally.
+    let options = EmissionOptions::new().with_typ(ID_JAG_MEDIA_TYPE); // invariant-allow: typ-via-declaration -- see `id_jag` above
+    let unmapped = sign_jws(&key, &payload, &options).expect("sign");
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &unmapped, None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unmapped subject: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+    assert_refused_because(&h, &client_id, "assertion_subject_unmapped").await;
 }

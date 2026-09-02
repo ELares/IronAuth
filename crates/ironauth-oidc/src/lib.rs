@@ -126,6 +126,9 @@ pub mod flow;
 mod global_revocation;
 mod hashing_pool;
 mod hints;
+/// Identity chaining and ID-JAG, the RECEIVING side, PROTOTYPE (issue #133). Layered ON the
+/// jwt-bearer assertion grant: it adds requirements and removes none.
+pub mod identity_chaining;
 mod interaction;
 mod introspection;
 mod invitations;

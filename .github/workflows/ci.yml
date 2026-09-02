@@ -1280,6 +1280,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install the WASM target for the pinned toolchain
+        # This lane was RED from the day it was added, and not on a prototype: `ironauth-hooks`
+        # builds its guest fixtures for wasm32-wasip2 from a build script, `ironauth-oidc` pulls
+        # it in, and this was the one job compiling the workspace without the target. It died in
+        # the FIRST section, so no prototype's tests have ever run here -- the dedicated lane
+        # issue #133 asks for existed and executed nothing. Six other jobs already carry this
+        # step for the same reason; the comment at the clippy job records why it goes through
+        # rustup rather than the action's `targets:` input.
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: pinned draft revisions
         run: scripts/experimental-prototypes.sh --revisions

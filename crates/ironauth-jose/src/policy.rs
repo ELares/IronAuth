@@ -539,6 +539,33 @@ token_profiles! {
     TransactionToken => "txn_token",
 }
 
+/// Whether a protected header's `typ` names `expected`, for a media type IronAuth does NOT mint.
+///
+/// The same comparison [`TokenTyp::matches`] performs, and deliberately the same function
+/// rather than a third copy of it: case-insensitive per RFC 2045 section 5.1, with the optional
+/// `application/` prefix stripped first per RFC 7515 section 4.1.9, and an ABSENT `typ` never
+/// matching.
+///
+/// [`TokenTyp`] names only profiles this system mints, so a FOREIGN party's media type -- an
+/// IETF draft's, a peer IdP's -- has no variant to compare against and needs this. Two
+/// prototypes hand-rolled it before this existed, and the first of them shipped a divergence:
+/// it stripped the two literal spellings `application/` and `APPLICATION/`, so a conforming
+/// attester sending `Application/oauth-client-attestation+jwt` was refused. Fail-closed, and
+/// still a vetted comparison drifting one copy at a time.
+#[must_use]
+pub fn foreign_media_type_is(header_typ: Option<&str>, expected: &str) -> bool {
+    let Some(candidate) = header_typ else {
+        return false;
+    };
+    let bare = match candidate.get(..MEDIA_TYPE_PREFIX.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(MEDIA_TYPE_PREFIX) => {
+            &candidate[MEDIA_TYPE_PREFIX.len()..]
+        }
+        _ => candidate,
+    };
+    bare.eq_ignore_ascii_case(expected)
+}
+
 impl TokenTyp {
     /// Whether a protected header's `typ` names this profile.
     ///
@@ -550,16 +577,7 @@ impl TokenTyp {
     /// absence is a token that did not come from the mint.
     #[must_use]
     pub fn matches(self, header_typ: Option<&str>) -> bool {
-        let Some(candidate) = header_typ else {
-            return false;
-        };
-        let bare = match candidate.get(..MEDIA_TYPE_PREFIX.len()) {
-            Some(prefix) if prefix.eq_ignore_ascii_case(MEDIA_TYPE_PREFIX) => {
-                &candidate[MEDIA_TYPE_PREFIX.len()..]
-            }
-            _ => candidate,
-        };
-        bare.eq_ignore_ascii_case(self.media_type())
+        foreign_media_type_is(header_typ, self.media_type())
     }
 }
 
