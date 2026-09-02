@@ -12,8 +12,22 @@ workspace = true
 
 [dependencies]
 ironauth-store = { path = "../ironauth-store" }
+ironauth-env = { path = "../ironauth-env" }
+axum = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+ironauth-store = { path = "../ironauth-store", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower.workspace = true
 serde_json.workspace = true
+
+
+# THE SCIM SURFACE (issue #135): that no route answers without a credential, that a token
+# cannot be repointed at another scope by editing the half that names one, and that the
+# discovery documents report what the server enforces. Needs a database.
+[[test]]
+name = "surface"
+path = "tests/surface.rs"

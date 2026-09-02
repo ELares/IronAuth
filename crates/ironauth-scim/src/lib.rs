@@ -21,6 +21,8 @@ mod filter;
 mod patch;
 mod path;
 mod resource;
+pub mod schema;
+pub mod server;
 mod service_provider_config;
 
 pub use bulk::{
