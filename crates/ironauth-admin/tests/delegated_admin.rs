@@ -811,6 +811,133 @@ async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_wid
 /// merely some permission. A handler demanding `Read` would answer 200 here, and one
 /// demanding the wrong write permission would name that one instead.
 #[tokio::test]
+async fn a_read_only_credential_can_list_scim_connections_and_cannot_mint_or_kill_one() {
+    // THE PIN FOR THE SCIM CONNECTION SURFACE. A reviewer mutated its permission checks and
+    // found five of them survived the whole suite: downgrading create and revoke from
+    // `WriteCredentials` to `Read`, deleting the sudo check, deleting the list's permission
+    // check entirely, and widening the create's environment access. The controls were correct
+    // and nothing held them there.
+    //
+    // `management_permissions.rs` cannot do it -- as its own comment says, it asserts only
+    // that SOME permission is demanded, and a downgrade to `Read` satisfies that. Naming the
+    // specific permission is what this file is for, and it is the argument `api_keys.rs`
+    // records above its own check.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "sc-mint").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "sc-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let base = format!("{orgs}/{org}/scim-connections");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "sc-seed",
+            &serde_json::json!({ "display_name": "seed", "provider": "okta" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed connection: {body}");
+    let seeded = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    // The READ it holds still works, which is what makes the refusals below the narrowing
+    // rather than a credential locked out of the surface.
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the connection listing it holds: {body}"
+    );
+
+    // MINT is refused, and the refusal NAMES write_credentials rather than any other write.
+    let (status, _, body) = h
+        .post_as(
+            &base,
+            &secret,
+            "sc-denied-create",
+            &serde_json::json!({ "display_name": "should not exist", "provider": "okta" })
+                .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential MINTED a SCIM provisioning credential: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "the refusal does not name write_credentials, so the handler may be demanding a \
+         different permission than the classification records: {body}"
+    );
+
+    // REVOKE is refused, and names the same permission.
+    let (status, _, body) = h.delete_as(&format!("{base}/{seeded}"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential REVOKED a SCIM provisioning credential: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "revoke: {body}"
+    );
+
+    // And nothing landed: the seeded connection is still live and still the only one.
+    let (_, _, listed) = h.get(&base).await;
+    let parsed = serde_json::from_str::<serde_json::Value>(&listed).expect("json");
+    assert_eq!(
+        parsed["items"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    // A live connection omits `revoked_at_unix_ms` from the view entirely, so the field
+    // being ABSENT is what says the refused revoke changed nothing. `is_null()` would say
+    // the same thing about a field that had been renamed; the revoked direction is pinned
+    // in `scim_connections.rs::a_revoked_connection_is_listed_and_stops_authenticating`.
+    assert!(
+        parsed["items"][0].get("revoked_at_unix_ms").is_none(),
+        "the refused revoke landed anyway: {listed}"
+    );
+
+    // And the LISTING demands `management.read` rather than merely being reachable. Deleting
+    // the list handler's permission check was one of the five mutations that survived, and
+    // the half above cannot see it: a credential HOLDING read lists successfully either way.
+    // A credential holding a DIFFERENT permission is what separates them. It is
+    // `write_config` rather than an empty grant set, because an empty set could be refused
+    // by some earlier check and would prove nothing about which permission this route wants.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential LISTED SCIM connections, so the listing demands no \
+         permission of its own: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;

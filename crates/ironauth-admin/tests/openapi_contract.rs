@@ -120,6 +120,7 @@ fn operation_ids_are_the_stable_set() {
             "createPermission",
             "createProjectGrant",
             "createRoutingRule",
+            "createScimConnection",
             "createServiceAccountApiKey",
             "createServiceAccountMembership",
             "createSubjectMapping",
@@ -260,6 +261,7 @@ fn operation_ids_are_the_stable_set() {
             "listResourceServers",
             "listResourceTypes",
             "listRoutingRules",
+            "listScimConnections",
             "listSecrets",
             "listServiceAccountApiKeys",
             "listSessionTokenTemplates",
@@ -309,6 +311,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeChallengeComponentSecret",
             "revokeInvitation",
             "revokeOrganizationApiKey",
+            "revokeScimConnection",
             "revokeServiceAccountApiKey",
             "revokeSession",
             "revokeTokenHookSecret",
@@ -405,6 +408,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listOrgGroupRoles",
         "listOrgMembershipRoles",
         "listOrgRolePermissions",
+        "listScimConnections",
         "listPermissions",
         "listResourceServers",
     ] {
@@ -564,6 +568,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants/{grant_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}",
@@ -652,6 +657,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/queues",
@@ -746,6 +752,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
@@ -904,7 +911,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        279,
+        282,
         "the documented route count is pinned"
     );
 

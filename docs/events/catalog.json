@@ -2561,6 +2561,57 @@
       "type": "routing_rule.domain_verification_changed"
     },
     {
+      "domain": "scim_connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "provider": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scim_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scim_connection_id",
+          "organization_id",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "scim_connection.created"
+    },
+    {
+      "domain": "scim_connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scim_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scim_connection_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "scim_connection.revoked"
+    },
+    {
       "domain": "session",
       "payload_schema": {
         "additionalProperties": false,

@@ -431,6 +431,19 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         ManagementPermission::WriteCredentials,
     ),
     ("listOrganizationApiKeys", ManagementPermission::Read),
+    // The SCIM provisioning credential surface (issue #135). A connection token provisions and
+    // deprovisions an organization's entire user population, so minting or revoking one is
+    // `WriteCredentials` on the same argument as the organization API key it sits beside; the
+    // listing never carries a token and is `Read`.
+    (
+        "createScimConnection",
+        ManagementPermission::WriteCredentials,
+    ),
+    ("listScimConnections", ManagementPermission::Read),
+    (
+        "revokeScimConnection",
+        ManagementPermission::WriteCredentials,
+    ),
     (
         "revokeOrganizationApiKey",
         ManagementPermission::WriteCredentials,
@@ -829,6 +842,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     "createOrganizationApiKey",
     "revokeOrganizationApiKey",
     "rotateOrganizationApiKey",
+    // Proven in `a_read_only_credential_can_list_scim_connections_and_cannot_mint_or_kill_one`,
+    // which drives the mint and the revoke with a read-only credential and asserts each refusal
+    // NAMES write_credentials, then drives the LISTING with a `write_config` credential so the
+    // read is checked in both directions too. Verified by mutation: downgrading either write to
+    // `Read`, or deleting the listing's check, fails that test and passes every other pin.
+    "createScimConnection",
+    "listScimConnections",
+    "revokeScimConnection",
     // Proven in `a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key`. The
     // listing is here too, and only here: that test checks it in BOTH directions, so a
     // downgrade of the read to "any permission" is refused as well as an upgrade of it.
@@ -936,8 +957,8 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 218 minus 74 is always 144. (It read "166 minus 22", then "171 minus 27", then
-/// "210 minus 66" -- each of them stale, and the last of them stale in a doc paragraph that
+/// its own: 221 minus 77 is always 144. (It read "166 minus 22", then "171 minus 27", then
+/// "210 minus 66", then "218 minus 74" -- each of them stale, and the last of them stale in a doc paragraph that
 /// says in the same breath that this is the hazard, while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
 /// identity beside the numbers it derives from rather than deriving it. Both operands are
@@ -956,12 +977,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        218,
+        221,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        74,
+        77,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

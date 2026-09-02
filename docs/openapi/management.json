@@ -17605,7 +17605,7 @@
           "scim"
         ],
         "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`",
-        "operationId": "list_scim_connections",
+        "operationId": "listScimConnections",
         "parameters": [
           {
             "name": "tenant_id",
@@ -17633,15 +17633,45 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "The organization's SCIM connections",
+            "description": "A page of the organization's SCIM connections",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ScimConnectionListView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor or limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -17688,7 +17718,7 @@
           "scim"
         ],
         "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`",
-        "operationId": "create_scim_connection",
+        "operationId": "createScimConnection",
         "parameters": [
           {
             "name": "tenant_id",
@@ -17759,7 +17789,7 @@
             }
           },
           "400": {
-            "description": "Malformed request or unknown provider",
+            "description": "Malformed request, unknown provider, or an expiry that is not in the future",
             "content": {
               "application/json": {
                 "schema": {
@@ -17812,7 +17842,7 @@
           "scim"
         ],
         "summary": "`DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`",
-        "operationId": "revoke_scim_connection",
+        "operationId": "revokeScimConnection",
         "parameters": [
           {
             "name": "tenant_id",
@@ -34031,6 +34061,13 @@
               "$ref": "#/components/schemas/ScimConnectionView"
             },
             "description": "This organization's connections, revoked ones included."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, absent on the last one."
           }
         }
       },

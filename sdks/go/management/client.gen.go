@@ -316,6 +316,13 @@ func (c *Client) CreateRoutingRule(tenant_id string, environment_id string, quer
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/routing-rules", query, body)
 }
 
+// CreateScimConnection performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
+//
+// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
+func (c *Client) CreateScimConnection(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, body)
+}
+
 // CreateServiceAccountApiKey performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys.
 //
 // createServiceAccountApiKey.
@@ -377,13 +384,6 @@ func (c *Client) CreateUserPersonalAccessToken(tenant_id string, environment_id 
 // Register a delivery endpoint and mint its signing secret.
 func (c *Client) CreateWebhookEndpoint(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints", query, body)
-}
-
-// Create_scim_connection performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
-//
-// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
-func (c *Client) Create_scim_connection(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
-	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, body)
 }
 
 // DecideAgentVaultApproval performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision.
@@ -1303,6 +1303,13 @@ func (c *Client) ListRoutingRules(tenant_id string, environment_id string, query
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/routing-rules", query, nil)
 }
 
+// ListScimConnections performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
+//
+// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
+func (c *Client) ListScimConnections(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, nil)
+}
+
 // ListSecrets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets.
 //
 // List the secrets of an environment (metadata only, cursor paginated).
@@ -1448,13 +1455,6 @@ func (c *Client) ListWebhookDeliveryAttempts(tenant_id string, environment_id st
 // List the environment's registered webhook endpoints.
 func (c *Client) ListWebhookEndpoints(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/webhook-endpoints", query, nil)
-}
-
-// List_scim_connections performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
-//
-// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
-func (c *Client) List_scim_connections(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
-	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, nil)
 }
 
 // PauseWebhookEndpoint performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause.
@@ -1653,6 +1653,13 @@ func (c *Client) RevokeOrganizationApiKey(tenant_id string, environment_id strin
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/api-keys/" + escape(key_id), query, nil)
 }
 
+// RevokeScimConnection performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}.
+//
+// `DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`.
+func (c *Client) RevokeScimConnection(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections/" + escape(connection_id), query, nil)
+}
+
 // RevokeServiceAccountApiKey performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}.
 //
 // revokeServiceAccountApiKey.
@@ -1693,13 +1700,6 @@ func (c *Client) RevokeUserPersonalAccessToken(tenant_id string, environment_id 
 // Revoke EVERYTHING for one user: every session, cascading to the user's refresh-token families in the SAME transaction. The `offline_access` families SURVIVE (issue #21's offline-survives-logout semantic) unless the explicit `hard_kill` flag is passed, which also revokes their grants so every already-issued access token dies immediately.
 func (c *Client) RevokeUserSessions(tenant_id string, environment_id string, user_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/users/" + escape(user_id) + "/sessions/revoke", query, body)
-}
-
-// Revoke_scim_connection performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}.
-//
-// `DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`.
-func (c *Client) Revoke_scim_connection(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values) (*http.Response, error) {
-	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections/" + escape(connection_id), query, nil)
 }
 
 // RollbackTokenHook performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback.

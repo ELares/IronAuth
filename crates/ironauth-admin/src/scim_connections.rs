@@ -21,7 +21,9 @@
 //! idempotency replay body -- the stored replay carries the id and a flag saying the token was
 //! already issued, because `idempotency_keys.response_body` is plaintext retained for a day
 //! and putting a live credential there would recreate the recoverable copy migration 0183
-//! exists to prevent. `api_keys.rs` solved this first and this follows it exactly.
+//! exists to prevent. `api_keys.rs` solved this first and this follows it, with two knowing
+//! differences: the provider is validated in the handler rather than by catching the column's
+//! CHECK, and the writes emit domain events through the `*_with_event` methods.
 //!
 //! # Revoked connections are listed
 //!
@@ -29,7 +31,7 @@
 //! to be able to tell "I revoked that at 14:02" from "no such connection ever existed".
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
@@ -43,6 +45,7 @@ use crate::error::ApiError;
 use crate::idempotency;
 use crate::input::parse_json;
 use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
+use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
 
@@ -72,6 +75,9 @@ pub struct ScimConnectionView {
 pub struct ScimConnectionListView {
     /// This organization's connections, revoked ones included.
     pub items: Vec<ScimConnectionView>,
+    /// The cursor for the next page, absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// What a create names.
@@ -122,14 +128,17 @@ fn view(connection: &ironauth_store::ScimConnection) -> ScimConnectionView {
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
+    operation_id = "listScimConnections",
     tag = "scim",
     params(
         ("tenant_id" = String, Path, description = "Tenant identifier"),
         ("environment_id" = String, Path, description = "Environment identifier"),
         ("organization_id" = String, Path, description = "Organization identifier"),
+        ListQuery
     ),
     responses(
-        (status = 200, description = "The organization's SCIM connections", body = ScimConnectionListView),
+        (status = 200, description = "A page of the organization's SCIM connections", body = ScimConnectionListView),
+        (status = 400, description = "Malformed cursor or limit", body = crate::error::ErrorBody),
         (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorBody),
         (status = 403, description = "The credential may not read this organization", body = crate::error::ErrorBody),
         (status = 404, description = "No such live organization", body = crate::error::ErrorBody),
@@ -140,6 +149,7 @@ pub async fn list_scim_connections(
     State(state): State<AdminState>,
     principal: Principal,
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     // READ, not write credentials: a listing carries no digest and no plaintext, so it is a
@@ -153,24 +163,72 @@ pub async fn list_scim_connections(
         EnvironmentAccess::Read,
     )
     .await?;
+    // CURSOR PAGINATED, like every sibling listing on this surface. It was not, and an
+    // organization's whole inventory came back in one response however large it had grown;
+    // `MANAGEMENT_LIST_HARD_CAP` is the bound nothing was applying.
+    let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
     let connections = state
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org_id)
+        .list_for_organization(&org_id, page.fetch_limit(), page.after())
         .await
         .map_err(|_| ApiError::Internal)?;
+    let (connections, next_cursor) = page.finish(connections, |connection| {
+        (connection.created_at_unix_micros, connection.id.to_string())
+    });
     let body = serde_json::to_string(&ScimConnectionListView {
         items: connections.iter().map(view).collect(),
+        next_cursor,
     })
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))
+}
+
+/// Check what a create names, and return the expiry in micros.
+///
+/// VALIDATED HERE, not by catching the database's refusal. The provider column carries a closed
+/// vocabulary, and an earlier version mapped every `StoreError::Database` onto a 400 naming that
+/// field -- so a revoked INSERT grant, a full disk, or a failed idempotency write all told the
+/// caller their provider was wrong. A reviewer drove it: revoking `INSERT ON scim_connections`
+/// produced `400 invalid_provider`, where `api_keys.rs` under the same revocation produces a 500.
+///
+/// That mattered beyond the message. `no_management_operation_answers_a_server_error_...` sweeps
+/// for exactly the missing-grant case, and a handler that answers 400 to it passes the sweep
+/// while being broken.
+///
+/// THE EXPIRY MUST BE IN THE FUTURE. A past one was accepted and minted a credential that never
+/// authenticated: `authenticate` filters on `expires_at > now`, so the operator got a 201, a
+/// token, and a connection that answered 401 to their identity provider from the first request.
+/// Refusing here is the only place that can tell them why, because by the time SCIM fails there
+/// is nothing left to distinguish "expired" from "wrong token".
+fn validated_expiry(
+    request: &CreateScimConnectionRequest,
+    now_micros: i64,
+) -> Result<Option<i64>, ApiError> {
+    if !matches!(request.provider.as_str(), "okta" | "entra" | "generic") {
+        return Err(ApiError::BadRequest(
+            "invalid_provider: provider must be one of okta, entra, generic".to_owned(),
+        ));
+    }
+    let expires_micros = request
+        .expires_at_unix_ms
+        .map(|millis| millis.saturating_mul(1_000));
+    if let Some(expires) = expires_micros
+        && expires <= now_micros
+    {
+        return Err(ApiError::BadRequest(
+            "invalid_expiry: expires_at_unix_ms must be in the future".to_owned(),
+        ));
+    }
+    Ok(expires_micros)
 }
 
 /// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`
 #[utoipa::path(
     post,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
+    operation_id = "createScimConnection",
     tag = "scim",
     params(
         ("tenant_id" = String, Path, description = "Tenant identifier"),
@@ -182,7 +240,7 @@ pub async fn list_scim_connections(
     responses(
         (status = 201, description = "The connection, with its token, returned once", body = ScimConnectionCreated),
         (status = 200, description = "An idempotent replay; the token is not returned again", body = ScimConnectionCreated),
-        (status = 400, description = "Malformed request or unknown provider", body = crate::error::ErrorBody),
+        (status = 400, description = "Malformed request, unknown provider, or an expiry that is not in the future", body = crate::error::ErrorBody),
         (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorBody),
         (status = 403, description = "The credential may not mint credentials for this organization", body = crate::error::ErrorBody),
         (status = 404, description = "No such live organization", body = crate::error::ErrorBody),
@@ -222,6 +280,7 @@ pub async fn create_scim_connection(
     )
     .await?;
     let request: CreateScimConnectionRequest = parse_json(&body)?;
+    let expires_micros = validated_expiry(&request, state.now_unix_micros())?;
 
     // MINTED THROUGH THE SCIM CRATE, not reimplemented here. `mint_token` and `digest_of` are
     // the format the verifier uses, so a second copy of `{scim_id}.{secret}` in this crate
@@ -257,6 +316,7 @@ pub async fn create_scim_connection(
     };
     let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
 
+    let pending = created_event(&state, scope, &id, &org_id, &request.provider);
     let result = state
         .store()
         .scoped(scope)
@@ -265,7 +325,7 @@ pub async fn create_scim_connection(
         // on this surface does.
         .in_organization(org_id)
         .scim_connections()
-        .create(
+        .create_with_event(
             state.env(),
             NewScimConnection {
                 id: &id,
@@ -273,9 +333,7 @@ pub async fn create_scim_connection(
                 display_name: &request.display_name,
                 provider: &request.provider,
                 token_digest: &digest,
-                expires_at_unix_micros: request
-                    .expires_at_unix_ms
-                    .map(|millis| millis.saturating_mul(1_000)),
+                expires_at_unix_micros: expires_micros,
             },
             // IN THE SAME TRANSACTION as the row, which is why it is a parameter rather than a
             // second call: a record written afterwards leaves a window in which the connection
@@ -287,26 +345,28 @@ pub async fn create_scim_connection(
                 response_status: 200,
                 response_body: &stored_body,
             }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
         )
         .await;
     match result {
         Ok(()) => {}
-        // A provider outside the column's closed vocabulary arrives here as a database error.
-        // It is the caller's mistake, not the server's, so it is a 400 naming the field rather
-        // than an opaque 500.
-        Err(StoreError::Database(_)) => {
-            return Err(ApiError::BadRequest(
-                "invalid_provider: provider must be one of okta, entra, generic".to_owned(),
-            ));
-        }
-        // A digest already present means a caller reused a token rather than letting the
-        // server mint one, which the store refuses. Not reachable from this handler, which
-        // always mints, but the arm says so rather than falling into Internal.
+        // A unique violation on either the id or the digest. Neither is reachable from this
+        // handler, which mints both, but the arm names the case rather than letting it fall
+        // into an opaque 500.
         Err(StoreError::Conflict) => {
             return Err(ApiError::Conflict(
-                "connection_exists: a connection with this token digest already exists".to_owned(),
+                "connection_exists: a connection with this id or token digest already exists"
+                    .to_owned(),
             ));
         }
+        // The idempotency race the record exists to close: two requests with one key arriving
+        // together. A 409 telling the caller to retry, not a 500.
+        Err(StoreError::IdempotencyConflict) => return Err(ApiError::IdempotencyKeyConflict),
+        // EVERYTHING ELSE IS THE SERVER'S. A database failure is a 500 so the sweep that
+        // looks for one can see it, and so a client that retries 5xx does.
         Err(_) => return Err(ApiError::Internal),
     }
 
@@ -317,6 +377,7 @@ pub async fn create_scim_connection(
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
+    operation_id = "revokeScimConnection",
     tag = "scim",
     params(
         ("tenant_id" = String, Path, description = "Tenant identifier"),
@@ -362,27 +423,38 @@ pub async fn revoke_scim_connection(
     // organization-fenced, so without this an operator holding write-credentials on one
     // organization could revoke another organization's provisioning connection in the same
     // environment -- a denial of service against a sibling tenant's identity provider.
+    //
+    // A POINT LOOKUP rather than a scan of the listing. Scanning was correct only while the
+    // listing was unbounded; once it took a page limit, a connection past the first page would
+    // have become unrevokable, which is the failure that matters most on this route.
     let belongs = state
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org_id)
+        .exists_in_organization(&org_id, &id)
         .await
-        .map_err(|_| ApiError::Internal)?
-        .into_iter()
-        .any(|connection| connection.id == id);
+        .map_err(|_| ApiError::Internal)?;
     if !belongs {
         return Err(ApiError::NotFound);
     }
 
     let now = state.now_unix_micros();
+    let pending = revoked_event(&state, scope, &id, &org_id);
     match state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .in_organization(org_id)
         .scim_connections()
-        .revoke(state.env(), &id, now)
+        .revoke_with_event(
+            state.env(),
+            &id,
+            now,
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
         .await
     {
         // TRUE and FALSE are both 204: revoking a connection that is already revoked is the
@@ -393,4 +465,60 @@ pub async fn revoke_scim_connection(
         Err(StoreError::NotFound) => Err(ApiError::NotFound),
         Err(_) => Err(ApiError::Internal),
     }
+}
+
+/// The `scim_connection.created` envelope.
+fn created_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    id: &ScimConnectionId,
+    organization_id: &ironauth_store::OrganizationId,
+    provider: &str,
+) -> Option<crate::events::PendingEvent> {
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "scim_connection.created",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "scim_connection_id": subject,
+            "organization_id": organization_id.to_string(),
+            "provider": provider,
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id: event_id,
+        subject,
+        envelope,
+    })
+}
+
+/// The `scim_connection.revoked` envelope.
+fn revoked_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    id: &ScimConnectionId,
+    organization_id: &ironauth_store::OrganizationId,
+) -> Option<crate::events::PendingEvent> {
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "scim_connection.revoked",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "scim_connection_id": subject,
+            "organization_id": organization_id.to_string(),
+        }),
+    )?;
+    Some(crate::events::PendingEvent {
+        id: event_id,
+        subject,
+        envelope,
+    })
 }

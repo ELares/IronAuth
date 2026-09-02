@@ -254,6 +254,116 @@ async fn a_locale_write_is_sudo_gated() {
     );
 }
 
+/// The SCIM connection MINT and REVOKE are sudo gated (issue #135). A mint hands back a
+/// bearer credential that provisions and deprovisions an organization's whole user
+/// population, which is the strongest thing this surface issues, and a revoke is what
+/// stops a leaked one. A reviewer deleted the mint's `require_fresh_privilege` and the
+/// entire suite stayed green; this is the row that makes it fail.
+///
+/// One test for both handlers: the challenged half has to be measured against the SAME
+/// connection the elevated half then revokes, or "the refused mint stored nothing" and
+/// "the refused revoke changed nothing" are two claims about two different fixtures.
+#[tokio::test]
+async fn a_scim_connection_mint_or_revoke_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+    let orgs = organizations_path(&tenant, &env);
+
+    // Seed the organization and one connection, both of which need an elevation of their
+    // own. The seeding elevation is then LAPSED below rather than never taken, so what the
+    // challenged half measures is a stale credential and not a missing one.
+    let (status, _, elevated) = harness.post(&elevate, "e-seed", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate to seed: {elevated}");
+    let (status, _, created) = harness
+        .post(
+            &orgs,
+            "k-org",
+            &serde_json::json!({ "display_name": "Globex" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {created}");
+    let org = id_of(&created);
+    let base = format!("{orgs}/{org}/scim-connections");
+    let (status, _, seeded) = harness
+        .post(
+            &base,
+            "k-seed",
+            "{\"display_name\":\"seed\",\"provider\":\"okta\"}",
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed connection: {seeded}");
+    let seeded_id = id_of(&seeded);
+
+    // Lapse the elevation, which is how every other row in this file reaches the state
+    // the gate is supposed to protect.
+    clock.advance(Duration::from_secs(601));
+
+    // A MINT without a fresh elevation is challenged, and no second connection exists.
+    let (status, _, challenge) = harness
+        .post(
+            &base,
+            "k-stale-mint",
+            "{\"display_name\":\"stale\",\"provider\":\"okta\"}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale SCIM connection mint is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+
+    // A REVOKE without one is challenged too, and the connection is still live.
+    let (status, _, challenge) = harness.delete(&format!("{base}/{seeded_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale SCIM connection revoke is challenged: {challenge}"
+    );
+
+    // Nothing landed: still exactly the seeded connection, still unrevoked. Without this
+    // the two assertions above would also pass against a handler that answered 401 and
+    // then wrote anyway.
+    let (status, _, listed) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "reads are unaffected: {listed}");
+    assert_eq!(item_count(&listed), 1, "the refused mint landed: {listed}");
+    // The view omits `revoked_at_unix_ms` entirely while a connection is live, so its
+    // ABSENCE is what "still live" looks like on the wire. The revoked direction -- the
+    // field present and carrying a timestamp -- is pinned in
+    // `scim_connections.rs::a_revoked_connection_is_listed_and_stops_authenticating`, which
+    // is what keeps this absence from passing on a renamed or dropped field.
+    assert!(
+        !listed.contains("revoked_at_unix_ms"),
+        "the refused revoke landed: {listed}"
+    );
+
+    // After a fresh elevation both succeed.
+    let (status, _, elevated) = harness.post(&elevate, "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, minted) = harness
+        .post(
+            &base,
+            "k-fresh-mint",
+            "{\"display_name\":\"fresh\",\"provider\":\"okta\"}",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the elevated SCIM connection mint succeeds: {minted}"
+    );
+    let (status, _, revoked) = harness.delete(&format!("{base}/{seeded_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the elevated SCIM connection revoke succeeds: {revoked}"
+    );
+}
+
 /// A signup form write is sudo-gated exactly like the other environment-scoped config writes
 /// (issue #87): a stale write is challenged and stored nothing; the same write succeeds after a
 /// fresh elevation.

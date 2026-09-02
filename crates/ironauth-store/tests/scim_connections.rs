@@ -227,7 +227,7 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org)
+        .list_for_organization(&org, 100, None)
         .await
         .expect("list");
     assert_eq!(listed.len(), 1, "the revoked connection is still listed");
@@ -251,7 +251,7 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org)
+        .list_for_organization(&org, 100, None)
         .await
         .expect("list");
     assert_eq!(
@@ -305,7 +305,7 @@ async fn an_expired_token_stops_authenticating_without_being_revoked() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org)
+        .list_for_organization(&org, 100, None)
         .await
         .expect("list");
     assert!(!listed[0].revoked, "expired is not revoked");
@@ -327,7 +327,7 @@ async fn the_listing_is_per_organization_and_not_per_environment() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org_a)
+        .list_for_organization(&org_a, 100, None)
         .await
         .expect("list");
     assert_eq!(listed.len(), 1);
@@ -435,7 +435,7 @@ async fn every_scope_guard_refuses_a_foreign_id() {
         .store()
         .scoped(scope_a)
         .scim_connections()
-        .list_for_organization(&org_b)
+        .list_for_organization(&org_b, 100, None)
         .await;
     assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
 }

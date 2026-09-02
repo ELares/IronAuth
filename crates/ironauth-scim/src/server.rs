@@ -456,11 +456,13 @@ async fn authenticate(
 /// makes it a credential. Returned once by whatever creates the connection, and stored
 /// nowhere: only the SHA-256 of the whole string is written.
 ///
-/// NO SHIPPED CALLER creates one today. An earlier version of this sentence said "the
-/// management surface that creates the connection", and there is none: `ironauth-admin`
-/// contains no reference to SCIM and the published management API has no SCIM path. The
-/// minting route belongs with the self-service portal that owns SCIM token lifecycle, and
-/// until it lands a connection can only be created from inside the process.
+/// CALLED BY THE MANAGEMENT PLANE, which is why this is `pub`: `ironauth-admin`'s
+/// `create_scim_connection` mints here and stores only the digest, and `authenticate` above
+/// hashes the presented token with `digest_of`. ONE definition of the format, used by both,
+/// rather than two that would agree until somebody changed one.
+///
+/// An earlier version of this said no shipped caller existed, which was true when the surface
+/// was mounted and the minting route had not landed.
 #[must_use]
 pub fn mint_token(id: &ironauth_store::ScimConnectionId, secret: &str) -> String {
     format!("{id}.{secret}")

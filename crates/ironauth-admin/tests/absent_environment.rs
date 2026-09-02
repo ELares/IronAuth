@@ -1506,6 +1506,30 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/organizations/{org}/api-keys"),
             body: Some("{\"display_name\":\"absent\"}".to_owned()),
         },
+        // The SCIM connection surface (issue #135). Only the two WRITES appear here: this
+        // file sweeps environment-scoped writes, and the listing resolves under
+        // `EnvironmentAccess::Read`, which deliberately does NOT fence a soft-deleted
+        // environment.
+        //
+        // What these two cases do NOT pin is the Write-versus-Read choice itself. Both
+        // segments below name rows that do not exist, so a handler with the fence removed
+        // answers the same uniform not-found for the ORGANIZATION instead of the
+        // environment, and this sweep cannot tell them apart. The variant is pinned by
+        // `live_surface.rs::every_environment_scoped_write_refuses_a_soft_deleted_environment`,
+        // which drives both writes against a REAL organization and a REAL connection and
+        // rejects outright any case whose live answer is already the not-found.
+        Case {
+            label: "scim_connections.createScimConnection",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/scim-connections"),
+            body: Some("{\"display_name\":\"absent\",\"provider\":\"okta\"}".to_owned()),
+        },
+        Case {
+            label: "scim_connections.revokeScimConnection",
+            method: "DELETE",
+            path: format!("{base}/organizations/{org}/scim-connections/scim_absent"),
+            body: None,
+        },
         // The service-account surface is NOT nested under an organization, so its cases
         // address the environment directly. The principal id is a literal that names nothing;
         // the point of the sweep is that the absent ENVIRONMENT is refused before the path

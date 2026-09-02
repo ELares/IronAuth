@@ -52,7 +52,13 @@ PROVIDER_DIR="terraform-provider-ironauth/internal/provider"
 # rotated its signing keys could never be repointed. Adding the DELETE fixed that and, as a
 # side effect, made both resources promotable. So this raise records real new provider debt
 # that the earlier shape was hiding, not new debt this change created.
-UNCOVERED_CEILING=24
+# RAISED 24 -> 25 for `createScimConnection` (issue #135), on the same terms once more: the
+# inbound SCIM provisioning surface is new, so the denominator grew rather than coverage
+# slipping. A Terraform resource is deliberately NOT part of this change: the create returns a
+# provisioning TOKEN exactly once and never again, so a provider resource for it has to decide
+# where that secret lives in state before it is written, and that decision belongs with the
+# provider work rather than being made in passing inside the API's own change.
+UNCOVERED_CEILING=25
 
 python3 - "$SPEC" "$PROVIDER_DIR" "$UNCOVERED_CEILING" <<'PY'
 import collections, json, pathlib, re, sys

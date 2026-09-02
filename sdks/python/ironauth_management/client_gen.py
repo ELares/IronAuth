@@ -191,6 +191,10 @@ class Client:
         """createRoutingRule. POST /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/routing-rules", query, body)
 
+    def create_scim_connection(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, body)
+
     def create_service_account_api_key(self, tenant_id: str, environment_id: str, service_account_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """createServiceAccountApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys", query, body)
@@ -226,10 +230,6 @@ class Client:
     def create_webhook_endpoint(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Register a delivery endpoint and mint its signing secret. POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webhook-endpoints", query, body)
-
-    def create_scim_connection(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
-        """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
-        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, body)
 
     def decide_agent_vault_approval(self, tenant_id: str, environment_id: str, organization_id: str, approval_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Decide one held action (issue #132, criterion 4). POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals/{approval_id}/decision."""
@@ -755,6 +755,10 @@ class Client:
         """listRoutingRules. GET /v1/tenants/{tenant_id}/environments/{environment_id}/routing-rules."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/routing-rules", query, None)
 
+    def list_scim_connections(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, None)
+
     def list_secrets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the secrets of an environment (metadata only, cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets", query, None)
@@ -838,10 +842,6 @@ class Client:
     def list_webhook_endpoints(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the environment's registered webhook endpoints. GET /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/webhook-endpoints", query, None)
-
-    def list_scim_connections(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
-        """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
-        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, None)
 
     def pause_webhook_endpoint(self, tenant_id: str, environment_id: str, endpoint_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Pause deliveries to an endpoint without destroying it or its signing secret. POST /v1/tenants/{tenant_id}/environments/{environment_id}/webhook-endpoints/{endpoint_id}/pause."""
@@ -955,6 +955,10 @@ class Client:
         """revokeOrganizationApiKey. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/api-keys/{urllib.parse.quote(key_id)}", query, None)
 
+    def revoke_scim_connection(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections/{urllib.parse.quote(connection_id)}", query, None)
+
     def revoke_service_account_api_key(self, tenant_id: str, environment_id: str, service_account_id: str, key_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """revokeServiceAccountApiKey. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys/{urllib.parse.quote(key_id)}", query, None)
@@ -978,10 +982,6 @@ class Client:
     def revoke_user_sessions(self, tenant_id: str, environment_id: str, user_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Revoke EVERYTHING for one user: every session, cascading to the user's refresh-token families in the SAME transaction. The `offline_access` families SURVIVE (issue #21's offline-survives-logout semantic) unless the explicit `hard_kill` flag is passed, which also revokes their grants so every already-issued access token dies immediately. POST /v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/sessions/revoke."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/users/{urllib.parse.quote(user_id)}/sessions/revoke", query, body)
-
-    def revoke_scim_connection(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
-        """`DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}."""
-        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections/{urllib.parse.quote(connection_id)}", query, None)
 
     def rollback_token_hook(self, tenant_id: str, environment_id: str, client_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Roll a client's token hook back to an earlier version. POST /v1/tenants/{tenant_id}/environments/{environment_id}/applications/{client_id}/token-hook/rollback."""

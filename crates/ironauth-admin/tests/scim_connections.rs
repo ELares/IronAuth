@@ -278,3 +278,129 @@ async fn a_revoked_connection_is_listed_and_stops_authenticating() {
     let (status, _, _) = h.delete(&format!("{path}/{handle}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+/// The listing is CURSOR PAGINATED, so one organization's inventory cannot make one response
+/// arbitrarily large.
+///
+/// It was not. The first version fetched every row and rendered every one, which is the
+/// unbounded read `MANAGEMENT_LIST_HARD_CAP` exists to prevent and which every sibling listing
+/// on this surface already avoided.
+///
+/// Both directions, because either alone is satisfiable by a broken handler: a page that stops
+/// at the limit and offers NO cursor loses rows silently, and a cursor that is always present
+/// makes a client page forever. So this walks the pages and requires the union to be exactly
+/// the set that was minted, in order and with no repeats.
+#[tokio::test]
+async fn the_connection_listing_pages_and_the_pages_cover_every_connection() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    let mut minted: Vec<String> = Vec::new();
+    for index in 0..5 {
+        let (_, id) = mint(&h, &tenant, &environment, &org, &format!("k-mint-{index}")).await;
+        minted.push(id);
+    }
+
+    // A page smaller than the inventory. Two rows at a time over five rows is three pages,
+    // and the last one must NOT offer a cursor -- that is the half that ends the walk.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let path = match &cursor {
+            Some(after) => format!("{base}?limit=2&cursor={after}"),
+            None => format!("{base}?limit=2"),
+        };
+        let (status, _, body) = h.get(&path).await;
+        assert_eq!(status, StatusCode::OK, "page {pages}: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("json");
+        let items = parsed["items"].as_array().expect("items");
+        assert!(
+            items.len() <= 2,
+            "a page exceeded the limit it asked for: {body}"
+        );
+        for item in items {
+            seen.push(item["id"].as_str().expect("id").to_owned());
+        }
+        pages += 1;
+        assert!(pages <= 10, "the walk did not terminate: {seen:?}");
+        match parsed["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        seen, minted,
+        "the pages must cover exactly what was minted, in creation order, with no repeats"
+    );
+    assert_eq!(
+        pages, 3,
+        "five rows two at a time is three pages, the last one short"
+    );
+}
+
+/// An expiry that is not in the future is REFUSED rather than minted.
+///
+/// It used to be minted. `authenticate` filters on `expires_at > now`, so a past expiry
+/// produced a 201, a live-looking token, and a connection that answered 401 to the identity
+/// provider from its very first request -- with nothing at that point able to tell the operator
+/// "the credential you were handed was already expired" apart from "wrong token".
+///
+/// The FUTURE half is asserted too, because a handler that refused every expiry would pass the
+/// refusal alone while making the whole field unusable.
+#[tokio::test]
+async fn an_expiry_in_the_past_is_refused_and_one_in_the_future_is_accepted() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    for (label, expires) in [("the epoch", 0_i64), ("before the epoch", -1)] {
+        let body = serde_json::json!({
+            "display_name": "already dead",
+            "provider": "okta",
+            "expires_at_unix_ms": expires,
+        })
+        .to_string();
+        let (status, _, response) = h.post(&base, &format!("k-past-{expires}"), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an expiry at {label} minted a credential that can never authenticate: {response}"
+        );
+        assert!(
+            response.contains("invalid_expiry"),
+            "the refusal must name the field: {response}"
+        );
+    }
+
+    // And nothing landed.
+    let (_, _, listed) = h.get(&base).await;
+    let parsed: Value = serde_json::from_str(&listed).expect("json");
+    assert_eq!(
+        parsed["items"].as_array().map(Vec::len),
+        Some(0),
+        "a refused create landed a row: {listed}"
+    );
+
+    // A future expiry is accepted, and comes back on the connection rather than being dropped.
+    let future = 4_102_444_800_000_i64;
+    let body = serde_json::json!({
+        "display_name": "expires one day",
+        "provider": "okta",
+        "expires_at_unix_ms": future,
+    })
+    .to_string();
+    let (status, _, response) = h.post(&base, "k-future", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "a future expiry: {response}");
+    let (_, _, listed) = h.get(&base).await;
+    let parsed: Value = serde_json::from_str(&listed).expect("json");
+    assert_eq!(
+        parsed["items"][0]["expires_at_unix_ms"].as_i64(),
+        Some(future),
+        "the accepted expiry must be the one that was asked for: {listed}"
+    );
+}

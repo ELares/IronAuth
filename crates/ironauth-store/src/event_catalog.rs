@@ -2723,6 +2723,48 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The id and the ORGANIZATION, because a SCIM connection provisions INTO exactly one
+        // organization and a consumer routing on "who gained a provisioning credential"
+        // cannot get that from the id. The PROVIDER too: a SIEM correlating a new connection
+        // with traffic from Okta or Entra needs to know which one to expect.
+        //
+        // NO TOKEN and no digest, for the reason `api_key.created` gives: the digest verifies
+        // exactly as well as the token does, so putting it on the wire that announces the
+        // credential exists would BE the leak.
+        "scim_connection.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scim_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "provider": {"type": "string", "minLength": 1}
+            },
+            "required": ["scim_connection_id", "organization_id", "provider"]
+        }"#,
+    ),
+    (
+        // Emitted at most ONCE per connection. Revocation is idempotent -- a retried revoke
+        // changes nothing and audits nothing -- and the event inherits that, so a receiver
+        // counting revocations never sees two because a client retried.
+        //
+        // The organization travels here too, unlike `api_key.revoked`: a receiver reacting to
+        // "provisioning into this organization has stopped" would otherwise have to have kept
+        // the created event to know which organization it was.
+        "scim_connection.revoked",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scim_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["scim_connection_id", "organization_id"]
+        }"#,
+    ),
+    (
         // The id and the OWNER, because an api key is the same credential kind under three
         // different owners (user, service account, organization) and a consumer routing on
         // "who gained a credential" cannot get that from the id alone.
