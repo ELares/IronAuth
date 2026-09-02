@@ -23,16 +23,18 @@
 //! decides whether the caller may have it. A path with no organization in it has no such step.
 //! "Decode then authorize" is the standard advice; having nothing to decode is stronger.
 //!
-//! # What this module does NOT do yet
+//! # Mounted behind a config flag
 //!
-//! Get SERVED. The router below mounts the three discovery endpoints RFC 7644 section 4
-//! requires plus the Users and Groups resource routes, and every one of them is tested, but
-//! the binary does not yet mount this router. That, behind its config flag, is the next slice.
+//! `crates/ironauth/src/main.rs` mounts this router on the public plane when `scim.enabled`
+//! is set. While it is off nothing under `/scim/v2` is mounted and every such path is a
+//! uniform 404, which is the same shape the admin console takes: a surface an operator has
+//! not asked for is not one reachable from the internet.
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -41,6 +43,48 @@ use ironauth_store::{ActorRef, ScimConnection, ServiceId, Store};
 use serde_json::json;
 
 use crate::service_provider_config::{ScimLimits, ServiceProviderConfig};
+
+/// The largest request body this surface accepts.
+///
+/// One mebibyte, matching `BulkLimits::max_payload_bytes`, so the two bounds a caller can hit
+/// are one number rather than two that drift. A SCIM create or PATCH is a small JSON document;
+/// the only shape that approaches this is a bulk payload, and that surface advertises the same
+/// figure.
+///
+/// EXPLICIT rather than inherited. Axum's implicit default is 2 MiB and its refusal is a bare
+/// `text/plain` 413 emitted before any handler runs, which is the one response shape on this
+/// surface that would not be SCIM.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Rewrite the framework's oversized-body refusal into a SCIM error document.
+///
+/// # Exactly the 413, and nothing else
+///
+/// The first version keyed on the ABSENCE of a content type, reasoning that only a framework
+/// response would lack one. It does not: axum's body-limit rejection answers
+/// `text/plain; charset=utf-8` with "Failed to buffer the request body", so the guard passed
+/// it straight through and the test caught it.
+///
+/// Keying on the status is also what keeps this narrow. A path this router does not mount
+/// falls through to axum's own 404, and that 404 must STAY un-SCIM: `surface.rs` uses the
+/// content type to tell a mounted route from an unmounted one, which is the only signal that
+/// separates them once a mounted route can legitimately answer 404 for an absent resource.
+/// Rewriting every framework response would destroy that discriminator.
+///
+/// No handler here produces a 413, so a 413 is always the body-limit layer's.
+///
+/// A response MAP rather than a fallback, because `DefaultBodyLimit` rejects before routing
+/// and there is no handler to hand it to.
+async fn scim_shaped_refusal(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    scim_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Some("tooLarge"),
+        "the request body exceeds the size this server accepts",
+    )
+}
 
 /// The SCIM content type (RFC 7644 section 3.1). Answered on every response, including errors.
 pub const SCIM_CONTENT_TYPE: &str = "application/scim+json";
@@ -99,7 +143,14 @@ impl ScimState {
     }
 
     /// The deployment's configured identifier-uniqueness mode.
-    pub(crate) fn uniqueness_mode(&self) -> UniquenessMode {
+    /// The deployment's configured identifier-uniqueness mode.
+    ///
+    /// Public so the boot-wiring harness can assert this surface and the management plane hold
+    /// the SAME mode. Two doors onto one identity model that disagreed about what "the same
+    /// person" means is the corruption the single-carrier boot exists to prevent, and it is
+    /// only observable if the value can be read back off an assembled state.
+    #[must_use]
+    pub fn uniqueness_mode(&self) -> UniquenessMode {
         self.inner.uniqueness
     }
 
@@ -177,6 +228,17 @@ pub fn scim_router(state: ScimState) -> Router {
                 .delete(crate::groups::delete_group),
         )
         .with_state(state)
+        // EVERY RESPONSE ON THIS SURFACE IS A SCIM DOCUMENT, including the ones the framework
+        // produces. Six handlers take `body: String`, so without an explicit bound they
+        // inherit axum's implicit 2 MiB default and a body over it becomes a bare
+        // `text/plain` 413 emitted before any handler runs -- which falsifies
+        // `SCIM_CONTENT_TYPE`'s own promise two hundred lines up, and hands Okta and Entra a
+        // response shape their connectors do not parse.
+        //
+        // The bound is `MAX_REQUEST_BYTES` and the refusal is rewritten below, so the answer
+        // to an oversized body is a SCIM error like every other refusal here.
+        .layer(map_response(scim_shaped_refusal))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
 }
 
 /// Why a SCIM request was refused before any handler ran.

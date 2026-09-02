@@ -37,6 +37,10 @@ ironauth-oidc.workspace = true
 # under /admin when admin_spa.enabled is set. It embeds its assets with
 # rust-embed and owns no store connection, so the musl static lane holds.
 ironauth-admin-ui.workspace = true
+# The SCIM 2.0 inbound surface (issue #135). Declares only ironauth-store, ironauth-env,
+# axum, serde, serde_json and sha2, so no HTTP client or TLS crate enters the binary graph
+# and the static musl lane is unaffected.
+ironauth-scim.workspace = true
 ironauth-jose.workspace = true
 # The tenant/environment quota engine (issue #50): the boot path builds one
 # enforcer from the [quota] config and hands it to the OIDC data plane. Pure,
@@ -127,6 +131,14 @@ required-features = ["testing"]
 # test green. Same gating as the CLI suite above.
 [[test]]
 name = "serve_retention_boot"
+required-features = ["testing"]
+
+# The SCIM mount suite (issue #135) boots the COMPILED binary for the same reason the
+# retention one does: `server.mount_public(scim_router(...))` is a single line in `serve`,
+# and no in-process test can observe whether a deployed process serves that surface. The
+# boot-wiring tests prove the STATE assembles; only this proves it is reachable.
+[[test]]
+name = "serve_scim_mount"
 required-features = ["testing"]
 
 [lints]

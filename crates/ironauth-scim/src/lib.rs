@@ -33,6 +33,7 @@ pub use bulk::{
 pub use patch::{PatchPath, PatchPathError, parse_patch_path};
 pub use path::{PathError, ResourceRef, ResourceType, parse_resource_path};
 pub use resource::ScimUser;
+pub use server::{ScimState, scim_router};
 pub use service_provider_config::{
     AuthenticationScheme, BulkConfig, FilterConfig, ScimLimits, ServiceProviderConfig, Supported,
 };

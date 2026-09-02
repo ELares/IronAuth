@@ -168,7 +168,7 @@ pub use input::require_permission_slug;
 pub use openapi::{management_openapi, openapi_json};
 pub use pagination::ListQuery;
 pub use provision::{DayOneSigningKeys, ProvisionError};
-pub use state::{AdminOidcBridge, AdminState, StateError, bootstrap_operator_id};
+pub use state::{AdminOidcBridge, AdminState, StateError, bootstrap_operator_id, uniqueness_mode};
 
 /// Build the management API router.
 ///

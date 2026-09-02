@@ -39,6 +39,7 @@ use ironauth_oidc::{
     known_step_up_acrs, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
+use ironauth_scim::{ScimLimits, ScimState, scim_router};
 use ironauth_server::{Server, ServerError};
 use ironauth_store::message_consumer::MessageDeliveryConsumer;
 use std::collections::{BTreeMap, BTreeSet};
@@ -400,6 +401,19 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // independently; while off nothing is mounted and every /admin path is a
         // uniform 404. PR1 serves a static shell (no auth yet); PR2 wires the login
         // and the same origin management proxy.
+        // Mount the SCIM 2.0 inbound surface on the PUBLIC plane when enabled (issue #135).
+        // `mount_public` MERGES, so this composes with the OIDC router above rather than
+        // replacing it. Its callers are hosted provisioning services on the open internet, so
+        // the public plane is where it has to be; while off, nothing under /scim/v2 is
+        // mounted and every such path is a uniform 404.
+        if let Some(plane) = planes.scim {
+            tracing::info!(
+                "SCIM 2.0 inbound provisioning mounted on the public plane; every route \
+                 authenticates with a per-connection bearer token that names its own \
+                 organization"
+            );
+            server = server.mount_public(scim_router(plane.state));
+        }
         if admin_spa_enabled {
             // Wire the same-origin management proxy (issue #90, PR 2): /admin/api/*
             // on the public plane forwards to the in-process management router, but
@@ -670,6 +684,8 @@ struct AssembledPlanes {
     management: Option<AdminState>,
     /// The OIDC data plane, or `None` when it is disabled or cannot mount.
     oidc: Option<OidcPlane>,
+    /// The SCIM inbound plane, or `None` when it is disabled or cannot mount.
+    scim: Option<ScimPlane>,
 }
 
 /// Assemble BOTH planes from the one loaded config (issue #414).
@@ -713,6 +729,12 @@ async fn assemble_planes(
         tracing::info!("OIDC provider not mounted: oidc.enabled is false");
         None
     };
+    let scim = if config.scim.enabled {
+        build_scim_plane(config, env, &shared).await
+    } else {
+        tracing::info!("SCIM surface not mounted: scim.enabled is false");
+        None
+    };
     // ONE HOOK ENGINE FOR THE PROCESS, shared with the management plane (issue #114
     // criterion 5's draft testing).
     //
@@ -735,7 +757,11 @@ async fn assemble_planes(
         }
         (management, _) => management,
     };
-    Ok(AssembledPlanes { management, oidc })
+    Ok(AssembledPlanes {
+        management,
+        oidc,
+        scim,
+    })
 }
 
 /// Assemble the management plane's [`AdminState`], or `None` if it should not mount.
@@ -1117,6 +1143,67 @@ struct OidcPlane {
     discovery: Router,
     /// The per-environment JWKS surface.
     jwks: Router,
+}
+
+/// The assembled SCIM 2.0 inbound plane (issue #135).
+///
+/// Returned as STATE rather than as a `Router`, for the reason `AssembledPlanes` gives: a
+/// `Router` is opaque, and the boot-wiring harness has to be able to read back the limits and
+/// the identifier-uniqueness mode this surface was handed. Two identity doors that disagreed
+/// about what "the same person" means is exactly the cross-plane corruption the single-carrier
+/// assembly exists to prevent, and it is only observable if the value can be read.
+struct ScimPlane {
+    /// Everything the SCIM surface serves on.
+    state: ScimState,
+}
+
+/// Assemble the SCIM inbound plane (issue #135), or `None` if it cannot mount.
+///
+/// A DATA-plane surface: its callers are Okta, Entra and their peers, hosted services on the
+/// open internet, so it connects with `database.url` (the least-privilege `ironauth_app` DSN in
+/// production) exactly as the OIDC plane does. A failure to connect is logged and the server
+/// keeps serving the rest of the public plane rather than refusing to boot.
+///
+/// The identifier-uniqueness mode comes from `ironauth_admin::uniqueness_mode`, the ONE match
+/// that maps the config enum onto the store enum. A second copy here is the shape that rots --
+/// one of them gets a fourth variant and the other keeps compiling -- and a separate
+/// `scim.uniqueness` key would be worse still: two planes onto one identity model, handed
+/// different answers by configuration.
+async fn build_scim_plane(
+    config: &Config,
+    env: &Env,
+    shared: &SharedPlaneInputs,
+) -> Option<ScimPlane> {
+    let store = match Store::connect(config.database.url.expose()).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "SCIM surface not mounted: cannot connect the data-plane store"
+            );
+            return None;
+        }
+    };
+    // The envelope master key, for the same reason the OIDC plane takes it: provisioning
+    // writes and reads the sealed PII columns, and without the key those paths fail closed
+    // rather than falling back to plaintext.
+    let store = match shared.master_key() {
+        Some(master) => store.with_master_key(Arc::clone(master)),
+        None => store,
+    };
+    let limits = ScimLimits {
+        max_results: config.scim.max_results as usize,
+        max_scan: config.scim.max_scan as usize,
+        ..ScimLimits::default()
+    };
+    Some(ScimPlane {
+        state: ScimState::new(
+            store,
+            env.clone(),
+            limits,
+            ironauth_admin::uniqueness_mode(config.identifiers.uniqueness),
+        ),
+    })
 }
 
 /// Assemble the OIDC data plane (issue #12), or `None` if it cannot mount.

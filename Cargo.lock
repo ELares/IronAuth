@@ -1964,6 +1964,7 @@ dependencies = [
  "ironauth-jose",
  "ironauth-oidc",
  "ironauth-quota",
+ "ironauth-scim",
  "ironauth-screening",
  "ironauth-server",
  "ironauth-store",

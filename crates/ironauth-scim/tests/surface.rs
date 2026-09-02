@@ -388,3 +388,84 @@ async fn every_advertised_capability_is_reachable_and_every_unadvertised_one_is_
         "a mounted route answering its uniform 404 must still read as mounted"
     );
 }
+
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_as_a_scim_document() {
+    // EVERY response on this surface is a SCIM document, including the ones the framework
+    // produces. Six handlers take `body: String`; without an explicit bound they inherit
+    // axum's implicit 2 MiB default, and a body over it becomes a bare `text/plain` 413
+    // emitted before any handler runs. That is the one response shape here that would not be
+    // SCIM, and Okta and Entra connectors do not parse it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed(&db, &env, scope).await;
+
+    let state = ScimState::new(
+        db.store().clone(),
+        env.clone(),
+        ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    // One byte over.
+    let oversized = "x".repeat(ironauth_scim::server::MAX_REQUEST_BYTES + 1);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/scim/v2/Users")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/scim+json")
+        .body(Body::from(oversized))
+        .expect("request builds");
+    let response = scim_router(state)
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 21)
+        .await
+        .expect("body");
+    let body = String::from_utf8_lossy(&bytes);
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(
+        content_type.starts_with("application/scim+json"),
+        "the refusal must be a SCIM document, got content type {content_type:?}: {body}"
+    );
+    assert!(
+        body.contains("urn:ietf:params:scim:api:messages:2.0:Error"),
+        "{body}"
+    );
+
+    // THE CONTROL: a body just UNDER the limit reaches a handler, so the bound is a bound and
+    // not a route that refuses everything. It is not a valid resource, so the handler refuses
+    // it -- with a 400, which is a handler's answer rather than the framework's.
+    let sized = format!("{{\"userName\":\"{}\"}}", "a".repeat(1024));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/scim/v2/Users")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/scim+json")
+        .body(Body::from(sized))
+        .expect("request builds");
+    let state = ScimState::new(
+        db.store().clone(),
+        env.clone(),
+        ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    let response = scim_router(state)
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    assert_ne!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body under the limit must reach a handler"
+    );
+}
