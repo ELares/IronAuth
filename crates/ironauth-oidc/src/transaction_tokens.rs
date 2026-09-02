@@ -37,12 +37,22 @@
 //! | `txn` | a fresh id | the transaction every hop shares |
 //! | `rctx` | the authenticated client | which workload asked for THIS token |
 //! | `azd` | the subject token's scopes | what the original request was authorized to do |
-//! | `purp` | the request's `purpose`, when given | what this transaction is for |
+//! | `purp` | NOT SET by the exchange path | see below |
 //! | `iat`, `exp` | the clock | short, and bounded here rather than configured |
 //!
 //! `sub` comes from the token the exchange REVALIDATED, never from a claim read out of an
 //! unverified payload; that is the token-exchange module's central invariant and this composes
 //! on it rather than beside it.
+//!
+//! # Why `purp` is minted-but-never-set
+//!
+//! [`mint`] carries `purp` because it is part of the token shape the draft defines, and the
+//! exchange path passes `None`. The draft defines the CLAIM and defines no request parameter
+//! that carries it, and the only free string a caller can send on this endpoint is `scope`,
+//! which means NARROW TO THIS everywhere else here. Reading it as a purpose would make one
+//! parameter mean two things depending on a requested token type: the kind of overload a caller
+//! gets wrong once and an implementer never notices. A graduation that wants `purp` should
+//! define a parameter for it.
 //!
 //! # Why the audience is the whole security story
 //!
@@ -67,8 +77,11 @@
 //!   the replacement flow is not implemented.
 //! - **No `sub_id`.** The draft allows a structured subject identifier (RFC 9493); this carries
 //!   the plain `sub` the subject token carried.
-//! - **One trust domain per environment.** A deployment with several would need the domain to
-//!   be a per-request choice, which means deciding who may name which one.
+//! - **One trust domain per PROCESS, shared by every tenant.** The domain is a single
+//!   `OidcConfig` field read once at boot, while the issuer is per (tenant, environment) -- so
+//!   every tenant this process serves mints with the SAME `aud`. For a multi-tenant deployment
+//!   that is the wrong axis, and it is the first thing a graduation has to change: the field
+//!   would have to be per environment, which means deciding who may name which domain.
 
 use ironauth_jose::{EmissionOptions, SigningKey, TokenTyp, sign_jws};
 use serde_json::{Value, json};
@@ -82,6 +95,13 @@ pub const TRANSACTION_TOKENS_DRAFT: &str = "draft-ietf-oauth-transaction-tokens-
 
 /// The RFC 8693 `requested_token_type` that asks for a transaction token.
 pub const TRANSACTION_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:txn_token";
+
+/// The longest a `purp` may be.
+///
+/// It is the only claim here that could come from a caller rather than from verified state, so
+/// it is the only one that needs a bound. Generous against any real purpose string and small
+/// against a hostile one.
+pub const MAX_PURPOSE_BYTES: usize = 256;
 
 /// The longest a transaction token may live.
 ///
@@ -101,6 +121,8 @@ pub enum TransactionTokenRefusal {
     /// The feature is armed but no trust domain is configured, so there is nowhere the token
     /// could be spent. Refused rather than minted against a default.
     NoTrustDomain,
+    /// The purpose exceeded [`MAX_PURPOSE_BYTES`].
+    PurposeTooLong,
     /// The claims could not be serialised, or the signature failed.
     Mint,
 }
@@ -144,9 +166,11 @@ pub fn mint(
     if request.trust_domain.is_empty() {
         return Err(TransactionTokenRefusal::NoTrustDomain);
     }
-    // CLAMPED, not trusted. The caller resolves a lifetime from config and this is the last
-    // place that can be wrong about it; a bound applied only where the value is read is a bound
-    // one refactor away from not applying.
+    // CLAMPED. The exchange path passes the maximum, so today this is the identity -- it is a
+    // guard for a caller that resolves a lifetime from somewhere else, which is what a
+    // graduation adding per-deployment tuning would be. Kept rather than deleted because the
+    // whole mitigation for an unrevocable, unreplay-checked bearer token is that it expires
+    // soon, and that bound should not live only at the one site that happens to set it.
     let lifetime = request.lifetime_secs.clamp(1, MAX_LIFETIME_SECS);
     let mut claims = serde_json::Map::new();
     claims.insert("iss".to_owned(), json!(request.issuer));
@@ -159,6 +183,14 @@ pub fn mint(
         json!({ "scope": request.authorization_context }),
     );
     if let Some(purpose) = request.purpose {
+        // BOUNDED. Every other claim here comes from verified state; a purpose would be
+        // caller-supplied text signed by the environment key, and nothing caps a form field on
+        // this plane. Megabytes of it would produce a token past the verifier's own size cap
+        // that can therefore never verify -- a mint that always fails at the far end. Refused
+        // rather than truncated: a silently shortened purpose is a different statement.
+        if purpose.len() > MAX_PURPOSE_BYTES {
+            return Err(TransactionTokenRefusal::PurposeTooLong);
+        }
         claims.insert("purp".to_owned(), json!(purpose));
     }
     claims.insert("iat".to_owned(), json!(request.now_unix_seconds));
@@ -179,64 +211,60 @@ pub fn mint(
 
 /// What the exchange knows when it reaches the transaction-token branch.
 ///
-/// Every field comes from something the endpoint already VERIFIED: the subject from a
-/// revalidated token, the requester from an authenticated client, the context from the subject
-/// token's own scopes. Nothing here is read out of an unverified payload, which is the property
-/// that lets this compose on the exchange rather than duplicate it.
+/// Every field comes from something the endpoint already VERIFIED or DECIDED: the subject from a
+/// revalidated token, the requester from an authenticated client, and the context from the
+/// exchange's own decision, which is the NARROWED scope after the impersonation policy, the
+/// registered-grant list, the confidential-client requirement and the widening check have all
+/// run. Nothing here is read from an unverified payload and nothing skips a control.
 pub struct ExchangeInputs<'a> {
-    /// The RFC 8693 `requested_token_type`, if the caller named one.
-    pub requested_type: Option<&'a str>,
+    /// The authenticated client, for the audit row's target.
+    pub client_id: &'a ironauth_store::ClientId,
+    /// The workload asking, as a string for the token's `rctx`.
+    pub requester: &'a str,
     /// The person, from the revalidated subject token.
     pub subject: &'a str,
-    /// The workload, from the authenticated client.
-    pub requester: &'a str,
-    /// What the subject token was authorized to do.
+    /// What this exchange was DECIDED to authorize: the narrowed scope, not the subject token's
+    /// full set. A caller that asked for less must not receive a token asserting more.
     pub authorization_context: &'a std::collections::BTreeSet<String>,
-    /// What this transaction is for, when the caller said. The exchange's `scope` parameter,
-    /// which in this profile is the caller's statement of purpose rather than a narrowing.
-    pub purpose: Option<&'a str>,
 }
 
-/// Mint a transaction token if this request asked for one and the deployment can issue one.
+/// Mint a transaction token and record that it was minted.
 ///
-/// Returns `Ok(None)` when the requested type is not a transaction token, when the feature is
-/// not armed, or when no trust domain is configured. All three fall through to the ordinary
-/// type negotiation, which refuses an unknown requested type as unsupported -- so an unarmed
-/// deployment answers a `txn_token` request exactly as it answers a request for any URI it does
-/// not implement, and the type's existence here is not observable.
+/// Reached only when the caller asked for one AND the deployment can issue one, both of which
+/// the exchange resolved before running its policy checks -- so by here every refusal that
+/// applies to an ordinary exchange has already fired.
 ///
 /// # Errors
 ///
-/// [`crate::TokenError::ServerError`] if the mint fails, which means the environment's
-/// signing key or the claim serialisation is broken. A refusal to mint is never reported as a
-/// client error: the client asked for something this deployment offers.
-pub fn try_exchange(
+/// [`crate::TokenError::ServerError`] if this environment has no live signing key, if the mint
+/// fails, or if the audit row cannot be written. The last is not pedantry: a transaction token
+/// is not revocable and not introspectable, so the audit row is the ONLY record that it exists,
+/// and minting one nobody can trace would be worse than refusing.
+pub async fn issue_transaction_token(
     state: &crate::state::OidcState,
     scope: ironauth_store::Scope,
     entry: &std::sync::Arc<crate::issuer::IssuerEntry>,
     inputs: &ExchangeInputs<'_>,
-) -> Result<Option<axum::response::Response>, crate::TokenError> {
-    if inputs.requested_type != Some(TRANSACTION_TOKEN_TYPE) {
-        return Ok(None);
-    }
-    // BOTH conditions, and neither implies the other: the flag says the operator accepts a
-    // draft-stage wire format, the domain says where the token may be spent. `transaction_token_
-    // domain` is `None` unless the boot path resolved both, so this one read answers both.
+) -> Result<axum::response::Response, crate::TokenError> {
     let Some(trust_domain) = state.transaction_token_domain() else {
-        return Ok(None);
-    };
-
-    // The environment's ACTIVE signer, chosen by the same rotation policy every other mint on
-    // this issuer uses. `None` means this environment has no live key, which is a deployment
-    // fault rather than anything the caller did.
-    let Some(key) = entry.keyset().active_signer(state.now()) else {
+        // Unreachable: the caller resolved this before deciding. Kept as a refusal rather than
+        // an `expect` because a second caller is exactly the kind of thing that gets added.
         return Err(crate::TokenError::ServerError);
     };
+    // The environment's signer under ITS OWN rotation policy, which is what every other mint on
+    // this issuer uses. `keyset().active_signer()` was wrong twice over: it ignores the policy
+    // (so it can pick an algorithm the policy bans) and it breaks ties on insertion order, and
+    // every environment provisions three day-one keys sharing one activation instant -- so
+    // roughly a third of deployments would have signed transaction tokens with RS256 while
+    // every other token from the same issuer was EdDSA.
+    let Some(key) = entry.signer(state.now()) else {
+        return Err(crate::TokenError::ServerError);
+    };
+
     let now = crate::util::epoch_micros(state.now()) / 1_000_000;
-    let transaction_id = format!(
-        "txn_{}",
-        ironauth_store::CorrelationId::generate(state.env())
-    );
+    // The transaction id, which the audit row records. `CorrelationId` already carries its own
+    // `req_` prefix, so prefixing again produced `txn_req_...`; the id is used verbatim.
+    let transaction_id = ironauth_store::CorrelationId::generate(state.env()).to_string();
     let context: Vec<String> = inputs.authorization_context.iter().cloned().collect();
     let token = mint(
         key,
@@ -246,7 +274,12 @@ pub fn try_exchange(
             subject: inputs.subject,
             requester: inputs.requester,
             authorization_context: &context,
-            purpose: inputs.purpose,
+            // NO `purp`. The draft defines the claim and defines no request parameter that
+            // carries it, and the exchange's `scope` -- the only free string a caller can send
+            // here -- means NARROW TO THIS everywhere else on this endpoint. Repurposing it
+            // would make one parameter mean two things depending on a token type, which is the
+            // kind of overload a caller gets wrong once and an implementer never notices.
+            purpose: None,
             transaction_id: &transaction_id,
             now_unix_seconds: now,
             lifetime_secs: MAX_LIFETIME_SECS,
@@ -254,7 +287,34 @@ pub fn try_exchange(
     )
     .map_err(|_| crate::TokenError::ServerError)?;
 
-    Ok(Some(transaction_token_response(&token)))
+    // BEFORE the token leaves. A record written afterwards is one a crash can lose while the
+    // credential is already out, and this row is the only record that the token exists at all.
+    state
+        .store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(state.env())),
+            ironauth_store::CorrelationId::generate(state.env()),
+        )
+        .authorization()
+        .record_transaction_token(
+            state.env(),
+            inputs.client_id,
+            inputs.subject,
+            &transaction_id,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(?error, "recording a transaction-token mint failed");
+            crate::TokenError::ServerError
+        })?;
+
+    tracing::info!(
+        client_id = %inputs.requester,
+        txn = %transaction_id,
+        "transaction token issued (issue #133, PROTOTYPE)"
+    );
+    Ok(transaction_token_response(&token))
 }
 
 /// The RFC 8693 response shape for an issued transaction token.

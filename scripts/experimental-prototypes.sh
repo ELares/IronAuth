@@ -106,6 +106,9 @@ echo "== transaction tokens =="
 # What the token carries, the refusal without a trust domain, the lifetime clamp, and that it
 # does not verify as an access token. Needs no database.
 cargo test -p ironauth-oidc --test transaction_tokens
+# And the EXCHANGE: that the branch sits after every policy check, that an unarmed deployment
+# answers as it does for any unknown URI, and that the audit row is written. Needs a database.
+cargo test -p ironauth-oidc --features testing --test token_exchange transaction
 # And the BOOT wiring: the ack AND a domain, and another prototype's ack arming nothing.
 cargo test -p ironauth --bin ironauth transaction_token
 

@@ -2095,6 +2095,17 @@ impl Harness {
     /// With none installed -- the default -- the client-credentials grant IGNORES the two
     /// headers and answers as though they were not present, which is what a test of the
     /// default posture drives.
+    /// Arm transaction tokens for the harness by installing a trust domain (issue #133).
+    ///
+    /// The boot path resolves "the draft is acknowledged AND a domain is configured" to one
+    /// `Option`, and installing a domain is what that resolves to. With none installed -- the
+    /// default -- the exchange refuses the requested type exactly as it refuses any unknown URI.
+    pub fn install_transaction_token_domain(&mut self, domain: &str) {
+        let state = self.state.clone().with_transaction_token_domain(domain);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     pub fn install_attesters(
         &mut self,
         registry: Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>,

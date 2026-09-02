@@ -1022,3 +1022,169 @@ async fn the_mapping_reaches_an_exchanged_token() {
         "an unplaced `static` rule lands on the one token this grant mints: {claims}"
     );
 }
+
+// ===========================================================================
+// TRANSACTION TOKENS (issue #133, PROTOTYPE).
+//
+// These live in THIS file rather than beside the mint, because what they answer is whether the
+// exchange reaches the mint and whether it still refuses everything it refused before. A review
+// found the first version returning BEFORE `decide`, which is the only place the impersonation
+// policy, the registered-grant list and the confidential-client requirement are enforced: a
+// public client registered for another grant could present somebody else's access token and
+// receive a signed assertion naming that person. Nothing in the mint's own suite could see it.
+// ===========================================================================
+
+const TRANSACTION_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:txn_token";
+const TRUST_DOMAIN: &str = "internal.example.test";
+
+#[tokio::test]
+async fn an_unarmed_deployment_refuses_the_transaction_token_type_as_unsupported() {
+    // THE DEFAULT. No trust domain installed, so the requested type reaches the ordinary
+    // negotiator and is refused as an unsupported type -- byte for byte what any unknown URI
+    // draws, so the type's existence here is not observable.
+    let harness = harness().await;
+    let (client, secret) = exchanging_client(&harness).await;
+    let own = access_token_for(&harness, &client, &secret).await;
+
+    let (txn_status, txn_body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &own),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    let (unknown_status, unknown_body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &own),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", "urn:example:token-type:nonsense"),
+        ],
+    )
+    .await;
+
+    assert_ne!(txn_status, StatusCode::OK, "{txn_body}");
+    assert_eq!(
+        (txn_status, txn_body["error"].clone()),
+        (unknown_status, unknown_body["error"].clone()),
+        "an unarmed deployment must answer a txn_token request exactly as it answers a request \
+         for a URI it does not implement"
+    );
+}
+
+#[tokio::test]
+async fn a_transaction_token_request_is_still_refused_by_the_impersonation_policy() {
+    // THE BLOCKER. The branch used to sit before `decide`, so this exchange -- another client's
+    // token, no impersonation policy -- returned 200 with a signed assertion naming that
+    // client's subject. On main the same request is `invalid_grant`, and it must stay so.
+    let mut harness = harness().await;
+    harness.install_transaction_token_domain(TRUST_DOMAIN);
+    let (client, secret) = exchanging_client(&harness).await;
+    let (other, other_secret) = exchanging_client(&harness).await;
+    let foreign = access_token_for(&harness, &other, &other_secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &foreign),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+        ],
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a transaction token must not escape the impersonation policy: {body}"
+    );
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+    assert!(
+        body.get("access_token").is_none(),
+        "and nothing is issued: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_armed_exchange_issues_a_transaction_token_carrying_the_narrowed_scope() {
+    // The happy path, and the NARROWING is the part worth asserting: the token must carry what
+    // the exchange DECIDED, not the subject token's full set. A caller that asked for less must
+    // not receive an assertion claiming more.
+    let mut harness = harness().await;
+    harness.install_transaction_token_domain(TRUST_DOMAIN);
+    let (client, secret) = exchanging_client(&harness).await;
+    let own = access_token_for(&harness, &client, &secret).await;
+
+    let (status, body) = exchange(
+        &harness,
+        &client.to_string(),
+        &secret,
+        &[
+            ("subject_token", &own),
+            ("subject_token_type", ACCESS_TOKEN_TYPE),
+            ("requested_token_type", TRANSACTION_TOKEN_TYPE),
+            ("scope", "profile"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["issued_token_type"], TRANSACTION_TOKEN_TYPE,
+        "RFC 8693 2.2.1: the response names what was ACTUALLY issued, so a caller need not \
+         parse the token to find out: {body}"
+    );
+
+    let token = body["access_token"].as_str().expect("a token");
+    let claims = unverified_claims(token);
+    assert_eq!(claims["aud"], TRUST_DOMAIN, "the trust domain, and only it");
+    assert_eq!(
+        claims["rctx"]["workload"],
+        client.to_string(),
+        "the workload asking"
+    );
+    assert_eq!(
+        claims["azd"]["scope"],
+        serde_json::json!(["profile"]),
+        "the NARROWED scope, not the subject token's full set: {claims}"
+    );
+    assert!(claims["sub"].is_string(), "the person: {claims}");
+    assert!(claims.get("purp").is_none(), "no purpose is set: {claims}");
+
+    // The audit row is the ONLY record a transaction token exists: it opens no grant, so it is
+    // neither revocable nor introspectable. Without this the mint could stop recording and
+    // nothing would notice.
+    assert_eq!(
+        harness
+            .count_audit_action("token_exchange.transaction_token")
+            .await,
+        1,
+        "exactly one audit row per minted transaction token"
+    );
+    assert_eq!(
+        harness.count_audit_action("token_exchange.issue").await,
+        0,
+        "and it is NOT recorded as an exchange issuance, whose rows describe revocable, \
+         introspectable access tokens"
+    );
+}
+
+/// A token's claims, decoded WITHOUT verifying.
+///
+/// Deliberate: this file asserts what the exchange PUT in the token, and the mint's own suite
+/// verifies it under the transaction-token policy. Verifying here would need the environment's
+/// JWKS and would prove the same thing twice while making a failure harder to read.
+fn unverified_claims(token: &str) -> Value {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1).expect("a JWS payload");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url");
+    serde_json::from_slice(&bytes).expect("claims parse")
+}

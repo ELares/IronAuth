@@ -26,7 +26,7 @@ type is refused exactly as any unknown URI is.
 **Known limits, recorded in `docs/experimental/transaction-tokens.md`:** `azd` carries the
 subject token's scopes rather than RFC 9396 authorization details, there is no replacement flow
 so each request mints its own `txn` and nothing correlates a call chain, there is no `sub_id`,
-one trust domain per environment, and no replay recording or revocation -- the five-minute
+one trust domain per PROCESS shared by every tenant, and no replay recording or revocation -- the five-minute
 lifetime cap is the whole mitigation, which is why it is clamped at the mint.
 
 ### Experimental: attestation-based client authentication (issue #133)

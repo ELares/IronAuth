@@ -853,6 +853,17 @@ pub enum Action {
     /// anything: the criterion in #125 asks for an audit event on EVERY exchange, and
     /// impersonation in particular is only defensible because it is recorded.
     TokenExchangeIssue,
+    /// A TRANSACTION TOKEN was minted from an exchange (issue #133, PROTOTYPE).
+    ///
+    /// Its own action rather than [`Action::TokenExchangeIssue`], because the two are different
+    /// things and an investigator filtering the latter is asking about revocable, introspectable
+    /// access tokens. A transaction token is neither: it is a short-lived intra-domain
+    /// assertion with no grant chain behind it, so recording it as an exchange issuance would
+    /// put a row in that stream for a credential none of that stream's assumptions hold for.
+    ///
+    /// The detail carries the transaction id, which is otherwise generated and thrown away:
+    /// without it nothing ties a token a service is holding back to the request that minted it.
+    TokenExchangeTransactionToken,
     /// A client's RFC 8707 resource-indicator policy was set (issue #28): the
     /// per-client allowed-resource allowlist and the no-resource behavior
     /// (default audience or refusal).
@@ -1731,6 +1742,7 @@ impl Action {
             Action::AgentTokenDeny => "agent_token.deny",
             Action::JwtBearerAssertionIssue => "jwt_bearer_assertion.issue",
             Action::TokenExchangeIssue => "token_exchange.issue",
+            Action::TokenExchangeTransactionToken => "token_exchange.transaction_token",
             Action::ClientResourceIndicatorPolicySet => "client.resource_indicator_policy.set",
             Action::ClientAllowedScopesSet => "client.allowed_scopes.set",
             Action::DeviceCodeIssue => "device_code.issue",

@@ -180,37 +180,29 @@ pub async fn token_exchange_grant(
         ExchangeMode::Impersonation
     };
 
-    // TRANSACTION TOKENS (issue #133, PROTOTYPE). Taken HERE, after the client authenticated
-    // and after both presented tokens were revalidated in full, and before the ordinary type
-    // negotiation. The position is the point: `sub` comes from a token this endpoint verified,
-    // never from a claim read out of an unverified payload, which is this module's central
-    // invariant and the reason the prototype composes on the exchange rather than beside it.
-    //
-    // With the feature off, or with no trust domain configured, this returns `None` and the
-    // requested type falls through to `negotiate_type`, which refuses it as unsupported exactly
-    // as it refuses any unknown URI. So an unarmed deployment cannot tell from the answer that
-    // the type has a meaning here.
-    if let Some(response) = crate::transaction_tokens::try_exchange(
-        state,
-        scope,
-        &entry,
-        &crate::transaction_tokens::ExchangeInputs {
-            requested_type: params.requested_token_type.as_deref(),
-            subject: &subject.subject,
-            requester: &client_id_str,
-            authorization_context: &subject.scope,
-            purpose: params.scope.as_deref(),
-        },
-    )? {
-        return Ok(response);
-    }
-
     // What the client asked to narrow TO. The RFC 8707 `resource` parameter and the RFC
     // 8693 `audience` parameter both name a target service, so they are unioned: they are
     // the same request expressed two ways, and honouring only one would let the other
     // silently widen.
     let mut requested_audience = space_set(params.audience.as_deref());
     requested_audience.extend(resources.iter().cloned());
+
+    // WANTS A TRANSACTION TOKEN (issue #133, PROTOTYPE), and can have one: the draft is
+    // acknowledged and a trust domain is configured. Resolved here so the decision below runs
+    // with the txn URI HIDDEN from the type negotiator, which would otherwise refuse it as
+    // unsupported before any policy ran.
+    //
+    // Hiding it is what makes every control apply. The first version returned BEFORE `decide`,
+    // and `decide` is the only place the impersonation policy, the registered-grant list and
+    // the confidential-client requirement are enforced -- so a PUBLIC client registered for
+    // another grant could present somebody else's access token and receive a signed assertion
+    // naming that person, which every service in the trust domain accepts. On main the same
+    // request is `invalid_grant`. With the type hidden, the negotiator settles the ordinary
+    // access-token type, every refusal fires exactly as it does for any other exchange, and the
+    // decision's NARROWED scope is what the transaction token then carries.
+    let wants_transaction_token = params.requested_token_type.as_deref()
+        == Some(crate::transaction_tokens::TRANSACTION_TOKEN_TYPE)
+        && state.transaction_token_domain().is_some();
 
     let policy = ClientGrantPolicy {
         allowed: registered_grants(&authenticated.grant_types),
@@ -239,7 +231,11 @@ pub async fn token_exchange_grant(
             actor_present: actor.is_some(),
             mode,
         },
-        requested_type: params.requested_token_type.as_deref(),
+        requested_type: if wants_transaction_token {
+            None
+        } else {
+            params.requested_token_type.as_deref()
+        },
         existing_act: subject.act.as_ref(),
         actor_subject: actor.as_ref().map(|token| token.subject.as_str()),
     })
@@ -256,6 +252,22 @@ pub async fn token_exchange_grant(
             "a client is configured for exchanged refresh tokens, which this grant does not issue"
         );
         return Err(TokenError::ServerError);
+    }
+
+    // The transaction token, now that every control has run and the scope is the NARROWED one.
+    if wants_transaction_token {
+        return crate::transaction_tokens::issue_transaction_token(
+            state,
+            scope,
+            &entry,
+            &crate::transaction_tokens::ExchangeInputs {
+                client_id: &client_id,
+                requester: &client_id_str,
+                subject: &subject.subject,
+                authorization_context: &decision.scope,
+            },
+        )
+        .await;
     }
 
     issue(
