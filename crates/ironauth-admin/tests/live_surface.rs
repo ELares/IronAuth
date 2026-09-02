@@ -328,6 +328,8 @@ struct Fixture {
     /// than an id that never resolved (issue #99).
     service_account: String,
     agent: String,
+    /// A PENDING vault approval for `agent`, so the decision case addresses a live one.
+    approval: String,
     sa_api_key: String,
     /// A live personal access token handle, so the PAT cases address a real one (issue #99).
     pat: String,
@@ -520,13 +522,46 @@ impl Fixture {
                 &serde_json::json!({
                     "linked_user_id": user,
                     "display_name": "sweep bot",
-                    "tool_scopes": ["sweep.read"],
+                    // TWO tools, and `vault` is the one that matters: storing a vault
+                    // connection refuses a provider the agent has not declared AND one that is
+                    // not a lowercase identifier, and `sweep.read` fails the second rule on its
+                    // dot. `sweep.read` is kept because it was the pre-existing value and it
+                    // mirrors the permission slug seeded below; nothing in this file drives it,
+                    // and removing it leaves the suite green.
+                    "tool_scopes": ["sweep.read", "vault"],
                 })
                 .to_string(),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "create agent: {body}");
         let agent = field(&body, "/id", "seed agent");
+
+        // A PENDING approval, so the decision case addresses a live one. Through the store,
+        // because nothing on the management plane raises one: an approval is raised by the
+        // agent's own token exchange, a data-plane path this suite never drives. An absent id
+        // answers the uniform not-found at a HEALTHY environment too, which would leave the
+        // soft-deleted fence unmeasurable through this route.
+        let approval = ironauth_store::AgentVaultApprovalId::generate(&env, &scope);
+        h.db()
+            .control_store()
+            .scoped(scope)
+            .acting(h.db().test_actor(&env), CorrelationId::generate(&env))
+            .agent_vault_approvals()
+            .request(
+                &env,
+                ironauth_store::NewVaultApproval {
+                    id: &approval,
+                    agent_id: &ironauth_store::AgentPrincipalId::parse_in_scope(&agent, &scope)
+                        .expect("the seeded agent id parses in scope"),
+                    provider: "vault",
+                    requested_details: &serde_json::json!([{ "type": "vault" }]),
+                    action_digest: &"b2".repeat(32),
+                    expires_at_unix_micros: i64::from(u32::MAX) * 1_000_000,
+                },
+            )
+            .await
+            .expect("seed a pending vault approval");
+        let approval = approval.to_string();
 
         let (status, _, body) = h
             .post(
@@ -1292,6 +1327,7 @@ impl Fixture {
             api_key,
             service_account,
             agent,
+            approval,
             sa_api_key,
             pat,
             doomed_tenant,
@@ -1354,6 +1390,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         api_key,
         service_account,
         agent,
+        approval,
         sa_api_key,
         pat,
         connector,
@@ -2473,6 +2510,31 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
                 "tool_scopes": ["deploy"],
             }),
         ),
+        Case::empty(
+            "agents.listAgentVaultApprovals",
+            "GET",
+            format!("{org_base}/agent-approvals"),
+        ),
+        Case::json(
+            "agents.storeAgentVaultConnection",
+            "PUT",
+            format!("{org_base}/agents/{agent}/vault-connections"),
+            &serde_json::json!({
+                "provider": "vault",
+                "access_token": "downstream-token",
+                "granted_scopes": ["send"],
+            }),
+        ),
+        Case::json(
+            "agents.decideAgentVaultApproval",
+            "POST",
+            format!("{org_base}/agent-approvals/{approval}/decision"),
+            &serde_json::json!({ "approve": true }),
+        ),
+        // LAST of the agent cases. Neither handler above reads agent state, so this is
+        // defensive rather than required -- but the LIST-BEFORE-DECIDE order above is not:
+        // deciding consumes the row, and the listing returns only approvals still awaiting a
+        // decision, so reversing them would leave the listing reading an empty queue.
         Case::json(
             "agents.setAgentState",
             "PUT",
@@ -3084,6 +3146,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         message: "msg_0".to_owned(),
         service_account: "sva_0".to_owned(),
         agent: "agp_0".to_owned(),
+        approval: "ava_0".to_owned(),
         sa_api_key: "akey_0".to_owned(),
         pat: "akey_1".to_owned(),
         org_connection: "ocn_0".to_owned(),
@@ -4105,6 +4168,27 @@ fn documented_read_exceptions() -> BTreeSet<&'static str> {
 /// that are freshly generated per run and appear nowhere else in a response.
 fn documented_body_contents(f: &Fixture) -> BTreeMap<&'static str, Vec<String>> {
     BTreeMap::from([
+        // The pending approval queue, by row id. A 200 alone proves nothing here: the read
+        // pass compares STATUS only, and an emptied queue answers 200 exactly as a populated
+        // one does. That is the vacuity this map exists to close, and it matters more for this
+        // listing than most -- an operator asking "what is this agent waiting on" after an
+        // environment is decommissioned reads it, and an empty array answers wrongly rather
+        // than not at all.
+        ("agents.listAgentVaultApprovals", vec![f.approval.clone()]),
+        // The stored vault connection, by the agent it hangs off and the two fields that only
+        // a real write produces. Without this the case is satisfied by a 400 refusal: a
+        // reviewer reverted the seed's `vault` tool scope, every environment answered
+        // "the agent has not declared the tool vault", and the whole file stayed green --
+        // the case then never touches `agent_vault_connections`, which is the relation-grant
+        // question this file exists to ask.
+        (
+            "agents.storeAgentVaultConnection",
+            vec![
+                f.agent.clone(),
+                "\"provider\":\"vault\"".to_owned(),
+                "\"state\":\"active\"".to_owned(),
+            ],
+        ),
         // The user page and the single user, by the id of the seeded row.
         ("users.listUsers", vec![f.user.clone()]),
         ("users.getUser", vec![f.user.clone()]),

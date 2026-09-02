@@ -815,6 +815,13 @@ async fn plant_upstream_token(db: &TestDatabase, env: &Env, scope: Scope) -> Ses
 /// leak there would let a client id observed in one tenant resolve that tenant's agent under
 /// a caller's own scope, and the token doors would then gate issuance against a FOREIGN
 /// agent's declared tool set.
+///
+/// EACH SCOPE GETS ITS OWN CLIENT, and the probe presents the foreign one. An earlier version
+/// planted the same literal string in both scopes, reasoning that an identical handle made a
+/// leak attributable to the scope filter alone. That is not expressible: `clients.id` is a
+/// global PRIMARY KEY, so one string exists in at most one scope, and the seed could never
+/// have run. The probe presenting a client id that genuinely belongs to another scope is the
+/// real shape of the attack anyway -- an attacker has the victim's id, not a copy of it.
 #[tokio::test]
 async fn an_agent_is_unreachable_from_another_tenant_or_environment() {
     let db = TestDatabase::start().await;
@@ -825,11 +832,28 @@ async fn an_agent_is_unreachable_from_another_tenant_or_environment() {
     let env_a2 = db.seed_environment(&env, scope_a.tenant()).await;
     let scope_a2 = Scope::new(scope_a.tenant(), env_a2);
 
-    // The SAME client-id string in each foreign scope, so a leak could only come from a scope
-    // boundary miss rather than from the handle being globally unique.
-    let victim_client = "cli_victim_agent";
-    let agent_b = plant_agent(&db, &env, scope_b, victim_client).await;
-    let agent_a2 = plant_agent(&db, &env, scope_a2, victim_client).await;
+    // A REAL client in each foreign scope. `agents.client_id` carries a foreign key to
+    // `clients` (migration 0177), so an invented handle cannot be planted at all.
+    let client_b = db
+        .store()
+        .scoped(scope_b)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "agent client in tenant B")
+        .await
+        .expect("create the tenant-B agent client")
+        .to_string();
+    let client_a2 = db
+        .store()
+        .scoped(scope_a2)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .clients()
+        .create(&env, "agent client in environment A2")
+        .await
+        .expect("create the environment-A2 agent client")
+        .to_string();
+    let agent_b = plant_agent(&db, &env, scope_b, &client_b).await;
+    let agent_a2 = plant_agent(&db, &env, scope_a2, &client_a2).await;
 
     let mut harness = IdorHarness::new();
     harness.register_agent_probes();
@@ -840,8 +864,11 @@ async fn an_agent_is_unreachable_from_another_tenant_or_environment() {
         "both agent read surfaces are registered with the harness"
     );
 
+    // BOTH foreign client ids, so the `for_client` probe presents a handle that genuinely
+    // belongs to another scope rather than one that belongs to nobody.
     let foreign = [
-        victim_client.to_string(),
+        client_b.clone(),
+        client_a2.clone(),
         agent_b.to_string(),
         agent_a2.to_string(),
     ];
@@ -852,12 +879,15 @@ async fn an_agent_is_unreachable_from_another_tenant_or_environment() {
     // Each agent is STILL readable in its OWN scope, so the isolation above is a genuine
     // scope boundary rather than a global miss. Without this the test passes against a
     // `for_client` that returns None for everything.
-    for (scope, agent) in [(scope_b, &agent_b), (scope_a2, &agent_a2)] {
+    for (scope, agent, client) in [
+        (scope_b, &agent_b, &client_b),
+        (scope_a2, &agent_a2, &client_a2),
+    ] {
         let by_client = db
             .store()
             .scoped(scope)
             .agents()
-            .for_client(victim_client)
+            .for_client(client)
             .await
             .expect("read in own scope");
         assert_eq!(
@@ -895,12 +925,41 @@ async fn plant_agent(
 
     let user = ironauth_store::UserId::generate(env, &scope);
     sqlx::query(
+        // EIGHT columns, not three, five of them newly required. `password_hash` is NOT NULL
+        // since 0006, and 0028 added
+        // `identifier_bidx`, `identifier_sealed`, `claims_sealed` and `pii_dek_version` and made
+        // all four NOT NULL when it moved PII behind envelope encryption. The three-column form
+        // this used to be could never insert a row on any schema this repository has shipped: a
+        // seed that cannot run is a test that can only fail, and this one shipped that way
+        // because nothing ever ran it.
+        //
+        // The sealed values are placeholders. This row exists only as the FK target for
+        // `agents.linked_user_id` (0176), and nothing here reads it back or decrypts it; a
+        // real seal would need a DEK and would test the crypto rather than the thing under
+        // test.
         "INSERT INTO users /* query-audit-allow: owner test seed */ \
-         (id, tenant_id, environment_id) VALUES ($1, $2, $3)",
+         (id, tenant_id, environment_id, password_hash, \
+          identifier_bidx, identifier_sealed, claims_sealed, pii_dek_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
     )
     .bind(user.to_string())
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
+    .bind("not-a-real-hash")
+    // DERIVED from the id, not a constant: `users_identifier_bidx_unique` is UNIQUE over
+    // (tenant, environment, identifier_bidx), so a constant makes a second seeded user in one
+    // scope fail with an opaque 23505 from inside a fixture.
+    .bind(
+        user.to_string()
+            .as_bytes()
+            .iter()
+            .cycle()
+            .take(32)
+            .copied()
+            .collect::<Vec<u8>>(),
+    )
+    .bind(vec![0_u8; 16])
+    .bind(vec![0_u8; 16])
     .execute(db.owner_pool())
     .await
     .expect("seed user");
