@@ -165,6 +165,17 @@ pub fn scim_router(state: ScimState) -> Router {
                 .patch(crate::users::patch_user)
                 .delete(crate::users::delete_user),
         )
+        .route(
+            "/scim/v2/Groups",
+            get(crate::groups::list_groups).post(crate::groups::create_group),
+        )
+        .route(
+            "/scim/v2/Groups/{id}",
+            get(crate::groups::get_group)
+                .put(crate::groups::replace_group)
+                .patch(crate::groups::patch_group)
+                .delete(crate::groups::delete_group),
+        )
         .with_state(state)
 }
 

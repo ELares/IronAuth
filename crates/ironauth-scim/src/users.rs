@@ -61,7 +61,7 @@ const PATCH_OP_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
 /// A function rather than a constant so there is ONE body: a second literal somewhere in this
 /// module is how the two cases start to differ, and a caller only needs them to differ by a
 /// byte to have the oracle this exists to deny.
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     scim_error(
         StatusCode::NOT_FOUND,
         None,
@@ -74,7 +74,7 @@ fn not_found() -> Response {
 /// [`StoreError::NotFound`] becomes the uniform 404 rather than anything more specific: the
 /// store returns it for an out-of-scope id, which is exactly the case a caller must not be
 /// able to tell from an absent one.
-fn store_failure(error: &StoreError) -> Response {
+pub(crate) fn store_failure(error: &StoreError) -> Response {
     match error {
         StoreError::NotFound => not_found(),
         StoreError::Conflict => scim_error(
@@ -97,7 +97,7 @@ fn store_failure(error: &StoreError) -> Response {
 /// `exists` then binds it to the credential's organization, which is the check the scope alone
 /// cannot make: two organizations inside one environment share a scope, so a scope-valid id is
 /// still not necessarily this connection's business.
-async fn addressed_user(
+pub(crate) async fn addressed_user(
     state: &ScimState,
     auth: &Authenticated,
     raw_id: &str,
@@ -359,7 +359,7 @@ async fn land_account(
 }
 
 /// The application clock as epoch microseconds.
-fn epoch_micros(state: &ScimState) -> i64 {
+pub(crate) fn epoch_micros(state: &ScimState) -> i64 {
     state
         .env()
         .clock()
@@ -785,6 +785,31 @@ pub(crate) struct ListQuery {
     count: Option<i64>,
 }
 
+impl ListQuery {
+    /// The raw filter text, if the caller sent one.
+    pub(crate) fn filter(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// The 1-based index of the first resource to return (RFC 7644 section 3.4.2.4).
+    ///
+    /// Clamped up to 1 rather than refused: the RFC says a value less than 1 is interpreted
+    /// as 1, and refusing would fail a client that sent 0 meaning "the beginning".
+    pub(crate) fn start_index(&self) -> i64 {
+        self.start_index.unwrap_or(1).max(1)
+    }
+
+    /// The requested page size, for [`ScimLimits::clamp_count`] to bound.
+    ///
+    /// A NEGATIVE count becomes zero rather than wrapping: `usize::try_from` on a negative
+    /// fails, and mapping that failure to the default page size would turn "give me nothing"
+    /// into a full page.
+    pub(crate) fn count(&self) -> Option<usize> {
+        self.count
+            .map(|count| usize::try_from(count.max(0)).unwrap_or(0))
+    }
+}
+
 /// `GET /scim/v2/Users` (RFC 7644 section 3.4.2).
 ///
 /// # Three ways to answer, and the reason there are three
@@ -817,7 +842,7 @@ pub(crate) async fn list_users(
         Ok(auth) => auth,
         Err(refusal) => return refusal.response(),
     };
-    let filter = match query.filter.as_deref().map(crate::parse_filter).transpose() {
+    let filter = match query.filter().map(crate::parse_filter).transpose() {
         Ok(filter) => filter,
         Err(error) => {
             let rendered = error.to_scim_error();
@@ -828,12 +853,8 @@ pub(crate) async fn list_users(
             );
         }
     };
-    let start_index = query.start_index.unwrap_or(1).max(1);
-    let count = state.limits().clamp_count(
-        query
-            .count
-            .map(|count| usize::try_from(count.max(0)).unwrap_or(0)),
-    );
+    let start_index = query.start_index();
+    let count = state.limits().clamp_count(query.count());
     let matched = match collect_matches(&state, &auth, filter.as_ref()).await {
         Ok(matched) => matched,
         Err(response) => return response,

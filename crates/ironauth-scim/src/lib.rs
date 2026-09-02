@@ -18,6 +18,7 @@
 
 mod bulk;
 mod filter;
+mod groups;
 mod patch;
 mod path;
 mod resource;

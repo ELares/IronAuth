@@ -1,0 +1,68 @@
+-- SCIM group push: the data plane may create and populate an organization group (issue #135).
+--
+-- WHAT THIS CHANGES, SAID PLAINLY.
+--
+-- 0087 says of `org_groups`: "No data-plane path ever writes a group, so INSERT, UPDATE, and
+-- DELETE are granted to nobody there." 0088 says of `org_group_members` that the data plane
+-- "may REVOKE a membership's group bindings and may do nothing else". Both sentences were true
+-- when they were written and both are SUPERSEDED here. SCIM group push is the first data-plane
+-- path that writes a group, and this migration is what makes it possible. Those two migrations
+-- are checksummed and cannot be corrected in place, so this is where the correction lives.
+--
+-- WHY THIS IS THE RIGHT PLANE FOR IT.
+--
+-- The SCIM surface is public: its callers are Okta, Entra and their peers, which are hosted
+-- services on the open internet, so it runs on the public plane under `ironauth_app` like
+-- every other public surface. Group push therefore has to be a data-plane write or not exist.
+--
+-- The alternative considered was a dedicated `ironauth_scim` role holding exactly these grants
+-- and nothing else, which is strictly better least-privilege and is the right shape if this
+-- surface ever needs a privilege the rest of the public plane must not have. It is not that
+-- yet, and the reason is the comparison below: what this grants is SMALLER than what the data
+-- plane already holds.
+--
+-- WHAT THIS ACTUALLY WIDENS, AND WHAT IT DOES NOT.
+--
+-- The data plane already holds `SELECT, INSERT` on `org_memberships` (0084, for the
+-- invitation-accept path). Binding a person into an organization is a STRICTLY larger
+-- privilege than putting a person who is already in that organization into one of its groups:
+-- the membership is what makes them a principal there at all, and every group binding hangs
+-- off a membership that already exists.
+--
+-- A group binding confers roles only through `org_group_roles`, and this migration grants the
+-- data plane NOTHING on that table. So the strongest true statement about what a compromised
+-- data-plane path gains here is: it may create a group, and it may put existing members of an
+-- organization into groups of that organization. It may NOT attach a role to a group, so it
+-- cannot manufacture a privilege that an operator has not already attached to some group.
+--
+-- The column scoping keeps the 0087/0088 containment property intact. `organization_id`,
+-- `parent_id`, `slug`, `group_id`, `membership_id` and the scope columns are all ABSENT from
+-- every UPDATE list below, so a row whose containment was checked when it was written can
+-- never be repointed afterwards. DELETE is still granted to nobody.
+
+-- `org_groups`: create and rename. `slug` is deliberately NOT in the UPDATE list, so the
+-- stable name a token claim carries stays immutable exactly as 0087 made it, and a SCIM
+-- rename moves the label only. `parent_id` is likewise absent: this surface creates flat
+-- groups, and a data-plane path that could reparent one could graft a group under a
+-- role-bearing ancestor and inherit its roles.
+--
+-- `metadata` IS in the list, and not because this surface sets it. `ActingOrgGroupRepo::update`
+-- is one statement shared with the control plane and its SET list always names `metadata`
+-- (`COALESCE($2::jsonb, metadata)`, so a NULL argument leaves the value alone). Postgres checks
+-- the column privilege for every column a SET list names, unchanged value or not, so without
+-- this grant every rename fails with SQLSTATE 42501 -- which is what happened, and is why this
+-- line is here rather than a shorter list that looks tighter and does not work. The column
+-- carries no authorization: nothing derives a role, a permission or a claim from it.
+GRANT INSERT ON org_groups TO ironauth_app;
+GRANT UPDATE (display_name, metadata, updated_at, deleted_at) ON org_groups TO ironauth_app;
+
+-- `org_group_members`: create a binding. The soft-delete pair was already granted by 0088 for
+-- the invitation-accept cascade, so removal needs nothing new; only INSERT is added.
+GRANT INSERT ON org_group_members TO ironauth_app;
+
+-- The scope policies 0087 and 0088 installed are PERMISSIVE and already cover the app role's
+-- INSERT and UPDATE: each has a WITH CHECK requiring the row's scope columns to equal the
+-- session's, so a data-plane write outside the caller's scope is refused by the policy exactly
+-- as a control-plane one is. Nothing is added here, and nothing needs to be: a new policy
+-- would be a SECOND answer to a question 0087 and 0088 already answer, and two policies on one
+-- table are OR'd, so a permissive addition could only ever widen what they allow.
