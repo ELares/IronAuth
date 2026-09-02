@@ -328,6 +328,8 @@ struct Fixture {
     /// than an id that never resolved (issue #99).
     service_account: String,
     agent: String,
+    /// A PENDING vault approval for `agent`, so the decision case addresses a live one.
+    approval: String,
     sa_api_key: String,
     /// A live personal access token handle, so the PAT cases address a real one (issue #99).
     pat: String,
@@ -520,13 +522,44 @@ impl Fixture {
                 &serde_json::json!({
                     "linked_user_id": user,
                     "display_name": "sweep bot",
-                    "tool_scopes": ["sweep.read"],
+                    // TWO tools. `sweep.read` is what the agent surface itself uses; `vault`
+                    // is there because storing a vault connection refuses a provider the agent
+                    // has not declared AND one that is not a lowercase identifier, and
+                    // `sweep.read` fails the second rule on its dot.
+                    "tool_scopes": ["sweep.read", "vault"],
                 })
                 .to_string(),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "create agent: {body}");
         let agent = field(&body, "/id", "seed agent");
+
+        // A PENDING approval, so the decision case addresses a live one. Through the store,
+        // because nothing on the management plane raises one: an approval is raised by the
+        // agent's own token exchange, a data-plane path this suite never drives. An absent id
+        // answers the uniform not-found at a HEALTHY environment too, which would leave the
+        // soft-deleted fence unmeasurable through this route.
+        let approval = ironauth_store::AgentVaultApprovalId::generate(&env, &scope);
+        h.db()
+            .control_store()
+            .scoped(scope)
+            .acting(h.db().test_actor(&env), CorrelationId::generate(&env))
+            .agent_vault_approvals()
+            .request(
+                &env,
+                ironauth_store::NewVaultApproval {
+                    id: &approval,
+                    agent_id: &ironauth_store::AgentPrincipalId::parse_in_scope(&agent, &scope)
+                        .expect("the seeded agent id parses in scope"),
+                    provider: "vault",
+                    requested_details: &serde_json::json!([{ "type": "vault" }]),
+                    action_digest: &"b2".repeat(32),
+                    expires_at_unix_micros: i64::from(u32::MAX) * 1_000_000,
+                },
+            )
+            .await
+            .expect("seed a pending vault approval");
+        let approval = approval.to_string();
 
         let (status, _, body) = h
             .post(
@@ -1292,6 +1325,7 @@ impl Fixture {
             api_key,
             service_account,
             agent,
+            approval,
             sa_api_key,
             pat,
             doomed_tenant,
@@ -1354,6 +1388,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         api_key,
         service_account,
         agent,
+        approval,
         sa_api_key,
         pat,
         connector,
@@ -2473,6 +2508,29 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
                 "tool_scopes": ["deploy"],
             }),
         ),
+        Case::empty(
+            "agents.listAgentVaultApprovals",
+            "GET",
+            format!("{org_base}/agent-approvals"),
+        ),
+        Case::json(
+            "agents.storeAgentVaultConnection",
+            "PUT",
+            format!("{org_base}/agents/{agent}/vault-connections"),
+            &serde_json::json!({
+                "provider": "vault",
+                "access_token": "downstream-token",
+                "granted_scopes": ["send"],
+            }),
+        ),
+        Case::json(
+            "agents.decideAgentVaultApproval",
+            "POST",
+            format!("{org_base}/agent-approvals/{approval}/decision"),
+            &serde_json::json!({ "approve": true }),
+        ),
+        // LAST of the agent cases: suspension is not terminal, but it is still a lifecycle
+        // change, and the two above address the same agent.
         Case::json(
             "agents.setAgentState",
             "PUT",
@@ -3084,6 +3142,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         message: "msg_0".to_owned(),
         service_account: "sva_0".to_owned(),
         agent: "agp_0".to_owned(),
+        approval: "ava_0".to_owned(),
         sa_api_key: "akey_0".to_owned(),
         pat: "akey_1".to_owned(),
         org_connection: "ocn_0".to_owned(),
