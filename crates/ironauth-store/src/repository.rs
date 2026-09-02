@@ -74578,15 +74578,26 @@ impl ScimConnectionRepo<'_> {
     /// This is the SCIM surface's whole authentication step, and everything about its shape is
     /// deliberate:
     ///
-    /// * the lookup is BY DIGEST over the primary key, so it is constant-work in the value of
-    ///   the presented token: no prefix, no scan, no comparison that exits earlier for a token
-    ///   sharing more leading bytes with a stored one;
+    /// * the lookup key is a DIGEST, so nothing about the secret itself is ever compared. A
+    ///   btree probe on `text` does exit early and its page accesses do depend on the value,
+    ///   so this is not constant-work in the literal sense an earlier version of this comment
+    ///   claimed; what holds is that the value being compared is one the caller already knows,
+    ///   and learning it back reveals nothing about the token it was derived from;
     /// * liveness is checked in SQL rather than by the caller, because a handler that read the
     ///   row and then compared timestamps in Rust is one refactor away from forgetting to, and
     ///   the failure mode is a revoked provisioning credential that still provisions;
     /// * the row CARRIES its organization. The caller never supplies one, so there is no
-    ///   request shape in which a token reaches a second organization -- which is the
-    ///   CVE-2026-32130 class stated as a schema property rather than a handler discipline.
+    ///   request shape in which a token reaches a second organization -- the IDOR class
+    ///   Casdoor's CVE-2025-4210 is, stated as a schema property rather than a handler
+    ///   discipline. (Not CVE-2026-32130, which is a MISSING-authentication bug: binding the
+    ///   organization to the credential does nothing for a route that never authenticates.)
+    ///
+    /// AND THE ORGANIZATION MUST STILL BE LIVE. The join is not decoration: without it a
+    /// credential kept provisioning into an organization that had been soft-deleted or
+    /// disabled, and `list_for_organization` went on reporting it healthy, so an operator who
+    /// deleted an organization was not told the provisioning into it continued.
+    /// `ApiKeyRepo::verify` -- the credential this table copies for its digest scheme, its
+    /// retention rule and its column-scoped grant -- has carried this join all along.
     ///
     /// # Errors
     ///
@@ -74598,14 +74609,16 @@ impl ScimConnectionRepo<'_> {
     ) -> Result<Option<ScimConnection>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, organization_id, display_name, provider, \
-                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
-                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us \
-             FROM scim_connections \
-             WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
-               AND revoked_at IS NULL \
-               AND (expires_at IS NULL OR expires_at > \
-                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond'))",
+            "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                    (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us \
+             FROM scim_connections c \
+             JOIN organizations o ON o.id = c.organization_id \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.token_digest = $3 \
+               AND c.revoked_at IS NULL \
+               AND (c.expires_at IS NULL OR c.expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
+               AND o.deleted_at IS NULL AND o.state = 'active'",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -74696,7 +74709,7 @@ pub struct ActingScimConnectionRepo<'a> {
 }
 
 impl ActingScimConnectionRepo<'_> {
-    /// Create a connection, auditing `scim.connection_created`.
+    /// Create a connection, auditing `scim_connection.created`.
     ///
     /// The caller has already generated the token and hashed it; only the DIGEST arrives here,
     /// so there is no argument this function could log or store that would reveal a credential.
@@ -74704,9 +74717,10 @@ impl ActingScimConnectionRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the id or the organization is out of this scope;
-    /// [`StoreError::Conflict`] if the digest is already present (which in practice means a
-    /// caller reused a token rather than generating one); [`StoreError::Database`] otherwise,
-    /// including a provider outside the column's closed vocabulary.
+    /// [`StoreError::Conflict`] on any unique violation: a digest already present (a caller
+    /// reused a token rather than generating one) OR a handle already used, since `id` is
+    /// unique too. [`StoreError::Database`] otherwise, including a provider outside the
+    /// column's closed vocabulary.
     pub async fn create(&self, env: &Env, spec: NewScimConnection<'_>) -> Result<(), StoreError> {
         let NewScimConnection {
             id,
@@ -74777,7 +74791,7 @@ impl ActingScimConnectionRepo<'_> {
         .await
     }
 
-    /// Revoke a connection by its handle, auditing `scim.connection_revoked`.
+    /// Revoke a connection by its handle, auditing `scim_connection.revoked`.
     ///
     /// Returns whether a live row was revoked.
     ///
@@ -74785,7 +74799,7 @@ impl ActingScimConnectionRepo<'_> {
     /// handle is `NotFound`; an already-revoked one commits and audits NOTHING; only a live row
     /// revoked writes the audit row. The first version wrapped the UPDATE in `write_audited`
     /// unconditionally, so revoking a handle that was never created still wrote a
-    /// `scim.connection_revoked` row naming a connection that did not exist -- which is the
+    /// `scim_connection.revoked` row naming a connection that did not exist -- which is the
     /// opposite of the "revocation is observable" property this table's design rests on. This
     /// is `ApiKeyRepo::revoke`'s shape, for the same reason it has it.
     ///

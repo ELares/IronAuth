@@ -17,9 +17,12 @@
 --
 --   1. THE PLAINTEXT TOKEN IS NEVER STORED. `token_digest` holds the SHA-256 of the whole
 --      presented token and is the lookup key, exactly as `api_keys` (0123) and
---      `opaque_access_tokens` (0012) do it. The plaintext exists for the duration of the
---      creation response and nowhere else, which makes "shown once" a property of the schema
---      rather than a promise about a handler.
+--      `opaque_access_tokens` (0012) do it.
+--
+--      What the schema establishes is NARROWER than "shown once", and worth stating exactly:
+--      the digest is the only stored form, so no read of this table can yield a usable
+--      credential. Whether a handler returns the plaintext once, twice, or writes it to a log
+--      is a property of that handler, and no such handler exists yet.
 --
 --   2. `id` is a NON-SECRET handle (an `scim_` scoped id). Every management operation, every
 --      audit row and every provisioning event names this, never the digest and never the
@@ -73,10 +76,12 @@ CREATE TABLE scim_connections (
 
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
-    -- The organization must exist. Organization ids are globally unique, so an id-only key is
-    -- sufficient, exactly as `agents` (0176) and `org_memberships` do it. This is the backstop
-    -- that makes a connection into a nonexistent or cross-scope organization impossible even
-    -- though the handler resolves the organization up front.
+    -- The organization must EXIST. That is all this key does, and the distinction matters
+    -- enough to spell out: referential integrity checks BYPASS row-level security, so an
+    -- id-only key admits any globally existing organization, another tenant's included. What
+    -- refuses a cross-scope one is the repository, which takes a scope-checked
+    -- `OrganizationId`. A composite key would say it here too, but `organizations` carries no
+    -- `UNIQUE (id, tenant_id, environment_id)` to reference.
     FOREIGN KEY (organization_id) REFERENCES organizations (id)
 );
 
@@ -135,8 +140,8 @@ GRANT SELECT ON scim_connections TO ironauth_app;
 
 COMMENT ON TABLE scim_connections IS
     'Issue #135: one inbound SCIM connection, scoped to exactly ONE organization. The bearer '
-    'token is stored only as a SHA-256 digest; the plaintext is returned once at creation and '
-    'is recoverable from nothing.';
+    'token is stored only as a SHA-256 digest, so no read of this table yields a usable '
+    'credential.';
 COMMENT ON COLUMN scim_connections.organization_id IS
     'Issue #135: THE boundary. A token for one organization is unusable against another by '
     'construction, because the organization is a property of the credential rather than a '

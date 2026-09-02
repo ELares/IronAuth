@@ -452,3 +452,222 @@ async fn revoking_a_handle_that_names_nothing_is_not_found() {
         "a handle naming no connection is NotFound rather than a silent no-op: {outcome:?}"
     );
 }
+
+/// Run one statement as `ironauth_control` with this scope's RLS settings bound.
+///
+/// The suite otherwise goes through the repository, which is the right level for behaviour --
+/// but the grant and the policy are enforced by POSTGRES, and a repository that never attempts
+/// a forbidden write cannot tell whether they are there. A reviewer proved that: reverting the
+/// column-scoped grant to a whole-table one, and deleting the one-way revocation policy
+/// outright, both left the whole suite green.
+async fn as_control(db: &TestDatabase, scope: Scope, sql: &str) -> Result<u64, sqlx::Error> {
+    let mut tx = db.control_pool().begin().await?;
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(scope.tenant().to_string())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+    let affected = sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(affected)
+}
+
+#[tokio::test]
+async fn the_control_role_may_revoke_and_may_change_nothing_else() {
+    // THE GRANT AND THE POLICY, driven rather than read. Without both, the role that creates
+    // connections can re-point the boundary at another organization, swap the verifier for one
+    // it chose, or restore a credential an operator has just killed.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let other = seed_org(&db, &env, scope, "Initech").await;
+    let id = connect(&db, &env, scope, &org, "scim_tok_grant").await;
+
+    // Each forbidden column, one statement each. `42501` is "permission denied for table",
+    // which is the column-scoped GRANT refusing before any policy runs.
+    for (column, value) in [
+        ("organization_id", format!("'{other}'")),
+        ("token_digest", format!("'{}'", digest("attacker-chosen"))),
+        ("display_name", "'renamed'".to_owned()),
+        ("expires_at", "now()".to_owned()),
+    ] {
+        let outcome = as_control(
+            &db,
+            scope,
+            &format!("UPDATE scim_connections SET {column} = {value} WHERE id = '{id}'"),
+        )
+        .await;
+        let error = outcome.expect_err(&format!("{column} must not be updatable"));
+        assert!(
+            error.to_string().contains("permission denied"),
+            "{column} is refused by the column grant, not by something else: {error}"
+        );
+    }
+
+    // Revocation IS permitted, so the refusals above are the narrowing rather than a role that
+    // can do nothing.
+    let affected = as_control(
+        &db,
+        scope,
+        &format!("UPDATE scim_connections SET revoked_at = now() WHERE id = '{id}'"),
+    )
+    .await
+    .expect("revocation is the one permitted update");
+    assert_eq!(affected, 1);
+
+    // And it is ONE WAY. The grant cannot express this, because `revoked_at` is exactly the
+    // column a revoke must write; the RESTRICTIVE policy is what does.
+    let affected = as_control(
+        &db,
+        scope,
+        &format!("UPDATE scim_connections SET revoked_at = NULL WHERE id = '{id}'"),
+    )
+    .await
+    .expect("an un-revocation is filtered, not errored");
+    assert_eq!(
+        affected, 0,
+        "the one-way policy leaves an un-revocation matching no row"
+    );
+
+    // The connection is still revoked, so nothing above quietly restored it.
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_grant"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn only_a_real_revocation_writes_an_audit_row() {
+    // The three outcomes, COUNTED. `revoke`'s doc says an already-revoked connection "commits
+    // and audits nothing", and a reviewer showed that sentence was unmeasured: adding an audit
+    // write to that branch left the suite green.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &org, "scim_tok_audit").await;
+
+    let count = |action: &'static str| {
+        let db = &db;
+        async move {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM audit_log /* query-audit-allow: owner test read */ \
+                 WHERE action = $1",
+            )
+            .bind(action)
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("count audit rows");
+            count
+        }
+    };
+
+    // The CREATE row carries the organization in its detail, which is the only thing about a
+    // connection that decides what it may provision.
+    assert_eq!(count("scim_connection.created").await, 1);
+    let (detail,): (Option<String>,) = sqlx::query_as(
+        "SELECT detail FROM audit_log /* query-audit-allow: owner test read */ \
+         WHERE action = 'scim_connection.created'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the create row");
+    assert_eq!(
+        detail.as_deref(),
+        Some(org.to_string().as_str()),
+        "the created row names the organization"
+    );
+
+    assert_eq!(
+        count("scim_connection.revoked").await,
+        0,
+        "nothing revoked yet"
+    );
+
+    let acting = || {
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .scim_connections()
+    };
+
+    acting()
+        .revoke(&env, &id, now_micros(&env))
+        .await
+        .expect("the real revocation");
+    assert_eq!(count("scim_connection.revoked").await, 1);
+
+    // Twice more, both no-ops. The count must not move.
+    for _ in 0..2 {
+        assert!(
+            !acting()
+                .revoke(&env, &id, now_micros(&env))
+                .await
+                .expect("a re-revocation is not an error")
+        );
+    }
+    assert_eq!(
+        count("scim_connection.revoked").await,
+        1,
+        "an already-revoked connection commits and audits NOTHING"
+    );
+
+    // And a handle naming no connection writes none either.
+    let never = ScimConnectionId::generate(&env, &scope);
+    let outcome = acting().revoke(&env, &never, now_micros(&env)).await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+    assert_eq!(count("scim_connection.revoked").await, 1);
+}
+
+#[tokio::test]
+async fn a_credential_does_not_outlive_the_organization_it_provisions_into() {
+    // A reviewer found this: the token could not reach ANOTHER organization, but deleting its
+    // own did not stop it provisioning, and the listing went on reporting it healthy. So an
+    // operator who deleted an organization was not told that provisioning into it continued.
+    // `ApiKeyRepo::verify`, the credential this table copies in three other respects, has
+    // carried the liveness join all along.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Doomed").await;
+    connect(&db, &env, scope, &org, "scim_tok_orphan").await;
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_orphan"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "live while the organization is"
+    );
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .delete(&env, &org)
+        .await
+        .expect("soft delete the organization");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_orphan"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_none(),
+        "a deleted organization takes its provisioning credentials with it"
+    );
+}
