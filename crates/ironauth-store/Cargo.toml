@@ -975,3 +975,10 @@ required-features = ["testing"]
 name = "message_send"
 path = "tests/message_send.rs"
 required-features = ["testing"]
+
+# INBOUND SCIM CONNECTIONS (issue #135): that the organization comes off the CREDENTIAL rather
+# than the request, which is the CVE-2026-32130 class stated as a schema property. Needs a
+# database.
+[[test]]
+name = "scim_connections"
+path = "tests/scim_connections.rs"

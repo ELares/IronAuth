@@ -227,6 +227,10 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     "permission",
     "project_grant",
     "role",
+    // An inbound SCIM connection (issue #135) is a CREDENTIAL that grants provisioning rights
+    // over one organization, so creating or revoking one changes who may do what -- the same
+    // reason `api_key` is on this list rather than the entity-management one.
+    "scim",
     "scope",
     "admin",
     "credential_class",

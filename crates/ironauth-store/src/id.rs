@@ -1217,6 +1217,17 @@ impl ScopedKind for AgentVaultApprovalKind {
     const PREFIX: &'static str = "ava";
 }
 
+/// Marker for an inbound SCIM connection (`scim_`, issue #135).
+///
+/// The non-secret HANDLE of the connection, never its bearer token. Every management
+/// operation, audit row and provisioning event names this; the token is stored only as a
+/// digest and appears in no identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScimConnectionKind;
+impl ScopedKind for ScimConnectionKind {
+    const PREFIX: &'static str = "scim";
+}
+
 /// Marker for a Native SSO device secret (`nsd_`, issue #133, PROTOTYPE).
 ///
 /// The identifier of the ROW, never the secret. The secret itself is high-entropy, returned
@@ -2066,6 +2077,9 @@ pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
 pub type AgentVaultConnectionId = ScopedId<AgentVaultConnectionKind>;
 /// An out-of-band approval identifier (`ava_...`) for a sensitive agent action (issue #132).
 pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
+/// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
+/// bearer token.
+pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
 /// A Native SSO device secret row identifier (`nsd_...`), issue #133. The row, never the
 /// secret: the secret is stored only as a digest.
 pub type NativeSsoDeviceSecretId = ScopedId<NativeSsoDeviceSecretKind>;
