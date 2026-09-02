@@ -104,12 +104,21 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 ///
 /// This used to say "no handler here produces a 413, so a 413 is always the body-limit
 /// layer's", and mounting `/Bulk` falsified it in the same commit that mounted it: RFC 7644
-/// section 3.7.3 answers 413 when a batch exceeds `maxOperations` or `maxPayloadSize`, and
-/// that refusal NAMES the advertised limit so a client can resize. This layer rewrote it into
-/// the generic body-size message, so the number the whole advertised-equals-enforced argument
-/// rests on never reached the client. It was caught by a mutation: deleting the
-/// operations-count check left `the_advertised_limits_are_the_enforced_ones_over_the_real_route`
-/// green, because the assertion could not see which limit had answered.
+/// section 3.7.3 answers 413 when a batch exceeds `maxOperations`, and that refusal NAMES the
+/// advertised limit so a client can resize. This layer rewrote it into the generic body-size
+/// message, so the number the whole advertised-equals-enforced argument rests on never reached
+/// the client. It was caught by a mutation: deleting the operations-count check left
+/// `the_advertised_limits_are_the_enforced_ones_over_the_real_route` green, because the
+/// assertion could not see which limit had answered.
+///
+/// `maxPayloadSize` is deliberately NOT named above. At the shipped defaults it is EQUAL to
+/// [`MAX_REQUEST_BYTES`] -- `the_two_payload_bounds_agree` pins that equality -- so this
+/// layer's own refusal fires first and `validate_bulk`'s payload branch is unreachable. A
+/// review measured it: a 1 048 666-byte batch answers the generic body-size message, not the
+/// bulk-specific one. That is the correct answer (the body genuinely exceeded what this
+/// server accepts) and it is stated here rather than left as a claim that the bulk message
+/// appears. The branch is live only where an operator configures `max_payload_bytes` BELOW
+/// the request bound, which `the_advertised_limits_...` drives.
 ///
 /// So a 413 that is ALREADY a SCIM document is left alone. The layer exists for the framework's
 /// `text/plain` rejection, and that is the only thing it now rewrites.
@@ -326,6 +335,9 @@ pub fn scim_router(state: ScimState) -> Router {
 /// by the presence of `Operations` in the response, not by a status the client has to
 /// disambiguate. A batch REFUSED before any operation ran (over a limit, malformed envelope,
 /// no credential) answers with a SCIM error and no `Operations` at all.
+/// The URN a bulk request must declare (RFC 7644 section 3.7).
+const BULK_REQUEST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:BulkRequest";
+
 pub(crate) async fn bulk(
     State(state): State<ScimState>,
     headers: HeaderMap,
@@ -346,6 +358,30 @@ pub(crate) async fn bulk(
             "the request body is not a SCIM bulk request",
         );
     };
+    // THE ENVELOPE IS CHECKED, exactly as `patch_user` checks the PatchOp URN. Both fields are
+    // `#[serde(default)]`, so `{}` and a batch whose `Operations` key is misspelled both
+    // parsed into an empty request and answered `200` with an empty `Operations` array. This
+    // handler's own doc says the presence of `Operations` is how a client distinguishes a
+    // batch that RAN from one that was refused, so answering that to a typo made the stated
+    // discriminator not discriminate.
+    if !request
+        .schemas
+        .iter()
+        .any(|urn| urn.eq_ignore_ascii_case(BULK_REQUEST_SCHEMA))
+    {
+        return scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "a BulkRequest must declare the BulkRequest schema URN",
+        );
+    }
+    if request.operations.is_empty() {
+        return scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "a BulkRequest must carry at least one operation",
+        );
+    }
 
     // MEASURED ON THE BODY THIS HANDLER RECEIVED, in bytes, not on a count of operations or a
     // re-serialization. `body.len()` is the number of bytes that crossed the wire into this
@@ -372,7 +408,23 @@ pub(crate) async fn bulk(
     // server stops processing. Operations already done keep their results; the ones never
     // attempted are simply absent, which is what the RFC specifies and is why a client reads
     // the results rather than assuming its batch ran to the end.
-    let fail_on_errors = request.fail_on_errors;
+    //
+    // ZERO IS NOT A BUDGET OF ZERO. The check below sits at the TOP of the loop, so a literal
+    // `0` broke before the first operation: a review measured `{"failOnErrors":0}` with two
+    // valid creates answering `200 OK` with an empty `Operations` array and nothing
+    // provisioned, while the client that sent it meant "abort on the first error". A batch
+    // that ran nothing and reported success is the worst answer available.
+    //
+    // The RFC calls it "the number of errors that the service provider will accept before the
+    // operation is terminated", and every provisioning client that sends `1` means "stop at
+    // the first error" -- which is what `failures >= budget` gives. `0` is the degenerate
+    // reading of the same sentence and means the same thing a client could possibly want:
+    // tolerate no errors, so the first one stops the batch. It cannot mean "attempt nothing",
+    // because a client that wanted nothing attempted would not have sent operations.
+    //
+    // So the floor is one, and the comparison stays `>=`. Asking what degenerate input
+    // satisfies a bound is the habit this repo keeps needing: zero, empty, missing.
+    let fail_on_errors = request.fail_on_errors.map(|budget| budget.max(1));
     let mut failures = 0_usize;
     let mut results = Vec::with_capacity(outcomes.len());
     // ZIPPED WITH THE OPERATIONS THEY CAME FROM. `validate_bulk` maps over the operations in

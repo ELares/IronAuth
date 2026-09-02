@@ -58,10 +58,21 @@ impl Default for BulkLimits {
 }
 
 /// One operation in a bulk request.
+///
+/// EVERY FIELD IS OPTIONAL AT THE SERDE LAYER, and that is the point rather than laxity. They
+/// were required, so one operation with a missing `method` or a non-string `path` failed the
+/// whole envelope parse: a review measured a two-operation batch where the first named no
+/// method answering `400 the request body is not a SCIM bulk request`, with the valid sibling
+/// never run and nothing saying which operation was bad. That is exactly the retry-all-fifty
+/// outcome this module's own header opens by condemning, and the header claimed the opposite.
+///
+/// Shape problems are now per-OPERATION refusals like every other one, so a bad operation
+/// costs its own slot and nothing else.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BulkOperation {
-    /// `POST`, `PUT`, `PATCH` or `DELETE`.
-    pub method: String,
+    /// `POST`, `PUT`, `PATCH` or `DELETE`. Absent is refused as this operation's own 400.
+    #[serde(default)]
+    pub method: Option<String>,
     /// The resource path this operation addresses.
     #[serde(default)]
     pub path: Option<String>,
@@ -82,6 +93,15 @@ pub struct BulkOperation {
 /// A bulk request envelope.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BulkRequest {
+    /// The declared schema URNs.
+    ///
+    /// CHECKED, like `patch_user` checks the `PatchOp` URN. Without it a body of `{}` and a body
+    /// with `"Operatons"` misspelled both parsed into an empty batch and answered `200` with an
+    /// empty `Operations` array -- which this handler's own doc says is how a client tells a
+    /// batch that RAN from one that was refused. Two doors in one crate answered the same
+    /// question two ways.
+    #[serde(default)]
+    pub schemas: Vec<String>,
     /// The operations, in order.
     #[serde(rename = "Operations", default)]
     pub operations: Vec<BulkOperation>,
@@ -109,8 +129,15 @@ pub struct BulkOperationResult {
     pub detail: Option<String>,
     /// The created or addressed resource's location (RFC 7644 section 3.7.3).
     ///
-    /// Present for a successful operation that addressed or created a resource, so a client
-    /// can resolve its `bulkId` to a real id without a second request.
+    /// Present when the handler's own response carried the resource, which is what lets a
+    /// client resolve its `bulkId` to a real id without a second request.
+    ///
+    /// ABSENT ON A SUCCESSFUL DELETE, and that is worth stating because the RFC's own example
+    /// carries one there. It is read out of the handler's response document rather than built
+    /// from the path this module parsed -- a create is the case that matters, since the client
+    /// does not know the id it is about to get -- and a 204 has no document. Reporting a
+    /// location assembled from the request path instead would be this module asserting where a
+    /// resource is rather than reading where the handler put it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     /// The operation's own response body, for a FAILED operation.
@@ -136,6 +163,19 @@ pub enum BulkError {
         /// The advertised limit.
         limit: usize,
     },
+}
+
+/// The SCIM error document a per-operation refusal carries.
+///
+/// The same shape `crate::server::scim_error` renders, built here because this module has no
+/// `Response` to read back and the two must agree on what a client parses.
+fn scim_error_document(detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+        "scimType": "invalidValue",
+        "detail": detail,
+        "status": "400",
+    })
 }
 
 /// What one operation is, once its limits and path have been checked.
@@ -197,7 +237,11 @@ pub fn validate_bulk(
         .operations
         .iter()
         .map(|operation| {
-            let method = operation.method.to_ascii_uppercase();
+            let method = operation
+                .method
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
             let refuse = |detail: &str| {
                 BulkOutcome::Refused(BulkOperationResult {
                     bulk_id: operation.bulk_id.clone(),
@@ -205,9 +249,19 @@ pub fn validate_bulk(
                     status: "400".to_owned(),
                     detail: Some(detail.to_owned()),
                     location: None,
-                    response: None,
+                    // THE SAME SCIM ERROR DOCUMENT a dispatched failure carries, and in the
+                    // same field. RFC 7644 section 3.7.3 defines `response` for the operation
+                    // body and defines no operation-level `detail`, so a client written to the
+                    // RFC read nothing at all for the refusals most likely to happen -- a bad
+                    // path, an unsupported method, a bulkId reference. `detail` stays because
+                    // it is what this server already emitted and dropping it would be a
+                    // gratuitous break; `response` is what the spec-following client reads.
+                    response: Some(scim_error_document(detail)),
                 })
             };
+            if operation.method.is_none() {
+                return refuse("the operation names no method");
+            }
             if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
                 return refuse("unsupported bulk method");
             }

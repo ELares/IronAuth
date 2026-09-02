@@ -127,9 +127,23 @@ pub fn parse_resource_path(raw: &str) -> Result<ResourceRef, PathError> {
     if trimmed.is_empty() {
         return Err(PathError::Empty);
     }
-    // A trailing slash names the collection, so it is allowed and dropped; two trailing
-    // slashes are an empty segment and are not.
-    let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    // A trailing slash names the COLLECTION, so `/Users/` is allowed and the slash dropped;
+    // two trailing slashes are an empty segment and are not.
+    //
+    // ONLY ON THE COLLECTION FORM. It used to be dropped unconditionally, which made
+    // `/Users/{id}/` an item path here while axum's router refuses it -- so an operation
+    // inside a batch was routed by a laxer reading than the same request sent alone. A review
+    // measured it: `GET /scim/v2/Users/{id}/` as a single request answers 404, and
+    // `{"method":"PATCH","path":"/Users/{id}/"}` inside a batch APPLIED the patch. Not
+    // exploitable across organizations -- the id was unchanged and the membership fence still
+    // held -- but it is a surviving second interpretation of a path, which is the one property
+    // this module claims to have eliminated.
+    let trimmed = match trimmed.strip_suffix('/') {
+        Some(without) if !without.contains('/') => without,
+        // `/Users/{id}/` -- an ITEM path with a trailing slash, which axum's router refuses.
+        Some(_) => return Err(PathError::IllegalSegment),
+        None => trimmed,
+    };
 
     let mut segments = trimmed.split('/');
     let Some(type_segment) = segments.next() else {

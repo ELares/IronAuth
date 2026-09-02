@@ -69,6 +69,7 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret
                 token_digest: &digest_of(&token),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await
         .expect("create connection");
@@ -698,4 +699,322 @@ async fn a_method_the_path_does_not_offer_is_that_operations_405_rather_than_the
         Some("201"),
         "the legal operation beside them still ran: {body}"
     );
+}
+
+/// `failOnErrors: 0` runs the batch and stops at the first failure; it does not run nothing.
+///
+/// The budget check sits at the top of the loop, so a literal `0` broke before the first
+/// operation: a review measured `{"failOnErrors":0}` with two valid creates answering
+/// `200 OK` with an empty `Operations` array and nothing provisioned, while the client that
+/// sent it meant "tolerate no errors". A batch that ran nothing and reported success is the
+/// worst answer available, and it is the bound-satisfied-by-zero shape -- ask what degenerate
+/// input satisfies a check.
+#[tokio::test]
+async fn fail_on_errors_zero_still_runs_the_batch_and_stops_at_the_first_failure() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    // ALL VALID: a budget of zero must not stop a batch that never fails.
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "failOnErrors": 0,
+            "Operations": [
+                {"method": "POST", "path": "/Users", "bulkId": "a", "data": user("a@example.com")},
+                {"method": "POST", "path": "/Users", "bulkId": "b", "data": user("b@example.com")},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        operations(&body).len(),
+        2,
+        "failOnErrors: 0 ran no operations at all: {body}"
+    );
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(2),
+        "a batch that reported two creates provisioned none: {listed}"
+    );
+
+    // AND IT STILL STOPS AT THE FIRST FAILURE, which is what the client asking for zero
+    // tolerance wanted. Without this half the fix above would have turned the field off.
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "failOnErrors": 0,
+            "Operations": [
+                {"method": "POST", "path": "/Users", "bulkId": "bad", "data": {"nonsense": 1}},
+                {"method": "POST", "path": "/Users", "bulkId": "never", "data": user("n@example.com")},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        operations(&body).len(),
+        1,
+        "a zero budget must stop at the first failure: {body}"
+    );
+}
+
+/// A path inside a batch is read no more permissively than the router reads the same one.
+///
+/// `parse_resource_path` stripped one trailing slash unconditionally so the collection form
+/// `/Groups/` would work. That made `/Users/{id}/` an item path HERE while axum's router
+/// refuses it, so an operation inside a batch was routed by a laxer reading than the same
+/// request sent alone -- measured: `GET /scim/v2/Users/{id}/` alone answered 404, and
+/// `{"method":"PATCH","path":"/Users/{id}/"}` inside a batch APPLIED the patch.
+///
+/// Not exploitable across organizations -- the id was unchanged and the membership fence still
+/// held -- but it is a surviving second interpretation of a path, which is the one property
+/// this module claims to have eliminated.
+///
+/// Both directions: the collection form must still work, or the fix has broken what the strip
+/// existed for.
+#[tokio::test]
+async fn a_trailing_slash_is_read_the_same_way_inside_a_batch_as_the_router_reads_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(user("slash@example.com")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // THE ROUTER'S ANSWER to the item path with a trailing slash, measured rather than assumed.
+    let (single, _) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{id}/"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        single,
+        StatusCode::NOT_FOUND,
+        "the premise of this test is that the router refuses an item path with a trailing \
+         slash; if that changed, the batch's answer should change with it"
+    );
+
+    // The BATCH must not be more permissive.
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"method": "PATCH", "path": format!("/Users/{id}/"), "bulkId": "slash",
+                 "data": {"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                          "Operations": [{"op": "replace", "path": "active", "value": false}]}},
+                // The COLLECTION form, which the strip existed for and must still work.
+                {"method": "POST", "path": "/Groups/", "bulkId": "collection",
+                 "data": {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                          "displayName": "Engineering"}},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = operations(&body);
+    assert_eq!(
+        results[0]["status"].as_str(),
+        Some("400"),
+        "an item path with a trailing slash must be refused inside a batch too: {body}"
+    );
+    assert_eq!(
+        results[1]["status"].as_str(),
+        Some("201"),
+        "the COLLECTION form must still work, or the fix broke what the strip was for: {body}"
+    );
+
+    // And the patch did not apply.
+    let (_, after) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{id}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&after).expect("json")["active"].as_bool(),
+        Some(true),
+        "the refused operation deactivated the user anyway: {after}"
+    );
+}
+
+/// A malformed envelope is REFUSED, not answered `200` with an empty `Operations` array.
+///
+/// `schemas` and `Operations` are both `#[serde(default)]`, so `{}` and a batch whose
+/// `Operations` key is misspelled both parsed into an empty request. The handler's own doc says
+/// the presence of `Operations` in the response is how a client tells a batch that RAN from one
+/// that was refused, so answering `200 {"Operations":[]}` to a typo made the stated
+/// discriminator not discriminate. `patch_user` in this same crate already checked its URN and
+/// refused an empty operation list; two doors, two rules.
+#[tokio::test]
+async fn a_malformed_bulk_envelope_is_refused_rather_than_answered_as_an_empty_batch() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    for (label, envelope) in [
+        ("an empty object", json!({})),
+        (
+            "a misspelled Operations key",
+            json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+                "Operatons": [{"method": "POST", "path": "/Users"}],
+            }),
+        ),
+        (
+            "no schema URN",
+            json!({"Operations": [{"method": "POST", "path": "/Users"}]}),
+        ),
+        (
+            "the wrong schema URN",
+            json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [{"method": "POST", "path": "/Users"}],
+            }),
+        ),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Bulk",
+            Some(&acme.token),
+            Some(envelope),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} was answered as a batch rather than refused: {body}"
+        );
+        assert!(
+            body.contains("urn:ietf:params:scim:api:messages:2.0:Error"),
+            "{label}: the refusal is a SCIM document: {body}"
+        );
+        assert!(
+            !body.contains("\"Operations\""),
+            "{label}: a REFUSED batch must not carry Operations, which is the discriminator \
+             this handler documents: {body}"
+        );
+    }
+}
+
+/// One operation with a broken SHAPE costs its own slot, not the whole batch.
+///
+/// `method` was a required `String`, so an operation that named none failed the ENVELOPE parse
+/// and took every valid sibling with it: a review measured a two-operation batch answering
+/// `400 the request body is not a SCIM bulk request`, with the valid create never run and
+/// nothing saying which operation was bad. That is the retry-all-fifty outcome this module's
+/// header opens by condemning, while the header claimed the opposite.
+///
+/// The refusal also carries a `response`, because RFC 7644 section 3.7.3 defines that field for
+/// the operation body and defines no operation-level `detail`: a client written to the RFC read
+/// nothing at all for the refusals most likely to happen.
+#[tokio::test]
+async fn a_broken_operation_shape_refuses_that_operation_rather_than_the_batch() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"path": "/Users", "bulkId": "no-method"},
+                {"method": "POST", "path": "/Users", "bulkId": "fine", "data": user("f@example.com")},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = operations(&body);
+    assert_eq!(results.len(), 2, "{body}");
+    assert_eq!(results[0]["status"].as_str(), Some("400"), "{body}");
+    assert_eq!(
+        results[1]["status"].as_str(),
+        Some("201"),
+        "the valid sibling of a malformed operation still ran: {body}"
+    );
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(1),
+        "{listed}"
+    );
+
+    // EVERY failed operation carries a `response`, whether it failed before dispatch or during
+    // it. A client reading the RFC's field must not get nothing for the pre-dispatch half.
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"method": "GET", "path": "/Users", "bulkId": "bad-method"},
+                {"method": "PATCH", "path": "/Users/%2e%2e", "bulkId": "bad-path"},
+                {"method": "PATCH", "path": "/Groups/bulkId:x", "bulkId": "bad-ref"},
+                {"method": "PATCH", "path": "/Users/usr_nobody", "bulkId": "dispatched",
+                 "data": {"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                          "Operations": [{"op": "replace", "path": "active", "value": false}]}},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for result in operations(&body) {
+        assert_eq!(
+            result["response"]["schemas"][0].as_str(),
+            Some("urn:ietf:params:scim:api:messages:2.0:Error"),
+            "every failed operation must carry the RFC's `response` field, including the ones \
+             refused before dispatch: {result}"
+        );
+    }
 }
