@@ -388,6 +388,43 @@ async fn revoke_and_signal(state: &OidcState, scope: Scope, session_id: &Session
             None,
         )
         .await;
+    // SEVER THE NATIVE SSO SET (issue #133, PROTOTYPE).
+    //
+    // Sign-out has to end the app family's ability to bootstrap, or it is not a sign-out: a
+    // device secret left live after a logout mints fresh tokens for the person who just left,
+    // through a sibling app, with no session anywhere to notice. `revoke` above ends the
+    // session, its per-client sessions and its session-bound refresh families; the device
+    // secret hangs off the same session and is the one thing that outlives them.
+    //
+    // Best effort and AFTER the revocation, and the justification is a check that now exists:
+    // `redeem` JOINS `sessions` and requires the session live, so a secret whose sweep failed
+    // is already unredeemable the moment the session above is revoked. This sweep is therefore
+    // an optimisation -- it retires rows eagerly rather than leaving them to expire -- and not
+    // the control. An earlier version of this comment claimed that backstop before it was
+    // built, which is exactly the wrong order to write a justification in.
+    if state.native_sso_enabled() {
+        match state
+            .store()
+            .scoped(scope)
+            .native_sso_device_secrets()
+            .revoke_session_set(
+                &session_id.to_string(),
+                crate::util::epoch_micros(state.now()),
+            )
+            .await
+        {
+            Ok(severed) if severed > 0 => {
+                tracing::info!(
+                    severed,
+                    "native SSO device secrets revoked with the session"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not sever the native SSO set on logout");
+            }
+        }
+    }
     match outcome {
         Ok(revocation) if revocation.session_flipped => {
             state

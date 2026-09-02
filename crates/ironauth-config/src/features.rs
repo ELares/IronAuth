@@ -101,6 +101,20 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the Native SSO prototype (issue #133, exploratory bet 1).
+///
+/// ONE flag for both halves, because arming either alone is useless or unsafe. Issuance without
+/// redemption hands out a secret nothing accepts; redemption without issuance relaxes the
+/// exchange's ID-token refusal while no ID token carries the `ds_hash` that makes the
+/// relaxation safe.
+pub const NATIVE_SSO_FEATURE: &str = "native-sso";
+
+/// The experimental `ack` version for Native SSO (issue #133).
+///
+/// The Implementer's Draft revision itself, so a new draft invalidates every acknowledgment in
+/// the wild rather than silently changing what a device secret means.
+pub const NATIVE_SSO_VERSION: &str = "openid-connect-native-sso-1_0-ID2";
+
 /// The registry name of the identity-chaining / ID-JAG receiving side (issue #133,
 /// exploratory bet 3).
 ///
@@ -361,6 +375,25 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Registers the Native SSO prototype (issue #133, PROTOTYPE).
+    pub fn register_native_sso(&mut self) {
+        self.register(Feature::experimental(
+            NATIVE_SSO_FEATURE,
+            "Native SSO for mobile apps (issue #133, OpenID Connect Native SSO 1.0 ID2): a \
+             vendor's apps on one device share a sign-in without a shared browser session. A \
+             code exchange granted the `device_sso` scope returns a DEVICE SECRET beside its \
+             tokens and stamps that secret's ds_hash on the ID token; a sibling app presents \
+             the pair through RFC 8693 and receives its own tokens for the same person. \
+             PROTOTYPE: an Implementer's Draft, the device secret is a BEARER credential (the \
+             draft's DPoP-binding question is open and unresolved here), nothing binds it to \
+             the device beyond its name, and it is the ONLY reason this deployment will accept \
+             an ID token as a token-exchange subject at all -- so the pair, never either half, \
+             is what the exchange admits.",
+            NATIVE_SSO_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     /// Registers the identity-chaining / ID-JAG receiving side (issue #133, PROTOTYPE).
     pub fn register_identity_chaining(&mut self) {
         self.register(Feature::experimental(
@@ -455,6 +488,7 @@ impl FeatureRegistry {
         registry.register_authzen_agent_profile();
         registry.register_transaction_tokens();
         registry.register_identity_chaining();
+        registry.register_native_sso();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();

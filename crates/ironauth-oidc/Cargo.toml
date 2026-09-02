@@ -1509,3 +1509,17 @@ path = "tests/transaction_tokens.rs"
 [[test]]
 name = "identity_chaining"
 path = "tests/identity_chaining.rs"
+
+# NATIVE SSO (issue #133): the ds_hash binding between an ID token and the device secret it was
+# issued beside, which is the ONLY reason the exchange may accept an ID token as a subject token
+# at all. Drives the binding directly; needs no database.
+[[test]]
+name = "native_sso"
+path = "tests/native_sso.rs"
+
+# NATIVE SSO end to end (issue #133): that the endpoints reach the binding, that an unarmed
+# deployment issues no secret and no ds_hash, and that neither half of the pair works alone.
+# Needs a database.
+[[test]]
+name = "native_sso_flow"
+path = "tests/native_sso_flow.rs"

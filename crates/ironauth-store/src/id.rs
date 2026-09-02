@@ -1217,6 +1217,17 @@ impl ScopedKind for AgentVaultApprovalKind {
     const PREFIX: &'static str = "ava";
 }
 
+/// Marker for a Native SSO device secret (`nsd_`, issue #133, PROTOTYPE).
+///
+/// The identifier of the ROW, never the secret. The secret itself is high-entropy, returned
+/// once, and stored only as a digest; an id that embedded it would put a credential for a whole
+/// app family into every log line that mentions the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NativeSsoDeviceSecretKind;
+impl ScopedKind for NativeSsoDeviceSecretKind {
+    const PREFIX: &'static str = "nsd";
+}
+
 /// Marker for a pushed authorization request (`par_`), a request the PAR endpoint
 /// (RFC 9126, issue #27) stored for later single-use reference from `/authorize`. A
 /// tenant-scoped resource: the identifier embeds its `(tenant, environment)`, so the
@@ -2055,6 +2066,9 @@ pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
 pub type AgentVaultConnectionId = ScopedId<AgentVaultConnectionKind>;
 /// An out-of-band approval identifier (`ava_...`) for a sensitive agent action (issue #132).
 pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
+/// A Native SSO device secret row identifier (`nsd_...`), issue #133. The row, never the
+/// secret: the secret is stored only as a digest.
+pub type NativeSsoDeviceSecretId = ScopedId<NativeSsoDeviceSecretKind>;
 /// A registered external assertion issuer identifier (`xai_...`), a trust anchor
 /// the JWT bearer assertion grant accepts assertions from (issue #26).
 pub type ExternalIssuerId = ScopedId<ExternalIssuerKind>;

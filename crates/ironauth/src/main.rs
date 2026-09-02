@@ -25,7 +25,7 @@ use ironauth_config::{
     ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE,
     AUTHZEN_AGENT_PROFILE_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
     FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, IDENTITY_CHAINING_FEATURE, Loaded,
-    ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
+    NATIVE_SSO_FEATURE, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
     RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, TRANSACTION_TOKENS_FEATURE,
     WASM_HOOKS_FEATURE, WebhooksConfig,
 };
@@ -599,6 +599,9 @@ struct DataPlaneSurfaces {
     /// Whether the identity-chaining / ID-JAG receiving side is armed (issue #133). Off leaves
     /// the jwt-bearer grant behaving exactly as it does without this prototype.
     identity_chaining: bool,
+    /// Whether Native SSO is armed (issue #133). Off leaves every ID token unbound and the
+    /// exchange refusing an ID-token subject, exactly as without this prototype.
+    native_sso: bool,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
     /// The experimental org-scoped-clients surface (issue #103, milestone M10).
@@ -640,6 +643,7 @@ impl DataPlaneSurfaces {
             // set, and the domain is the value the mint needs. One resolution, one place.
             transaction_token_domain: transaction_token_domain(features, config),
             identity_chaining: identity_chaining_armed(features, config),
+            native_sso: native_sso_armed(features, config),
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
@@ -1466,6 +1470,7 @@ async fn build_oidc_plane(
     // Identity chaining / ID-JAG (issue #133, PROTOTYPE). ONE plane: the jwt-bearer grant is a
     // data-plane endpoint. Off leaves that grant behaving exactly as it does on main.
     .with_identity_chaining_enabled(surfaces.identity_chaining)
+    .with_native_sso_enabled(surfaces.native_sso)
     .with_flows_enabled(surfaces.flows)
     .with_hosted_pages_enabled(surfaces.hosted_pages)
     .with_diagnostics(&config.diagnostics)
@@ -1720,6 +1725,16 @@ async fn build_oidc_plane(
 /// an unrelated acknowledgment.
 fn identity_chaining_armed(features: &FeatureRegistry, config: &Config) -> bool {
     features.is_enabled(config, IDENTITY_CHAINING_FEATURE)
+}
+
+/// Whether Native SSO is armed (issue #133, PROTOTYPE).
+///
+/// A named function for the same reason its neighbours are: the boot path that would read it
+/// inline needs a live store, so the wiring -- which flag, which surface -- could not be tested,
+/// and substituting another prototype's constant would arm a live ISSUANCE path off an
+/// unrelated acknowledgment.
+fn native_sso_armed(features: &FeatureRegistry, config: &Config) -> bool {
+    features.is_enabled(config, NATIVE_SSO_FEATURE)
 }
 
 /// The trust domain transaction tokens are minted for, or `None` (issue #133, PROTOTYPE).
@@ -6494,6 +6509,78 @@ mod tests {
         );
         assert!(
             transaction_token_domain(&features, &other).is_none(),
+            "an acknowledgment for a different prototype must not arm this one"
+        );
+    }
+
+    /// Native SSO is armed by ITS OWN acknowledgment and no other (issue #133).
+    ///
+    /// Two assertions for "armed", as its neighbour records: `is_enabled` reads the toggle and
+    /// nothing else, while the acknowledgment is enforced by `validate`, which fails the BOOT.
+    /// Asserting only the arming would leave the ack string decorative.
+    ///
+    /// The last case is the one a default-false implementation cannot satisfy on its own, and
+    /// it matters more here than for a surface that mounts a route: a wrong constant would arm
+    /// an ISSUANCE path off an unrelated acknowledgment, and the visible symptom would be a
+    /// device secret appearing in a token response nobody asked to enable.
+    #[test]
+    fn native_sso_is_armed_by_its_own_acknowledgment() {
+        let features = FeatureRegistry::builtin();
+
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            !native_sso_armed(&features, &bare),
+            "off in a default deployment"
+        );
+
+        let armed = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             native-sso = { enabled = true, ack = \"openid-connect-native-sso-1_0-ID2\" }\n",
+        );
+        assert!(
+            features.validate(&armed).is_ok(),
+            "this exact acknowledgment string is the one the ladder accepts"
+        );
+        assert!(
+            native_sso_armed(&features, &armed),
+            "its own acknowledgment at its own pinned revision arms it"
+        );
+
+        for (case, toml) in [
+            (
+                "missing",
+                "[admin]\nbootstrap_operator_token = \"t\"\n\
+                 [features]\n\
+                 native-sso = { enabled = true }\n",
+            ),
+            (
+                "stale",
+                "[admin]\nbootstrap_operator_token = \"t\"\n\
+                 [features]\n\
+                 native-sso = { enabled = true, ack = \
+                 \"openid-connect-native-sso-1_0-ID1\" }\n",
+            ),
+        ] {
+            let cfg = config(toml);
+            let error = features
+                .validate(&cfg)
+                .expect_err(&format!("a {case} acknowledgment must refuse the boot"));
+            assert!(
+                error.to_string().contains(NATIVE_SSO_FEATURE),
+                "the {case} case must be refused by NAME: {error}"
+            );
+        }
+
+        // A DIFFERENT prototype's acknowledgment must not arm this one.
+        let other = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             transaction-tokens = { enabled = true, ack = \
+             \"draft-ietf-oauth-transaction-tokens-09\" }\n",
+        );
+        assert!(
+            !native_sso_armed(&features, &other),
             "an acknowledgment for a different prototype must not arm this one"
         );
     }

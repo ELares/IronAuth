@@ -1910,8 +1910,8 @@ mod tests {
         // RESERVED_ENRICHMENT_CLAIMS is covered by the mint fold could be removed with
         // nothing red.
         assert_eq!(
-            checked, 57,
-            "the three lists are 29 + 5 + 23; a link was dropped from the chain"
+            checked, 58,
+            "the three lists are 30 + 5 + 23; a link was dropped from the chain"
         );
     }
 
@@ -1942,6 +1942,10 @@ mod tests {
         "cnf",
         "at_hash",
         "c_hash",
+        // Native SSO (issue #133): the ID token's binding to its device secret. A hook that
+        // could set it would bind a token to a secret IT chose and redeem the pair for a
+        // sibling's tokens.
+        "ds_hash",
         "sid",
         "org_id",
         "roles",

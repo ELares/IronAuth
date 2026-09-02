@@ -544,6 +544,10 @@ pub struct OidcState {
     // ordinary bearer assertion from a trusted issuer -- because the prototype only ever ADDS
     // refusals.
     identity_chaining_enabled: bool,
+    // Whether Native SSO is armed (issue #133, PROTOTYPE). Default false, which leaves every ID
+    // token unbound (no `ds_hash`) and the exchange refusing an ID token subject exactly as it
+    // does on main -- so the relaxation is unreachable for every token already issued.
+    native_sso_enabled: bool,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -1075,6 +1079,7 @@ impl OidcState {
             attesters: None,
             transaction_token_domain: None,
             identity_chaining_enabled: false,
+            native_sso_enabled: false,
         }
     }
 
@@ -1169,6 +1174,25 @@ impl OidcState {
     #[must_use]
     pub fn identity_chaining_enabled(&self) -> bool {
         self.identity_chaining_enabled
+    }
+
+    /// Arm Native SSO (issue #133, PROTOTYPE).
+    ///
+    /// Two things turn on together and neither is useful alone: a code exchange granted the
+    /// `device_sso` scope mints a device secret and stamps its `ds_hash` on the ID token, and
+    /// the token exchange will accept that (ID token, device secret) PAIR as a subject. With it
+    /// off -- the default -- no ID token carries `ds_hash` and the exchange refuses an ID token
+    /// subject exactly as it does today, so nothing already issued becomes redeemable.
+    #[must_use]
+    pub fn with_native_sso_enabled(mut self, enabled: bool) -> Self {
+        self.native_sso_enabled = enabled;
+        self
+    }
+
+    /// Whether Native SSO is armed (issue #133).
+    #[must_use]
+    pub fn native_sso_enabled(&self) -> bool {
+        self.native_sso_enabled
     }
 
     /// The trust domain transaction tokens are minted for, if any (issue #133).
@@ -4146,6 +4170,63 @@ impl OidcState {
             return Err(DpopPresentationFailure::Rejected);
         }
         Ok(())
+    }
+
+    /// Verify an ID token THIS environment issued, for the Native SSO exchange (issue #133).
+    ///
+    /// Deliberately not `verify_logout_hint` with a different name, and the difference is the
+    /// whole reason this exists: that one passes `allow_expired(true)`, because a logout hint
+    /// only has to say WHICH session to end and an expired one still says it. Here the ID token
+    /// is being traded for fresh tokens, so an expired one must not work -- otherwise a device
+    /// secret plus any ID token the family ever received would mint indefinitely, and the ID
+    /// token's own lifetime would bound nothing.
+    ///
+    /// `audience` comes from the STORED device-secret row, never from the presented token: the
+    /// caller redeems the secret first and passes the client that secret was issued to. Reading
+    /// the audience out of the token would let the presenter choose which audience its token is
+    /// checked against, which is not a check.
+    ///
+    /// # Errors
+    ///
+    /// `()` when the environment has no keys, or the token does not verify as an ID token this
+    /// environment issued to `audience` and is still live.
+    pub(crate) async fn verify_native_sso_id_token(
+        &self,
+        scope: &Scope,
+        audience: &str,
+        token: &str,
+    ) -> Result<VerifiedToken, ()> {
+        let entry = self.issuer_entry(scope).await.ok_or(())?;
+        let keys = published_verify_keys(&entry, self.now());
+        if keys.is_empty() {
+            return Err(());
+        }
+        let trusted: Vec<TrustedKey> = keys
+            .iter()
+            .filter_map(|key| key.verifying_key().ok())
+            .collect();
+        if trusted.is_empty() {
+            return Err(());
+        }
+        let mut algorithms: Vec<JwsAlgorithm> = Vec::new();
+        for key in &keys {
+            if !algorithms.contains(&key.algorithm()) {
+                algorithms.push(key.algorithm());
+            }
+        }
+        let policy = VerificationPolicy::new(
+            algorithms,
+            trusted,
+            self.issuer_for(scope),
+            audience.to_owned(),
+            // The media type is REQUIRED, exactly as the logout hint requires it and for the
+            // same reason: without it a logout token or an access token verifies here, and both
+            // carry this issuer and an audience. An access token becoming redeemable for a
+            // sibling app's tokens is the sharpest version of that mistake.
+            ExpectedTyp::Required(TokenTyp::IdToken),
+        )
+        .map_err(|_| ())?;
+        verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
 
     /// Verify an RP-Initiated Logout `id_token_hint` (issue #33): an id token THIS OP

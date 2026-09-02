@@ -23,6 +23,13 @@
 //! whether the grant is still live (so a revoked token is dead even while its signature
 //! verifies), and verifies the signature and expiry against the token's own audience.
 //!
+//! ONE EXCEPTION, added by the Native SSO prototype (issue #133): its subject is an ID token
+//! rather than a stored access token, so `revalidate` would refuse it and it is verified
+//! CRYPTOGRAPHICALLY instead -- signature, this issuer, the ID-token media type, unexpired, and
+//! the audience taken from the STORED device-secret row rather than from the token. Its grant
+//! liveness is not re-checked; what stands in for that is the SESSION liveness the redemption
+//! join requires, so a token from an ended sign-in is refused just as a revoked one would be.
+//!
 //! That is a deliberate structural choice rather than a set of checks to remember. There
 //! is no field on this path that is read from an unverified payload, and no branch that
 //! skips a check because an earlier handler is believed to have run one.
@@ -90,6 +97,12 @@ struct ValidatedToken {
     audience: std::collections::BTreeSet<String>,
     /// The `act` chain it already carries, for nesting.
     act: Option<Value>,
+    /// Whether this subject came from a Native SSO redemption (issue #133, PROTOTYPE).
+    ///
+    /// Set ONLY by `native_sso_subject`, after the device secret was redeemed and matched the
+    /// ID token's `ds_hash`. It is what selects `ExchangeMode::NativeSsoBootstrap`, so it is
+    /// the carrier of that authorization and not a hint.
+    native_sso_bootstrap: bool,
 }
 
 /// Split a space-separated OAuth list into a set, dropping empties.
@@ -114,7 +127,15 @@ pub async fn token_exchange_grant(
     resources: &[String],
 ) -> Result<Response, TokenError> {
     // 1. The request has to be COHERENT before anything is authenticated.
-    let subject_token = check_request_shape(&params)?;
+    // The Native SSO verdict is decided HERE, once, and carried. It used to be recomputed
+    // inside `native_sso_subject` from the raw parameters, and the two disagreed: `required()`
+    // TRIMS, so `subject_token_type` with a trailing space was a Native SSO pair to this check
+    // and an ordinary request to that one -- which admitted the ID token past the access-token
+    // rule and then handed it to `revalidated`, the one door this prototype must never open.
+    // A security predicate computed twice from two normalizations of the same input is two
+    // predicates.
+    let (subject_token, native_sso_pair) =
+        check_request_shape(&params, state.native_sso_enabled())?;
 
     // 2-3. Authenticate the client and run the shared grant-restriction seam.
     let (scope, authenticated, client_id) =
@@ -137,11 +158,14 @@ pub async fn token_exchange_grant(
 
     // 5. Revalidate BOTH presented tokens IN FULL. Nothing below reads a field from an
     //    unverified payload; see the module docs for why this is the whole point.
-    let subject = revalidated(state, scope, subject_token).await?;
-    let actor = match params.actor_token.as_deref() {
-        Some(token) => Some(revalidated(state, scope, token).await?),
-        None => None,
-    };
+    //
+    //    NATIVE SSO (issue #133, PROTOTYPE) revalidates a DIFFERENT pair, because its subject is
+    //    an ID token rather than an access token: `revalidated` resolves a stored access token
+    //    and would refuse one. It is still a full verification -- signature, this issuer, the
+    //    ID-token media type, unexpired, and the audience taken from the STORED device-secret
+    //    row rather than from the token -- and nothing below reads an unverified field either.
+    let (subject, actor) =
+        revalidate_both(state, scope, &params, subject_token, native_sso_pair).await?;
 
     // 6. FENCE EVERY principal this exchange would give authority to (issue #52's
     //    invariant, and the mint registry in docs/design/USER-BOUND-MINT-SITES.md).
@@ -172,7 +196,13 @@ pub async fn token_exchange_grant(
     // 7. Derive the mode (see the module docs). Presenting a token that was issued to
     //    another client, without naming yourself as the actor, IS a request to
     //    impersonate, and it is default-denied below.
-    let mode = if actor.is_some() {
+    let mode = if subject.native_sso_bootstrap {
+        // Decided by the REDEMPTION, not derived from the token shapes. By shape a bootstrap is
+        // an impersonation -- another client's token, no actor -- and deriving that would make
+        // the feature require the impersonation flag on every sibling app. What authorized it
+        // is the device secret, already checked against the ID token's `ds_hash`.
+        ExchangeMode::NativeSsoBootstrap
+    } else if actor.is_some() {
         ExchangeMode::Delegation
     } else if subject.client_id.as_deref() == Some(client_id_str.as_str()) {
         ExchangeMode::Downscope
@@ -367,10 +397,45 @@ async fn issue(
             .resolve_access_token_target(&scope, &[], client_id_str)
             .await
             .map_err(|_| TokenError::ServerError)?;
-        inherited.audiences = decision.audience.iter().cloned().collect();
+        // A Native SSO bootstrap KEEPS the resolved default, which is the requesting sibling
+        // as its own audience. Overwriting it with the decision's audience would mint a token
+        // with no `aud` at all, since a bootstrap's decision audience is empty by design.
+        if mode != ExchangeMode::NativeSsoBootstrap {
+            inherited.audiences = decision.audience.iter().cloned().collect();
+        }
         inherited
     } else {
         let targets: Vec<String> = decision.audience.iter().cloned().collect();
+        // A BOOTSTRAP HAS TO PASS THE REQUESTING CLIENT'S OWN RESOURCE ALLOWLIST.
+        //
+        // Every other mode is ceilinged by the subject token: a downscope or a delegation
+        // cannot name an audience the subject lacks, and an impersonation is gated by its
+        // flag. A bootstrap has no subject audience by design -- that is what makes it a first
+        // issuance rather than a narrowing -- so removing that ceiling removed the ONLY one
+        // it had, and `resolve_access_token_target` does not fill the gap: it checks that a
+        // target is a registered resource server, and says in as many words that the CALLER
+        // enforces the per-client allowlist. The ordinary first-issuance doors call
+        // `resources_permitted`; this one did not, so a sibling could mint for a resource its
+        // own allowlist forbids while the same client asking through the front door is refused.
+        //
+        // The ALLOWLIST HALF only. Those doors also enforce `require_resource_indicator`
+        // through `effective_exchange_resources`, and this endpoint never has, for this mode or
+        // any other: a client registered to refuse indicator-less requests still receives a
+        // client-id-audience token from a bootstrap that names no resource. That audience is
+        // the sibling's own id, which no resource server accepts, so it is a parity gap rather
+        // than an escalation -- but it is a gap, and claiming full parity would hide it.
+        if mode == ExchangeMode::NativeSsoBootstrap {
+            let policy = state
+                .store()
+                .scoped(scope)
+                .clients()
+                .resource_policy(ironauth_store::StoredClientId::Registered(&client_id))
+                .await
+                .map_err(|_| TokenError::ServerError)?;
+            if !crate::resource::resources_permitted(&targets, &policy) {
+                return Err(TokenError::InvalidTarget);
+            }
+        }
         state
             .resolve_access_token_target(&scope, &targets, client_id_str)
             .await
@@ -634,13 +699,30 @@ async fn authenticate_for_exchange(
 /// to trade) or a refresh token (already redeemable by its own grant, under its own
 /// rotation policy) from becoming a second, less-guarded path to what the first path
 /// controls.
-fn check_request_shape(params: &TokenParams) -> Result<&str, TokenError> {
+fn check_request_shape(
+    params: &TokenParams,
+    native_sso_armed: bool,
+) -> Result<(&str, bool), TokenError> {
     let subject_token = required(params.subject_token.as_deref(), "subject_token is required")?;
     let subject_type = required(
         params.subject_token_type.as_deref(),
         "subject_token_type is required",
     )?;
-    if subject_type != type_uri::ACCESS_TOKEN {
+    // NATIVE SSO (issue #133, PROTOTYPE) is the ONE relaxation of the rule below, and it is
+    // JOINT. An ID token becomes an acceptable subject only when a device secret is presented
+    // as the actor in the same request, because `ds_hash` binds the two and neither is a
+    // credential alone. Admitting an ID token subject on its own -- for a request that merely
+    // got the actor type wrong, say -- would be exactly the confused-deputy hole the paragraph
+    // below describes, reached through the prototype instead of directly.
+    //
+    // This is the only check in this function that depends on anything other than the caller's
+    // own parameters, and what it depends on is deployment CONFIG rather than stored state: an
+    // unarmed deployment answers precisely as main does. That an armed one answers differently
+    // discloses that the operator turned a documented feature on, which is the same disclosure
+    // every other experimental surface here accepts.
+    let native_sso_pair = native_sso_armed
+        && crate::native_sso::is_native_sso_pair(subject_type, params.actor_token_type.as_deref());
+    if !native_sso_pair && subject_type != type_uri::ACCESS_TOKEN {
         return Err(TokenError::InvalidRequest(
             "subject_token_type must name an access token".to_owned(),
         ));
@@ -657,10 +739,14 @@ fn check_request_shape(params: &TokenParams) -> Result<&str, TokenError> {
         (None, Some(_)) => Err(TokenError::InvalidRequest(
             "actor_token is required with actor_token_type".to_owned(),
         )),
+        // The Native SSO pair carries a DEVICE SECRET as its actor, which is the other half of
+        // the same relaxation. Admitted only together with the ID-token subject above: the two
+        // are checked as one condition, never independently.
+        (Some(_), Some(_)) if native_sso_pair => Ok((subject_token, true)),
         (Some(_), Some(actor_type)) if actor_type != type_uri::ACCESS_TOKEN => Err(
             TokenError::InvalidRequest("actor_token_type must name an access token".to_owned()),
         ),
-        _ => Ok(subject_token),
+        _ => Ok((subject_token, native_sso_pair)),
     }
 }
 
@@ -722,7 +808,161 @@ async fn revalidated(
         scope: space_set(claims.scope.as_deref()),
         audience: claims.aud.into_iter().collect(),
         act: claims.act,
+        // An ordinary access-token subject. Only the Native SSO redemption sets this.
+        native_sso_bootstrap: false,
     })
+}
+
+/// Revalidate the presented tokens, by whichever of the two shapes this request is.
+///
+/// Split out of `token_exchange_grant` only because the two shapes together push it past the
+/// crate's function-length lint. The BRANCH is the interesting part: a Native SSO pair takes the
+/// ID-token path and everything else takes the access-token one, and no request takes both.
+///
+/// # Errors
+///
+/// Whatever the chosen revalidation returns; both answer the uniform `invalid_grant`.
+async fn revalidate_both(
+    state: &OidcState,
+    scope: Scope,
+    params: &TokenParams,
+    subject_token: &str,
+    native_sso_pair: bool,
+) -> Result<(ValidatedToken, Option<ValidatedToken>), TokenError> {
+    if let Some(subject) =
+        native_sso_subject(state, scope, params, subject_token, native_sso_pair).await?
+    {
+        // The device secret IS the actor and it is not an exchangeable token, so there is no
+        // second `ValidatedToken` here. Returning one would put the secret into the `act` chain.
+        return Ok((subject, None));
+    }
+    let subject = revalidated(state, scope, subject_token).await?;
+    let actor = match params.actor_token.as_deref() {
+        Some(token) => Some(revalidated(state, scope, token).await?),
+        None => None,
+    };
+    Ok((subject, actor))
+}
+
+/// Redeem a Native SSO (ID token, device secret) pair into an exchangeable subject (issue #133).
+///
+/// `Ok(None)` when this is not a Native SSO request, which leaves the ordinary path untouched.
+///
+/// # The order is the security argument
+///
+/// The DEVICE SECRET is redeemed first, and everything after it is checked against the row that
+/// redemption returned rather than against the presented token:
+///
+/// 1. the secret's SHA-256 finds a live, unrevoked, unexpired row -- or there is nothing here;
+/// 2. the ID token is verified against the audience THAT ROW names, so the presenter cannot
+///    choose which audience its token is judged against;
+/// 3. `ds_hash` in the verified token must be the hash of the secret actually presented, which
+///    is what makes the two halves one credential rather than two independent bearer tokens;
+/// 4. the token's subject must be the person the row is for.
+///
+/// Reversing 1 and 2 -- reading `aud` out of the token to pick the audience to verify against --
+/// would be a check the caller controls both sides of.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidGrant`], uniformly. Which half of the pair was wrong is exactly what an
+/// attacker probing this endpoint wants to learn, so the refusals are indistinguishable on the
+/// wire; the reason goes to the log.
+async fn native_sso_subject(
+    state: &OidcState,
+    scope: Scope,
+    params: &TokenParams,
+    subject_token: &str,
+    native_sso_pair: bool,
+) -> Result<Option<ValidatedToken>, TokenError> {
+    // The verdict is the one `check_request_shape` reached, PASSED IN rather than recomputed.
+    // See the call site for what recomputing it cost.
+    if !native_sso_pair {
+        return Ok(None);
+    }
+    // From here the request IS a Native SSO attempt, so every exit is a refusal rather than a
+    // fall-through: letting a malformed one drop into the ordinary path would hand an ID token
+    // to `revalidated`, which is the door this prototype must never open by accident.
+    let presented_secret = required(
+        params.actor_token.as_deref(),
+        "actor_token is required with actor_token_type",
+    )?;
+
+    let digest = crate::native_sso::storage_digest(presented_secret);
+    let now_micros = crate::util::epoch_micros(state.now());
+    let record = state
+        .store()
+        .scoped(scope)
+        .native_sso_device_secrets()
+        .redeem(&digest, now_micros)
+        .await
+        .map_err(|_| TokenError::ServerError)?
+        .ok_or(TokenError::InvalidGrant)?;
+
+    let verified = state
+        .verify_native_sso_id_token(&scope, &record.issued_to_client_id, subject_token)
+        .await
+        .map_err(|()| TokenError::InvalidGrant)?;
+
+    crate::native_sso::admit(
+        // The CONSTANTS, not the request's copies of them. The verdict was settled by
+        // `check_request_shape` and passed in; re-deriving it here from the raw parameters is
+        // exactly what let one normalization disagree with another. `admit` still re-checks the
+        // pair so the module stands on its own for any other caller; feeding it the constants
+        // makes that check a tautology at THIS call site, which is the honest shape when the
+        // decision has already been made upstream.
+        crate::native_sso::ID_TOKEN_TOKEN_TYPE,
+        Some(crate::native_sso::DEVICE_SECRET_TOKEN_TYPE),
+        verified
+            .claims()
+            .get(crate::native_sso::DS_HASH_CLAIM)
+            .and_then(Value::as_str),
+        verified.algorithm(),
+        presented_secret,
+    )
+    .map_err(|refusal| {
+        tracing::debug!(?refusal, "a native SSO pair was refused");
+        TokenError::InvalidGrant
+    })?;
+
+    // The person. REDUNDANT BY CONSTRUCTION today and kept deliberately: both sides derive from
+    // the same `bindings.subject` at one mint -- the ROW keeps the local value and the TOKEN
+    // carries the public one -- and `ds_hash` already pins the token to this exact row, so
+    // nothing can currently reach it. Note which side is which: the row is written raw and only
+    // the token goes through `resolve_public_subject`, which is exactly why the comparison
+    // below applies that derivation rather than comparing the two strings directly. It is here against the divergence its own comment describes -- a
+    // per-client pairwise `sub` would make the two differ -- and a reviewer confirmed deleting
+    // it changes no test, which is what "redundant" means rather than a gap in coverage.
+    //
+    // The row records the LOCAL subject and the token carries the PUBLIC one, which
+    // are the same string today and are documented as free to diverge, so the comparison goes
+    // through the same derivation the mint used rather than comparing the two directly.
+    let token_subject = verified
+        .claims()
+        .subject()
+        .ok_or(TokenError::InvalidGrant)?;
+    if token_subject != state.resolve_public_subject(&record.subject) {
+        return Err(TokenError::InvalidGrant);
+    }
+
+    Ok(Some(ValidatedToken {
+        subject: record.subject,
+        // The client the ID token was actually issued to. Recorded truthfully; it does NOT
+        // decide the mode here, because `native_sso_bootstrap` does.
+        client_id: Some(record.issued_to_client_id.clone()),
+        // What the ORIGINAL sign-in was granted, minus `device_sso` itself, so the sibling
+        // narrows from what the person actually authorized and cannot mint a further device
+        // secret from a bootstrap. An empty set here would be refused outright by `decide`
+        // ("nothing to narrow from"), which is what made the first version of this unreachable.
+        scope: crate::native_sso::inheritable_scope(&record.granted_scope),
+        // EMPTY on purpose, and `decide` treats a bootstrap's audience as unconstrained for it.
+        // Seeding app A's audience here made the sibling's token audienced to APP A and made
+        // every target it named an `invalid_target`; the sibling's own audience is resolved
+        // below, the way any other first issuance resolves one.
+        audience: std::collections::BTreeSet::new(),
+        act: None,
+        native_sso_bootstrap: true,
+    }))
 }
 
 /// Everything the transaction-token branch needs from the exchange (issue #133).
@@ -743,7 +983,9 @@ struct TransactionTokenBranch<'a> {
     decision: &'a ironauth_store::token_exchange_decision::ExchangeDecision,
     /// Any target the caller named, which this profile refuses rather than ignores.
     requested_audience: &'a std::collections::BTreeSet<String>,
-    /// Downscope, delegation or impersonation.
+    /// Downscope, delegation, impersonation, or a Native SSO bootstrap. All four reach this
+    /// branch, and `mode_label`'s only caller is here, so the bootstrap arm added for issue
+    /// #133 is reachable ONLY through this struct.
     mode: ExchangeMode,
 }
 
@@ -838,6 +1080,7 @@ fn mode_label(mode: ExchangeMode) -> &'static str {
         ExchangeMode::Downscope => "downscope",
         ExchangeMode::Delegation => "delegation",
         ExchangeMode::Impersonation => "impersonation",
+        ExchangeMode::NativeSsoBootstrap => "native_sso_bootstrap",
     }
 }
 

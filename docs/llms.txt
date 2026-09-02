@@ -30,6 +30,7 @@ both files and fails if either drifts.
 - [Attestation-based client authentication (PROTOTYPE)](docs/experimental/attestation-client-auth.md): A client instance that holds no registered secret authenticates with two JWTs carried in headers:
 - [AuthZEN agent tool profile (PROTOTYPE)](docs/experimental/authzen-agent-profile.md): Answers **may this agent call this tool** for an agent principal, on the AuthZEN PDP IronAuth
 - [Identity chaining and ID-JAG, the receiving side (PROTOTYPE)](docs/experimental/identity-chaining.md): A person signs in to domain A. They then need to reach an API in domain B, and B does not trust A's access tokens -- nor should it, because an access token is a bearer credential minted for A's own...
+- [Native SSO for mobile apps (PROTOTYPE)](docs/experimental/native-sso.md): A vendor ships three apps on one phone. The person signs in to the first, opens the second, and is asked to sign in again.
 - [Transaction tokens (PROTOTYPE)](docs/experimental/transaction-tokens.md): A request enters a trust domain at the edge, authenticated as a person. It then fans out across a dozen internal services, and each hop needs three things the original access token cannot carry tog...
 - [IdP-side FedCM (experimental, issue #83)](docs/fedcm.md): IronAuth ships the IdP side of the W3C
 - [Verifying a signed log stream](docs/log-stream-verification.md): IronAuth can sign every batch it ships to a SIEM. This is how a consumer checks one, and
