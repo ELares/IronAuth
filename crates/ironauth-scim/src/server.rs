@@ -25,9 +25,9 @@
 //!
 //! # What this module does NOT do yet
 //!
-//! Users and Groups. This slice is the surface, its authentication, and the three discovery
-//! endpoints RFC 7644 section 4 requires, so that the boundary and the wire shape are settled
-//! and tested before any resource handler is written on top of them.
+//! Get SERVED. The router below mounts the three discovery endpoints RFC 7644 section 4
+//! requires plus the Users and Groups resource routes, and every one of them is tested, but
+//! the binary does not yet mount this router. That, behind its config flag, is the next slice.
 
 use std::sync::Arc;
 

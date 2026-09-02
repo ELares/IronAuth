@@ -33,10 +33,15 @@ pub const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 enum Mutability {
     /// Settable at creation and changeable afterwards.
     ReadWrite,
-    /// Settable at CREATION and never afterwards. `userName` is this one: the identifier lives
-    /// on the account row, which this store gives no update path, so `replace_user` refuses a
-    /// changed `userName` with a 400. Publishing it as `readWrite` told every client the
-    /// opposite of what the surface does.
+    /// Settable at CREATION and never afterwards. TWO attributes are this, and both were
+    /// published as `readWrite` while the code refused any change:
+    ///
+    /// * `userName` -- the identifier lives on the account row, which this store gives no
+    ///   update path, so `replace_user` refuses a changed one with a 400;
+    /// * `externalId` -- `rebind_external_id` answers 409 `mutability` for a repoint, because
+    ///   the mapping table holds no UPDATE grant.
+    ///
+    /// Publishing either as `readWrite` tells a client to make a request that cannot succeed.
     Immutable,
 }
 
@@ -91,7 +96,7 @@ pub fn core_schemas() -> Vec<Value> {
                 // to mean "the same person".
                 attribute("userName", "string", false, true, Mutability::Immutable),
                 attribute("displayName", "string", false, false, Mutability::ReadWrite),
-                attribute("externalId", "string", false, false, Mutability::ReadWrite),
+                attribute("externalId", "string", false, false, Mutability::Immutable),
                 attribute("active", "boolean", false, false, Mutability::ReadWrite),
                 attribute("emails", "complex", true, false, Mutability::ReadWrite),
                 attribute("name", "complex", false, false, Mutability::ReadWrite),

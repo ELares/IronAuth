@@ -95,8 +95,22 @@ GRANT INSERT ON org_group_members TO ironauth_app;
 -- membership in place and writes here instead, and the person stays addressable.
 --
 -- DELETE is a different act and keeps its own meaning: RFC 7644 section 3.6 deletes the
--- resource, so it removes the membership and the person genuinely stops being visible. A
--- client that wants them back POSTs them again, which is what a client does after a delete.
+-- resource, so it removes the membership and the person genuinely stops being visible.
+--
+-- A client that wants them back POSTs them again, and THAT WORKS BECAUSE OF THIS TABLE. The
+-- account row, the login identifier and this connection's `externalId` mapping all survive a
+-- delete (0184 grants no DELETE there, deliberately), so without something recording that this
+-- organization once held the person, the re-POST would collide with all three and every route
+-- back would be closed -- which is what a reviewer found before this table existed: an Okta
+-- rehire was unrecoverable through SCIM.
+--
+-- A `false` row here is that record, and it is exactly the right key for it: only the SCIM
+-- surface writes this table, only for the organization on the credential, and only when that
+-- organization deactivated or deleted the person. So a create naming somebody with a `false`
+-- row is a RE-ADMIT, and a create naming anybody else -- including another organization's live
+-- user -- is the ordinary conflict. Conditioning the re-admit on "not currently a member"
+-- instead would be true of every user in the environment and would let any credential take
+-- another organization's user by naming their handle.
 --
 -- SCOPED TO THE ORGANIZATION, NOT THE CONNECTION. Two connections provisioning one
 -- organization must agree about who is active in it: a per-connection answer would let one

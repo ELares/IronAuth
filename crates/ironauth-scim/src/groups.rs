@@ -138,6 +138,51 @@ async fn membership_of(
         .ok_or_else(not_found)
 }
 
+/// Every live member binding of a group, or the `tooMany` refusal.
+///
+/// # Why this is a function rather than three call sites
+///
+/// The three places that read a group's members were each passing `scan_bound()` as a plain
+/// limit with no probe and no refusal, so a group larger than the bound rendered a SHORT
+/// `members` array inside a 200 -- exactly the silent truncation `ScimLimits::max_scan` exists
+/// to prevent, and worse here than in a listing: `set_members` computes its REMOVALS from this
+/// list, so a PUT against an over-large group both fails to remove people it should and tries
+/// to re-add members it could not see.
+///
+/// One function, so a fourth caller cannot reintroduce it.
+///
+/// # What this means for a group at the bound
+///
+/// A group cannot be grown PAST the bound, because the write's own response renders the group
+/// and that render is one of the reads being bounded. So the bound is effectively a maximum
+/// group size for this surface, and a group that somehow exceeds it (an operator built it
+/// through the admin API, or the bound was lowered) is unreadable and unmodifiable here until
+/// the bound is raised. That is the honest failure: the alternative is a 200 carrying a
+/// members array that is missing people, which a provisioning client acts on by removing them.
+async fn member_bindings(
+    state: &ScimState,
+    auth: &Authenticated,
+    group: &OrgGroupId,
+) -> Result<Vec<ironauth_store::OrgGroupMemberRecord>, Response> {
+    // One row MORE than the bound, so reaching it is distinguishable from exactly filling it.
+    let probe = i64::try_from(state.limits().scan_bound().saturating_add(1)).unwrap_or(i64::MAX);
+    let bindings = state
+        .store()
+        .scoped(auth.scope)
+        .org_group_members()
+        .list_for_group(&auth.connection.organization_id, group, probe, None)
+        .await
+        .map_err(|error| store_failure(&error))?;
+    if bindings.len() > state.limits().scan_bound() {
+        return Err(scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("tooMany"),
+            "this group has more members than one request may examine",
+        ));
+    }
+    Ok(bindings)
+}
+
 /// Render a stored group as a SCIM group resource.
 async fn group_resource(
     state: &ScimState,
@@ -145,16 +190,7 @@ async fn group_resource(
     record: &OrgGroupRecord,
 ) -> Result<Value, Response> {
     let scoped = state.store().scoped(auth.scope);
-    let bindings = scoped
-        .org_group_members()
-        .list_for_group(
-            &auth.connection.organization_id,
-            &record.id,
-            i64::try_from(state.limits().scan_bound()).unwrap_or(i64::MAX),
-            None,
-        )
-        .await
-        .map_err(|error| store_failure(&error))?;
+    let bindings = member_bindings(state, auth, &record.id).await?;
     let mut members = Vec::with_capacity(bindings.len());
     for binding in &bindings {
         // A binding names a MEMBERSHIP; SCIM wants the person. A membership removed since
@@ -205,6 +241,12 @@ pub(crate) async fn create_group(
             "displayName must contain at least one ASCII letter or digit",
         );
     };
+    // BEFORE the group exists. A member this credential may not reach used to answer 404 with
+    // the group already committed, and the retry then answered 409 forever on the display name.
+    let members = match resolve_members(&state, &auth, &parsed.members).await {
+        Ok(members) => members,
+        Err(response) => return response,
+    };
     let env = state.env().clone();
     let group_id = OrgGroupId::generate(&env, &auth.scope);
     if let Err(error) = state
@@ -231,20 +273,24 @@ pub(crate) async fn create_group(
         .await
     {
         // A slug collision is the interesting one. RFC 7643 section 4.2 already treats
-        // displayName as a group's name, so 409 is the right answer, but two display names
-        // differing only in punctuation fold onto ONE slug: the detail says so rather than
-        // leaving an operator to wonder why a visibly different name conflicted.
+        // displayName as a group's name, so 409 is the right answer -- but the slug folds
+        // EVERY character outside `[a-z0-9._-]` to a separator, non-ASCII letters included, so
+        // "team A" and "team B" collide and so do two names differing only in a CJK character.
+        // The detail says that rather than leaving an operator to wonder why two visibly
+        // different names conflicted.
         if matches!(error, ironauth_store::StoreError::Conflict) {
             return scim_error(
                 StatusCode::CONFLICT,
                 Some("uniqueness"),
                 "a group with this displayName already exists, or one whose displayName \
-                 differs from it only in punctuation or case",
+                 reduces to the same stable name: every character outside \
+                 [a-z0-9._-] folds to a separator, so two names can differ visibly \
+                 and still collide",
             );
         }
         return store_failure(&error);
     }
-    if let Err(response) = set_members(&state, &auth, &group_id, &parsed.members, true).await {
+    if let Err(response) = set_members(&state, &auth, &group_id, &members, true).await {
         return response;
     }
     match rendered_group(&state, &auth, &group_id.to_string()).await {
@@ -252,7 +298,10 @@ pub(crate) async fn create_group(
             StatusCode::CREATED,
             [
                 (header::CONTENT_TYPE, crate::server::SCIM_CONTENT_TYPE),
-                (header::LOCATION, "/scim/v2/Groups"),
+                (
+                    header::LOCATION,
+                    format!("/scim/v2/Groups/{group_id}").as_str(),
+                ),
             ],
             body.to_string(),
         )
@@ -272,6 +321,39 @@ async fn rendered_group(
     group_resource(state, auth, &record).await
 }
 
+/// Resolve every member id to a membership in this credential's organization, de-duplicated.
+///
+/// # Resolving BEFORE any write is the point
+///
+/// `POST /Groups` used to create the group and then apply its members, so a create naming a
+/// member this credential may not reach -- somebody in another organization, or somebody not
+/// provisioned yet -- answered 404 with the GROUP ALREADY COMMITTED. The retry then answered
+/// 409 forever on the display name. A reviewer drove it with the most ordinary group push
+/// there is. The gate is the same one `/Users` applies; what changed is that it runs first.
+///
+/// DE-DUPLICATED, because a payload naming one person twice is ordinary and used to be a 409:
+/// `set_members` reads the existing bindings once, so the second copy was not yet in that list
+/// and the insert hit the unique index.
+async fn resolve_members(
+    state: &ScimState,
+    auth: &Authenticated,
+    wanted: &[ScimMember],
+) -> Result<Vec<OrgMembershipId>, Response> {
+    let mut resolved: Vec<OrgMembershipId> = Vec::with_capacity(wanted.len());
+    for member in wanted {
+        // EVERY member id goes through the same gate a direct /Users request would: the user
+        // must hold a membership in THIS credential's organization. Without it, group push
+        // would be a way to name a user of another organization and have the server resolve
+        // it -- the criterion-5 failure through a door that is not /Users.
+        let user = addressed_user(state, auth, &member.value).await?;
+        let membership = membership_of(state, auth, &user).await?;
+        if !resolved.contains(&membership) {
+            resolved.push(membership);
+        }
+    }
+    Ok(resolved)
+}
+
 /// Bring a group's membership to `wanted`.
 ///
 /// `replace` distinguishes the two callers. A create and a PUT declare the WHOLE member set,
@@ -282,34 +364,18 @@ async fn set_members(
     state: &ScimState,
     auth: &Authenticated,
     group: &OrgGroupId,
-    wanted: &[ScimMember],
+    wanted: &[OrgMembershipId],
     replace: bool,
 ) -> Result<(), Response> {
     let env = state.env().clone();
-    let scoped = state.store().scoped(auth.scope);
-    let existing = scoped
-        .org_group_members()
-        .list_for_group(
-            &auth.connection.organization_id,
-            group,
-            i64::try_from(state.limits().scan_bound()).unwrap_or(i64::MAX),
-            None,
-        )
-        .await
-        .map_err(|error| store_failure(&error))?;
+    let existing = member_bindings(state, auth, group).await?;
     let acting = state
         .store()
         .management()
         .acting(auth.actor, CorrelationId::generate(&env));
 
     let mut keep = Vec::with_capacity(wanted.len());
-    for member in wanted {
-        // EVERY member id goes through the same gate a direct /Users request would: the user
-        // must hold a membership in THIS credential's organization. Without it, group push
-        // would be a way to name a user of another organization and have the server resolve
-        // it -- the criterion-5 failure through a door that is not /Users.
-        let user = addressed_user(state, auth, &member.value).await?;
-        let membership = membership_of(state, auth, &user).await?;
+    for membership in wanted.iter().copied() {
         if existing
             .iter()
             .any(|binding| binding.membership_id == membership)
@@ -356,27 +422,15 @@ async fn drop_members(
     state: &ScimState,
     auth: &Authenticated,
     group: &OrgGroupId,
-    unwanted: &[ScimMember],
+    unwanted: &[OrgMembershipId],
 ) -> Result<(), Response> {
     let env = state.env().clone();
-    let scoped = state.store().scoped(auth.scope);
-    let existing = scoped
-        .org_group_members()
-        .list_for_group(
-            &auth.connection.organization_id,
-            group,
-            i64::try_from(state.limits().scan_bound()).unwrap_or(i64::MAX),
-            None,
-        )
-        .await
-        .map_err(|error| store_failure(&error))?;
+    let existing = member_bindings(state, auth, group).await?;
     let acting = state
         .store()
         .management()
         .acting(auth.actor, CorrelationId::generate(&env));
-    for member in unwanted {
-        let user = addressed_user(state, auth, &member.value).await?;
-        let membership = membership_of(state, auth, &user).await?;
+    for membership in unwanted.iter().copied() {
         for binding in existing
             .iter()
             .filter(|binding| binding.membership_id == membership)
@@ -429,6 +483,13 @@ pub(crate) async fn replace_group(
             "the request body is not a SCIM group resource",
         );
     };
+    // RESOLVED FIRST, before the rename below writes anything. A PUT naming a member this
+    // credential cannot reach would otherwise answer 404 having already renamed the group, and
+    // the client would have no way to tell that half of its request landed.
+    let members = match resolve_members(&state, &auth, &parsed.members).await {
+        Ok(members) => members,
+        Err(response) => return response,
+    };
     let env = state.env().clone();
     if !parsed.display_name.is_empty() && parsed.display_name != record.display_name {
         // The SLUG does not move; see the module docs. Only the label does.
@@ -450,7 +511,7 @@ pub(crate) async fn replace_group(
         }
     }
     // A PUT declares the WHOLE member set, so anybody absent from it leaves the group.
-    if let Err(response) = set_members(&state, &auth, &record.id, &parsed.members, true).await {
+    if let Err(response) = set_members(&state, &auth, &record.id, &members, true).await {
         return response;
     }
     match rendered_group(&state, &auth, &raw_id).await {
@@ -526,10 +587,9 @@ pub(crate) async fn patch_group(
             "a PatchOp must carry at least one operation",
         );
     }
-    for operation in &parsed.operations {
-        if let Err(response) = apply_group_operation(&state, &auth, &record, operation).await {
-            return response;
-        }
+    if let Err(response) = apply_group_operations(&state, &auth, &record, &parsed.operations).await
+    {
+        return response;
     }
     match rendered_group(&state, &auth, &raw_id).await {
         Ok(body) => scim_json(StatusCode::OK, &body),
@@ -561,13 +621,58 @@ async fn rename(
         .map_err(|error| store_failure(&error))
 }
 
-/// Apply one group PATCH operation.
-async fn apply_group_operation(
+/// What one group PATCH operation asks this surface to change, with every member id already
+/// resolved to a membership in this credential's organization.
+#[derive(Debug)]
+enum GroupChange {
+    /// Change the display label. The slug does not move.
+    Rename(String),
+    /// Bring the membership to this set. `true` REPLACES (anybody absent leaves).
+    Members(Vec<OrgMembershipId>, bool),
+    /// Remove these members, leaving the rest.
+    Drop(Vec<OrgMembershipId>),
+}
+
+/// A group `PatchOp` is ATOMIC: everything is validated and resolved, then applied.
+///
+/// The same RFC 7644 section 3.5.2 requirement the users handler implements, and it was
+/// missing here: a reviewer sent `[add members(alice), replace externalId]`, got a 400 for the
+/// unsupported second operation, and found alice already in the group.
+///
+/// Resolving in the PLAN pass is what makes it worth anything on this door. A group PATCH's
+/// failures are mostly member ids -- a person in another organization, a person not
+/// provisioned yet -- so a plan pass that only checked the operation SHAPE would still apply
+/// the first operation before the second's member id was rejected.
+async fn apply_group_operations(
     state: &ScimState,
     auth: &Authenticated,
     record: &OrgGroupRecord,
-    operation: &GroupPatchOperation,
+    operations: &[GroupPatchOperation],
 ) -> Result<(), Response> {
+    let mut planned = Vec::new();
+    for operation in operations {
+        planned.extend(plan_group_operation(state, auth, operation).await?);
+    }
+    for change in &planned {
+        match change {
+            GroupChange::Rename(label) => rename(state, auth, &record.id, label).await?,
+            GroupChange::Members(members, replace) => {
+                set_members(state, auth, &record.id, members, *replace).await?;
+            }
+            GroupChange::Drop(members) => {
+                drop_members(state, auth, &record.id, members).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reduce one group operation to the changes it asks for, resolving every member id.
+async fn plan_group_operation(
+    state: &ScimState,
+    auth: &Authenticated,
+    operation: &GroupPatchOperation,
+) -> Result<Vec<GroupChange>, Response> {
     let op = operation.op.to_ascii_lowercase();
     // The path is PARSED, never matched as text: `members` and `members[value eq "x"]` are
     // told apart by the grammar rather than by a substring test, which would accept the
@@ -590,12 +695,14 @@ async fn apply_group_operation(
     };
     match (op.as_str(), attribute.as_deref()) {
         ("add", Some("members")) => {
-            let members = members_of(operation.value.as_ref())?;
-            set_members(state, auth, &record.id, &members, false).await
+            let members =
+                resolve_members(state, auth, &members_of(operation.value.as_ref())?).await?;
+            Ok(vec![GroupChange::Members(members, false)])
         }
         ("replace", Some("members")) => {
-            let members = members_of(operation.value.as_ref())?;
-            set_members(state, auth, &record.id, &members, true).await
+            let members =
+                resolve_members(state, auth, &members_of(operation.value.as_ref())?).await?;
+            Ok(vec![GroupChange::Members(members, true)])
         }
         ("remove", Some("members")) => {
             // A single-person removal names the member in a SELECTOR and sends no value. A
@@ -609,16 +716,19 @@ async fn apply_group_operation(
                         "a members selector must compare value to a single member id",
                     )
                 })?;
-                return drop_members(state, auth, &record.id, &[named]).await;
+                let members = resolve_members(state, auth, &[named]).await?;
+                return Ok(vec![GroupChange::Drop(members)]);
             }
-            let members = members_of(operation.value.as_ref())?;
-            if members.is_empty() {
+            let named = members_of(operation.value.as_ref())?;
+            if named.is_empty() {
                 // `remove` on the whole attribute with no value empties the group, which is
                 // what RFC 7644 section 3.5.2.2 says. It is destructive, so it happens only
                 // for that exact shape rather than as the fallback of a parse failure.
-                return set_members(state, auth, &record.id, &[], true).await;
+                return Ok(vec![GroupChange::Members(Vec::new(), true)]);
             }
-            drop_members(state, auth, &record.id, &members).await
+            Ok(vec![GroupChange::Drop(
+                resolve_members(state, auth, &named).await?,
+            )])
         }
         ("replace", Some("displayname")) => {
             let Some(Value::String(name)) = operation.value.as_ref() else {
@@ -628,34 +738,20 @@ async fn apply_group_operation(
                     "displayName must be a string",
                 ));
             };
-            rename(state, auth, &record.id, name).await
+            Ok(vec![GroupChange::Rename(name.clone())])
         }
         // The no-path shape: a whole object whose members are the attributes to set.
         ("add" | "replace", None) => {
-            let Some(Value::Object(fields)) = operation.value.as_ref() else {
-                return Err(scim_error(
-                    StatusCode::BAD_REQUEST,
-                    Some("invalidValue"),
-                    "an operation with no path must carry an object value",
-                ));
-            };
-            for (name, value) in fields {
-                match (name.to_ascii_lowercase().as_str(), value) {
-                    ("displayname", Value::String(label)) => {
-                        rename(state, auth, &record.id, label).await?;
-                    }
-                    ("members", Value::Array(_)) => {
-                        let members = members_of(Some(value))?;
-                        set_members(state, auth, &record.id, &members, op == "replace").await?;
-                    }
-                    // Anything else in a no-path object is ignored rather than refused: a
-                    // client sends whole resources here, and failing would make every
-                    // ordinary update a 400.
-                    _ => {}
-                }
-            }
-            Ok(())
+            plan_whole_object(state, auth, operation.value.as_ref(), op == "replace").await
         }
+        // A pathless `remove` has nothing to remove. RFC 7644 section 3.5.2.2 gives `noTarget`
+        // for exactly this, and answering "op must be add, remove or replace" -- which an
+        // earlier version did -- names the one thing that was not wrong.
+        ("remove", None) => Err(scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("noTarget"),
+            "a remove operation must name the attribute it removes",
+        )),
         (_, Some(other)) => Err(scim_error(
             StatusCode::BAD_REQUEST,
             Some("invalidPath"),
@@ -667,6 +763,43 @@ async fn apply_group_operation(
             "op must be add, remove or replace",
         )),
     }
+}
+
+/// Plan the no-path shape: a whole object whose members are the attributes to set.
+///
+/// Its own function only because the arm is the one that loops; the behaviour is unchanged.
+async fn plan_whole_object(
+    state: &ScimState,
+    auth: &Authenticated,
+    value: Option<&Value>,
+    replace: bool,
+) -> Result<Vec<GroupChange>, Response> {
+    let Some(Value::Object(fields)) = value else {
+        return Err(scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "an operation with no path must carry an object value",
+        ));
+    };
+    let mut changes = Vec::new();
+    for (name, member) in fields {
+        match (name.to_ascii_lowercase().as_str(), member) {
+            ("displayname", Value::String(label)) => {
+                changes.push(GroupChange::Rename(label.clone()));
+            }
+            ("members", Value::Array(_)) => {
+                let named = members_of(Some(member))?;
+                changes.push(GroupChange::Members(
+                    resolve_members(state, auth, &named).await?,
+                    replace,
+                ));
+            }
+            // Anything else in a no-path object is ignored rather than refused: a client sends
+            // whole resources here, and failing would make every ordinary update a 400.
+            _ => {}
+        }
+    }
+    Ok(changes)
 }
 
 /// The member list an operation's value carries.

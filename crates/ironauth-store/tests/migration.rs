@@ -8813,8 +8813,8 @@ async fn unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> b
 }
 
 #[tokio::test]
-async fn the_two_scim_tables_carry_their_isolation_structurally() {
-    // WHY STRUCTURALLY. Every repository query on both tables also carries explicit
+async fn every_scim_table_carries_its_isolation_structurally() {
+    // WHY STRUCTURALLY. Every repository query on these tables also carries explicit
     // `tenant_id`/`environment_id` predicates, so no test reachable through the repository can
     // tell the RLS policy from its absence: a reviewer replaced 0184's policy with
     // `USING (true) WITH CHECK (true)` and every suite stayed green. The policy is the defence
@@ -8826,6 +8826,10 @@ async fn the_two_scim_tables_carry_their_isolation_structurally() {
     for (table, policy) in [
         ("scim_connections", "scim_connections_scope"),
         ("scim_external_ids", "scim_external_ids_scope"),
+        (
+            "scim_membership_activation",
+            "scim_membership_activation_scope",
+        ),
     ] {
         assert!(
             rls_enabled_and_forced(pool, table).await,

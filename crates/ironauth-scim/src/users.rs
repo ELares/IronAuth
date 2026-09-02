@@ -33,14 +33,15 @@
 //!
 //! # What is NOT here yet
 //!
-//! Groups, and the boot mount. The router this module extends is still assembled and tested
-//! but not served by the binary; mounting it, behind its config flag, is the next slice, and
-//! is deliberately done ONCE for the whole surface rather than half now and half later.
+//! The BOOT MOUNT. Groups ship beside this module in `groups.rs` and are mounted by
+//! `scim_router` alongside these routes; what the binary does not yet do is serve that router.
+//! Mounting it, behind its config flag and with `ScimLimits` plumbed from configuration, is
+//! the next slice, and is deliberately done ONCE for the whole surface.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use ironauth_store::identifier::{IdentifierType, UniquenessMode};
+use ironauth_store::identifier::IdentifierType;
 use ironauth_store::{
     CorrelationId, NewMembership, NewUserIdentifier, OffboardingSchedule, OrgMembershipId,
     ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId, UserState,
@@ -241,10 +242,20 @@ pub(crate) async fn create_user(
     let env = state.env().clone();
     let scope = auth.scope;
     let store = state.store();
-    if let Err(response) = refuse_a_duplicate(&state, &auth, &parsed, kind).await {
-        return response;
-    }
-    let user_id = UserId::generate(&env, &scope);
+    let user_id = match refuse_a_duplicate(&state, &auth, &parsed, kind).await {
+        // A person this credential once held, brought back. Their account, identifier row and
+        // externalId mapping all still exist, so there is nothing to create: the response is a
+        // 201 naming the id they already had, which is what the client's stored reference
+        // points at.
+        Ok(Some(readmitted)) => {
+            return match rendered_user(&state, &auth, &readmitted).await {
+                Ok(body) => created(&readmitted, &body),
+                Err(response) => response,
+            };
+        }
+        Ok(None) => UserId::generate(&env, &scope),
+        Err(response) => return response,
+    };
     if let Err(response) = land_account(&state, &auth, &user_id, &parsed, kind).await {
         return response;
     }
@@ -268,23 +279,29 @@ pub(crate) async fn create_user(
         return error;
     }
     match rendered_user(&state, &auth, &user_id).await {
-        // RFC 7644 section 3.3: the Location header SHALL carry the URI of the CREATED
-        // RESOURCE. A constant naming the collection satisfies nothing, and Entra follows this
-        // header to read the resource back.
-        Ok(body) => (
-            StatusCode::CREATED,
-            [
-                (header::CONTENT_TYPE, crate::server::SCIM_CONTENT_TYPE),
-                (
-                    header::LOCATION,
-                    format!("/scim/v2/Users/{user_id}").as_str(),
-                ),
-            ],
-            body.to_string(),
-        )
-            .into_response(),
+        Ok(body) => created(&user_id, &body),
         Err(response) => response,
     }
+}
+
+/// The 201 a create answers, for both a fresh person and a re-admitted one.
+///
+/// RFC 7644 section 3.3: the `Location` header SHALL carry the URI of the CREATED RESOURCE. A
+/// constant naming the collection satisfies nothing, and Entra follows this header to read the
+/// resource back. One function so the two create paths cannot answer differently.
+fn created(user_id: &UserId, body: &Value) -> Response {
+    (
+        StatusCode::CREATED,
+        [
+            (header::CONTENT_TYPE, crate::server::SCIM_CONTENT_TYPE),
+            (
+                header::LOCATION,
+                format!("/scim/v2/Users/{user_id}").as_str(),
+            ),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Refuse a create that would duplicate somebody this credential can already see.
@@ -296,7 +313,7 @@ async fn refuse_a_duplicate(
     auth: &Authenticated,
     parsed: &ScimUser,
     kind: IdentifierType,
-) -> Result<(), Response> {
+) -> Result<Option<UserId>, Response> {
     let store = state.store();
     let scope = auth.scope;
     // Duplicate detection BEFORE the write, so a collision answers 409 without having created
@@ -304,18 +321,23 @@ async fn refuse_a_duplicate(
     // what makes this a fast path rather than the check: two concurrent creates both pass here
     // and one loses there.
     //
-    // SCOPED TO THIS ORGANIZATION, and that is not a refinement. `resolve` searches the whole
-    // ENVIRONMENT, so an unconditional refusal on any hit is an existence oracle: a reviewer
-    // held `victim@example.test` in one organization, POSTed it from another's token, and got
-    // a 409 that distinguished a handle somebody in the environment holds from one nobody
-    // does. Under `OrgScoped` uniqueness it was also simply wrong -- the store would have
-    // accepted the second organization's copy, so SCIM could not provision one person into two
-    // organizations at all.
+    // UNCONDITIONAL, and NOT because the uniqueness mode is ignored. A create makes an ACCOUNT
+    // row, and `users_identifier_bidx_unique` (migration 0028) is
+    // `UNIQUE (tenant_id, environment_id, identifier_bidx)` -- one account per login handle per
+    // ENVIRONMENT, whatever `UniquenessMode` is configured. That mode governs
+    // `user_identifiers`, the additional identifiers an account may carry; it cannot make a
+    // second account for a handle the environment already has.
     //
-    // So a hit is a conflict only when it is a conflict FOR THIS CALLER: under environment-wide
-    // uniqueness any hit is, and under org-scoped or non-unique it is one only if the person
-    // found is already a member here. Anything else falls through to `add`, whose index is the
-    // authority and which refuses the same case with the same status.
+    // Round 1 read this as an existence oracle and asked for a mode-aware check. The oracle
+    // reading is right and the mode-aware fix was wrong: its org-scoped arm let a create
+    // proceed to `register_passwordless`, which then failed on that unique constraint, so the
+    // caller learned the same fact through a 500 instead of a 409. What is actually required
+    // is that the refusal a foreign handle produces be INDISTINGUISHABLE from the one a handle
+    // held here produces, which it is: the same status, the same scimType, the same detail,
+    // and nothing naming an organization or a person.
+    //
+    // A person this organization previously held is the one case that is not a conflict, and
+    // `readmit` below is gated on a fact only this organization could have created.
     match store
         .scoped(scope)
         .user_identifiers()
@@ -323,29 +345,19 @@ async fn refuse_a_duplicate(
         .await
     {
         Ok(found) if !found.is_empty() => {
-            let conflicts = match state.uniqueness_mode() {
-                UniquenessMode::EnvironmentWide => true,
-                UniquenessMode::OrgScoped | UniquenessMode::NonUnique => {
-                    let mut here = false;
-                    for resolution in &found {
-                        match store
-                            .scoped(scope)
-                            .org_memberships()
-                            .exists(&auth.connection.organization_id, &resolution.user_id)
-                            .await
-                        {
-                            Ok(true) => {
-                                here = true;
-                                break;
-                            }
-                            Ok(false) => {}
-                            Err(error) => return Err(store_failure(&error)),
-                        }
+            {
+                // A RE-ADMIT rather than a conflict, when the person this names is somebody
+                // this credential once held and no longer does. DELETE removes the membership
+                // but nothing releases the identifier row or this connection's externalId
+                // mapping (0184 grants no DELETE there, deliberately), so without this every
+                // route back was closed: a reviewer deleted a person and found the re-POST
+                // answered 409 in all three spellings, PATCH answered 404, and an Okta rehire
+                // was unrecoverable through SCIM.
+                for resolution in &found {
+                    if let Some(user) = readmit(state, auth, &resolution.user_id).await? {
+                        return Ok(Some(user));
                     }
-                    here
                 }
-            };
-            if conflicts {
                 return Err(scim_error(
                     StatusCode::CONFLICT,
                     Some("uniqueness"),
@@ -368,7 +380,13 @@ async fn refuse_a_duplicate(
             .resolve(&auth.connection.id, external_id)
             .await
         {
-            Ok(Some(_)) => {
+            Ok(Some(known)) => {
+                // The same re-admit, through the externalId door: this connection's own key
+                // for somebody it once provisioned is exactly how an identity provider names a
+                // rehire.
+                if let Some(user) = readmit(state, auth, &known).await? {
+                    return Ok(Some(user));
+                }
                 return Err(scim_error(
                     StatusCode::CONFLICT,
                     Some("uniqueness"),
@@ -379,18 +397,100 @@ async fn refuse_a_duplicate(
             Err(error) => return Err(store_failure(&error)),
         }
     }
-    Ok(())
+    Ok(None)
 }
 
-/// Register the account, index its login identifier, and bind it into the credential's
-/// organization.
+/// Re-admit a person this credential once held, or [`None`] if they are still a live member.
 ///
-/// The THREE writes a create is, in one place, because they are not independently meaningful:
-/// an account with no identifier row cannot be resolved by the seam that detects duplicates,
-/// and an account with no membership is invisible to the very credential that just created
-/// it. They are not one transaction (the repository surface has no way to make them one), so
-/// the order is chosen for what a partial failure leaves behind: an orphan account that no
-/// connection can see, rather than a membership pointing at nothing.
+/// Returns `Some(user)` only when the person is genuinely absent from this organization, which
+/// is the case a create is entitled to fix. A person who IS still a member is a real duplicate
+/// and the caller falls through to the 409.
+///
+/// # This is not a way to reach somebody else's user
+///
+/// The person was found either by an identifier this credential is allowed to create, or by
+/// THIS connection's own externalId mapping. In both cases the credential has already
+/// demonstrated it knows who they are, and the re-admit binds them into the credential's own
+/// organization and nowhere else -- the same write an ordinary create makes.
+async fn readmit(
+    state: &ScimState,
+    auth: &Authenticated,
+    user: &UserId,
+) -> Result<Option<UserId>, Response> {
+    let env = state.env().clone();
+    let scoped = state.store().scoped(auth.scope);
+    // THE GATE, and it is the whole safety of this path. "Not currently a member" is NOT
+    // enough: it is true of every user in the environment, so re-admitting on that alone lets
+    // any credential pull another organization's live user into its own by POSTing their
+    // handle. That is a cross-organization write, and an earlier version of this function had
+    // it -- caught by the environment-wide duplicate test answering 201.
+    //
+    // The activation row is the right key because only THIS surface writes it, only for THIS
+    // organization, and only when this organization deactivated or deleted the person. So an
+    // absent row (which reads as active) means this organization never held them, and a
+    // present false row means it did.
+    if scoped
+        .scim_activation()
+        .is_active(&auth.connection.organization_id, user)
+        .await
+        .map_err(|error| store_failure(&error))?
+    {
+        return Ok(None);
+    }
+    let member = scoped
+        .org_memberships()
+        .exists(&auth.connection.organization_id, user)
+        .await
+        .map_err(|error| store_failure(&error))?;
+    if member {
+        return Ok(None);
+    }
+    let membership_id = OrgMembershipId::generate(&env, &auth.scope);
+    scoped
+        .acting(auth.actor, CorrelationId::generate(&env))
+        .org_memberships()
+        .create(
+            &env,
+            NewMembership {
+                id: &membership_id,
+                organization_id: &auth.connection.organization_id,
+                user_id: user,
+                metadata: None,
+            },
+            epoch_micros(state),
+            None,
+        )
+        .await
+        .map_err(|error| store_failure(&error))?;
+    // A re-admitted person is ACTIVE. The activation row from their deactivation is still
+    // there and still says false, and leaving it would make the create answer 201 with
+    // `active: false` -- a person the client believes it just provisioned who cannot sign in.
+    set_active(state, auth, user, true).await?;
+    Ok(Some(*user))
+}
+
+/// Register the account, bind it into the credential's organization, and index its login
+/// identifier.
+///
+/// # The order is forced, not chosen
+///
+/// The three writes are not independently meaningful -- an account with no identifier row
+/// cannot be resolved by the seam that detects duplicates, and an account with no membership is
+/// invisible to the very credential that just created it -- and the repository surface offers
+/// no way to make them one transaction.
+///
+/// An earlier version wrote the identifier BEFORE the membership, reasoning that a partial
+/// failure should leave an orphan account rather than a membership pointing at nothing. That
+/// reasoning was fine and the order was still wrong: under
+/// [`UniquenessMode::OrgScoped`], `ActingUserIdentifierRepo::add` calls `require_live_membership`
+/// and refuses an identifier for somebody who is not yet a member. So on an org-scoped
+/// deployment EVERY create failed with a 500, after `register_passwordless` had already
+/// committed. A reviewer drove it: the surface worked in exactly one of the three configured
+/// modes, and the mode-aware duplicate check above it could never be reached in the other two.
+///
+/// The membership therefore comes second and the identifier third. What a partial failure
+/// leaves behind is now a member with no login identifier, which the next create of the same
+/// person resolves as absent and retries.
 async fn land_account(
     state: &ScimState,
     auth: &Authenticated,
@@ -412,6 +512,22 @@ async fn land_account(
         .register_passwordless(&env, user_id, &parsed.user_name, None)
         .await
         .map_err(|error| store_failure(&error))?;
+    let membership_id = OrgMembershipId::generate(&env, &scope);
+    acting
+        .org_memberships()
+        .create(
+            &env,
+            NewMembership {
+                id: &membership_id,
+                organization_id: &auth.connection.organization_id,
+                user_id,
+                metadata: None,
+            },
+            epoch_micros(state),
+            None,
+        )
+        .await
+        .map_err(|error| store_failure(&error))?;
     let identifier_id = UserIdentifierId::generate(&env, &scope);
     let organization = auth.connection.organization_id.to_string();
     acting
@@ -431,22 +547,6 @@ async fn land_account(
                 mode: state.uniqueness_mode(),
                 org: Some(&organization),
             },
-            None,
-        )
-        .await
-        .map_err(|error| store_failure(&error))?;
-    let membership_id = OrgMembershipId::generate(&env, &scope);
-    acting
-        .org_memberships()
-        .create(
-            &env,
-            NewMembership {
-                id: &membership_id,
-                organization_id: &auth.connection.organization_id,
-                user_id,
-                metadata: None,
-            },
-            epoch_micros(state),
             None,
         )
         .await

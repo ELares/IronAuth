@@ -100,9 +100,14 @@ CREATE POLICY scim_external_ids_scope ON scim_external_ids
 -- request on the data plane. Routing it through the control plane would put an operator in the
 -- middle of every provisioning run.
 --
--- No DELETE. A mapping is not removed when a person is deprovisioned: `active = false` is a
--- lifecycle change on the USER, and the mapping is what lets the same IdP find that person
--- again to reactivate them. Nothing in this slice deletes one, and a DELETE grant would be a
+-- No DELETE. A mapping is not removed when a person is deprovisioned, and both halves of that
+-- matter. A deactivation does not touch the person's identity, so there is nothing to remove;
+-- and after a DELETE the mapping is one of the two things that let the same identity provider
+-- name that person again for a rehire (the other is their login handle). It is not by itself
+-- what makes the rehire succeed -- that is the activation row migration 0185 adds, which is
+-- what distinguishes "this organization once held them" from "this handle belongs to somebody
+-- else" -- but a create naming the old `externalId` resolves through this table to the person
+-- that record is about. Nothing in this slice deletes a mapping, and a DELETE grant would be a
 -- capability with no caller.
 GRANT SELECT, INSERT ON scim_external_ids TO ironauth_app;
 

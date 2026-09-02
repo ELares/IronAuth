@@ -102,12 +102,38 @@ async fn call_with(
     body: Option<Value>,
     limits: ScimLimits,
 ) -> (StatusCode, String) {
-    let state = ScimState::new(
-        db.store().clone(),
-        env.clone(),
+    call_configured(
+        db,
+        env,
+        method,
+        path,
+        token,
+        body,
         limits,
         ironauth_store::identifier::UniquenessMode::EnvironmentWide,
-    );
+    )
+    .await
+}
+
+/// [`call`] with an explicit UNIQUENESS MODE.
+///
+/// Every other helper passes `EnvironmentWide`, which is how the mode-aware duplicate check
+/// became a vacuous guard: a reviewer replaced its `OrgScoped | NonUnique` arm with the
+/// pre-fix unconditional refusal and all 90 tests stayed green, because nothing ever entered
+/// it. `ScimState` takes the deployment's mode deliberately, so the suite has to drive more
+/// than one of them.
+#[allow(clippy::too_many_arguments)]
+async fn call_configured(
+    db: &TestDatabase,
+    env: &Env,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    limits: ScimLimits,
+    uniqueness: ironauth_store::identifier::UniquenessMode,
+) -> (StatusCode, String) {
+    let state = ScimState::new(db.store().clone(), env.clone(), limits, uniqueness);
     let mut builder = Request::builder().method(method).uri(path);
     if let Some(token) = token {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -1443,4 +1469,461 @@ async fn a_malformed_query_string_does_not_answer_an_unauthenticated_caller() {
         let parsed: Value = serde_json::from_str(&body).expect("a list");
         assert_eq!(parsed["totalResults"], json!(1), "{query}: {body}");
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// REVIEW ROUND 2.
+// ---------------------------------------------------------------------------------------
+
+/// The three modes a deployment can configure, so a test that only drives one is visibly
+/// incomplete rather than quietly so.
+const MODES: [ironauth_store::identifier::UniquenessMode; 3] = [
+    ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    ironauth_store::identifier::UniquenessMode::OrgScoped,
+    ironauth_store::identifier::UniquenessMode::NonUnique,
+];
+
+#[tokio::test]
+async fn a_create_works_under_every_configured_uniqueness_mode() {
+    // BLOCKER. `land_account` wrote the identifier row before the membership, and
+    // `ActingUserIdentifierRepo::add` refuses an identifier for a non-member under
+    // `OrgScoped` -- so on an org-scoped deployment EVERY create answered 500, after
+    // `register_passwordless` had already committed. The surface worked in exactly one of the
+    // three modes it takes as a parameter.
+    for mode in MODES {
+        let db = TestDatabase::start().await;
+        let env = Env::system();
+        let scope = db.seed_scope(&env).await;
+        let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&okta.token),
+            Some(json!({"userName": "alice@example.test", "externalId": "00u1alice"})),
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{mode:?}: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a resource");
+        let id = parsed["id"].as_str().expect("an id");
+
+        // And the person is fully landed, not half: resolvable by handle, which needs the
+        // identifier row, and visible in the listing, which needs the membership.
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "GET",
+            "/scim/v2/Users?filter=userName%20eq%20%22alice@example.test%22",
+            Some(&okta.token),
+            None,
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{mode:?}: {body}");
+        let parsed: Value = serde_json::from_str(&body).expect("a list");
+        assert_eq!(parsed["totalResults"], json!(1), "{mode:?}: {body}");
+        assert_eq!(parsed["Resources"][0]["id"], json!(id), "{mode:?}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn one_handle_is_one_account_under_every_configured_mode() {
+    // Round 1 asked for a mode-aware duplicate check on the reasoning that under `OrgScoped`
+    // the store would accept a second organization's copy of a handle. It does not:
+    // `users_identifier_bidx_unique` (migration 0028) is
+    // `UNIQUE (tenant_id, environment_id, identifier_bidx)`, so one login handle is one ACCOUNT
+    // per environment whatever the mode is. That mode governs `user_identifiers` -- the extra
+    // identifiers an account may carry -- not the account row a create makes.
+    //
+    // Driving all three modes is what turned that reasoning from plausible to checked: the
+    // mode-aware branch answered 500 under `OrgScoped`, because the create it let through then
+    // hit the constraint inside `register_passwordless`.
+    for mode in MODES {
+        let db = TestDatabase::start().await;
+        let env = Env::system();
+        let scope = db.seed_scope(&env).await;
+        let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+        let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&globex.token),
+            Some(json!({"userName": "shared@example.test"})),
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{mode:?}: {body}");
+
+        // The second organization is refused, and refused as a CONFLICT rather than as a 500
+        // from a constraint it was allowed to reach.
+        let (status, body) = call_configured(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&initech.token),
+            Some(json!({"userName": "shared@example.test"})),
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{mode:?}: {body}");
+        assert!(body.contains("uniqueness"), "{mode:?}: {body}");
+
+        // And nothing landed: the refused organization has no members.
+        let (_, body) = call_configured(
+            &db,
+            &env,
+            "GET",
+            "/scim/v2/Users",
+            Some(&initech.token),
+            None,
+            ScimLimits::default(),
+            mode,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&body).expect("a list");
+        assert_eq!(parsed["totalResults"], json!(0), "{mode:?}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_create_cannot_pull_another_organizations_live_user_into_this_one() {
+    // The re-admit's gate, and the reason it needs one. "Not currently a member of MY
+    // organization" is true of every user in the environment, so a re-admit conditioned on
+    // that alone lets any credential take another organization's live user by POSTing their
+    // handle. An earlier version of `readmit` did exactly that, and this is the test that
+    // caught it -- it answered 201 where a 409 was required.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+    let victim = provision(
+        &db,
+        &env,
+        &globex.token,
+        "victim@example.test",
+        "00u1victim",
+    )
+    .await;
+    for (what, body) in [
+        ("by handle", json!({"userName": "victim@example.test"})),
+        (
+            "by handle and a fresh key",
+            json!({"userName": "victim@example.test", "externalId": "00u9mine"}),
+        ),
+    ] {
+        let (status, answer) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&initech.token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{what}: {answer}");
+        assert!(
+            !answer.contains(victim.as_str()),
+            "{what}: the refusal named the person: {answer}"
+        );
+    }
+
+    // And the victim is untouched: still Globex's, still active, still not Initech's.
+    let (_, body) = call(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users",
+        Some(&initech.token),
+        None,
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&body).expect("a list");
+    assert_eq!(parsed["totalResults"], json!(0), "{body}");
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{victim}"),
+        Some(&globex.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["active"], json!(true), "{body}");
+}
+
+#[tokio::test]
+async fn an_environment_wide_deployment_still_refuses_a_handle_another_organization_holds() {
+    // The other side of the same guard. Without this the mode-aware check would pass on an
+    // implementation that never refused anything, which would break the uniqueness the
+    // environment-wide mode exists to provide.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+    provision(
+        &db,
+        &env,
+        &globex.token,
+        "shared@example.test",
+        "00u1shared",
+    )
+    .await;
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&initech.token),
+        Some(json!({"userName": "shared@example.test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn a_deleted_person_can_be_provisioned_again() {
+    // BLOCKER. DELETE removes the membership but nothing releases the identifier row or this
+    // connection's externalId mapping, so every route back was closed: a reviewer deleted a
+    // person and found the re-POST answered 409 in all three spellings and PATCH answered 404.
+    // An Okta rehire was unrecoverable through SCIM.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    let alice = provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+    let (status, _) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "deleted, so not visible");
+
+    // Every spelling an identity provider would use for the rehire.
+    for (what, body) in [
+        (
+            "the same handle and the same key",
+            json!({"userName": "alice@example.test", "externalId": "00u1alice"}),
+        ),
+        (
+            "the same handle and a new key",
+            json!({"userName": "alice@example.test", "externalId": "00u2alice"}),
+        ),
+        (
+            "a new handle and the old key",
+            json!({"userName": "alice2@example.test", "externalId": "00u1alice"}),
+        ),
+    ] {
+        // Take them out again between attempts, so each spelling is driven from the same
+        // state rather than the second finding the first's re-admit.
+        let (status, answer) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&okta.token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{what}: {answer}");
+        let parsed: Value = serde_json::from_str(&answer).expect("a resource");
+        // The SAME id they had: a re-admit is the person coming back, not a second account,
+        // and the client's stored reference points at the old id.
+        assert_eq!(parsed["id"], json!(alice.as_str()), "{what}: {answer}");
+        // And ACTIVE, because the deactivation their delete recorded must not survive the
+        // re-admit: a 201 carrying `active: false` is a person the client believes it just
+        // provisioned who cannot sign in.
+        assert_eq!(parsed["active"], json!(true), "{what}: {answer}");
+        assert_eq!(
+            db.store()
+                .scoped(scope)
+                .users()
+                .state_for_subject(&alice)
+                .await
+                .expect("read the account state"),
+            Some(ironauth_store::UserState::Active),
+            "{what}"
+        );
+
+        let (status, _) = call(
+            &db,
+            &env,
+            "DELETE",
+            &format!("/scim/v2/Users/{alice}"),
+            Some(&okta.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_duplicate_of_a_live_member_is_still_a_conflict() {
+    // The control for the re-admit. Without it, "a deleted person can be provisioned again"
+    // would pass on an implementation that answered 201 to EVERY duplicate, which would make
+    // a retried create look like a success and hide a genuine collision.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+    for (what, body) in [
+        (
+            "the same handle",
+            json!({"userName": "alice@example.test", "externalId": "00u9new"}),
+        ),
+        (
+            "the same externalId",
+            json!({"userName": "someone@example.test", "externalId": "00u1alice"}),
+        ),
+    ] {
+        let (status, answer) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&okta.token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{what}: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn a_provisioning_client_cannot_lift_an_administrative_block() {
+    // The reactivation guard, which a reviewer showed was vacuous: deleting the three lines
+    // that refuse to move anything but `Disabled` left all 28 tests green, and nothing in the
+    // crate mentioned `Blocked`, `Waitlisted` or `ScheduledOffboarding`.
+    //
+    // A person in one of those states is there because an operator or another subsystem put
+    // them there. `active: true` from a provisioning client must not undo that.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let alice = provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+    let alice_id = db
+        .store()
+        .scoped(scope)
+        .users()
+        .parse_id(&alice)
+        .expect("a user id");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(
+            &env,
+            &alice_id,
+            ironauth_store::UserState::Blocked,
+            ironauth_store::OffboardingSchedule {
+                at_unix_micros: None,
+                wake_payload: None,
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("an operator blocks the account");
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": true}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&alice)
+            .await
+            .expect("read the account state"),
+        Some(ironauth_store::UserState::Blocked),
+        "a provisioning client must not be able to lift an administrative block"
+    );
+
+    // THE CONTROL: the same PATCH DOES reactivate a merely disabled account. Without it this
+    // passes on an implementation that never reactivates anybody.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(
+            &env,
+            &alice_id,
+            ironauth_store::UserState::Disabled,
+            ironauth_store::OffboardingSchedule {
+                at_unix_micros: None,
+                wake_payload: None,
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("an operator disables the account");
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{alice}"),
+        Some(&okta.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": true}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .state_for_subject(&alice)
+            .await
+            .expect("read the account state"),
+        Some(ironauth_store::UserState::Active)
+    );
 }

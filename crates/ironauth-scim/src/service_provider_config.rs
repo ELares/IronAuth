@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The `/ServiceProviderConfig` document (RFC 7644 section 5, issue #135, criterion 4).
+//! The `/ServiceProviderConfig` document (RFC 7644 section 4, issue #135, criterion 4).
 //!
 //! Criterion 4 says bulk requests "respect advertised limits". This module is the ADVERTISED
 //! half, and it exists because without it that sentence is unfalsifiable: a limit nothing
@@ -41,8 +41,10 @@ pub struct ScimLimits {
     /// truncated: a short page that looked complete would make a provisioning client
     /// deprovision every member it did not see.
     ///
-    /// READ IT THROUGH [`ScimLimits::scan_bound`], never directly. The store will not return
-    /// more than [`MANAGEMENT_LIST_HARD_CAP`] rows from one list call, so a value above that
+    /// READ IT THROUGH [`ScimLimits::scan_bound`], never directly. One store list call returns at
+    /// most `MANAGEMENT_LIST_HARD_CAP + 1` rows (the repository clamps its limit to that, so a
+    /// caller can always see ONE row past the cap and tell a full page from the last one), so a
+    /// bound above `MANAGEMENT_LIST_HARD_CAP`
     /// makes the refusal UNREACHABLE and turns the bound into exactly the silent truncation
     /// the paragraph above says it prevents. That is not hypothetical: the first version of
     /// this field defaulted to 10 000, and a reviewer seeded 1100 members and got a 200 with
@@ -166,7 +168,7 @@ pub struct AuthenticationScheme {
 
 /// The `/ServiceProviderConfig` document.
 ///
-/// Serializes to exactly the RFC 7644 section 5 shape, so a connector reads it without
+/// Serializes to exactly the RFC 7644 section 4 shape, so a connector reads it without
 /// special-casing this server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceProviderConfig {
@@ -400,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn the_document_is_the_shape_rfc_7644_section_5_describes() {
+    fn the_document_is_the_shape_rfc_7644_section_4_describes() {
         // A connector reads this without special-casing the server, which means the field
         // names are the RFC's rather than Rust's.
         let document = rendered(ScimLimits::default());

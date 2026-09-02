@@ -1482,9 +1482,10 @@ fn registry() -> Vec<Migration> {
         Migration {
             version: 185,
             name: "scim_group_push",
-            // EXPAND: grants only. It adds no object and removes no privilege, so an old
-            // binary running beside a migrated database is unaffected -- it simply never
-            // exercises the writes the new grants permit.
+            // EXPAND: one new table with its policy, plus grants that only WIDEN. Nothing
+            // existing is altered, no privilege is removed and no data is moved, so an old
+            // binary running beside a migrated database is unaffected: it never reads the new
+            // table and never exercises the writes the new grants permit.
             phase: Phase::Expand,
             sql: include_str!("../migrations/0185_scim_group_push.sql"),
         },

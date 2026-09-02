@@ -79,10 +79,26 @@ async fn call(
     token: Option<&str>,
     body: Option<Value>,
 ) -> (StatusCode, String) {
+    call_with(db, env, method, path, token, body, ScimLimits::default()).await
+}
+
+/// [`call`] with explicit limits, so the scan bound can be driven rather than asserted about.
+///
+/// The groups harness had no such helper, which is why the group member reads were silently
+/// truncated at the bound with nothing to notice.
+async fn call_with(
+    db: &TestDatabase,
+    env: &Env,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+    limits: ScimLimits,
+) -> (StatusCode, String) {
     let state = ScimState::new(
         db.store().clone(),
         env.clone(),
-        ScimLimits::default(),
+        limits,
         ironauth_store::identifier::UniquenessMode::EnvironmentWide,
     );
     let mut builder = Request::builder().method(method).uri(path);
@@ -622,4 +638,323 @@ async fn a_display_name_that_cannot_become_a_slug_is_refused_and_a_collision_is_
 
     // The control: a genuinely different name still creates.
     make_group(&db, &env, &token, "Sales").await;
+}
+
+// ---------------------------------------------------------------------------------------
+// REVIEW ROUND 2.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_group_larger_than_the_scan_bound_is_refused_rather_than_truncated() {
+    // BLOCKER. The three group member reads passed `scan_bound()` as a plain limit with no
+    // probe and no refusal, so a group larger than the bound rendered a SHORT `members` array
+    // inside a 200 -- and `set_members` computes its REMOVALS from that list, so a PUT against
+    // an over-large group both failed to remove people it should and tried to re-add members
+    // it could not see.
+    //
+    // Driven by building the group under a bound that fits it and then reading it under a
+    // smaller one, because a group cannot be grown PAST the bound: the write's own response
+    // renders the group, and that render is one of the reads being bounded.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let roomy = ScimLimits {
+        max_scan: 3,
+        ..ScimLimits::default()
+    };
+    let tight = ScimLimits {
+        max_scan: 2,
+        ..ScimLimits::default()
+    };
+
+    let group = make_group(&db, &env, &token, "Engineering").await;
+    let mut people = Vec::new();
+    for who in ["a", "b", "c"] {
+        let id = provision(&db, &env, &token, &format!("{who}@example.test")).await;
+        people.push(json!({"value": id}));
+    }
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": people}]),
+        )),
+        roomy,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(
+        parsed["members"].as_array().map(Vec::len),
+        Some(3),
+        "at the bound, the whole membership is rendered: {body}"
+    );
+
+    // Under the tighter bound the SAME group is over it, and every door refuses rather than
+    // answering a short list. The PUT matters most: it computes its removals from that list.
+    for (method, request) in [
+        ("GET", None),
+        (
+            "PUT",
+            Some(json!({"displayName": "Engineering", "members": []})),
+        ),
+        (
+            "PATCH",
+            Some(patch(
+                &json!([{"op": "remove", "path": "members", "value": []}]),
+            )),
+        ),
+    ] {
+        let (status, answer) = call_with(
+            &db,
+            &env,
+            method,
+            &format!("/scim/v2/Groups/{group}"),
+            Some(&token),
+            request,
+            tight,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {answer}");
+        assert!(answer.contains("tooMany"), "{method}: {answer}");
+    }
+
+    // And the group is INTACT: every refusal happened before anything was removed. Read back
+    // under the roomy bound, since the tight one cannot see it.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        None,
+        roomy,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(
+        parsed["members"].as_array().map(Vec::len),
+        Some(3),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_create_naming_a_member_it_cannot_reach_creates_nothing() {
+    // MAJOR. The group was created and THEN its members applied, so a create naming a member
+    // this credential may not reach answered 404 with the group already committed -- and the
+    // retry then answered 409 forever on the display name. The most ordinary group push there
+    // is: push a group whose members are not all provisioned yet.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech", "s3cret-initech").await;
+
+    let victim = provision(&db, &env, &globex, "victim@example.test").await;
+    for (what, member) in [
+        ("a member of another organization", victim.as_str()),
+        ("a member that does not exist", "usr_nobody"),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Groups",
+            Some(&initech),
+            Some(json!({"displayName": "Fresh Attackers", "members": [{"value": member}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{what}: {body}");
+
+        // NOTHING was created, which the existing IDOR test could not see: it asserted only
+        // that no member landed and never looked at the group list.
+        let (_, body) = call(&db, &env, "GET", "/scim/v2/Groups", Some(&initech), None).await;
+        let parsed: Value = serde_json::from_str(&body).expect("a list");
+        assert_eq!(parsed["totalResults"], json!(0), "{what}: {body}");
+    }
+
+    // The control: the same name creates cleanly once nothing unreachable is named, which is
+    // the retry the orphan used to block forever.
+    make_group(&db, &env, &initech, "Fresh Attackers").await;
+}
+
+#[tokio::test]
+async fn a_member_named_twice_in_one_request_is_not_a_conflict() {
+    // MAJOR. `set_members` read the existing bindings once, so a payload naming one person
+    // twice tried to insert the same binding twice and hit the unique index: an ordinary
+    // duplicate in a client's payload became a 409.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let alice = provision(&db, &env, &token, "alice@example.test").await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Groups",
+        Some(&token),
+        Some(json!({
+            "displayName": "Engineering",
+            "members": [{"value": alice}, {"value": alice}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    let group = parsed["id"].as_str().expect("an id").to_owned();
+    assert_eq!(
+        members(&db, &env, &token, &group).await,
+        vec![alice.clone()],
+        "one person, once"
+    );
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(&json!([{
+            "op": "add",
+            "path": "members",
+            "value": [{"value": alice}, {"value": alice}],
+        }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(members(&db, &env, &token, &group).await, vec![alice]);
+}
+
+#[tokio::test]
+async fn a_group_patch_that_cannot_be_completed_applies_none_of_it() {
+    // MAJOR. RFC 7644 section 3.5.2's atomicity requirement, implemented for /Users in round 1
+    // and left as a loop on this door: a reviewer sent [add members, replace externalId], got
+    // a 400 for the unsupported second operation, and found the member already added.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+    let alice = provision(&db, &env, &token, "alice@example.test").await;
+    let group = make_group(&db, &env, &token, "Engineering").await;
+
+    for (what, operations) in [
+        (
+            "an unsupported attribute after a member add",
+            json!([
+                {"op": "add", "path": "members", "value": [{"value": alice}]},
+                {"op": "replace", "path": "externalId", "value": "x"},
+            ]),
+        ),
+        (
+            "an unreachable member after a rename",
+            json!([
+                {"op": "replace", "path": "displayName", "value": "Renamed"},
+                {"op": "add", "path": "members", "value": [{"value": "usr_nobody"}]},
+            ]),
+        ),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "PATCH",
+            &format!("/scim/v2/Groups/{group}"),
+            Some(&token),
+            Some(patch(&operations)),
+        )
+        .await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+            "{what}: {status} {body}"
+        );
+        assert!(
+            members(&db, &env, &token, &group).await.is_empty(),
+            "{what}: a member landed"
+        );
+        let (_, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Groups/{group}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&body).expect("a resource");
+        assert_eq!(
+            parsed["displayName"], "Engineering",
+            "{what}: the rename landed"
+        );
+    }
+
+    // The control: each first operation ALONE does apply. Without it this passes on a PATCH
+    // that never applies anything.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&token),
+        Some(patch(
+            &json!([{"op": "add", "path": "members", "value": [{"value": alice}]}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(members(&db, &env, &token, &group).await, vec![alice]);
+}
+
+#[tokio::test]
+async fn a_group_create_answers_the_location_of_the_group_it_created() {
+    // MAJOR. RFC 7644 section 3.3 wants the URI of the CREATED RESOURCE; the users door was
+    // fixed in round 1 and this one kept the collection constant.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let token = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    let state = ScimState::new(
+        db.store().clone(),
+        env.clone(),
+        ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/scim/v2/Groups")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/scim+json")
+        .body(Body::from(
+            json!({"displayName": "Engineering"}).to_string(),
+        ))
+        .expect("request builds");
+    let response = scim_router(state)
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let parsed: Value = serde_json::from_slice(&bytes).expect("a resource");
+    let id = parsed["id"].as_str().expect("an id");
+    assert_eq!(location, format!("/scim/v2/Groups/{id}"));
+
+    // And following it reaches the group, which is the only thing the header is for.
+    let (status, body) = call(&db, &env, "GET", &location, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("a resource");
+    assert_eq!(parsed["meta"]["location"], json!(location.as_str()));
 }
