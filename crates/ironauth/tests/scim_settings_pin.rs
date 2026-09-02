@@ -17,9 +17,9 @@
 //! of these numbers read "`scim_settings_pin.rs` in the `ironauth` crate asserts the two
 //! agree, because this crate cannot see that one" -- and a reviewer found that no such file
 //! existed. The pattern had been copied from `outbox_settings_pin.rs` without the pin. So
-//! the numbers agreed only by coincidence, under a sentence saying they were checked. (For
-//! `max_scan` "coincidence" is too strong -- the SCIM side is derived from the store's list
-//! cap -- but `max_results` is two hand-written literals and nothing compared them.)
+//! the numbers agreed only by coincidence, under a sentence saying they were checked. Both
+//! fields: `max_results` is two hand-written literals, and `max_scan` is a hand-written literal
+//! beside a const-eval of the store's list cap, so moving the cap would separate them.
 //!
 //! # What drifting would actually cost
 //!
@@ -51,17 +51,20 @@ fn the_scim_crate_defaults_are_the_configuration_defaults() {
 }
 
 #[test]
-fn neither_default_exceeds_the_bound_that_makes_the_refusal_reachable() {
+fn the_configured_default_cannot_make_the_refusal_unreachable() {
     // The property `max_scan` actually has to satisfy, asserted on BOTH sides rather than
     // only on the configured one. `validate_scim` refuses a configured value above the cap,
     // but nothing refuses the SCIM crate's own default -- it is what every deployment that
     // never opens the section, and every test in that crate, actually runs on.
     let cap = usize::try_from(ironauth_store::MANAGEMENT_LIST_HARD_CAP).expect("a small cap");
-    // NOT asserted on the SCIM side: `ScimLimits::default().max_scan` IS a const-eval of
-    // `MANAGEMENT_LIST_HARD_CAP`, so `cap <= cap` is a tautology with both sides tracing to
-    // one constant. A reviewer caught that, and it also corrects this file's header: the two
-    // defaults do not agree by coincidence on this field, the SCIM side is DERIVED from the
-    // store cap. The config side is a hand-written literal and is the one that can drift.
+    // ONE SIDE, not both. `ScimLimits::default().max_scan` IS a const-eval of
+    // `MANAGEMENT_LIST_HARD_CAP`, so asserting it against the cap is `cap <= cap` with both
+    // sides tracing to one constant.
+    //
+    // The SCIM side therefore CANNOT drift above the cap, because it is derived from it. The
+    // config side is a hand-written `1000` with nothing tying it to the constant -- move the
+    // cap to 2000 and the SCIM side follows while this one does not -- so it is the one that
+    // can drift and the one asserted here.
     assert!(
         ironauth_config::ScimConfig::default().max_scan as usize <= cap,
         "the configured default scan bound exceeds the store's list cap, so the tooMany \

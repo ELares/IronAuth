@@ -40,8 +40,8 @@ ironauth-admin-ui.workspace = true
 # The SCIM 2.0 inbound surface (issue #135). Its dependencies are already in this binary's
 # graph and none of them is an HTTP client or a TLS stack, so the static musl lane is
 # unaffected. The set is deliberately not enumerated here: an earlier version listed six
-# crates by name and a seventh was added two commits later, which is what a list beside the
-# thing it describes does.
+# crates by name and a seventh was added in the very next commit, which is what a list
+# beside the thing it describes does.
 ironauth-scim.workspace = true
 ironauth-jose.workspace = true
 # The tenant/environment quota engine (issue #50): the boot path builds one

@@ -222,28 +222,39 @@ fn the_mounted_scim_surface_answers_on_the_public_plane() {
         "the boot must SAY it mounted, so an operator can tell: {}",
         process.log()
     );
-    // THE COMPOSITION IS ASSERTED, not just described. A previous revision of this file
-    // claimed in a comment that the OIDC plane was enabled too and never changed the config
-    // that writes it, so the sole test of the mount ran on a plane where SCIM was the only
-    // extension -- and a commit message cited "booting both planes together" as evidence for a
-    // property nothing in the tree exercised. A log assertion is what stops a comment and a
-    // config disagreeing again.
-    assert!(
-        process
-            .log()
-            .contains("OIDC provider, discovery, and per-environment JWKS mounted"),
-        "the OIDC plane must be mounted beside SCIM, or this test is not exercising the \
-         router composition production runs: {}",
-        process.log()
-    );
-    // And the sibling surface still answers, which is what a merged router breaking would show.
-    let discovery = get(port, "/.well-known/openid-configuration");
-    assert!(process.alive(), "the binary died; log:\n{}", process.log());
-    assert!(
-        discovery.starts_with("HTTP/1.1 "),
-        "the OIDC discovery surface stopped answering once SCIM was merged beside it: \
-         {discovery}"
-    );
+    // THE COMPOSITION IS ASSERTED ON THE WIRE, which took three tries to get right and is
+    // worth recording. First the file claimed in a comment that OIDC was enabled and the
+    // config did not enable it. Then the config enabled it and the assertions still did not
+    // measure the mount: one checked a log line that `main.rs` emits BEFORE `mount_public`, so
+    // it proves the plane ASSEMBLED; the other probed
+    // `/.well-known/openid-configuration`, which is not a route in this product -- the real
+    // path carries the scope -- so it answered a bare 404 that `starts_with("HTTP/1.1 ")`
+    // happily accepted. A reviewer no-oped the OIDC mount and both tests stayed green.
+    //
+    // These probe routes the OIDC plane really serves, and use the CONTENT TYPE as the
+    // discriminator for the same reason the SCIM half does: an unmounted path falls through to
+    // axum's own 404, which carries no content type, while every one of these answers with one
+    // even when it refuses.
+    for (path, expect) in [
+        // The token endpoint answers 405 to a GET, with an `allow` header only a mounted
+        // route produces.
+        ("/token", "allow"),
+        // The authorize endpoint refuses a parameterless GET with an HTML error page.
+        ("/authorize", "text/html"),
+        // And the scoped discovery document, which is where `.well-known` actually lives.
+        (
+            "/.well-known/openid-configuration/t/nonexistent/e/nonexistent",
+            "text/plain",
+        ),
+    ] {
+        let answer = get(port, path);
+        assert!(process.alive(), "the binary died; log:\n{}", process.log());
+        assert!(
+            answer.to_ascii_lowercase().contains(expect),
+            "{path} did not answer as a mounted OIDC route (looking for {expect:?}), so this \
+             test is not exercising the router composition production runs: {answer}"
+        );
+    }
 }
 
 #[test]
