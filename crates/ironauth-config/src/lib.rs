@@ -115,6 +115,10 @@ pub struct Config {
     /// policy for typed login identifiers. Safe default: environment-wide uniqueness.
     pub identifiers: IdentifiersConfig,
 
+    /// Inbound SCIM 2.0 provisioning (issue #135). OFF by default, so the default
+    /// boot mounts nothing under `/scim/v2` and every such path is a uniform 404.
+    pub scim: ScimConfig,
+
     /// Per-tenant and per-environment quota fairness settings (issue #50). The
     /// operator-plane noisy-neighbor guard: nested token buckets that keep one
     /// tenant or environment from starving another. Safe defaults, fully tunable
@@ -794,6 +798,72 @@ pub struct TraitsConfig {
     /// that window causes the message to be redelivered mid-batch, which is safe (advance
     /// is resumable and idempotent) but wasteful. Must be at least 1.
     pub migration_batch_size: u32,
+}
+
+/// Inbound SCIM 2.0 provisioning settings (issue #135).
+///
+/// OFF by default. While off nothing is mounted under `/scim/v2` and every such path is a
+/// uniform 404, which is the same shape the admin console takes: a surface an operator has not
+/// asked for is not a surface reachable from the internet.
+///
+/// The callers of this surface are Okta, Entra and their peers, which are hosted services on
+/// the open internet, so it mounts on the PUBLIC plane. Turning it on is a decision to serve a
+/// new authenticated surface publicly.
+///
+/// # There is NO route that mints a connection credential yet
+///
+/// Said plainly, because an earlier version of this comment said the opposite and it ships in
+/// `docs/config-schema.json`, which is a release artifact. The management API has no SCIM
+/// endpoint: `crates/ironauth-admin` contains no reference to SCIM and `docs/openapi/management.json`
+/// publishes no SCIM path. The store surface that creates a connection
+/// (`ActingScimConnectionRepo::create`) is reachable only from inside the process.
+///
+/// So enabling this today gives you a surface that authenticates correctly and that nobody can
+/// obtain a credential for through any shipped interface. It is safe -- every route refuses an
+/// unknown token, and refuses it identically to a malformed one -- but it is not yet useful,
+/// and an operator turning it on should know that rather than discover it. The minting route
+/// belongs with the self-service portal that owns SCIM token lifecycle.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScimConfig {
+    /// Whether to serve the SCIM 2.0 surface on the public plane. Off by default.
+    ///
+    /// Off is a uniform 404 on every `/scim/v2` path, not a 501 or an error document: a
+    /// deployment that has not enabled SCIM should be indistinguishable from one that does not
+    /// implement it.
+    pub enabled: bool,
+
+    /// The most resources one page of a list response may carry.
+    ///
+    /// SCIM lets a client choose `count`, so an unbounded value is a client-chosen amount of
+    /// server work. This is the ceiling the surface clamps to, and it is also the `maxResults`
+    /// the `ServiceProviderConfig` document advertises, so the number an operator sets here is
+    /// the number a provisioning client is told.
+    pub max_results: u32,
+
+    /// The most organization members or groups one list request may examine.
+    ///
+    /// A filter the surface cannot answer from an index is answered by examining members, and
+    /// an unfiltered listing is the same work. Reaching this bound is REFUSED rather than
+    /// silently truncated, because a short page that looked complete would make a provisioning
+    /// client deprovision everyone it did not see.
+    ///
+    /// Must not exceed the store's own list cap: above that the refusal becomes unreachable
+    /// and the truncation happens anyway, which is a measured defect rather than a theory.
+    pub max_scan: u32,
+}
+
+impl Default for ScimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Kept in lockstep with `ironauth_scim::ScimLimits::default()`, which the surface
+            // itself uses when no configuration reaches it. `scim_settings_pin.rs` in the
+            // `ironauth` crate asserts the two agree, because this crate cannot see that one.
+            max_results: 200,
+            max_scan: 1000,
+        }
+    }
 }
 
 impl Default for TraitsConfig {
@@ -5393,6 +5463,7 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         check_byok_unconsumed(&self.byok)?;
         validate_admin(&self.admin)?;
+        validate_scim(&self.scim)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
             self.oidc.authorization_code_ttl_secs,
@@ -5565,6 +5636,42 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
                 "organizations.max_group_depth ({}) must not exceed \
                  {ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING}",
                 organizations.max_group_depth
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the inbound SCIM settings (issue #135).
+///
+/// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
+/// merely large, which is the distinction that decides what belongs in this function.
+fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
+    if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "scim.max_scan ({}) must not exceed the management list hard cap \
+                 ({MANAGEMENT_LIST_HARD_CAP}): one store list call returns at most that many \
+                 rows, so a larger bound can never be reached and the surface silently \
+                 truncates instead of refusing",
+                scim.max_scan
+            ),
+        });
+    }
+    if scim.max_results < 1 {
+        return Err(ConfigError::Invalid {
+            message: "scim.max_results must be at least 1: a zero page returns nothing while \
+                      reporting itself configured"
+                .to_owned(),
+        });
+    }
+    if scim.max_results > scim.max_scan {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "scim.max_results ({}) must not exceed scim.max_scan ({}): a page larger than \
+                 the scan bound can never be filled, so the advertised maxResults would be a \
+                 number no response can reach",
+                scim.max_results, scim.max_scan
             ),
         });
     }
@@ -9517,6 +9624,85 @@ mod tests {
             "<inline>",
         )
         .expect("an explicitly-default section boots");
+    }
+
+    #[test]
+    fn scim_section_defaults_off_and_parses_its_limits() {
+        // Default: the SCIM surface is OFF, so the default boot mounts nothing under
+        // /scim/v2 and every such path is a uniform 404.
+        let config = Config::from_toml_str("", "<inline>").expect("valid").config;
+        assert!(!config.scim.enabled, "scim.enabled defaults to false");
+        assert_eq!(config.scim.max_results, 200);
+        assert_eq!(config.scim.max_scan, 1000);
+
+        // And every key parses, at values DIFFERENT from the defaults, so a parser that
+        // silently ignored the section would fail here rather than pass on the defaults.
+        let on = Config::from_toml_str(
+            "[scim]\nenabled = true\nmax_results = 25\nmax_scan = 500\n",
+            "<inline>",
+        )
+        .expect("valid")
+        .config;
+        assert!(on.scim.enabled);
+        assert_eq!(on.scim.max_results, 25);
+        assert_eq!(on.scim.max_scan, 500);
+
+        // An unknown key is refused, which is what `deny_unknown_fields` buys: a typo in a
+        // security-relevant bound must not read as a default.
+        let err = Config::from_toml_str("[scim]\nenable = true\n", "<inline>")
+            .expect_err("an unknown scim key is refused");
+        assert!(format!("{err}").contains("enable"), "{err}");
+    }
+
+    #[test]
+    fn scim_max_scan_above_the_management_list_hard_cap_is_refused() {
+        // The bound whose violation makes a control UNREACHABLE. One store list call returns
+        // at most MANAGEMENT_LIST_HARD_CAP + 1 rows, so a larger scan bound leaves the
+        // `tooMany` refusal permanently false and the surface truncates silently -- which is
+        // a measured defect, not a theory: a reviewer seeded 1100 members and got a 200
+        // reporting 1001.
+        let err = Config::from_toml_str(
+            &format!(
+                "[scim]\nmax_scan = {}\nmax_results = 10\n",
+                MANAGEMENT_LIST_HARD_CAP + 1
+            ),
+            "<inline>",
+        )
+        .expect_err("a scan bound above the store cap is refused");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("scim.max_scan"), "{rendered}");
+        assert!(
+            rendered.contains(&MANAGEMENT_LIST_HARD_CAP.to_string()),
+            "the refusal must name the cap it is enforcing, got: {rendered}"
+        );
+
+        // The control: exactly AT the cap is permitted, so the refusal is the boundary and
+        // not a section that never accepts a large number.
+        Config::from_toml_str(
+            &format!("[scim]\nmax_scan = {MANAGEMENT_LIST_HARD_CAP}\nmax_results = 10\n"),
+            "<inline>",
+        )
+        .expect("the cap itself is a legal bound");
+    }
+
+    #[test]
+    fn a_scim_page_that_can_never_be_filled_is_refused() {
+        // Zero: a page that returns nothing while reporting itself configured.
+        let err = Config::from_toml_str("[scim]\nmax_results = 0\n", "<inline>")
+            .expect_err("a zero page is refused");
+        assert!(format!("{err}").contains("scim.max_results"), "{err}");
+
+        // Larger than the scan bound: an advertised maxResults no response can reach, which
+        // is the same unreachable-advertisement class one field to the left.
+        let err = Config::from_toml_str("[scim]\nmax_results = 500\nmax_scan = 100\n", "<inline>")
+            .expect_err("a page larger than the scan bound is refused");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("scim.max_results"), "{rendered}");
+        assert!(rendered.contains("scim.max_scan"), "{rendered}");
+
+        // The control: equal is legal, so the comparison is `>` and not `>=`.
+        Config::from_toml_str("[scim]\nmax_results = 100\nmax_scan = 100\n", "<inline>")
+            .expect("a page exactly the size of the scan bound is legal");
     }
 
     #[test]

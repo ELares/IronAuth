@@ -281,7 +281,8 @@ struct Inner {
 /// here rather than silently mapping to the default. A second copy of this match
 /// anywhere would be the shape that rots: one of them gets the new variant and the other
 /// keeps compiling.
-pub(crate) const fn uniqueness_mode(uniqueness: IdentifierUniqueness) -> UniquenessMode {
+#[must_use]
+pub const fn uniqueness_mode(uniqueness: IdentifierUniqueness) -> UniquenessMode {
     match uniqueness {
         IdentifierUniqueness::EnvironmentWide => UniquenessMode::EnvironmentWide,
         IdentifierUniqueness::OrgScoped => UniquenessMode::OrgScoped,

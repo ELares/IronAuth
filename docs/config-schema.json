@@ -2476,6 +2476,32 @@
       },
       "type": "object"
     },
+    "ScimConfig": {
+      "additionalProperties": false,
+      "description": "Inbound SCIM 2.0 provisioning settings (issue #135).\n\nOFF by default. While off nothing is mounted under `/scim/v2` and every such path is a\nuniform 404, which is the same shape the admin console takes: a surface an operator has not\nasked for is not a surface reachable from the internet.\n\nThe callers of this surface are Okta, Entra and their peers, which are hosted services on\nthe open internet, so it mounts on the PUBLIC plane. Turning it on is a decision to serve a\nnew authenticated surface publicly.\n\n# There is NO route that mints a connection credential yet\n\nSaid plainly, because an earlier version of this comment said the opposite and it ships in\n`docs/config-schema.json`, which is a release artifact. The management API has no SCIM\nendpoint: `crates/ironauth-admin` contains no reference to SCIM and `docs/openapi/management.json`\npublishes no SCIM path. The store surface that creates a connection\n(`ActingScimConnectionRepo::create`) is reachable only from inside the process.\n\nSo enabling this today gives you a surface that authenticates correctly and that nobody can\nobtain a credential for through any shipped interface. It is safe -- every route refuses an\nunknown token, and refuses it identically to a malformed one -- but it is not yet useful,\nand an operator turning it on should know that rather than discover it. The minting route\nbelongs with the self-service portal that owns SCIM token lifecycle.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether to serve the SCIM 2.0 surface on the public plane. Off by default.\n\nOff is a uniform 404 on every `/scim/v2` path, not a 501 or an error document: a\ndeployment that has not enabled SCIM should be indistinguishable from one that does not\nimplement it.",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": 200,
+          "description": "The most resources one page of a list response may carry.\n\nSCIM lets a client choose `count`, so an unbounded value is a client-chosen amount of\nserver work. This is the ceiling the surface clamps to, and it is also the `maxResults`\nthe `ServiceProviderConfig` document advertises, so the number an operator sets here is\nthe number a provisioning client is told.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_scan": {
+          "default": 1000,
+          "description": "The most organization members or groups one list request may examine.\n\nA filter the surface cannot answer from an index is answered by examining members, and\nan unfiltered listing is the same work. Reaching this bound is REFUSED rather than\nsilently truncated, because a short page that looked complete would make a provisioning\nclient deprovision everyone it did not see.\n\nMust not exceed the store's own list cap: above that the refusal becomes unreachable\nand the truncation happens anyway, which is a measured defect rather than a theory.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ScopeQuotaConfig": {
       "additionalProperties": false,
       "description": "The limits for one quota tier (issue #50), over the three enforced\ndimensions. Each dimension is a token bucket with a sustained refill rate\n(`*_per_second`) and a burst capacity (`*_burst`); the dimensions enforce\nindependently, so exhausting one does not affect another. A `*_burst` of 0\ndisables that dimension (unlimited), which is how a single-tenant self-hoster\nexpresses no quota.",
@@ -3246,6 +3272,15 @@
         ]
       },
       "description": "Per-tenant and per-environment quota fairness settings (issue #50). The\noperator-plane noisy-neighbor guard: nested token buckets that keep one\ntenant or environment from starving another. Safe defaults, fully tunable\n(the tunability principle); a burst of 0 for a dimension means unlimited\n(the single-tenant self-hoster posture)."
+    },
+    "scim": {
+      "$ref": "#/$defs/ScimConfig",
+      "default": {
+        "enabled": false,
+        "max_results": 200,
+        "max_scan": 1000
+      },
+      "description": "Inbound SCIM 2.0 provisioning (issue #135). OFF by default, so the default\nboot mounts nothing under `/scim/v2` and every such path is a uniform 404."
     },
     "server": {
       "$ref": "#/$defs/ServerConfig",

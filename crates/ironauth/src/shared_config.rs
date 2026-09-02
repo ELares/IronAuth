@@ -593,6 +593,17 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "scim",
+            Reach::OnePlaneOrNoState,
+            "read by `assemble_planes` (issue #135), which decides whether the surface mounts at \
+             all, and by `build_scim_plane`, which sizes its page and scan bounds. ONE \
+             plane holds it: the SCIM state on the public plane. The management plane never \
+             sees it, and there is deliberately no `scim.uniqueness` key -- the mode SCIM \
+             needs is a SHARED value, taken from `[identifiers]` through the single \
+             `uniqueness_mode` match, because two identity doors handed different modes by \
+             configuration would disagree about what the same person is.",
+        ),
+        (
             "messaging",
             Reach::OnePlaneOrNoState,
             "consumed once at boot to build the message delivery consumer (issue #111), a \

@@ -457,3 +457,32 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod payload_bound_tests {
+    use super::BulkLimits;
+
+    #[test]
+    fn the_two_payload_bounds_agree() {
+        // `server::MAX_REQUEST_BYTES` bounds every request body this surface accepts, and
+        // `BulkLimits::max_payload_bytes` bounds a bulk payload. They are the same figure
+        // written as two literals in two modules, and a comment used to claim they were "one
+        // number rather than two that drift" while nothing checked it.
+        //
+        // They must agree in the direction that matters: the bulk limit cannot exceed the
+        // request limit, or the bulk surface would advertise a payload size the router refuses
+        // before the bulk validator ever sees it -- an advertised capability no request can
+        // use, which is the defect class this document exists to avoid.
+        // EQUALITY, because that is what the prose claims. An earlier version asserted only
+        // `<=`, which stays green while `BulkLimits` drops to 512 KiB and the sentence saying
+        // they are "the same figure" becomes false. The direction the `<=` guarded still
+        // matters and is implied: the bulk bound cannot exceed what the router accepts, or the
+        // document would advertise a payload no request can deliver.
+        assert_eq!(
+            BulkLimits::default().max_payload_bytes,
+            crate::server::MAX_REQUEST_BYTES,
+            "the advertised bulk payload bound and the router's body limit are the same \
+             figure written twice; they have drifted"
+        );
+    }
+}

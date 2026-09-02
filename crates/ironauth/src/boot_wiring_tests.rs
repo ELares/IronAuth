@@ -61,6 +61,7 @@ use ironauth_config::{
 };
 use ironauth_env::{Env, ManualClock};
 use ironauth_oidc::{IssuerRegistry, JwksCacheWindow, OidcState};
+use ironauth_scim::ScimState;
 use ironauth_server::SiteContext;
 use ironauth_store::Store;
 use ironauth_store::test_support::TestDatabase;
@@ -79,6 +80,16 @@ const PUBLIC_URL: &str = "https://boot-wiring.invalid";
 /// default (600) and inside the validated 300 to 900 range, so the clamp both planes
 /// apply is a no-op and cannot mask a divergence.
 const JWKS_CACHE_MAX_AGE_SECS: u64 = 900;
+
+/// The SCIM page bound this harness configures, deliberately AWAY from the 200 default.
+///
+/// A fixture written at the defaults cannot distinguish a plane built from the config from one
+/// built from `ScimLimits::default()`, which is the exact non-observation this harness exists
+/// to prevent.
+const SCIM_MAX_RESULTS: u32 = 37;
+/// The SCIM scan bound this harness configures, likewise away from the 1000 default and below
+/// it, so it is also a legal value under `validate_scim`.
+const SCIM_MAX_SCAN: u32 = 512;
 
 /// The address of the object behind an `Arc`, which is what an identity contract means:
 /// the two planes hold the SAME object, not an equal one.
@@ -296,6 +307,9 @@ fn harness_config(db: &TestDatabase, ladder: LadderIntent) -> Config {
          [oidc.lazy_migration]\nenabled = true\n\
          endpoint = \"https://legacy.invalid/verify\"\n\
          [oidc.federation]\nenabled = true\n\
+         [scim]\nenabled = true\n\
+         max_results = {SCIM_MAX_RESULTS}\nmax_scan = {SCIM_MAX_SCAN}\n\
+         [identifiers]\nuniqueness = \"org_scoped\"\n\
          [features]\n",
         app = db.app_url(),
         control = db.control_url(),
@@ -712,5 +726,118 @@ async fn the_boot_path_installs_the_client_key_resolver() {
     assert!(
         unwired.oidc.client_key_resolver().is_none(),
         "the unwired control must NOT hold one, or the assertion above proves nothing"
+    );
+}
+
+/// The SCIM plane assembled from the same fixture, or `None`.
+///
+/// Separate from [`boot_both_planes`] because two of the tests below need the ABSENCE of this
+/// plane, and a helper that `expect`ed it could not express that.
+async fn boot_scim_plane(fixture: &BootFixture) -> Option<ScimState> {
+    assemble_planes(&fixture.config, &fixture.env, &fixture.features)
+        .await
+        .expect("the harness config derives a valid site context")
+        .scim
+        .map(|plane| plane.state)
+}
+
+#[tokio::test]
+async fn the_scim_surface_assembles_with_the_configured_limits() {
+    // The limits must come from the CONFIG, not from `ScimLimits::default()`. Both fixture
+    // values are away from the defaults, so a plane that ignored the section would report 200
+    // and 1000 and fail here.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(
+        &db,
+        &env,
+        LadderIntent {
+            signup_quarantine: true,
+            advanced_recovery: true,
+        },
+    );
+    let state = boot_scim_plane(&fixture)
+        .await
+        .expect("the SCIM plane must assemble against the throwaway database");
+
+    assert_eq!(
+        state.limits().max_results,
+        SCIM_MAX_RESULTS as usize,
+        "the advertised page bound must be the configured one"
+    );
+    assert_eq!(
+        state.limits().max_scan,
+        SCIM_MAX_SCAN as usize,
+        "the scan bound must be the configured one"
+    );
+    // And the fixture values really are distinguishable from the crate defaults, or the two
+    // assertions above would hold against a plane that read no config at all.
+    let unconfigured = ironauth_scim::ScimLimits::default();
+    assert_ne!(unconfigured.max_results, SCIM_MAX_RESULTS as usize);
+    assert_ne!(unconfigured.max_scan, SCIM_MAX_SCAN as usize);
+}
+
+#[tokio::test]
+async fn the_scim_surface_does_not_assemble_when_its_flag_is_off() {
+    // The flag has to be load bearing. Nothing else in this harness asserts a plane's
+    // ABSENCE -- both existing planes are unconditionally expected -- so a builder that
+    // ignored its own flag would otherwise be invisible.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let mut fixture = fixture(
+        &db,
+        &env,
+        LadderIntent {
+            signup_quarantine: true,
+            advanced_recovery: true,
+        },
+    );
+    assert!(
+        boot_scim_plane(&fixture).await.is_some(),
+        "the control: with the flag on, the plane assembles"
+    );
+
+    fixture.config.scim.enabled = false;
+    assert!(
+        boot_scim_plane(&fixture).await.is_none(),
+        "scim.enabled = false must leave the plane unassembled, so nothing mounts"
+    );
+}
+
+#[tokio::test]
+async fn the_scim_surface_and_the_management_plane_hold_the_same_uniqueness_mode() {
+    // TWO DOORS ONTO ONE IDENTITY MODEL. SCIM creates accounts and so does the management
+    // API; if they disagreed about what "the same person" means, one door would accept a
+    // duplicate the other refuses. The mode is mapped by exactly one function
+    // (`ironauth_admin::uniqueness_mode`) and this asserts both planes came through it.
+    //
+    // The fixture drives `org_scoped`, away from the `environment_wide` default, so a plane
+    // that ignored the section and took the default would fail rather than agree by accident.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(
+        &db,
+        &env,
+        LadderIntent {
+            signup_quarantine: true,
+            advanced_recovery: true,
+        },
+    );
+    let scim = boot_scim_plane(&fixture)
+        .await
+        .expect("the SCIM plane must assemble");
+    let planes = boot_both_planes(&fixture).await;
+
+    assert_eq!(
+        scim.uniqueness_mode(),
+        planes.admin.identifier_uniqueness(),
+        "the two identity doors must hold the same uniqueness mode"
+    );
+    // And that shared value is distinguishable from the default, so the agreement above is
+    // an observation rather than two planes both falling back to the same constant.
+    assert_ne!(
+        scim.uniqueness_mode(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+        "the fixture must drive a NON-default mode, or agreement proves nothing"
     );
 }
