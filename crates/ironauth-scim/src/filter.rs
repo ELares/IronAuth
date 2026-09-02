@@ -1323,7 +1323,7 @@ mod seed_corpus_tests {
     fn every_committed_filter_seed_still_parses() {
         let seeds = seeds("scim_filter");
         assert!(
-            seeds.len() >= 12,
+            seeds.len() >= 13,
             "the filter seed corpus must not have shrunk: {}",
             seeds.len()
         );
@@ -1336,19 +1336,71 @@ mod seed_corpus_tests {
     }
 
     #[test]
+    fn every_committed_resource_path_seed_still_parses_or_is_a_named_refusal() {
+        // THE SEEDS ARE THE ONLY THING THAT REACHES THIS PARSER. `parse_resource_path` matches
+        // its first segment EXACTLY against "Users" or "Groups", and nothing else can produce
+        // a `ResourceRef`, so random input stops at the first refusal.
+        //
+        // Measured here, and re-derivable with two commands from
+        // `crates/ironauth-scim/fuzz`:
+        //
+        //   cargo +nightly fuzz run scim_resource_path -- -runs=1
+        //     -> INITED cov: 83 ft: 141      (the corpus alone, before a mutation)
+        //   cargo +nightly fuzz run scim_resource_path <empty-dir> -- -runs=200000 -seed=1
+        //     -> DONE   cov: 54 ft:  65      (200k runs, finding none of it)
+        //
+        // A reviewer found this target shipped with no corpus at all, which meant it was
+        // registered, listed, built, run nightly, and exercising nothing past that first
+        // refusal.
+        //
+        // Unlike the two sibling corpora, some seeds here are deliberate REFUSALS -- an
+        // encoding trick and a lowercase spelling are exactly what this parser exists to
+        // reject, and a corpus of only-accepted paths would leave the refusal arms unseeded.
+        // So this asserts the split: both outcomes present, and every accepted one really
+        // addressing a resource.
+        let seeds = seeds("scim_resource_path");
+        assert!(
+            seeds.len() >= 10,
+            "the resource-path seed corpus must not have shrunk: {}",
+            seeds.len()
+        );
+        let (mut accepted, mut refused) = (0, 0);
+        for (name, text) in seeds {
+            match crate::parse_resource_path(&text) {
+                Ok(reference) => {
+                    // An accepted path must name a resource type, or it accepted something
+                    // that is not a SCIM path at all.
+                    let _ = reference.resource_type();
+                    accepted += 1;
+                }
+                Err(_) => refused += 1,
+            }
+            let _ = name;
+        }
+        assert!(accepted >= 5, "only {accepted} seeds are accepted paths");
+        assert!(
+            refused >= 3,
+            "only {refused} seeds are refusals, so the refusal arms are barely seeded"
+        );
+    }
+
+    #[test]
     fn enough_patch_path_seeds_carry_a_selector_to_seed_that_branch() {
-        // The selector branch of `scim_patch_path` is unreachable from random input: a
-        // reviewer measured 2,000,000 random printable-ASCII strings producing 83,318 parsed
-        // PATCH paths and ZERO with a selector. So the only thing that ever enters it is a
-        // seed, and "some seed happens to have brackets" is not a property worth relying on
-        // without saying so here.
+        // The selector branch of `scim_patch_path` is not reached by random input. A reviewer
+        // generated ten million random printable-ASCII strings across five length
+        // distributions: a few percent parse as a PATCH path and ZERO carry a selector, in
+        // every distribution. The parse RATE depends entirely on the length distribution and
+        // is not worth quoting; the zero does not, and that is the load-bearing half.
+        //
+        // So a seed is the only thing that enters that branch, and "some seed happens to have
+        // brackets" is not a property to rely on silently.
         let with_selector = seeds("scim_patch_path")
             .into_iter()
             .filter_map(|(_, text)| crate::parse_patch_path(&text).ok())
             .filter(|path| path.selector().is_some())
             .count();
         assert!(
-            with_selector >= 5,
+            with_selector >= 8,
             "only {with_selector} seeds carry a value selector, so the branch that evaluates \
              one is barely seeded"
         );
@@ -1372,15 +1424,22 @@ mod seed_corpus_tests {
 
     #[test]
     fn the_filter_seeds_reach_the_evaluator_and_not_only_the_parser() {
-        // A reviewer measured what these seeds actually buy, and it is the whole value of the
-        // corpus: from an EMPTY corpus, 400k runs entered the recursive half of the evaluator
-        // (And / Or / Not / ValuePath) ZERO times, because uniform random bytes parse as a
-        // filter essentially never. From these seeds, 53 times.
+        // WHAT THE SEEDS BUY, stated so a reader can re-derive it rather than trust a figure.
+        // From an EMPTY corpus, `cargo fuzz run scim_filter -- -runs=400000 -seed=1` (and 2,
+        // and 3) saves no input that parses as a connective or a value path; from this corpus
+        // both are present at INITED, before a single mutation.
         //
-        // The first version of this test asserted only `matched > 0 && missed > 0`, and the
-        // same reviewer showed that passes against `json!({})`: one seed is a `not`, which is
-        // true of an empty object, and the other eleven are false. It measured "at least one
-        // seed is a negation", not "the seeds exercise a resource".
+        // An earlier version of this comment explained that as "uniform random bytes parse as
+        // a filter essentially never", and that is FALSE: libFuzzer is coverage guided with
+        // compare tracing, and given 1.4M runs it does crack this grammar from empty. What the
+        // seeds buy is the BUDGET, not the possibility -- and the number that mattered was
+        // borrowed from a review rather than measured here, which is how a wrong reason
+        // travelled with a right conclusion.
+        //
+        // The first version of this test asserted only `matched > 0 && missed > 0`, and a
+        // reviewer showed that passes against `json!({})`: one seed is a `not`, which is true
+        // of an empty object, and the other eleven are false. It measured "at least one seed
+        // is a negation", not "the seeds exercise a resource".
         let resource = super::sample_user_resource();
         let parsed: Vec<super::Filter> = seeds("scim_filter")
             .into_iter()
@@ -1399,9 +1458,15 @@ mod seed_corpus_tests {
             "the sample resource is not exercising the seeds: only {matched} of {} match",
             parsed.len()
         );
+        // TWO, not one. This rested on a single seed whose miss was incidental -- it simply
+        // compares a different value -- so tidying that seed to use the same address every
+        // other one does would have turned the suite red with a message about the wrong
+        // thing. `seed_12` is a deliberate negative and is named as such in the corpus.
         assert!(
-            missed > 0,
-            "every seed matches, so no negative branch is seeded"
+            missed >= 2,
+            "fewer than two seeds miss, so the negative branch rests on an accident: \
+             {missed} of {}",
+            parsed.len()
         );
 
         // And the STRUCTURAL property the coverage measurement is really about: a corpus of

@@ -9,6 +9,22 @@
 name: fuzz
 
 on:
+  # ON PULL REQUESTS, for the `build` job only (the `fuzz` matrix below skips them).
+  #
+  # Without this the build job was worthless, and the commit that added it said the opposite.
+  # A schedule-only workflow cannot gate a merge, and `cargo fuzz run` already compiles its
+  # target -- so the dead `scim_filter` this job was written for had ALREADY been failing its
+  # nightly lane, and adding a second nightly compile detected nothing new. The gap was never
+  # "nothing compiles these"; it was "nothing compiles these BEFORE a merge".
+  #
+  # Path-filtered, because building eight detached crates with a sanitizer is not cheap and
+  # only these paths can break one.
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/*/fuzz/**"
+      - "crates/*/src/**"
+      - ".github/workflows/fuzz.yml"
   schedule:
     # Nightly, off-peak; arbitrary minute to avoid the top-of-hour herd.
     - cron: "27 4 * * *"
@@ -37,7 +53,10 @@ jobs:
   build:
     name: build every fuzz target
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Measured at 394s over eight crates on an M-series laptop, and a hosted runner is
+    # slower, has fewer cores, shares no target directory between the detached crates, and
+    # builds cargo-fuzz from source first.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -48,16 +67,36 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: |
           set -euo pipefail
-          for manifest in fuzz/Cargo.toml crates/*/fuzz/Cargo.toml; do
-            [ -f "$manifest" ] || continue
+          # FOUND, not enumerated. Two hardcoded shapes is the exact narrow search that caused
+          # the miss this job exists for: the dead target lived in the repository-root `fuzz/`
+          # crate and a `crates/*/fuzz` grep did not see it.
+          # `scripts/fuzz-matrix-freshness.sh` walks rather than enumerates for the same
+          # reason, and says so.
+          found=0
+          while IFS= read -r manifest; do
             crate_dir="$(dirname "$(dirname "$manifest")")"
             echo "::group::$crate_dir"
             (cd "$crate_dir" && cargo fuzz build)
             echo "::endgroup::"
-          done
+            found=$((found + 1))
+          done < <(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
+                          -not -path '*/target/*' | sort)
+          # A walk that found nothing would pass silently, which is the failure this job is
+          # supposed to be immune to.
+          if [ "$found" -lt 2 ]; then
+            echo "found only $found fuzz crates; the walk is wrong" >&2
+            exit 1
+          fi
+          echo "built $found fuzz crates"
 
   fuzz:
     name: fuzz ${{ matrix.target }}
+    # NOT on pull requests: eighteen targets at five minutes each is a nightly lane, not a
+    # merge gate. `build` above is the part that gates.
+    if: github.event_name != 'pull_request'
+    # AFTER the build job, so eighteen targets do not each spend five minutes discovering
+    # that the tree does not compile.
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -143,6 +182,10 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
+          # KEYED ON THE PAIR, because the matrix is keyed on (dir, target) and two
+          # crates may legally register the same target name -- which this repository just
+          # had. The bare target name collides in that case and one upload overwrites the
+          # other, losing a crash input.
+          name: fuzz-artifacts-${{ matrix.target }}-${{ strategy.job-index }}
           path: ${{ matrix.dir }}/fuzz/artifacts/
           if-no-files-found: ignore

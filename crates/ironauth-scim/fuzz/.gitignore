@@ -8,7 +8,8 @@ artifacts/
 # committing.
 #
 # The CURATED seeds are kept, and the rule is exact rather than approximate: every corpus
-# entry this repository tracks is named `seed_*` (20 of them here, verified), and libFuzzer
+# entry this repository tracks is named `seed_*` (one per `seed_*` file; the tests in the crate assert the floors, which is the
+# version that cannot drift), and libFuzzer
 # names what it generates after the hash of the contents, so the two populations cannot
 # collide. Adding a new seed therefore needs no `git add -f`.
 corpus/**

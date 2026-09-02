@@ -23,7 +23,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 ironauth-webauthn = { path = "../crates/ironauth-webauthn" }
-ironauth-scim = { path = "../crates/ironauth-scim" }
 serde_json = "1"
 # The certificate-facing half of the target builds the two carriers an X.509 chain
 # arrives in: a CBOR `packed` attestation statement and an MDS3 JWS header, whose

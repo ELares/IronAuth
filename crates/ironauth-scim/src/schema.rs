@@ -80,7 +80,7 @@ fn attribute(name: &str, kind: &str, multi: bool, required: bool, mutability: Mu
 /// surface no identity provider would attempt to use, and would have to be reverted attribute
 /// by attribute as each lands.
 ///
-/// [`crate::schema::tests::the_user_schema_covers_every_attribute_the_model_parses`] checks the
+/// The test `the_user_schema_covers_every_attribute_the_model_parses` checks the
 /// direction that MUST hold: everything the model parses is published. The reverse direction
 /// is deliberately not asserted, for the reason above.
 #[must_use]

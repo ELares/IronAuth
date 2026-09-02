@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = path.attribute();
     let _ = path.sub_attribute();
     if let Some(selector) = path.selector() {
-        // The selector is evaluated exactly as the group remove path evaluates it.
+        // Evaluated IN FULL, which no consumer does; see the module comment above.
         let member = serde_json::json!({"value": "usr_fuzz", "type": "User"});
         let _ = ironauth_scim::filter_matches(selector, &member);
     }
