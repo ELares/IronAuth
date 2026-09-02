@@ -33,6 +33,14 @@ pub struct ScimLimits {
     /// SCIM lets a client choose `count`, so an unbounded value is a client-chosen amount of
     /// server work. This is the ceiling [`ScimLimits::clamp_count`] applies.
     pub max_results: usize,
+    /// The most organization members one list request may examine.
+    ///
+    /// A filter this server cannot answer from an index is answered by examining members, and
+    /// an unfiltered list of a large organization is the same work. Both are bounded here, and
+    /// reaching the bound is REFUSED (RFC 7644 section 3.4.2.2 `tooMany`) rather than silently
+    /// truncated: a short page that looked complete would make a provisioning client
+    /// deprovision every member it did not see.
+    pub max_scan: usize,
 }
 
 impl Default for ScimLimits {
@@ -42,6 +50,9 @@ impl Default for ScimLimits {
             // What Okta and Entra page at, and small enough that a hostile `count` buys
             // nothing over an honest one.
             max_results: 200,
+            // Comfortably above any organization a single IdP provisions in practice, and
+            // far below an amount of per-request work a caller can choose.
+            max_scan: 10_000,
         }
     }
 }
@@ -200,6 +211,7 @@ mod tests {
         for limits in [
             ScimLimits::default(),
             ScimLimits {
+                max_scan: ScimLimits::default().max_scan,
                 bulk: BulkLimits {
                     max_operations: 3,
                     max_payload_bytes: 64,
@@ -207,6 +219,7 @@ mod tests {
                 max_results: 7,
             },
             ScimLimits {
+                max_scan: ScimLimits::default().max_scan,
                 bulk: BulkLimits {
                     max_operations: 1,
                     max_payload_bytes: 1,
@@ -264,6 +277,7 @@ mod tests {
         for limits in [
             ScimLimits::default(),
             ScimLimits {
+                max_scan: ScimLimits::default().max_scan,
                 bulk: BulkLimits::default(),
                 max_results: 5,
             },
