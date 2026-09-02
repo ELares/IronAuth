@@ -1178,7 +1178,8 @@ async fn seed_agent_audit_rows(db: &TestDatabase, env: &Env, scope: Scope) -> Pl
 
     let user = ironauth_store::UserId::generate(env, &scope);
     sqlx::query(
-        // FIVE columns, not three. `password_hash` is NOT NULL since 0006, and 0028 added
+        // EIGHT columns, not three, five of them newly required. `password_hash` is NOT NULL
+        // since 0006, and 0028 added
         // `identifier_bidx`, `identifier_sealed`, `claims_sealed` and `pii_dek_version` and made
         // all four NOT NULL when it moved PII behind envelope encryption. The three-column form
         // this used to be could never insert a row on any schema this repository has shipped: a
@@ -1197,7 +1198,18 @@ async fn seed_agent_audit_rows(db: &TestDatabase, env: &Env, scope: Scope) -> Pl
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .bind("not-a-real-hash")
-    .bind(vec![0_u8; 32])
+    // DERIVED from the id, not a constant: `users_identifier_bidx_unique` is UNIQUE over
+    // (tenant, environment, identifier_bidx), so a constant makes a second seeded user in one
+    // scope fail with an opaque 23505 from inside a fixture.
+    .bind(
+        user.to_string()
+            .as_bytes()
+            .iter()
+            .cycle()
+            .take(32)
+            .copied()
+            .collect::<Vec<u8>>(),
+    )
     .bind(vec![0_u8; 16])
     .bind(vec![0_u8; 16])
     .execute(db.owner_pool())

@@ -2529,8 +2529,10 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             format!("{org_base}/agent-approvals/{approval}/decision"),
             &serde_json::json!({ "approve": true }),
         ),
-        // LAST of the agent cases: suspension is not terminal, but it is still a lifecycle
-        // change, and the two above address the same agent.
+        // LAST of the agent cases. Neither handler above reads agent state, so this is
+        // defensive rather than required -- but the LIST-BEFORE-DECIDE order above is not:
+        // deciding consumes the row, and the listing returns only approvals still awaiting a
+        // decision, so reversing them would leave the listing reading an empty queue.
         Case::json(
             "agents.setAgentState",
             "PUT",
@@ -4164,6 +4166,13 @@ fn documented_read_exceptions() -> BTreeSet<&'static str> {
 /// that are freshly generated per run and appear nowhere else in a response.
 fn documented_body_contents(f: &Fixture) -> BTreeMap<&'static str, Vec<String>> {
     BTreeMap::from([
+        // The pending approval queue, by row id. A 200 alone proves nothing here: the read
+        // pass compares STATUS only, and an emptied queue answers 200 exactly as a populated
+        // one does. That is the vacuity this map exists to close, and it matters more for this
+        // listing than most -- an operator asking "what is this agent waiting on" after an
+        // environment is decommissioned reads it, and an empty array answers wrongly rather
+        // than not at all.
+        ("agents.listAgentVaultApprovals", vec![f.approval.clone()]),
         // The user page and the single user, by the id of the seeded row.
         ("users.listUsers", vec![f.user.clone()]),
         ("users.getUser", vec![f.user.clone()]),
