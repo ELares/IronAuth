@@ -26,7 +26,7 @@ use ironauth_config::{
     AUTHZEN_AGENT_PROFILE_FEATURE, Config, FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE,
     FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded, ORG_SCOPED_CLIENTS_FEATURE,
     OidcConfig, OutboxConfig, PasswordPolicyConfig, RISK_SIGNALS_FEATURE, ScreeningFailurePolicy,
-    ScreeningProvider, WASM_HOOKS_FEATURE, WebhooksConfig,
+    ScreeningProvider, TRANSACTION_TOKENS_FEATURE, WASM_HOOKS_FEATURE, WebhooksConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -591,6 +591,10 @@ struct DataPlaneSurfaces {
     /// entirely: the request answers exactly as it would without them, which is a stronger
     /// property than "the seam refuses" and the one an unarmed deployment needs.
     attesters: Option<Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>>,
+    /// The trust domain transaction tokens are minted for (issue #133), or `None` when the
+    /// draft is unacknowledged or no domain is configured. `None` leaves the requested token
+    /// type refused exactly as any unknown one is.
+    transaction_token_domain: Option<String>,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
     /// The experimental org-scoped-clients surface (issue #103, milestone M10).
@@ -628,6 +632,9 @@ impl DataPlaneSurfaces {
             // attester the deployment trusts, and the two conditions are independent. Resolved
             // HERE so every experimental surface is decided in one place.
             attesters: build_attester_registry(features, config),
+            // Not a bool either: "armed" means the draft is acknowledged AND a trust domain is
+            // set, and the domain is the value the mint needs. One resolution, one place.
+            transaction_token_domain: transaction_token_domain(features, config),
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
@@ -1447,6 +1454,10 @@ async fn build_oidc_plane(
     // than refusing on them. So an unacknowledged deployment does not merely fail to advertise
     // the method: a request carrying these headers is answered as though they were not there.
     .with_optional_attesters(surfaces.attesters.clone())
+    // Transaction tokens (issue #133, PROTOTYPE). ONE plane: the exchange is a data-plane
+    // endpoint. `None` leaves the requested type refused as unsupported, which is what an
+    // unarmed deployment already answers for any URI it does not implement.
+    .with_optional_transaction_token_domain(surfaces.transaction_token_domain.clone())
     .with_flows_enabled(surfaces.flows)
     .with_hosted_pages_enabled(surfaces.hosted_pages)
     .with_diagnostics(&config.diagnostics)
@@ -1674,6 +1685,31 @@ async fn build_oidc_plane(
         discovery,
         jwks,
     })
+}
+
+/// The trust domain transaction tokens are minted for, or `None` (issue #133, PROTOTYPE).
+///
+/// TWO conditions, and neither implies the other: the draft acknowledged at its exact revision,
+/// AND a trust domain configured. Returning `None` for either is what makes the exchange refuse
+/// the requested type as unsupported rather than mint a token with an audience nobody chose.
+///
+/// A named function rather than an inline read for the same reason `build_attester_registry` is
+/// one: the boot path that would call it inline needs a live store, so the wiring -- which flag
+/// is read, which config field -- could not be tested at all.
+fn transaction_token_domain(features: &FeatureRegistry, config: &Config) -> Option<String> {
+    if !features.is_enabled(config, TRANSACTION_TOKENS_FEATURE) {
+        return None;
+    }
+    let domain = config.oidc.transaction_token_trust_domain.trim();
+    if domain.is_empty() {
+        tracing::warn!(
+            "transaction tokens (issue #133) are acknowledged but no trust domain is \
+             configured, so the token type stays refused; set \
+             `oidc.transaction_token_trust_domain` to the domain these tokens may be spent in"
+        );
+        return None;
+    }
+    Some(domain.to_owned())
 }
 
 /// Whether the `AuthZEN` agent tool profile is armed (issue #133, PROTOTYPE).
@@ -6355,6 +6391,75 @@ mod tests {
         assert!(
             select_control_dsn(&cfg).is_none(),
             "production without the control DSN must refuse to mount"
+        );
+    }
+
+    /// The transaction-token trust domain needs BOTH conditions (issue #133).
+    ///
+    /// Four cases, and the last two are the ones that matter. A configured domain with no
+    /// acknowledgment must arm nothing, or writing the config would opt an operator into a
+    /// draft-stage wire format they never accepted. And an acknowledgment with no domain must
+    /// arm nothing either, because the audience is the only thing that keeps a transaction
+    /// token inside the trust domain it was minted for: defaulting it would produce a token
+    /// spendable somewhere nobody chose.
+    #[test]
+    fn the_transaction_token_domain_needs_the_ack_and_a_domain() {
+        const ACK: &str = "draft-ietf-oauth-transaction-tokens-09";
+
+        let features = FeatureRegistry::builtin();
+
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            transaction_token_domain(&features, &bare).is_none(),
+            "off in a default deployment"
+        );
+
+        let configured_only = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [oidc]\n\
+             transaction_token_trust_domain = \"internal.example.test\"\n",
+        );
+        assert!(
+            transaction_token_domain(&features, &configured_only).is_none(),
+            "a domain without the acknowledgment arms nothing"
+        );
+
+        let acked_only = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             transaction-tokens = {{ enabled = true, ack = \"{ACK}\" }}\n"
+        ));
+        assert!(
+            transaction_token_domain(&features, &acked_only).is_none(),
+            "an acknowledgment with no domain arms nothing, because the audience is what keeps \
+             the token inside its trust domain"
+        );
+
+        let armed = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             transaction-tokens = {{ enabled = true, ack = \"{ACK}\" }}\n\
+             [oidc]\n\
+             transaction_token_trust_domain = \"internal.example.test\"\n"
+        ));
+        assert_eq!(
+            transaction_token_domain(&features, &armed).as_deref(),
+            Some("internal.example.test"),
+            "both together arm it, and the value reaching the mint is the one configured"
+        );
+
+        // A DIFFERENT prototype's acknowledgment must not arm this one. Without this case the
+        // three refusals above hold against a call site reading any flag at all.
+        let other = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             authzen-agent-profile = { enabled = true, ack = \"0.1.0-exp.1\" }\n\
+             [oidc]\n\
+             transaction_token_trust_domain = \"internal.example.test\"\n",
+        );
+        assert!(
+            transaction_token_domain(&features, &other).is_none(),
+            "an acknowledgment for a different prototype must not arm this one"
         );
     }
 

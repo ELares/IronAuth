@@ -180,6 +180,31 @@ pub async fn token_exchange_grant(
         ExchangeMode::Impersonation
     };
 
+    // TRANSACTION TOKENS (issue #133, PROTOTYPE). Taken HERE, after the client authenticated
+    // and after both presented tokens were revalidated in full, and before the ordinary type
+    // negotiation. The position is the point: `sub` comes from a token this endpoint verified,
+    // never from a claim read out of an unverified payload, which is this module's central
+    // invariant and the reason the prototype composes on the exchange rather than beside it.
+    //
+    // With the feature off, or with no trust domain configured, this returns `None` and the
+    // requested type falls through to `negotiate_type`, which refuses it as unsupported exactly
+    // as it refuses any unknown URI. So an unarmed deployment cannot tell from the answer that
+    // the type has a meaning here.
+    if let Some(response) = crate::transaction_tokens::try_exchange(
+        state,
+        scope,
+        &entry,
+        &crate::transaction_tokens::ExchangeInputs {
+            requested_type: params.requested_token_type.as_deref(),
+            subject: &subject.subject,
+            requester: &client_id_str,
+            authorization_context: &subject.scope,
+            purpose: params.scope.as_deref(),
+        },
+    )? {
+        return Ok(response);
+    }
+
     // What the client asked to narrow TO. The RFC 8707 `resource` parameter and the RFC
     // 8693 `audience` parameter both name a target service, so they are unioned: they are
     // the same request expressed two ways, and honouring only one would let the other

@@ -195,6 +195,10 @@ mod token_hash;
 /// no cranelift, and no hook surface -- the default build is byte-for-byte what it was.
 #[cfg(feature = "wasm-hooks")]
 pub mod token_hook;
+/// Transaction tokens, PROTOTYPE (issue #133). Public so the experimental CI lane can drive the
+/// mint directly; the exchange refuses the requested type unless the draft is acknowledged AND a
+/// trust domain is configured.
+pub mod transaction_tokens;
 
 /// The hook dispatch's SHAPE, with the feature off.
 ///

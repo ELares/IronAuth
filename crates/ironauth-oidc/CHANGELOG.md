@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Experimental: transaction tokens (issue #133)
+
+A PROTOTYPE of `draft-ietf-oauth-transaction-tokens-09`, off by default behind the
+`transaction-tokens` feature and requested through RFC 8693 token exchange. A short-lived signed
+JWT scoped to ONE request inside ONE trust domain, carrying the person, the workload asking, and
+what the original request was authorized to do -- so an internal hop needs neither the user's own
+access token nor an unsigned header.
+
+`sub` comes from the token the exchange REVALIDATED, never from an unverified payload, which is
+why this composes on that endpoint rather than beside it.
+
+**Nothing is minted until a trust domain is configured.** The audience is the only thing keeping
+a transaction token inside the domain it was minted for, so an unset one refuses the token type
+rather than defaulting it: a default trust domain is one nobody chose. Both that and the
+acknowledgment are required, and neither implies the other; with either missing, the requested
+type is refused exactly as any unknown URI is.
+
+**Known limits, recorded in `docs/experimental/transaction-tokens.md`:** `azd` carries the
+subject token's scopes rather than RFC 9396 authorization details, there is no replacement flow
+so each request mints its own `txn` and nothing correlates a call chain, there is no `sub_id`,
+one trust domain per environment, and no replay recording or revocation -- the five-minute
+lifetime cap is the whole mitigation, which is why it is clamped at the mint.
+
 ### Experimental: attestation-based client authentication (issue #133)
 
 A PROTOTYPE of `draft-ietf-oauth-attestation-based-client-auth-10`, off by default behind the

@@ -529,6 +529,14 @@ token_profiles! {
     /// this implements, and `typ` is the field that carries it: the mint stamps this and the
     /// verifier requires it, so neither token answers to the other's policy.
     SessionToken => "session+jwt",
+    /// A TRANSACTION TOKEN: `txn_token` (draft-ietf-oauth-transaction-tokens-09 section 6).
+    ///
+    /// PROTOTYPE (issue #133). Declared here rather than stamped as a bare string at the mint
+    /// site because it is a profile IronAuth MINTS, and the whole point of this list is that
+    /// the spelling the minter stamps and the spelling a verifier requires come from one
+    /// declaration. The draft's media type carries no `+jwt` suffix, which is the draft's
+    /// choice and not a typo.
+    TransactionToken => "txn_token",
 }
 
 impl TokenTyp {
@@ -809,6 +817,9 @@ mod tests {
                 // unregistered media type for the signed `.iaj` journey archive.
                 TokenTyp::JourneyInterchange => "iaj+jws",
                 TokenTyp::SessionToken => "session+jwt",
+                // draft-ietf-oauth-transaction-tokens-09 section 6. No `+jwt` suffix: that is
+                // the draft's spelling, transcribed rather than tidied.
+                TokenTyp::TransactionToken => "txn_token",
             };
             assert_eq!(typ.media_type(), expected, "{typ:?}");
         }

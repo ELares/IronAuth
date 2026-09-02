@@ -1493,3 +1493,10 @@ path = "tests/attestation_client_auth.rs"
 name = "attestation_token_endpoint"
 path = "tests/attestation_token_endpoint.rs"
 required-features = ["testing"]
+
+# TRANSACTION TOKENS (issue #133, draft-ietf-oauth-transaction-tokens-09): what the token
+# carries, the refusal to mint without a trust domain, the lifetime clamp, and that it does not
+# verify as an access token. Drives the mint directly; needs no database.
+[[test]]
+name = "transaction_tokens"
+path = "tests/transaction_tokens.rs"

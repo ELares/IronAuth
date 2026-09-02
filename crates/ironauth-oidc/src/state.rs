@@ -534,6 +534,11 @@ pub struct OidcState {
     // were not there and a client registered for the method while the flag is off fails closed
     // rather than falling back to something weaker.
     attesters: Option<Arc<crate::attestation_client_auth::AttesterRegistry>>,
+    // The trust domain transaction tokens are minted for (issue #133, PROTOTYPE). `None` is the
+    // default and is what makes the requested type refuse as unsupported: a transaction token
+    // with no trust domain has nowhere it may be spent, and a DEFAULT trust domain is one
+    // nobody chose.
+    transaction_token_domain: Option<String>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -1063,6 +1068,7 @@ impl OidcState {
             breach_provider: None,
             federation: None,
             attesters: None,
+            transaction_token_domain: None,
         }
     }
 
@@ -1109,6 +1115,40 @@ impl OidcState {
             Some(registry) => self.with_attesters(registry),
             None => self,
         }
+    }
+
+    /// Install the trust domain transaction tokens are minted for (issue #133, PROTOTYPE).
+    ///
+    /// The boot path calls this only when the experimental feature is acknowledged AND a domain
+    /// is configured, so "installed" and "usable" are one condition. With none installed -- the
+    /// default -- the exchange refuses `urn:ietf:params:oauth:token-type:txn_token` exactly as
+    /// it refuses any unknown requested type, so a deployment that has not opted in cannot tell
+    /// from the answer that the type means anything here.
+    #[must_use]
+    pub fn with_transaction_token_domain(mut self, domain: impl Into<String>) -> Self {
+        let domain = domain.into();
+        if !domain.is_empty() {
+            self.transaction_token_domain = Some(domain);
+        }
+        self
+    }
+
+    /// Install the trust domain when there is one, and change nothing when there is not.
+    ///
+    /// The boot path resolves "acknowledged AND configured" to an `Option` in one place, so the
+    /// chain that assembles the state does not have to branch.
+    #[must_use]
+    pub fn with_optional_transaction_token_domain(self, domain: Option<String>) -> Self {
+        match domain {
+            Some(domain) => self.with_transaction_token_domain(domain),
+            None => self,
+        }
+    }
+
+    /// The trust domain transaction tokens are minted for, if any (issue #133).
+    #[must_use]
+    pub fn transaction_token_domain(&self) -> Option<&str> {
+        self.transaction_token_domain.as_deref()
     }
 
     /// The installed attester registry, if any (issue #133).

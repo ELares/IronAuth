@@ -101,6 +101,20 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the transaction-token prototype (issue #133, exploratory bet 2).
+///
+/// ONE flag for the surface: the requested token type and the trust domain it is minted for.
+/// They are useless apart, and an operator reasoning about "may a workload mint an internal
+/// assertion for a user" is asking one question.
+pub const TRANSACTION_TOKENS_FEATURE: &str = "transaction-tokens";
+
+/// The experimental `ack` version for transaction tokens (issue #133).
+///
+/// The DRAFT REVISION itself, as for attestation client auth and unlike the `AuthZEN` agent
+/// profile: what an operator acknowledges here is a wire format the IETF may still change, so a
+/// draft bump has to invalidate every acknowledgment in the wild.
+pub const TRANSACTION_TOKENS_VERSION: &str = "draft-ietf-oauth-transaction-tokens-09";
+
 /// The registry name of the `AuthZEN` agent tool-authorization profile (issue #133,
 /// exploratory bet 5).
 ///
@@ -327,6 +341,24 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Registers the transaction-token prototype (issue #133, PROTOTYPE).
+    pub fn register_transaction_tokens(&mut self) {
+        self.register(Feature::experimental(
+            TRANSACTION_TOKENS_FEATURE,
+            "Transaction tokens (issue #133, draft-ietf-oauth-transaction-tokens): a \
+             short-lived signed JWT scoped to ONE request inside ONE trust domain, carrying the \
+             person, the workload asking, and what the original request was authorized to do -- \
+             so an internal hop needs neither the user's own access token nor an unsigned \
+             header. Requested through RFC 8693 token exchange. PROTOTYPE: the wire format is \
+             an IETF draft, `azd` carries the subject token's scopes rather than RFC 9396 \
+             authorization details, there is no replacement flow so each request mints its own \
+             transaction id, and NOTHING is minted until a trust domain is configured, because \
+             a token with no audience has nowhere it may be spent.",
+            TRANSACTION_TOKENS_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     /// Registers the `AuthZEN` agent tool-authorization profile (issue #133, PROTOTYPE).
     pub fn register_authzen_agent_profile(&mut self) {
         self.register(Feature::experimental(
@@ -380,6 +412,7 @@ impl FeatureRegistry {
         registry.register_agent_token_vault();
         registry.register_attestation_client_auth();
         registry.register_authzen_agent_profile();
+        registry.register_transaction_tokens();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();
