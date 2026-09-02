@@ -595,10 +595,10 @@ mod tests {
         (
             "scim",
             Reach::OnePlaneOrNoState,
-            "read once by `build_scim_plane` (issue #135) to size the SCIM surface's page \
-             and scan bounds and to decide whether it mounts at all. ONE plane holds it: the \
-             SCIM state on the public plane. The management plane never sees it, and there is \
-             deliberately no `scim.uniqueness` key -- the identifier-uniqueness mode SCIM \
+            "read by `assemble_planes` (issue #135), which decides whether the surface mounts at \
+             all, and by `build_scim_plane`, which sizes its page and scan bounds. ONE \
+             plane holds it: the SCIM state on the public plane. The management plane never \
+             sees it, and there is deliberately no `scim.uniqueness` key -- the mode SCIM \
              needs is a SHARED value, taken from `[identifiers]` through the single \
              `uniqueness_mode` match, because two identity doors handed different modes by \
              configuration would disagree about what the same person is.",

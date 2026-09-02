@@ -396,11 +396,6 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
                     .merge(plane.jwks),
             );
         }
-        // Mount the admin console SPA on the PUBLIC plane under /admin when enabled
-        // (issue #90). mount_public MERGES with the OIDC router above, so both mount
-        // independently; while off nothing is mounted and every /admin path is a
-        // uniform 404. PR1 serves a static shell (no auth yet); PR2 wires the login
-        // and the same origin management proxy.
         // Mount the SCIM 2.0 inbound surface on the PUBLIC plane when enabled (issue #135).
         // `mount_public` MERGES, so this composes with the OIDC router above rather than
         // replacing it. Its callers are hosted provisioning services on the open internet, so
@@ -414,6 +409,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             );
             server = server.mount_public(scim_router(plane.state));
         }
+        // Mount the admin console SPA on the PUBLIC plane under /admin when enabled
+        // (issue #90). mount_public MERGES with the OIDC router above, so both mount
+        // independently; while off nothing is mounted and every /admin path is a
+        // uniform 404. PR1 serves a static shell (no auth yet); PR2 wires the login
+        // and the same origin management proxy.
         if admin_spa_enabled {
             // Wire the same-origin management proxy (issue #90, PR 2): /admin/api/*
             // on the public plane forwards to the in-process management router, but

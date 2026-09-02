@@ -31,6 +31,13 @@
 //! believing any answer, because a stale listener from another test answering for a process
 //! that exited would make a broken mount look fine.
 //!
+//! # The OIDC plane is enabled too, deliberately
+//!
+//! `mount_public` MERGES routers, so the shape production runs is SCIM beside the OIDC
+//! provider, not SCIM alone. A test that enabled only `[scim]` would exercise a router
+//! composition that no deployment uses -- and the composition is exactly where a route
+//! collision or an escaped layer would show up.
+//!
 //! # No HTTP client
 //!
 //! `scripts/http-audit.sh` greps every crate manifest for a direct HTTP-client dependency,

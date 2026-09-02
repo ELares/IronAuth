@@ -321,8 +321,8 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.usage_thresholds_percent` | array | `[80, 100]` | The usage percentages (1 to 100) at which a saturation webhook fires per dimension, so operators see pressure before the hard limit. The default (`[80, 100]`) warns at 80 percent and again at the limit. An empty list disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS` entries; each must be between 1 and 100. |
 | `scim` | table | see fields | Inbound SCIM 2.0 provisioning (issue #135). OFF by default, so the default boot mounts nothing under `/scim/v2` and every such path is a uniform 404. |
 | `scim.enabled` | boolean | `false` | Whether to serve the SCIM 2.0 surface on the public plane. Off by default. |
-| `scim.max_results` | integer | `200` | The most resources one page of a list response may carry. Default 200. |
-| `scim.max_scan` | integer | `1000` | The most organization members or groups one list request may examine. Default 1000. |
+| `scim.max_results` | integer | `200` | The most resources one page of a list response may carry. |
+| `scim.max_scan` | integer | `1000` | The most organization members or groups one list request may examine. |
 | `server` | table | see fields | HTTP server settings. |
 | `server.bind` | string | `"127.0.0.1:8443"` | Socket address the public data plane listens on. This plane serves the protocol and hosted-page surfaces; health, readiness, and metrics are never exposed here. |
 | `server.management_bind` | string | `"127.0.0.1:9443"` | Socket address the management plane listens on. Liveness, readiness, and the Prometheus metrics endpoint live here so the data plane is never probed publicly; bind it to a private interface. |

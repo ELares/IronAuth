@@ -807,9 +807,22 @@ pub struct TraitsConfig {
 /// asked for is not a surface reachable from the internet.
 ///
 /// The callers of this surface are Okta, Entra and their peers, which are hosted services on
-/// the open internet, so it mounts on the PUBLIC plane. Turning it on is therefore a decision
-/// to serve a new authenticated surface publicly, and the credential that reaches it is minted
-/// separately over the management API.
+/// the open internet, so it mounts on the PUBLIC plane. Turning it on is a decision to serve a
+/// new authenticated surface publicly.
+///
+/// # There is NO route that mints a connection credential yet
+///
+/// Said plainly, because an earlier version of this comment said the opposite and it ships in
+/// `docs/config-schema.json`, which is a release artifact. The management API has no SCIM
+/// endpoint: `crates/ironauth-admin` contains no reference to SCIM and `docs/openapi/management.json`
+/// publishes no SCIM path. The store surface that creates a connection
+/// (`ActingScimConnectionRepo::create`) is reachable only from inside the process.
+///
+/// So enabling this today gives you a surface that authenticates correctly and that nobody can
+/// obtain a credential for through any shipped interface. It is safe -- every route refuses an
+/// unknown token, and refuses it identically to a malformed one -- but it is not yet useful,
+/// and an operator turning it on should know that rather than discover it. The minting route
+/// belongs with the self-service portal that owns SCIM token lifecycle.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ScimConfig {
@@ -820,7 +833,7 @@ pub struct ScimConfig {
     /// implement it.
     pub enabled: bool,
 
-    /// The most resources one page of a list response may carry. Default 200.
+    /// The most resources one page of a list response may carry.
     ///
     /// SCIM lets a client choose `count`, so an unbounded value is a client-chosen amount of
     /// server work. This is the ceiling the surface clamps to, and it is also the `maxResults`
@@ -828,7 +841,7 @@ pub struct ScimConfig {
     /// the number a provisioning client is told.
     pub max_results: u32,
 
-    /// The most organization members or groups one list request may examine. Default 1000.
+    /// The most organization members or groups one list request may examine.
     ///
     /// A filter the surface cannot answer from an index is answered by examining members, and
     /// an unfiltered listing is the same work. Reaching this bound is REFUSED rather than
@@ -5629,9 +5642,6 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
     Ok(())
 }
 
-/// Validate the management API settings, extracted from [`Config::validate`] for the
-/// reason `validate_organizations` was: one section's rules read as a unit, and the
-/// combined function grew past the crate's length lint when the second rule landed.
 /// Validate the inbound SCIM settings (issue #135).
 ///
 /// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
@@ -5668,6 +5678,9 @@ fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validate the management API settings, extracted from [`Config::validate`] for the
+/// reason `validate_organizations` was: one section's rules read as a unit, and the
+/// combined function grew past the crate's length lint when the second rule landed.
 fn validate_admin(admin: &AdminConfig) -> Result<(), ConfigError> {
     if admin.max_authzen_batch > MANAGEMENT_MAX_AUTHZEN_BATCH_CEILING {
         return Err(ConfigError::Invalid {

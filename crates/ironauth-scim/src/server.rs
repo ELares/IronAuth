@@ -44,10 +44,20 @@ use serde_json::json;
 
 use crate::service_provider_config::{ScimLimits, ServiceProviderConfig};
 
+/// How many unauthenticated credential checks may be in flight at once.
+///
+/// Sized for a provisioning surface rather than an interactive one: Okta and Entra open a
+/// small connection pool and sync in batches, so a legitimate deployment never approaches
+/// this. It is a backstop against an unauthenticated caller choosing how much database work
+/// this surface does, not a throughput knob.
+const MAX_INFLIGHT_CREDENTIAL_CHECKS: usize = 32;
+
 /// The largest request body this surface accepts.
 ///
-/// One mebibyte, matching `BulkLimits::max_payload_bytes`, so the two bounds a caller can hit
-/// are one number rather than two that drift. A SCIM create or PATCH is a small JSON document;
+/// One mebibyte, the same figure as `BulkLimits::max_payload_bytes`. They are TWO literals,
+/// not one: a reviewer pointed out that an earlier version of this sentence claimed they were
+/// "one number rather than two that drift" while nothing pinned them together. The agreement
+/// is asserted by `the_two_payload_bounds_agree` below rather than described here. A SCIM create or PATCH is a small JSON document;
 /// the only shape that approaches this is a bulk payload, and that surface advertises the same
 /// figure.
 ///
@@ -73,8 +83,19 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 ///
 /// No handler here produces a 413, so a 413 is always the body-limit layer's.
 ///
-/// A response MAP rather than a fallback, because `DefaultBodyLimit` rejects before routing
-/// and there is no handler to hand it to.
+/// # Why a response map and not a fallback
+///
+/// A reviewer falsified the reason an earlier version of this comment gave. It said
+/// `DefaultBodyLimit` "rejects before routing", and it does not: the layer only inserts a
+/// limit into the request extensions, and the 413 is produced by the BODY EXTRACTOR inside
+/// the matched route. A router `fallback` therefore never sees it, which is why this is a
+/// response map.
+///
+/// The correction matters beyond the wording. Because the bound is enforced by the extractor,
+/// it reaches only handlers that extract a body -- a route taking no body extractor would
+/// answer 200 to an oversized request, which the reviewer demonstrated directly. Every route
+/// on this surface that accepts a body takes `body: String`, so the bound is complete today;
+/// a future route that reads the body some other way would not inherit it.
 async fn scim_shaped_refusal(response: Response) -> Response {
     if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
         return response;
@@ -100,6 +121,25 @@ struct ScimStateInner {
     env: ironauth_env::Env,
     limits: ScimLimits,
     uniqueness: UniquenessMode,
+    /// How many credential checks may be in flight at once.
+    ///
+    /// # The pre-authentication path is a database amplifier
+    ///
+    /// Every request here reaches `scim_connections().authenticate` before anything has been
+    /// authenticated: a syntactically well-formed but invented bearer token gets a store round
+    /// trip. That is by design -- the digest lookup IS the authentication -- but it means an
+    /// unauthenticated caller chooses how much database work this surface does, and a reviewer
+    /// pointed out that the public plane applies no rate limit, no concurrency limit and no
+    /// timeout of its own.
+    ///
+    /// A SEMAPHORE rather than a rate limit, deliberately. A rate limit needs a dimension, and
+    /// the only dimension available before authentication is the scope the token DECLARES --
+    /// which the caller supplies, so budgeting by it lets one caller spread load across
+    /// invented scopes and starve nothing but itself. Bounding concurrency needs no dimension
+    /// and is correct whatever the eventual answer is: it caps the database work in flight,
+    /// and a caller that exceeds it gets the same 503 an outage produces rather than a
+    /// refusal implying its credential is wrong.
+    credential_checks: Arc<tokio::sync::Semaphore>,
 }
 
 impl ScimState {
@@ -122,6 +162,9 @@ impl ScimState {
                 env,
                 limits,
                 uniqueness,
+                credential_checks: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_INFLIGHT_CREDENTIAL_CHECKS,
+                )),
             }),
         }
     }
@@ -142,7 +185,6 @@ impl ScimState {
         &self.inner.env
     }
 
-    /// The deployment's configured identifier-uniqueness mode.
     /// The deployment's configured identifier-uniqueness mode.
     ///
     /// Public so the boot-wiring harness can assert this surface and the management plane hold
@@ -399,6 +441,14 @@ async fn authenticate(
             .as_micros(),
     )
     .map_err(|_| AuthRefusal::Unknown)?;
+    // BOUNDED. See `ScimStateInner::credential_checks`: this is the one store call an
+    // unauthenticated caller can reach, so the number of them in flight is capped rather than
+    // left to whatever arrives.
+    let _permit = state
+        .inner
+        .credential_checks
+        .try_acquire()
+        .map_err(|_| AuthRefusal::Unavailable)?;
     let found = state
         .inner
         .store

@@ -137,6 +137,11 @@ required-features = ["testing"]
 # retention one does: `server.mount_public(scim_router(...))` is a single line in `serve`,
 # and no in-process test can observe whether a deployed process serves that surface. The
 # boot-wiring tests prove the STATE assembles; only this proves it is reachable.
+# The SCIM defaults, pinned across ironauth-config and ironauth-scim (issue #135). Neither
+# crate can see the other, so this is the only place the two Default impls can be compared.
+[[test]]
+name = "scim_settings_pin"
+
 [[test]]
 name = "serve_scim_mount"
 required-features = ["testing"]
