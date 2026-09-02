@@ -97,11 +97,12 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScimConnectionId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimExternalIdId, ScopeStepUpPolicyId,
+    ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId,
+    SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId,
+    TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -159,6 +160,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> AgentVaultRepo<'a> {
         AgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The SCIM `externalId` mappings for this scope (issue #135).
+    ///
+    /// The DATA plane owns these, unlike `scim_connections`: a mapping is written when an IdP
+    /// provisions a person, which is a SCIM request rather than an operator action.
+    #[must_use]
+    pub fn scim_external_ids(&self) -> ScimExternalIdRepo<'a> {
+        ScimExternalIdRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -74850,5 +74863,128 @@ impl ActingScimConnectionRepo<'_> {
         insert_audit_row(&mut tx, &spec, None).await?;
         tx.commit().await?;
         Ok(true)
+    }
+}
+
+/// The SCIM `externalId` mappings for one scope (issue #135).
+pub struct ScimExternalIdRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimExternalIdRepo<'_> {
+    /// Record that `connection` calls `user` by `external_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of this scope; [`StoreError::Conflict`] when
+    /// the connection already maps that `external_id`, or already maps that user -- both are
+    /// the unique indexes, and both mean the same thing to a provisioning client: it has
+    /// already created this person here, and RFC 7644 section 3.3 asks for a 409 rather than a
+    /// second row. [`StoreError::Database`] otherwise.
+    pub async fn bind(
+        &self,
+        id: &ScimExternalIdId,
+        connection: &ScimConnectionId,
+        external_id: &str,
+        user: &UserId,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope
+            || connection.scope() != self.scope
+            || user.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_external_ids \
+                 (id, tenant_id, environment_id, connection_id, external_id, user_id) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(external_id)
+        .bind(user.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The person `connection` calls `external_id`, or `None`.
+    ///
+    /// Scoped to the CONNECTION, not the environment: that is the namespace this table exists
+    /// to provide, and a lookup keyed on the environment would let one IdP resolve another's
+    /// identifier to a person it has never seen.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn resolve(
+        &self,
+        connection: &ScimConnectionId,
+        external_id: &str,
+    ) -> Result<Option<UserId>, StoreError> {
+        if connection.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT user_id FROM scim_external_ids \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND connection_id = $3 AND external_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(external_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let stored: String = row.get("user_id");
+        Ok(Some(
+            UserId::parse_in_scope(&stored, &self.scope).map_err(|_| StoreError::NotFound)?,
+        ))
+    }
+
+    /// What `connection` calls `user`, for the round trip on a read, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn external_id_for(
+        &self,
+        connection: &ScimConnectionId,
+        user: &UserId,
+    ) -> Result<Option<String>, StoreError> {
+        if connection.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT external_id FROM scim_external_ids \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND connection_id = $3 AND user_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(user.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get("external_id")))
     }
 }

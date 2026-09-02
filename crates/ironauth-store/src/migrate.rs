@@ -1472,6 +1472,13 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0183_scim_connections.sql"),
         },
+        Migration {
+            version: 184,
+            name: "scim_external_ids",
+            // EXPAND: one new table the old binary never reads or writes.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0184_scim_external_ids.sql"),
+        },
     ]
 }
 

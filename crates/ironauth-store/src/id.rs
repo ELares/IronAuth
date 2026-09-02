@@ -1217,6 +1217,13 @@ impl ScopedKind for AgentVaultApprovalKind {
     const PREFIX: &'static str = "ava";
 }
 
+/// Marker for a SCIM `externalId` mapping (`sxid_`, issue #135).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScimExternalIdKind;
+impl ScopedKind for ScimExternalIdKind {
+    const PREFIX: &'static str = "sxid";
+}
+
 /// Marker for an inbound SCIM connection (`scim_`, issue #135).
 ///
 /// The non-secret HANDLE of the connection, never its bearer token. Every management
@@ -2077,6 +2084,8 @@ pub type AgentPrincipalId = ScopedId<AgentPrincipalKind>;
 pub type AgentVaultConnectionId = ScopedId<AgentVaultConnectionKind>;
 /// An out-of-band approval identifier (`ava_...`) for a sensitive agent action (issue #132).
 pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
+/// A SCIM `externalId` mapping row identifier (`sxid_...`), issue #135.
+pub type ScimExternalIdId = ScopedId<ScimExternalIdKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
