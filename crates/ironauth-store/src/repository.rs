@@ -12371,7 +12371,7 @@ impl ClientAuthDiagnosticReason {
     /// nothing outside the `match` can observe a variant the array omits, so no runtime
     /// assertion written against the array can notice the omission. Only a witness
     /// derived from the enum's own declaration can, which is what the test above is.
-    pub const ALL: [ClientAuthDiagnosticReason; 17] = [
+    pub const ALL: [ClientAuthDiagnosticReason; 22] = [
         ClientAuthDiagnosticReason::Unparsable,
         ClientAuthDiagnosticReason::UnknownClient,
         ClientAuthDiagnosticReason::MethodMismatch,
@@ -12387,6 +12387,14 @@ impl ClientAuthDiagnosticReason {
         ClientAuthDiagnosticReason::ClientSecretJwtUnsupported,
         ClientAuthDiagnosticReason::AssertionIssuerUntrusted,
         ClientAuthDiagnosticReason::AssertionSubjectUnmapped,
+        // The five identity-chaining reasons (issue #133). In DECLARATION order, which this
+        // list is required to hold: they were added to the enum and to `as_str` and not to
+        // here, so every sweep that iterates ALL silently skipped them.
+        ClientAuthDiagnosticReason::IdentityAssertionPresenterPublic,
+        ClientAuthDiagnosticReason::IdentityAssertionClientMismatch,
+        ClientAuthDiagnosticReason::IdentityAssertionUnbound,
+        ClientAuthDiagnosticReason::IdentityAssertionNoScope,
+        ClientAuthDiagnosticReason::IdentityAssertionScopeExceeded,
         ClientAuthDiagnosticReason::ScopeNotAllowlisted,
         ClientAuthDiagnosticReason::PrincipalNotAuthenticatable,
     ];
@@ -74355,8 +74363,8 @@ impl NativeSsoDeviceSecretRepo<'_> {
     /// AND IT INCLUDES THE SESSION, which is the half that turns "revoking severs the set" from
     /// a hope into a fact. The explicit `revoke_session_set` sweep runs on RP-initiated logout
     /// only; every OTHER way a session ends -- an operator revoking it in the console, a bulk
-    /// revoke, a password change, a risk decision, global token revocation, or plain expiry --
-    /// touches no row in this table. Without this join, each of those would leave a live
+    /// revoke, revoke-all, global token revocation, or the session passing its absolute or idle
+    /// expiry -- touches no row in this table. Without this join, each of those would leave a live
     /// family-wide credential behind a sign-out that reported success, redeemable for up to
     /// thirty days, minting access tokens that are not session bound and therefore survive
     /// every later revocation for their full lifetime.
@@ -74364,6 +74372,14 @@ impl NativeSsoDeviceSecretRepo<'_> {
     /// So the sweep is now an optimisation and this join is the control. That is the right way
     /// round: a control that has to be remembered at six call sites is a control that will be
     /// forgotten at the seventh.
+    ///
+    /// THE PREDICATE IS THE SAME ONE `SessionRepo::get` USES, clause for clause, and that is
+    /// not decoration. The first version checked only revocation, ending, supersession and the
+    /// absolute expiry -- it omitted the IDLE window and the impersonation cap. A session that
+    /// idled out is dead to every other reader in this system, so the person is signed out,
+    /// while this call still called it live and kept minting for the remaining life of the ID
+    /// token. Any liveness check that is written out by hand beside an authoritative one drifts
+    /// from it in exactly the clauses nobody was thinking about.
     ///
     /// The lookup is BY DIGEST, which is what makes it constant-work with respect to the
     /// presented secret: there is no prefix, no scan, and no early exit that differs between a
@@ -74391,7 +74407,11 @@ impl NativeSsoDeviceSecretRepo<'_> {
                AND d.expires_at > TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
                AND s.revoked_at IS NULL AND s.ended_at IS NULL AND s.superseded_by IS NULL \
                AND COALESCE(s.absolute_expires_at, s.expires_at) > \
-                   TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')",
+                   TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+               AND (s.idle_expires_at IS NULL OR s.idle_expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
+               AND (s.impersonation_expires_at IS NULL OR s.impersonation_expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond'))",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -74419,6 +74439,12 @@ impl NativeSsoDeviceSecretRepo<'_> {
     /// Returns how many were revoked, so a caller can record it and a test can tell a severing
     /// that happened from one that matched nothing.
     ///
+    /// `revoked_at` is `GREATEST(issued_at, now)` rather than `now`, because this is ONE update
+    /// covering every row of a session and the clock is the LOGGING-OUT node's. On a node whose
+    /// clock trails the minting node's, a plain `now` violates `revocation_after_issuance` and
+    /// aborts the entire statement -- and the caller swallows that as a warning, so a sweep
+    /// that severed nothing would look like one that had nothing to sever.
+    ///
     /// Keyed on the SESSION rather than on the secret, because that is what "the SSO set" means:
     /// one sign-in can have handed out several secrets (an app asks again after reinstalling),
     /// and revoking the one you happen to hold while leaving its siblings live would sever
@@ -74436,7 +74462,9 @@ impl NativeSsoDeviceSecretRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let result = sqlx::query(
             "UPDATE native_sso_device_secrets \
-             SET revoked_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+             SET revoked_at = GREATEST( \
+                     issued_at, \
+                     TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
              WHERE tenant_id = $1 AND environment_id = $2 AND session_id = $3 \
                AND revoked_at IS NULL",
         )

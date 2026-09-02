@@ -3275,6 +3275,33 @@ impl Harness {
         location_param(&headers, "code").expect("code in redirect")
     }
 
+    /// Issue a code for `client_id` granting `scope`, for a SUBJECT THE CALLER NAMES.
+    ///
+    /// The unnamed variant seeds a fresh user every call, which is right for most suites and
+    /// wrong for any negative that has to vary ONE dimension. A Native SSO test presenting a
+    /// device secret beside another sign-in's ID token, built on the fresh-user helper, differs
+    /// in the person AND the binding, so the subject check refuses it and the `ds_hash` check
+    /// under test is never reached: the two controls shadow each other and deleting either
+    /// leaves the suite green.
+    pub async fn issue_code_for_subject(
+        &self,
+        client_id: &str,
+        subject: &str,
+        scope: &str,
+    ) -> String {
+        self.grant_consent_scoped(subject, client_id, Some(scope))
+            .await;
+        let cookie = self.session_cookie(subject).await;
+        let query = format!(
+            "response_type=code&client_id={client_id}&redirect_uri={}&scope={}",
+            enc(REDIRECT_URI),
+            enc(scope)
+        );
+        let (status, headers, body) = self.authorize_with_cookie(&query, &cookie).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "authorize: {body}");
+        location_param(&headers, "code").expect("code in redirect")
+    }
+
     /// Create a CONFIDENTIAL client registered for `method`, returning its id and
     /// the plaintext secret (shown once).
     pub async fn create_confidential_client(&self, method: ClientAuthMethod) -> (ClientId, String) {

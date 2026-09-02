@@ -17,7 +17,7 @@
 -- that person, until it expired. `trusted_devices` (0053) made the same choice for the same
 -- reason, and this follows it exactly rather than inventing a second shape.
 --
--- WHAT THE ROW IS BOUND TO, and why `sid` is a column rather than a detail.
+-- WHAT THE ROW IS BOUND TO, and why it is the underlying session id rather than `sid`.
 --
 -- The criterion this prototype has to meet is that revoking a device secret SEVERS THE SSO SET.
 -- A set is only severable if it is identifiable, so the row names the sign-in it came from.
@@ -28,9 +28,12 @@
 -- that happened to ask and leave its siblings minting, with the revocation reporting success.
 --
 -- Revoking the secret ends the family's ability to bootstrap new siblings, and so does the
--- session ending by ANY route: redemption joins `sessions` and requires it live, so an operator
--- revoking in the console, a bulk revoke, a password change, a risk decision, global revocation
--- and plain expiry all sever the set without needing to know this table exists. That is the
+-- session ending by ANY route: redemption joins `sessions` and applies the SAME liveness
+-- predicate `SessionRepo::get` uses, so anything that sets `revoked_at`, `ended_at` or
+-- `superseded_by`, or lets the session pass its absolute or idle expiry, severs the set without
+-- needing to know this table exists. Stated as the RULE rather than a list of routes, because a
+-- list gets two of them wrong: a risk decision revokes nothing and a password change preserves
+-- the session it is made from. That is the
 -- property an operator actually wants: "sign this person out" must not leave a credential
 -- behind that mints fresh tokens for them.
 --

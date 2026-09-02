@@ -397,7 +397,12 @@ async fn issue(
             .resolve_access_token_target(&scope, &[], client_id_str)
             .await
             .map_err(|_| TokenError::ServerError)?;
-        inherited.audiences = decision.audience.iter().cloned().collect();
+        // A Native SSO bootstrap KEEPS the resolved default, which is the requesting sibling
+        // as its own audience. Overwriting it with the decision's audience would mint a token
+        // with no `aud` at all, since a bootstrap's decision audience is empty by design.
+        if mode != ExchangeMode::NativeSsoBootstrap {
+            inherited.audiences = decision.audience.iter().cloned().collect();
+        }
         inherited
     } else {
         let targets: Vec<String> = decision.audience.iter().cloned().collect();
@@ -870,15 +875,14 @@ async fn native_sso_subject(
         .map_err(|()| TokenError::InvalidGrant)?;
 
     crate::native_sso::admit(
-        // The verdict above already settled that this is a pair; `admit` re-checks it from the
-        // same parameters so the module stays usable on its own, and the two cannot disagree
-        // because both read the value `check_request_shape` accepted.
-        params
-            .subject_token_type
-            .as_deref()
-            .unwrap_or_default()
-            .trim(),
-        params.actor_token_type.as_deref().map(str::trim),
+        // The CONSTANTS, not the request's copies of them. The verdict was settled by
+        // `check_request_shape` and passed in; re-deriving it here from the raw parameters is
+        // exactly what let one normalization disagree with another. `admit` still re-checks the
+        // pair so the module stands on its own for any other caller; feeding it the constants
+        // makes that check a tautology at THIS call site, which is the honest shape when the
+        // decision has already been made upstream.
+        crate::native_sso::ID_TOKEN_TOKEN_TYPE,
+        Some(crate::native_sso::DEVICE_SECRET_TOKEN_TYPE),
         verified
             .claims()
             .get(crate::native_sso::DS_HASH_CLAIM)
@@ -912,10 +916,11 @@ async fn native_sso_subject(
         // secret from a bootstrap. An empty set here would be refused outright by `decide`
         // ("nothing to narrow from"), which is what made the first version of this unreachable.
         scope: crate::native_sso::inheritable_scope(&record.granted_scope),
-        // The audience the ID token was for. Left empty, `decide` returns an empty audience and
-        // `issue` OVERWRITES the resolved default with it, minting a token with no `aud` at all
-        // -- unbounded for any resource server that does not enforce one.
-        audience: std::iter::once(record.issued_to_client_id.clone()).collect(),
+        // EMPTY on purpose, and `decide` treats a bootstrap's audience as unconstrained for it.
+        // Seeding app A's audience here made the sibling's token audienced to APP A and made
+        // every target it named an `invalid_target`; the sibling's own audience is resolved
+        // below, the way any other first issuance resolves one.
+        audience: std::collections::BTreeSet::new(),
         act: None,
         native_sso_bootstrap: true,
     }))

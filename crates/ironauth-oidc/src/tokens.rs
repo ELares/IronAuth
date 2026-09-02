@@ -3229,6 +3229,7 @@ mod tests {
             "cnf": { "jkt": "evil-thumbprint" },
             "at_hash": "evil-at-hash",
             "c_hash": "evil-c-hash",
+            "ds_hash": "evil-ds-hash",
             "sid": "evil-session",
             // The RFC 8693 actor claim (issue #101): a forged impersonator on a token the
             // attacker obtained honestly, which is an audit forgery rather than a privilege
@@ -3300,6 +3301,7 @@ mod tests {
             "cnf",
             "at_hash",
             "c_hash",
+            "ds_hash",
             "sid",
             "org_id",
             "roles",
@@ -3343,6 +3345,7 @@ mod tests {
             "cnf",
             "at_hash",
             "c_hash",
+            "ds_hash",
             "sid",
             "org_id",
             "roles",

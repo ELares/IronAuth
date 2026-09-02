@@ -29,9 +29,13 @@ against the audience THAT ROW names, not one read out of the token, so the prese
 choose which audience its token is judged against. Then `ds_hash`, then the subject.
 
 **Ending the session severs the SSO set, by ANY route.** The row hangs off the SIGN-IN rather
-than off the app that asked, and redemption JOINS `sessions` and requires it live, so an admin
-revoke, a bulk revoke, a password change, a risk decision, global revocation and plain expiry all
-sever it. RP-initiated logout additionally sweeps the rows eagerly; that sweep is an optimisation
+than off the app that asked, and redemption JOINS `sessions` applying the SAME liveness predicate
+`SessionRepo::get` uses, clause for clause -- revoked, ended, superseded, absolute expiry, the
+IDLE window, and the impersonation cap -- so ANY route that sets `revoked_at`, `ended_at` or
+`superseded_by`, or lets the session pass its absolute or idle expiry, severs it. Stated as the
+rule rather than a list, because an earlier draft enumerated six routes and two were wrong: a
+risk decision revokes nothing (it refuses a NEW sign-in) and a password change deliberately
+preserves the session it is made from. RP-initiated logout additionally sweeps the rows eagerly; that sweep is an optimisation
 and the join is the control, because a control remembered at six call sites is one that will be
 forgotten at the seventh. The row keys on the UNDERLYING session id and not the ID token's `sid`,
 which is per-client by design: keying on `sid` would have severed only the app that happened to
@@ -47,8 +51,12 @@ constructible only after the device secret matched the ID token's `ds_hash`.
 credential and the draft's DPoP-binding question is open and unanswered here; nothing binds it to
 the device beyond the name; its lifetime is clamped at thirty days at the mint rather than
 configured, because an operator-set year would be a year-long key to every sibling app's tokens;
-it is returned ONCE and only its digest is stored; and there is no rotation on redemption, so a
-leaked secret is good until the session ends.
+it is returned ONCE and only its digest is stored; there is no rotation on redemption, so a
+leaked secret is good until the session ends; a re-authentication ORPHANS the row, because
+session rotation does not carry it; and REDEMPTION IS UNGATED per client -- removing the
+impersonation flag removed the only control on the redeeming side and nothing replaced it, so
+any confidential client registered for the exchange can redeem a secret it obtains. A graduation
+must add a per-client gate.
 
 ### Experimental: identity chaining and ID-JAG, the receiving side (issue #133)
 

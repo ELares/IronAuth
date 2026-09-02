@@ -78,6 +78,30 @@ async fn sign_in(
     (status, response)
 }
 
+/// Sign in as `client` FOR A NAMED SUBJECT, so a negative can vary one dimension.
+async fn sign_in_as(
+    h: &Harness,
+    client: &ClientId,
+    secret: &str,
+    subject: &str,
+    scope: &str,
+) -> (StatusCode, String) {
+    let code = h
+        .issue_code_for_subject(&client.to_string(), subject, scope)
+        .await;
+    let (status, _headers, response) = h
+        .token_with_auth(
+            &form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT_URI),
+            ]),
+            Some(&basic(&client.to_string(), secret)),
+        )
+        .await;
+    (status, response)
+}
+
 /// Present a (ID token, device secret) pair at the exchange as `client`.
 async fn present_pair(
     h: &Harness,
@@ -179,9 +203,27 @@ async fn an_armed_deployment_returns_a_bound_pair_and_a_sibling_redeems_it() {
         "a sibling redeems the pair for its own tokens: {response}"
     );
     let issued = json(&response);
-    assert!(
-        issued["access_token"].as_str().is_some(),
-        "and receives an access token: {response}"
+    let access = issued["access_token"].as_str().expect("an access token");
+
+    // ITS OWN token, which is the whole promise and was silently untrue: the audience was
+    // seeded from the ID token's client, so the sibling received a bearer token audienced to
+    // APP A -- the shape impersonation is gated for -- and every target it named came back
+    // `invalid_target` because the subject audience was pinned to app A.
+    let claims = payload(access);
+    assert_eq!(
+        claims["aud"],
+        app_b.to_string(),
+        "the sibling's token is audienced to ITSELF, not to app A: {claims}"
+    );
+    assert_eq!(
+        claims["client_id"],
+        app_b.to_string(),
+        "and issued to it: {claims}"
+    );
+    assert_eq!(
+        claims["sub"],
+        payload(&id_token)["sub"],
+        "for the same person app A signed in as: {claims}"
     );
 
     // `device_sso` is NOT inherited. A sibling that could inherit it would mint a further
@@ -215,18 +257,43 @@ async fn neither_half_of_the_pair_works_alone() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
     assert_eq!(json(&response)["error"], "invalid_grant", "{response}");
 
-    // The secret with an ID token from a DIFFERENT sign-in, carrying a different binding.
-    let (_status, other) = sign_in(&h, &app_a, &secret_a, &format!("openid {DEVICE_SSO}")).await;
+    // The secret with an ID token from a DIFFERENT SIGN-IN BY THE SAME PERSON, so the ONLY
+    // thing that differs is the binding.
+    //
+    // The first version signed in twice through the fresh-user helper, so the two sign-ins
+    // differed in the person AND the binding. The subject check refused it and `ds_hash` was
+    // never reached: a reviewer proved both controls could be deleted independently with the
+    // whole suite still green. A negative that varies two dimensions measures whichever control
+    // happens to fire first.
+    let subject = payload(&id_token)["sub"].as_str().expect("sub").to_owned();
+    let (_status, other) = sign_in_as(
+        &h,
+        &app_a,
+        &secret_a,
+        &subject,
+        &format!("openid {DEVICE_SSO}"),
+    )
+    .await;
     let other_id_token = json(&other)["id_token"]
         .as_str()
         .expect("an id token")
         .to_owned();
+    assert_eq!(
+        payload(&other_id_token)["sub"],
+        payload(&id_token)["sub"],
+        "the same person, so only the binding differs"
+    );
+    assert_ne!(
+        payload(&other_id_token)["ds_hash"],
+        payload(&id_token)["ds_hash"],
+        "and the bindings really are different, or this case proves nothing"
+    );
     let (status, response) =
         present_pair(&h, &app_a, &secret_a, &other_id_token, &device_secret).await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a secret does not open another sign-in's token: {response}"
+        "a secret does not open the SAME person's other sign-in: {response}"
     );
     assert_eq!(json(&response)["error"], "invalid_grant", "{response}");
 
