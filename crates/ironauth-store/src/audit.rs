@@ -1324,9 +1324,11 @@ pub enum Action {
     /// `akey_` handle.
     ApiKeyRevoked,
     /// An inbound SCIM connection was CREATED (issue #135). The row targets the `scim_`
-    /// handle, never the bearer token and never its digest, and the detail names the
-    /// organization the connection is bound to -- which is the only thing about it that
-    /// decides what it may provision.
+    /// handle, never the bearer token and never its digest.
+    ///
+    /// The detail carries the ORGANIZATION the connection is bound to, which is the only thing
+    /// about it that decides what it may provision. An operator reading this row without it
+    /// would have to join back to a table the credential may since have been revoked from.
     ScimConnectionCreated,
     /// An inbound SCIM connection was REVOKED (issue #135). The row targets the `scim_`
     /// handle. The row is retained rather than deleted, so this action stays resolvable.

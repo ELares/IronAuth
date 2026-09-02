@@ -29,12 +29,11 @@
 --      credential indistinguishable from one that never existed, and the audit rows naming it
 --      outlive it either way.
 --
---   4. `external_id_namespace` is per CONNECTION, not per environment. RFC 7643's `externalId`
---      is the IdP's own identifier and two IdPs provisioning into one organization can easily
---      use the same string for different people. Storing it against the connection is what
---      keeps "look this user up by the externalId my IdP knows" unambiguous; a per-environment
---      namespace would make the second connection's first provisioning either collide or
---      silently update the wrong person.
+--   4. THE ORGANIZATION IS A TYPED, SCOPE-CHECKED ID on the write path, not just a column.
+--      The foreign key below is id-only, and Postgres referential integrity checks BYPASS row
+--      level security, so a bare string resolved any globally existing organization -- another
+--      tenant's included. The repository takes an `OrganizationId` and refuses one out of
+--      scope; this key is the backstop for a NONEXISTENT organization, and only that.
 --
 -- Expand phase: a new table the old binary never reads or writes, so a rollback leaves it
 -- inert.
@@ -105,7 +104,29 @@ CREATE POLICY scim_connections_scope ON scim_connections
 
 -- The CONTROL plane owns the lifecycle: creating a connection mints a credential that can
 -- write users and groups into an organization, which is squarely an operator action.
-GRANT SELECT, INSERT, UPDATE ON scim_connections TO ironauth_control;
+--
+-- UPDATE IS COLUMN SCOPED, exactly as 0123 scopes it for `api_keys`. A whole-table UPDATE let
+-- the control role re-point `organization_id` at another organization, swap `token_digest` for
+-- one it chose, or set `revoked_at` back to NULL -- so the boundary this table exists to
+-- enforce, the verifier, and the permanence of revocation were all editable by the role that
+-- creates connections. Only revocation is a legitimate update.
+GRANT SELECT, INSERT ON scim_connections TO ironauth_control;
+GRANT UPDATE (revoked_at, updated_at) ON scim_connections TO ironauth_control;
+
+-- And revocation is ONE WAY. The column grant above stops a re-pointing; this stops an
+-- un-revocation, which the grant cannot express because `revoked_at` is exactly the column a
+-- revoke must write.
+--
+-- AS RESTRICTIVE, deliberately: `scim_connections_scope` has no FOR clause and no TO clause,
+-- so a permissive narrowing would be OR'd with a check the offending update already satisfies
+-- and would constrain nothing. 0181 and 0182 record the same reasoning.
+CREATE POLICY scim_connections_revoke_is_one_way
+    ON scim_connections
+    AS RESTRICTIVE
+    FOR UPDATE
+    TO ironauth_control
+    USING (revoked_at IS NULL)
+    WITH CHECK (revoked_at IS NOT NULL);
 
 -- The DATA plane READS, because every SCIM request authenticates against this table. It may
 -- not write: a provisioning credential that could mint another provisioning credential would

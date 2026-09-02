@@ -74523,13 +74523,23 @@ pub struct ScimConnection {
     /// The non-secret handle (`scim_`).
     pub id: ScimConnectionId,
     /// THE boundary: the one organization this connection may provision into.
-    pub organization_id: String,
+    ///
+    /// Parsed IN SCOPE on the way out, so a row that somehow held a foreign organization fails
+    /// the read rather than handing a handler a boundary it would trust.
+    pub organization_id: OrganizationId,
     /// The operator-facing label.
     pub display_name: String,
     /// Which IdP this is for: `okta`, `entra` or `generic`.
     pub provider: String,
     /// When it stops authenticating, if ever.
     pub expires_at_unix_micros: Option<i64>,
+    /// WHEN it was revoked, if it was.
+    ///
+    /// A timestamp rather than only the boolean below, because the question an operator asks
+    /// of this table is when a credential stopped working. `revoke`'s doc justifies preserving
+    /// the first `revoked_at`, and a boolean makes that property unobservable through the
+    /// public API -- so the justification could not be checked.
+    pub revoked_at_unix_micros: Option<i64>,
     /// Whether it has been revoked.
     pub revoked: bool,
 }
@@ -74539,7 +74549,13 @@ pub struct NewScimConnection<'a> {
     /// The handle the caller minted.
     pub id: &'a ScimConnectionId,
     /// The organization this connection provisions into, and the only one it ever can.
-    pub organization_id: &'a str,
+    ///
+    /// A TYPED, scoped id rather than a string, and that is the whole slice's claim rather than
+    /// a style choice. The `organizations` foreign key is id-only, and Postgres referential
+    /// integrity checks BYPASS row-level security, so an untyped string resolved any globally
+    /// existing organization -- including one in another tenant. `NewAgent` and
+    /// `NewOrgMembershipRole` take the typed id for exactly this reason.
+    pub organization_id: &'a OrganizationId,
     /// The operator-facing label.
     pub display_name: &'a str,
     /// `okta`, `entra` or `generic`. The column's CHECK is the closed vocabulary.
@@ -74583,7 +74599,8 @@ impl ScimConnectionRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT id, organization_id, display_name, provider, \
-                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
+                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us \
              FROM scim_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
                AND revoked_at IS NULL \
@@ -74602,10 +74619,15 @@ impl ScimConnectionRepo<'_> {
         Ok(Some(ScimConnection {
             id: ScimConnectionId::parse_in_scope(&stored_id, &self.scope)
                 .map_err(|_| StoreError::NotFound)?,
-            organization_id: row.get("organization_id"),
+            organization_id: OrganizationId::parse_in_scope(
+                &row.get::<String, _>("organization_id"),
+                &self.scope,
+            )
+            .map_err(|_| StoreError::NotFound)?,
             display_name: row.get("display_name"),
             provider: row.get("provider"),
             expires_at_unix_micros: row.get("expires_us"),
+            revoked_at_unix_micros: row.get("revoked_us"),
             revoked: false,
         }))
     }
@@ -74632,6 +74654,7 @@ impl ScimConnectionRepo<'_> {
         let rows = sqlx::query(
             "SELECT id, organization_id, display_name, provider, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
                     (revoked_at IS NOT NULL) AS revoked \
              FROM scim_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
@@ -74649,10 +74672,15 @@ impl ScimConnectionRepo<'_> {
                 Ok(ScimConnection {
                     id: ScimConnectionId::parse_in_scope(&stored_id, &self.scope)
                         .map_err(|_| StoreError::NotFound)?,
-                    organization_id: row.get("organization_id"),
+                    organization_id: OrganizationId::parse_in_scope(
+                        &row.get::<String, _>("organization_id"),
+                        &self.scope,
+                    )
+                    .map_err(|_| StoreError::NotFound)?,
                     display_name: row.get("display_name"),
                     provider: row.get("provider"),
                     expires_at_unix_micros: row.get("expires_us"),
+                    revoked_at_unix_micros: row.get("revoked_us"),
                     revoked: row.get("revoked"),
                 })
             })
@@ -74688,16 +74716,20 @@ impl ActingScimConnectionRepo<'_> {
             token_digest,
             expires_at_unix_micros,
         } = spec;
-        if id.scope() != self.scope {
+        // BOTH ids, not just the connection's. The organization guard is the one this slice
+        // exists for: without it a control-plane caller binds a credential to another tenant's
+        // organization and the foreign key waves it through, because RI does not see RLS.
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
         let id = *id;
-        let organization_id = organization_id.to_owned();
+        let organization_id = organization_id.to_string();
         let display_name = display_name.to_owned();
         let provider = provider.to_owned();
         let token_digest = token_digest.to_owned();
-        write_audited(
+        let organization_detail = organization_id.clone();
+        write_audited_detailed(
             AuditedWrite {
                 store: self.store,
                 scope,
@@ -74738,22 +74770,33 @@ impl ActingScimConnectionRepo<'_> {
                 Ok(())
             },
             false,
+            // The organization, which is what makes the row answerable on its own. It is an
+            // operator-safe scoped id and never attacker-controlled free text.
+            Some(&organization_detail),
         )
         .await
     }
 
     /// Revoke a connection by its handle, auditing `scim.connection_revoked`.
     ///
-    /// Returns whether a live row was revoked, so a caller can tell a revocation from a
-    /// no-op. Revoking an already-revoked connection is NOT an error and NOT a second
-    /// revocation: the row keeps its first `revoked_at`, because the question an operator asks
-    /// of this table is when the credential stopped working, and a re-revocation that moved
-    /// the timestamp would answer it wrongly.
+    /// Returns whether a live row was revoked.
+    ///
+    /// THREE OUTCOMES, and the first version collapsed them into one audit row each. An absent
+    /// handle is `NotFound`; an already-revoked one commits and audits NOTHING; only a live row
+    /// revoked writes the audit row. The first version wrapped the UPDATE in `write_audited`
+    /// unconditionally, so revoking a handle that was never created still wrote a
+    /// `scim.connection_revoked` row naming a connection that did not exist -- which is the
+    /// opposite of the "revocation is observable" property this table's design rests on. This
+    /// is `ApiKeyRepo::revoke`'s shape, for the same reason it has it.
+    ///
+    /// An already-revoked connection keeps its FIRST `revoked_at`, because the question an
+    /// operator asks here is when the credential stopped working, and a re-revocation that
+    /// moved the timestamp would answer it wrongly.
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id is out of this scope; [`StoreError::Database`] on a
-    /// persistence failure.
+    /// [`StoreError::NotFound`] if the id is out of this scope or names no connection;
+    /// [`StoreError::Database`] on a persistence failure.
     pub async fn revoke(
         &self,
         env: &Env,
@@ -74764,36 +74807,48 @@ impl ActingScimConnectionRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        let id = *id;
-        let outcome = write_audited(
-            AuditedWrite {
-                store: self.store,
-                scope,
-                acting: &self.acting,
-                env,
-                action: Action::ScimConnectionRevoked,
-                target: &id,
-            },
-            async |tx| {
-                let result = sqlx::query(
-                    "UPDATE scim_connections \
-                     SET revoked_at = TIMESTAMPTZ 'epoch' \
-                                      + ($4::bigint * INTERVAL '1 microsecond'), \
-                         updated_at = now() \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
-                       AND revoked_at IS NULL",
-                )
-                .bind(scope.tenant().to_string())
-                .bind(scope.environment().to_string())
-                .bind(id.to_string())
-                .bind(now_micros)
-                .execute(&mut **tx)
-                .await?;
-                Ok(result.rows_affected())
-            },
-            false,
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let changed = sqlx::query(
+            "UPDATE scim_connections \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND revoked_at IS NULL \
+             RETURNING id",
         )
+        .bind(now_micros)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(outcome > 0)
+
+        if changed.is_none() {
+            let exists = sqlx::query(
+                "SELECT 1 FROM scim_connections \
+                 WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
+            )
+            .bind(id.to_string())
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ScimConnectionRevoked,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 }

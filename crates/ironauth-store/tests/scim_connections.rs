@@ -72,7 +72,7 @@ async fn connect(
             env,
             NewScimConnection {
                 id: &id,
-                organization_id: &organization.to_string(),
+                organization_id: organization,
                 display_name: "Okta production",
                 provider: "okta",
                 token_digest: &digest(token),
@@ -103,7 +103,7 @@ async fn a_token_authenticates_and_carries_its_own_organization() {
     assert_eq!(found.id, id);
     // THE POINT. The organization comes off the credential, not off the request, so a handler
     // has nothing to compare and nothing to forget to compare.
-    assert_eq!(found.organization_id, org.to_string());
+    assert_eq!(found.organization_id, org);
     assert_eq!(found.provider, "okta");
     assert!(!found.revoked);
 
@@ -142,8 +142,7 @@ async fn a_token_for_one_organization_never_resolves_another() {
             .expect("authenticate")
             .expect("a live connection");
         assert_eq!(
-            found.organization_id,
-            expected.to_string(),
+            found.organization_id, *expected,
             "{token} resolves ONLY its own organization"
         );
     }
@@ -228,15 +227,31 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
     assert!(listed[0].revoked, "and is shown as revoked");
 
     // Revoking again is a no-op rather than a second revocation.
+    let first_revoked_at = listed[0].revoked_at_unix_micros.expect("a revocation time");
     let again = db
         .control_store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .scim_connections()
-        .revoke(&env, &id, now_micros(&env))
+        .revoke(&env, &id, now_micros(&env) + 5_000_000)
         .await
         .expect("revoke again");
     assert!(!again, "an already-revoked connection reports no change");
+    // AND THE TIMESTAMP IS THE FIRST ONE. That is what `revoke`'s doc justifies the
+    // `revoked_at IS NULL` clause with, and it was unobservable while the read side exposed
+    // only a boolean.
+    let relisted = db
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .list_for_organization(&org)
+        .await
+        .expect("list");
+    assert_eq!(
+        relisted[0].revoked_at_unix_micros,
+        Some(first_revoked_at),
+        "a re-revocation keeps the FIRST revocation time"
+    );
 }
 
 #[tokio::test]
@@ -255,7 +270,7 @@ async fn an_expired_token_stops_authenticating_without_being_revoked() {
             &env,
             NewScimConnection {
                 id: &id,
-                organization_id: &org.to_string(),
+                organization_id: &org,
                 display_name: "Entra staging",
                 provider: "entra",
                 token_digest: &digest("scim_tok_stale"),
@@ -309,4 +324,131 @@ async fn the_listing_is_per_organization_and_not_per_environment() {
         .expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, a);
+}
+
+#[tokio::test]
+async fn a_connection_cannot_be_bound_to_another_tenants_organization() {
+    // THE SLICE'S WHOLE CLAIM, and the first version did not enforce it.
+    //
+    // The `organizations` foreign key is id-only, and Postgres referential integrity checks
+    // BYPASS row-level security, so an untyped `organization_id` string resolved any globally
+    // existing organization -- another tenant's included. `create` then bound a credential to
+    // it and `authenticate` handed that foreign organization to the caller as the boundary it
+    // should trust. A reviewer proved it by measurement; nothing here had driven it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let org_b = seed_org(&db, &env, scope_b, "Beta").await;
+
+    let id = ScimConnectionId::generate(&env, &scope_a);
+    let outcome = db
+        .control_store()
+        .scoped(scope_a)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &id,
+                // Scope A's connection, scope B's organization.
+                organization_id: &org_b,
+                display_name: "Cross-tenant",
+                provider: "generic",
+                token_digest: &digest("scim_tok_cross"),
+                expires_at_unix_micros: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+        "an organization from another tenant is refused, not bound: {outcome:?}"
+    );
+
+    // And nothing was written, so the refusal is not a half-done create.
+    assert!(
+        db.store()
+            .scoped(scope_a)
+            .scim_connections()
+            .authenticate(&digest("scim_tok_cross"), now_micros(&env))
+            .await
+            .expect("authenticate")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn every_scope_guard_refuses_a_foreign_id() {
+    // The three `NotFound` paths the repo documents. None was driven, which is the blind spot
+    // that let the cross-tenant bind above ship: a guard nothing exercises is a guard nobody
+    // notices the absence of.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let org_a = seed_org(&db, &env, scope_a, "Alpha").await;
+    let org_b = seed_org(&db, &env, scope_b, "Beta").await;
+    let foreign_id = ScimConnectionId::generate(&env, &scope_b);
+
+    // `create` with a foreign CONNECTION id.
+    let outcome = db
+        .control_store()
+        .scoped(scope_a)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &foreign_id,
+                organization_id: &org_a,
+                display_name: "Foreign handle",
+                provider: "generic",
+                token_digest: &digest("scim_tok_foreign_id"),
+                expires_at_unix_micros: None,
+            },
+        )
+        .await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+
+    // `revoke` with a foreign connection id.
+    let outcome = db
+        .control_store()
+        .scoped(scope_a)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &foreign_id, now_micros(&env))
+        .await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+
+    // `list_for_organization` with a foreign organization.
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_connections()
+        .list_for_organization(&org_b)
+        .await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+}
+
+#[tokio::test]
+async fn revoking_a_handle_that_names_nothing_is_not_found() {
+    // And it writes no audit row, which the shape of `revoke` now guarantees: an absent handle
+    // returns before the audit write. The first version wrapped the UPDATE unconditionally, so
+    // revoking a handle that was never created still recorded `scim.connection_revoked`
+    // naming a connection that did not exist -- the opposite of "revocation is observable".
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let never = ScimConnectionId::generate(&env, &scope);
+    let outcome = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &never, now_micros(&env))
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+        "a handle naming no connection is NotFound rather than a silent no-op: {outcome:?}"
+    );
 }
