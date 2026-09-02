@@ -417,6 +417,13 @@ async fn issue(
         // enforces the per-client allowlist. The ordinary first-issuance doors call
         // `resources_permitted`; this one did not, so a sibling could mint for a resource its
         // own allowlist forbids while the same client asking through the front door is refused.
+        //
+        // The ALLOWLIST HALF only. Those doors also enforce `require_resource_indicator`
+        // through `effective_exchange_resources`, and this endpoint never has, for this mode or
+        // any other: a client registered to refuse indicator-less requests still receives a
+        // client-id-audience token from a bootstrap that names no resource. That audience is
+        // the sibling's own id, which no resource server accepts, so it is a parity gap rather
+        // than an escalation -- but it is a gap, and claiming full parity would hide it.
         if mode == ExchangeMode::NativeSsoBootstrap {
             let policy = state
                 .store()
@@ -918,10 +925,12 @@ async fn native_sso_subject(
         TokenError::InvalidGrant
     })?;
 
-    // The person. REDUNDANT BY CONSTRUCTION today and kept deliberately: the row's `subject`
-    // and the token's `sub` are both written from `resolve_public_subject(bindings.subject)` at
-    // the same mint, and `ds_hash` already pins the token to this exact row, so nothing can
-    // currently reach it. It is here against the divergence its own comment describes -- a
+    // The person. REDUNDANT BY CONSTRUCTION today and kept deliberately: both sides derive from
+    // the same `bindings.subject` at one mint -- the ROW keeps the local value and the TOKEN
+    // carries the public one -- and `ds_hash` already pins the token to this exact row, so
+    // nothing can currently reach it. Note which side is which: the row is written raw and only
+    // the token goes through `resolve_public_subject`, which is exactly why the comparison
+    // below applies that derivation rather than comparing the two strings directly. It is here against the divergence its own comment describes -- a
     // per-client pairwise `sub` would make the two differ -- and a reviewer confirmed deleting
     // it changes no test, which is what "redundant" means rather than a gap in coverage.
     //
@@ -974,7 +983,9 @@ struct TransactionTokenBranch<'a> {
     decision: &'a ironauth_store::token_exchange_decision::ExchangeDecision,
     /// Any target the caller named, which this profile refuses rather than ignores.
     requested_audience: &'a std::collections::BTreeSet<String>,
-    /// Downscope, delegation or impersonation.
+    /// Downscope, delegation, impersonation, or a Native SSO bootstrap. All four reach this
+    /// branch, and `mode_label`'s only caller is here, so the bootstrap arm added for issue
+    /// #133 is reachable ONLY through this struct.
     mode: ExchangeMode,
 }
 

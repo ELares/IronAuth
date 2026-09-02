@@ -384,8 +384,12 @@ async fn a_bootstrap_still_obeys_the_requesting_clients_resource_allowlist() {
     // target is a REGISTERED resource server and leaves the per-client allowlist to the caller.
     //
     // Without the check, a sibling could mint for a resource its own allowlist forbids while
-    // the same client asking through the ordinary door is refused. The control below is that
-    // same client and that same resource through that same door.
+    // the same client asking through the ordinary door is refused.
+    //
+    // The control below is that same client at that SAME bootstrap door naming its ALLOWLISTED
+    // resource, which is what makes the refusal above attributable to the allowlist rather than
+    // to anything else about a bootstrap. (It is not an ordinary-door request; this test drives
+    // only the exchange.)
     let mut h = Harness::start().await;
     h.install_native_sso();
 
