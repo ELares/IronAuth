@@ -120,7 +120,7 @@ cargo test -p ironauth-oidc --test identity_chaining
 # fires, and that the assertion's scope is not a way past the machine-grant floor or the
 # presenting client's allowlist. Needs a database.
 #
-# The filter is `id_jag`, and every one of the five grant tests is NAMED for it. That is not a
+# The filter is `id_jag`, and every grant test in that section is NAMED for it. That is not a
 # convention, it is the lane's coverage: the first version of this line matched exactly ONE of
 # them -- the unarmed-posture test, the only one that still passes with the whole prototype
 # deleted -- so the lane was green having exercised none of the checks it names above. A test

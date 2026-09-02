@@ -3935,6 +3935,27 @@ async fn an_armed_deployment_admits_an_honest_id_jag_and_refuses_the_attacks() {
     assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
     assert_refused_because(&h, &client_id, "identity_assertion_client_mismatch").await;
 
+    // AND AN ASSERTION BOUND TO NOBODY, which is refused for the same reason but recorded
+    // under a DIFFERENT one. Without this case the split between the two is untested end to
+    // end: collapsing `Unbound` back into `ClientMismatch` would leave every other test green
+    // while making the interception alert fire for an issuer that forgot to set the claim.
+    let unbound = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-unbound",
+        "",
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present_confidential(&h, &client_id, &secret, &unbound, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_grant",
+        "the wire cannot tell it from an interception: {resp}"
+    );
+    assert_refused_because(&h, &client_id, "identity_assertion_unbound").await;
+
     // THE MISSING CEILING: an assertion with no scope authorizes nothing, so there is nothing to
     // issue against. Treating it as "whatever the local mapping allows" is the widening the
     // ceiling exists to stop.

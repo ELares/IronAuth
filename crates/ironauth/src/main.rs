@@ -6500,11 +6500,11 @@ mod tests {
 
     /// Identity chaining is armed by ITS OWN acknowledgment and no other (issue #133).
     ///
-    /// Only the last case carries weight. The first two hold for any function that returns
-    /// `false` by default -- including one reading a different prototype's constant, which is
-    /// the substitution this test exists to catch. Getting it wrong here is worse than for the
-    /// surfaces that mount a route: those fail visibly as a 404, whereas this one silently
-    /// changes what an ALREADY LIVE grant accepts, off an acknowledgment for something else.
+    /// The first case holds for any function that returns `false` by default. The POSITIVE
+    /// case and the last one are what pin it to THIS feature's constant: a function reading a
+    /// different prototype's fails both. Getting it wrong here is worse than for the surfaces
+    /// that mount a route: those fail visibly as a 404, whereas this one silently changes what
+    /// an ALREADY LIVE grant accepts, off an acknowledgment for something else.
     #[test]
     fn identity_chaining_is_armed_by_its_own_acknowledgment() {
         let features = FeatureRegistry::builtin();
@@ -6593,10 +6593,10 @@ mod tests {
 
     /// The agent tool profile is armed by ITS OWN acknowledgment and no other (issue #133).
     ///
-    /// The third case is the one that matters. The first two are satisfied by any
-    /// implementation that returns `false` by default, and would hold if the call site read a
-    /// different experimental feature's constant -- which would arm a LIVE authorization
-    /// subject type off an acknowledgment for something else entirely.
+    /// The first case is satisfied by any implementation that returns `false` by default. The
+    /// SECOND and the third are what pin it to this feature's constant: a call site reading a
+    /// different experimental feature's fails both, and would otherwise arm a LIVE
+    /// authorization subject type off an acknowledgment for something else entirely.
     #[test]
     fn the_agent_tool_profile_is_armed_by_its_own_acknowledgment() {
         let features = FeatureRegistry::builtin();
@@ -6617,8 +6617,9 @@ mod tests {
             "its own acknowledgment arms it"
         );
 
-        // ANOTHER experimental feature, acknowledged. This must NOT arm the profile, and it is
-        // the only case that distinguishes "reads the right flag" from "reads a flag".
+        // ANOTHER experimental feature, acknowledged. This must NOT arm the profile. Together
+        // with the positive case above it distinguishes "reads the right flag" from "reads a
+        // flag"; neither does so alone.
         let other = config(
             "[admin]\nbootstrap_operator_token = \"t\"\n\
              [features]\n\

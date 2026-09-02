@@ -9029,9 +9029,11 @@ The order matters and is worth writing out, because one step is not where a read
 | check | without it |
 |---|---|
 | the header `typ` is `oauth-id-jag+jwt` | an issuer registered to federate a CI workload could present an assertion that speaks for a **person** |
-| the presenting client is **confidential** | see below: the binding beneath it costs an interceptor nothing |
 | `client_id` names the presenting client | the assertion is a bearer token for whoever intercepts it |
+| the presenting client is **confidential** | see below: the binding above it costs an interceptor nothing |
 | `scope` is present, and bounds the issued **`scope`** | a **local** subject mapping could widen what the **authoritative** domain granted |
+
+The order of the middle two is the order the code checks them in, and it is deliberate. Both refuse, so a caller cannot tell them apart either way, but the **recorded** reason differs. Replaying a stolen assertion through a throwaway public client is the cheapest interception there is; judging the binding first records it as `identity_assertion_client_mismatch`, the reason an operator should page on. Judging the presenter first would file that attack under `identity_assertion_presenter_public`, which usually just means a deployment has not finished configuring, and the alert would never fire for what it was built for.
 
 **The ceiling reaches `scope` and nothing else.** The minted token also carries `org_id` and `roles`, resolved from the **local** principal the assertion's subject maps to, and the assertion does not bound those. That follows from what this grant is -- B mints its own token under its own local identity -- but a resource server that authorizes on `roles` rather than on scope sees no ceiling at all. It is in the graduation list below.
 

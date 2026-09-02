@@ -9,15 +9,21 @@
 //! them; the grant's own DB-backed suite does that, and the distinction has produced a blocker
 //! in every prototype in this series.
 //!
-//! # Why every refusal here is an attack
+//! # Why these refusals exist
 //!
 //! The four checks are what make an identity assertion different from an ordinary bearer
 //! assertion from the same trusted issuer:
 //!
 //! - without the MEDIA TYPE, an issuer trusted to federate a workload can speak for a user;
 //! - without the CLIENT BINDING, the assertion is a bearer token for whoever intercepts it;
-//! - without the SCOPE CEILING, a local subject mapping can widen what the authoritative domain
-//!   granted.
+//! - without a CONFIDENTIAL PRESENTER, satisfying that binding costs an interceptor nothing,
+//!   because a public client authenticates by naming itself;
+//! - without the SCOPE CEILING, a local subject mapping can widen the SCOPE the authoritative
+//!   domain granted.
+//!
+//! Not every refusal is an attack, which is why they do not share one reason: an assertion
+//! naming a DIFFERENT client is an interception, while one naming NO client and one carrying
+//! no scope are an issuer that did not set the claim.
 //!
 //! Each is driven by minting the honest assertion and changing exactly one thing.
 //!
@@ -262,14 +268,19 @@ fn a_repeated_scope_token_is_normalized_away() {
     // as written. `read:orders read:orders` is not wrong and the machine-grant validator
     // passes it through, so this is where it gets normalized: a remote party does not get to
     // choose how this deployment spells its own claims.
+    // DESCENDING on purpose. Every other fixture here happens to be in ascending order, so a
+    // `dedup` that SORTED would agree with one that preserves order on all of them, and the
+    // "first occurrence keeps its place" sentence would be measured by nothing. A reviewer
+    // proved that by mutation: replacing the body with a sorted collect kept every test green.
     let repeated = assertion(
         ID_JAG_TYP,
-        &claims(PRESENTER, Some("orders.read orders.write orders.read")),
+        &claims(PRESENTER, Some("orders.write orders.read orders.write")),
     );
     assert_eq!(
         admit(&repeated, PRESENTER, CONFIDENTIAL, None),
-        Ok(vec!["orders.read".to_owned(), "orders.write".to_owned()]),
-        "the repeat is dropped and the first occurrence keeps its place"
+        Ok(vec!["orders.write".to_owned(), "orders.read".to_owned()]),
+        "the repeat is dropped, the first occurrence keeps its place, and the result is NOT \
+         sorted"
     );
     assert_eq!(
         admit(

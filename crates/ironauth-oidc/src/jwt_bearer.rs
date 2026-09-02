@@ -570,8 +570,8 @@ async fn validate_and_map(
             // the one uniform `invalid_grant`, but an operator has to be able to separate an
             // assertion minted for a different client -- an interception, and the only one of
             // these worth paging on -- from an issuer that forgot to set `scope`. Folding them
-            // into the generic `AssertionInvalid` told the operator nothing the grant's other
-            // seventeen reasons would not have.
+            // into the generic `AssertionInvalid` told the operator nothing the other reasons
+            // this grant can already record would not have.
             Err(refusal) => return Err(JwtBearerError::Reject(diagnose_refusal(refusal))),
         }
     } else {
