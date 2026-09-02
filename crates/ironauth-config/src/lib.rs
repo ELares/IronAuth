@@ -34,12 +34,13 @@ use serde::{Deserialize, Serialize};
 pub use dsn::{Dsn, DsnError, KNOWN_SCHEMES};
 pub use features::{
     ADVANCED_RECOVERY_FEATURE, ADVANCED_RECOVERY_VERSION, AGENT_TOKEN_VAULT_FEATURE,
-    AGENT_TOKEN_VAULT_VERSION, CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION,
-    FEDCM_FEATURE, FEDCM_VERSION, FIRST_PARTY_CHALLENGE_FEATURE, Feature, FeatureRegistry,
-    FeatureValidationError, FeatureViolation, GLOBAL_TOKEN_REVOCATION_DRAFT,
-    GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity, ORG_SCOPED_CLIENTS_FEATURE, RISK_SIGNALS_FEATURE,
-    RISK_SIGNALS_VERSION, SIGNUP_QUARANTINE_FEATURE, SIGNUP_QUARANTINE_VERSION,
-    SUPPORTED_FIRST_PARTY_DRAFT, WASM_HOOKS_FEATURE,
+    AGENT_TOKEN_VAULT_VERSION, ATTESTATION_CLIENT_AUTH_FEATURE, ATTESTATION_CLIENT_AUTH_VERSION,
+    CUSTOM_DOMAINS_ACME_FEATURE, CUSTOM_DOMAINS_ACME_VERSION, FEDCM_FEATURE, FEDCM_VERSION,
+    FIRST_PARTY_CHALLENGE_FEATURE, Feature, FeatureRegistry, FeatureValidationError,
+    FeatureViolation, GLOBAL_TOKEN_REVOCATION_DRAFT, GLOBAL_TOKEN_REVOCATION_FEATURE, Maturity,
+    ORG_SCOPED_CLIENTS_FEATURE, RISK_SIGNALS_FEATURE, RISK_SIGNALS_VERSION,
+    SIGNUP_QUARANTINE_FEATURE, SIGNUP_QUARANTINE_VERSION, SUPPORTED_FIRST_PARTY_DRAFT,
+    WASM_HOOKS_FEATURE,
 };
 pub use secret::{REDACTED, Secret, SecretError, SecretString};
 
@@ -2902,6 +2903,10 @@ pub struct OidcConfig {
     /// stored data) to suppress it. See [`FederationConfig`].
     pub federation: FederationConfig,
 
+    /// Attestation-based client authentication (issue #133, PROTOTYPE). Empty by default, and
+    /// inert unless the `attestation-client-auth` experimental feature is acknowledged.
+    pub attestation_client_auth: AttestationClientAuthConfig,
+
     /// The IdP-side FedCM surface settings (issue #83, EXPLORATORY): the single
     /// designated `(tenant, environment)` this origin exposes over FedCM plus the
     /// branding metadata the browser account chooser renders. This section only
@@ -3393,6 +3398,7 @@ impl Default for OidcConfig {
             lazy_migration: LazyMigrationConfig::default(),
             claims_enrichment: ClaimsEnrichmentConfig::default(),
             federation: FederationConfig::default(),
+            attestation_client_auth: AttestationClientAuthConfig::default(),
             fedcm: FedcmConfig::default(),
             webauthn_enabled: true,
             webauthn_rp_id: None,
@@ -3769,6 +3775,44 @@ impl Default for FederationConfig {
             link_reauth_max_age_secs: 300,
         }
     }
+}
+
+/// Which attesters this deployment trusts for attestation-based client authentication
+/// (issue #133, PROTOTYPE, `draft-ietf-oauth-attestation-based-client-auth`).
+///
+/// EMPTY BY DEFAULT, and empty means the method authenticates nobody. That is the correct
+/// default rather than a placeholder: the attester is the party that decides which `client_id`
+/// an instance may claim, so a deployment that trusted "whoever signed" would let anyone who
+/// can mint a JWT become any client. There is no wildcard and no "any valid signature" mode.
+///
+/// The section is inert unless the `attestation-client-auth` experimental feature is
+/// acknowledged. Both conditions are required and neither implies the other: the flag says the
+/// operator accepts a draft-stage wire format, the list says whose attestations they believe.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct AttestationClientAuthConfig {
+    /// The trusted attesters, by issuer identifier.
+    pub attesters: Vec<TrustedAttesterConfig>,
+}
+
+/// One attester this deployment trusts (issue #133).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct TrustedAttesterConfig {
+    /// The attester's issuer identifier, matched EXACTLY against the attestation's `iss`.
+    ///
+    /// Exactly, because this is what selects the key set an attestation is verified against.
+    /// A prefix or suffix match would let an issuer the operator did not name select the keys
+    /// of one they did.
+    pub issuer: String,
+
+    /// The attester's public JWKS, inline as JSON.
+    ///
+    /// INLINE rather than a `jwks_uri`, and that is a prototype decision worth stating: a URI
+    /// means a fetch, a cache, a rotation policy and an SSRF surface, all of which are
+    /// graduation work. Inline keys mean an attester's rotation is a config change, which is
+    /// the right trade while the wire format itself is a draft.
+    pub jwks: String,
 }
 
 /// The IdP-side FedCM surface settings (issue #83, EXPLORATORY).

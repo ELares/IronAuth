@@ -6,6 +6,27 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Experimental: attestation-based client authentication (issue #133)
+
+A PROTOTYPE of `draft-ietf-oauth-attestation-based-client-auth-10`, off by default behind the
+`attestation-client-auth` feature. The acknowledgment version IS the draft revision, so a draft
+bump invalidates every acknowledgment in the wild and a routine upgrade can refuse to boot for a
+deployment that enabled this. That is the flag working.
+
+**Not a supported method.** It is absent from `ClientAuthMethod::ALL`, so discovery never
+advertises it, and no production path registers a client for it, so the surface is exercisable by
+the test suite and by nothing else. Arming it requires the acknowledgment AND at least one
+configured attester whose JWKS yields a usable key; with either missing, nothing is installed and
+the client-credentials grant ignores the two headers and answers as though they were not
+present.
+
+**Known limits, all recorded in `docs/experimental/attestation-client-auth.md`:** `jti` replay
+recording is not wired (the bound on reuse is the claimed PoP lifetime, at most five minutes plus
+clock skew), attester trust is deployment-wide rather than per scope, `aud` is REQUIRED on the
+attestation where the draft makes it optional, and the attestation's `aal`, `key_type`,
+`user_authentication` and `status` claims are not read.
+
+
 - **A deployed WASM hook shapes a real token (issue #114, M11's exit criterion).** The new
   `token_hook` module reads a client's deployed component, compiles it, runs it off the reactor
   under `spawn_blocking` (wasmtime's `in_tokio` panics on a tokio worker), and puts everything it

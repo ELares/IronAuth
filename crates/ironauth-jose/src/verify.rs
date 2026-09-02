@@ -26,6 +26,7 @@ use crate::policy::{JwsAlgorithm, TrustedKey, VerificationPolicy};
 pub struct VerifiedToken {
     algorithm: JwsAlgorithm,
     key_id: Option<String>,
+    token_typ: Option<String>,
     claims: VerifiedClaims,
 }
 
@@ -41,6 +42,28 @@ impl VerifiedToken {
     #[must_use]
     pub fn key_id(&self) -> Option<&str> {
         self.key_id.as_deref()
+    }
+
+    /// The `typ` the verified token's protected header carried, if any.
+    ///
+    /// Exposed for ONE situation: a caller verifying a token minted by a foreign
+    /// party under [`ExpectedTyp::ForeignIssuer`](crate::ExpectedTyp::ForeignIssuer),
+    /// where the policy cannot enforce `typ` because [`TokenTyp`](crate::TokenTyp)
+    /// names only profiles IronAuth mints, but the FOREIGN protocol still separates
+    /// two of its own profiles by media type. Attestation-based client
+    /// authentication is exactly that shape: the attestation JWT and its
+    /// proof-of-possession share an issuer relationship and a key chain, and
+    /// `oauth-client-attestation+jwt` versus `oauth-client-attestation-pop+jwt` is
+    /// the only thing that stops one being presented as the other.
+    ///
+    /// This value is READ FROM THE VERIFIED TOKEN, so it is the `typ` that was
+    /// covered by the signature this policy accepted. It is nonetheless a value the
+    /// FOREIGN party chose, so a caller must compare it against what it requires and
+    /// reject a mismatch; it is not a trust decision on its own, and there is
+    /// deliberately no accessor that returns it before verification.
+    #[must_use]
+    pub fn token_typ(&self) -> Option<&str> {
+        self.token_typ.as_deref()
     }
 
     /// The verified claims.
@@ -139,6 +162,7 @@ pub fn verify(
     Ok(VerifiedToken {
         algorithm: header.alg,
         key_id: header.kid,
+        token_typ: header.typ,
         claims,
     })
 }

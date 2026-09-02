@@ -22,9 +22,9 @@ use ironauth_admin::webhook_delivery::{
 };
 use ironauth_admin::{AdminOidcBridge, AdminState};
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, Config, FEDCM_FEATURE,
-    FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE, Loaded,
-    ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
+    ADVANCED_RECOVERY_FEATURE, AGENT_TOKEN_VAULT_FEATURE, ATTESTATION_CLIENT_AUTH_FEATURE, Config,
+    FEDCM_FEATURE, FIRST_PARTY_CHALLENGE_FEATURE, FeatureRegistry, GLOBAL_TOKEN_REVOCATION_FEATURE,
+    Loaded, ORG_SCOPED_CLIENTS_FEATURE, OidcConfig, OutboxConfig, PasswordPolicyConfig,
     RISK_SIGNALS_FEATURE, ScreeningFailurePolicy, ScreeningProvider, WASM_HOOKS_FEATURE,
     WebhooksConfig,
 };
@@ -574,7 +574,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
 // positional booleans threaded through two call sites, where any two could be swapped
 // silently. A state machine would model a composition these do not have.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy)]
+// No longer `Copy`: the attester registry is an `Arc`, and a registry that could be copied
+// bit-for-bit would be a second handle nobody meant to create. Cloning is explicit at the one
+// call site that needs it.
+#[derive(Debug, Clone)]
 struct DataPlaneSurfaces {
     /// The experimental Global Token Revocation receiver (issue #36).
     global_revocation: bool,
@@ -582,6 +585,12 @@ struct DataPlaneSurfaces {
     fedcm: bool,
     /// The agent token vault (issue #132), armed only through the exploratory ladder.
     agent_vault: bool,
+    /// The attesters trusted for attestation-based client authentication (issue #133), or
+    /// `None` when the draft is unacknowledged or no attester parses. `None` leaves the state
+    /// without a registry, and the client-credentials grant then IGNORES the two headers
+    /// entirely: the request answers exactly as it would without them, which is a stronger
+    /// property than "the seam refuses" and the one an unarmed deployment needs.
+    attesters: Option<Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>>,
     /// The experimental third-party risk-signal ingestion surface (issue #82, PR 1).
     risk_signals: bool,
     /// The experimental org-scoped-clients surface (issue #103, milestone M10).
@@ -615,6 +624,10 @@ impl DataPlaneSurfaces {
             global_revocation: features.is_enabled(config, GLOBAL_TOKEN_REVOCATION_FEATURE),
             fedcm: features.is_enabled(config, FEDCM_FEATURE),
             agent_vault: features.is_enabled(config, AGENT_TOKEN_VAULT_FEATURE),
+            // Not a bool, because "on" is not enough: the method also needs at least one
+            // attester the deployment trusts, and the two conditions are independent. Resolved
+            // HERE so every experimental surface is decided in one place.
+            attesters: build_attester_registry(features, config),
             risk_signals: features.is_enabled(config, RISK_SIGNALS_FEATURE),
             org_scoped_clients: features.is_enabled(config, ORG_SCOPED_CLIENTS_FEATURE),
             first_party_challenge: features.is_enabled(config, FIRST_PARTY_CHALLENGE_FEATURE),
@@ -1404,6 +1417,17 @@ async fn build_oidc_plane(
     .with_risk_signals_enabled(surfaces.risk_signals)
     .with_org_scoped_clients_enabled(surfaces.org_scoped_clients)
     .with_first_party_challenge_enabled(surfaces.first_party_challenge)
+    // Attestation-based client authentication (issue #133, PROTOTYPE). ONE plane, and
+    // deliberately not routed through the shared cross-plane capture: the management API
+    // authenticates no client instances, so declaring it there would have meant an
+    // `AdminState` builder storing a registry nothing on that plane reads -- a layer with no
+    // caller, which is the shape that mechanism exists to prevent rather than to produce.
+    //
+    // `None` (the default, and any deployment that has not acknowledged the draft) leaves the
+    // state without a registry, and the grant then IGNORES the two headers entirely rather
+    // than refusing on them. So an unacknowledged deployment does not merely fail to advertise
+    // the method: a request carrying these headers is answered as though they were not there.
+    .with_optional_attesters(surfaces.attesters.clone())
     .with_flows_enabled(surfaces.flows)
     .with_hosted_pages_enabled(surfaces.hosted_pages)
     .with_diagnostics(&config.diagnostics)
@@ -1631,6 +1655,73 @@ async fn build_oidc_plane(
         discovery,
         jwks,
     })
+}
+
+/// Build the trusted-attester registry, or `None` (issue #133, PROTOTYPE).
+///
+/// TWO conditions, and neither implies the other: the experimental feature must be
+/// acknowledged at its exact draft revision, AND at least one attester must be configured and
+/// parse. An acknowledged flag with an empty or unusable list installs NOTHING rather than an
+/// empty registry. `None` is what makes the grant IGNORE the two headers; an empty registry
+/// would instead be a `Some` that a later reader could take as "the method is armed", and the
+/// refusal would move from the caller into a seam whose own guard then never runs. An operator
+/// reading the log learns which of the two conditions they are missing.
+///
+/// An attester whose JWKS yields no usable key is dropped with a warning rather than failing
+/// the boot: one bad entry among several should not take a deployment down, and an entry that
+/// verifies nothing would sit in the registry refusing silently at every authentication.
+fn build_attester_registry(
+    features: &FeatureRegistry,
+    config: &Config,
+) -> Option<Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>> {
+    if !features.is_enabled(config, ATTESTATION_CLIENT_AUTH_FEATURE) {
+        return None;
+    }
+    let mut registry = ironauth_oidc::attestation_client_auth::AttesterRegistry::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for attester in &config.oidc.attestation_client_auth.attesters {
+        // A REPEATED issuer keeps only the first key set, because the lookup returns the first
+        // match. The documented rotation story is "an attester's rotation is a config change",
+        // so the natural operator move is a second block for the same issuer with the new key
+        // -- which would silently keep the old one and fail every attestation signed with the
+        // new. Warned about rather than merged: merging would make two blocks mean something
+        // this build's lookup does not implement.
+        if !seen.insert(attester.issuer.as_str()) {
+            tracing::warn!(
+                issuer = %attester.issuer,
+                "attestation-based client authentication (issue #133): this issuer is \
+                 configured more than once and only the FIRST key set is used; put every key \
+                 for one attester in that attester's own `jwks`"
+            );
+            continue;
+        }
+        if let Some(trusted) = ironauth_oidc::attestation_client_auth::TrustedAttester::from_jwks(
+            &attester.issuer,
+            attester.jwks.as_bytes(),
+        ) {
+            // Recorded only once it PARSED. Inserting above the parse meant a first block with
+            // an unusable JWKS burned the issuer, so a second block carrying the good keys was
+            // skipped with a warning saying only the first key set is used -- when none was,
+            // and the registry ended empty.
+            seen.insert(attester.issuer.as_str());
+            registry = registry.with(trusted);
+        } else {
+            tracing::warn!(
+                issuer = %attester.issuer,
+                "attestation-based client authentication (issue #133): this attester's JWKS \
+                 yielded no usable key, so it is NOT trusted; attestations naming it are refused"
+            );
+        }
+    }
+    if registry.is_empty() {
+        tracing::warn!(
+            "attestation-based client authentication (issue #133) is acknowledged but no \
+             attester is trusted, so the method authenticates nobody; configure \
+             `oidc.attestation_client_auth.attesters`"
+        );
+        return None;
+    }
+    Some(Arc::new(registry))
 }
 
 /// The federation runtime over an injected fetcher builder (issues #75 and #674).
@@ -6233,6 +6324,123 @@ mod tests {
         assert!(
             select_control_dsn(&cfg).is_none(),
             "production without the control DSN must refuse to mount"
+        );
+    }
+
+    /// The attester registry needs BOTH conditions, and neither implies the other
+    /// (issue #133, criterion 6).
+    ///
+    /// Three cases rather than two, because the interesting one is the middle: an operator who
+    /// acknowledges the draft and configures nobody. Installing an EMPTY registry there would
+    /// make the seam refuse at its last check instead of its first, which looks identical from
+    /// outside and is a different thing to debug -- and would leave a `Some` in the state that
+    /// a later reader could take as "the method is armed".
+    #[test]
+    fn the_attester_registry_needs_the_ack_and_an_attester() {
+        let jwks = ironauth_jose::JwkSet::from_signing_keys([
+            &ironauth_jose::SigningKey::ed25519_from_seed(
+                Some("attester-kid".to_owned()),
+                &[9_u8; 32],
+            )
+            .expect("a key"),
+        ])
+        .expect("a jwk set")
+        .to_json()
+        .expect("jwks json");
+        // `builtin()`: the registry this build actually ships. `new()` is empty, so every
+        // `is_enabled` is false and the three refusals below would hold against a flag that
+        // ships default-on.
+        let features = FeatureRegistry::builtin();
+
+        // 1. The DEFAULT: no acknowledgment, no attesters.
+        let bare = config("[admin]\nbootstrap_operator_token = \"t\"\n");
+        assert!(
+            build_attester_registry(&features, &bare).is_none(),
+            "the prototype is off in a default deployment"
+        );
+
+        // 2. Attesters configured, draft NOT acknowledged. The list alone must arm nothing:
+        //    an operator who wrote the config and never set the flag has not opted in.
+        let configured = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n"
+        ));
+        assert!(
+            build_attester_registry(&features, &configured).is_none(),
+            "an unacknowledged draft arms nothing, however the section is filled in"
+        );
+
+        // 3. Acknowledged with NO attester. The flag alone must arm nothing either.
+        let acked = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = { enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }\n",
+        );
+        assert!(
+            build_attester_registry(&features, &acked).is_none(),
+            "an acknowledged flag with nobody trusted authenticates nobody, and installs nothing"
+        );
+
+        // 4. BOTH. The control: without it the three refusals above would be satisfied by a
+        //    function that returns `None` unconditionally.
+        let armed = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = {{ enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }}\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n"
+        ));
+        assert!(
+            build_attester_registry(&features, &armed).is_some(),
+            "both conditions together arm it"
+        );
+
+        // 5. And an attester whose JWKS yields no key is dropped rather than trusted, so a
+        //    typo in the key material cannot produce a registry that verifies nothing while
+        //    reading as armed.
+        let unusable = config(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = { enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{\"keys\":[]}'\n",
+        );
+        assert!(
+            build_attester_registry(&features, &unusable).is_none(),
+            "an attester with no usable key is not trusted"
+        );
+
+        // 6. A REPEATED issuer arms the registry once and does not silently swallow the second
+        //    block. The lookup returns the first match, so two blocks for one issuer would
+        //    keep only the first key set: this pins that the build still succeeds (a duplicate
+        //    is an operator mistake, not a boot failure) and the warning is what tells them.
+        let duplicated = config(&format!(
+            "[admin]\nbootstrap_operator_token = \"t\"\n\
+             [features]\n\
+             attestation-client-auth = {{ enabled = true, ack = \
+             \"draft-ietf-oauth-attestation-based-client-auth-10\" }}\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n\
+             [[oidc.attestation_client_auth.attesters]]\n\
+             issuer = \"https://attester.example.test\"\n\
+             jwks = '{jwks}'\n"
+        ));
+        let deduped = build_attester_registry(&features, &duplicated)
+            .expect("a duplicate issuer is an operator mistake, not a boot failure");
+        assert_eq!(
+            deduped.len(),
+            1,
+            "the duplicate is DROPPED rather than registered behind the first, which is what \
+             the warning tells the operator; asserting only that something was registered is \
+             satisfied identically with the dedupe deleted"
         );
     }
 

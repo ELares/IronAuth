@@ -43,7 +43,7 @@ use ironauth_store::{
 use serde_json::json;
 
 use crate::client_auth::{
-    self, ClientAuthError, ClientAuthInputs, ClientAuthMethod, parse_presented,
+    self, AuthenticatedClient, ClientAuthError, ClientAuthInputs, ClientAuthMethod, parse_presented,
 };
 use crate::error::TokenError;
 use crate::state::OidcState;
@@ -71,6 +71,111 @@ use crate::util::{client_service_actor, epoch_micros};
 /// may ask for, never widen it past this floor.
 const DISALLOWED_M2M_SCOPES: &[&str] = &["openid", "offline_access"];
 
+/// The ATTESTATION path (issue #133, PROTOTYPE), or `None` when it was not attempted.
+///
+/// Extracted so the grant reads as one flow rather than two: everything after it is identical
+/// for a client that proved a secret and one that proved possession of an attested key, and a
+/// second copy of that would be a second place for the two to disagree.
+///
+/// Client credentials is the grant an attested instance uses -- an instance holding no
+/// registered secret is asking for its own token, not a user's -- so this is where the
+/// prototype plugs in. The other grants are unchanged, which is the point of a prototype.
+///
+/// # Errors
+///
+/// [`TokenError::InvalidRequest`] when more than one authentication method is presented;
+/// [`TokenError::InvalidClient`] for a missing or unparseable `client_id` and for every
+/// authentication failure.
+async fn attested_client(
+    state: &OidcState,
+    headers: &HeaderMap,
+    params: &TokenParams,
+    authorization: Option<&str>,
+) -> Result<Option<(Scope, AuthenticatedClient)>, TokenError> {
+    // BOTH headers, or this is not an attestation attempt. One alone is not a partial attempt
+    // to be helped along: treating it as one would give an unauthenticated prober a way to
+    // tell the method's presence from its absence, because the request would take a different
+    // path and could answer differently.
+    // NON-EMPTY, for the same reason the four form inputs below are checked that way: an
+    // empty header is not a credential, and treating `OAuth-Client-Attestation:` with no value
+    // as an attempt made an armed deployment answer 400 to a `client_secret_basic` client that
+    // happened to send one. The seam itself already calls an empty string `MissingHeader`, so
+    // reading it as present here made the caller disagree with what it calls.
+    let header = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(attestation), Some(proof)) = (
+        header(crate::attestation_client_auth::ATTESTATION_HEADER),
+        header(crate::attestation_client_auth::ATTESTATION_POP_HEADER),
+    ) else {
+        return Ok(None);
+    };
+
+    // WITH THE FEATURE OFF, these headers mean nothing and must change nothing. Checking the
+    // registry first is what keeps that true: the mixing refusal below used to run before it,
+    // so a deployment that had never enabled the prototype started answering 400 to a request
+    // with perfectly good Basic credentials that happened to carry the two headers -- where it
+    // had answered 200. A prototype that is off has to be invisible, not merely inert.
+    if state.attesters().is_none() {
+        return Ok(None);
+    }
+
+    // Mixing methods is refused rather than resolved. RFC 6749 section 2.3 forbids more than
+    // one authentication method on a request, and resolving it in either direction would be a
+    // downgrade an attacker chooses.
+    //
+    // ALL FOUR of the other credential inputs, not the two that came to mind. The first
+    // version named the Authorization header and `client_secret`, so a request carrying the
+    // attestation headers AND a `client_assertion` was silently resolved in favour of the
+    // attestation -- the exact thing the sentence above says cannot happen. And it was
+    // over-broad in the other direction: it fired on ANY Authorization scheme, while
+    // `parse_presented` deliberately ignores a non-Basic one, so a Bearer header alongside
+    // these would have been a 400 where the secret path ignores it.
+    // PRESENT means non-empty after trimming, which is what `parse_presented` means by it.
+    // `serde_urlencoded` turns `client_secret=` into `Some("")`, and many form encoders emit
+    // exactly that for a value they do not have, so testing `.is_some()` refused a request the
+    // secret path would have ignored -- the same over-broad shape round 1 caught on the
+    // Authorization half, moved to a different axis.
+    let present = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    };
+    if is_basic_scheme(authorization)
+        || present(&params.client_secret)
+        || present(&params.client_assertion)
+        || present(&params.client_assertion_type)
+    {
+        return Err(TokenError::InvalidRequest(
+            "more than one client authentication method was presented".to_owned(),
+        ));
+    }
+    let claimed = params
+        .client_id
+        .as_deref()
+        .ok_or(TokenError::InvalidClient { via_basic: false })?;
+    let scope = ClientId::parse_declared_scope(claimed)
+        .map(|id| id.scope())
+        .map_err(|_| TokenError::InvalidClient { via_basic: false })?;
+    let authenticated =
+        client_auth::authenticate_attested(state, scope, claimed, attestation, proof)
+            .await
+            .map_err(|error| match error {
+                ClientAuthError::InvalidRequest(message) => {
+                    TokenError::InvalidRequest(message.to_owned())
+                }
+                ClientAuthError::InvalidClient { via_basic } => {
+                    TokenError::InvalidClient { via_basic }
+                }
+            })?;
+    Ok(Some((scope, authenticated)))
+}
+
 /// The `client_credentials` grant handler (issue #23).
 pub async fn client_credentials_grant(
     state: &OidcState,
@@ -80,6 +185,9 @@ pub async fn client_credentials_grant(
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
+
+    let attested = attested_client(state, headers, &params, authorization).await?;
+
     let inputs = ClientAuthInputs {
         authorization,
         client_id: params.client_id.as_deref(),
@@ -88,35 +196,47 @@ pub async fn client_credentials_grant(
         client_assertion_type: params.client_assertion_type.as_deref(),
     };
 
-    // 1. Recover the scope from the CLAIMED client id so the scoped authentication
-    //    can run. A parse failure or a client id that declares no valid scope is a
-    //    uniform invalid_client (a Basic attempt drives the 401 WWW-Authenticate).
-    let presented = parse_presented(
-        inputs.authorization,
-        inputs.client_id,
-        inputs.client_secret,
-        inputs.client_assertion,
-        inputs.client_assertion_type,
-    )
-    .map_err(|_| TokenError::InvalidClient {
-        via_basic: is_basic_scheme(authorization),
-    })?;
-    let via_basic = presented.via_basic();
-    let scope = ClientId::parse_declared_scope(presented.client_id())
-        .map(|id| id.scope())
-        .map_err(|_| TokenError::InvalidClient { via_basic })?;
-
-    // 2. Authenticate the client (RFC 6749 4.4 REQUIRES it). The shared seam
-    //    verifies the secret in scope and records any failure out of band, so
-    //    enforcement matches the code and refresh grants.
-    let authenticated = client_auth::authenticate_client(state, scope, inputs)
-        .await
-        .map_err(|error| match error {
-            ClientAuthError::InvalidRequest(message) => {
-                TokenError::InvalidRequest(message.to_owned())
-            }
-            ClientAuthError::InvalidClient { via_basic } => TokenError::InvalidClient { via_basic },
+    // 1 and 2, or the attested pair already computed above. The two authentication paths
+    // CONVERGE here on purpose: everything below -- the registered-grant check, the public-
+    // client refusal, the scope allowlist, the issuance -- is the same for a client that
+    // proved a secret and one that proved possession of an attested key, and a second copy of
+    // it would be a second place for the two to disagree.
+    let (scope, authenticated, via_basic) = if let Some((scope, authenticated)) = attested {
+        (scope, authenticated, false)
+    } else {
+        // Recover the scope from the CLAIMED client id so the scoped authentication can
+        // run. A parse failure or a client id that declares no valid scope is a uniform
+        // invalid_client (a Basic attempt drives the 401 WWW-Authenticate).
+        let presented = parse_presented(
+            inputs.authorization,
+            inputs.client_id,
+            inputs.client_secret,
+            inputs.client_assertion,
+            inputs.client_assertion_type,
+        )
+        .map_err(|_| TokenError::InvalidClient {
+            via_basic: is_basic_scheme(authorization),
         })?;
+        let via_basic = presented.via_basic();
+        let scope = ClientId::parse_declared_scope(presented.client_id())
+            .map(|id| id.scope())
+            .map_err(|_| TokenError::InvalidClient { via_basic })?;
+
+        // Authenticate the client (RFC 6749 4.4 REQUIRES it). The shared seam verifies the
+        // secret in scope and records any failure out of band, so enforcement matches the
+        // code and refresh grants.
+        let authenticated = client_auth::authenticate_client(state, scope, inputs)
+            .await
+            .map_err(|error| match error {
+                ClientAuthError::InvalidRequest(message) => {
+                    TokenError::InvalidRequest(message.to_owned())
+                }
+                ClientAuthError::InvalidClient { via_basic } => {
+                    TokenError::InvalidClient { via_basic }
+                }
+            })?;
+        (scope, authenticated, via_basic)
+    };
     // The ONE shared grant-restriction seam (issue #763): this client must be
     // registered for the grant it just presented.
     crate::token::enforce_registered_grant_for(

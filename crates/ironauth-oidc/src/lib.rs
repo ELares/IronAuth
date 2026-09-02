@@ -75,6 +75,10 @@ pub mod account_linking;
 mod acme;
 pub mod advanced_recovery;
 pub mod agent_vault;
+/// Attestation-based client authentication, PROTOTYPE (issue #133). Public so the
+/// experimental CI lane can drive it directly; it is not wired into the token door and
+/// `ClientAuthMethod::ALL` does not name it, so no registered client can select it.
+pub mod attestation_client_auth;
 mod authn;
 mod authorize;
 mod backchannel;

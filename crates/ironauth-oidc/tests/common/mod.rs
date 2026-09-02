@@ -2063,6 +2063,63 @@ impl Harness {
         self.send(request).await
     }
 
+    /// `POST /token` carrying the two ATTESTATION headers (issue #133, PROTOTYPE).
+    ///
+    /// Separate from [`Harness::token_with_auth`] because these credentials do not ride the
+    /// `Authorization` header: they are two dedicated headers, and a caller presenting one of
+    /// them alongside a Basic credential is presenting two methods, which the grant refuses.
+    pub async fn token_attested(
+        &self,
+        form: &str,
+        attestation: Option<&str>,
+        proof: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(value) = attestation {
+            builder = builder.header("OAuth-Client-Attestation", value);
+        }
+        if let Some(value) = proof {
+            builder = builder.header("OAuth-Client-Attestation-PoP", value);
+        }
+        let request = builder
+            .body(Body::from(form.to_owned()))
+            .expect("request builds");
+        self.send(request).await
+    }
+
+    /// Install the trusted attesters and rebuild the protocol router (issue #133).
+    ///
+    /// With none installed -- the default -- the client-credentials grant IGNORES the two
+    /// headers and answers as though they were not present, which is what a test of the
+    /// default posture drives.
+    pub fn install_attesters(
+        &mut self,
+        registry: Arc<ironauth_oidc::attestation_client_auth::AttesterRegistry>,
+    ) {
+        let state = self.state.clone().with_attesters(registry);
+        // ALL THREE routers, exactly as `main.rs` mounts them and as `enable_fedcm` does next
+        // door. `oidc_router` alone mounts no `.well-known/openid-configuration`, so a test
+        // asserting the prototype method is NOT advertised got a 404 and failed -- which is a
+        // 404 for the route rather than evidence about the document, and left the one property
+        // the module, the changelog and the operator note all lead with entirely unproven.
+        let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
+        let config = OidcConfig::default();
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(config.jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&config),
+            Arc::clone(&self.registry),
+            self.env.clone(),
+        );
+        self.router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
+        self.state = state;
+    }
+
     /// `POST /par` (RFC 9126, issue #27) with a pre-built form body (already encoded)
     /// and an optional `Authorization` header (for a `client_secret_basic` client).
     pub async fn par(

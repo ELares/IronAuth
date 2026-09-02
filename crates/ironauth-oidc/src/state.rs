@@ -527,6 +527,13 @@ pub struct OidcState {
     // not-found (federation disabled), so the many DB-only OIDC tests and a deployment that
     // has not enabled federation are unaffected.
     federation: Option<Arc<crate::federation::FederationRuntime>>,
+    // The attesters this deployment trusts for attestation-based client authentication
+    // (issue #133, PROTOTYPE). Default: `None`, which is what makes the method unreachable
+    // rather than merely unadvertised: with no registry installed the client-credentials
+    // grant IGNORES the two headers, so a request carrying them is answered as though they
+    // were not there and a client registered for the method while the flag is off fails closed
+    // rather than falling back to something weaker.
+    attesters: Option<Arc<crate::attestation_client_auth::AttesterRegistry>>,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -1055,6 +1062,7 @@ impl OidcState {
             screen_on_login: false,
             breach_provider: None,
             federation: None,
+            attesters: None,
         }
     }
 
@@ -1068,6 +1076,45 @@ impl OidcState {
     pub fn with_federation(mut self, runtime: Arc<crate::federation::FederationRuntime>) -> Self {
         self.federation = Some(runtime);
         self
+    }
+
+    /// Install the trusted attesters for attestation-based client authentication (issue
+    /// #133, PROTOTYPE).
+    ///
+    /// The boot path calls this only when the experimental feature is acknowledged AND at
+    /// least one attester is configured, so "installed" and "usable" are the same condition.
+    /// With none installed -- the default, and the default this build ships -- the method
+    /// authenticates nobody: it is not in `ClientAuthMethod::ALL`, so discovery never
+    /// advertises it, and the client-credentials grant ignores the two headers rather than
+    /// reading the JWTs they carry.
+    #[must_use]
+    pub fn with_attesters(
+        mut self,
+        attesters: Arc<crate::attestation_client_auth::AttesterRegistry>,
+    ) -> Self {
+        self.attesters = Some(attesters);
+        self
+    }
+
+    /// Install the attesters when there are any, and change nothing when there are not.
+    ///
+    /// The boot path resolves "acknowledged AND at least one attester parses" to an
+    /// `Option` in one place, so the chain that assembles the state does not have to branch.
+    #[must_use]
+    pub fn with_optional_attesters(
+        self,
+        attesters: Option<Arc<crate::attestation_client_auth::AttesterRegistry>>,
+    ) -> Self {
+        match attesters {
+            Some(registry) => self.with_attesters(registry),
+            None => self,
+        }
+    }
+
+    /// The installed attester registry, if any (issue #133).
+    #[must_use]
+    pub fn attesters(&self) -> Option<&Arc<crate::attestation_client_auth::AttesterRegistry>> {
+        self.attesters.as_ref()
     }
 
     /// The installed federation runtime, if any (issue #75, PR B). The `/federation`
