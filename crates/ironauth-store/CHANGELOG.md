@@ -6,6 +6,16 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+- **`scim_connections`, the inbound SCIM credential table (issue #135).** One row per identity
+  provider connection, bound to exactly ONE organization: the organization comes off the
+  CREDENTIAL rather than off the request path, so the SCIM surface has no caller-supplied
+  identifier to decode and authorize -- which is the entire class the Zitadel CVE-2026-32130
+  and Casdoor CVE-2025-4210 SCIM bypasses belong to. Only a digest is stored; the table has no
+  column the plaintext can come back from. `authenticate` joins `organizations` and requires it
+  live and active, so deleting or disabling an organization stops its provisioning.
+  Revocation preserves the FIRST `revoked_at`, and revoking a handle that names nothing writes
+  no audit row.
+
 - **`token_hooks`, the deployed-hook table (issue #114).** One row per (scope, client) holding
   the WASM component and the payload version its guest was built against. The COMPONENT rather
   than a precompiled artifact: `load_precompiled` is `unsafe` because nothing checks that machine

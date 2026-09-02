@@ -65,6 +65,32 @@ async fn mint(
     )
 }
 
+/// Whether a token is accepted by the REAL SCIM router, which is the only place that answers
+/// "does this credential still provision".
+///
+/// A fresh `ScimState` per call, because the surface reads the store on every request and a
+/// reused one would answer from whatever it had seen before the revoke.
+async fn authenticates(h: &Harness, token: &str) -> bool {
+    let state = ironauth_scim::ScimState::new(
+        h.db().store().clone(),
+        ironauth_env::Env::system(),
+        ironauth_scim::ScimLimits::default(),
+        ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+    );
+    let request = Request::builder()
+        .method("GET")
+        .uri("/scim/v2/ServiceProviderConfig")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request builds");
+    ironauth_scim::scim_router(state)
+        .oneshot(request)
+        .await
+        .expect("the SCIM router answers")
+        .status()
+        == StatusCode::OK
+}
+
 #[tokio::test]
 async fn a_minted_token_authenticates_against_the_scim_surface() {
     // THE GRANTING PATH, end to end. A 201 carrying a token proves the management surface
@@ -402,5 +428,227 @@ async fn an_expiry_in_the_past_is_refused_and_one_in_the_future_is_accepted() {
         parsed["items"][0]["expires_at_unix_ms"].as_i64(),
         Some(future),
         "the accepted expiry must be the one that was asked for: {listed}"
+    );
+}
+
+/// An unknown provider is refused with a 400 that names the field, and not by the database.
+///
+/// The route used to map every `StoreError::Database` onto a 400 naming `provider`, so a
+/// revoked INSERT grant told the caller their provider was wrong. That was replaced with a
+/// handler-side check -- and a reviewer then measured that DELETING the replacement broke
+/// nothing: `provider: "onelogin"` answered 500, and 114 tests stayed green. The field's own
+/// published doc still said the database refused it.
+///
+/// So this drives the refusal, and drives it in both directions: an unknown provider is a 400
+/// naming the field, and each of the three real ones is accepted, because a guard that refused
+/// everything would pass the refusal alone.
+#[tokio::test]
+async fn an_unknown_provider_is_refused_by_the_handler_and_the_three_real_ones_are_accepted() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    for unknown in ["onelogin", "OKTA", "", "okta ", "generic'; DROP TABLE"] {
+        let body = serde_json::json!({ "display_name": "nope", "provider": unknown }).to_string();
+        let (status, _, response) = h.post(&base, &format!("k-bad-{unknown}"), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "provider {unknown:?} was not refused by the handler: {response}"
+        );
+        assert!(
+            response.contains("invalid_provider"),
+            "the refusal must name the field rather than surfacing a store failure: {response}"
+        );
+    }
+
+    // The control. Without it the loop above passes against a handler that refuses every
+    // provider, which would make the whole surface unusable while looking well guarded.
+    for known in ["okta", "entra", "generic"] {
+        let body = serde_json::json!({ "display_name": known, "provider": known }).to_string();
+        let (status, _, response) = h.post(&base, &format!("k-ok-{known}"), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "provider {known} must be accepted: {response}"
+        );
+    }
+}
+
+/// A malformed `display_name` is a 400 rather than a 500.
+///
+/// Migration 0183 carries `CHECK (display_name <> '')`, and nothing validated the field before
+/// the INSERT: a reviewer sent `{"display_name":""}` and got `500 internal server error`, with
+/// the store returning SQLSTATE 23514. `is_unique_violation` is false for a CHECK violation, so
+/// it fell straight through to `ApiError::Internal`.
+///
+/// The length half is here for the same reason from the other side: 0183 bounds the column
+/// below and not above, a 200 000 character name was accepted and stored, and the migration is
+/// shipped and checksummed so the ceiling has to live in the handler.
+#[tokio::test]
+async fn a_display_name_that_the_column_would_refuse_is_a_bad_request_rather_than_a_server_error() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    for (label, name) in [
+        ("empty", String::new()),
+        ("whitespace only", "   ".to_owned()),
+        ("far past any column bound", "n".repeat(200_000)),
+    ] {
+        let body = serde_json::json!({ "display_name": name, "provider": "okta" }).to_string();
+        let (status, _, response) = h.post(&base, &format!("k-{label}"), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a {label} display_name answered {status}, which is the database's refusal \
+             surfacing rather than the handler's: {response}"
+        );
+        assert!(
+            response.contains("display_name"),
+            "the refusal must name the field: {response}"
+        );
+    }
+
+    // And nothing landed, which is what separates "refused" from "refused after writing".
+    let (_, _, listed) = h.get(&base).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "a refused create landed a row: {listed}"
+    );
+}
+
+/// An expiry beyond what the column can store is a 400 rather than a 500.
+///
+/// `expires_at_unix_ms` is multiplied by 1000 with `saturating_mul`, so `i64::MAX` clamps to
+/// `i64::MAX` micros -- which IS in the future, passes the not-in-the-past check, and then
+/// reaches `TIMESTAMPTZ 'epoch' + ($8 * INTERVAL '1 microsecond')`, outside Postgres'
+/// timestamp range. Measured: `i64::MAX` answered 500 while 900000000000000 answered 201. A
+/// bound with only one side is half a bound.
+#[tokio::test]
+async fn an_expiry_beyond_the_storable_range_is_a_bad_request_rather_than_a_server_error() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    for (label, millis) in [
+        ("i64::MAX", i64::MAX),
+        ("one past the ceiling", 253_402_300_800_000_i64),
+    ] {
+        let body = serde_json::json!({
+            "display_name": "too far",
+            "provider": "okta",
+            "expires_at_unix_ms": millis,
+        })
+        .to_string();
+        let (status, _, response) = h.post(&base, &format!("k-far-{label}"), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} answered {status}: {response}"
+        );
+        assert!(
+            response.contains("invalid_expiry"),
+            "the refusal must name the field: {response}"
+        );
+    }
+
+    // The control, and it is what makes the ceiling a ceiling rather than a ban: an expiry
+    // just BELOW it is accepted and round-trips.
+    let just_under = 253_402_300_799_000_i64;
+    let body = serde_json::json!({
+        "display_name": "far but storable",
+        "provider": "okta",
+        "expires_at_unix_ms": just_under,
+    })
+    .to_string();
+    let (status, _, response) = h.post(&base, "k-just-under", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let (_, _, listed) = h.get(&base).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["items"][0]["expires_at_unix_ms"]
+            .as_i64(),
+        Some(just_under),
+        "the accepted expiry must round-trip: {listed}"
+    );
+}
+
+/// A leaked connection is still REVOKABLE after its environment is decommissioned.
+///
+/// This is the failure the route shipped with, measured end to end: soft-delete the
+/// environment, and the revoke answered the uniform not-found while the listing beside it
+/// still showed the connection live and its token still authenticated against the SCIM
+/// surface. The management API was telling an operator, in one breath, that a credential
+/// exists and that it does not -- and the only thing this design offers against a leak is the
+/// revoke.
+///
+/// `authenticate` joins only `organizations` and checks `deleted_at`/`state` there, so
+/// soft-deleting an ENVIRONMENT cascades to neither. Requiring environment LIVENESS to
+/// disarm therefore made the soft delete a one-way door, which is exactly what
+/// `org_context::require_present_environment` exists for.
+#[tokio::test]
+async fn a_connection_is_still_revokable_after_its_environment_is_decommissioned() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+    let (token, handle) = mint(&h, &tenant, &environment, &org, "k-mint").await;
+
+    // The credential works, so what follows is about a LIVE one rather than one that never
+    // authenticated.
+    assert!(
+        authenticates(&h, &token).await,
+        "the minted token must authenticate before the environment is deleted"
+    );
+
+    let (status, _, body) = h
+        .delete(&format!("/v1/tenants/{tenant}/environments/{environment}"))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "soft delete: {body}");
+
+    // THE STATE THAT MAKES THIS URGENT: the token still provisions. The environment being
+    // decommissioned did not stop it, which is why the revoke has to keep working.
+    assert!(
+        authenticates(&h, &token).await,
+        "a soft-deleted environment does not by itself stop a SCIM connection token, so the \
+         revoke below is the only thing that can"
+    );
+
+    // The listing still reports it, because a decommissioned environment stays auditable.
+    let (status, _, listed) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(listed.contains(&handle), "{listed}");
+
+    // AND THE REVOKE WORKS. This is the assertion the route failed.
+    let (status, _, body) = h.delete(&format!("{base}/{handle}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a connection in a decommissioned environment could not be revoked, so a leaked \
+         credential would provision forever: {body}"
+    );
+    assert!(
+        !authenticates(&h, &token).await,
+        "the revoke answered 204 and the token still provisions"
+    );
+
+    // And a connection whose environment never existed is still the uniform not-found, so
+    // the relaxation is "present" and not "unchecked".
+    let absent = ironauth_store::EnvironmentId::generate(&ironauth_env::Env::system()).to_string();
+    let (status, _, body) = h
+        .delete(&format!(
+            "/v1/tenants/{tenant}/environments/{absent}/organizations/{org}/scim-connections/{handle}"
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an environment that never existed must still be the uniform not-found: {body}"
     );
 }

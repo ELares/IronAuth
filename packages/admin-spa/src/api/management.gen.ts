@@ -4996,8 +4996,8 @@ export interface components {
              */
             expires_at_unix_ms?: number | null;
             /**
-             * @description `okta`, `entra` or `generic`. The column carries a closed vocabulary, so anything else
-             *     is refused by the database rather than stored and puzzled over later.
+             * @description `okta`, `entra` or `generic`. Anything else is refused by this route with
+             *     `400 invalid_provider`, before the write.
              */
             provider: string;
         };
@@ -21283,6 +21283,15 @@ export interface operations {
             };
             /** @description No such live organization */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The same Idempotency-Key was used for a different request */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

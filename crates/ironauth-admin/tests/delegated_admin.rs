@@ -799,29 +799,37 @@ async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_wid
     );
 }
 
-/// A read-only credential may LIST API keys and may not create, rotate or revoke one.
+/// A read-only credential may LIST SCIM connections and may not mint or revoke one.
 ///
-/// This closes a gap I documented in three separate handlers and did not close at the time.
-/// `management_permissions.rs` classifies these operations as `WriteCredentials` and
-/// separately asserts each handler calls `require_permission`, but nothing compares the two:
-/// its own comment says it "cannot tell WHICH permission a handler demands, only that it
-/// demands one". A mutation downgrading any of them to `Read` passed every pin.
+/// The same argument as the api-keys test below, on the surface that mints the strongest
+/// credential here: a SCIM connection token provisions and deprovisions an organization's
+/// entire user population.
 ///
 /// The refusal-body assertions are what make this verify the SPECIFIC permission rather than
-/// merely some permission. A handler demanding `Read` would answer 200 here, and one
-/// demanding the wrong write permission would name that one instead.
+/// merely some permission. A handler demanding `Read` would answer 201 here, and one demanding
+/// the wrong write permission would name that one instead.
 #[tokio::test]
 async fn a_read_only_credential_can_list_scim_connections_and_cannot_mint_or_kill_one() {
-    // THE PIN FOR THE SCIM CONNECTION SURFACE. A reviewer mutated its permission checks and
-    // found five of them survived the whole suite: downgrading create and revoke from
-    // `WriteCredentials` to `Read`, deleting the sudo check, deleting the list's permission
-    // check entirely, and widening the create's environment access. The controls were correct
-    // and nothing held them there.
+    // THE PIN FOR THE SCIM CONNECTION SURFACE'S PERMISSIONS, and only those. A reviewer
+    // mutated five controls on that surface and found every one surviving the whole suite;
+    // this test kills THREE of them, MEASURED one at a time:
     //
-    // `management_permissions.rs` cannot do it -- as its own comment says, it asserts only
-    // that SOME permission is demanded, and a downgrade to `Read` satisfies that. Naming the
-    // specific permission is what this file is for, and it is the argument `api_keys.rs`
-    // records above its own check.
+    //   - create `WriteCredentials` -> `Read`   killed here
+    //   - revoke `WriteCredentials` -> `Read`   killed here
+    //   - the list's `require_permission` gone  killed here, and ONLY here (63/64)
+    //
+    // The other two are held elsewhere, and saying so is the point: this test runs
+    // `Harness::start(50)`, where sudo mode is OFF, so it structurally cannot see a deleted
+    // `require_fresh_privilege` -- `sudo.rs::a_scim_connection_mint_or_revoke_is_sudo_gated`
+    // does. And widening `EnvironmentAccess::Write` to `Read` is invisible at a live
+    // environment by definition;
+    // `live_surface.rs::every_environment_scoped_write_refuses_a_soft_deleted_environment`
+    // is what kills that one. An earlier version of this comment claimed all five, which is
+    // the credit-without-a-measurement this file exists to avoid.
+    //
+    // `management_permissions.rs` cannot do any of it -- as its own comment says, it asserts
+    // only that SOME permission is demanded, and a downgrade to `Read` satisfies that. Naming
+    // the specific permission is what this file is for.
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
     let (key_id, secret) = mint_key(&h, &tenant, &environment, "sc-mint").await;
@@ -937,6 +945,17 @@ async fn a_read_only_credential_can_list_scim_connections_and_cannot_mint_or_kil
     );
 }
 
+/// A read-only credential may LIST API keys and may not create, rotate or revoke one.
+///
+/// This closes a gap I documented in three separate handlers and did not close at the time.
+/// `management_permissions.rs` classifies these operations as `WriteCredentials` and
+/// separately asserts each handler calls `require_permission`, but nothing compares the two:
+/// its own comment says it "cannot tell WHICH permission a handler demands, only that it
+/// demands one". A mutation downgrading any of them to `Read` passed every pin.
+///
+/// The refusal-body assertions are what make this verify the SPECIFIC permission rather than
+/// merely some permission. A handler demanding `Read` would answer 200 here, and one
+/// demanding the wrong write permission would name that one instead.
 #[tokio::test]
 async fn a_read_only_credential_can_list_api_keys_and_cannot_mint_or_kill_one() {
     let h = Harness::start(50).await;

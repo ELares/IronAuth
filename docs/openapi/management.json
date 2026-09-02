@@ -17827,6 +17827,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The same Idempotency-Key was used for a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -29741,7 +29751,7 @@
           },
           "provider": {
             "type": "string",
-            "description": "`okta`, `entra` or `generic`. The column carries a closed vocabulary, so anything else\nis refused by the database rather than stored and puzzled over later."
+            "description": "`okta`, `entra` or `generic`. Anything else is refused by this route with\n`400 invalid_provider`, before the write."
           }
         }
       },

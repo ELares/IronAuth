@@ -43,8 +43,10 @@ use utoipa::ToSchema;
 use crate::auth::{ManagementPermission, Principal};
 use crate::error::ApiError;
 use crate::idempotency;
-use crate::input::parse_json;
-use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
+use crate::input::{parse_json, require_non_empty};
+use crate::org_context::{
+    EnvironmentAccess, require_present_environment, resolve_live_org, resolve_scope,
+};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -85,8 +87,8 @@ pub struct ScimConnectionListView {
 pub struct CreateScimConnectionRequest {
     /// The operator-facing label, for telling two identity providers apart in a listing.
     pub display_name: String,
-    /// `okta`, `entra` or `generic`. The column carries a closed vocabulary, so anything else
-    /// is refused by the database rather than stored and puzzled over later.
+    /// `okta`, `entra` or `generic`. Anything else is refused by this route with
+    /// `400 invalid_provider`, before the write.
     pub provider: String,
     /// Optional expiry, in milliseconds since the epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,10 +204,26 @@ pub async fn list_scim_connections(
 /// token, and a connection that answered 401 to their identity provider from the first request.
 /// Refusing here is the only place that can tell them why, because by the time SCIM fails there
 /// is nothing left to distinguish "expired" from "wrong token".
-fn validated_expiry(
+fn validated_create(
     request: &CreateScimConnectionRequest,
     now_micros: i64,
-) -> Result<Option<i64>, ApiError> {
+) -> Result<(String, Option<i64>), ApiError> {
+    // THE DISPLAY NAME, through the helper 15 admin modules already call. Migration 0183
+    // carries `CHECK (display_name <> '')`, and a review drove what happens without this:
+    // `{"display_name":""}` reached the INSERT, Postgres refused with SQLSTATE 23514, and
+    // `is_unique_violation` is false for a CHECK violation, so it fell through to
+    // `ApiError::Internal` -- a 500 on a brand-new route from a one-character body.
+    // `input.rs`'s own doc says the helper exists for exactly that reason.
+    let display_name = require_non_empty(&request.display_name, "display_name")?;
+    // AND BOUNDED ABOVE, which 0183 does not do. A 200 000 character name was accepted and
+    // stored; the migration is shipped and checksummed, so the bound lives here. The figure is
+    // the schema's own slug ceiling times four, which is far more than an operator label needs
+    // and far less than a row worth storing.
+    if display_name.len() > MAX_DISPLAY_NAME_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "display_name must be at most {MAX_DISPLAY_NAME_BYTES} bytes"
+        )));
+    }
     if !matches!(request.provider.as_str(), "okta" | "entra" | "generic") {
         return Err(ApiError::BadRequest(
             "invalid_provider: provider must be one of okta, entra, generic".to_owned(),
@@ -221,8 +239,34 @@ fn validated_expiry(
             "invalid_expiry: expires_at_unix_ms must be in the future".to_owned(),
         ));
     }
-    Ok(expires_micros)
+    // AND BOUNDED ABOVE TOO. `saturating_mul` clamps to `i64::MAX` micros, which is in the
+    // future and so passed the check above, and then reached
+    // `TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 microsecond')` -- outside Postgres'
+    // timestamp range, which is a 500. A review drove it: `i64::MAX` answered 500 while
+    // 900000000000000 answered 201. A bound with only one side is half a bound.
+    if let Some(expires) = expires_micros
+        && expires > MAX_EXPIRY_UNIX_MICROS
+    {
+        return Err(ApiError::BadRequest(
+            "invalid_expiry: expires_at_unix_ms is further ahead than this server stores"
+                .to_owned(),
+        ));
+    }
+    Ok((display_name, expires_micros))
 }
+
+/// The longest operator-facing label this route accepts.
+///
+/// Migration 0183 bounds the column below (non-empty) and not above, and it is shipped and
+/// checksummed, so this is where the ceiling lives.
+const MAX_DISPLAY_NAME_BYTES: usize = 252;
+
+/// The furthest future expiry this route accepts, in microseconds since the epoch.
+///
+/// The year 9999, which is inside Postgres' `timestamptz` range with room to spare. Anything
+/// past it is a client that computed a date wrong, and answering 400 says so where a 500 does
+/// not.
+const MAX_EXPIRY_UNIX_MICROS: i64 = 253_402_300_799_000_000;
 
 /// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`
 #[utoipa::path(
@@ -244,6 +288,7 @@ fn validated_expiry(
         (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorBody),
         (status = 403, description = "The credential may not mint credentials for this organization", body = crate::error::ErrorBody),
         (status = 404, description = "No such live organization", body = crate::error::ErrorBody),
+        (status = 409, description = "The same Idempotency-Key was used for a different request", body = crate::error::ErrorBody),
     ),
     security(("bearer_auth" = []))
 )]
@@ -280,7 +325,7 @@ pub async fn create_scim_connection(
     )
     .await?;
     let request: CreateScimConnectionRequest = parse_json(&body)?;
-    let expires_micros = validated_expiry(&request, state.now_unix_micros())?;
+    let (display_name, expires_micros) = validated_create(&request, state.now_unix_micros())?;
 
     // MINTED THROUGH THE SCIM CRATE, not reimplemented here. `mint_token` and `digest_of` are
     // the format the verifier uses, so a second copy of `{scim_id}.{secret}` in this crate
@@ -297,7 +342,7 @@ pub async fn create_scim_connection(
 
     let created = ScimConnectionCreated {
         id: id.to_string(),
-        display_name: request.display_name.clone(),
+        display_name: display_name.clone(),
         token: Some(token.clone()),
         token_already_issued: false,
     };
@@ -310,7 +355,7 @@ pub async fn create_scim_connection(
     // can come back from, and this would have created one in a different table.
     let stored = ScimConnectionCreated {
         id: id.to_string(),
-        display_name: request.display_name.clone(),
+        display_name: display_name.clone(),
         token: None,
         token_already_issued: true,
     };
@@ -330,7 +375,7 @@ pub async fn create_scim_connection(
             NewScimConnection {
                 id: &id,
                 organization_id: &org_id,
-                display_name: &request.display_name,
+                display_name: &display_name,
                 provider: &request.provider,
                 token_digest: &digest,
                 expires_at_unix_micros: expires_micros,
@@ -406,12 +451,25 @@ pub async fn revoke_scim_connection(
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
     principal.require_permission(ManagementPermission::WriteCredentials)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+    // PRESENT, NOT LIVE, and this is the one route on this surface where the difference
+    // matters. A revoke DESTROYS a capability, and `authenticate` joins only `organizations`:
+    // soft-deleting an ENVIRONMENT cascades to neither the organization's `deleted_at` nor its
+    // state, so a minted token goes on provisioning after the environment is decommissioned.
+    // Under `EnvironmentAccess::Write` the revoke then answered the uniform not-found while
+    // the listing beside it still showed the connection live -- the management API telling an
+    // operator, in the same breath, that a credential exists and that it does not.
+    //
+    // `org_context.rs` names this shape and the rule for it: requiring liveness to DISARM
+    // turns a soft delete into a one-way door. Issue #250 measured the same state on the
+    // outbound-verification credential; this is that lesson applied to the strongest
+    // credential this surface issues.
+    require_present_environment(&state, &scope).await?;
     let org_id = resolve_live_org(
         &state,
         &principal,
         scope,
         &organization_id,
-        EnvironmentAccess::Write,
+        EnvironmentAccess::Read,
     )
     .await?;
 

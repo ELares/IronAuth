@@ -4079,6 +4079,22 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
             "migration.deleteOutboundVerification",
             StatusCode::NO_CONTENT,
         ),
+        // REVOKING a SCIM provisioning credential (issue #135), exempt on exactly the
+        // argument the entry above makes and for the same class of reason.
+        //
+        // `ScimConnectionRepo::authenticate` joins only `organizations` and checks
+        // `deleted_at`/`state` there, so soft-deleting an ENVIRONMENT stops nothing: a
+        // minted token goes on provisioning an organization's whole user population, which
+        // was measured by presenting one to the real `scim_router` after the delete. That
+        // is the same shape as the credential oracle above -- something that outlives the
+        // environment -- and fencing its off switch is the same one-way door.
+        //
+        // It still requires the environment to EXIST, and `tests/absent_environment.rs`
+        // drives this route to require the uniform not-found there.
+        (
+            "scim_connections.revokeScimConnection",
+            StatusCode::NO_CONTENT,
+        ),
     ])
 }
 
@@ -4103,8 +4119,10 @@ fn documented_write_row_effects() -> BTreeMap<String, i64> {
     BTreeMap::from([
         // The disarm destroys THIS environment's outbound-verification secret.
         ("environment_secrets".to_owned(), -1),
-        // And audits `environment_secret.delete` in the same transaction.
-        ("audit_log".to_owned(), 1),
+        // And audits `environment_secret.delete` in the same transaction. Two, not one: the
+        // SCIM connection revoke audits `scim_connection.revoked` the same way. See the note
+        // on `outbox_messages` below for why this map sums across exceptions.
+        ("audit_log".to_owned(), 2),
         // And ANNOUNCES it in the same transaction (issue #108), which belongs here for
         // the same reason the exception itself does. A soft-deleted environment KEEPS
         // answering the verify endpoint -- that is why the off switch must not be fenced
@@ -4117,7 +4135,12 @@ fn documented_write_row_effects() -> BTreeMap<String, i64> {
         // producer quietly dropped from the disarm leaves this at zero and fails here,
         // and a write that starts announcing something ELSE shows up as an unexpected
         // row rather than being absorbed by a tolerance.
-        ("outbox_messages".to_owned(), 1),
+        //
+        // The counts below are the SUM over both row-changing exceptions, because this map
+        // is per TABLE and not per operation. The SCIM revoke UPDATEs `scim_connections` in
+        // place, so that table's count does not move; what it adds is one audit row and one
+        // announcement, in the same transaction as the update. Hence two of each.
+        ("outbox_messages".to_owned(), 2),
     ])
 }
 
