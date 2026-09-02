@@ -101,6 +101,25 @@ pub const RISK_SIGNALS_VERSION: &str = "0.1.0-exp.1";
 /// old ack.
 pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 
+/// The registry name of the identity-chaining / ID-JAG receiving side (issue #133,
+/// exploratory bet 3).
+///
+/// ONE flag for three checks, because they are one control: an identity assertion is separated
+/// from an ordinary bearer assertion by its media type, bound to its presenter by the client it
+/// names, and bounded by the scope it carries. Arming any two of the three would leave the
+/// third as the way through.
+pub const IDENTITY_CHAINING_FEATURE: &str = "identity-chaining";
+
+/// The experimental `ack` version for identity chaining (issue #133).
+///
+/// TWO draft revisions in one string, because the receiving side composes them: the chaining
+/// draft says how the legs fit together and the ID-JAG draft says what the assertion looks like.
+/// Either moving is a wire change an operator has to re-acknowledge, so either bump invalidates
+/// this. The chaining draft is in the RFC Editor queue, so this string will change to an RFC
+/// number, and that is a version bump like any other.
+pub const IDENTITY_CHAINING_VERSION: &str =
+    "draft-ietf-oauth-identity-chaining-16+draft-ietf-oauth-identity-assertion-authz-grant-04";
+
 /// The registry name of the transaction-token prototype (issue #133, exploratory bet 2).
 ///
 /// ONE flag for the surface: the requested token type and the trust domain it is minted for.
@@ -341,6 +360,25 @@ impl FeatureRegistry {
         Self::default()
     }
 
+    /// Registers the identity-chaining / ID-JAG receiving side (issue #133, PROTOTYPE).
+    pub fn register_identity_chaining(&mut self) {
+        self.register(Feature::experimental(
+            IDENTITY_CHAINING_FEATURE,
+            "Identity chaining and ID-JAG, the RECEIVING side (issue #133): this deployment \
+             ACCEPTS an identity assertion minted in another trust domain and presented as an \
+             RFC 7523 authorization grant, so a user who signed in there reaches an API here \
+             without either domain trusting the other's access tokens. Layered ON the \
+             jwt-bearer grant, adding three checks and removing none: the ID-JAG media type, \
+             the assertion naming the presenting client, and the assertion's scope as a \
+             ceiling. PROTOTYPE: two IETF drafts, the REQUESTING side is not built, `jti` \
+             stays optional as RFC 7523 has it, and trust is per ISSUER rather than per \
+             (issuer, domain) -- so an issuer registered for workload federation can present \
+             identity assertions once this is on, which is the sharpest edge here.",
+            IDENTITY_CHAINING_VERSION,
+            "crates/ironauth-oidc/CHANGELOG.md",
+        ));
+    }
+
     /// Registers the transaction-token prototype (issue #133, PROTOTYPE).
     pub fn register_transaction_tokens(&mut self) {
         self.register(Feature::experimental(
@@ -414,6 +452,7 @@ impl FeatureRegistry {
         registry.register_attestation_client_auth();
         registry.register_authzen_agent_profile();
         registry.register_transaction_tokens();
+        registry.register_identity_chaining();
         registry.register_advanced_recovery();
         registry.register_first_party_challenge();
         registry.register_wasm_hooks();

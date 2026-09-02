@@ -214,13 +214,54 @@ pub async fn jwt_bearer_grant(
     //       subject to an IronAuth principal. A validation/mapping failure is the
     //       uniform invalid_grant with the specific reason recorded out of band; a
     //       store/persistence fault fails closed as a server_error (no diagnostic).
-    let mapped = match validate_and_map(state, scope, assertion).await {
+    let mapped = match validate_and_map(
+        state,
+        scope,
+        assertion,
+        &client_id_str,
+        requested_scope.as_deref(),
+    )
+    .await
+    {
         Ok(mapped) => mapped,
         Err(JwtBearerError::Reject(reason)) => {
             record_diagnostic(state, scope, &client_id_str, assertion, reason).await;
             return Err(TokenError::InvalidGrant);
         }
         Err(JwtBearerError::Server) => return Err(TokenError::ServerError),
+    };
+
+    // 5b. THE ASSERTION'S CEILING IS NOT A SECOND WAY IN (issue #133, PROTOTYPE).
+    //
+    //  `admit` intersects the client's REQUEST with the assertion, so when the client asked
+    //  for something the result is already bounded by a scope step 3 validated. But a client
+    //  that asks for NOTHING gets the assertion's whole scope, and that string was written by
+    //  a foreign issuer -- it has passed neither the shared machine-grant floor (which puts
+    //  `openid` and `offline_access` out of policy on every machine grant) nor the presenting
+    //  client's own allowlist. Handing it to the mint would make an identity assertion a way
+    //  to obtain scopes the very same client is refused when it asks plainly, which is the
+    //  control this prototype is layered onto the grant to inherit rather than route around.
+    //
+    //  So it goes back through the SAME function step 3 used, with the same policy, the same
+    //  uniform `invalid_grant` and the same out-of-band diagnostic. The one difference from
+    //  step 3 is ordering: this runs after the `jti` was spent, because the ceiling is not
+    //  known until the assertion is verified. That costs an out-of-policy assertion its
+    //  single-use `jti`, which is the right way round -- the scope here is the FOREIGN
+    //  ISSUER's claim, not a string the caller varies per request to probe the allowlist,
+    //  and the probing attack step 3's ordering exists to prevent needs the latter.
+    let granted_scope = match mapped.id_jag_scope.as_ref() {
+        Some(admitted) => {
+            resolve_machine_scope(
+                state,
+                scope,
+                &client_id_str,
+                via_basic,
+                Some(admitted.join(" ").as_str()),
+                assertion,
+            )
+            .await?
+        }
+        None => requested_scope,
     };
 
     // 6. Mint the short-lived access token under the mapped principal and persist
@@ -230,7 +271,7 @@ pub async fn jwt_bearer_grant(
         scope,
         &client_id_str,
         &mapped.principal,
-        requested_scope.as_deref(),
+        granted_scope.as_deref(),
         FederatedSource {
             issuer: &mapped.issuer,
             subject: &mapped.subject,
@@ -331,12 +372,21 @@ struct MappedFederation {
     issuer: String,
     /// The external subject, before mapping.
     subject: String,
+    /// The scope an IDENTITY ASSERTION authorized, when this was one and the prototype is armed
+    /// (issue #133).
+    ///
+    /// `None` for an ordinary bearer assertion, and for an identity assertion on a deployment
+    /// that has not acknowledged the drafts -- which is main's behaviour unchanged, because the
+    /// prototype only ever ADDS refusals.
+    id_jag_scope: Option<Vec<String>>,
 }
 
 async fn validate_and_map(
     state: &OidcState,
     scope: Scope,
     assertion: &str,
+    presenting_client: &str,
+    requested_scope: Option<&str>,
 ) -> Result<MappedFederation, JwtBearerError> {
     // Peek the UNVERIFIED `iss` to find WHICH registered issuer to verify against.
     // Reading it before verification introduces no trust: the policy below enforces
@@ -440,10 +490,37 @@ async fn validate_and_map(
     // say which trust anchor vouched for the issuance (issue #126 criterion 5). Returned
     // together rather than re-derived at the call site: re-peeking the assertion there
     // would be a second parse of a credential this function has already verified.
+    // IDENTITY CHAINING / ID-JAG (issue #133, PROTOTYPE), LAST, so every control the ordinary
+    // grant runs has already run: the registered-and-enabled issuer, the verified signature and
+    // audience, the required `sub` and `exp`, the single-use `jti`, the registered subject
+    // mapping, and the mapped principal's lifecycle fence. These add refusals and remove none.
+    //
+    // With the flag off, an assertion carrying the ID-JAG media type is treated exactly as it is
+    // on main -- an ordinary bearer assertion from a trusted issuer -- because `typ` is not a
+    // separator the ordinary path reads. That is the honest unchanged posture and it is also
+    // why the flag exists: the checks below are what make an identity assertion different, and
+    // an operator has to opt into them.
+    let id_jag_scope = if state.identity_chaining_enabled()
+        && crate::identity_chaining::is_identity_assertion(&verified)
+    {
+        match crate::identity_chaining::admit(&verified, presenting_client, requested_scope) {
+            Ok(admitted) => Some(admitted),
+            Err(refusal) => {
+                tracing::debug!(?refusal, "an identity assertion was refused");
+                return Err(JwtBearerError::Reject(
+                    ClientAuthDiagnosticReason::AssertionInvalid,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(MappedFederation {
         principal,
         issuer: record.issuer,
         subject,
+        id_jag_scope,
     })
 }
 

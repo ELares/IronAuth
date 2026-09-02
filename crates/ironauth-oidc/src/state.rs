@@ -539,6 +539,11 @@ pub struct OidcState {
     // with no trust domain has nowhere it may be spent, and a DEFAULT trust domain is one
     // nobody chose.
     transaction_token_domain: Option<String>,
+    // Whether the identity-chaining / ID-JAG receiving side is armed (issue #133, PROTOTYPE).
+    // Default false, which leaves an identity assertion treated exactly as main treats it -- an
+    // ordinary bearer assertion from a trusted issuer -- because the prototype only ever ADDS
+    // refusals.
+    identity_chaining_enabled: bool,
 }
 
 // The per-environment policy flags each mirror an independent, individually
@@ -1069,6 +1074,7 @@ impl OidcState {
             federation: None,
             attesters: None,
             transaction_token_domain: None,
+            identity_chaining_enabled: false,
         }
     }
 
@@ -1143,6 +1149,24 @@ impl OidcState {
             Some(domain) => self.with_transaction_token_domain(domain),
             None => self,
         }
+    }
+
+    /// Arm the identity-chaining / ID-JAG receiving side (issue #133, PROTOTYPE).
+    ///
+    /// It adds three checks to the jwt-bearer assertion grant and removes none: the ID-JAG
+    /// media type, the assertion naming the presenting client, and the assertion's scope as a
+    /// ceiling. With it off -- the default -- an assertion carrying that media type is treated
+    /// exactly as main treats it, because `typ` is not a separator the ordinary path reads.
+    #[must_use]
+    pub fn with_identity_chaining_enabled(mut self, enabled: bool) -> Self {
+        self.identity_chaining_enabled = enabled;
+        self
+    }
+
+    /// Whether the identity-chaining receiving side is armed (issue #133).
+    #[must_use]
+    pub fn identity_chaining_enabled(&self) -> bool {
+        self.identity_chaining_enabled
     }
 
     /// The trust domain transaction tokens are minted for, if any (issue #133).

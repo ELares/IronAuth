@@ -134,7 +134,13 @@ scan entropy-via-env 'getrandom::|(^|[^A-Za-z0-9_])rand::|rand_core::' 1
 # declaration for it to be stamped from and inventing one would put a peer's spelling into the
 # enum the verifier reads. Two markers, one per test file, each on the single `sign_jws` call
 # site that file mints through.
-scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 13
+# 13 -> 16 (issue #133, identity chaining / ID-JAG). Three test sites mint an assertion carrying
+# `oauth-id-jag+jwt`, a media type dictated by draft-ietf-oauth-identity-assertion-authz-grant and
+# stamped by a FOREIGN IdP. It is not an IronAuth token profile, so it has no `TokenTyp` to be
+# declared through -- the same reason the attestation draft's two types and every simulated
+# upstream ID token above carry the marker. Two of the three deliberately mint the WRONG type, to
+# prove the media type is what separates an identity assertion from an ordinary one.
+scan typ-via-declaration '(\.|::)\s*with_typ\s*\(' 16
 
 # Rule fetcher-in-integration-tests: no integration test constructs a REAL `Fetcher`.
 #

@@ -6,6 +6,45 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### Experimental: identity chaining and ID-JAG, the receiving side (issue #133)
+
+A PROTOTYPE of `draft-ietf-oauth-identity-chaining-16` and
+`draft-ietf-oauth-identity-assertion-authz-grant-04`, off by default behind the
+`identity-chaining` feature. A person who signed in to one trust domain reaches an API in
+another WITHOUT either domain trusting the other's access tokens: the first domain mints an
+identity assertion, and this one accepts it as an RFC 7523 authorization grant and issues its
+own token under its own local identity, lifetime and revocation.
+
+**Layered ON the jwt-bearer grant, not beside it.** Three checks are added and none removed, and
+they run LAST -- after the registered-and-enabled issuer, the verified signature and audience,
+the required `sub` and `exp`, the single-use `jti`, the REGISTERED subject mapping (nothing is
+auto-provisioned), the principal's lifecycle fence, and the scope policy. A prototype sitting
+beside the grant would have had to restate all eight, and the one it forgot would be the hole.
+
+The three: the header `typ` must be `oauth-id-jag+jwt`, or an issuer registered to federate a
+workload could speak for a PERSON; `client_id` must name the presenting client, or the assertion
+is a bearer token for whoever intercepts it; and `scope` must be present and BOUNDS what is
+issued, or a local subject mapping could widen what the authoritative domain granted. An
+assertion carrying no scope is refused rather than read as "everything the mapping allows".
+
+**The ceiling is not a second way in.** When the client requests nothing, the assertion's scope
+becomes the granted scope -- and that string was written by a foreign issuer, so it is validated
+exactly as a plainly requested one is, through the same function, against the same machine-grant
+floor and the same per-client allowlist. Without that, an identity assertion would be a way to
+obtain scopes the very same client is refused when it asks plainly.
+
+**With the flag off, an ID-JAG-typed assertion is treated exactly as it is today**: an ordinary
+bearer assertion from a trusted issuer, because `typ` is not a separator the ordinary path
+reads. That is the unchanged posture and it is also the reason the flag exists.
+
+**Known limits, recorded in `docs/experimental/identity-chaining.md`:** the RECEIVING side only
+(this deployment does not yet request an assertion from a foreign AS); trust is per ISSUER
+rather than per (issuer, trust domain), so an issuer registered for workload federation can
+present identity assertions once this is on, which is the sharpest edge here; `jti` stays
+optional as RFC 7523 has it; RFC 9396 `authorization_details` and RFC 9493 `sub_id` are not
+read; and an identity assertion produces the same audit shape as an ordinary one, so nothing in
+the log says which tokens came through this path.
+
 ### Experimental: transaction tokens (issue #133)
 
 A PROTOTYPE of `draft-ietf-oauth-transaction-tokens-09`, off by default behind the

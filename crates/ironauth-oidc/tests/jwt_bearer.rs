@@ -3758,3 +3758,299 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
         "the assertion above describes a token for the mapped principal: {claims}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// IDENTITY CHAINING / ID-JAG, the RECEIVING side (issue #133, PROTOTYPE).
+//
+// These live in THIS file rather than beside the module's own unit suite, and the reason is the
+// property they exist to prove. `tests/identity_chaining.rs` drives `admit` directly and answers
+// what the three checks accept; it cannot answer whether the grant reaches them, nor whether the
+// grant's OTHER controls still fire once it does. Layering a prototype onto a live grant is
+// exactly where a control gets routed around, and it happened here: the first draft handed the
+// mint the assertion's own scope claim, which the machine-grant floor and the presenting
+// client's allowlist had never seen.
+// ---------------------------------------------------------------------------------------------
+
+/// The ID-JAG media type, spelled here rather than imported, so a rename of the constant does
+/// not silently move what these tests present. The wire is the contract.
+const ID_JAG_MEDIA_TYPE: &str = "oauth-id-jag+jwt";
+
+/// Sign an ID-JAG-shaped assertion: an ordinary RFC 7523 assertion PLUS the media type in the
+/// header, the presenting client in `client_id`, and the authorized `scope`.
+fn id_jag(
+    key: &SigningKey,
+    aud: &str,
+    jti: &str,
+    client_id: &str,
+    scope: Option<&str>,
+    typ: &str,
+) -> String {
+    let mut claims = serde_json::json!({
+        "iss": EXTERNAL_ISSUER, "sub": EXTERNAL_SUBJECT, "aud": aud,
+        "exp": 3600, "iat": 0, "jti": jti, "client_id": client_id,
+    });
+    if let Some(scope) = scope {
+        claims["scope"] = serde_json::json!(scope);
+    }
+    let payload = serde_json::to_vec(&claims).expect("serialize claims");
+    sign_jws(key, &payload, &EmissionOptions::new().with_typ(typ)).expect("sign assertion") // invariant-allow: typ-via-declaration -- a FOREIGN issuer's media type from an IETF draft, not an IronAuth token profile
+}
+
+#[tokio::test]
+async fn an_id_jag_assertion_is_an_ordinary_assertion_until_the_prototype_is_armed() {
+    // THE UNARMED POSTURE, and it is the honest one rather than a convenient one. `typ` is not
+    // a separator the ordinary path reads, so on a deployment that has not opted in, an
+    // assertion carrying the ID-JAG media type is exactly what it is on main today: an ordinary
+    // bearer assertion from a trusted issuer. None of the three checks apply -- and that is
+    // precisely why the flag exists, because those checks are the whole difference between an
+    // identity assertion and a bearer one.
+    let h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+
+    // Naming ANOTHER client, and with no scope: two things the armed side refuses outright.
+    let token = id_jag(
+        &issuer_key(),
+        h.issuer(),
+        "jti-idjag-unarmed",
+        "cli_somebody_else",
+        None,
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unarmed, the media type means nothing and the ordinary grant issues: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn an_armed_deployment_admits_an_honest_identity_assertion_and_refuses_the_three_attacks() {
+    let mut h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    h.install_identity_chaining();
+    let key = issuer_key();
+
+    // ADMITTED, and the token carries the scope the AUTHORITATIVE domain authorized rather than
+    // anything this deployment chose.
+    let honest = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-honest",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &honest).await;
+    assert_eq!(status, StatusCode::OK, "an honest assertion issues: {resp}");
+    assert_eq!(
+        json(&resp)["scope"],
+        "read:orders",
+        "the issued scope is the assertion's, not the client's default: {resp}"
+    );
+    let claims = jwt_payload(json(&resp)["access_token"].as_str().expect("a token"));
+    assert_eq!(
+        claims["sub"], MAPPED_PRINCIPAL,
+        "and it still speaks for the LOCALLY mapped principal: {claims}"
+    );
+
+    // THE INTERCEPTION: the same assertion, naming another client. Refused, with this grant's
+    // uniform answer -- the ID-JAG refusals join the existing wire contract rather than
+    // introducing a new error an attacker could use to tell them apart.
+    let stolen = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-stolen",
+        "cli_somebody_else",
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &stolen).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+
+    // THE MISSING CEILING: an assertion with no scope authorizes nothing, so there is nothing to
+    // issue against. Treating it as "whatever the local mapping allows" is the widening the
+    // ceiling exists to stop.
+    let scopeless = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-scopeless",
+        &client_id,
+        None,
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &scopeless).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+
+    // THE OVERREACH: a request wider than the assertion. Refused rather than quietly narrowed,
+    // because a client that asked for `admin` and received `read:orders` has been told it holds
+    // something it does not.
+    let honest_again = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-overreach",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) =
+        present_with_scope(&h, &client_id, &honest_again, "read:orders admin").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+}
+
+#[tokio::test]
+async fn the_assertions_scope_is_not_a_way_past_the_floor_or_the_allowlist() {
+    // THE BYPASS THIS PROTOTYPE INTRODUCED AND CLOSED. When the client asks for nothing, the
+    // assertion's ceiling becomes the granted scope -- and that string is written by a FOREIGN
+    // issuer. If it went to the mint unexamined, an identity assertion would be a way to obtain
+    // scopes the very same client is refused when it asks plainly. Both of this grant's scope
+    // controls are driven through the assertion rather than through `scope`.
+    let mut h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    h.install_identity_chaining();
+    set_allowlist(&h, Some(&["read:orders".to_owned()])).await;
+    let key = issuer_key();
+
+    // THE ALLOWLIST (issue #98). The client may only ever hold `read:orders`; an assertion
+    // authorizing `admin` does not change that.
+    let past_allowlist = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-allowlist",
+        &client_id,
+        Some("admin"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &past_allowlist).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the assertion must not carry the client past its own allowlist: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_grant",
+        "and it is refused with the same uniform answer a plain request gets: {resp}"
+    );
+
+    // THE MACHINE-GRANT FLOOR (issue #23). `openid` and `offline_access` are out of policy on
+    // every machine grant because there is no interactive user; a foreign issuer asserting them
+    // does not create one.
+    let past_floor = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-floor",
+        &client_id,
+        Some("read:orders openid"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &past_floor).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the floor still applies to a scope the assertion authorized: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["error"],
+        "invalid_scope",
+        "the floor answers invalid_scope, exactly as it does for a plainly requested one: {resp}"
+    );
+
+    // And the control case: within BOTH, it issues. Without this, every assertion above could be
+    // failing for a reason unrelated to scope.
+    let allowed = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-allowed",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &allowed).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(json(&resp)["scope"], "read:orders", "{resp}");
+}
+
+#[tokio::test]
+async fn every_ordinary_jwt_bearer_refusal_still_fires_on_an_identity_assertion() {
+    // The layering claim, stated as a test. An identity assertion is checked by the ID-JAG rules
+    // IN ADDITION TO the grant's own, never instead of them -- so an assertion that is perfect
+    // by ID-JAG's lights and broken by RFC 7523's is still refused. Each case is the honest
+    // assertion with exactly one ordinary property broken.
+    let mut h = Harness::start().await;
+    let client_id = seed_trust(&h).await;
+    h.install_identity_chaining();
+    let key = issuer_key();
+
+    // A BAD SIGNATURE: signed by a key the registered JWKS does not hold.
+    let forged = id_jag(
+        &wrong_key(),
+        h.issuer(),
+        "jti-idjag-forged",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a forged signature: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+
+    // THE WRONG AUDIENCE: an assertion minted for somewhere else.
+    let misaudienced = id_jag(
+        &key,
+        "https://another.deployment.test",
+        "jti-idjag-aud",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &misaudienced).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a wrong audience: {resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+
+    // A REPLAY: the single-use `jti` is spent by the first presentation, and carrying the ID-JAG
+    // media type does not exempt an assertion from that.
+    let once = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-replay",
+        &client_id,
+        Some("read:orders"),
+        ID_JAG_MEDIA_TYPE,
+    );
+    let (status, _h, resp) = present(&h, &client_id, &once).await;
+    assert_eq!(status, StatusCode::OK, "the first presentation: {resp}");
+    let (status, _h, resp) = present(&h, &client_id, &once).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the replay: {resp}");
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+
+    // AN UNREGISTERED SUBJECT: no mapping, so no local principal to speak for. An identity
+    // assertion does not auto-provision one -- if it did, a trusted issuer could create
+    // identities here by asserting them.
+    let unmapped_claims = serde_json::json!({
+        "iss": EXTERNAL_ISSUER, "sub": "spiffe://cluster.test/ns/prod/sa/nobody",
+        "aud": h.issuer(), "exp": 3600, "iat": 0, "jti": "jti-idjag-unmapped",
+        "client_id": client_id, "scope": "read:orders",
+    });
+    let payload = serde_json::to_vec(&unmapped_claims).expect("serialize");
+    let unmapped = sign_jws(
+        &key,
+        &payload,
+        &EmissionOptions::new().with_typ(ID_JAG_MEDIA_TYPE),
+    ) // invariant-allow: typ-via-declaration -- see `id_jag` above
+    .expect("sign");
+    let (status, _h, resp) = present(&h, &client_id, &unmapped).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unmapped subject: {resp}"
+    );
+    assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
+}
