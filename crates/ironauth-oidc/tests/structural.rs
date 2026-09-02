@@ -322,7 +322,7 @@ fn every_machine_token_door_runs_the_agent_gate() {
 /// libtest filter `id_jag`. The first version of that line matched exactly ONE of the four --
 /// the unarmed-posture test, which is the only one that still passes with the entire prototype
 /// deleted. So the lane whose whole purpose is "this prototype works at its pinned revision"
-/// ran green having exercised none of the three checks, nor the floor-and-allowlist fix.
+/// ran green having exercised none of the four checks, nor the floor-and-allowlist fix.
 ///
 /// A filter and a naming convention are two artifacts describing each other with nothing in
 /// between. This is the thing in between: name an ID-JAG test without the substring and it
@@ -335,6 +335,8 @@ fn every_id_jag_grant_test_is_reachable_by_the_lane_filter() {
     const FILTER: &str = "id_jag";
     const MARKER: &str =
         "// IDENTITY CHAINING / ID-JAG, the RECEIVING side (issue #133, PROTOTYPE).";
+    /// How many tests the ID-JAG section holds. Raised in the same change that adds one.
+    const EXPECTED: usize = 6;
     let source = include_str!("jwt_bearer.rs");
 
     let (_, section) = source
@@ -348,7 +350,10 @@ fn every_id_jag_grant_test_is_reachable_by_the_lane_filter() {
     let mut attributed = false;
     for line in section.lines() {
         let line = line.trim();
-        if line == "#[tokio::test]" || line == "#[test]" {
+        // `starts_with`, not equality: `#[tokio::test(flavor = "multi_thread")]` is the same
+        // attribute and an exact match would not see it, so such a test would vanish from the
+        // scan rather than fail it.
+        if line.starts_with("#[tokio::test") || line.starts_with("#[test") {
             attributed = true;
             continue;
         }
@@ -370,10 +375,15 @@ fn every_id_jag_grant_test_is_reachable_by_the_lane_filter() {
     // A scan that found nothing must fail rather than pass vacuously: zero tests trivially
     // satisfy "every test contains the filter", which is the exact shape of a guard that
     // stopped measuring.
-    assert!(
-        names.len() >= 4,
-        "the ID-JAG section names {} tests; the scan found nothing to check, which is a broken \
-         scan rather than a clean result: {names:?}",
+    // The EXACT count, not a floor. A floor of four while the section held five let exactly
+    // one test disappear from the scan unnoticed, which is the same "guard that stopped
+    // measuring" this test exists to prevent -- one size smaller.
+    assert_eq!(
+        names.len(),
+        EXPECTED,
+        "the ID-JAG section names {} tests, not {EXPECTED}. If a test was ADDED, raise the \
+         count in the same change; if this dropped, the scan stopped seeing something: \
+         {names:?}",
         names.len()
     );
 

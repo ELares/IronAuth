@@ -204,10 +204,14 @@ pub async fn jwt_bearer_grant(
     //    applies is the PRESENTING one, which is the client this token is minted for.
     //    Do this BEFORE touching the assertion so an out-of-policy scope never spends
     //    the assertion's single-use jti, which is why the allowlist read sits here too
-    //    rather than later. (Step 5b judges a second scope against the SAME policy after
-    //    the assertion is verified; see there for why that ordering is sound.) That ordering is also why the allowlist refusal cannot
-    //    answer `invalid_scope`: nothing has authenticated the caller yet on this
-    //    grant. `resolve_machine_scope` owns that mapping.
+    //    rather than later. That ordering is also why the allowlist refusal cannot answer
+    //    `invalid_scope`: nothing has authenticated the caller yet on this grant.
+    //    `resolve_machine_scope` owns that mapping.
+    //
+    //    NOTE what this does NOT do when the client sends no `scope`: `validate_m2m_scope`
+    //    answers `Ok(None)` immediately, so this step validates nothing at all. That is the
+    //    ordinary case for an identity assertion, and it is exactly why step 5b sends the
+    //    admitted ceiling back through the SAME policy.
     let (requested_scope, scope_policy) = resolve_machine_scope(
         state,
         scope,
@@ -259,6 +263,14 @@ pub async fn jwt_bearer_grant(
     //  ISSUER's claim, not a string the caller varies per request to probe the allowlist,
     //  and the probing attack step 3's ordering exists to prevent needs the latter.
     let granted_scope = match mapped.id_jag_scope.as_ref() {
+        // An EMPTY admitted set would fail open, so it is refused here rather than trusted not
+        // to happen. `admit` cannot return one today (it refuses an assertion with no scope,
+        // and both of its other returns are non-empty), but the function that reads this one
+        // interprets an empty string as "the caller asked for nothing" and answers
+        // `Ok(None)` -- which would mint a token with NO scope claim at all and hand the agent
+        // gate a `None`. That invariant lives in a different module from the code depending
+        // on it, which is the distance a fail-open needs to survive.
+        Some(admitted) if admitted.is_empty() => return Err(TokenError::InvalidGrant),
         Some(admitted) => {
             judge_machine_scope(
                 state,
@@ -591,6 +603,7 @@ fn diagnose_refusal(refusal: IdentityAssertionRefusal) -> ClientAuthDiagnosticRe
         IdentityAssertionRefusal::ClientMismatch => {
             ClientAuthDiagnosticReason::IdentityAssertionClientMismatch
         }
+        IdentityAssertionRefusal::Unbound => ClientAuthDiagnosticReason::IdentityAssertionUnbound,
         IdentityAssertionRefusal::NoScope => ClientAuthDiagnosticReason::IdentityAssertionNoScope,
         IdentityAssertionRefusal::ScopeExceedsAssertion => {
             ClientAuthDiagnosticReason::IdentityAssertionScopeExceeded
@@ -986,6 +999,13 @@ async fn mint_and_persist(
     .await
     .map_err(|_| TokenError::ServerError)?;
     // Resolved BEFORE the mint, through the one shared helper (issue #126).
+    //
+    // THE ID-JAG CEILING DOES NOT REACH THESE (issue #133). `org_id` and `roles` describe the
+    // LOCAL principal the assertion's subject maps to, and the assertion's scope bounds
+    // `oauth_scope` alone. That is consistent with what this grant is -- B mints its own token
+    // under its own local identity -- but it means a resource server authorizing on `roles`
+    // rather than on scope sees no ceiling at all. Recorded here and in the prototype's
+    // graduation list rather than left for a reader to infer from the argument list.
     let (workload_org, workload_roles) =
         crate::token::resolve_workload_org_and_roles(state, scope, principal).await?;
     // And the agent gate (issue #130), through ITS one shared helper. This door mints the

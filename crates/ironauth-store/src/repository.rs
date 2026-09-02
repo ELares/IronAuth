@@ -12284,13 +12284,20 @@ pub enum ClientAuthDiagnosticReason {
     /// public presenting client on purpose (the assertion IS the authorization grant); an
     /// identity assertion cannot, because it speaks for a person.
     IdentityAssertionPresenterPublic,
-    /// An ID-JAG identity assertion named a different client than the one presenting it
+    /// An ID-JAG identity assertion named a DIFFERENT client than the one presenting it
     /// (issue #133).
     ///
-    /// Recorded distinctly because this is the only one of these an operator should be
-    /// paged on: an assertion minted for another client reaching this endpoint is an
-    /// interception, not a misconfiguration.
+    /// Recorded distinctly because this is the one of these an operator should be paged on:
+    /// an assertion minted for another client reaching this endpoint is an interception. It
+    /// is kept apart from [`ClientAuthDiagnosticReason::IdentityAssertionUnbound`] for
+    /// exactly that reason -- an assertion with NO `client_id` is refused too, but it is an
+    /// issuer that did not set the claim, and folding the two together would make the alert
+    /// built on this one fire for a misconfiguration.
     IdentityAssertionClientMismatch,
+    /// An ID-JAG identity assertion carried NO `client_id`, so it was bound to nobody
+    /// (issue #133). A misconfigured issuer, not an interception; see
+    /// [`ClientAuthDiagnosticReason::IdentityAssertionClientMismatch`].
+    IdentityAssertionUnbound,
     /// An ID-JAG identity assertion carried no `scope` (issue #133), so it authorized
     /// nothing and there was no ceiling to issue against. A misconfigured issuer.
     IdentityAssertionNoScope,
@@ -12400,6 +12407,7 @@ impl ClientAuthDiagnosticReason {
             ClientAuthDiagnosticReason::IdentityAssertionClientMismatch => {
                 "identity_assertion_client_mismatch"
             }
+            ClientAuthDiagnosticReason::IdentityAssertionUnbound => "identity_assertion_unbound",
             ClientAuthDiagnosticReason::IdentityAssertionNoScope => "identity_assertion_no_scope",
             ClientAuthDiagnosticReason::IdentityAssertionScopeExceeded => {
                 "identity_assertion_scope_exceeded"

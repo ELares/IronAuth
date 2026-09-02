@@ -1153,10 +1153,12 @@ impl OidcState {
 
     /// Arm the identity-chaining / ID-JAG receiving side (issue #133, PROTOTYPE).
     ///
-    /// It adds three checks to the jwt-bearer assertion grant and removes none: the ID-JAG
-    /// media type, the assertion naming the presenting client, and the assertion's scope as a
-    /// ceiling. With it off -- the default -- an assertion carrying that media type is treated
-    /// exactly as main treats it, because `typ` is not a separator the ordinary path reads.
+    /// It adds four checks to the jwt-bearer assertion grant and removes none: the ID-JAG
+    /// media type, the assertion naming the presenting client, a CONFIDENTIAL presenting
+    /// client (without which that naming costs an interceptor nothing), and the assertion's
+    /// scope as a ceiling on the token's `scope`. With it off -- the default -- an assertion
+    /// carrying that media type is treated exactly as main treats it, because `typ` is not a
+    /// separator the ordinary path reads.
     #[must_use]
     pub fn with_identity_chaining_enabled(mut self, enabled: bool) -> Self {
         self.identity_chaining_enabled = enabled;

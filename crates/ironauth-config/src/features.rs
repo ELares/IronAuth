@@ -104,10 +104,11 @@ pub const ORG_SCOPED_CLIENTS_VERSION: &str = "0.1.0-exp.1";
 /// The registry name of the identity-chaining / ID-JAG receiving side (issue #133,
 /// exploratory bet 3).
 ///
-/// ONE flag for three checks, because they are one control: an identity assertion is separated
+/// ONE flag for four checks, because they are one control: an identity assertion is separated
 /// from an ordinary bearer assertion by its media type, bound to its presenter by the client it
-/// names, and bounded by the scope it carries. Arming any two of the three would leave the
-/// third as the way through.
+/// names, made to COST something by requiring that presenter to be confidential, and bounded by
+/// the scope it carries. Arming any three of the four would leave the fourth as the way
+/// through.
 pub const IDENTITY_CHAINING_FEATURE: &str = "identity-chaining";
 
 /// The experimental `ack` version for identity chaining (issue #133).

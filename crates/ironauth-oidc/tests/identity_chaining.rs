@@ -4,14 +4,14 @@
 //!
 //! # What this file can and cannot answer
 //!
-//! It drives `identity_chaining::admit` against verified tokens, so it answers what the three
+//! It drives `identity_chaining::admit` against verified tokens, so it answers what the four
 //! extra checks accept and refuse. It says nothing about whether the jwt-bearer grant reaches
 //! them; the grant's own DB-backed suite does that, and the distinction has produced a blocker
 //! in every prototype in this series.
 //!
 //! # Why every refusal here is an attack
 //!
-//! The three checks are what make an identity assertion different from an ordinary bearer
+//! The four checks are what make an identity assertion different from an ordinary bearer
 //! assertion from the same trusted issuer:
 //!
 //! - without the MEDIA TYPE, an issuer trusted to federate a workload can speak for a user;
@@ -159,6 +159,18 @@ fn a_public_presenter_cannot_spend_an_identity_assertion() {
         "an assertion perfect in every other way is refused to a public presenter"
     );
 
+    // AND THE ORDER OF THE TWO. An assertion bound to ANOTHER client, replayed through a
+    // public one, is the cheapest interception there is -- open registration makes the public
+    // client free. It must be recorded as the interception, not as the deployment-hygiene
+    // reason, or the alert an operator builds on `ClientMismatch` never fires for the attack
+    // it was built for.
+    let stolen = assertion(ID_JAG_TYP, &claims("cli_the_victim", Some("orders.read")));
+    assert_eq!(
+        admit(&stolen, PRESENTER, false, None),
+        Err(IdentityAssertionRefusal::ClientMismatch),
+        "when both fail, the refusal recorded is the one worth paging on"
+    );
+
     // The control: the SAME assertion, presented by a client that authenticated.
     assert!(
         admit(&verified, PRESENTER, CONFIDENTIAL, None).is_ok(),
@@ -188,11 +200,13 @@ fn an_assertion_naming_another_client_is_refused() {
     );
 
     // And one naming NOBODY is refused too: an unbound assertion is the same bearer token with
-    // the binding left out rather than contradicted.
+    // the binding left out rather than contradicted. It gets its OWN refusal, because it is a
+    // misconfigured issuer rather than an interception, and an operator paging on the mismatch
+    // above must not be woken by it.
     let unbound = assertion(ID_JAG_TYP, &claims("", Some("orders.read")));
     assert_eq!(
         admit(&unbound, PRESENTER, CONFIDENTIAL, None),
-        Err(IdentityAssertionRefusal::ClientMismatch)
+        Err(IdentityAssertionRefusal::Unbound)
     );
 }
 
@@ -238,6 +252,34 @@ fn the_assertions_scope_is_a_ceiling_and_not_a_default() {
         admit(&empty, PRESENTER, CONFIDENTIAL, None),
         Err(IdentityAssertionRefusal::NoScope),
         "whitespace is not a scope"
+    );
+}
+
+#[test]
+fn a_repeated_scope_token_is_normalized_away() {
+    // The assertion's `scope` is the one string in this grant a party OUTSIDE this deployment
+    // chooses, and it reaches the minted token's `scope` claim and every log line downstream
+    // as written. `read:orders read:orders` is not wrong and the machine-grant validator
+    // passes it through, so this is where it gets normalized: a remote party does not get to
+    // choose how this deployment spells its own claims.
+    let repeated = assertion(
+        ID_JAG_TYP,
+        &claims(PRESENTER, Some("orders.read orders.write orders.read")),
+    );
+    assert_eq!(
+        admit(&repeated, PRESENTER, CONFIDENTIAL, None),
+        Ok(vec!["orders.read".to_owned(), "orders.write".to_owned()]),
+        "the repeat is dropped and the first occurrence keeps its place"
+    );
+    assert_eq!(
+        admit(
+            &repeated,
+            PRESENTER,
+            CONFIDENTIAL,
+            Some("orders.read orders.read")
+        ),
+        Ok(vec!["orders.read".to_owned()]),
+        "and a repeat in the REQUEST is dropped too, rather than echoed back doubled"
     );
 }
 

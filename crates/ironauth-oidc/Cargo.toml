@@ -1502,9 +1502,10 @@ name = "transaction_tokens"
 path = "tests/transaction_tokens.rs"
 
 # IDENTITY CHAINING / ID-JAG, the receiving side's admission rules (issue #133): the media type
-# that separates an identity assertion from an ordinary one, the client binding that stops an
-# intercepted assertion, and the scope ceiling that stops a local mapping widening a remote
-# grant. Drives the admission directly; needs no database.
+# that separates an identity assertion from an ordinary one, the confidential presenter and the
+# client binding that together stop an intercepted assertion, and the scope ceiling that stops a
+# local mapping widening the SCOPE of a remote grant. Drives the admission directly; needs no
+# database.
 [[test]]
 name = "identity_chaining"
 path = "tests/identity_chaining.rs"

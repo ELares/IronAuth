@@ -9004,7 +9004,13 @@ Identity chaining splits it in two. A mints an **identity assertion** naming the
 
 ## How it is built: layered ON the jwt-bearer grant, not beside it
 
-An ID-JAG **is** an RFC 7523 assertion grant. So this is not a new door. It is three extra checks inside the door that already exists, and they run **last** -- after every ordinary control:
+An ID-JAG **is** an RFC 7523 assertion grant. So this is not a new door. It is four extra checks inside the door that already exists, and they run **after every control that touches the assertion**.
+
+The order matters and is worth writing out, because one step is not where a reader would put it.
+
+**First**, before the assertion is looked at: the **requested** scope passes the machine-grant floor and the presenting client's allowlist. This is deliberately early, so an out-of-policy request cannot spend the assertion's single-use `jti`. Note what it means for this prototype: when the client requests **no** scope -- the shape an ID-JAG flow normally takes -- this step validates **nothing**, because there is nothing to validate yet. That vacuity is exactly why the last step below exists.
+
+**Then**, on the assertion itself:
 
 1. the issuer is registered and enabled,
 2. the signature verifies against that issuer's keys,
@@ -9012,10 +9018,11 @@ An ID-JAG **is** an RFC 7523 assertion grant. So this is not a new door. It is t
 4. `sub` and `exp` are present and `exp` is in the future,
 5. the `jti`, if present, has not been seen,
 6. the subject has a **registered** mapping to a local principal (nothing is auto-provisioned),
-7. the mapped principal passes its lifecycle fence,
-8. the requested scope passes the machine-grant floor and the presenting client's allowlist.
+7. the mapped principal passes its lifecycle fence.
 
-**Then** the three ID-JAG checks. They add refusals and remove none, which is the whole reason for building it this way: a prototype that sat beside the grant would have had to re-implement all eight, and the one it forgot would be the hole.
+**Then** the four ID-JAG checks. They add refusals and remove none, which is the whole reason for building it this way: a prototype that sat beside the grant would have had to re-implement all seven above, and the one it forgot would be the hole.
+
+**Finally**, when the ID-JAG checks admitted a ceiling, that ceiling goes back through the same scope policy the first step used. See "The ceiling is not a second way in".
 
 ## The four checks
 
@@ -9024,7 +9031,9 @@ An ID-JAG **is** an RFC 7523 assertion grant. So this is not a new door. It is t
 | the header `typ` is `oauth-id-jag+jwt` | an issuer registered to federate a CI workload could present an assertion that speaks for a **person** |
 | the presenting client is **confidential** | see below: the binding beneath it costs an interceptor nothing |
 | `client_id` names the presenting client | the assertion is a bearer token for whoever intercepts it |
-| `scope` is present, and bounds what is issued | a **local** subject mapping could widen what the **authoritative** domain granted |
+| `scope` is present, and bounds the issued **`scope`** | a **local** subject mapping could widen what the **authoritative** domain granted |
+
+**The ceiling reaches `scope` and nothing else.** The minted token also carries `org_id` and `roles`, resolved from the **local** principal the assertion's subject maps to, and the assertion does not bound those. That follows from what this grant is -- B mints its own token under its own local identity -- but a resource server that authorizes on `roles` rather than on scope sees no ceiling at all. It is in the graduation list below.
 
 ### Why the presenting client must be confidential
 
@@ -9038,7 +9047,7 @@ The media type is compared with the optional and case-insensitive `application/`
 
 An assertion carrying **no** `scope` is refused rather than treated as "everything the mapping allows". That default is the widening the last check exists to stop.
 
-Each refusal records its **own** reason in the client-authentication diagnostics sink, while the wire answer stays the one uniform `invalid_grant` every assertion failure gives. An operator has to be able to separate an assertion minted for a different client, which is an interception and the only one of these worth paging on, from an issuer that forgot to set `scope`. A caller must not.
+Each refusal records its **own** reason in the client-authentication diagnostics sink, while the wire answer stays the one uniform `invalid_grant` every assertion failure gives. An operator has to be able to separate an assertion minted for a **different** client, which is an interception, from an assertion carrying **no** `client_id` or no `scope`, which is an issuer that did not set the claim. Those are three different reasons and only the first is an attack. A caller must not be able to tell any of them apart.
 
 ## The assertion's scope is a ceiling, never a second way in
 
@@ -9050,9 +9059,9 @@ The one visible difference from a plainly requested scope is ordering. The ceili
 
 ## With the flag off
 
-An assertion carrying the ID-JAG media type is treated **exactly as it is on main today**: an ordinary bearer assertion from a trusted issuer. `typ` is not a separator the ordinary path reads, so none of the three checks apply and none of the three refusals fire.
+An assertion carrying the ID-JAG media type is treated **exactly as it is on main today**: an ordinary bearer assertion from a trusted issuer. `typ` is not a separator the ordinary path reads, so none of the four checks apply and none of their refusals fire.
 
-That is stated plainly because it is the sharp edge, not a footnote. It is also why the flag exists: the three checks are the entire difference between an identity assertion and a bearer one, and an operator has to opt into them.
+That is stated plainly because it is the sharp edge, not a footnote. It is also why the flag exists: the four checks are the entire difference between an identity assertion and a bearer one, and an operator has to opt into them.
 
 ## Turning it on
 
@@ -9081,6 +9090,7 @@ Nothing is mounted and nothing is advertised. The only visible sign that it is a
 ## What a graduation still needs
 
 - **Trust is per ISSUER, not per (issuer, trust domain).** This is the sharpest edge here. An external issuer registered for **workload** federation can, once the flag is on, present identity assertions that speak for people -- because the registration says "we trust this issuer" and nothing narrows that to a purpose. A graduation needs the registration to say which of the two an issuer may do.
+- **The ceiling does not reach the local authorization claims.** `org_id` and `roles` are resolved from the mapped local principal, not from the assertion. Bounding them needs a decision this prototype does not make: whether a chained identity should carry the local principal's authority at all, or only what the authoritative domain named. A deployment whose resource servers authorize on `roles` should treat this prototype as bounding nothing they read.
 - **No `sub_id`.** RFC 9493 structured subject identifiers are not read; the plain `sub` is matched against the registered mapping, which is what the ordinary grant has always done.
 - **The requesting side.** See above.
 - **No per-assertion audit distinction on the SUCCESS path.** A token minted from an identity assertion and one minted from an ordinary assertion produce the same audit shape, so an operator reading the log cannot tell which came through this path. The refusals are distinguished (each records its own diagnostic reason); the mints are not.

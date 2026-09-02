@@ -3777,7 +3777,7 @@ async fn the_jwt_bearer_grant_runs_the_hook() {
 //
 // These live in THIS file rather than beside the module's own unit suite, and the reason is the
 // property they exist to prove. `tests/identity_chaining.rs` drives `admit` directly and answers
-// what the three checks accept; it cannot answer whether the grant reaches them, nor whether the
+// what the four checks accept; it cannot answer whether the grant reaches them, nor whether the
 // grant's OTHER controls still fire once it does. Layering a prototype onto a live grant is
 // exactly where a control gets routed around, and it happened here: the first draft handed the
 // mint the assertion's own scope claim, which the machine-grant floor and the presenting
@@ -3795,8 +3795,9 @@ const ID_JAG_MEDIA_TYPE: &str = "oauth-id-jag+jwt";
 /// purpose: a caller that could tell them apart would learn how far a forged assertion got. So
 /// a test asserting only the status and the error code cannot tell an interception from a
 /// forged signature, and would still pass if the ID-JAG path had short-circuited a check it
-/// was supposed to run in addition to. Every sibling test in this file pins the reason for the
-/// same reason.
+/// was supposed to run in addition to. Every sibling test in this file that has to tell one
+/// `invalid_grant` from another pins the reason the same way; the ones asserting only the wire
+/// are the ones where the status IS the whole claim.
 async fn assert_refused_because(h: &Harness, client_id: &str, reason: &str) {
     let seen: Vec<String> = h
         .client_auth_diagnostics(client_id)
@@ -3859,7 +3860,7 @@ async fn an_id_jag_assertion_is_an_ordinary_assertion_until_the_prototype_is_arm
     // THE UNARMED POSTURE, and it is the honest one rather than a convenient one. `typ` is not
     // a separator the ordinary path reads, so on a deployment that has not opted in, an
     // assertion carrying the ID-JAG media type is exactly what it is on main today: an ordinary
-    // bearer assertion from a trusted issuer. None of the three checks apply -- and that is
+    // bearer assertion from a trusted issuer. None of the four checks apply -- and that is
     // precisely why the flag exists, because those checks are the whole difference between an
     // identity assertion and a bearer one.
     let h = Harness::start().await;
@@ -3972,6 +3973,50 @@ async fn an_armed_deployment_admits_an_honest_id_jag_and_refuses_the_attacks() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
     assert_eq!(json(&resp)["error"], "invalid_grant", "{resp}");
     assert_refused_because(&h, &client_id, "identity_assertion_scope_exceeded").await;
+}
+
+#[tokio::test]
+async fn the_media_type_alone_decides_whether_the_id_jag_rules_apply() {
+    // WHAT THE `typ` PARAMETER IS FOR, and until this case nothing varied it.
+    //
+    // Every other armed case differs from the honest one in something the ID-JAG rules judge,
+    // so all of them would still pass if the media type were ignored and the rules applied to
+    // every assertion. This is the converse: a client that could satisfy EVERY other check --
+    // confidential, named in the assertion, asking within its scope -- presents an assertion
+    // whose only difference is an ordinary `typ`. None of the rules may apply to it, and in
+    // particular the scope ceiling must not, or the prototype would be silently changing what
+    // the ordinary grant issues.
+    let mut h = Harness::start().await;
+    seed_trust(&h).await;
+    h.install_identity_chaining();
+    let (confidential, secret) = h.create_confidential_client(ClientAuthMethod::Basic).await;
+    let client_id = confidential.to_string();
+    let key = issuer_key();
+
+    // `JWT`, not the ID-JAG type, and carrying a `scope` claim of `read:orders`. If the
+    // ceiling applied, asking for `admin` would be refused as exceeding it.
+    let ordinary = id_jag(
+        &key,
+        h.issuer(),
+        "jti-idjag-typ-decides",
+        &client_id,
+        Some("read:orders"),
+        "JWT",
+    );
+    let (status, _h, resp) =
+        present_confidential(&h, &client_id, &secret, &ordinary, Some("admin")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an ordinary assertion is judged by the ordinary rules even when every ID-JAG \
+         condition happens to hold: {resp}"
+    );
+    assert_eq!(
+        json(&resp)["scope"],
+        "admin",
+        "and it carries what the CLIENT asked for, with the assertion's scope claim ignored \
+         exactly as main ignores it: {resp}"
+    );
 }
 
 #[tokio::test]

@@ -22,7 +22,11 @@ cd "$(git rev-parse --show-toplevel)"
 revisions() {
     echo "Issue #133 prototypes, and the exact revision each pins:"
     echo
-    printf '  %-28s %-52s %s\n' FLAG REVISION 'UPGRADE-RISK NOTE'
+    # 92, not 52: identity-chaining's pinned value is two draft names joined by a `+` and is
+    # 89 characters, so the narrower column pushed its note off the row and the table stopped
+    # lining up. A revision column too narrow for the longest revision is a table that reports
+    # correctly and reads wrong.
+    printf '  %-28s %-92s %s\n' FLAG REVISION 'UPGRADE-RISK NOTE'
     # ONE row per prototype and ONE extraction, rather than the copy per prototype this started
     # as. Four near-identical blocks was already three chances for a bump to be applied to some
     # of them; a fifth would have made that the shape of the file. The table below is the only
@@ -49,7 +53,7 @@ revisions() {
                  "than hard-coding the revision here." >&2
             exit 1
         fi
-        printf '  %-28s %-52s %s\n' "$flag" "$pinned" "$note"
+        printf '  %-28s %-92s %s\n' "$flag" "$pinned" "$note"
     done <<'ROWS'
 attestation-client-auth ATTESTATION_CLIENT_AUTH_VERSION docs/experimental/attestation-client-auth.md
 authzen-agent-profile AUTHZEN_AGENT_PROFILE_VERSION docs/experimental/authzen-agent-profile.md
@@ -109,7 +113,7 @@ cargo test -p ironauth --bin ironauth transaction_token
 
 echo
 echo "== identity chaining / ID-JAG (receiving side) =="
-# The three admission rules, each driven by minting the honest assertion and changing exactly
+# The four admission rules, each driven by minting the honest assertion and changing exactly
 # one thing. Needs no database.
 cargo test -p ironauth-oidc --test identity_chaining
 # And the GRANT: that it reaches those rules, that every ordinary jwt-bearer refusal still

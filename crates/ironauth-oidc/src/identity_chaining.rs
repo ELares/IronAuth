@@ -34,7 +34,7 @@
 //! every one of those, and the copy is where they stop agreeing.
 //!
 //! So this adds requirements and removes none. Everything the ordinary grant refuses, the
-//! ID-JAG path still refuses; what it adds is the three checks that make an identity assertion
+//! ID-JAG path still refuses; what it adds is the four checks that make an identity assertion
 //! different from an ordinary bearer assertion:
 //!
 //! - **The media type.** `draft-ietf-oauth-identity-assertion-authz-grant` gives the assertion
@@ -44,11 +44,28 @@
 //! - **The requesting client is NAMED in the assertion.** The draft binds the assertion to the
 //!   client that will present it, so an assertion intercepted by another client of the same
 //!   deployment is inert. Without this the assertion is a bearer token for anyone who holds it.
-//! - **The assertion's scope is a CEILING.** What A said the user authorized bounds what B
-//!   issues. A receiving side that ignored it would let a registered mapping widen what the
-//!   authoritative domain granted.
+//! - **The presenting client is CONFIDENTIAL.** Which is what makes the naming above a
+//!   control rather than a spelling requirement: a public client authenticates by naming
+//!   itself, so an interceptor satisfies the binding by reading the client id off the
+//!   assertion it stole. The ordinary grant permits a public presenter on purpose, because
+//!   there the assertion IS the authorization grant and nothing claims to bind it.
+//! - **The assertion's scope is a CEILING on the token's `scope`.** What A said the user
+//!   authorized bounds the `scope` B issues. A receiving side that ignored it would let a
+//!   registered mapping widen what the authoritative domain granted.
+//!
+//!   THE CEILING REACHES `scope` AND NOTHING ELSE, which is worth stating because the sentence
+//!   above invites the wider reading. The minted token also carries `org_id` and `roles`,
+//!   resolved from the LOCAL principal the subject maps to, and the assertion does not bound
+//!   those. That is consistent with what this grant is -- B mints its own token under its own
+//!   local identity -- but a resource server that authorizes on `roles` rather than on scope
+//!   sees no ceiling at all. See the graduation list.
 //!
 //! # What a graduation still needs
+//!
+//! - **The ceiling does not reach the local authorization claims.** `org_id` and `roles` come
+//!   from the mapped local principal. Bounding them needs a decision this prototype does not
+//!   make: whether a chained identity should carry the local principal's authority at all, or
+//!   only what the authoritative domain named.
 //!
 //! - **The REQUESTING side.** This accepts an assertion; it does not mint one. That is the
 //!   other half of the chain and the half that needs a policy for which downstream domains a
@@ -102,8 +119,20 @@ pub enum IdentityAssertionRefusal {
     /// form. Anyone who intercepted the assertion could satisfy the binding for free, and the
     /// assertion would be exactly the bearer token the binding exists to stop it being.
     PresenterNotConfidential,
-    /// The assertion names no client, or names a different one than the presenter.
+    /// The assertion names a DIFFERENT client than the presenter.
+    ///
+    /// Kept apart from [`Self::Unbound`] because only this one is an attack. An assertion
+    /// minted for another client arriving here is an interception; an assertion with no
+    /// `client_id` at all is an issuer that did not set the claim. An operator pages on the
+    /// first and files a ticket for the second, so recording both under one reason makes the
+    /// alert built on it fire for a misconfiguration.
     ClientMismatch,
+    /// The assertion names NO client, so it is bound to nobody.
+    ///
+    /// Refused for the same reason a mismatch is -- an unbound assertion is a bearer token
+    /// with the binding left out rather than contradicted -- but it is a misconfigured issuer,
+    /// not an interception. See [`Self::ClientMismatch`].
+    Unbound,
     /// The assertion carries no scope, so there is no ceiling and nothing to issue against.
     NoScope,
     /// The request asked for scope the assertion does not authorize.
@@ -146,26 +175,35 @@ pub fn admit(
 
     // THE BINDING BELOW HAS TO COST SOMETHING. A public client authenticates by naming
     // itself, so an interceptor satisfies `client_id` by sending the id printed in the
-    // assertion it just stole. Refusing a public presenter is what turns the next check from a
-    // spelling requirement into a control. It is checked HERE, after the media type, so an
-    // ordinary bearer assertion from a public client -- which this grant permits on purpose --
-    // is untouched.
-    if !presenter_is_confidential {
-        return Err(IdentityAssertionRefusal::PresenterNotConfidential);
-    }
-
-    // BOUND TO THE PRESENTER. The draft names the client the assertion is for, so one
-    // intercepted by another client of this same deployment is inert. Without this the
-    // assertion is a bearer token for whoever holds it, which is exactly what a chained
-    // identity must not be.
+    // assertion it just stole.
+    //
+    // THE BINDING IS CHECKED FIRST, and the order is about the RECORD rather than the answer.
+    // Both refuse, so a caller cannot tell them apart either way. But an assertion naming
+    // another client is an INTERCEPTION and is the one refusal here an operator should be
+    // paged on, while a public presenter is usually a deployment that has not finished
+    // configuring. Checking the presenter first would report the cheapest interception --
+    // replaying a stolen assertion through any public client, which open registration makes
+    // free -- as the benign reason, and the alert built on the page-worthy one would never
+    // fire for the attack it was built for.
     let named = verified
         .claims()
         .get("client_id")
         .and_then(serde_json::Value::as_str)
         .filter(|client| !client.is_empty())
-        .ok_or(IdentityAssertionRefusal::ClientMismatch)?;
+        .ok_or(IdentityAssertionRefusal::Unbound)?;
     if named != presenting_client {
         return Err(IdentityAssertionRefusal::ClientMismatch);
+    }
+
+    // AND THE BINDING ABOVE HAS TO COST SOMETHING. A public client authenticates by naming
+    // itself, so satisfying `client_id` costs an interceptor nothing: it reads the id off the
+    // assertion. Refusing a public presenter is what turns the check above from a spelling
+    // requirement into a control. Both are needed and neither implies the other.
+    //
+    // Checked after the media type, so an ordinary bearer assertion from a public client --
+    // which this grant permits on purpose -- is untouched.
+    if !presenter_is_confidential {
+        return Err(IdentityAssertionRefusal::PresenterNotConfidential);
     }
 
     // THE CEILING. What the authoritative domain said the user authorized bounds what this one
@@ -174,7 +212,7 @@ pub fn admit(
         .claims()
         .get("scope")
         .and_then(serde_json::Value::as_str)
-        .map(|scope| scope.split_whitespace().map(ToOwned::to_owned).collect())
+        .map(|scope| dedup(scope.split_whitespace().map(ToOwned::to_owned)))
         .unwrap_or_default();
     if authorized.is_empty() {
         return Err(IdentityAssertionRefusal::NoScope);
@@ -183,10 +221,7 @@ pub fn admit(
     let Some(requested) = requested_scope else {
         return Ok(authorized);
     };
-    let requested: Vec<String> = requested
-        .split_whitespace()
-        .map(ToOwned::to_owned)
-        .collect();
+    let requested: Vec<String> = dedup(requested.split_whitespace().map(ToOwned::to_owned));
     if requested.is_empty() {
         return Ok(authorized);
     }
@@ -194,4 +229,16 @@ pub fn admit(
         return Err(IdentityAssertionRefusal::ScopeExceedsAssertion);
     }
     Ok(requested)
+}
+
+/// Preserve order, drop repeats.
+///
+/// The scope string is a FOREIGN issuer's, and this is the one place in the grant where a
+/// party outside this deployment chooses it. `read:orders read:orders` is not wrong, and the
+/// machine-grant validator is happy to pass it through, but it would reach the token's `scope`
+/// claim and every log line downstream exactly as written. Normalizing here costs nothing and
+/// keeps a remote party from choosing how this deployment's own claims are spelled.
+fn dedup(scopes: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    scopes.filter(|scope| seen.insert(scope.clone())).collect()
 }
