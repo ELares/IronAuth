@@ -62,15 +62,40 @@ async fn seed_agent(harness: &Harness, client: &ClientId, tool_scopes: &[&str]) 
 }
 
 /// Move a seeded agent to `state`, as the control plane would.
+///
+/// THROUGH THE REPOSITORY, not a raw UPDATE, and the difference is the whole reason
+/// `revoking_an_agent_revokes_its_grants_and_leaves_the_clients_human_grants_alone` exists.
+/// This helper used to be `UPDATE agents SET state = $1` against the owner pool, which is
+/// exactly what the control plane does NOT do: `ActingAgentRepo::set_state` revokes the
+/// agent's outstanding grants in the SAME transaction as the state change, and a raw column
+/// write cannot cascade. So the test asserting the cascade could never pass, and its own
+/// message said why -- "setting the state alone only blocks the NEXT issuance" -- while the
+/// helper's comment claimed it was acting as the control plane.
+///
+/// Two of the three callers only need the next issuance blocked and were unaffected either
+/// way; the third needs the cascade, which is the one that was red.
 async fn set_state(harness: &Harness, id: &AgentPrincipalId, state: &str) {
-    sqlx::query(
-        "UPDATE agents /* query-audit-allow: owner test seed */ SET state = $1 WHERE id = $2",
+    let env = harness.env().clone();
+    let now = i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_micros(),
     )
-    .bind(state)
-    .bind(id.to_string())
-    .execute(harness.db().owner_pool())
-    .await
-    .expect("set agent state");
+    .expect("fits i64");
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(&env),
+            ironauth_store::CorrelationId::generate(&env),
+        )
+        .agents()
+        .set_state(&env, id, state, now, None)
+        .await
+        .expect("set agent state");
 }
 
 /// Every audit action recorded in the harness scope, with its detail.
