@@ -12388,8 +12388,9 @@ impl ClientAuthDiagnosticReason {
         ClientAuthDiagnosticReason::AssertionIssuerUntrusted,
         ClientAuthDiagnosticReason::AssertionSubjectUnmapped,
         // The five identity-chaining reasons (issue #133). In DECLARATION order, which this
-        // list is required to hold: they were added to the enum and to `as_str` and not to
-        // here, so every sweep that iterates ALL silently skipped them.
+        // list is required to hold. They were added to the enum and to `as_str` and not to
+        // here, so every sweep that iterates ALL has silently skipped them since #1089 -- and
+        // the guard below has been failing on main ever since, which is what it is for.
         ClientAuthDiagnosticReason::IdentityAssertionPresenterPublic,
         ClientAuthDiagnosticReason::IdentityAssertionClientMismatch,
         ClientAuthDiagnosticReason::IdentityAssertionUnbound,
