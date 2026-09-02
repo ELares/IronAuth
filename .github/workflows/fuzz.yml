@@ -9,6 +9,27 @@
 name: fuzz
 
 on:
+  # ON PULL REQUESTS, for the `build` job only (the `fuzz` matrix below skips them).
+  #
+  # Without this the build job was worthless, and the commit that added it said the opposite.
+  # A schedule-only workflow cannot gate a merge, and `cargo fuzz run` already compiles its
+  # target -- so the dead `scim_filter` this job was written for had ALREADY been failing its
+  # nightly lane, and adding a second nightly compile detected nothing new. The gap was never
+  # "nothing compiles these"; it was "nothing compiles these BEFORE a merge".
+  #
+  # NOT path-filtered, and that is a deliberate reversal. The first version filtered on
+  # `fuzz/**` and `crates/*/fuzz/**`, which is the SAME two-shape enumeration this PR removed
+  # from the build loop one commit earlier -- a fuzz crate at any other path would not have
+  # started the workflow at all, so the `find` that was added to catch it would never run. A
+  # reviewer planted one at `tools/oddplace/fuzz` and confirmed the trigger missed it.
+  #
+  # The filter was also wrong about what can break a build: a crate's own `Cargo.toml`, the
+  # workspace manifest and `Cargo.lock` all can, and none were listed.
+  #
+  # And a filtered `paths:` cannot be a REQUIRED check: GitHub leaves it permanently pending
+  # on any PR that misses the filter, which blocks the merge instead of gating it. Running on
+  # every pull request costs one compile job and is the only shape that can actually gate.
+  pull_request:
   schedule:
     # Nightly, off-peak; arbitrary minute to avoid the top-of-hour herd.
     - cron: "27 4 * * *"
@@ -22,8 +43,83 @@ permissions:
   contents: read
 
 jobs:
+  # BUILD EVERY TARGET, which is the check `scripts/fuzz-matrix-freshness.sh` structurally
+  # cannot make. That gate compares registration three ways -- [[bin]] entries, target files,
+  # matrix rows -- and never invokes cargo, deliberately, so it runs without a nightly
+  # toolchain. The gap that leaves is a target that is registered everywhere and does not
+  # COMPILE, and the repository shipped exactly that: a `scim_filter` target in the
+  # repository-root crate read a private field and matched non-exhaustively on an enum that
+  # had gained a variant, so `cargo fuzz build` failed on it and its scheduled lane could only
+  # ever have failed too. It sat listed-and-dead, and the parser it uniquely covered had
+  # therefore never been fuzzed at all.
+  #
+  # One job over every crate, not one per target: this is a compile check, it is cheap, and a
+  # failure here means the matrix below is lying about what it runs.
+  build:
+    name: build every fuzz target
+    runs-on: ubuntu-latest
+    # Measured at 394s over eight crates on an M-series laptop, and a hosted runner is
+    # slower, has fewer cores, shares no target directory between the detached crates, and
+    # builds cargo-fuzz from source first.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          set -euo pipefail
+          # FOUND, not enumerated. Two hardcoded shapes is the exact narrow search that caused
+          # the miss this job exists for: the dead target lived in the repository-root `fuzz/`
+          # crate and a `crates/*/fuzz` grep did not see it.
+          # `scripts/fuzz-matrix-freshness.sh` walks rather than enumerates for the same
+          # reason, and says so.
+          found=0
+          broken=""
+          while IFS= read -r manifest; do
+            crate_dir="$(dirname "$(dirname "$manifest")")"
+            echo "::group::$crate_dir"
+            # EVERY crate is attempted. `set -e` would abort at the first failure and the log
+            # would name one offender while the rest stayed unknown, which is a poor report
+            # for a check whose whole job is to say which targets do not build.
+            if ! (cd "$crate_dir" && cargo fuzz build); then
+              broken="$broken $crate_dir"
+            fi
+            echo "::endgroup::"
+            found=$((found + 1))
+          done < <(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
+                          -not -path '*/target/*' | sort)
+          # The floor is the count the freshness gate reports, not a token 2: a floor of 2
+          # tolerates the walk silently dropping six of the eight crates, which is most of the
+          # way back to finding nothing.
+          expected="$(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
+                            -not -path '*/target/*' | wc -l | tr -d ' ')"
+          if [ "$found" -ne "$expected" ] || [ "$found" -lt 8 ]; then
+            echo "walked $found fuzz crates, expected at least 8 (found $expected)" >&2
+            exit 1
+          fi
+          if [ -n "$broken" ]; then
+            echo "these fuzz crates do not build:$broken" >&2
+            exit 1
+          fi
+          echo "built $found fuzz crates"
+
   fuzz:
     name: fuzz ${{ matrix.target }}
+    # NOT on pull requests: eighteen targets at five minutes each is a nightly lane, not a
+    # merge gate. `build` above is the part that gates.
+    #
+    # `!cancelled()` rather than a bare event check, because `needs: build` otherwise carries
+    # an implicit `success()`: one crate failing to build would skip ALL EIGHTEEN legs, so a
+    # single dead target would stop seventeen healthy parsers being fuzzed that night. That is
+    # a strictly worse version of the failure this PR exists to fix, and `fail-fast: false`
+    # below says the opposite is intended. The ordering is kept for the log; the suppression
+    # is not.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -34,9 +130,12 @@ jobs:
         #
         # EVERY registered target belongs here. A target absent from this matrix has
         # never run, which is exactly how issue #418 sat undetected; keep this list
-        # equal to the union of `cargo fuzz list` over every `*/fuzz` crate. As of
-        # issue #135 that is 15 targets, matching the 15 `fuzz_targets/*.rs` files and
-        # the 15 `[[bin]]` entries.
+        # equal to the union of `cargo fuzz list` over every `*/fuzz` crate.
+        #
+        # The COUNT is deliberately not written here. It said 15 while the tree held 16,
+        # and then 18: a number in a comment beside the thing it counts is a number that
+        # drifts, and this one drifted twice. `scripts/fuzz-matrix-freshness.sh` computes
+        # it and prints it, which is the only version that cannot be wrong.
         #
         # That equality is ENFORCED, not merely documented here: the gate runs
         # `scripts/fuzz-matrix-freshness.sh`, which fails naming any target that is
@@ -45,6 +144,12 @@ jobs:
         include:
           - dir: crates/ironauth-jose
             target: verify_jws
+          - dir: crates/ironauth-scim
+            target: scim_filter
+          - dir: crates/ironauth-scim
+            target: scim_patch_path
+          - dir: crates/ironauth-scim
+            target: scim_resource_path
           - dir: crates/ironauth-fetch
             target: fetch_validation
           - dir: crates/ironauth-store
@@ -79,11 +184,6 @@ jobs:
             target: claim_mapping
           - dir: crates/ironauth-connector
             target: connector_def
-          # SCIM filter grammar (issue #135). The filter parser runs on a query string
-          # an external provisioning connector chose, before any scope check narrows it,
-          # so a panic here is reachable by every SCIM client the deployment trusts.
-          - dir: .
-            target: scim_filter
     steps:
       - uses: actions/checkout@v7
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The
@@ -105,6 +205,10 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
+          # KEYED ON THE PAIR, because the matrix is keyed on (dir, target) and two
+          # crates may legally register the same target name -- which this repository just
+          # had. The bare target name collides in that case and one upload overwrites the
+          # other, losing a crash input.
+          name: fuzz-artifacts-${{ matrix.target }}-${{ strategy.job-index }}
           path: ${{ matrix.dir }}/fuzz/artifacts/
           if-no-files-found: ignore

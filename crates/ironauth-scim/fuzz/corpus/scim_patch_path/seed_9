@@ -1,0 +1,1 @@
+emails[type eq "work" and primary eq true].value

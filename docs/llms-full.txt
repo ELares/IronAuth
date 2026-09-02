@@ -29,12 +29,20 @@ to pick an open issue in the current milestone and say so on the issue.
   `tail -1 gate.log` for the verdict. The summary prints from an EXIT trap, so it
   survives an interrupt, and it reports every failing check rather than the first.
   `gate.log` is gitignored.
-- **New fuzz targets run in CI.** A fuzz target is registered by a `[[bin]]`
-  entry in its `*/fuzz/Cargo.toml`, and it only ever EXECUTES if it also has a
-  row in the `.github/workflows/fuzz.yml` matrix. `scripts/fuzz-matrix-freshness.sh`
-  (in the gate) fails if those two sets differ in either direction, so a new
-  target lands with its matrix row or not at all. The check is static and needs
-  no nightly toolchain and no `cargo-fuzz` install.
+- **New fuzz targets run in CI.** Three things must agree, not two. A fuzz target
+  is registered by a `[[bin]]` entry in its `*/fuzz/Cargo.toml`, it only ever
+  EXECUTES if it also has a row in the `.github/workflows/fuzz.yml` matrix, and
+  it must COMPILE. `scripts/fuzz-matrix-freshness.sh` (in the gate) fails if the
+  first two sets differ in either direction; it is deliberately static, needing
+  no nightly toolchain and no `cargo-fuzz` install, which means it cannot see the
+  third. The `build` job in `fuzz.yml` covers that: it runs `cargo fuzz build`
+  over every fuzz crate, on every pull request. It is deliberately NOT path
+  filtered, because a filter is itself an enumeration of where a fuzz crate may
+  live, and that is the assumption both gaps below came from.
+  Both checks exist because both gaps have shipped. Targets were registered and
+  never listed (issue #419, seven of them); and a target was registered, listed,
+  and had never compiled, so the parser it uniquely covered was reported as
+  fuzzed and never was.
 - **Prose rule.** No em dashes and no en dashes anywhere in repo text
   (code, comments, docs, commit messages). CI enforces this.
 - **Determinism seam.** All time and randomness flows through

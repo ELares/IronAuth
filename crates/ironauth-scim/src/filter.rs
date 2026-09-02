@@ -577,6 +577,34 @@ fn utf8_width(byte: u8) -> usize {
     }
 }
 
+/// The sample user resource the filter fuzz target evaluates against, and the one the seed
+/// test measures the corpus with.
+///
+/// EXPORTED so there is exactly ONE. The fuzz target and the test each had a hand-written
+/// copy, so a change to the target's resource -- dropping `emails`, say -- could not fail the
+/// test that claims to measure what the target explores. Two objects asserted about as though
+/// they were one is the defect class this crate keeps finding in its own prose.
+///
+/// Shaped like what `/Users` renders, plus a multi-valued attribute, because a resource of
+/// scalars leaves the recursive half of [`matches`] untouched.
+#[doc(hidden)]
+#[must_use]
+pub fn sample_user_resource() -> serde_json::Value {
+    serde_json::json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "id": "usr_fuzz",
+        "userName": "alice@example.test",
+        "active": true,
+        "externalId": "00u1",
+        "emails": [
+            {"type": "work", "value": "alice@example.test", "primary": true},
+            {"type": "home", "value": "a@home.test"},
+        ],
+        "name": {"givenName": "Alice", "familyName": "Example"},
+        "meta": {"resourceType": "User"},
+    })
+}
+
 /// Whether `resource` satisfies `filter` (RFC 7644 section 3.4.2.2).
 ///
 /// # Why the evaluator lives beside the parser
@@ -1246,5 +1274,279 @@ mod tests {
             }
             Filter::And(_, _) | Filter::Or(_, _) | Filter::Not(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_corpus_tests {
+    //! The committed fuzz seeds must stay VALID inputs.
+    //!
+    //! A seed exists to start libFuzzer from something that reaches the interesting code:
+    //! random bytes almost never parse as a filter, so without seeds the evaluator behind the
+    //! parser is barely explored. A seed that stops parsing is therefore not a test failure in
+    //! the fuzz job -- it is silent loss of coverage there, which nothing else would report.
+    //!
+    //! This lives in the crate rather than in the fuzz harness because the fuzz harness is not
+    //! a workspace member and does not run in the ordinary test lane.
+
+    use std::path::{Path, PathBuf};
+
+    /// What one resource-path seed is: its text, and either the (type, id) it names or
+    /// `None` for a seed that must be REFUSED.
+    ///
+    /// A named type because the tuple is genuinely hard to read, and because the refusal half
+    /// is the point: a table of only-accepted paths would leave the segment allowlist unseeded.
+    type SeedExpectation = (&'static str, Option<(&'static str, Option<&'static str>)>);
+
+    fn seeds(target: &str) -> Vec<(String, String)> {
+        let dir: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/corpus")
+            .join(target);
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("the {target} corpus directory exists: {error}"))
+        {
+            let path = entry.expect("a corpus entry").path();
+            let name = path
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy()
+                .into_owned();
+            // Only the CURATED seeds. libFuzzer names what it generates after the hash of its
+            // contents and `.gitignore` keeps those out of the tree, but a developer who has
+            // run the fuzzer locally has them on disk, and they are not expected to parse.
+            if !name.starts_with("seed_") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            out.push((name, text));
+        }
+        out
+    }
+
+    #[test]
+    fn every_committed_filter_seed_still_parses() {
+        let seeds = seeds("scim_filter");
+        assert!(
+            seeds.len() >= 13,
+            "the filter seed corpus must not have shrunk: {}",
+            seeds.len()
+        );
+        for (name, text) in seeds {
+            assert!(
+                super::parse_filter(&text).is_ok(),
+                "{name} no longer parses, so the fuzzer starts from a dead seed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_committed_resource_path_seed_still_parses_or_is_a_named_refusal() {
+        // THE SEEDS ARE THE ONLY THING THAT REACHES THIS PARSER. `parse_resource_path`
+        // matches its first segment EXACTLY against "Users" or "Groups", and nothing else can
+        // produce a `ResourceRef`, so input the fuzzer invents stops at the first refusal.
+        // The target shipped with no corpus at all and was therefore registered, listed,
+        // built, run nightly, and exercising nothing past that refusal.
+        //
+        // NO COVERAGE FIGURES HERE, deliberately, and this is the third round in which that
+        // decision was made the hard way. A comment quoted numbers borrowed from a review;
+        // the replacement quoted numbers measured against a corpus the local fuzzer had
+        // already grown, so it credited the seeds with coverage the fuzzer earned and no
+        // clone could reproduce it; and a third claim about what libFuzzer finds from an
+        // empty corpus was simply false when run. A figure in a comment is a measurement
+        // nothing re-runs. What this file asserts instead is the STRUCTURE of the corpus,
+        // below, which is executed on every test run.
+        // A TABLE, not counts. Aggregate floors with slack let an accepted seed flip to
+        // refused and stay green -- a reviewer degraded the three id-carrying seeds to bare
+        // collection paths and the whole suite passed, leaving `reference.id()` and the
+        // segment-byte allowlist (which is what refuses `%2e%2e`, `..` and control bytes, the
+        // CVE class this parser exists for) entirely unseeded.
+        //
+        // Each row is what the seed IS, so a seed edited to something else fails by name.
+        let expected: &[SeedExpectation] = &[
+            ("/Users", Some(("User", None))),
+            ("/Groups", Some(("Group", None))),
+            ("/Users/usr_abc-123", Some(("User", Some("usr_abc-123")))),
+            ("/Groups/grp_7f31", Some(("Group", Some("grp_7f31")))),
+            ("/Users/usr_2c9a8b", Some(("User", Some("usr_2c9a8b")))),
+            // A trailing slash is the COLLECTION, not a refusal. Writing this row as a
+            // refusal is what I assumed and the table said otherwise on the first run, which
+            // is the whole argument for a table over a count.
+            ("/Users/", Some(("User", None))),
+            // The REFUSALS, which are half of what this parser is for.
+            ("/Users/usr_a/extra", None),
+            ("/Users/%2e%2e", None),
+            ("/Users/a.b", None),
+            ("/users", None),
+        ];
+        let corpus: Vec<String> = seeds("scim_resource_path")
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            corpus.len(),
+            expected.len(),
+            "the corpus and this table must describe the same seeds"
+        );
+        for (text, want) in expected {
+            assert!(
+                corpus.iter().any(|seed| seed == text),
+                "the corpus no longer contains the seed {text:?}"
+            );
+            match (crate::parse_resource_path(text), want) {
+                (Ok(reference), Some((kind, id))) => {
+                    assert_eq!(
+                        format!("{:?}", reference.resource_type()),
+                        *kind,
+                        "{text:?} names the wrong resource type"
+                    );
+                    assert_eq!(reference.id(), *id, "{text:?} yields the wrong id");
+                }
+                (Err(_), None) => {}
+                (outcome, want) => {
+                    panic!("{text:?}: expected {want:?}, parser said {outcome:?}")
+                }
+            }
+        }
+        // And the two halves are both present, so a table edited down to one kind is caught.
+        assert!(
+            expected.iter().filter(|(_, want)| want.is_some()).count() >= 5,
+            "too few accepted seeds"
+        );
+        assert!(
+            expected
+                .iter()
+                .filter(|(_, want)| matches!(want, Some((_, Some(_)))))
+                .count()
+                >= 3,
+            "too few seeds carry an id, so the segment allowlist is unseeded"
+        );
+        assert!(
+            expected.iter().filter(|(_, want)| want.is_none()).count() >= 3,
+            "too few refusal seeds"
+        );
+    }
+
+    #[test]
+    fn enough_patch_path_seeds_carry_a_selector_to_seed_that_branch() {
+        // The selector branch of `scim_patch_path` is not reached by input the fuzzer
+        // invents: a reviewer generated ten million random strings across five length
+        // distributions and none carried a selector, in any of them. That zero is the
+        // load-bearing part and it is the only part quoted, because the parse RATE alongside
+        // it depended entirely on an unstated generator and was not reproducible.
+        //
+        // So a seed is the only thing that enters that branch, which makes "some seed happens
+        // to have brackets" a property worth asserting rather than assuming.
+        let with_selector = seeds("scim_patch_path")
+            .into_iter()
+            .filter_map(|(_, text)| crate::parse_patch_path(&text).ok())
+            .filter(|path| path.selector().is_some())
+            .count();
+        assert!(
+            with_selector >= 8,
+            "only {with_selector} seeds carry a value selector, so the branch that evaluates \
+             one is barely seeded"
+        );
+    }
+
+    #[test]
+    fn every_committed_patch_path_seed_still_parses() {
+        let seeds = seeds("scim_patch_path");
+        assert!(
+            seeds.len() >= 13,
+            "the patch-path seed corpus must not have shrunk: {}",
+            seeds.len()
+        );
+        for (name, text) in seeds {
+            assert!(
+                crate::parse_patch_path(&text).is_ok(),
+                "{name} no longer parses, so the fuzzer starts from a dead seed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_seeds_reach_the_evaluator_and_not_only_the_parser() {
+        // WHAT THE SEEDS BUY is asserted below rather than described in a figure. Three
+        // rounds of review removed three different sets of numbers from this comment: two
+        // borrowed from a reviewer, one measured against a locally fuzzed corpus, and one
+        // ("libFuzzer cracks this grammar from empty given 1.4M runs") that was false when
+        // somebody finally ran it -- 1.4M runs from empty produced no connective and no value
+        // path at all.
+        //
+        // The durable version is the assertions: the corpus contains a connective and a value
+        // path, it matches the sample resource far more often than a degenerate one would, and
+        // it contains a deliberate miss. Those hold on every run, on any machine, and a
+        // reviewer can check them by reading them.
+        //
+        // The first version of this test asserted only `matched > 0 && missed > 0`, and a
+        // reviewer showed that passes against `json!({})`: one seed is a `not`, which is true
+        // of an empty object, and the rest are false. It measured "at least one seed is a
+        // negation", not "the seeds exercise a resource".
+        let resource = super::sample_user_resource();
+        let parsed: Vec<super::Filter> = seeds("scim_filter")
+            .into_iter()
+            .filter_map(|(_, text)| super::parse_filter(&text).ok())
+            .collect();
+        let matched = parsed
+            .iter()
+            .filter(|filter| super::matches(filter, &resource))
+            .count();
+        let missed = parsed.len() - matched;
+
+        // A FLOOR a degenerate resource cannot clear: against `json!({})` exactly one seed
+        // matches, against the real resource eleven do.
+        assert!(
+            matched >= 8,
+            "the sample resource is not exercising the seeds: only {matched} of {} match",
+            parsed.len()
+        );
+        // ONE is the right floor, now that a DELIBERATE negative exists.
+        //
+        // Raising it to two was a mistake and a reviewer measured why: the corpus has exactly
+        // two misses, so a floor of two made BOTH load bearing -- the deliberate one and
+        // `seed_9`, whose miss is incidental (it compares a different value). Tidying seed_9,
+        // which is an obvious thing for somebody to do, then turned the suite red with a
+        // message saying the negative branch was unseeded when it was not. That is strictly
+        // worse coupling than the single-seed version it was meant to fix.
+        //
+        // The corpus cannot say WHICH seed is the deliberate one -- these are bare `seed_N`
+        // files and there is nowhere to put a label -- so an earlier version of this comment
+        // claiming it was "named as such in the corpus" was false. What holds it is the
+        // assertion below: a filter that matches nothing this resource carries.
+        assert!(
+            missed >= 1,
+            "no seed misses, so the negative branch is unseeded: {missed} of {}",
+            parsed.len()
+        );
+        // AND NOTHING MORE. I tried to add an assertion that a DELIBERATE negative exists,
+        // and it was vacuous on its first test: probing for a seed that matches
+        // `{"userName": "nobody@example.invalid"}` is satisfied by `userName ne "nobody"` and
+        // by any `not (...)`, so deleting the deliberate seed left it green.
+        //
+        // The honest position is that "which seed is the deliberate one" is not a property a
+        // directory of bare `seed_N` files can carry, and a check that pretends otherwise
+        // passes for the wrong reason. `missed >= 1` is the property that matters -- the
+        // negative branch is entered from the starting corpus -- and it is true whichever seed
+        // supplies it.
+
+        // And the STRUCTURAL property the coverage measurement is really about: a corpus of
+        // nothing but flat comparisons would satisfy both counts above and still never enter
+        // the recursive walk.
+        assert!(
+            parsed
+                .iter()
+                .any(|filter| matches!(filter, super::Filter::ValuePath { .. })),
+            "no seed is a value path, so the sub-filter walk is unseeded"
+        );
+        assert!(
+            parsed.iter().any(|filter| matches!(
+                filter,
+                super::Filter::And(..) | super::Filter::Or(..) | super::Filter::Not(..)
+            )),
+            "no seed is a connective, so the recursive walk is unseeded"
+        );
     }
 }
