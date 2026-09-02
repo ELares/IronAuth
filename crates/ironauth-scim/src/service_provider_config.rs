@@ -204,19 +204,19 @@ impl ServiceProviderConfig {
             // Supported because `parse_patch_path` exists and every operation goes through it.
             patch: Supported { supported: true },
             bulk: BulkConfig {
-                // FALSE, and the reason is the whole point of this document.
+                // TRUE, and it names a ROUTE. `scim_router` mounts `POST /scim/v2/Bulk` at
+                // `server::bulk`, and the limits below are the ones that handler passes to
+                // `validate_bulk` -- read off this same `ScimLimits`, so there is no second
+                // constant for the advertised and the enforced number to drift apart.
                 //
-                // `validate_bulk` exists and the limits below are real, but there is NO
-                // `/Bulk` ROUTE in `scim_router`. A client reading `supported: true` sends
-                // `POST /scim/v2/Bulk` and gets axum's bare 404 -- not even a SCIM error --
-                // and a provisioning run that batched its work would simply fail. An audit
-                // caught this: the guard that was supposed to stop it asserted `supported ==
-                // true` justified by the NAME of a parser, which is a fact about the crate
-                // rather than about what a caller can reach.
-                //
-                // The limits stay populated because they are what the eventual route will
-                // enforce, and RFC 7644 section 4 lets a provider advertise them either way.
-                supported: false,
+                // This flag was FALSE for one release, and the paragraph it replaces is worth
+                // keeping in mind: the guard that was supposed to stop it asserted
+                // `supported == true` justified by the NAME of a parser, which is a fact about
+                // the crate rather than about what a caller can reach. What makes it true now
+                // is `every_advertised_capability_is_reachable_and_every_unadvertised_one_is_not`
+                // in tests/surface.rs, which drives `POST /scim/v2/Bulk` through the real
+                // router and would fail on a flag flipped without a route behind it.
+                supported: true,
                 max_operations: limits.bulk.max_operations,
                 max_payload_size: limits.bulk.max_payload_bytes,
             },
@@ -413,8 +413,8 @@ mod tests {
             "PATCH /Users/{{id}} and /Groups/{{id}} are mounted"
         );
         assert_eq!(
-            document["bulk"]["supported"], false,
-            "no /Bulk route is mounted; validate_bulk is a parser, not a capability"
+            document["bulk"]["supported"], true,
+            "POST /Bulk is mounted at server::bulk"
         );
         assert_eq!(
             document["filter"]["supported"], true,

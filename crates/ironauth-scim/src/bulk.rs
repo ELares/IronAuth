@@ -68,6 +68,15 @@ pub struct BulkOperation {
     /// The client's correlation id for this operation.
     #[serde(rename = "bulkId", default)]
     pub bulk_id: Option<String>,
+    /// The resource body, for the methods that carry one.
+    ///
+    /// Kept as a raw `Value` and re-serialized when the operation is dispatched, rather than
+    /// parsed into a `ScimUser` or `Group` here. Parsing it here would be a SECOND reader of
+    /// the same wire format, and the whole argument of this module is that an operation in a
+    /// batch is dispatched to the very handler a single request reaches -- including that
+    /// handler's own parse, its own refusals, and its own error text.
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
 }
 
 /// A bulk request envelope.
@@ -76,6 +85,13 @@ pub struct BulkRequest {
     /// The operations, in order.
     #[serde(rename = "Operations", default)]
     pub operations: Vec<BulkOperation>,
+    /// After this many operations have failed, stop (RFC 7644 section 3.7.3).
+    ///
+    /// Absent means run every operation. The operations never attempted are simply absent from
+    /// the response, which is why a client reads the results rather than assuming its batch
+    /// ran to the end.
+    #[serde(rename = "failOnErrors", default)]
+    pub fail_on_errors: Option<usize>,
 }
 
 /// One operation's outcome.
@@ -91,6 +107,20 @@ pub struct BulkOperationResult {
     /// Why it failed, when it did. Never echoes the client's input.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The created or addressed resource's location (RFC 7644 section 3.7.3).
+    ///
+    /// Present for a successful operation that addressed or created a resource, so a client
+    /// can resolve its `bulkId` to a real id without a second request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// The operation's own response body, for a FAILED operation.
+    ///
+    /// RFC 7644 section 3.7.3 says a failed operation carries the error response it would
+    /// have received on its own. Carrying it means a client debugging one operation out of
+    /// fifty reads the same SCIM error it would have read had it sent that one alone --
+    /// rather than a status code and a sentence this module invented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<serde_json::Value>,
 }
 
 /// Why a whole bulk request was refused before any operation ran.
@@ -108,11 +138,38 @@ pub enum BulkError {
     },
 }
 
+/// What one operation is, once its limits and path have been checked.
+///
+/// AN ENUM RATHER THAN A STATUS PLUS AN OPTION. The first version returned a
+/// `(BulkOperationResult, Option<ResourceRef>)` per operation and gave a resolved operation the
+/// status `"200"` -- which read as "this operation succeeded" while nothing had run yet. Any
+/// caller that rendered those results without dispatching would have told a client that fifty
+/// writes had landed. There is no such status here: a resolved operation carries no outcome,
+/// because it does not have one until [`crate::server::bulk`] dispatches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkOutcome {
+    /// The operation was refused before dispatch, and this is its final result.
+    Refused(BulkOperationResult),
+    /// The operation is well formed and addresses this resource. It has not run.
+    Resolved {
+        /// The client's correlation id, echoed on the eventual result.
+        bulk_id: Option<String>,
+        /// The uppercased method.
+        method: String,
+        /// Where it points, as the single-request path parser read it.
+        resource: ResourceRef,
+    },
+}
+
 /// Validate a bulk request against the advertised limits and resolve every operation's path.
 ///
-/// Returns EITHER a whole-request refusal or a per-operation result for every operation. A
-/// refused operation does not abort the others: that is the half of the criterion a
-/// fail-the-batch implementation silently drops.
+/// Returns EITHER a whole-request refusal or one [`BulkOutcome`] per operation, in the order
+/// they were sent. A refused operation does not abort the others: that is the half of the
+/// criterion a fail-the-batch implementation silently drops.
+///
+/// This function does NOT execute anything. It cannot: it has no store, and the whole argument
+/// of this module is that an operation is executed by the same handler a single request
+/// reaches. [`crate::server::bulk`] is what dispatches a [`BulkOutcome::Resolved`].
 ///
 /// # Errors
 ///
@@ -122,7 +179,7 @@ pub fn validate_bulk(
     request: &BulkRequest,
     payload_bytes: usize,
     limits: BulkLimits,
-) -> Result<Vec<(BulkOperationResult, Option<ResourceRef>)>, BulkError> {
+) -> Result<Vec<BulkOutcome>, BulkError> {
     // Checked BEFORE anything is parsed or executed. A limit applied per-operation as the
     // batch runs has already paid for the work it was meant to prevent.
     if payload_bytes > limits.max_payload_bytes {
@@ -141,50 +198,43 @@ pub fn validate_bulk(
         .iter()
         .map(|operation| {
             let method = operation.method.to_ascii_uppercase();
+            let refuse = |detail: &str| {
+                BulkOutcome::Refused(BulkOperationResult {
+                    bulk_id: operation.bulk_id.clone(),
+                    method: method.clone(),
+                    status: "400".to_owned(),
+                    detail: Some(detail.to_owned()),
+                    location: None,
+                    response: None,
+                })
+            };
             if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
-                return (
-                    BulkOperationResult {
-                        bulk_id: operation.bulk_id.clone(),
-                        method,
-                        status: "400".to_owned(),
-                        detail: Some("unsupported bulk method".to_owned()),
-                    },
-                    None,
-                );
+                return refuse("unsupported bulk method");
             }
             let Some(path) = operation.path.as_deref() else {
-                return (
-                    BulkOperationResult {
-                        bulk_id: operation.bulk_id.clone(),
-                        method,
-                        status: "400".to_owned(),
-                        detail: Some("the operation names no path".to_owned()),
-                    },
-                    None,
-                );
+                return refuse("the operation names no path");
             };
+            // A `bulkId:` REFERENCE, which RFC 7644 section 3.7.2 lets a client use to point a
+            // later operation at a resource an earlier one created. REFUSED, not resolved.
+            //
+            // Resolving it means this module maintaining its own map from correlation ids to
+            // real ids and substituting into a path AFTER the parser read it -- which is a
+            // second interpretation of a path, and a second interpretation of a path is the
+            // exact shape of every IDOR this surface was written to close. Refusing is honest
+            // and costs a client one extra round trip; neither Okta nor Entra sends one.
+            if path.contains("bulkId:") {
+                return refuse("bulkId references between operations are not supported");
+            }
             // The SAME path parser a single request uses. An operation inside a batch is not
             // a lesser kind of request that earns a laxer reading of its path, and a batch is
             // exactly where an attacker would hope it were.
             match parse_resource_path(path) {
-                Ok(resource) => (
-                    BulkOperationResult {
-                        bulk_id: operation.bulk_id.clone(),
-                        method,
-                        status: "200".to_owned(),
-                        detail: None,
-                    },
-                    Some(resource),
-                ),
-                Err(error) => (
-                    BulkOperationResult {
-                        bulk_id: operation.bulk_id.clone(),
-                        method,
-                        status: "400".to_owned(),
-                        detail: Some(error.to_string()),
-                    },
-                    None,
-                ),
+                Ok(resource) => BulkOutcome::Resolved {
+                    bulk_id: operation.bulk_id.clone(),
+                    method,
+                    resource,
+                },
+                Err(error) => refuse(&error.to_string()),
             }
         })
         .collect())
@@ -211,14 +261,21 @@ mod tests {
         );
         let results = validate_bulk(&parsed, 200, BulkLimits::default()).expect("within limits");
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0.status, "200");
-        assert_eq!(results[1].0.status, "400", "the traversal is refused");
-        assert_eq!(
-            results[2].0.status, "200",
-            "and the operation AFTER the failure still ran"
+        assert!(
+            matches!(&results[0], BulkOutcome::Resolved { bulk_id, .. } if bulk_id.as_deref() == Some("a")),
+            "{:?}",
+            results[0]
         );
-        assert_eq!(results[0].0.bulk_id.as_deref(), Some("a"));
-        assert_eq!(results[2].0.bulk_id.as_deref(), Some("c"));
+        assert!(
+            matches!(&results[1], BulkOutcome::Refused(result) if result.status == "400"),
+            "the traversal is refused: {:?}",
+            results[1]
+        );
+        assert!(
+            matches!(&results[2], BulkOutcome::Resolved { bulk_id, .. } if bulk_id.as_deref() == Some("c")),
+            "and the operation AFTER the failure was still resolved: {:?}",
+            results[2]
+        );
     }
 
     #[test]
@@ -238,8 +295,13 @@ mod tests {
                 hostile.replace('\\', "\\\\")
             ));
             let results = validate_bulk(&parsed, 200, BulkLimits::default()).expect("limits ok");
-            assert_eq!(results[0].0.status, "400", "must refuse {hostile:?}");
-            assert!(results[0].1.is_none(), "and resolve no resource");
+            // `Refused` is the whole assertion: the enum has no variant that both carries a
+            // refusal and points at a resource, so there is nothing left to dispatch.
+            assert!(
+                matches!(&results[0], BulkOutcome::Refused(result) if result.status == "400"),
+                "must refuse {hostile:?}: {:?}",
+                results[0]
+            );
         }
     }
 
@@ -308,8 +370,46 @@ mod tests {
                ]}"#,
         );
         let results = validate_bulk(&parsed, 100, BulkLimits::default()).expect("limits ok");
-        assert_eq!(results[0].0.status, "400");
-        assert_eq!(results[1].0.status, "200");
+        assert!(
+            matches!(&results[0], BulkOutcome::Refused(result) if result.status == "400"),
+            "{:?}",
+            results[0]
+        );
+        assert!(
+            matches!(&results[1], BulkOutcome::Resolved { .. }),
+            "the well-formed sibling still resolved: {:?}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn a_bulk_id_reference_is_refused_rather_than_resolved() {
+        // RFC 7644 section 3.7.2 lets a client point a later operation at a resource an
+        // earlier one created, by `bulkId:` in the path. Resolving it means substituting into
+        // a path AFTER the parser read it, which is a second interpretation of a path -- the
+        // exact shape of every IDOR this surface closes. So it is refused, and the refusal
+        // says what is unsupported rather than reading as a malformed path.
+        let parsed = request(
+            r#"{"Operations":[
+                 {"method":"POST","path":"/Users","bulkId":"new"},
+                 {"method":"PATCH","path":"/Groups/bulkId:new","bulkId":"b"}
+               ]}"#,
+        );
+        let results = validate_bulk(&parsed, 200, BulkLimits::default()).expect("limits ok");
+        let BulkOutcome::Refused(refused) = &results[1] else {
+            panic!("a bulkId reference must be refused: {:?}", results[1]);
+        };
+        assert_eq!(refused.status, "400");
+        assert_eq!(
+            refused.detail.as_deref(),
+            Some("bulkId references between operations are not supported"),
+            "the refusal must name the unsupported feature rather than read as a bad path"
+        );
+        assert!(
+            matches!(&results[0], BulkOutcome::Resolved { .. }),
+            "and the operation that DEFINED the bulkId is untouched: {:?}",
+            results[0]
+        );
     }
 
     #[test]
