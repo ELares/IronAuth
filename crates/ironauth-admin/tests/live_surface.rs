@@ -522,10 +522,12 @@ impl Fixture {
                 &serde_json::json!({
                     "linked_user_id": user,
                     "display_name": "sweep bot",
-                    // TWO tools. `sweep.read` is what the agent surface itself uses; `vault`
-                    // is there because storing a vault connection refuses a provider the agent
-                    // has not declared AND one that is not a lowercase identifier, and
-                    // `sweep.read` fails the second rule on its dot.
+                    // TWO tools, and `vault` is the one that matters: storing a vault
+                    // connection refuses a provider the agent has not declared AND one that is
+                    // not a lowercase identifier, and `sweep.read` fails the second rule on its
+                    // dot. `sweep.read` is kept because it was the pre-existing value and it
+                    // mirrors the permission slug seeded below; nothing in this file drives it,
+                    // and removing it leaves the suite green.
                     "tool_scopes": ["sweep.read", "vault"],
                 })
                 .to_string(),
@@ -4173,6 +4175,20 @@ fn documented_body_contents(f: &Fixture) -> BTreeMap<&'static str, Vec<String>> 
         // environment is decommissioned reads it, and an empty array answers wrongly rather
         // than not at all.
         ("agents.listAgentVaultApprovals", vec![f.approval.clone()]),
+        // The stored vault connection, by the agent it hangs off and the two fields that only
+        // a real write produces. Without this the case is satisfied by a 400 refusal: a
+        // reviewer reverted the seed's `vault` tool scope, every environment answered
+        // "the agent has not declared the tool vault", and the whole file stayed green --
+        // the case then never touches `agent_vault_connections`, which is the relation-grant
+        // question this file exists to ask.
+        (
+            "agents.storeAgentVaultConnection",
+            vec![
+                f.agent.clone(),
+                "\"provider\":\"vault\"".to_owned(),
+                "\"state\":\"active\"".to_owned(),
+            ],
+        ),
         // The user page and the single user, by the id of the seeded row.
         ("users.listUsers", vec![f.user.clone()]),
         ("users.getUser", vec![f.user.clone()]),

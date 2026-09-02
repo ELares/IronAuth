@@ -933,9 +933,10 @@ async fn plant_agent(
         // seed that cannot run is a test that can only fail, and this one shipped that way
         // because nothing ever ran it.
         //
-        // The sealed values are placeholders. This row exists to be an audit SUBJECT, and
-        // nothing in these tests decrypts it; a real seal would need a DEK and would test the
-        // crypto rather than the thing under test.
+        // The sealed values are placeholders. This row exists only as the FK target for
+        // `agents.linked_user_id` (0176), and nothing here reads it back or decrypts it; a
+        // real seal would need a DEK and would test the crypto rather than the thing under
+        // test.
         "INSERT INTO users /* query-audit-allow: owner test seed */ \
          (id, tenant_id, environment_id, password_hash, \
           identifier_bidx, identifier_sealed, claims_sealed, pii_dek_version) \
