@@ -33,9 +33,10 @@
 -- `superseded_by`, or lets the session pass its absolute or idle expiry, severs the set without
 -- needing to know this table exists. Stated as the RULE rather than a list of routes, because a
 -- list gets two of them wrong: a risk decision revokes nothing and a password change preserves
--- the session it is made from. That is the
--- property an operator actually wants: "sign this person out" must not leave a credential
--- behind that mints fresh tokens for them.
+-- the session it is made from.
+--
+-- Severing on any of those is the property an operator actually wants: "sign this person out"
+-- must not leave a credential behind that mints fresh tokens for them.
 --
 -- Expand phase: a new table the old binary never reads or writes, so a rollback leaves it inert.
 

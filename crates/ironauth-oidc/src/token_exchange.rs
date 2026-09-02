@@ -406,6 +406,29 @@ async fn issue(
         inherited
     } else {
         let targets: Vec<String> = decision.audience.iter().cloned().collect();
+        // A BOOTSTRAP HAS TO PASS THE REQUESTING CLIENT'S OWN RESOURCE ALLOWLIST.
+        //
+        // Every other mode is ceilinged by the subject token: a downscope or a delegation
+        // cannot name an audience the subject lacks, and an impersonation is gated by its
+        // flag. A bootstrap has no subject audience by design -- that is what makes it a first
+        // issuance rather than a narrowing -- so removing that ceiling removed the ONLY one
+        // it had, and `resolve_access_token_target` does not fill the gap: it checks that a
+        // target is a registered resource server, and says in as many words that the CALLER
+        // enforces the per-client allowlist. The ordinary first-issuance doors call
+        // `resources_permitted`; this one did not, so a sibling could mint for a resource its
+        // own allowlist forbids while the same client asking through the front door is refused.
+        if mode == ExchangeMode::NativeSsoBootstrap {
+            let policy = state
+                .store()
+                .scoped(scope)
+                .clients()
+                .resource_policy(ironauth_store::StoredClientId::Registered(&client_id))
+                .await
+                .map_err(|_| TokenError::ServerError)?;
+            if !crate::resource::resources_permitted(&targets, &policy) {
+                return Err(TokenError::InvalidTarget);
+            }
+        }
         state
             .resolve_access_token_target(&scope, &targets, client_id_str)
             .await
@@ -895,7 +918,14 @@ async fn native_sso_subject(
         TokenError::InvalidGrant
     })?;
 
-    // The person. The row records the LOCAL subject and the token carries the PUBLIC one, which
+    // The person. REDUNDANT BY CONSTRUCTION today and kept deliberately: the row's `subject`
+    // and the token's `sub` are both written from `resolve_public_subject(bindings.subject)` at
+    // the same mint, and `ds_hash` already pins the token to this exact row, so nothing can
+    // currently reach it. It is here against the divergence its own comment describes -- a
+    // per-client pairwise `sub` would make the two differ -- and a reviewer confirmed deleting
+    // it changes no test, which is what "redundant" means rather than a gap in coverage.
+    //
+    // The row records the LOCAL subject and the token carries the PUBLIC one, which
     // are the same string today and are documented as free to diverge, so the comparison goes
     // through the same derivation the mint used rather than comparing the two directly.
     let token_subject = verified

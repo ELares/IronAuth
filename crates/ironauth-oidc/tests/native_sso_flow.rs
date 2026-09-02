@@ -372,3 +372,157 @@ async fn ending_the_session_severs_the_sso_set() {
     );
     assert_eq!(json(&after)["error"], "invalid_grant", "{after}");
 }
+
+#[tokio::test]
+async fn a_bootstrap_still_obeys_the_requesting_clients_resource_allowlist() {
+    // THE CEILING THE AUDIENCE FIX ALMOST REMOVED.
+    //
+    // Every other exchange mode is bounded by the subject token's audience. A bootstrap has no
+    // subject audience by design -- that is what makes it a first issuance rather than a
+    // narrowing -- so the fix that stopped it inheriting app A's audience removed the only
+    // ceiling it had. `resolve_access_token_target` does not replace it: it checks that a
+    // target is a REGISTERED resource server and leaves the per-client allowlist to the caller.
+    //
+    // Without the check, a sibling could mint for a resource its own allowlist forbids while
+    // the same client asking through the ordinary door is refused. The control below is that
+    // same client and that same resource through that same door.
+    let mut h = Harness::start().await;
+    h.install_native_sso();
+
+    let audience = "https://api.example.test/finance";
+    let allowed = "https://api.example.test/only-mine";
+    for rs in [audience, allowed] {
+        let id = ironauth_store::ResourceServerId::generate(h.env(), &h.scope());
+        h.store()
+            .scoped(h.scope())
+            .acting(
+                ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(h.env())),
+                ironauth_store::CorrelationId::generate(h.env()),
+            )
+            .resource_servers()
+            .register(
+                h.env(),
+                ironauth_store::NewResourceServer {
+                    id: &id,
+                    audience: rs,
+                    token_format: ironauth_store::TokenFormat::AtJwt,
+                    access_token_ttl_secs: None,
+                },
+            )
+            .await
+            .expect("register resource server");
+    }
+
+    let (app_a, secret_a) = family_app(&h).await;
+    let (_status, response) = sign_in(
+        &h,
+        &app_a,
+        &secret_a,
+        &format!("openid profile {DEVICE_SSO}"),
+    )
+    .await;
+    let body = json(&response);
+    let device_secret = body["device_secret"].as_str().expect("a secret").to_owned();
+    let id_token = body["id_token"].as_str().expect("an id token").to_owned();
+
+    // The sibling is allowlisted for ONE resource, and it is not the one it will name.
+    let (app_b, secret_b) = family_app(&h).await;
+    h.store()
+        .scoped(h.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(h.env())),
+            ironauth_store::CorrelationId::generate(h.env()),
+        )
+        .clients()
+        .set_resource_indicator_policy(h.env(), &app_b, Some(&[allowed.to_owned()]), false)
+        .await
+        .expect("set the sibling's resource policy");
+
+    let (status, _headers, response) = h
+        .token_with_auth(
+            &form(&[
+                ("grant_type", EXCHANGE_GRANT),
+                ("subject_token", &id_token),
+                ("subject_token_type", ID_TOKEN_TOKEN_TYPE),
+                ("actor_token", &device_secret),
+                ("actor_token_type", DEVICE_SECRET_TOKEN_TYPE),
+                ("resource", audience),
+            ]),
+            Some(&basic(&app_b.to_string(), &secret_b)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a bootstrap must not reach a resource the sibling's own allowlist forbids: {response}"
+    );
+    assert_eq!(json(&response)["error"], "invalid_target", "{response}");
+
+    // And the ALLOWLISTED one succeeds, so the refusal above is the allowlist rather than
+    // anything else about the bootstrap.
+    let (status, _headers, response) = h
+        .token_with_auth(
+            &form(&[
+                ("grant_type", EXCHANGE_GRANT),
+                ("subject_token", &id_token),
+                ("subject_token_type", ID_TOKEN_TOKEN_TYPE),
+                ("actor_token", &device_secret),
+                ("actor_token_type", DEVICE_SECRET_TOKEN_TYPE),
+                ("resource", allowed),
+            ]),
+            Some(&basic(&app_b.to_string(), &secret_b)),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an allowlisted resource issues: {response}"
+    );
+    assert_eq!(
+        payload(json(&response)["access_token"].as_str().expect("a token"))["aud"],
+        allowed,
+        "audienced to the resource it asked for and may have"
+    );
+}
+
+#[tokio::test]
+async fn an_id_token_subject_with_an_access_token_actor_is_not_a_pair() {
+    // The JOINT half of the relaxation, witnessed at its USE SITE.
+    //
+    // `tests/native_sso.rs` pins `is_native_sso_pair` the function; nothing pinned that
+    // `check_request_shape` reads BOTH halves of it. Dropping the actor-type half there left
+    // every suite green, because an ID-token subject with no actor token falls to the
+    // required-parameter check and answers the same `invalid_request`. This case supplies an
+    // actor token of the WRONG type, so the two answers separate: refused by the shape rule
+    // here, and `invalid_grant` from the redemption if the gate were weakened.
+    let mut h = Harness::start().await;
+    h.install_native_sso();
+    let (app, secret) = family_app(&h).await;
+    let (_status, response) = sign_in(&h, &app, &secret, &format!("openid {DEVICE_SSO}")).await;
+    let id_token = json(&response)["id_token"]
+        .as_str()
+        .expect("an id token")
+        .to_owned();
+
+    let (status, _headers, response) = h
+        .token_with_auth(
+            &form(&[
+                ("grant_type", EXCHANGE_GRANT),
+                ("subject_token", &id_token),
+                ("subject_token_type", ID_TOKEN_TOKEN_TYPE),
+                ("actor_token", "some-access-token"),
+                (
+                    "actor_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+            ]),
+            Some(&basic(&app.to_string(), &secret)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        json(&response)["error"],
+        "invalid_request",
+        "an ID-token subject is admitted ONLY beside a device-secret actor: {response}"
+    );
+}

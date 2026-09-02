@@ -74381,9 +74381,15 @@ impl NativeSsoDeviceSecretRepo<'_> {
     /// token. Any liveness check that is written out by hand beside an authoritative one drifts
     /// from it in exactly the clauses nobody was thinking about.
     ///
-    /// The lookup is BY DIGEST, which is what makes it constant-work with respect to the
-    /// presented secret: there is no prefix, no scan, and no early exit that differs between a
-    /// wrong secret and a revoked one.
+    /// The lookup is BY DIGEST over a unique index, which is what makes it constant-work in the
+    /// VALUE of the presented secret: there is no prefix match, no scan, and no comparison that
+    /// exits earlier for a secret that shares more leading bytes with a stored one.
+    ///
+    /// It is NOT constant-work overall, and the earlier wording claimed that: a wrong digest
+    /// misses the index, while a revoked or expired one hits it, fetches the tuple and
+    /// evaluates the session join. That difference is not a function of the secret's value, so
+    /// it leaks nothing about the secret; it is measurable as "some secret once existed", which
+    /// the row's existence already is.
     ///
     /// # Errors
     ///
