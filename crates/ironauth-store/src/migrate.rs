@@ -1472,6 +1472,23 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0183_scim_connections.sql"),
         },
+        Migration {
+            version: 184,
+            name: "scim_external_ids",
+            // EXPAND: one new table the old binary never reads or writes.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0184_scim_external_ids.sql"),
+        },
+        Migration {
+            version: 185,
+            name: "scim_group_push",
+            // EXPAND: one new table with its policy, plus grants that only WIDEN. Nothing
+            // existing is altered, no privilege is removed and no data is moved, so an old
+            // binary running beside a migrated database is unaffected: it never reads the new
+            // table and never exercises the writes the new grants permit.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0185_scim_group_push.sql"),
+        },
     ]
 }
 

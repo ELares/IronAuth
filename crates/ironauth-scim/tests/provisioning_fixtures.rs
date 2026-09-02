@@ -16,6 +16,24 @@
 //!
 //! The harness is deliberately data-driven: a real capture is dropped in as a file, with no
 //! test code to change.
+//!
+//! # Every fixture is REPLAYED, not just parsed
+//!
+//! An audit caught this file doing far less than its name: it fed the `path`, `patch_path` and
+//! `filter` STRINGS to three parsers and never read the `body` key at all, which five of the
+//! seven fixtures carry. It passed in 0.00s with no database, which was the tell. A corpus
+//! whose request bodies nothing executes is a corpus that cannot fail for any reason a
+//! provisioning client would notice.
+//!
+//! So each fixture now declares `expect_status`, and `every_fixture_replays_against_the_real_
+//! surface` drives its method, path and body through `scim_router` against a real database and
+//! holds the server to that number. The placeholder ids in the corpus (`usr_...`, `grp_...`)
+//! are substituted for the seeded ones at replay time, which is what keeps a fixture a
+//! verbatim-ish document rather than something the harness has to be taught about.
+//!
+//! An `expect_status` of 400 is a STATED GAP, not a pass: `entra_enterprise_user` records that
+//! the enterprise extension is published in the schema document and not parsed onto the
+//! resource, so widening that is a visible change to this file.
 
 use std::fs;
 use std::path::Path;
@@ -180,6 +198,215 @@ fn the_corpus_covers_every_operation_the_criterion_names() {
         assert!(
             names.iter().any(|name| name == required),
             "the corpus is missing {required}; it covers {names:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// THE REPLAY. Everything above this line reads strings; everything below executes requests.
+// ---------------------------------------------------------------------------------------
+
+/// The placeholder ids the corpus uses, substituted for real ones at replay time.
+const USER_PLACEHOLDER: &str = "usr_2c9a8b";
+const GROUP_PLACEHOLDER: &str = "grp_7f31";
+
+#[tokio::test]
+async fn every_fixture_replays_against_the_real_surface() {
+    let (db, env, token) = seeded_connection().await;
+    let _ = &token;
+    replay_all(&db, &env, &token).await;
+}
+
+/// Seed a scope, an organization and a SCIM connection, returning the token that reaches them.
+async fn seeded_connection() -> (
+    ironauth_store::test_support::TestDatabase,
+    ironauth_env::Env,
+    String,
+) {
+    use ironauth_env::Env;
+    use ironauth_scim::server::{digest_of, mint_token};
+    use ironauth_store::test_support::TestDatabase;
+    use ironauth_store::{CorrelationId, NewScimConnection, OrganizationId, ScimConnectionId};
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let now = i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_micros(),
+    )
+    .expect("fits i64");
+
+    let org = OrganizationId::generate(&env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &org, now, "Globex", None)
+        .await
+        .expect("create organization");
+    let connection = ScimConnectionId::generate(&env, &scope);
+    let token = mint_token(&connection, "s3cret-provisioning-material");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &connection,
+                organization_id: &org,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest_of(&token),
+                expires_at_unix_micros: None,
+            },
+        )
+        .await
+        .expect("create connection");
+    (db, env, token)
+}
+
+/// Replay every fixture in the corpus against the real router.
+async fn replay_all(
+    db: &ironauth_store::test_support::TestDatabase,
+    env: &ironauth_env::Env,
+    token: &str,
+) {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use ironauth_scim::ScimLimits;
+    use ironauth_scim::server::{ScimState, scim_router};
+    use tower::ServiceExt as _;
+
+    let token = token.to_owned();
+    let send = |method: String, path: String, body: Option<String>| {
+        let token = token.clone();
+        async move {
+            let state = ScimState::new(
+                db.store().clone(),
+                env.clone(),
+                ScimLimits::default(),
+                ironauth_store::identifier::UniquenessMode::EnvironmentWide,
+            );
+            let builder = Request::builder()
+                .method(method.as_str())
+                .uri(path.as_str())
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/scim+json");
+            let request = match body {
+                Some(body) => builder.body(Body::from(body)),
+                None => builder.body(Body::empty()),
+            }
+            .expect("request builds");
+            let response = scim_router(state)
+                .oneshot(request)
+                .await
+                .expect("router answers");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    // Seed the two resources the corpus addresses, through the surface itself, so the replay
+    // exercises the same doors a real sync would have used to create them.
+    let (status, body) = send(
+        "POST".to_owned(),
+        "/scim/v2/Users".to_owned(),
+        Some(r#"{"userName":"replay@example.test"}"#.to_owned()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let user_id = serde_json::from_str::<Value>(&body).expect("a resource")["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    let (status, body) = send(
+        "POST".to_owned(),
+        "/scim/v2/Groups".to_owned(),
+        Some(r#"{"displayName":"Replay Team"}"#.to_owned()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let group_id = serde_json::from_str::<Value>(&body).expect("a resource")["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+
+    let mut replayed = 0;
+    for (name, fixture) in fixtures() {
+        assert!(
+            fixture.get("expect_status").is_some(),
+            "{name} declares no expect_status; a fixture nothing holds the server to is a \
+             fixture that cannot fail"
+        );
+        let method = fixture["method"].as_str().expect("a method").to_owned();
+        // Substitution over the RENDERED text, so a placeholder is replaced wherever it
+        // appears -- in the path and inside a member value alike.
+        let swap = |text: &str| {
+            text.replace(USER_PLACEHOLDER, &user_id)
+                .replace(GROUP_PLACEHOLDER, &group_id)
+        };
+        let path = format!(
+            "/scim/v2{}",
+            swap(fixture["path"].as_str().expect("a path"))
+        );
+        let body = fixture
+            .get("body")
+            .map(|body| swap(&serde_json::to_string(body).expect("a body")));
+
+        let (status, answer) = send(method.clone(), path.clone(), body).await;
+        assert_replay(&name, &fixture, &method, &path, status.as_u16(), &answer);
+        replayed += 1;
+    }
+
+    // A COUNT, so a corpus that silently stopped being walked is caught. `fixtures()` reads a
+    // directory, and a directory that fails to read as expected would otherwise replay nothing
+    // and pass.
+    assert_eq!(
+        replayed,
+        fixtures().len(),
+        "every fixture in the directory must have been replayed"
+    );
+    assert!(replayed >= 8, "the corpus must not have shrunk: {replayed}");
+}
+
+/// Hold one replayed fixture to what it declared.
+fn assert_replay(name: &str, fixture: &Value, method: &str, path: &str, status: u16, answer: &str) {
+    let expected = fixture["expect_status"].as_u64().expect("expect_status");
+    let why = fixture
+        .get("expect_why")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(
+        u64::from(status),
+        expected,
+        "{name}: {method} {path} -- {why}: {answer}"
+    );
+    // THE EFFECT, where the fixture declares one. A status alone cannot tell a deactivate that
+    // worked from one that answered 200 and did nothing, which is the failure mode this whole
+    // corpus exists to catch: with only statuses asserted, removing the Entra stringly-boolean
+    // arm left every fixture green.
+    let Some(fragments) = fixture.get("expect_body_contains") else {
+        return;
+    };
+    let fragments = fragments
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: expect_body_contains must be an array"));
+    // Compared against the body with whitespace squeezed out, so a fragment is written the way
+    // a person reads JSON rather than the way serde happens to print it.
+    let compact: String = answer.chars().filter(|c| !c.is_whitespace()).collect();
+    for fragment in fragments {
+        let fragment = fragment.as_str().expect("a string fragment");
+        assert!(
+            compact.contains(fragment),
+            "{name}: {method} {path} answered {status} but not {fragment}: {answer}"
         );
     }
 }

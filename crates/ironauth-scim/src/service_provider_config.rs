@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The `/ServiceProviderConfig` document (RFC 7644 section 5, issue #135, criterion 4).
+//! The `/ServiceProviderConfig` document (RFC 7644 section 4, issue #135, criterion 4).
 //!
 //! Criterion 4 says bulk requests "respect advertised limits". This module is the ADVERTISED
 //! half, and it exists because without it that sentence is unfalsifiable: a limit nothing
@@ -33,6 +33,23 @@ pub struct ScimLimits {
     /// SCIM lets a client choose `count`, so an unbounded value is a client-chosen amount of
     /// server work. This is the ceiling [`ScimLimits::clamp_count`] applies.
     pub max_results: usize,
+    /// The most organization members one list request may examine.
+    ///
+    /// A filter this server cannot answer from an index is answered by examining members, and
+    /// an unfiltered list of a large organization is the same work. Both are bounded here, and
+    /// reaching the bound is REFUSED (RFC 7644 section 3.4.2.2 `tooMany`) rather than silently
+    /// truncated: a short page that looked complete would make a provisioning client
+    /// deprovision every member it did not see.
+    ///
+    /// READ IT THROUGH [`ScimLimits::scan_bound`], never directly. One store list call returns at
+    /// most `MANAGEMENT_LIST_HARD_CAP + 1` rows (the repository clamps its limit to that, so a
+    /// caller can always see ONE row past the cap and tell a full page from the last one), so a
+    /// bound above `MANAGEMENT_LIST_HARD_CAP`
+    /// makes the refusal UNREACHABLE and turns the bound into exactly the silent truncation
+    /// the paragraph above says it prevents. That is not hypothetical: the first version of
+    /// this field defaulted to 10 000, and a reviewer seeded 1100 members and got a 200 with
+    /// `totalResults: 1001` and no indication the answer was partial.
+    pub max_scan: usize,
 }
 
 impl Default for ScimLimits {
@@ -42,11 +59,53 @@ impl Default for ScimLimits {
             // What Okta and Entra page at, and small enough that a hostile `count` buys
             // nothing over an honest one.
             max_results: 200,
+            // The store's own list cap, which is the largest value that can ever be reached:
+            // see the field's docs.
+            max_scan: DEFAULT_MAX_SCAN,
         }
     }
 }
 
+/// The default scan bound: exactly what one store list call will return.
+///
+/// A `usize` conversion of an `i64` constant, done once here rather than at each use.
+/// `MANAGEMENT_LIST_HARD_CAP` is a small positive literal, so the fallback is unreachable and
+/// is a saturating floor rather than a panic.
+const DEFAULT_MAX_SCAN: usize = {
+    // `usize::try_from` is not const, so the conversion is written out. The negative guard is
+    // a saturating floor rather than a panic; the cap is a small positive literal in the store,
+    // so it is unreachable, and 0 refuses every scan rather than silently allowing an
+    // unbounded one.
+    //
+    // There is deliberately NO upper guard. An earlier version had `cap > usize::MAX as i64`,
+    // which is nonsense: that cast wraps to -1, so the comparison was always true and this
+    // constant evaluated to 0 -- which would have made `scan_bound` return 0 and refuse every
+    // list. Clippy found it, through `unnecessary_min_or_max` on the caller rather than here.
+    let cap = ironauth_store::MANAGEMENT_LIST_HARD_CAP;
+    if cap < 0 {
+        0
+    } else {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        {
+            cap as usize
+        }
+    }
+};
+
 impl ScimLimits {
+    /// The scan bound actually enforced: the configured value, or the store's list cap if that
+    /// is smaller.
+    ///
+    /// The `min` is the whole point. A caller can configure `max_scan` to anything, but the
+    /// store returns at most `MANAGEMENT_LIST_HARD_CAP` rows per list call, so a larger
+    /// configured value would leave `len() > bound` permanently false and the refusal
+    /// permanently dead. Clamping here makes the bound reachable BY CONSTRUCTION rather than
+    /// by whoever last edited the default.
+    #[must_use]
+    pub fn scan_bound(&self) -> usize {
+        self.max_scan.min(DEFAULT_MAX_SCAN)
+    }
+
     /// The page size to actually use for a client-requested `count`.
     ///
     /// Clamps rather than refuses: RFC 7644 section 3.4.2.4 says a provider MAY return fewer
@@ -109,7 +168,7 @@ pub struct AuthenticationScheme {
 
 /// The `/ServiceProviderConfig` document.
 ///
-/// Serializes to exactly the RFC 7644 section 5 shape, so a connector reads it without
+/// Serializes to exactly the RFC 7644 section 4 shape, so a connector reads it without
 /// special-casing this server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceProviderConfig {
@@ -145,7 +204,19 @@ impl ServiceProviderConfig {
             // Supported because `parse_patch_path` exists and every operation goes through it.
             patch: Supported { supported: true },
             bulk: BulkConfig {
-                supported: true,
+                // FALSE, and the reason is the whole point of this document.
+                //
+                // `validate_bulk` exists and the limits below are real, but there is NO
+                // `/Bulk` ROUTE in `scim_router`. A client reading `supported: true` sends
+                // `POST /scim/v2/Bulk` and gets axum's bare 404 -- not even a SCIM error --
+                // and a provisioning run that batched its work would simply fail. An audit
+                // caught this: the guard that was supposed to stop it asserted `supported ==
+                // true` justified by the NAME of a parser, which is a fact about the crate
+                // rather than about what a caller can reach.
+                //
+                // The limits stay populated because they are what the eventual route will
+                // enforce, and RFC 7644 section 4 lets a provider advertise them either way.
+                supported: false,
                 max_operations: limits.bulk.max_operations,
                 max_payload_size: limits.bulk.max_payload_bytes,
             },
@@ -200,6 +271,7 @@ mod tests {
         for limits in [
             ScimLimits::default(),
             ScimLimits {
+                max_scan: ScimLimits::default().max_scan,
                 bulk: BulkLimits {
                     max_operations: 3,
                     max_payload_bytes: 64,
@@ -207,6 +279,7 @@ mod tests {
                 max_results: 7,
             },
             ScimLimits {
+                max_scan: ScimLimits::default().max_scan,
                 bulk: BulkLimits {
                     max_operations: 1,
                     max_payload_bytes: 1,
@@ -258,12 +331,44 @@ mod tests {
     }
 
     #[test]
+    fn the_scan_bound_can_never_exceed_what_one_store_list_call_returns() {
+        // THE PROPERTY THE CLAMP EXISTS FOR, and it cannot be driven through the HTTP surface:
+        // a test at a small bound exercises a `min` that is a no-op there, and a test at a
+        // large one would have to seed a thousand members. It is a pure function, so it is
+        // asserted directly.
+        //
+        // The defect this closes: `max_scan` defaulted to 10 000 while
+        // `OrgMembershipRepo::list_for_org` clamps its limit to `MANAGEMENT_LIST_HARD_CAP + 1`,
+        // so `len() > max_scan` was permanently false, the `tooMany` refusal was dead code, and
+        // 1100 seeded members answered 200 with `totalResults: 1001` and no sign the answer was
+        // partial. An identity provider reads that as the complete member list.
+        let cap = usize::try_from(ironauth_store::MANAGEMENT_LIST_HARD_CAP).expect("a small cap");
+        for configured in [1, 10, cap - 1, cap, cap + 1, 10_000, usize::MAX] {
+            let limits = ScimLimits {
+                max_scan: configured,
+                ..ScimLimits::default()
+            };
+            assert!(
+                limits.scan_bound() <= cap,
+                "a configured {configured} must not produce an unreachable bound"
+            );
+            // And it is a CLAMP, not a constant: a bound below the cap is honoured, or a
+            // deployment could not narrow the scan at all.
+            assert_eq!(limits.scan_bound(), configured.min(cap), "{configured}");
+        }
+        // The default is reachable, which is the case that actually ships.
+        assert!(ScimLimits::default().scan_bound() <= cap);
+        assert!(ScimLimits::default().scan_bound() > 0);
+    }
+
+    #[test]
     fn the_advertised_page_bound_is_the_one_actually_applied() {
         // Same shape for the other published number: read it out of the document, then prove
         // the clamp cannot be persuaded past it by any request.
         for limits in [
             ScimLimits::default(),
             ScimLimits {
+                max_scan: ScimLimits::default().max_scan,
                 bulk: BulkLimits::default(),
                 max_results: 5,
             },
@@ -297,9 +402,24 @@ mod tests {
         // without. A future edit that flips a flag has to come back here and say which code
         // makes it true.
         let document = rendered(ScimLimits::default());
-        assert_eq!(document["patch"]["supported"], true, "parse_patch_path");
-        assert_eq!(document["bulk"]["supported"], true, "validate_bulk");
-        assert_eq!(document["filter"]["supported"], true, "parse_filter");
+        // Each of these names the ROUTE that makes it true, not the parser that would serve
+        // one. That distinction is the finding this test exists to have caught and did not:
+        // it asserted `bulk: true` justified by `validate_bulk`, which is a function in this
+        // crate, while `scim_router` mounts no `/Bulk` at all. A capability is what a caller
+        // can REACH. `every_advertised_capability_is_reachable` in tests/surface.rs drives
+        // them through the real router, which is the assertion this one cannot make.
+        assert_eq!(
+            document["patch"]["supported"], true,
+            "PATCH /Users/{{id}} and /Groups/{{id}} are mounted"
+        );
+        assert_eq!(
+            document["bulk"]["supported"], false,
+            "no /Bulk route is mounted; validate_bulk is a parser, not a capability"
+        );
+        assert_eq!(
+            document["filter"]["supported"], true,
+            "GET /Users and /Groups accept ?filter="
+        );
         assert_eq!(
             document["changePassword"]["supported"], false,
             "no SCIM write in this crate sets a password"
@@ -309,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn the_document_is_the_shape_rfc_7644_section_5_describes() {
+    fn the_document_is_the_shape_rfc_7644_section_4_describes() {
         // A connector reads this without special-casing the server, which means the field
         // names are the RFC's rather than Rust's.
         let document = rendered(ScimLimits::default());

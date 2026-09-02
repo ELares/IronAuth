@@ -97,11 +97,12 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScimConnectionId, ScopeStepUpPolicyId, ServiceAccountId,
-    SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimExternalIdId, ScopeStepUpPolicyId,
+    ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId,
+    SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId,
+    TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -159,6 +160,29 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> AgentVaultRepo<'a> {
         AgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Whether each organization considers a person active (issue #135, migration 0185).
+    ///
+    /// The DATA plane owns it outright: SCIM is the only writer and the only reader.
+    #[must_use]
+    pub fn scim_activation(&self) -> ScimActivationRepo<'a> {
+        ScimActivationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The SCIM `externalId` mappings for this scope (issue #135).
+    ///
+    /// The DATA plane owns these, unlike `scim_connections`: a mapping is written when an IdP
+    /// provisions a person, which is a SCIM request rather than an operator action.
+    #[must_use]
+    pub fn scim_external_ids(&self) -> ScimExternalIdRepo<'a> {
+        ScimExternalIdRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -74867,5 +74891,247 @@ impl ActingScimConnectionRepo<'_> {
         insert_audit_row(&mut tx, &spec, None).await?;
         tx.commit().await?;
         Ok(true)
+    }
+}
+
+/// The SCIM `externalId` mappings for one scope (issue #135).
+pub struct ScimExternalIdRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+/// Whether an organization considers a person active (issue #135, migration 0185).
+///
+/// SCIM's `active` is a property of a person AS ONE ORGANIZATION SEES THEM, which is neither
+/// `users.state` (the whole environment) nor `org_memberships.state` (a closed set with no
+/// deactivated value). See migration 0185 for the whole argument.
+pub struct ScimActivationRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimActivationRepo<'_> {
+    /// Whether `organization` considers `user` active. An absent row is ACTIVE.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn is_active(
+        &self,
+        organization: &OrganizationId,
+        user: &UserId,
+    ) -> Result<bool, StoreError> {
+        if organization.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT active FROM scim_membership_activation              WHERE tenant_id = $1 AND environment_id = $2                AND organization_id = $3 AND user_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization.to_string())
+        .bind(user.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // ABSENT is active. Provisioning a person writes nothing here, so the ordinary case
+        // costs no row, and a table that has never been written reads as "everybody active"
+        // rather than as "nobody is".
+        Ok(row.is_none_or(|row| row.get("active")))
+    }
+
+    /// Record whether `organization` considers `user` active.
+    ///
+    /// An upsert rather than a delete-on-reactivate: writing `true` back keeps the fact that
+    /// this organization once deactivated the person, which an operator answering "was this
+    /// person ever offboarded here" needs and which a removed row would erase. The table holds
+    /// no DELETE grant, so that is enforced rather than intended.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn set_active(
+        &self,
+        organization: &OrganizationId,
+        user: &UserId,
+        active: bool,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if organization.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_membership_activation                  (tenant_id, environment_id, organization_id, user_id, active, updated_at)              VALUES ($1, $2, $3, $4, $5,                      TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)              ON CONFLICT (tenant_id, environment_id, organization_id, user_id)              DO UPDATE SET active = EXCLUDED.active, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization.to_string())
+        .bind(user.to_string())
+        .bind(active)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Whether any organization OTHER than `excluding` still considers `user` active.
+    ///
+    /// This is the question that decides whether the ACCOUNT's own state may move. A person
+    /// deactivated by their last organization is genuinely offboarded and the account should
+    /// stop authenticating; a person one organization deactivated while another still holds
+    /// them active must keep signing in, and a deactivation that disabled the account anyway
+    /// would be the cross-organization write this whole design exists to prevent.
+    ///
+    /// A membership with no activation row counts as ACTIVE, matching [`Self::is_active`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn active_elsewhere(
+        &self,
+        excluding: &OrganizationId,
+        user: &UserId,
+    ) -> Result<bool, StoreError> {
+        if excluding.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // A LEFT JOIN, so a membership with no activation row counts: an inner join would make
+        // every person who was never explicitly activated look deactivated everywhere, and the
+        // account would be disabled the first time any organization deactivated them.
+        let row = sqlx::query(
+            "SELECT EXISTS (                 SELECT 1 FROM org_memberships m                 LEFT JOIN scim_membership_activation a                   ON a.tenant_id = m.tenant_id AND a.environment_id = m.environment_id                  AND a.organization_id = m.organization_id AND a.user_id = m.user_id                 WHERE m.tenant_id = $1 AND m.environment_id = $2                   AND m.user_id = $3 AND m.organization_id <> $4                   AND m.deleted_at IS NULL AND m.owner_kind = 'user'                   AND COALESCE(a.active, true)              ) AS present",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(user.to_string())
+        .bind(excluding.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.get("present"))
+    }
+}
+
+impl ScimExternalIdRepo<'_> {
+    /// Record that `connection` calls `user` by `external_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of this scope; [`StoreError::Conflict`] when
+    /// the connection already maps that `external_id`, or already maps that user -- both are
+    /// the unique indexes, and both mean the same thing to a provisioning client: it has
+    /// already created this person here, and RFC 7644 section 3.3 asks for a 409 rather than a
+    /// second row. [`StoreError::Database`] otherwise.
+    pub async fn bind(
+        &self,
+        id: &ScimExternalIdId,
+        connection: &ScimConnectionId,
+        external_id: &str,
+        user: &UserId,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope
+            || connection.scope() != self.scope
+            || user.scope() != self.scope
+        {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_external_ids \
+                 (id, tenant_id, environment_id, connection_id, external_id, user_id) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(external_id)
+        .bind(user.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The person `connection` calls `external_id`, or `None`.
+    ///
+    /// Scoped to the CONNECTION, not the environment: that is the namespace this table exists
+    /// to provide, and a lookup keyed on the environment would let one IdP resolve another's
+    /// identifier to a person it has never seen.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of this scope; [`StoreError::Database`]
+    /// on a persistence failure.
+    pub async fn resolve(
+        &self,
+        connection: &ScimConnectionId,
+        external_id: &str,
+    ) -> Result<Option<UserId>, StoreError> {
+        if connection.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT user_id FROM scim_external_ids \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND connection_id = $3 AND external_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(external_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let stored: String = row.get("user_id");
+        Ok(Some(
+            UserId::parse_in_scope(&stored, &self.scope).map_err(|_| StoreError::NotFound)?,
+        ))
+    }
+
+    /// What `connection` calls `user`, for the round trip on a read, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn external_id_for(
+        &self,
+        connection: &ScimConnectionId,
+        user: &UserId,
+    ) -> Result<Option<String>, StoreError> {
+        if connection.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT external_id FROM scim_external_ids \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+               AND connection_id = $3 AND user_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(user.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get("external_id")))
     }
 }

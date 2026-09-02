@@ -18,7 +18,10 @@
 
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, NewScimConnection, OrganizationId, ScimConnectionId, Scope};
+use ironauth_store::{
+    CorrelationId, NewScimConnection, OrganizationId, ScimConnectionId, ScimExternalIdId, Scope,
+    UserId,
+};
 
 fn now_micros(env: &Env) -> i64 {
     i64::try_from(
@@ -865,4 +868,307 @@ async fn the_column_checks_refuse_a_malformed_digest_and_an_unknown_provider() {
             "{what} must be refused by the column CHECK, got {outcome:?}"
         );
     }
+}
+
+/// Seed a user through the ordinary registration path.
+async fn seed_user(db: &TestDatabase, env: &Env, scope: Scope, handle: &str) -> UserId {
+    let id = UserId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .users()
+        .register_passwordless(env, &id, handle, None)
+        .await
+        .expect("register user");
+    id
+}
+
+#[tokio::test]
+async fn two_connections_may_use_the_same_external_id_for_different_people() {
+    // THE REASON THIS TABLE IS KEYED ON THE CONNECTION.
+    //
+    // Okta's `externalId` is a directory id and Entra's is an object id; neither knows about
+    // the other, and nothing stops them colliding. Keyed per ENVIRONMENT, the second IdP's
+    // first create would either collide or silently update the first IdP's person -- and
+    // silently updating is the worse of the two, because provisioning would report success.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let okta = connect(&db, &env, scope, &org, "scim_tok_okta").await;
+    let entra = connect(&db, &env, scope, &org, "scim_tok_entra").await;
+
+    let alice = seed_user(&db, &env, scope, "alice@example.test").await;
+    let bob = seed_user(&db, &env, scope, "bob@example.test").await;
+
+    // THE SAME external id, two connections, two different people.
+    let collide = "00u1abcdef";
+    for (connection, user) in [(&okta, &alice), (&entra, &bob)] {
+        db.store()
+            .scoped(scope)
+            .scim_external_ids()
+            .bind(
+                &ScimExternalIdId::generate(&env, &scope),
+                connection,
+                collide,
+                user,
+            )
+            .await
+            .expect("bind the external id");
+    }
+
+    // Each connection resolves ITS OWN person.
+    for (connection, expected) in [(&okta, &alice), (&entra, &bob)] {
+        let found = db
+            .store()
+            .scoped(scope)
+            .scim_external_ids()
+            .resolve(connection, collide)
+            .await
+            .expect("resolve")
+            .expect("a mapping");
+        assert_eq!(found, *expected, "each connection resolves its own person");
+    }
+
+    // And the round trip: what each connection calls the person it knows.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .scim_external_ids()
+            .external_id_for(&okta, &alice)
+            .await
+            .expect("round trip"),
+        Some(collide.to_owned())
+    );
+    // Okta has no mapping for Bob, who is Entra's person.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .scim_external_ids()
+            .external_id_for(&okta, &bob)
+            .await
+            .expect("round trip"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn one_connection_cannot_bind_an_external_id_twice() {
+    // The unique index, which is what makes a retried provisioning run a 409 rather than a
+    // second person. RFC 7644 section 3.3 asks for exactly that.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let okta = connect(&db, &env, scope, &org, "scim_tok_dup").await;
+    let alice = seed_user(&db, &env, scope, "alice@example.test").await;
+    let bob = seed_user(&db, &env, scope, "bob@example.test").await;
+
+    db.store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1dup",
+            &alice,
+        )
+        .await
+        .expect("the first bind");
+
+    // The same external id, a DIFFERENT person: a conflict, not a silent re-point.
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1dup",
+            &bob,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::Conflict)),
+        "a second bind of one external id is a conflict: {outcome:?}"
+    );
+
+    // And the SAME person under a second external id is a conflict too, by the by-user index:
+    // a connection that could call one person two things would break the round trip, which
+    // has to answer with exactly one value.
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1second",
+            &alice,
+        )
+        .await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::Conflict)));
+
+    // The first mapping is untouched by either refusal.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .scim_external_ids()
+            .resolve(&okta, "00u1dup")
+            .await
+            .expect("resolve"),
+        Some(alice)
+    );
+}
+
+#[tokio::test]
+async fn an_external_id_mapping_refuses_a_foreign_scope() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope_a = db.seed_scope(&env).await;
+    let scope_b = db.seed_scope(&env).await;
+    let org_b = seed_org(&db, &env, scope_b, "Beta").await;
+    let connection_b = connect(&db, &env, scope_b, &org_b, "scim_tok_scoped").await;
+    let user_a = seed_user(&db, &env, scope_a, "alice@example.test").await;
+
+    // A connection from another scope.
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope_a),
+            &connection_b,
+            "00u1foreign",
+            &user_a,
+        )
+        .await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+
+    // And resolving through one.
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_external_ids()
+        .resolve(&connection_b, "00u1foreign")
+        .await;
+    assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+}
+
+#[tokio::test]
+async fn a_second_external_id_for_the_same_person_is_refused() {
+    // The `scim_external_ids_by_user` unique index, which a reviewer replaced with a plain
+    // index leaving every suite green. It is what makes `external_id_for` a single answer: two
+    // rows for one (connection, user) would make "what does this connection call this person"
+    // ambiguous, and the read would return whichever the planner picked.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let okta = connect(&db, &env, scope, &org, "scim_tok_two_keys").await;
+    let alice = seed_user(&db, &env, scope, "alice@example.test").await;
+
+    db.store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1first",
+            &alice,
+        )
+        .await
+        .expect("the first key");
+
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &scope),
+            &okta,
+            "00u1second",
+            &alice,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::Conflict)),
+        "one connection calls one person by ONE name, got {outcome:?}"
+    );
+
+    // The control: the first mapping is intact and readable, so the refusal above is the
+    // index rather than a bind that never works twice.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .scim_external_ids()
+            .external_id_for(&okta, &alice)
+            .await
+            .expect("read back"),
+        Some("00u1first".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_cross_scope_bind_is_refused_by_the_guard_before_any_write() {
+    // `bind`'s three-way scope guard, which a reviewer replaced with `if false` leaving every
+    // suite green. Each id is varied ALONE, so a guard that checked only one of the three is
+    // caught by the other two rather than hidden by them.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let here = db.seed_scope(&env).await;
+    let there = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, here, "Globex").await;
+    let okta = connect(&db, &env, here, &org, "scim_tok_scoped").await;
+    let alice = seed_user(&db, &env, here, "alice@example.test").await;
+
+    let foreign_org = seed_org(&db, &env, there, "Elsewhere").await;
+    let foreign_connection = connect(&db, &env, there, &foreign_org, "scim_tok_elsewhere").await;
+    let foreign_user = seed_user(&db, &env, there, "bob@example.test").await;
+
+    for (what, id, connection, user) in [
+        (
+            "a mapping id from another scope",
+            ScimExternalIdId::generate(&env, &there),
+            okta,
+            alice,
+        ),
+        (
+            "a connection from another scope",
+            ScimExternalIdId::generate(&env, &here),
+            foreign_connection,
+            alice,
+        ),
+        (
+            "a user from another scope",
+            ScimExternalIdId::generate(&env, &here),
+            okta,
+            foreign_user,
+        ),
+    ] {
+        let outcome = db
+            .store()
+            .scoped(here)
+            .scim_external_ids()
+            .bind(&id, &connection, "00u1cross", &user)
+            .await;
+        assert!(
+            matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+            "{what} must be refused, got {outcome:?}"
+        );
+    }
+
+    // The control: all three in scope binds, so the refusals above are the guard rather than a
+    // bind that never succeeds.
+    db.store()
+        .scoped(here)
+        .scim_external_ids()
+        .bind(
+            &ScimExternalIdId::generate(&env, &here),
+            &okta,
+            "00u1cross",
+            &alice,
+        )
+        .await
+        .expect("all three in scope");
 }

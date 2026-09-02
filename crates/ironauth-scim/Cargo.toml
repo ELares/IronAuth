@@ -12,8 +12,38 @@ workspace = true
 
 [dependencies]
 ironauth-store = { path = "../ironauth-store" }
+ironauth-env = { path = "../ironauth-env" }
+axum = { workspace = true, features = ["json", "query"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+ironauth-store = { path = "../ironauth-store", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower.workspace = true
 serde_json.workspace = true
+
+
+# THE SCIM SURFACE (issue #135): that no route answers without a credential, that a token
+# cannot be repointed at another scope by editing the half that names one, and that the
+# discovery documents report what the server enforces. Needs a database.
+[[test]]
+name = "surface"
+path = "tests/surface.rs"
+
+# THE USERS RESOURCE and the SCIM IDOR suite (issue #135 criterion 5): that every method
+# authenticates, that a credential reaches exactly its own organization through every path
+# shape, filter and encoding, and that both vendor PATCH dialects actually deactivate.
+# Needs a database.
+[[test]]
+name = "users"
+path = "tests/users.rs"
+
+# GROUP PUSH (issue #135): the three PATCH shapes an identity provider actually sends, each
+# asserted on the membership read back rather than on the status; that a group cannot hold
+# another organization's user through any member-carrying door; and the slug derivation.
+# Needs a database.
+[[test]]
+name = "groups"
+path = "tests/groups.rs"

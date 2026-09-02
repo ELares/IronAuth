@@ -3,10 +3,21 @@
   "path": "/Users",
   "method": "POST",
   "body": {
-    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+    "schemas": [
+      "urn:ietf:params:scim:schemas:core:2.0:User"
+    ],
     "userName": "bjensen@example.com",
     "externalId": "701984",
-    "name": { "givenName": "Barbara", "familyName": "Jensen" },
+    "name": {
+      "givenName": "Barbara",
+      "familyName": "Jensen"
+    },
     "active": true
-  }
+  },
+  "expect_status": 201,
+  "expect_why": "a create is a create",
+  "expect_body_contains": [
+    "\"active\":true",
+    "\"externalId\":\"701984\""
+  ]
 }

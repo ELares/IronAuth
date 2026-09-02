@@ -2,5 +2,7 @@
   "source": "RFC 7644 section 3.4.2.2; the lookup every connector does before a create",
   "path": "/Users",
   "method": "GET",
-  "filter": "userName eq \"bjensen@example.com\""
+  "filter": "userName eq \"bjensen@example.com\"",
+  "expect_status": 200,
+  "expect_why": "the userName lookup that opens every sync"
 }

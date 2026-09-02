@@ -577,6 +577,311 @@ fn utf8_width(byte: u8) -> usize {
     }
 }
 
+/// Whether `resource` satisfies `filter` (RFC 7644 section 3.4.2.2).
+///
+/// # Why the evaluator lives beside the parser
+///
+/// Because the parser's guarantee is only half of one. [`Filter`] cannot hold raw filter text,
+/// so no filter reaches a datastore unparsed -- but a filter that is parsed and then never
+/// APPLIED is a filter the caller believes narrowed the answer and did not. Putting the
+/// semantics in the same module as the grammar is what makes "every operator the parser
+/// accepts is an operator something can act on" checkable in one place: a new [`CompareOp`]
+/// breaks this match, rather than silently becoming an operator that parses and does nothing.
+///
+/// # Attribute names are matched case-insensitively
+///
+/// RFC 7643 section 2.1 says attribute names are case insensitive, and Okta sends `userName`
+/// where Entra sends `username`. A case-sensitive lookup would answer "no such user" to one
+/// vendor for a person the other can see.
+///
+/// A path that names no attribute of the resource does not match, for every operator except
+/// `ne`: "not equal to a value that is not there" is true, and a resource missing the
+/// attribute is genuinely not equal to it. RFC 7644 section 3.4.2.2 says only that a provider
+/// "SHALL treat the attribute as if there is no attribute value" and prescribes no such
+/// exception, so the asymmetry is the common implementation convention rather than something
+/// the specification requires.
+#[must_use]
+pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
+    match filter {
+        Filter::Compare { path, op, value } => {
+            let found = attribute_values(resource, path);
+            if found.is_empty() {
+                // "not equal to a value that is not there" is true; every other operator is
+                // false against an attribute the resource does not carry. A convention rather
+                // than a requirement; see this function's docs.
+                return *op == CompareOp::NotEqual;
+            }
+            found.iter().any(|value_at| compare(value_at, *op, value))
+        }
+        Filter::Present {
+            path,
+            op: PresentOp,
+        } => attribute_values(resource, path)
+            .iter()
+            .any(|found| !found.is_null()),
+        Filter::ValuePath { path, filter } => {
+            // The sub-filter applies to each VALUE of the multi-valued attribute, and the
+            // whole path matches when ONE value satisfies the whole sub-filter. This reads
+            // the attribute directly rather than through `attribute_values`, because that
+            // helper flattens a sub-attribute across values, which is exactly the
+            // across-values semantics a value path exists to refuse.
+            match member(resource, &path.name) {
+                Some(serde_json::Value::Array(values)) => {
+                    values.iter().any(|value| matches(filter, value))
+                }
+                Some(single) => matches(filter, single),
+                None => false,
+            }
+        }
+        Filter::And(left, right) => matches(left, resource) && matches(right, resource),
+        Filter::Or(left, right) => matches(left, resource) || matches(right, resource),
+        Filter::Not(inner) => !matches(inner, resource),
+    }
+}
+
+/// Every value an [`AttributePath`] names inside `resource`.
+///
+/// # A dotted path over a multi-valued attribute distributes across its values
+///
+/// `emails.type eq "work"` must match a user with several addresses one of which is a work
+/// one, which means the path names a LIST of candidate values rather than a single one. A
+/// lookup that returned the array itself and then asked it for a `type` member would find
+/// nothing, and every dotted filter over `emails`, `phoneNumbers` or any other multi-valued
+/// attribute would silently match nobody.
+///
+/// This distribution is also precisely what a value path does NOT do, and the difference is
+/// the reason RFC 7644 section 3.4.2.2 has both spellings: `emails.type eq "work" and
+/// emails.value ew "@example.com"` may be satisfied by two DIFFERENT addresses, while
+/// `emails[type eq "work" and value ew "@example.com"]` requires one address to be both.
+///
+/// The schema URN half of a qualified path is IGNORED rather than matched. A resource is
+/// rendered as ONE flat JSON object regardless of which schema declares each attribute, so
+/// there is nothing for a URN to select between: `urn:...:core:2.0:User:userName` and
+/// `userName` name the same member of the same object. (The surface does publish the
+/// enterprise User extension alongside the core schema, so "one schema per resource type"
+/// would be false; what is true is that one RESOURCE is one object here.) Matching the URN
+/// would make a fully qualified filter, which Entra sends for extension attributes, miss the
+/// attribute it correctly named.
+fn attribute_values<'a>(
+    resource: &'a serde_json::Value,
+    path: &AttributePath,
+) -> Vec<&'a serde_json::Value> {
+    let Some(found) = member(resource, &path.name) else {
+        return Vec::new();
+    };
+    match (path.sub.as_deref(), found) {
+        (None, serde_json::Value::Array(values)) => values.iter().collect(),
+        (None, single) => vec![single],
+        (Some(sub), serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| member(value, sub))
+            .collect(),
+        (Some(sub), single) => member(single, sub).into_iter().collect(),
+    }
+}
+
+/// One member of a JSON object, matched case-insensitively on the key.
+fn member<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    let object = value.as_object()?;
+    object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, found)| found)
+}
+
+/// Apply one comparison operator to a resource value and a filter literal.
+///
+/// Types that cannot be ordered do not compare: `gt` against a boolean is FALSE rather than an
+/// error, because a filter is a selection and a value that cannot satisfy the test simply does
+/// not. String comparison is case-insensitive, which RFC 7643 section 2.1 requires for the
+/// `caseExact: false` attributes that make up the core user schema.
+fn compare(found: &serde_json::Value, op: CompareOp, literal: &Value) -> bool {
+    match (found, literal) {
+        (serde_json::Value::String(left), Value::String(right)) => string_compare(left, op, right),
+        (serde_json::Value::Bool(left), Value::Boolean(right)) => match op {
+            CompareOp::Equal => left == right,
+            CompareOp::NotEqual => left != right,
+            _ => false,
+        },
+        // EXACT equality is the right relation here and `float_cmp` is wrong about this one.
+        // A filter is a SELECTION over values a client stored, not a measurement: an epsilon
+        // would make `count eq 3` also select 3.0000001, which no client asked for and which
+        // has no defensible width. The lint is what pushed an earlier version into
+        // `(left - right).abs() == 0.0`, a DIFFERENT relation that yields NaN once a
+        // non-finite value is involved -- so dodging the lint is how the bug got in.
+        #[allow(clippy::float_cmp)]
+        (serde_json::Value::Number(left), Value::Number(right)) => {
+            let Some(left) = left.as_f64() else {
+                return false;
+            };
+            match op {
+                // DIRECT equality on the two f64s, no epsilon: a filter is a selection over
+                // stored values rather than a measurement. Written as `==` rather than as the
+                // `(left - right).abs() == 0.0` an earlier version used, which is a different
+                // relation once a non-finite value is involved: `parse_number` accepts `1e999`
+                // and `f64` parses it to infinity without error, so the LITERAL side can be
+                // infinite. (The resource side cannot: JSON has no infinity, so the
+                // both-infinite case that would make the subtraction NaN is unreachable. The
+                // direct comparison is simply the right relation and does not need that
+                // argument to hold.)
+                CompareOp::Equal => left == *right,
+                CompareOp::NotEqual => left != *right,
+                CompareOp::GreaterThan => left > *right,
+                CompareOp::GreaterOrEqual => left >= *right,
+                CompareOp::LessThan => left < *right,
+                CompareOp::LessOrEqual => left <= *right,
+                CompareOp::Contains | CompareOp::StartsWith | CompareOp::EndsWith => false,
+            }
+        }
+        (serde_json::Value::Null, Value::Null) => op == CompareOp::Equal,
+        // Everything else is a TYPE MISMATCH: a null against a non-null, a string against a
+        // number, an object against anything. None of them satisfies an equality and all of
+        // them satisfy its negation, which is one arm rather than several saying the same.
+        _ => op == CompareOp::NotEqual,
+    }
+}
+
+/// The string half of [`compare`], case-insensitive per RFC 7643 section 2.1.
+fn string_compare(left: &str, op: CompareOp, right: &str) -> bool {
+    let left_folded = left.to_lowercase();
+    let right_folded = right.to_lowercase();
+    match op {
+        CompareOp::Equal => left_folded == right_folded,
+        CompareOp::NotEqual => left_folded != right_folded,
+        CompareOp::Contains => left_folded.contains(&right_folded),
+        CompareOp::StartsWith => left_folded.starts_with(&right_folded),
+        CompareOp::EndsWith => left_folded.ends_with(&right_folded),
+        CompareOp::GreaterThan => left_folded > right_folded,
+        CompareOp::GreaterOrEqual => left_folded >= right_folded,
+        CompareOp::LessThan => left_folded < right_folded,
+        CompareOp::LessOrEqual => left_folded <= right_folded,
+    }
+}
+
+#[cfg(test)]
+mod evaluator_tests {
+    use super::*;
+
+    fn user() -> serde_json::Value {
+        serde_json::json!({
+            "id": "usr_1",
+            "userName": "Alice@Example.com",
+            "active": true,
+            "externalId": "okta-77",
+            "emails": [
+                {"type": "work", "value": "alice@example.com"},
+                {"type": "home", "value": "a@home.test"},
+            ],
+        })
+    }
+
+    fn holds(input: &str) -> bool {
+        matches(&parse_filter(input).expect("a valid filter"), &user())
+    }
+
+    #[test]
+    fn the_two_filters_a_provisioning_client_actually_sends_select_the_right_user() {
+        // These are the ONLY filters Okta and Entra send during ordinary provisioning, so a
+        // server that got either wrong would fail against real traffic on the first sync.
+        assert!(holds(r#"userName eq "alice@example.com""#));
+        assert!(holds(r#"externalId eq "okta-77""#));
+        assert!(!holds(r#"userName eq "bob@example.com""#));
+        assert!(!holds(r#"externalId eq "okta-78""#));
+    }
+
+    #[test]
+    fn attribute_names_and_string_values_are_matched_case_insensitively() {
+        // RFC 7643 section 2.1. Okta sends `userName`, Entra sends `username`, and the stored
+        // handle here is mixed case: all three spellings name one person.
+        assert!(holds(r#"username eq "ALICE@EXAMPLE.COM""#));
+        assert!(holds(r#"USERNAME eq "alice@example.com""#));
+        assert!(holds(r#"userName eq "Alice@Example.com""#));
+    }
+
+    #[test]
+    fn a_value_path_selects_within_one_value_rather_than_across_all_of_them() {
+        // The distinction the ValuePath doc comment names, asserted: the bracketed form
+        // requires ONE email to be both work and at example.com, and the dotted form does
+        // not. A user whose work address is elsewhere must not match the bracketed filter.
+        assert!(holds(
+            r#"emails[type eq "work" and value ew "@example.com"]"#
+        ));
+        assert!(!holds(
+            r#"emails[type eq "home" and value ew "@example.com"]"#
+        ));
+        // The control: the dotted spelling matches, because the two conditions are satisfied
+        // by DIFFERENT values. Without this the test above would pass on an evaluator that
+        // simply never matched a value path.
+        assert!(holds(
+            r#"emails.type eq "home" and emails.value ew "@example.com""#
+        ));
+    }
+
+    #[test]
+    fn a_type_mismatch_satisfies_ne_and_nothing_else() {
+        // The arm the doc comment argues for at length, and which a reviewer mutated to
+        // `_ => true` with all 52 lib tests still green. A wrong TRUE here puts a resource in
+        // a list the client asked to exclude.
+        assert!(!holds(r#"active eq "true""#));
+        assert!(holds(r#"active ne "true""#));
+        assert!(!holds("userName gt 5"));
+        assert!(!holds("userName eq 5"));
+        assert!(holds("userName ne 5"));
+        assert!(!holds(r#"emails eq "alice@example.com""#));
+    }
+
+    #[test]
+    fn a_number_compares_directly_and_survives_an_overflowing_literal() {
+        // `1e999` parses to f64 infinity, and any client can send it. Only the LITERAL side
+        // can be infinite: JSON has no infinity, so `serde_json` cannot hold one on the
+        // resource side and a stored-infinity case is unreachable. The comparison is
+        // therefore always finite-against-possibly-infinite, which `==` and the ordering
+        // operators handle and which an epsilon would only blur.
+        let resource = serde_json::json!({"count": 3.0});
+        let holds_on =
+            |input: &str| matches(&parse_filter(input).expect("a valid filter"), &resource);
+        assert!(holds_on("count eq 3"));
+        assert!(!holds_on("count eq 4"));
+        assert!(holds_on("count gt 2"));
+        assert!(holds_on("count le 3"));
+        // The overflowing literal: a finite stored value is less than infinity, is not equal
+        // to it, and IS unequal to it. All three have to agree, because a comparison that
+        // yielded NaN internally would answer the opposite on the last two.
+        assert!(holds_on("count lt 1e999"));
+        assert!(!holds_on("count eq 1e999"));
+        assert!(holds_on("count ne 1e999"));
+        assert!(!holds_on("count gt 1e999"));
+    }
+
+    #[test]
+    fn an_absent_attribute_matches_ne_and_nothing_else() {
+        assert!(!holds(r#"nickName eq "alice""#));
+        assert!(holds(r#"nickName ne "alice""#));
+        assert!(!holds("nickName pr"));
+        assert!(holds("userName pr"));
+    }
+
+    #[test]
+    fn the_boolean_and_the_connectives_behave() {
+        assert!(holds("active eq true"));
+        assert!(!holds("active eq false"));
+        assert!(holds(r#"active eq true and userName sw "alice""#));
+        assert!(holds(r#"active eq false or userName co "example""#));
+        assert!(holds(r#"not (userName eq "bob@example.com")"#));
+        // The control for `not`: it has to be able to be false too, or every negation would
+        // pass and the assertion above would say nothing.
+        assert!(!holds(r#"not (userName eq "alice@example.com")"#));
+    }
+
+    #[test]
+    fn a_fully_qualified_path_names_the_same_attribute_as_the_bare_one() {
+        // Entra qualifies paths with the schema URN. Both spellings must select the user.
+        assert!(holds(
+            r#"urn:ietf:params:scim:schemas:core:2.0:User:userName eq "alice@example.com""#
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

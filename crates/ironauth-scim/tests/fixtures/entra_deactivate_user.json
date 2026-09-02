@@ -1,0 +1,23 @@
+{
+  "source": "Microsoft Entra provisioning documentation: Entra capitalises `op` and sends `active` as the STRING \"False\", not a JSON boolean",
+  "path": "/Users/usr_2c9a8b",
+  "method": "PATCH",
+  "patch_path": "active",
+  "body": {
+    "schemas": [
+      "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+    ],
+    "Operations": [
+      {
+        "op": "Replace",
+        "path": "active",
+        "value": "False"
+      }
+    ]
+  },
+  "expect_status": 200,
+  "expect_why": "the deactivate every Entra terminate sends. A server that accepted only the JSON boolean would answer 200 here and leave the account ENABLED, which is why this fixture exists separately from the Okta one.",
+  "expect_body_contains": [
+    "\"active\":false"
+  ]
+}

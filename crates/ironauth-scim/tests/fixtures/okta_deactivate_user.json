@@ -4,7 +4,20 @@
   "method": "PATCH",
   "patch_path": "active",
   "body": {
-    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-    "Operations": [{ "op": "replace", "path": "active", "value": false }]
-  }
+    "schemas": [
+      "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+    ],
+    "Operations": [
+      {
+        "op": "replace",
+        "path": "active",
+        "value": false
+      }
+    ]
+  },
+  "expect_status": 200,
+  "expect_why": "the deactivate every Okta terminate sends",
+  "expect_body_contains": [
+    "\"active\":false"
+  ]
 }

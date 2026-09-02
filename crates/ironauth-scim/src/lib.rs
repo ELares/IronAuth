@@ -18,10 +18,14 @@
 
 mod bulk;
 mod filter;
+mod groups;
 mod patch;
 mod path;
 mod resource;
+pub mod schema;
+pub mod server;
 mod service_provider_config;
+mod users;
 
 pub use bulk::{
     BulkError, BulkLimits, BulkOperation, BulkOperationResult, BulkRequest, validate_bulk,
@@ -34,5 +38,6 @@ pub use service_provider_config::{
 };
 
 pub use filter::{
-    AttributePath, CompareOp, Filter, FilterError, PresentOp, ScimErrorBody, Value, parse_filter,
+    AttributePath, CompareOp, Filter, FilterError, PresentOp, ScimErrorBody, Value,
+    matches as filter_matches, parse_filter,
 };

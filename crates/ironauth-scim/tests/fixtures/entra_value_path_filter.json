@@ -2,5 +2,7 @@
   "source": "RFC 7644 section 3.4.2.2 valuePath, the bracketed form; the shape a connector sends to find a user by their WORK address rather than by any address. Derived from the specification, not captured: see PROVENANCE.md.",
   "path": "/Users",
   "method": "GET",
-  "filter": "emails[type eq \"work\" and value ew \"@example.com\"]"
+  "filter": "emails[type eq \"work\" and value ew \"@example.com\"]",
+  "expect_status": 200,
+  "expect_why": "Entra's value-path filter"
 }
