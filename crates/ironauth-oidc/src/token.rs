@@ -1074,21 +1074,31 @@ async fn mint_device_secret(
         .store()
         .scoped(scope)
         .native_sso_device_secrets()
-        .mint(
-            state.env(),
-            ironauth_store::NewNativeSsoDeviceSecret {
-                id: &id,
-                subject: &bindings.subject,
-                // The UNDERLYING session, not the per-client `sid`. See `CodeExchangeSession`.
-                session_id: &session_id.to_string(),
-                issued_to_client_id: &bindings.client_id,
-                secret_hash: &digest,
-                expires_at_unix_micros: now
-                    .saturating_add(crate::native_sso::DEVICE_SECRET_TTL_SECS * 1_000_000),
-            },
-        )
+        .mint(ironauth_store::NewNativeSsoDeviceSecret {
+            id: &id,
+            subject: &bindings.subject,
+            // The UNDERLYING session, not the per-client `sid`. See `CodeExchangeSession`.
+            session_id: &session_id.to_string(),
+            issued_to_client_id: &bindings.client_id,
+            secret_hash: &digest,
+            // The GRANTED scope, so a sibling redeeming this secret has something to
+            // narrow from. Without it the bootstrap presents an empty subject scope and
+            // the exchange refuses it outright, which would make the whole feature
+            // unreachable rather than merely unscoped.
+            granted_scope: bindings.oauth_scope.as_deref().unwrap_or_default(),
+            // Both sides of the row's ordering CHECKs come from THIS clock. A Postgres
+            // `now()` default on the other side would compare two unrelated timelines.
+            issued_at_unix_micros: now,
+            expires_at_unix_micros: now
+                .saturating_add(crate::native_sso::DEVICE_SECRET_TTL_SECS * 1_000_000),
+        })
         .await
-        .map_err(|_| TokenError::ServerError)?;
+        .map_err(|error| {
+            // Logged rather than swallowed: this fails the sign-in with a 500, and the operator
+            // needs to know it was the device-secret write and not the token mint.
+            tracing::error!(%error, "native SSO device secret could not be recorded");
+            TokenError::ServerError
+        })?;
     Ok(Some(secret))
 }
 

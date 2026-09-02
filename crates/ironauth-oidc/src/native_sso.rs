@@ -189,3 +189,19 @@ pub fn storage_digest(device_secret: &str) -> [u8; 32] {
     hasher.update(device_secret.as_bytes());
     hasher.finalize().into()
 }
+
+/// What a sibling inherits from the sign-in the device secret came from.
+///
+/// The granted scope MINUS `device_sso` itself. The scope is a request for a device secret, and
+/// app A already received one: passing it along would let every sibling mint a further secret
+/// from a bootstrap, so one sign-in could fan out into an unbounded family of independent
+/// credentials, each with its own thirty-day life. A sibling that genuinely needs its own secret
+/// can ask for the scope in its own sign-in.
+#[must_use]
+pub fn inheritable_scope(granted_scope: &str) -> std::collections::BTreeSet<String> {
+    granted_scope
+        .split_whitespace()
+        .filter(|token| *token != DEVICE_SSO_SCOPE)
+        .map(ToOwned::to_owned)
+        .collect()
+}

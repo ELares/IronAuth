@@ -20,11 +20,19 @@
 -- WHAT THE ROW IS BOUND TO, and why `sid` is a column rather than a detail.
 --
 -- The criterion this prototype has to meet is that revoking a device secret SEVERS THE SSO SET.
--- A set is only severable if it is identifiable, so the row names the sign-in it came from: the
--- session id already carried in every ID token this deployment issues. Revoking the secret ends
--- the family's ability to bootstrap new siblings, and the session's own revocation ends it too,
--- which is the property an operator actually wants -- "sign this person out" should not leave a
--- credential behind that mints fresh tokens for them.
+-- A set is only severable if it is identifiable, so the row names the sign-in it came from.
+--
+-- THE UNDERLYING SESSION ID, not the ID token's `sid`. Those are different values on purpose:
+-- `sid` comes from `ensure_sid` and is per (client, session), so one relying party cannot
+-- correlate a person across another's tokens. Keying this row on `sid` would sever only the app
+-- that happened to ask and leave its siblings minting, with the revocation reporting success.
+--
+-- Revoking the secret ends the family's ability to bootstrap new siblings, and so does the
+-- session ending by ANY route: redemption joins `sessions` and requires it live, so an operator
+-- revoking in the console, a bulk revoke, a password change, a risk decision, global revocation
+-- and plain expiry all sever the set without needing to know this table exists. That is the
+-- property an operator actually wants: "sign this person out" must not leave a credential
+-- behind that mints fresh tokens for them.
 --
 -- Expand phase: a new table the old binary never reads or writes, so a rollback leaves it inert.
 
@@ -36,14 +44,29 @@ CREATE TABLE native_sso_device_secrets (
     -- The person the secret speaks for. Every sibling app's tokens are minted under this
     -- subject, so it is the thing the secret ultimately authorizes.
     subject             text        NOT NULL,
-    -- The SIGN-IN this secret came from, as carried in the ID token's `sid`. What makes the
-    -- SSO set identifiable, and therefore severable.
+    -- The SIGN-IN this secret came from: the UNDERLYING session id, NOT the ID token's
+    -- per-client `sid`. See the header for why the distinction is load bearing.
     session_id          text        NOT NULL,
     -- The client that asked for `device_sso`. Recorded for the audit trail rather than as a
     -- control: any sibling may redeem the secret, which is the entire point of the feature.
     issued_to_client_id text        NOT NULL,
     -- SHA-256 of the device secret. NEVER the secret. See the header.
     secret_hash         bytea       NOT NULL,
+    -- The scope the sign-in was GRANTED, carried so a sibling's exchange has something to
+    -- narrow from.
+    --
+    -- Without it the bootstrap presents an empty subject scope, and the exchange refuses that
+    -- outright ("nothing to narrow from") -- so the whole feature would be unreachable rather
+    -- than merely unscoped. It is the GRANTED scope rather than the requested one, so a sibling
+    -- can never end up with more than the person actually authorized at sign-in.
+    granted_scope       text        NOT NULL,
+    -- Set by the WRITER from the same clock as `expires_at`, so the ordering CHECK below
+    -- compares two values from ONE clock. `created_at` is the database's and is deliberately
+    -- not used for it, exactly as 0128 and 0130 do it: `now()` here and an application clock
+    -- there would make the constraint a comparison between two unrelated timelines, which is a
+    -- REJECTED INSERT under any deployment whose database clock leads the application's, and a
+    -- guaranteed one under a test clock that does not track wall time.
+    issued_at           timestamptz NOT NULL,
     created_at          timestamptz NOT NULL DEFAULT now(),
     -- A device secret with no end is a permanent credential for an app family. The issuance
     -- path sets this; the column is NOT NULL so it cannot be forgotten into permanence.
@@ -61,12 +84,13 @@ CREATE TABLE native_sso_device_secrets (
     -- truncated hash compares equal more often than it should.
     CONSTRAINT native_sso_device_secrets_hash_shaped
         CHECK (octet_length(secret_hash) = 32),
-    -- The secret cannot outlive the moment it was created, and cannot be revoked before it
-    -- existed. Both are the kind of ordering a clock skew or a bad caller produces.
-    CONSTRAINT native_sso_device_secrets_expiry_after_creation
-        CHECK (expires_at > created_at),
-    CONSTRAINT native_sso_device_secrets_revocation_after_creation
-        CHECK (revoked_at IS NULL OR revoked_at >= created_at),
+    -- The secret cannot outlive the moment it was issued, and cannot be revoked before it
+    -- existed. Both compare against `issued_at`, the APPLICATION clock's value, never against
+    -- `created_at`: see the column comment above.
+    CONSTRAINT native_sso_device_secrets_expiry_after_issuance
+        CHECK (expires_at > issued_at),
+    CONSTRAINT native_sso_device_secrets_revocation_after_issuance
+        CHECK (revoked_at IS NULL OR revoked_at >= issued_at),
 
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id)
@@ -114,9 +138,18 @@ GRANT SELECT, INSERT, UPDATE ON native_sso_device_secrets TO ironauth_app;
 -- it is the rule that bites every time someone reaches for a policy to forbid something.)
 --
 -- USING is what the row must look like BEFORE: not yet revoked. WITH CHECK is what it must look
--- like AFTER: revoked, with everything that identifies the secret unchanged. Together the data
--- plane may revoke, and may not un-revoke, re-point a digest at another subject, extend an
--- expiry, or move a secret to a different session.
+-- like AFTER: revoked.
+--
+-- THAT IS ALL IT ENFORCES, stated exactly because an earlier version of this comment claimed
+-- four properties and the policy delivered one. It does NOT pin `subject`, `secret_hash`,
+-- `session_id` or `expires_at`: an UPDATE that rewrites all of them AND sets `revoked_at`
+-- satisfies both clauses. What makes that harmless is a consequence rather than the policy --
+-- every permitted UPDATE leaves the row revoked, and no read path ever returns a revoked row.
+-- Un-revocation is the one thing genuinely blocked, because USING can never match again.
+--
+-- The residual trust is the INSERT grant: minting runs on this role, so the role that can
+-- revoke a row can also insert a fresh one. Narrowing that needs the mint to move behind a
+-- function or the column set to be restricted, and neither is this prototype's to decide.
 CREATE POLICY native_sso_device_secrets_app_revokes_only
     ON native_sso_device_secrets
     AS RESTRICTIVE
@@ -133,9 +166,14 @@ COMMENT ON TABLE native_sso_device_secrets IS
     'Issue #133 PROTOTYPE, OpenID Connect Native SSO 1.0 ID2: the device secret an app family '
     'shares so a sibling app need not ask the person to sign in again. The plaintext is '
     'returned once and never stored; only its SHA-256 digest lives here.';
+COMMENT ON COLUMN native_sso_device_secrets.granted_scope IS
+    'Issue #133: the scope the ORIGINAL sign-in was granted. A sibling redeeming the secret '
+    'narrows from this, so it can never obtain more than the person authorized; without it '
+    'the exchange has an empty subject scope and refuses the bootstrap outright.';
 COMMENT ON COLUMN native_sso_device_secrets.session_id IS
-    'Issue #133: the sign-in this secret came from, as carried in the ID token `sid`. What '
-    'makes the SSO set identifiable and therefore severable.';
+    'Issue #133: the sign-in this secret came from, the UNDERLYING session id and NOT the ID '
+    'token per-client sid. Redemption joins sessions on it, so any route that ends the session '
+    'severs the set.';
 COMMENT ON COLUMN native_sso_device_secrets.secret_hash IS
     'Issue #133: SHA-256 of the device secret, never the secret. A read of this table must not '
     'yield a credential that mints tokens for an entire app family.';

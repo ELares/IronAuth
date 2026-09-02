@@ -74269,11 +74269,14 @@ pub struct NativeSsoDeviceSecret {
     pub id: NativeSsoDeviceSecretId,
     /// The person the secret speaks for.
     pub subject: String,
-    /// The sign-in it came from, as carried in the ID token's `sid`. What makes the SSO set
-    /// severable.
+    /// The sign-in it came from: the UNDERLYING session id, NOT the ID token's per-client
+    /// `sid`. Redemption joins `sessions` on it, which is what makes the set severable by any
+    /// route that ends the session.
     pub session_id: String,
     /// The client that asked for `device_sso`. Audit, not a control: any sibling may redeem.
     pub issued_to_client_id: String,
+    /// The scope the original sign-in was granted, which a sibling's exchange narrows from.
+    pub granted_scope: String,
     /// When it stops being redeemable.
     pub expires_at_unix_micros: i64,
     /// Whether it has been revoked.
@@ -74286,12 +74289,17 @@ pub struct NewNativeSsoDeviceSecret<'a> {
     pub id: &'a NativeSsoDeviceSecretId,
     /// The person.
     pub subject: &'a str,
-    /// The sign-in, from the ID token's `sid`.
+    /// The sign-in: the UNDERLYING session id, never the ID token's per-client `sid`.
     pub session_id: &'a str,
     /// The client that asked.
     pub issued_to_client_id: &'a str,
     /// SHA-256 of the secret. THE DIGEST, never the secret.
     pub secret_hash: &'a [u8],
+    /// The scope the sign-in was GRANTED, so a sibling has something to narrow from.
+    pub granted_scope: &'a str,
+    /// When it was issued, from the APPLICATION clock. The ordering constraints compare
+    /// against this rather than the row's `created_at`, so both sides come from one clock.
+    pub issued_at_unix_micros: i64,
     /// When it stops being redeemable.
     pub expires_at_unix_micros: i64,
 }
@@ -74309,12 +74317,7 @@ impl NativeSsoDeviceSecretRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the id is out of this scope; [`StoreError::Database`] on a
     /// persistence failure, which includes a digest that is not 32 bytes (the column's CHECK).
-    pub async fn mint(
-        &self,
-        env: &Env,
-        spec: NewNativeSsoDeviceSecret<'_>,
-    ) -> Result<(), StoreError> {
-        let _ = env;
+    pub async fn mint(&self, spec: NewNativeSsoDeviceSecret<'_>) -> Result<(), StoreError> {
         if spec.id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -74322,9 +74325,10 @@ impl NativeSsoDeviceSecretRepo<'_> {
         sqlx::query(
             "INSERT INTO native_sso_device_secrets \
                  (id, tenant_id, environment_id, subject, session_id, issued_to_client_id, \
-                  secret_hash, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, \
-                     TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 microsecond'))",
+                  secret_hash, granted_scope, issued_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 microsecond'), \
+                     TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 microsecond'))",
         )
         .bind(spec.id.to_string())
         .bind(self.scope.tenant().to_string())
@@ -74333,6 +74337,8 @@ impl NativeSsoDeviceSecretRepo<'_> {
         .bind(spec.session_id)
         .bind(spec.issued_to_client_id)
         .bind(spec.secret_hash)
+        .bind(spec.granted_scope)
+        .bind(spec.issued_at_unix_micros)
         .bind(spec.expires_at_unix_micros)
         .execute(&mut *tx)
         .await?;
@@ -74345,6 +74351,19 @@ impl NativeSsoDeviceSecretRepo<'_> {
     /// "Live" is checked in SQL rather than by the caller: a redemption path that read the row
     /// and then compared timestamps in Rust would be one refactor away from forgetting the
     /// comparison, and the failure mode is a revoked device secret that still mints tokens.
+    ///
+    /// AND IT INCLUDES THE SESSION, which is the half that turns "revoking severs the set" from
+    /// a hope into a fact. The explicit `revoke_session_set` sweep runs on RP-initiated logout
+    /// only; every OTHER way a session ends -- an operator revoking it in the console, a bulk
+    /// revoke, a password change, a risk decision, global token revocation, or plain expiry --
+    /// touches no row in this table. Without this join, each of those would leave a live
+    /// family-wide credential behind a sign-out that reported success, redeemable for up to
+    /// thirty days, minting access tokens that are not session bound and therefore survive
+    /// every later revocation for their full lifetime.
+    ///
+    /// So the sweep is now an optimisation and this join is the control. That is the right way
+    /// round: a control that has to be remembered at six call sites is a control that will be
+    /// forgotten at the seventh.
     ///
     /// The lookup is BY DIGEST, which is what makes it constant-work with respect to the
     /// presented secret: there is no prefix, no scan, and no early exit that differs between a
@@ -74360,12 +74379,19 @@ impl NativeSsoDeviceSecretRepo<'_> {
     ) -> Result<Option<NativeSsoDeviceSecret>, StoreError> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
-            "SELECT id, subject, session_id, issued_to_client_id, \
-                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us \
-             FROM native_sso_device_secrets \
-             WHERE tenant_id = $1 AND environment_id = $2 AND secret_hash = $3 \
-               AND revoked_at IS NULL \
-               AND expires_at > TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')",
+            "SELECT d.id, d.subject, d.session_id, d.issued_to_client_id, d.granted_scope, \
+                    (EXTRACT(EPOCH FROM d.expires_at) * 1000000)::bigint AS expires_us \
+             FROM native_sso_device_secrets d \
+             JOIN sessions s \
+               ON s.id = d.session_id \
+              AND s.tenant_id = d.tenant_id \
+              AND s.environment_id = d.environment_id \
+             WHERE d.tenant_id = $1 AND d.environment_id = $2 AND d.secret_hash = $3 \
+               AND d.revoked_at IS NULL \
+               AND d.expires_at > TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+               AND s.revoked_at IS NULL AND s.ended_at IS NULL AND s.superseded_by IS NULL \
+               AND COALESCE(s.absolute_expires_at, s.expires_at) > \
+                   TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -74382,6 +74408,7 @@ impl NativeSsoDeviceSecretRepo<'_> {
             subject: row.get("subject"),
             session_id: row.get("session_id"),
             issued_to_client_id: row.get("issued_to_client_id"),
+            granted_scope: row.get("granted_scope"),
             expires_at_unix_micros: row.get("expires_us"),
             revoked: false,
         }))

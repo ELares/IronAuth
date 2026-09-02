@@ -1485,7 +1485,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 ///
 /// `pub(crate)` so the Native SSO prototype (issue #133) compares its `ds_hash` through THIS
 /// one rather than adding another copy. There are already nine hand-rolled versions of this
-/// function across five crates in this workspace, which is eight too many for a primitive whose
+/// function across FOUR crates in this workspace, which is eight too many for a primitive whose
 /// whole value is that it was written carefully once; a tenth is not this change's to add, and
 /// consolidating the nine is not this change's to do either.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

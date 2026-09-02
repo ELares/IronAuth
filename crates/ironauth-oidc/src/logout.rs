@@ -396,10 +396,12 @@ async fn revoke_and_signal(state: &OidcState, scope: Scope, session_id: &Session
     // session, its per-client sessions and its session-bound refresh families; the device
     // secret hangs off the same session and is the one thing that outlives them.
     //
-    // Best effort and AFTER the revocation, in the same shape as the signal below: a failure
-    // here must not leave the session un-revoked, because a half-done sign-out that kept the
-    // session is worse than one that kept a secret whose next redemption fails the session
-    // check anyway.
+    // Best effort and AFTER the revocation, and the justification is a check that now exists:
+    // `redeem` JOINS `sessions` and requires the session live, so a secret whose sweep failed
+    // is already unredeemable the moment the session above is revoked. This sweep is therefore
+    // an optimisation -- it retires rows eagerly rather than leaving them to expire -- and not
+    // the control. An earlier version of this comment claimed that backstop before it was
+    // built, which is exactly the wrong order to write a justification in.
     if state.native_sso_enabled() {
         match state
             .store()

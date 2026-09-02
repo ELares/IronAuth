@@ -9155,7 +9155,9 @@ Reading `aud` out of the presented token to decide which audience to verify it a
 
 ## Revoking severs the SSO set
 
-Signing a person out ends the family's ability to bootstrap. The device-secret row hangs off the **sign-in**, not off the app that asked for it, so logging out revokes every live secret from that session in the same operation that revokes the session and its refresh families.
+Ending the session ends the family's ability to bootstrap, **by any route**. The device-secret row hangs off the **sign-in**, not off the app that asked for it, and redemption **joins `sessions` and requires it live**. So an operator revoking in the console, a bulk revoke, a password change, a risk decision, global token revocation and plain expiry all sever the set without needing to know this table exists.
+
+RP-initiated logout additionally sweeps the rows, marking them revoked eagerly rather than leaving them to expire. That sweep is an optimisation; the join is the control. A control that has to be remembered at six call sites is one that will be forgotten at the seventh.
 
 That distinction is load-bearing and is the one thing a reader should take from the schema. The ID token's `sid` is **per-client** by design, so that one relying party cannot correlate a person across another's tokens. Keying the device secret on `sid` would have severed only the app that happened to ask and left its siblings minting: the criterion failing silently, with the revocation appearing to succeed.
 
@@ -9166,15 +9168,21 @@ That distinction is load-bearing and is the one thing a reader should take from 
 native-sso = { enabled = true, ack = "openid-connect-native-sso-1_0-ID2" }
 ```
 
-Then a client asks for `device_sso` in its authorization request. Nothing else is configured: the secret's lifetime is clamped at the mint rather than exposed, for the reason below.
+Then a client asks for `device_sso` in its authorization request, and **each app in the family must be a confidential client registered for the token-exchange grant**: the exchange requires both, as it does for every other caller.
+
+What it does **not** need is `token_exchange_impersonation_allowed`. By shape a bootstrap looks like an impersonation (another client's token, no actor recorded), so deriving that mode would have made this feature require the broadest privilege in the exchange: once that flag is set, the app may present *any* client's token for *any* subject. A bootstrap gets its own `ExchangeMode::NativeSsoBootstrap` instead, reachable only after the device secret has been redeemed and matched against `ds_hash`.
+
+The secret's lifetime is clamped at the mint rather than exposed, for the reason below.
 
 ## Deviations and limits, stated
 
 - **The device secret is a BEARER credential.** The draft's DPoP-binding question is open and this prototype does not answer it. Anything that reads the secret out of the device can use it from anywhere, until it expires or the session ends. This is the sharpest edge here.
 - **Nothing binds it to the device** beyond the name. There is no attestation, no key, no platform binding.
+- **`device_sso` is not gated per client.** Arming the flag lets any client in any environment of the deployment ask for a device secret. What bounds the damage is that redemption needs the matching ID token and a live session; a graduation should still make it a registration property.
 - **The lifetime is clamped at 30 days at the mint, not configured.** A credential for a whole app family that an operator could set to a year is a year-long key to every sibling's tokens, and the apps holding it cannot revoke it themselves.
 - **Returned once.** Only the SHA-256 digest is stored, so an app that loses the secret must sign in again, which is the correct outcome for a credential that speaks for a family.
 - **No `device_secret` rotation.** The draft allows the exchange to return a fresh secret; this returns none, so the family's secret is the one it got at sign-in until the session ends.
+- **A sibling does not inherit `device_sso`.** The bootstrap strips it, so one sign-in cannot fan out into an unbounded family of independent thirty-day credentials. A sibling that needs its own secret asks for the scope in its own sign-in.
 
 ## What a graduation still needs
 

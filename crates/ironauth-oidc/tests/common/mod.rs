@@ -2142,6 +2142,25 @@ impl Harness {
         self.state = state;
     }
 
+    /// Revoke every session for `subject`, the way an operator or a risk decision does.
+    ///
+    /// Deliberately NOT RP-initiated logout: that path runs an explicit device-secret sweep,
+    /// and a test using it would pass even if the sweep were the only thing severing the set.
+    /// This route touches no row in `native_sso_device_secrets`, so what it measures is the
+    /// session join inside `redeem`.
+    pub async fn revoke_every_session_for(&self, subject: &str) {
+        let (actor, corr) = self.seeding_actor();
+        let user = ironauth_store::UserId::parse_in_scope(subject, &self.scope)
+            .expect("the subject parses as a user id in this scope");
+        self.store()
+            .scoped(self.scope)
+            .acting(actor, corr)
+            .sessions()
+            .revoke_all_for_user(&self.env, &user, false, None)
+            .await
+            .expect("revoke every session for the subject");
+    }
+
     /// Arm Native SSO (issue #133, PROTOTYPE).
     ///
     /// Two behaviours turn on together: a code exchange granted `device_sso` returns a device

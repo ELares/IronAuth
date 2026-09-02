@@ -1456,6 +1456,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0181_agent_vault_refresh.sql"),
         },
+        Migration {
+            version: 182,
+            name: "native_sso_device_secrets",
+            // EXPAND: one new table the old binary never reads or writes, so a rollback leaves
+            // it inert. Nothing else is touched.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0182_native_sso_device_secrets.sql"),
+        },
     ]
 }
 

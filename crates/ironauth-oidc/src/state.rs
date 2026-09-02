@@ -4172,28 +4172,6 @@ impl OidcState {
         Ok(())
     }
 
-    /// Verify an RP-Initiated Logout `id_token_hint` (issue #33): an id token THIS OP
-    /// minted, presented at `end_session` ONLY to identify the session to end.
-    ///
-    /// It is verified through the SAME hardened [`ironauth_jose::verify`] path as an
-    /// access token, against the environment's published signing keys, the
-    /// per-environment issuer, and `audience` (the client the hint names in `aud`), with
-    /// exactly ONE relaxation: [`VerificationPolicy::allow_expired`] accepts a PAST
-    /// `exp`. That is mandated by the RP-Initiated Logout spec (a logout hint is
-    /// routinely stale) and confers no access, since the hint only NAMES a session. A
-    /// rotated-out key still verifies because `published_signing_keys` keeps the
-    /// verification-retained keys. Every OTHER check stays: the signature over the
-    /// environment's own keys, the algorithm allowlist, the exact issuer, the exact
-    /// audience, `nbf`, and `iat`. A hint signed by a FOREIGN issuer, or tampered, fails
-    /// the signature or issuer check and returns `Err(())`, so a logout never acts on an
-    /// unverifiable or foreign hint.
-    ///
-    /// # Errors
-    ///
-    /// `Err(())` if no signing key is provisioned for the scope's environment, or the
-    /// hint does not verify under the built policy (bad signature, wrong issuer or
-    /// audience, non-allowlisted algorithm, missing `exp`, future `nbf`/`iat`,
-    /// malformed).
     /// Verify an ID token THIS environment issued, for the Native SSO exchange (issue #133).
     ///
     /// Deliberately not `verify_logout_hint` with a different name, and the difference is the
@@ -4251,6 +4229,28 @@ impl OidcState {
         verify(token, &policy, self.inner.env.clock()).map_err(|_| ())
     }
 
+    /// Verify an RP-Initiated Logout `id_token_hint` (issue #33): an id token THIS OP
+    /// minted, presented at `end_session` ONLY to identify the session to end.
+    ///
+    /// It is verified through the SAME hardened [`ironauth_jose::verify`] path as an
+    /// access token, against the environment's published signing keys, the
+    /// per-environment issuer, and `audience` (the client the hint names in `aud`), with
+    /// exactly ONE relaxation: [`VerificationPolicy::allow_expired`] accepts a PAST
+    /// `exp`. That is mandated by the RP-Initiated Logout spec (a logout hint is
+    /// routinely stale) and confers no access, since the hint only NAMES a session. A
+    /// rotated-out key still verifies because `published_signing_keys` keeps the
+    /// verification-retained keys. Every OTHER check stays: the signature over the
+    /// environment's own keys, the algorithm allowlist, the exact issuer, the exact
+    /// audience, `nbf`, and `iat`. A hint signed by a FOREIGN issuer, or tampered, fails
+    /// the signature or issuer check and returns `Err(())`, so a logout never acts on an
+    /// unverifiable or foreign hint.
+    ///
+    /// # Errors
+    ///
+    /// `Err(())` if no signing key is provisioned for the scope's environment, or the
+    /// hint does not verify under the built policy (bad signature, wrong issuer or
+    /// audience, non-allowlisted algorithm, missing `exp`, future `nbf`/`iat`,
+    /// malformed).
     pub(crate) async fn verify_logout_hint(
         &self,
         scope: &Scope,

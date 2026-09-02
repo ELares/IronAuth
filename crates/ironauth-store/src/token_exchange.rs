@@ -46,6 +46,21 @@ pub enum ExchangeMode {
     /// The actor becomes indistinguishable from the subject. The actor is NOT recorded in the
     /// token, which is exactly why it is dangerous.
     Impersonation,
+    /// A Native SSO bootstrap (issue #133, PROTOTYPE): a sibling app on the same device trades
+    /// the family's ID token plus its device secret for its own tokens.
+    ///
+    /// Its OWN mode rather than one of the three above, and that is the point. By shape it
+    /// looks like an impersonation -- another client's token, no actor recorded -- so it would
+    /// otherwise be default-denied unless the operator set `token_exchange_impersonation_
+    /// allowed` on every sibling app. That flag is not scoped to this feature: once set, the
+    /// app may present ANY client's token for ANY subject. Making a device-secret bootstrap
+    /// require the broadest privilege in the exchange, in order to do something far narrower,
+    /// would be a worse trade than the feature is worth.
+    ///
+    /// What authorizes it instead is the DEVICE SECRET, which the caller verified against the
+    /// ID token's `ds_hash` before this mode can be constructed at all. This variant is
+    /// reachable only from that path.
+    NativeSsoBootstrap,
 }
 
 /// Why an exchange was refused.
@@ -136,6 +151,11 @@ pub fn decide_exchange(
 
     // Default deny. An operator turns this on per client; nothing about holding a valid token
     // implies it.
+    //
+    // `NativeSsoBootstrap` is deliberately NOT folded in here. It is impersonation-shaped, and
+    // routing it through this flag would mean arming a mobile SSO feature by granting every
+    // sibling app the right to present any client's token for any subject. Its authorization is
+    // the device secret, checked before the mode exists; see the variant's doc.
     if request.mode == ExchangeMode::Impersonation && !impersonation_allowed {
         return Err(ExchangeDenial::ImpersonationNotAllowed);
     }

@@ -28,11 +28,20 @@ everything after is checked against the row that redemption returned: the ID tok
 against the audience THAT ROW names, not one read out of the token, so the presenter cannot
 choose which audience its token is judged against. Then `ds_hash`, then the subject.
 
-**Revoking severs the SSO set.** The row hangs off the SIGN-IN rather than off the app that asked,
-so logging out revokes every live secret from that session in the same operation that revokes the
-session and its refresh families. That is not a detail: the ID token's `sid` is PER-CLIENT by
-design, so keying the secret on it would have severed only the app that happened to ask and left
-its siblings minting -- the criterion failing silently while the revocation appeared to succeed.
+**Ending the session severs the SSO set, by ANY route.** The row hangs off the SIGN-IN rather
+than off the app that asked, and redemption JOINS `sessions` and requires it live, so an admin
+revoke, a bulk revoke, a password change, a risk decision, global revocation and plain expiry all
+sever it. RP-initiated logout additionally sweeps the rows eagerly; that sweep is an optimisation
+and the join is the control, because a control remembered at six call sites is one that will be
+forgotten at the seventh. The row keys on the UNDERLYING session id and not the ID token's `sid`,
+which is per-client by design: keying on `sid` would have severed only the app that happened to
+ask while the revocation reported success.
+
+**It does not ride the impersonation flag.** By shape a bootstrap is an impersonation -- another
+client's token, no actor recorded -- so deriving that mode would have made a mobile SSO feature
+require `token_exchange_impersonation_allowed` on every sibling app, and that flag lets an app
+present ANY client's token for ANY subject. A bootstrap gets its own `ExchangeMode` instead,
+constructible only after the device secret matched the ID token's `ds_hash`.
 
 **Known limits, recorded in `docs/experimental/native-sso.md`:** the device secret is a BEARER
 credential and the draft's DPoP-binding question is open and unanswered here; nothing binds it to

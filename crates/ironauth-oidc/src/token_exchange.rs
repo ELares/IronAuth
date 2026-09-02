@@ -23,6 +23,13 @@
 //! whether the grant is still live (so a revoked token is dead even while its signature
 //! verifies), and verifies the signature and expiry against the token's own audience.
 //!
+//! ONE EXCEPTION, added by the Native SSO prototype (issue #133): its subject is an ID token
+//! rather than a stored access token, so `revalidate` would refuse it and it is verified
+//! CRYPTOGRAPHICALLY instead -- signature, this issuer, the ID-token media type, unexpired, and
+//! the audience taken from the STORED device-secret row rather than from the token. Its grant
+//! liveness is not re-checked; what stands in for that is the SESSION liveness the redemption
+//! join requires, so a token from an ended sign-in is refused just as a revoked one would be.
+//!
 //! That is a deliberate structural choice rather than a set of checks to remember. There
 //! is no field on this path that is read from an unverified payload, and no branch that
 //! skips a check because an earlier handler is believed to have run one.
@@ -90,6 +97,12 @@ struct ValidatedToken {
     audience: std::collections::BTreeSet<String>,
     /// The `act` chain it already carries, for nesting.
     act: Option<Value>,
+    /// Whether this subject came from a Native SSO redemption (issue #133, PROTOTYPE).
+    ///
+    /// Set ONLY by `native_sso_subject`, after the device secret was redeemed and matched the
+    /// ID token's `ds_hash`. It is what selects `ExchangeMode::NativeSsoBootstrap`, so it is
+    /// the carrier of that authorization and not a hint.
+    native_sso_bootstrap: bool,
 }
 
 /// Split a space-separated OAuth list into a set, dropping empties.
@@ -114,7 +127,15 @@ pub async fn token_exchange_grant(
     resources: &[String],
 ) -> Result<Response, TokenError> {
     // 1. The request has to be COHERENT before anything is authenticated.
-    let subject_token = check_request_shape(&params, state.native_sso_enabled())?;
+    // The Native SSO verdict is decided HERE, once, and carried. It used to be recomputed
+    // inside `native_sso_subject` from the raw parameters, and the two disagreed: `required()`
+    // TRIMS, so `subject_token_type` with a trailing space was a Native SSO pair to this check
+    // and an ordinary request to that one -- which admitted the ID token past the access-token
+    // rule and then handed it to `revalidated`, the one door this prototype must never open.
+    // A security predicate computed twice from two normalizations of the same input is two
+    // predicates.
+    let (subject_token, native_sso_pair) =
+        check_request_shape(&params, state.native_sso_enabled())?;
 
     // 2-3. Authenticate the client and run the shared grant-restriction seam.
     let (scope, authenticated, client_id) =
@@ -143,7 +164,8 @@ pub async fn token_exchange_grant(
     //    and would refuse one. It is still a full verification -- signature, this issuer, the
     //    ID-token media type, unexpired, and the audience taken from the STORED device-secret
     //    row rather than from the token -- and nothing below reads an unverified field either.
-    let (subject, actor) = revalidate_both(state, scope, &params, subject_token).await?;
+    let (subject, actor) =
+        revalidate_both(state, scope, &params, subject_token, native_sso_pair).await?;
 
     // 6. FENCE EVERY principal this exchange would give authority to (issue #52's
     //    invariant, and the mint registry in docs/design/USER-BOUND-MINT-SITES.md).
@@ -174,7 +196,13 @@ pub async fn token_exchange_grant(
     // 7. Derive the mode (see the module docs). Presenting a token that was issued to
     //    another client, without naming yourself as the actor, IS a request to
     //    impersonate, and it is default-denied below.
-    let mode = if actor.is_some() {
+    let mode = if subject.native_sso_bootstrap {
+        // Decided by the REDEMPTION, not derived from the token shapes. By shape a bootstrap is
+        // an impersonation -- another client's token, no actor -- and deriving that would make
+        // the feature require the impersonation flag on every sibling app. What authorized it
+        // is the device secret, already checked against the ID token's `ds_hash`.
+        ExchangeMode::NativeSsoBootstrap
+    } else if actor.is_some() {
         ExchangeMode::Delegation
     } else if subject.client_id.as_deref() == Some(client_id_str.as_str()) {
         ExchangeMode::Downscope
@@ -636,7 +664,10 @@ async fn authenticate_for_exchange(
 /// to trade) or a refresh token (already redeemable by its own grant, under its own
 /// rotation policy) from becoming a second, less-guarded path to what the first path
 /// controls.
-fn check_request_shape(params: &TokenParams, native_sso_armed: bool) -> Result<&str, TokenError> {
+fn check_request_shape(
+    params: &TokenParams,
+    native_sso_armed: bool,
+) -> Result<(&str, bool), TokenError> {
     let subject_token = required(params.subject_token.as_deref(), "subject_token is required")?;
     let subject_type = required(
         params.subject_token_type.as_deref(),
@@ -676,11 +707,11 @@ fn check_request_shape(params: &TokenParams, native_sso_armed: bool) -> Result<&
         // The Native SSO pair carries a DEVICE SECRET as its actor, which is the other half of
         // the same relaxation. Admitted only together with the ID-token subject above: the two
         // are checked as one condition, never independently.
-        (Some(_), Some(_)) if native_sso_pair => Ok(subject_token),
+        (Some(_), Some(_)) if native_sso_pair => Ok((subject_token, true)),
         (Some(_), Some(actor_type)) if actor_type != type_uri::ACCESS_TOKEN => Err(
             TokenError::InvalidRequest("actor_token_type must name an access token".to_owned()),
         ),
-        _ => Ok(subject_token),
+        _ => Ok((subject_token, native_sso_pair)),
     }
 }
 
@@ -742,6 +773,8 @@ async fn revalidated(
         scope: space_set(claims.scope.as_deref()),
         audience: claims.aud.into_iter().collect(),
         act: claims.act,
+        // An ordinary access-token subject. Only the Native SSO redemption sets this.
+        native_sso_bootstrap: false,
     })
 }
 
@@ -759,8 +792,11 @@ async fn revalidate_both(
     scope: Scope,
     params: &TokenParams,
     subject_token: &str,
+    native_sso_pair: bool,
 ) -> Result<(ValidatedToken, Option<ValidatedToken>), TokenError> {
-    if let Some(subject) = native_sso_subject(state, scope, params, subject_token).await? {
+    if let Some(subject) =
+        native_sso_subject(state, scope, params, subject_token, native_sso_pair).await?
+    {
         // The device secret IS the actor and it is not an exchangeable token, so there is no
         // second `ValidatedToken` here. Returning one would put the secret into the `act` chain.
         return Ok((subject, None));
@@ -802,14 +838,11 @@ async fn native_sso_subject(
     scope: Scope,
     params: &TokenParams,
     subject_token: &str,
+    native_sso_pair: bool,
 ) -> Result<Option<ValidatedToken>, TokenError> {
-    if !state.native_sso_enabled() {
-        return Ok(None);
-    }
-    let Some(subject_type) = params.subject_token_type.as_deref() else {
-        return Ok(None);
-    };
-    if !crate::native_sso::is_native_sso_pair(subject_type, params.actor_token_type.as_deref()) {
+    // The verdict is the one `check_request_shape` reached, PASSED IN rather than recomputed.
+    // See the call site for what recomputing it cost.
+    if !native_sso_pair {
         return Ok(None);
     }
     // From here the request IS a Native SSO attempt, so every exit is a refusal rather than a
@@ -837,8 +870,15 @@ async fn native_sso_subject(
         .map_err(|()| TokenError::InvalidGrant)?;
 
     crate::native_sso::admit(
-        subject_type,
-        params.actor_token_type.as_deref(),
+        // The verdict above already settled that this is a pair; `admit` re-checks it from the
+        // same parameters so the module stays usable on its own, and the two cannot disagree
+        // because both read the value `check_request_shape` accepted.
+        params
+            .subject_token_type
+            .as_deref()
+            .unwrap_or_default()
+            .trim(),
+        params.actor_token_type.as_deref().map(str::trim),
         verified
             .claims()
             .get(crate::native_sso::DS_HASH_CLAIM)
@@ -864,14 +904,20 @@ async fn native_sso_subject(
 
     Ok(Some(ValidatedToken {
         subject: record.subject,
-        // The client the ID token was issued to, which is what makes this a DELEGATION to the
-        // presenting sibling rather than a downscope of its own token.
-        client_id: Some(record.issued_to_client_id),
-        // A Native SSO bootstrap carries no scope of its own: the sibling asks for what it
-        // needs and the ordinary scope policy decides, exactly as it would for any exchange.
-        scope: std::collections::BTreeSet::new(),
-        audience: std::collections::BTreeSet::new(),
+        // The client the ID token was actually issued to. Recorded truthfully; it does NOT
+        // decide the mode here, because `native_sso_bootstrap` does.
+        client_id: Some(record.issued_to_client_id.clone()),
+        // What the ORIGINAL sign-in was granted, minus `device_sso` itself, so the sibling
+        // narrows from what the person actually authorized and cannot mint a further device
+        // secret from a bootstrap. An empty set here would be refused outright by `decide`
+        // ("nothing to narrow from"), which is what made the first version of this unreachable.
+        scope: crate::native_sso::inheritable_scope(&record.granted_scope),
+        // The audience the ID token was for. Left empty, `decide` returns an empty audience and
+        // `issue` OVERWRITES the resolved default with it, minting a token with no `aud` at all
+        // -- unbounded for any resource server that does not enforce one.
+        audience: std::iter::once(record.issued_to_client_id.clone()).collect(),
         act: None,
+        native_sso_bootstrap: true,
     }))
 }
 
@@ -988,6 +1034,7 @@ fn mode_label(mode: ExchangeMode) -> &'static str {
         ExchangeMode::Downscope => "downscope",
         ExchangeMode::Delegation => "delegation",
         ExchangeMode::Impersonation => "impersonation",
+        ExchangeMode::NativeSsoBootstrap => "native_sso_bootstrap",
     }
 }
 
