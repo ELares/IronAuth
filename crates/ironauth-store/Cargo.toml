@@ -982,3 +982,4 @@ required-features = ["testing"]
 [[test]]
 name = "scim_connections"
 path = "tests/scim_connections.rs"
+required-features = ["testing"]
