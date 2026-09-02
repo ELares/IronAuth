@@ -61,16 +61,14 @@ async fn seed_agent(harness: &Harness, client: &ClientId, tool_scopes: &[&str]) 
     }
 }
 
-/// Move a seeded agent to `state`, as the control plane would.
+/// Move a seeded agent to `state`, through the SHARED harness helper.
+///
+/// A thin wrapper rather than a second copy. This file had its own `set_state` doing a raw
+/// `UPDATE agents SET state = $1`, and the harness had an identical one: two copies of the same
+/// false "as the control plane would" comment, one file apart. The cascade test below was red
+/// against both. One implementation now, in `common/mod.rs`, which is where the reasoning lives.
 async fn set_state(harness: &Harness, id: &AgentPrincipalId, state: &str) {
-    sqlx::query(
-        "UPDATE agents /* query-audit-allow: owner test seed */ SET state = $1 WHERE id = $2",
-    )
-    .bind(state)
-    .bind(id.to_string())
-    .execute(harness.db().owner_pool())
-    .await
-    .expect("set agent state");
+    harness.set_agent_state(id, state).await;
 }
 
 /// Every audit action recorded in the harness scope, with its detail.

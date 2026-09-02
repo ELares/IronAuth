@@ -2562,17 +2562,62 @@ impl Harness {
         (id, linked.to_string(), organization.to_string())
     }
 
-    /// Move a seeded agent to `state`, as the control plane would.
+    /// Move a seeded agent to `state`, through the repository as the control plane does.
+    ///
+    /// # Why this is not a raw UPDATE, and why that mattered
+    ///
+    /// It used to be `UPDATE agents SET state = $1` against the owner pool, under this same
+    /// "as the control plane would" comment. That comment was false in the one way that
+    /// matters: `ActingAgentRepo::set_state` revokes the agent's outstanding GRANTS in the same
+    /// transaction as the state change, and a raw column write cannot cascade. A test in
+    /// `agent_issuance.rs` asserting that cascade was red on main for exactly this reason, and
+    /// its own failure message was a description of the helper rather than of a bug.
+    ///
+    /// Two copies of this helper existed, one file apart, with the same false comment. Fixing
+    /// only the one under the red test would have left the other -- the one a future author
+    /// reaches for by name -- still promising a cascade it did not perform.
+    ///
+    /// # The attribution is the agent's own
+    ///
+    /// `in_organization` and `about_subject` are read off the agent record rather than passed
+    /// in, so a caller cannot attribute the change to the wrong organization. `docs/agents.md`
+    /// requires every agent audit row to name both, and `agents.rs` records that omitting them
+    /// on this exact call was a shipped defect once already.
+    ///
+    /// The DOMAIN EVENT is still `None`, unlike the real caller, which passes an
+    /// `agent.state_changed` envelope. That is a deliberate remaining gap rather than an
+    /// oversight: building the envelope needs `ironauth-admin`'s event machinery, which this
+    /// harness does not depend on, and no test anywhere currently drives that event.
     pub async fn set_agent_state(&self, id: &ironauth_store::AgentPrincipalId, state: &str) {
-        sqlx::query(
-            "UPDATE agents /* query-audit-allow: owner test write */ SET state = $1 \
-             WHERE id = $2",
+        let record = self
+            .store()
+            .scoped(self.scope())
+            .agents()
+            .get(id)
+            .await
+            .expect("the agent exists");
+        let env = self.env().clone();
+        let now = i64::try_from(
+            env.clock()
+                .now_utc()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after epoch")
+                .as_micros(),
         )
-        .bind(state)
-        .bind(id.to_string())
-        .execute(self.db.owner_pool())
-        .await
-        .expect("set the agent state");
+        .expect("fits i64");
+        self.db
+            .control_store()
+            .scoped(self.scope())
+            .acting(
+                self.db.test_actor(&env),
+                ironauth_store::CorrelationId::generate(&env),
+            )
+            .in_organization(record.organization_id)
+            .about_subject(record.linked_user_id)
+            .agents()
+            .set_state(&env, id, state, now, None)
+            .await
+            .expect("set the agent state");
     }
 
     /// Record `subject`'s consent to `client_id` in the harness scope for the broad
