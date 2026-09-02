@@ -77,7 +77,10 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      declarative claim mappings, claim mappings data plane read, claim mapping delete grant, token hooks, token hooks delete grant, token hook failure policy, token hook versions, \
      token hook component bound, token hook ordering, token hook named identity, \
      token hook secrets, token hook fetch budget, challenge components, aot artifacts, \
-     session token templates, session jwt mode, audit entry path.";
+     session token templates, session jwt mode, audit entry path, agents, \
+     agent client binding, agent token vault, agent vault approvals, audit subject, \
+     agent vault refresh, native SSO device secrets, SCIM connections, \
+     SCIM external ids, SCIM group push, data plane column scopes.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -708,7 +711,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        175,
+        186,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -748,7 +751,8 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
-            160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175
+            160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
+            177, 178, 179, 180, 181, 182, 183, 184, 185, 186
         ]
     );
     let phase_of = |version: i64| async move {
@@ -5447,30 +5451,58 @@ async fn org_groups_carries_its_isolation_indexes_and_least_privilege_grants() {
             "{role} must NOT hold DELETE on org_groups (deletion is a soft delete)"
         );
     }
-    // The data plane is READ ONLY on groups: the ancestor walk that resolves
-    // effective roles at token issuance runs there, and nothing on that plane ever
-    // writes a group.
+    // THE DATA PLANE IS NO LONGER READ ONLY ON GROUPS, and this block used to say it was.
+    //
+    // Migration 0185 gave it INSERT and a column-scoped UPDATE because SCIM group push is
+    // mounted on the PUBLIC plane: an identity provider creating a group through
+    // `/scim/v2/Groups` is a data-plane write by construction, so "nothing on that plane ever
+    // writes a group" stopped being true the day that surface shipped. This block did not
+    // move with it and was RED on main.
+    //
+    // What is asserted instead is the shape 0185 actually granted, in BOTH directions, so
+    // neither a widening nor a narrowing passes. The teeth are the two columns that are NOT
+    // in it.
     assert!(
         role_has_table_privilege(pool, "ironauth_app", "org_groups", "SELECT").await,
         "the data-plane role must hold SELECT on org_groups (the ancestor walk)"
     );
-    for privilege in ["INSERT", "UPDATE"] {
-        assert!(
-            !role_has_table_privilege(pool, "ironauth_app", "org_groups", privilege).await,
-            "the data-plane grant on org_groups must be SELECT only (no {privilege})"
+    assert!(
+        role_has_table_privilege(pool, "ironauth_app", "org_groups", "INSERT").await,
+        "the data plane must hold INSERT on org_groups (SCIM group push creates groups)"
+    );
+    // Never TABLE-WIDE, whatever else it holds: that is the issue #31 lesson, and it is the
+    // difference between "the data plane may rename a group" and "the data plane may rewrite
+    // any column this table comes to have".
+    assert!(
+        !role_has_table_privilege(pool, "ironauth_app", "org_groups", "UPDATE").await,
+        "the data-plane UPDATE on org_groups must never be table-wide"
+    );
+    for (column, granted) in [
+        // The label a SCIM rename moves, and the JSON blob the shared UPDATE statement always
+        // names even when it changes nothing.
+        ("display_name", true),
+        ("metadata", true),
+        ("updated_at", true),
+        ("deleted_at", true),
+        // THE TWO THAT ARE NOT GRANTED, and the reason this block still has teeth. `slug` is
+        // the stable name a token claim carries, so a data plane that could move it could
+        // move what a claim means. `parent_id` decides ancestry, and a data plane that could
+        // reparent a group could graft it under a role-bearing ancestor and inherit its roles.
+        ("slug", false),
+        ("parent_id", false),
+    ] {
+        assert_eq!(
+            role_has_column_privilege(pool, "ironauth_app", "org_groups", column, "UPDATE").await,
+            granted,
+            "the data plane's UPDATE on org_groups.{column} must be present exactly when \
+             migration 0185 grants it"
         );
     }
-    // The table-wide probes above cannot see a COLUMN-scoped grant, which is a real
-    // way for the data plane to gain a write while every one of them stays green.
-    // Sweeping every column closes that, so "nothing on the data plane writes a
-    // group" is a physical property of the schema rather than a claim about which
-    // code paths happen to exist today.
-    for privilege in ["INSERT", "UPDATE", "REFERENCES"] {
-        assert!(
-            !role_has_any_column_privilege(pool, "ironauth_app", "org_groups", privilege).await,
-            "the data plane must hold NO column-scoped {privilege} on org_groups"
-        );
-    }
+    // It still creates no foreign-key reference of its own.
+    assert!(
+        !role_has_any_column_privilege(pool, "ironauth_app", "org_groups", "REFERENCES").await,
+        "the data plane must hold NO column-scoped REFERENCES on org_groups"
+    );
     // Positive controls, so a sweep that answered "no" to everything could not pass.
     assert!(
         role_has_any_column_privilege(pool, "ironauth_app", "org_groups", "SELECT").await,
@@ -5869,16 +5901,27 @@ async fn the_org_join_tables_carry_their_isolation_indexes_and_least_privilege_g
         // table-wide probe cannot see a COLUMN-scoped grant, which is a real way for
         // the data plane to gain a write while every table-wide assertion stays
         // green, so every column is swept too.
-        for privilege in ["INSERT", "REFERENCES"] {
-            assert!(
-                !role_has_table_privilege(pool, "ironauth_app", table, privilege).await,
-                "the data plane must hold no {privilege} on {table}"
-            );
-            assert!(
-                !role_has_any_column_privilege(pool, "ironauth_app", table, privilege).await,
-                "the data plane must hold NO column-scoped {privilege} on {table}"
-            );
-        }
+        // It REPOINTS a row on none of them, and CREATES one on exactly the table SCIM group
+        // push binds through. Migration 0185 granted `org_group_members` INSERT for that
+        // surface, which is mounted on the PUBLIC plane, so this loop's blanket "no INSERT on
+        // any of the three" was false the day it shipped and was RED on main. It is asserted
+        // per table now, in both directions, so a fourth table quietly gaining INSERT still
+        // fails here.
+        let data_plane_may_bind = table == "org_group_members";
+        assert_eq!(
+            role_has_table_privilege(pool, "ironauth_app", table, "INSERT").await,
+            data_plane_may_bind,
+            "the data plane's INSERT on {table} must be present exactly when a public-plane \
+             surface creates a row in it"
+        );
+        assert!(
+            !role_has_table_privilege(pool, "ironauth_app", table, "REFERENCES").await,
+            "the data plane must hold no REFERENCES on {table}"
+        );
+        assert!(
+            !role_has_any_column_privilege(pool, "ironauth_app", table, "REFERENCES").await,
+            "the data plane must hold NO column-scoped REFERENCES on {table}"
+        );
         // UPDATE is where the three tables deliberately DIFFER, and the asymmetry is
         // the security statement. The invitation-accept side effect runs on the DATA
         // plane and REVIVES a previously removed membership, which must come back
