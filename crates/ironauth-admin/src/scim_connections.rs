@@ -44,9 +44,7 @@ use crate::auth::{ManagementPermission, Principal};
 use crate::error::ApiError;
 use crate::idempotency;
 use crate::input::{parse_json, require_non_empty};
-use crate::org_context::{
-    EnvironmentAccess, require_present_environment, resolve_live_org, resolve_scope,
-};
+use crate::org_context::{EnvironmentAccess, resolve_live_org, resolve_scope};
 use crate::pagination::{ListQuery, Pagination};
 use crate::response::{json, no_content};
 use crate::state::AdminState;
@@ -327,6 +325,30 @@ pub async fn create_scim_connection(
     let request: CreateScimConnectionRequest = parse_json(&body)?;
     let (display_name, expires_micros) = validated_create(&request, state.now_unix_micros())?;
 
+    // AND THE ORGANIZATION MUST BE ACTIVE, not merely undeleted. `resolve_live_org` fences on
+    // `deleted_at` and says nothing about `state`, while `ScimConnectionRepo::authenticate`
+    // requires `o.state = 'active'`. Minting into a DISABLED organization therefore answered
+    // 201 with a token that authenticated `false` from its very first request -- exactly the
+    // shape `validated_create` refuses on the expiry axis, on the other axis. Measured by a
+    // reviewer: disable, mint (201, token), present it (401), enable, present it (200).
+    //
+    // Refused rather than allowed-and-dormant because the alternative reads the same to the
+    // operator as a broken credential, and there is nothing at the point of failure that could
+    // tell them which it was.
+    let organization = state
+        .store()
+        .management()
+        .organizations(scope)
+        .get(&org_id)
+        .await?;
+    if organization.state != ironauth_store::OrganizationState::Active {
+        return Err(ApiError::Conflict(
+            "organization_disabled: a disabled organization cannot mint a provisioning \
+             credential, because the credential would not authenticate"
+                .to_owned(),
+        ));
+    }
+
     // MINTED THROUGH THE SCIM CRATE, not reimplemented here. `mint_token` and `digest_of` are
     // the format the verifier uses, so a second copy of `{scim_id}.{secret}` in this crate
     // would be two definitions of a credential that must agree byte for byte -- and they would
@@ -452,18 +474,21 @@ pub async fn revoke_scim_connection(
     principal.require_permission(ManagementPermission::WriteCredentials)?;
     crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
     // PRESENT, NOT LIVE, and this is the one route on this surface where the difference
-    // matters. A revoke DESTROYS a capability, and `authenticate` joins only `organizations`:
-    // soft-deleting an ENVIRONMENT cascades to neither the organization's `deleted_at` nor its
-    // state, so a minted token goes on provisioning after the environment is decommissioned.
-    // Under `EnvironmentAccess::Write` the revoke then answered the uniform not-found while
-    // the listing beside it still showed the connection live -- the management API telling an
-    // operator, in the same breath, that a credential exists and that it does not.
+    // matters. A revoke DESTROYS a capability, so it must keep working after the environment
+    // is soft-deleted: the row survives the deletion, and an environment that is later
+    // restored must not resurrect a credential the operator killed. Requiring liveness to
+    // DISARM turns a soft delete into a one-way door, which is the rule `org_context.rs`
+    // states and issue #250 measured on the outbound-verification credential.
     //
-    // `org_context.rs` names this shape and the rule for it: requiring liveness to DISARM
-    // turns a soft delete into a one-way door. Issue #250 measured the same state on the
-    // outbound-verification credential; this is that lesson applied to the strongest
-    // credential this surface issues.
-    require_present_environment(&state, &scope).await?;
+    // THE PRESENCE HALF IS `resolve_scope`, above, and nothing else. It asks
+    // `exists_in_any_state` under the bootstrap operator, which is the addressability check
+    // its own comment describes, so an environment that never existed is already the uniform
+    // not-found by the time control reaches here. An earlier version of this called
+    // `require_present_environment` as well and three comments claimed that call was what made
+    // the relaxation "present rather than unchecked". It was not: it is the SAME query with
+    // the same arguments two lines later, and a review measured that deleting it left all 80
+    // admin test binaries green. A guard that cannot fail is not a guard, and a second
+    // round trip per revoke was its only effect.
     let org_id = resolve_live_org(
         &state,
         &principal,

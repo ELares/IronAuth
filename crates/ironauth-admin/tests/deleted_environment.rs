@@ -1514,11 +1514,10 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
         // would turn the soft delete into a one-way door on the strongest credential this
         // surface issues, with no remedy short of a direct database write.
         //
-        // It still requires the environment to EXIST, which is the difference between
-        // `require_present_environment` and no check at all;
-        // `absent_environment.rs` drives the same route and requires the uniform not-found
-        // there, and `scim_connections.rs::a_connection_is_still_revokable_after_its_
-        // environment_is_decommissioned` drives both halves against a live token.
+        // It still requires the environment to EXIST, and `resolve_scope` is what provides
+        // that: its `exists_in_any_state` read runs before any of this. `absent_environment.rs`
+        // drives the same route at an environment that was never created and requires the
+        // uniform not-found, which is the test that would fail if that read were removed.
         //
         // This is the one exempted write here that LANDS A ROW CHANGE, which is the whole
         // point of it, so it is also the one entry in [`documented_write_row_effects`].
