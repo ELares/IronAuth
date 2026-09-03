@@ -356,16 +356,23 @@ pub(crate) async fn create_user(
             return response;
         }
     }
-    // A create REPLACES: there is nothing stored for a fresh person, and a re-admit must not
-    // inherit what a previous membership left behind.
-    if let Err(response) = store_enterprise_attributes(
-        &state,
-        &auth,
-        &user_id,
-        &enterprise,
-        EnterpriseWrite::Replace,
-    )
-    .await
+    // A create REPLACES, and only when the body carried an extension.
+    //
+    // The `Replace` is for the RE-ADMIT path: a person this organization once held may have a
+    // document from before, and a create must not leave them inheriting it. The emptiness guard
+    // is because a fresh person has nothing to replace -- and writing an empty row anyway was
+    // not merely wasteful, it made the upsert's INSERT branch UNREACHABLE, so the remove-key
+    // expression in that branch was covered by nothing. A review found the branch untested, and
+    // the test I first wrote for it did not reach it either, for exactly this reason.
+    if !enterprise.is_empty()
+        && let Err(response) = store_enterprise_attributes(
+            &state,
+            &auth,
+            &user_id,
+            &enterprise,
+            EnterpriseWrite::Replace,
+        )
+        .await
     {
         return response;
     }
@@ -447,6 +454,21 @@ fn enterprise_change(op: &str, value: &Value) -> Result<Change, Response> {
             "the Enterprise User extension must be an object",
         ));
     };
+    // AN UNKNOWN EXTENSION ATTRIBUTE IS REFUSED, while an unknown CORE member of the same
+    // no-path object is ignored. A review flagged the asymmetry against the policy stated ten
+    // lines below ("failing would make every ordinary update a 400"), and the two are different
+    // for a reason worth writing down rather than reconciling by making one match the other.
+    //
+    // The CORE schema is a SUPERSET of what this surface stores -- `displayName`, `emails` and
+    // `name` are published and unparsed, deliberately, so a client sending a whole resource
+    // carries members this server has no opinion on. Ignoring them is what lets Okta's no-path
+    // dialect work at all.
+    //
+    // The EXTENSION's vocabulary is CLOSED by RFC 7643 section 4.3 and this server publishes all
+    // seven, so an attribute outside it is not "something we do not implement", it is a name
+    // that is not in the specification. Accepting and dropping it is the defect this whole
+    // change exists to close, and it would close it on the create door while leaving it open on
+    // this one.
     let mut traits = serde_json::Map::new();
     for (attribute, extension_value) in extension {
         let lowered = attribute.to_ascii_lowercase();
@@ -704,7 +726,7 @@ async fn restore_membership(
 
 /// Store this connection's Enterprise User attributes for a person.
 ///
-/// PER CONNECTION, in `scim_enterprise_attributes` (migration 0187), not as identity traits. A
+/// PER ORGANIZATION, in `scim_enterprise_attributes` (migration 0187), not as identity traits. A
 /// review measured the trait storage with two organizations holding one person: Globex's token
 /// read back Acme's `employeeNumber` and then overwrote Acme's `department`. Traits live on the
 /// `users` row and are environment wide; an employee number is the number that person has at

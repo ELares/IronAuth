@@ -17,6 +17,8 @@
 use ironauth_store::identifier::{CanonicalIdentifier, IdentifierType, canonicalize_identifier};
 use serde::Deserialize;
 
+use crate::schema::ENTERPRISE_USER_SCHEMA;
+
 /// A SCIM 2.0 core user resource, as far as identity mapping reads it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScimUser {
@@ -42,11 +44,17 @@ pub struct ScimUser {
     /// Held as a raw map rather than a struct of the three attributes RFC 7643 names. A struct
     /// would silently drop a fourth, and [`ScimUser::enterprise_traits`] is where the set this
     /// server stores is decided, in one place, rather than by what a type happened to declare.
-    #[serde(
-        rename = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
-        default
-    )]
-    pub enterprise: Option<serde_json::Map<String, serde_json::Value>>,
+    /// CASE-INSENSITIVE on the URN, which a serde `rename` is not. RFC 7643 section 2.1 makes
+    /// attribute names case-insensitive and the URN is how the extension is named; both PATCH
+    /// doors already compared it that way, and a review measured the third door disagreeing:
+    /// a create carrying `...enterprise:2.0:user` -- only the final `User` lower-cased --
+    /// answered 201 with the extension SILENTLY DROPPED. That is the advertise-then-drop shape
+    /// this whole change closes, reintroduced one level up at the URN.
+    ///
+    /// Captured as a flattened map of everything the resource carries, and resolved by
+    /// [`ScimUser::enterprise_traits`], because serde has no case-insensitive `rename`.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_active() -> bool {
@@ -133,6 +141,18 @@ impl ScimUser {
         canonicalize_identifier(kind, &self.user_name)
     }
 
+    /// The Enterprise User extension object this resource carries, found case-insensitively.
+    ///
+    /// One place that knows how the URN is matched, so the create door and the two PATCH doors
+    /// cannot disagree about it again.
+    #[must_use]
+    pub fn enterprise(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.extra
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(ENTERPRISE_USER_SCHEMA))
+            .and_then(|(_, value)| value.as_object())
+    }
+
     /// The extension attributes to store, with their SCIM names preserved.
     ///
     /// Returns `Err` naming the first attribute this server does not store. Refusing rather
@@ -148,7 +168,7 @@ impl ScimUser {
         reason = "the Errors section is immediately above"
     )]
     pub fn enterprise_traits(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-        let Some(extension) = self.enterprise.as_ref() else {
+        let Some(extension) = self.enterprise() else {
             return Ok(serde_json::Map::new());
         };
         let mut traits = serde_json::Map::new();
@@ -188,7 +208,7 @@ mod tests {
 
     fn scim(user_name: &str) -> ScimUser {
         ScimUser {
-            enterprise: None,
+            extra: serde_json::Map::new(),
             user_name: user_name.to_owned(),
             external_id: None,
             active: true,

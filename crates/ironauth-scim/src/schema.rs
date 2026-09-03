@@ -206,12 +206,12 @@ mod tests {
             user_name: _,
             external_id: _,
             active: _,
-            enterprise: _,
+            extra: _,
         } = crate::resource::ScimUser {
             user_name: String::new(),
             external_id: None,
             active: true,
-            enterprise: None,
+            extra: serde_json::Map::new(),
         };
         assert_eq!(
             modelled.len(),

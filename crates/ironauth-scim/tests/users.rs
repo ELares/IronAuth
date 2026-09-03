@@ -3462,3 +3462,178 @@ async fn a_valueless_or_wrong_typed_enterprise_operation_is_refused() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
 }
+
+/// A `remove` against a person with NO stored document is a no-op, not a stored null.
+///
+/// The upsert's INSERT branch and its DO-UPDATE branch each carry `- $7::text[]`, and only the
+/// second was driven: both halves of `remove_clears_an_enterprise_attribute_in_both_dialects`
+/// create the document first. A review measured the INSERT branch's copy surviving deletion,
+/// and the mutant stores `{"department": null}` and adds the extension URN to `schemas` -- a
+/// resource carrying an attribute the client asked to remove, with a null value RFC 7643
+/// section 2.5 forbids.
+#[tokio::test]
+async fn a_remove_against_a_person_with_no_document_stores_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    // NO extension on the create, so the remove below hits the INSERT branch.
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "nodoc@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "remove",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let parsed: Value = serde_json::from_str(&patched).expect("json");
+    assert!(
+        parsed
+            .get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User")
+            .is_none(),
+        "a remove with nothing stored must leave no extension: {patched}"
+    );
+    assert!(
+        !parsed["schemas"]
+            .as_array()
+            .expect("schemas")
+            .iter()
+            .any(|urn| urn.as_str()
+                == Some("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User")),
+        "and must not declare the extension schema: {patched}"
+    );
+}
+
+/// The extension URN is matched CASE-INSENSITIVELY at every door.
+///
+/// RFC 7643 section 2.1 makes attribute names case-insensitive, and the URN is how the extension
+/// is named. Both PATCH doors compared it that way and the create door did not -- a serde
+/// `rename` is exact bytes -- so a review measured a create carrying
+/// `...enterprise:2.0:user` answering 201 with the extension SILENTLY DROPPED, while the same
+/// spelling through a PATCH wrote it. Three doors, two answers.
+#[tokio::test]
+async fn the_extension_urn_is_matched_case_insensitively_at_every_door() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    // Only the final `User` lower-cased, which is the spelling that was dropped.
+    let odd_urn = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:user";
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "oddurn@example.com",
+            "active": true,
+            odd_urn: { "employeeNumber": "701" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    // ANSWERED UNDER THE CANONICAL URN, because that is what the document publishes and what a
+    // client dispatches on.
+    assert_eq!(
+        serde_json::from_str::<Value>(&created).expect("json")
+            ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["employeeNumber"]
+            .as_str(),
+        Some("701"),
+        "a create must match the extension URN case-insensitively: {created}"
+    );
+}
+
+/// An `add` that names a null sub-attribute stores nothing for it.
+///
+/// The null-means-remove convention is computed from the top-level members, which cannot see one
+/// level down -- and `add` is the only mode that reaches there. A review measured
+/// `{"op":"add","path":"...:manager","value":{"displayName":null}}` storing and then RENDERING
+/// `"displayName": null`, which RFC 7643 section 2.5 forbids and which a client round-tripping
+/// the resource sends back as a null it never wrote.
+#[tokio::test]
+async fn an_add_naming_a_null_sub_attribute_stores_nothing_for_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "nullsub@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "manager": { "value": "boss", "displayName": "Boss One" },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "add",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:manager",
+                "value": { "displayName": null },
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let manager = serde_json::from_str::<Value>(&patched).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["manager"]
+        .clone();
+    assert!(
+        manager.get("displayName").is_none(),
+        "a null sub-attribute must be removed, not stored: {patched}"
+    );
+    // AND THE SIBLING SURVIVED, so the null cleared one sub-attribute rather than the value.
+    assert_eq!(manager["value"].as_str(), Some("boss"), "{patched}");
+}

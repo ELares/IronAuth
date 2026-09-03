@@ -1,6 +1,7 @@
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 --
--- 0187: the SCIM Enterprise User extension attributes, per CONNECTION (issue #135, criterion 2).
+-- 0187: the SCIM Enterprise User extension attributes, per ORGANIZATION (issue #135,
+-- criterion 2).
 --
 -- RFC 7643 section 4.3 defines seven attributes an identity provider sends alongside a user:
 -- `employeeNumber`, `costCenter`, `organization`, `division`, `department`, `employeeType` and

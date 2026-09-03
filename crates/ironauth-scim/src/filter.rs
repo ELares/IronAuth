@@ -709,11 +709,14 @@ pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
 /// prefix of every SCIM schema URN and names no member of any resource -- harmless today and a
 /// trap the moment a resource carries one.
 ///
-/// DETERMINISTIC when two extensions carry one attribute name. `serde_json::Map` iterates in
-/// insertion order by default and in sorted order under `preserve_order`, and neither is a
-/// property a caller should have to know; the lowest URN wins, so the answer does not depend on
-/// how the document was built. One extension is the only case that exists today, and a rule
-/// that only works for one case is how the second one becomes a bug.
+/// DETERMINISTIC when two extensions carry one attribute name: the LOWEST URN wins.
+///
+/// `serde_json::Map` is a `BTreeMap` by default -- already sorted -- and an `IndexMap` under
+/// the `preserve_order` feature, which iterates in insertion order. This crate does not enable
+/// it (verified in `Cargo.lock`), so the sort below is redundant TODAY and is the whole rule
+/// the day somebody enables that feature for an unrelated reason. An earlier version of this
+/// paragraph stated the two backwards, which made the accompanying test build one map twice and
+/// prove nothing; the sort is kept and the reason is now the true one.
 ///
 /// Case-insensitively on the attribute name, like every other lookup here.
 fn extension_member<'a>(
@@ -900,20 +903,21 @@ mod extension_lookup_tests {
         // document was built in.
         let lower = "urn:ietf:params:scim:schemas:extension:aaa:2.0:User";
         let higher = "urn:ietf:params:scim:schemas:extension:zzz:2.0:User";
-        for order in [[lower, higher], [higher, lower]] {
-            let mut object = serde_json::Map::new();
-            for urn in order {
-                object.insert(
-                    (*urn).to_owned(),
-                    serde_json::json!({ "employeeNumber": urn }),
-                );
-            }
-            assert_eq!(
-                attribute_values(&serde_json::Value::Object(object), &path),
-                vec![&serde_json::json!(lower)],
-                "two extensions carrying one attribute must resolve deterministically"
+        // ONE map, asserted directly. Building it twice in two insertion orders was the first
+        // shape of this test and it proved nothing: `serde_json::Map` is a `BTreeMap` here, so
+        // both orders produce the identical map and the loop could not observe what it named.
+        let mut object = serde_json::Map::new();
+        for urn in [higher, lower] {
+            object.insert(
+                (*urn).to_owned(),
+                serde_json::json!({ "employeeNumber": urn }),
             );
         }
+        assert_eq!(
+            attribute_values(&serde_json::Value::Object(object), &path),
+            vec![&serde_json::json!(lower)],
+            "two extensions carrying one attribute must resolve to the lowest URN"
+        );
     }
 }
 

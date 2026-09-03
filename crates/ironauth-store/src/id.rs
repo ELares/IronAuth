@@ -2095,10 +2095,11 @@ pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
 pub type ScimExternalIdId = ScopedId<ScimExternalIdKind>;
 /// A SCIM Enterprise User attribute document identifier (`sent_...`), issue #135.
 ///
-/// One per (connection, user): the extension attributes ONE identity provider sent about one
-/// person. Per connection rather than per person because an employee number is the number that
-/// person has at that organization, and two organizations provisioning one human legitimately
-/// have different ones.
+/// One per (organization, user): the extension attributes an organization holds about a person.
+/// Per organization rather than per person because an employee number is the number that person
+/// has AT THAT ORGANIZATION, and two organizations provisioning one human legitimately have
+/// different ones -- and not per CONNECTION, because a token rotation must create a new
+/// connection row and would otherwise strand everything the old one wrote.
 pub type ScimEnterpriseId = ScopedId<ScimEnterpriseKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.

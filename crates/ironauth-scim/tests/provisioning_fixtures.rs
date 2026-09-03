@@ -34,7 +34,7 @@
 //! An `expect_status` of 400 is a STATED GAP, not a pass -- and `entra_enterprise_user` was
 //! the one that carried it, recording that the enterprise extension was published in the schema
 //! document and not parsed onto the resource. It expects 200 now: the extension is parsed and
-//! stored per connection (migration 0187).
+//! stored per organization (migration 0187).
 //!
 //! Worth keeping in view, because a review caught it: the fixture NAMED FOR the extension was
 //! asserting the extension was refused, and the suite passed. A criterion can stay unmet

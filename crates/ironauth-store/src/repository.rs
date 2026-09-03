@@ -75090,8 +75090,8 @@ impl ScimEnterpriseRepo<'_> {
     /// expressed in SQL, so two concurrent writers both land: Postgres serializes them on the
     /// unique index under READ COMMITTED and the second sees the first's row. The trait storage
     /// this replaces read in one transaction and wrote in another, and a review measured six
-    /// concurrent writes answering 200 with five of them lost. Re-measured at twelve writers
-    /// after this change: every value landed.
+    /// concurrent writes answering 200 with five of them lost. Re-measured after this change:
+    /// every value landed.
     ///
     /// `mode` is what SCIM's three verbs mean, and they are genuinely three:
     ///
@@ -75110,6 +75110,15 @@ impl ScimEnterpriseRepo<'_> {
     /// In every mode a key whose incoming value is JSON `null` is REMOVED. That is what
     /// `{"op":"remove"}` means here, and it is the only way a `PUT` can clear one named
     /// attribute while keeping the others.
+    ///
+    /// SUB-ATTRIBUTES TOO, under [`EnterpriseWrite::Add`]. The top-level removal is computed in
+    /// Rust from the incoming map, which cannot see one level down -- and `Add` is the only mode
+    /// that reaches there. A review measured
+    /// `{"op":"add","path":"...:manager","value":{"displayName":null}}` storing and then
+    /// RENDERING `"displayName": null`, which RFC 7643 section 2.5 forbids ("unassigned
+    /// attributes SHALL NOT be present") and which a client round-tripping the resource sends
+    /// back as a null it never wrote. The deep merge drops null sub-attributes in the same
+    /// expression.
     ///
     /// # Errors
     ///
@@ -75154,7 +75163,12 @@ impl ScimEnterpriseRepo<'_> {
                            CASE WHEN jsonb_typeof(value) = 'object' \
                                  AND jsonb_typeof(scim_enterprise_attributes.attributes -> key) \
                                      = 'object' \
-                                THEN (scim_enterprise_attributes.attributes -> key) || value \
+                                THEN (SELECT COALESCE( \
+                                        jsonb_object_agg(sub_key, sub_value), '{}'::jsonb) \
+                                      FROM jsonb_each( \
+                                        (scim_enterprise_attributes.attributes -> key) || value \
+                                      ) AS merged_sub(sub_key, sub_value) \
+                                      WHERE jsonb_typeof(sub_value) <> 'null') \
                                 ELSE value END AS value \
                     FROM jsonb_each(scim_enterprise_attributes.attributes || EXCLUDED.attributes) \
                   ) AS merged)"
