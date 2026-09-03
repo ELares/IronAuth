@@ -95,10 +95,15 @@ jobs:
           # The floor is the count the freshness gate reports, not a token 2: a floor of 2
           # tolerates the walk silently dropping six of the eight crates, which is most of the
           # way back to finding nothing.
+          #
+          # AND IT HAS TO MOVE WITH THE TREE. `found` and `expected` come from the same `find`,
+          # so they can never disagree: the literal below is the job's only real backstop, and
+          # it went slack the moment ironauth-saml/fuzz was added and it still said 8. Adding a
+          # fuzz crate means raising this line in the same commit.
           expected="$(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
                             -not -path '*/target/*' | wc -l | tr -d ' ')"
-          if [ "$found" -ne "$expected" ] || [ "$found" -lt 8 ]; then
-            echo "walked $found fuzz crates, expected at least 8 (found $expected)" >&2
+          if [ "$found" -ne "$expected" ] || [ "$found" -lt 9 ]; then
+            echo "walked $found fuzz crates, expected at least 9 (found $expected)" >&2
             exit 1
           fi
           if [ -n "$broken" ]; then

@@ -196,6 +196,41 @@ pub mod test_util {
             self.pair.public_key().as_ref().to_vec()
         }
 
+        /// Load a key from a fixed PKCS#8 document, so a caller can have the SAME key twice.
+        ///
+        /// # Why a fuzz target cannot use [`XmlTestKey::generate`]
+        ///
+        /// A fuzzer needs the accept path to EXIST: with no key that can authorise anything,
+        /// `verify` is `Err` by construction and every assertion downstream of it is
+        /// unfalsifiable. It also needs determinism, because a corpus entry that verifies in one
+        /// process and not the next is a corpus entry that means nothing.
+        ///
+        /// `generate` gives neither. This takes the bytes, so the caller can embed one.
+        ///
+        /// # Errors
+        ///
+        /// If the document is not a P-256 PKCS#8 private key.
+        pub fn from_pkcs8(document: &[u8]) -> Result<Self, &'static str> {
+            let rng = secure_random();
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, document, &rng)
+                .map_err(|_| "not a P-256 PKCS#8 key")?;
+            Ok(Self { pair, rng })
+        }
+
+        /// A PKCS#8 document for a freshly generated key, so a caller can embed one.
+        ///
+        /// # Panics
+        ///
+        /// If the platform has no usable entropy.
+        #[must_use]
+        pub fn generate_pkcs8() -> Vec<u8> {
+            let rng = secure_random();
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .expect("generate a P-256 key")
+                .as_ref()
+                .to_vec()
+        }
+
         /// Sign `message`, producing the fixed-width `r || s` an XML signature carries.
         ///
         /// # Panics

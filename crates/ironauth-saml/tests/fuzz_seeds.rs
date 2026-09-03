@@ -60,8 +60,18 @@ fn every_fuzz_target_has_a_tracked_seed_corpus() {
              ignored by fuzz/.gitignore and exists only on the machine that wrote it.",
             found.len()
         );
+        // NOT MERELY NON-EMPTY. A count plus a non-emptiness check is satisfied by a corpus of
+        // five files holding one junk byte each -- a corpus that teaches the fuzzer nothing and
+        // passes every floor. Being a plausible XML document is the cheapest property a junk
+        // byte cannot satisfy; the per-target tests below then measure what each one REACHES.
         for (name, bytes) in &found {
-            assert!(!bytes.is_empty(), "{target}/{name} is empty");
+            assert!(bytes.len() >= 8, "{target}/{name} is {} bytes", bytes.len());
+            let text = core::str::from_utf8(bytes)
+                .unwrap_or_else(|_| panic!("{target}/{name} is not UTF-8"));
+            assert!(
+                text.trim_start().starts_with('<') && text.contains('>'),
+                "{target}/{name} is not an XML document"
+            );
         }
     }
 }
@@ -114,28 +124,81 @@ fn the_corpus_covers_both_answers_and_reaches_the_verifier() {
         refused >= 1,
         "no parse seed is a document the parser refuses"
     );
+    // AND THE REFUSALS ARE THE INTERESTING ONES. A corpus whose only refusals are "not XML"
+    // explores the first branch and stops; the shapes worth seeding are the ones carrying a
+    // payload a weaker parser would have executed.
+    let doctypes = seeds("saml_parse")
+        .into_iter()
+        .filter(|(_, bytes)| {
+            matches!(
+                ironauth_saml::parse(bytes, &limits),
+                Err(ironauth_saml::SamlError::DoctypeForbidden)
+            )
+        })
+        .count();
+    assert!(
+        doctypes >= 2,
+        "the parse corpus carries {doctypes} DOCTYPE seeds; the XXE and expansion shapes are the \
+         ones a weaker parser would have executed"
+    );
 
-    // AND THE VERIFY SEEDS REACH THE SIGNATURE PATH. `SignatureMissing` or later means the
-    // candidate was found and the signature was looked for; `Malformed` or `ReferenceRefused`
-    // means the run stopped earlier. At least one seed has to get past selection, or the target
-    // explores nothing but the parser a second time.
-    let anchors: [ironauth_saml::TrustAnchor; 0] = [];
-    let reached = seeds("saml_verify").into_iter().filter(|(_, bytes)| {
-        matches!(
+    // AND ONE VERIFY SEED VERIFIES. Not "gets past candidate selection", which an earlier
+    // version asserted and which a document with `<ds:DigestValue>AAAA</ds:DigestValue>`
+    // satisfies: that stops at the digest comparison, so the base64 decode of SignatureValue,
+    // the canonicalization of SignedInfo and the whole signature primitive are never reached by
+    // any seed, and mutation cannot get there either -- it would need a SHA-256 preimage.
+    //
+    // `seed_genuinely_signed` is signed by the key `fuzz_targets/saml_verify.rs` embeds, so the
+    // accept path is reachable from the corpus. This test re-derives the anchor from that same
+    // embedded key rather than storing a second copy, so the two cannot drift apart.
+    let key = ironauth_jose::xmldsig::test_util::XmlTestKey::from_pkcs8(&fuzz_key())
+        .expect("the embedded key loads");
+    let anchors = [ironauth_saml::TrustAnchor::EcdsaP256(key.public_point())];
+    let verified = seeds("saml_verify")
+        .into_iter()
+        .filter(|(_, bytes)| {
             ironauth_saml::verify(
                 bytes,
                 &limits,
                 &anchors,
                 ironauth_saml::ASSERTION_NS,
                 "Assertion",
-            ),
-            Err(ironauth_saml::VerifyError::SignatureInvalid
-                | ironauth_saml::VerifyError::SignatureMissing
-                | ironauth_saml::VerifyError::AlgorithmRefused)
-        )
-    });
+            )
+            .is_ok()
+        })
+        .count();
     assert!(
-        reached.count() >= 1,
-        "no verify seed gets past candidate selection, so the target only re-explores the parser"
+        verified >= 1,
+        "no verify seed VERIFIES under the key the fuzz target embeds, so the target's accept \
+         path is unreachable from the corpus and every assertion about what comes back is \
+         vacuous"
     );
+}
+
+/// The PKCS#8 key the `saml_verify` fuzz target embeds, read out of the target itself.
+///
+/// # Why it is parsed rather than duplicated
+///
+/// The corpus seed and the target have to agree about the key, and two copies of a key are two
+/// things that can drift. Reading the literal out of the target's own source means a change
+/// there fails HERE, loudly, rather than silently making a seed stop verifying.
+fn fuzz_key() -> Vec<u8> {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/fuzz_targets/saml_verify.rs"
+    ))
+    .expect("the fuzz target is readable");
+    let start = source
+        .find("const FUZZ_KEY_PKCS8: &[u8] = &[")
+        .expect("the target embeds a key")
+        + "const FUZZ_KEY_PKCS8: &[u8] = &[".len();
+    let end = start + source[start..].find("];").expect("the literal closes");
+    source[start..end]
+        .split(',')
+        .filter_map(|byte| {
+            let byte = byte.trim();
+            byte.strip_prefix("0x")
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        })
+        .collect()
 }

@@ -21,32 +21,63 @@ cargo +nightly fuzz run saml_parse
 
 ## What each target asserts, and what a fuzzer cannot reach
 
-A fuzzer cannot forge a signature, so it cannot explore the ACCEPT path. What it
-can do is prove the accept path is unreachable without the key, and that is what
-`saml_verify` asserts: the anchors it pins signed nothing, so any `Ok` at all is
-a finding. One assertion covers every bypass class -- wrapping, a skipped digest
-comparison, an algorithm confusion, a canonicalization collision -- because each
-of them ends in an `Ok` the pinned key did not authorise.
+`saml_verify` carries a FIXED private key and a document that genuinely verifies
+under it, so the accept path exists and the fuzzer's mutations of that document
+can reach it. When they do, two things are asserted: the returned subtree carries
+no `SignatureValue` (the enveloped transform removed it before the digest, so a
+`VerifiedAssertion` still holding one holds content the digest did not cover --
+which is exactly the authenticate-as-anyone defect this crate shipped and fixed),
+and the returned element's `ID` is the fragment the `Reference` URI named.
 
-The accept path is covered instead by `tests/wrapping.rs`, where every document
-starts from a genuinely valid signature. Neither substitutes for the other, and
-this paragraph is here so a reader does not mistake the fuzz lane for coverage of
-the half it structurally cannot reach.
+AN EARLIER VERSION OF THIS TARGET ASSERTED NOTHING, and the correction is worth
+recording. It pinned anchors that had signed nothing and asserted `verify` never
+returns `Ok`. `verify`'s only `Ok` exit sits immediately after
+`if !anchors.iter().any(|a| verify_xml_signature(..))`, so with an empty slice
+the `Err` is taken by construction whatever happened upstream. A reviewer deleted
+the digest comparison, the exactly-one-candidate refusal and the
+duplicate-identifier guard in turn and the target stayed green on every input.
+It asserted that `any()` over an empty iterator is false.
+
+What a fuzzer still cannot do is FORGE. Every `Ok` it reaches comes from a
+mutation that left the signature and the digest intact, so it explores the accept
+path's edges rather than its perimeter. The perimeter is `tests/wrapping.rs`,
+where each document is built deliberately. Neither substitutes for the other.
 
 `saml_canonicalize` asserts determinism and the FIXED POINT: canonicalising a
 canonical document must not move it. That is what a signature depends on, because
-the signer and the verifier start from different-but-equivalent documents.
+the signer and the verifier start from different-but-equivalent documents. It
+canonicalises a DESCENDANT as well as the root, because the inherited-scope path
+-- where this crate's worst canonicalization defect lived -- is not entered at
+all when the apex is the document element. It does NOT assert totality: a
+document with an unbound prefix parses and is refused here on purpose.
 
 `saml_parse` re-measures every accepted document against the limits it was parsed
-under, rather than trusting the parser to have checked them. A bound checked in
-the wrong place, or against the wrong number, fails here.
+under, against the EFFECTIVE depth bound (`max_depth.min(DEPTH_CEILING)`) rather
+than the ceiling. Its limits are small -- 2048 bytes, 8 deep, 64 elements --
+because libFuzzer generates 4096 bytes by default and the deployed defaults (a
+megabyte, ten thousand elements) cannot be crossed by any input the lane
+produces. The property under test is that `parse` enforces whatever bounds it is
+given.
 
 ## Seed corpus
 
-`corpus/<target>/` is seeded from the committed regression documents: the XXE and
-billion-laughs shapes from `tests/hostile.rs`, a genuinely signed response, and
-the wrapping documents from `tests/wrapping.rs`. Continuous fuzzing should persist
-and grow these.
+`corpus/<target>/` holds hand-written seeds, tracked by name: `fuzz/.gitignore`
+keeps `seed_*` and drops everything libFuzzer generates. They are the XXE and
+billion-laughs shapes, the malformed-QName shapes, a plain response, two
+canonicalization shapes with declarations and processing instructions in them,
+a two-assertion wrapping document, and `seed_genuinely_signed` -- a response
+really signed by the key `fuzz_targets/saml_verify.rs` embeds, which is what
+makes the accept path reachable from the corpus at all.
+
+`tests/fuzz_seeds.rs` is what holds those claims: it asserts the tracked-seed
+floors, that every canonicalization seed PARSES, that the parse corpus carries
+both accepted and DOCTYPE-refused documents, and that at least one verify seed
+genuinely VERIFIES under the embedded key. An earlier version of that last
+assertion accepted "gets past candidate selection", which a document carrying
+`<ds:DigestValue>AAAA</ds:DigestValue>` satisfies while never reaching the
+signature primitive at all.
+
+Continuous fuzzing should persist and grow these.
 
 ## What has actually been run
 
@@ -58,11 +89,19 @@ Ninety seconds per target on an M-series laptop, from the seeds above:
 | `saml_canonicalize` | 6,541,595 | 15,990 |
 | `saml_verify` | 2,256,060 | 9,055 |
 
-No crashes, and `artifacts/` was empty afterwards. That is a floor, not a
-result: ninety seconds is a smoke test, and the scheduled lane is what makes it
-continuous. The numbers are here so a later reader can tell whether the lane has
-ever actually executed, which is the failure `scripts/fuzz-matrix-freshness.sh`
-exists for.
+No crashes, and `artifacts/` was empty afterwards.
+
+TWO CAVEATS, because a number in a README is worth exactly what its provenance
+is. These were measured by hand on a developer machine before the targets were
+rewritten in response to review, so they say the harness RAN, not that the
+current targets have. And nothing in this repository verifies them: they are a
+note, not a check. `scripts/fuzz-matrix-freshness.sh` is a different thing
+entirely -- a static three-way check that the registered `[[bin]]` entries, the
+target files and the workflow matrix rows all agree -- and it deliberately never
+invokes cargo, so it cannot tell whether the lane has ever executed. Nothing
+can, from inside the repository.
+
+Ninety seconds is a smoke test. The scheduled lane is what makes it continuous.
 
 ## Triage
 

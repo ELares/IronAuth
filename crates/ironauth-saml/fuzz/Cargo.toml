@@ -27,6 +27,9 @@ libfuzzer-sys = "0.4"
 # reachable only through that feature, and a target that could not call it would
 # leave one of the three paths #138 names untouched.
 ironauth-saml = { path = "..", features = ["test-util"] }
+# The verify target needs a REAL key. An earlier version pinned anchors that had signed nothing,
+# so `verify` was `Err` by construction and every assertion in it was unfalsifiable.
+ironauth-jose = { path = "../../ironauth-jose", features = ["test-util"] }
 
 [[bin]]
 name = "saml_parse"
