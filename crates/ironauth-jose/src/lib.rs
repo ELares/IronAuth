@@ -164,6 +164,7 @@ pub mod totp;
 mod verify;
 pub mod webauthn;
 pub mod webhooks;
+pub mod xmldsig;
 
 pub mod seams;
 

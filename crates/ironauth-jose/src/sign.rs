@@ -48,6 +48,14 @@ pub(crate) fn secure_random() -> SystemRandom {
     SystemRandom::new()
 }
 
+/// The type [`secure_random`] returns, so a caller can hold one without naming `ring`.
+///
+/// A helper elsewhere in this crate that needs to KEEP an RNG (rather than make one per call)
+/// would otherwise have to name the backend's RNG type in its own struct, which is a second
+/// `entropy-via-env` exception with no argument behind it. This alias is how it borrows the one
+/// argument that already exists here.
+pub(crate) type SecureRandom = SystemRandom;
+
 /// Sign `signing_input` with `key` under the key's declared algorithm.
 ///
 /// Returns the raw signature bytes in the JWS-expected form (the fixed-width

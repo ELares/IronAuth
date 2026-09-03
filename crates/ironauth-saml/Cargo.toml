@@ -14,11 +14,23 @@ repository.workspace = true
 # serialisation or async, and every feature is a parser surface this crate would
 # then have to reason about.
 quick-xml = { workspace = true }
+# THE SIGNATURE PRIMITIVE LIVES IN `ironauth-jose`, and this crate calls it. `jose-audit.sh`
+# allows exactly one crate a direct dependency on the crypto backend, and its argument applies
+# here unchanged: a second crate reaching for the same primitives is a second verifier. This
+# crate owns the XML -- what a SignedInfo is, which transforms are allowed, how a subtree
+# canonicalises, every wrapping refusal -- and jose owns the two lines where bytes meet a key.
+ironauth-jose.workspace = true
 
 [dev-dependencies]
 # trybuild drives the compile-fail proof that a value cannot be read out of an
 # unverified document, which is the shape `ironauth-jose` uses for the same job.
 trybuild.workspace = true
+
+[features]
+default = []
+# Exposes the canonicalizer to its own test suite, and nothing else. See the module's doc for
+# why that suite cannot go through the verifier.
+test-util = ["ironauth-jose/test-util"]
 
 [lints]
 workspace = true

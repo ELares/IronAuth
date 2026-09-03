@@ -243,9 +243,14 @@ pub const DEPTH_CEILING: usize = 512;
 ///
 /// # The order is the contract
 ///
-/// Size, then DOCTYPE, then structure. Nothing about a signature happens here, and no consumer
-/// of this crate can reach a signature check without having come through this function first,
-/// because the type a signature check takes is the one only this function makes.
+/// Size, then DOCTYPE, then structure. Nothing about a signature happens here.
+///
+/// AND THE ORDER IS NOT ENFORCED BY THIS TYPE. An earlier version of this note said no consumer
+/// could reach a signature check without coming through here first, "because the type a
+/// signature check takes is the one only this function makes". [`crate::verify`] takes bytes and
+/// runs the same refusals itself, through the same reader configuration, before it looks at a
+/// signature. So the guarantee is real and it is an ORDERING inside `verify`, not a property of
+/// [`Document`]; the sentence claimed a structural argument the code does not make.
 ///
 /// # Errors
 ///
@@ -279,37 +284,15 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
     let mut elements = 0_usize;
     let mut seen_anything = false;
     loop {
-        let event = reader.read_event();
+        let event = reader.read_event().map_err(|_| SamlError::Malformed)?;
+        // EVERY STRUCTURAL RULE LIVES IN ONE PLACE, and this is the call to it. The rich tree
+        // the verifier builds runs the same function on the same events, so the two parsers
+        // cannot drift: two parsers disagreeing about what a document says is this crate's
+        // whole subject, and having two copies of the rules would be the way to get there.
+        check_document_event(&event, stack.len(), root.is_some(), seen_anything)?;
         match event {
-            Err(_) => return Err(SamlError::Malformed),
-            Ok(Event::Eof) => break,
-            // THE REFUSAL THAT CLOSES XXE. A DOCTYPE is where an external entity would be
-            // declared, so the document that could carry one never gets parsed.
-            Ok(Event::DocType(_)) => return Err(SamlError::DoctypeForbidden),
-            // AN ENTITY REFERENCE, and the parser hands over every one of them: it resolves
-            // nothing itself, which is the property this crate chose it for.
-            //
-            // The five XML built-ins (`amp`, `lt`, `gt`, `quot`, `apos`) and numeric character
-            // references are CONTENT: they are defined by the XML specification itself, need no
-            // DTD, and appear in ordinary SAML (an `&` in a `NameID`). Everything else names an
-            // entity that could only have been declared in a DOCTYPE, and this crate accepts no
-            // DOCTYPE, so it names something that cannot exist.
-            //
-            // Refused rather than passed through, because the alternative is a value silently
-            // becoming shorter: `<`NameID`>a&whoami;b</`NameID`>` would read as `ab` and a consumer
-            // would have no way to know it had been handed a truncation.
-            Ok(Event::GeneralRef(reference)) => {
-                // A REFERENCE IS CONTENT, so it obeys the same rule as text about WHERE it may
-                // appear. An earlier version checked the reference and not its position, so
-                // `<Response/>&#84;&#82;&#65;` was accepted while the same three characters
-                // written literally were refused: the prolog rule had been applied to `Text` and
-                // `CData` and not to the third thing that carries characters.
-                if stack.is_empty() {
-                    return Err(SamlError::Malformed);
-                }
-                check_reference(reference.as_ref())?;
-            }
-            Ok(Event::Start(start)) => {
+            Event::Eof => break,
+            Event::Start(start) => {
                 elements += 1;
                 if elements > limits.max_elements {
                     return Err(SamlError::TooManyElements);
@@ -322,7 +305,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
                     children: Vec::new(),
                 });
             }
-            Ok(Event::Empty(empty)) => {
+            Event::Empty(empty) => {
                 elements += 1;
                 if elements > limits.max_elements {
                     return Err(SamlError::TooManyElements);
@@ -344,7 +327,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
                     None => return Err(SamlError::Malformed),
                 }
             }
-            Ok(Event::End(_)) => {
+            Event::End(_) => {
                 let Some(done) = stack.pop() else {
                     return Err(SamlError::Malformed);
                 };
@@ -354,62 +337,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
                     None => return Err(SamlError::Malformed),
                 }
             }
-            // AN ENCODING DECLARATION THAT IS NOT UTF-8 IS REFUSED, not ignored. The bytes are
-            // already required to be UTF-8, so a document declaring `UTF-16` is telling a
-            // conforming peer to read it differently from how this reads it, and two components
-            // reading one document differently is the whole defect class this crate is about.
-            Ok(Event::Decl(decl)) => {
-                // AND IT MUST BE FIRST. XML 1.0 puts the declaration at the very start of the
-                // document, before any comment, whitespace or element. The prolog rule was
-                // extended to text, CDATA and references and not to this, so `<R><?xml
-                // version="1.0"?></R>` and three other placements were accepted -- the same
-                // class of differential as the trailing junk that rule exists to close.
-                if seen_anything {
-                    return Err(SamlError::Malformed);
-                }
-                if let Some(Ok(encoding)) = decl.encoding() {
-                    if !encoding.eq_ignore_ascii_case(b"utf-8") {
-                        return Err(SamlError::EncodingNotUtf8);
-                    }
-                }
-            }
-            // Text, CDATA, comments and processing instructions carry no structure this module
-            // records -- but WHERE they appear is structure. XML 1.0's `document` production is
-            // `prolog element Misc*`, so anything other than a comment, a processing instruction
-            // or whitespace outside the document element makes this not a document. A review
-            // measured `<Response/>TRAILING JUNK` and a leading-text variant being accepted here
-            // while every conforming processor rejects them, which is a parser differential
-            // against exactly the peer a signature has to agree with.
-            // LITERAL CONTROL CHARACTERS ARE REFUSED WHEREVER THEY APPEAR, which an earlier
-            // version did only for REFERENCES: `&#0;` was refused and a literal NUL in the same
-            // `NameID` was accepted, so one byte reached opposite verdicts by how it was written
-            // -- and the literal is the easier one to send. A NUL in a `NameID` is the classic
-            // truncation primitive against a C consumer.
-            Ok(Event::Text(ref text)) if !stack.is_empty() => {
-                check_literal_characters(text.as_ref())?;
-            }
-            Ok(Event::CData(ref data)) if !stack.is_empty() => {
-                check_literal_characters(data.as_ref())?;
-            }
-            // COMMENTS AND PROCESSING INSTRUCTIONS CARRY CHARACTER DATA TOO, and an earlier
-            // version said "wherever they appear" while checking three of the five places. A
-            // review measured `<NameID>a<!--\0-->b</NameID>` and `<NameID>a<?p \0?>b</NameID>`
-            // accepted beside the literal NUL in the text being refused, and #138 names a
-            // comment-truncation corpus as its own criterion: comments are a declared attack
-            // surface here.
-            Ok(Event::Comment(ref text)) => check_literal_characters(text.as_ref())?,
-            Ok(Event::PI(ref pi)) => check_literal_characters(pi.as_ref())?,
-            Ok(Event::Text(text)) if stack.is_empty() => {
-                // XML's `S` production is space, tab, carriage return and newline. Rust's
-                // `is_ascii_whitespace` also admits form feed, which is not even a legal `Char`:
-                // `<Response/>` followed by 0x0C was accepted while `&#12;` was refused, the
-                // same character reaching two verdicts by how it was written.
-                if !text.as_ref().iter().all(|byte| is_xml_space(*byte)) {
-                    return Err(SamlError::Malformed);
-                }
-            }
-            Ok(Event::CData(_)) if stack.is_empty() => return Err(SamlError::Malformed),
-            Ok(_) => {}
+            _ => {}
         }
         seen_anything = true;
     }
@@ -431,7 +359,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
 ///
 /// Everything else names an entity that could only have been declared in a DOCTYPE, and this
 /// crate accepts no DOCTYPE, so it names something that cannot exist.
-fn check_reference(name: &[u8]) -> Result<(), SamlError> {
+pub(crate) fn check_reference(name: &[u8]) -> Result<(), SamlError> {
     if matches!(name, b"amp" | b"lt" | b"gt" | b"quot" | b"apos") {
         return Ok(());
     }
@@ -502,6 +430,73 @@ fn is_forbidden_char(value: char) -> bool {
     matches!(value, '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}')
 }
 
+/// Every structural rule this crate applies to an event, in ONE place.
+///
+/// Called by [`parse`] and by the rich tree the verifier builds, on the same events in the same
+/// order. Two parsers with their own copies of these rules would be two parsers that can
+/// disagree about what a document says, which is the defect this whole crate exists to prevent
+/// -- so there is one copy and both callers run it.
+///
+/// What is NOT here is retention: how a tree is built from the events is each caller's own
+/// business, and is the only thing they differ in.
+///
+/// # Errors
+///
+/// [`SamlError`], one variant per refusal.
+pub(crate) fn check_document_event(
+    event: &Event<'_>,
+    depth: usize,
+    has_root: bool,
+    seen_anything: bool,
+) -> Result<(), SamlError> {
+    match event {
+        // THE REFUSAL THAT CLOSES XXE. A DOCTYPE is where an external entity would be declared,
+        // so the document that could carry one never gets parsed.
+        Event::DocType(_) => Err(SamlError::DoctypeForbidden),
+        Event::Decl(decl) => {
+            // IT MUST BE FIRST. XML 1.0 puts the declaration at the very start of the document,
+            // before any comment, whitespace or element.
+            if seen_anything {
+                return Err(SamlError::Malformed);
+            }
+            // AND MUST NOT NAME ANOTHER ENCODING. The bytes are already required to be UTF-8, so
+            // a document declaring `UTF-16` is telling a conforming peer to read it differently
+            // from how this reads it.
+            if let Some(Ok(encoding)) = decl.encoding() {
+                if !encoding.eq_ignore_ascii_case(b"utf-8") {
+                    return Err(SamlError::EncodingNotUtf8);
+                }
+            }
+            Ok(())
+        }
+        // A REFERENCE IS CONTENT, so it obeys the same rule as text about WHERE it may appear.
+        Event::GeneralRef(reference) => {
+            if depth == 0 {
+                return Err(SamlError::Malformed);
+            }
+            check_reference(reference.as_ref())
+        }
+        Event::Text(text) if depth == 0 => {
+            // XML's `S` production is space, tab, carriage return and newline. Rust's
+            // `is_ascii_whitespace` also admits form feed, which is not even a legal character.
+            let _ = has_root;
+            if text.as_ref().iter().all(|byte| is_xml_space(*byte)) {
+                Ok(())
+            } else {
+                Err(SamlError::Malformed)
+            }
+        }
+        Event::CData(_) if depth == 0 => Err(SamlError::Malformed),
+        // LITERAL CONTROL CHARACTERS ARE REFUSED IN EVERY PLACE CHARACTER DATA APPEARS, which is
+        // five of them: text, CDATA, comments, processing instructions, and attribute values.
+        // The last is checked with the element, since the parser never tokenises it.
+        Event::Text(text) | Event::Comment(text) => check_literal_characters(text.as_ref()),
+        Event::CData(data) => check_literal_characters(data.as_ref()),
+        Event::PI(pi) => check_literal_characters(pi.as_ref()),
+        _ => Ok(()),
+    }
+}
+
 /// The element's name, having checked everything about the element this module bounds.
 ///
 /// THE ATTRIBUTES ARE WALKED HERE AND NOWHERE ELSE, and that is the point of the function. An
@@ -513,7 +508,7 @@ fn is_forbidden_char(value: char) -> bool {
 ///
 /// Names are bounded because they are the one thing [`Element`] retains, and attributes are
 /// counted because nothing else in this module says anything about what hangs off one element.
-fn element_name(
+pub(crate) fn element_name(
     start: &quick_xml::events::BytesStart<'_>,
     limits: &Limits,
 ) -> Result<String, SamlError> {
@@ -575,8 +570,22 @@ fn element_name(
 ///
 /// The FIRST character is checked separately, because `9Signature` and `.Signature` are not
 /// names in any XML processor and were accepted here.
-fn check_name(raw: &[u8]) -> Result<(), SamlError> {
+pub(crate) fn check_name(raw: &[u8]) -> Result<(), SamlError> {
     let name = core::str::from_utf8(raw).map_err(|_| SamlError::Malformed)?;
+    // A QNAME HAS AT MOST ONE COLON AND NEITHER PART IS EMPTY. `a:b:c`, `:a` and `a:` are not
+    // names in any namespace-aware processor, and the last one matters most here: an attribute
+    // literally called `xmlns:` was taken as the DEFAULT namespace declaration by the
+    // canonicalizer, so `xmlns:="urn:x"` and `xmlns="urn:x"` produced identical canonical octets
+    // -- two different documents under one digest, and one signature covering both.
+    let colons = name.bytes().filter(|byte| *byte == b':').count();
+    if colons > 1 {
+        return Err(SamlError::Malformed);
+    }
+    if let Some((prefix, local)) = name.split_once(':') {
+        if prefix.is_empty() || local.is_empty() {
+            return Err(SamlError::Malformed);
+        }
+    }
     let mut characters = name.chars();
     let Some(first) = characters.next() else {
         return Err(SamlError::Malformed);
@@ -642,7 +651,7 @@ fn is_name_char(value: char) -> bool {
 /// The parser hands attribute values over untouched, so this is the only place the rule can be
 /// applied to them. A bare `&` is refused too: it is not well-formed XML, and quick-xml does not
 /// refuse it inside an attribute the way it does in text.
-fn check_attribute_value(value: &[u8]) -> Result<(), SamlError> {
+pub(crate) fn check_attribute_value(value: &[u8]) -> Result<(), SamlError> {
     // NO RAW `<`. XML's "No `<` in Attribute Values" well-formedness constraint, and this
     // scanner already refuses a bare `&` on exactly the reasoning that it is not well-formed --
     // and then let the more dangerous delimiter through. A review sent

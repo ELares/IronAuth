@@ -2259,6 +2259,7 @@ dependencies = [
 name = "ironauth-saml"
 version = "0.1.0"
 dependencies = [
+ "ironauth-jose",
  "quick-xml",
  "trybuild",
 ]
