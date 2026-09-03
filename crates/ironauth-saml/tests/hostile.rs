@@ -104,10 +104,21 @@ fn an_oversized_document_is_refused() {
         Err(SamlError::TooLarge)
     );
 
-    // THE CONTROL, one byte inside the bound: the refusal above is the bound and not the shape.
-    let inside = "<Response/>";
-    assert!(inside.len() <= limits.max_bytes);
-    parse(inside.as_bytes(), &limits).expect("a document inside the bound parses");
+    // EXACTLY AT THE BOUND, which is the control the comment used to claim and the test did not
+    // have: it drove an eleven-byte document against a 128-byte bound, so it said nothing about
+    // where the boundary is. A review flipped `>` to `>=` and nothing failed.
+    let filler = "y".repeat(limits.max_bytes - "<Response>x</Response>".len() + 1);
+    let exact = format!("<Response>{filler}</Response>");
+    assert_eq!(exact.len(), limits.max_bytes);
+    parse(exact.as_bytes(), &limits).expect("a document exactly at the byte bound parses");
+
+    let one_over = format!("<Response>{filler}x</Response>");
+    assert_eq!(one_over.len(), limits.max_bytes + 1);
+    assert_eq!(
+        parse(one_over.as_bytes(), &limits),
+        Err(SamlError::TooLarge),
+        "one byte past the bound must be refused"
+    );
 }
 
 /// A document nested past the depth bound is refused, and the bound counts ELEMENTS.
@@ -119,6 +130,16 @@ fn a_deeply_nested_document_is_refused() {
     };
     let deep = format!("{}{}", "<a>".repeat(20), "</a>".repeat(20));
     assert_eq!(parse(deep.as_bytes(), &limits), Err(SamlError::TooDeep));
+
+    // ONE PAST, WITH START TAGS. The test used to jump from 8 to 20, so a review moved the
+    // comparison from `>=` to `>` and nothing failed: the boundary was pinned for empty elements
+    // and not for start tags.
+    let one_past = format!("{}{}", "<a>".repeat(9), "</a>".repeat(9));
+    assert_eq!(
+        parse(one_past.as_bytes(), &limits),
+        Err(SamlError::TooDeep),
+        "nine open elements against a bound of eight must be refused"
+    );
 
     // EXACTLY AT THE BOUND parses, which is what makes the refusal a bound rather than a
     // rejection of nesting. Eight elements deep is eight open elements at the innermost point.
@@ -151,8 +172,23 @@ fn a_document_with_too_many_elements_is_refused() {
         Err(SamlError::TooManyElements)
     );
 
-    let inside = format!("<Response>{}</Response>", "<a/>".repeat(10));
-    parse(inside.as_bytes(), &limits).expect("a document inside the element bound parses");
+    // AT THE BOUND AND ONE PAST IT. Without both, `>` and `>=` are indistinguishable, and a
+    // review measured that they were.
+    let exact = format!(
+        "<Response>{}</Response>",
+        "<a/>".repeat(limits.max_elements - 1)
+    );
+    parse(exact.as_bytes(), &limits).expect("a document exactly at the element bound parses");
+
+    let one_past = format!(
+        "<Response>{}</Response>",
+        "<a/>".repeat(limits.max_elements)
+    );
+    assert_eq!(
+        parse(one_past.as_bytes(), &limits),
+        Err(SamlError::TooManyElements),
+        "one element past the bound must be refused"
+    );
 }
 
 /// Malformed XML is one refusal, whatever the malformedness.
@@ -165,7 +201,17 @@ fn malformedness_is_a_single_refusal() {
         ("an unclosed element", "<Response><NameID></Response>"),
         ("a mismatched end tag", "<Response></Assertion>"),
         ("a stray end tag", "</Response>"),
-        ("two document elements", "<Response/><Response/>"),
+        ("two empty document elements", "<Response/><Response/>"),
+        // THE OTHER PATH. A review made the closing branch accept a second root and watched the
+        // document parse with its root SILENTLY REPLACED by the last top-level element, which is
+        // a textbook wrapping primitive. Only the empty-element path had a test.
+        ("two closed document elements", "<a></a><b></b>"),
+        ("content after the document element", "<Response/>TRAILING"),
+        ("content before the document element", "LEADING<Response/>"),
+        (
+            "CDATA outside the document element",
+            "<Response/><![CDATA[<Assertion/>]]>",
+        ),
         ("nothing at all", ""),
         ("not markup", "not xml"),
     ] {
@@ -217,4 +263,220 @@ fn a_parsed_document_exposes_shape_and_not_values() {
     // all in the document and none of them has an accessor; the compile-fail proof beside this
     // file is what holds that, because a test that merely does not call one proves nothing.
     assert!(subject.children()[0].children().is_empty());
+}
+
+/// The entity rule reaches ATTRIBUTE values, not only text.
+///
+/// # The hole this closes
+///
+/// `quick-xml` tokenises entity references in TEXT only; an attribute value arrives inside the
+/// raw start tag and is never split into events. So an earlier version of this parser accepted
+/// `Destination="&whoami;"` while refusing the identical reference in a `NameID`, and a review
+/// measured it: same bytes, one position change, opposite verdict.
+///
+/// Attributes are where SAML actually carries the values an attacker wants to move --
+/// `Destination`, `ID`, `InResponseTo`, `Format` -- so the rule that applies to text has to
+/// apply here or it applies to the wrong half of the document.
+#[test]
+fn an_undefined_entity_in_an_attribute_is_refused_like_one_in_text() {
+    for (what, document) in [
+        (
+            "the Destination a response is bound to",
+            r#"<Response Destination="https://sp.example.test/acs&whoami;"/>"#,
+        ),
+        ("an assertion ID", r#"<Assertion ID="_a&whoami;"/>"#),
+        (
+            "a NameID Format",
+            r#"<NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent&whoami;"/>"#,
+        ),
+    ] {
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::UnknownEntity),
+            "{what} carried an undefined entity and was accepted"
+        );
+    }
+
+    // A BARE AMPERSAND in an attribute is not well-formed XML either, and quick-xml does not
+    // refuse it there the way it does in text.
+    assert_eq!(
+        parse(br#"<Response Destination="a&b"/>"#, &Limits::default()),
+        Err(SamlError::Malformed)
+    );
+
+    // THE CONTROL: the built-ins and character references are ordinary attribute content.
+    parse(
+        br#"<Response Destination="https://sp.example.test/acs?a=1&amp;b=2&#38;c=3"/>"#,
+        &Limits::default(),
+    )
+    .expect("a built-in and a character reference are content in an attribute too");
+}
+
+/// A numeric character reference must actually be one.
+///
+/// An earlier version delegated to the parser's `is_char_ref`, which tests for a leading `#` and
+/// nothing more, so a review walked `&#zzz;`, `&#xD800;` (a surrogate) and `&#x110000;` (past
+/// the last code point) straight through the entity gate. None is a character reference, and
+/// every conforming processor rejects each of them.
+#[test]
+fn a_malformed_character_reference_is_not_a_character_reference() {
+    for (what, reference) in [
+        ("digits that are not digits", "&#zzz;"),
+        ("an empty decimal reference", "&#;"),
+        ("an empty hexadecimal reference", "&#x;"),
+        ("a surrogate", "&#xD800;"),
+        ("past the last code point", "&#x110000;"),
+        ("NUL", "&#0;"),
+        ("a forbidden C0 control", "&#x1;"),
+        ("a non-character", "&#xFFFE;"),
+    ] {
+        let document = format!("<Response><NameID>a{reference}b</NameID></Response>");
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::UnknownEntity),
+            "{what} was accepted as a character reference"
+        );
+    }
+
+    // THE CONTROLS. Real references, decimal and hexadecimal, and the three C0 controls XML
+    // does admit, must all still parse: a rule that refused every `&#` would pass the loop above
+    // and reject legal documents.
+    for reference in [
+        "&#65;",
+        "&#x41;",
+        "&#X41;",
+        "&#9;",
+        "&#10;",
+        "&#13;",
+        "&#x1F600;",
+    ] {
+        let document = format!("<Response><NameID>a{reference}b</NameID></Response>");
+        parse(document.as_bytes(), &Limits::default())
+            .unwrap_or_else(|_| panic!("{reference} is a legal character reference"));
+    }
+}
+
+/// One element cannot carry unbounded attributes, and a name cannot be unbounded.
+///
+/// Depth and element count say nothing about what hangs off a single element. A review measured
+/// one element with five thousand attributes, a megabyte of attribute values, and a
+/// half-megabyte element NAME all surviving every bound this crate had.
+#[test]
+fn one_element_cannot_be_unbounded() {
+    let limits = Limits {
+        max_attributes: 8,
+        max_name_bytes: 32,
+        ..Limits::default()
+    };
+
+    let many = (0..20)
+        .map(|index| format!("a{index}=\"v\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        parse(format!("<Response {many}/>").as_bytes(), &limits),
+        Err(SamlError::ElementTooLarge)
+    );
+
+    let long_name = "a".repeat(64);
+    assert_eq!(
+        parse(format!("<{long_name}/>").as_bytes(), &limits),
+        Err(SamlError::ElementTooLarge)
+    );
+    assert_eq!(
+        parse(format!("<Response {long_name}=\"v\"/>").as_bytes(), &limits),
+        Err(SamlError::ElementTooLarge),
+        "an attribute name is a name too"
+    );
+
+    // AT THE BOUNDS, so these are bounds and not a refusal of attributes.
+    let eight = (0..8)
+        .map(|index| format!("a{index}=\"v\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    parse(format!("<Response {eight}/>").as_bytes(), &limits)
+        .expect("exactly the permitted number of attributes parses");
+    parse(format!("<{}/>", "a".repeat(32)).as_bytes(), &limits)
+        .expect("a name exactly at the bound parses");
+}
+
+/// A duplicated attribute is refused.
+///
+/// Two `ID` attributes on one element is a wrapping primitive: it gives two answers to "which
+/// node does this reference name". The parser's own duplicate check is what catches it, and
+/// this is what says the check is switched on.
+#[test]
+fn a_duplicated_attribute_is_refused() {
+    assert_eq!(
+        parse(br#"<Assertion ID="_a" ID="_b"/>"#, &Limits::default()),
+        Err(SamlError::Malformed)
+    );
+}
+
+/// An element name that is not a name is refused.
+///
+/// `quick-xml` does not validate the `Name` production, so a NUL sits happily inside one: a
+/// review measured `<Signature\0/>` parsing with `name()` not equal to `"Signature"`. A
+/// signature-locating step matching on the name would not see that node while a C-based
+/// verifier reading the same bytes would.
+#[test]
+fn a_name_carrying_a_control_byte_is_refused() {
+    let mut document = b"<Response><Signature".to_vec();
+    document.push(0);
+    document.extend_from_slice(b"/></Response>");
+    assert_eq!(
+        parse(&document, &Limits::default()),
+        Err(SamlError::Malformed)
+    );
+
+    // THE CONTROL: the same document without the NUL is ordinary.
+    parse(b"<Response><Signature/></Response>", &Limits::default()).expect("a plain name parses");
+}
+
+/// An encoding declaration naming anything but UTF-8 is refused rather than ignored.
+///
+/// The bytes are already required to be UTF-8, so a document declaring `UTF-16` is telling a
+/// conforming peer to read it differently from how this reads it. Two components reading one
+/// document differently is the defect class this crate exists to prevent, and it does not become
+/// acceptable because the disagreement is about an encoding rather than a node.
+#[test]
+fn a_non_utf8_encoding_declaration_is_refused() {
+    for declaration in ["UTF-16", "IBM037", "UTF-7", "ISO-8859-1"] {
+        let document = format!(r#"<?xml version="1.0" encoding="{declaration}"?><Response/>"#);
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::EncodingNotUtf8),
+            "a document declaring {declaration} was accepted"
+        );
+    }
+
+    // THE CONTROLS: declaring UTF-8, in either case, and declaring nothing.
+    for document in [
+        r#"<?xml version="1.0" encoding="UTF-8"?><Response/>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><Response/>"#,
+        r#"<?xml version="1.0"?><Response/>"#,
+    ] {
+        parse(document.as_bytes(), &Limits::default()).expect("UTF-8 or nothing is accepted");
+    }
+}
+
+/// A deep tree drops without overflowing the stack.
+///
+/// `parse` is iterative, but the tree's own destructor recurses, and `max_depth` is a public
+/// field with no ceiling whose documentation invites raising it. A review parsed a document at
+/// depth 60000 and watched the process abort on drop with `fatal runtime error: stack overflow`
+/// -- not a refusal anybody can catch. The destructor takes children out iteratively now.
+#[test]
+fn a_very_deep_tree_drops_without_overflowing() {
+    let limits = Limits {
+        max_depth: 100_000,
+        max_elements: 200_000,
+        max_bytes: 4 * 1024 * 1024,
+        ..Limits::default()
+    };
+    let depth = 60_000;
+    let document = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
+    let parsed = parse(document.as_bytes(), &limits).expect("a deep document within the bounds");
+    // The drop is the test: before the iterative destructor this aborted the process here.
+    drop(parsed);
 }

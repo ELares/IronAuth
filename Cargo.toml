@@ -55,11 +55,13 @@ repository = "https://github.com/ELares/IronAuth"
 # C, and it does not resolve entities: see that crate's doc for the evaluation and the rejected
 # alternatives. Default features off, so no serialisation or async surface is compiled.
 #
-# 0.41 SPECIFICALLY, and not the 0.37 already reachable elsewhere in the lockfile: 0.41 reports
-# an unresolved entity reference as its own `Event::GeneralRef`, which `ironauth-saml` refuses.
-# Under 0.37 the same reference rides inside a text node and is invisible until somebody
-# unescapes it, which is a value silently becoming something else -- the exact failure the SAML
-# harness exists to make impossible.
+# 0.41 SPECIFICALLY: it reports an unresolved entity reference in text as its own
+# `Event::GeneralRef`, so `ironauth-saml` can refuse it at PARSE time. 0.37 surfaces the same
+# reference only when a caller unescapes -- also an error there, not a silent truncation -- and
+# this crate never unescapes, so a refusal that fires only on a method call is one that depends
+# on every future caller remembering to make it. See the crate's own note.
+#
+# No other version of this crate was in the tree; nothing else here parses XML.
 quick-xml = { version = "0.41", default-features = false }
 # The IronBus client (issue #104): the OPTIONAL notification backbone for the
 # transactional outbox. Optional in the strict sense the issue requires: Postgres alone
