@@ -2257,3 +2257,372 @@ async fn a_deactivated_member_is_a_conflict_rather_than_a_re_admit() {
     let parsed: Value = serde_json::from_str(&body).expect("a list");
     assert_eq!(parsed["totalResults"], json!(1), "{body}");
 }
+
+/// Seed and activate a trait schema declaring the Enterprise User attributes.
+///
+/// An environment's trait schema is what decides which identity attributes it holds, so this is
+/// the operator configuration a deployment that wants the extension has to make. The tests that
+/// call it are the ones about a configured environment; the one that does NOT call it drives
+/// the refusal.
+async fn activate_enterprise_trait_schema(db: &TestDatabase, env: &Env, scope: Scope) {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "employeeNumber": { "type": "string" },
+            "department": { "type": "string" },
+            "costCenter": { "type": "string" },
+        },
+    })
+    .to_string();
+    let acting = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env));
+    let (_, version) = acting
+        .trait_schemas()
+        .create_version(env, &schema, now_micros(env))
+        .await
+        .expect("register a trait schema");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .trait_schemas()
+        .activate_version(env, version)
+        .await
+        .expect("activate it");
+}
+
+/// The Enterprise User extension round-trips: sent on create, read back on GET and on the list.
+///
+/// `/Schemas` published this extension from the day the surface shipped and `ScimUser` parsed
+/// none of it, so an Entra push carrying `employeeNumber` and `department` was answered
+/// `201 Created` with the attributes silently dropped. That is the advertise-what-you-do-not-do
+/// defect this crate has now been caught by twice, and a provisioning client has no way to see
+/// it: the create succeeds and the read simply omits what it sent.
+#[tokio::test]
+async fn the_enterprise_extension_round_trips_through_create_and_read() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    activate_enterprise_trait_schema(&db, &env, scope).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let body = json!({
+        "schemas": [
+            "urn:ietf:params:scim:schemas:core:2.0:User",
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
+        ],
+        "userName": "ada@example.com",
+        "active": true,
+        "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+            "employeeNumber": "701",
+            "department": "Tools",
+        },
+    });
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let parsed: Value = serde_json::from_str(&created).expect("json");
+    let id = parsed["id"].as_str().expect("id").to_owned();
+
+    // THE CREATE ITSELF carries it back, which is what a client reads to confirm the write.
+    let extension = &parsed["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"];
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("701"),
+        "{created}"
+    );
+    assert_eq!(extension["department"].as_str(), Some("Tools"), "{created}");
+    // AND THE SCHEMAS LIST DECLARES IT. RFC 7643 section 3 says a resource names every schema
+    // its attributes come from, and a client dispatching on that list would not look for the
+    // extension without it.
+    assert!(
+        parsed["schemas"]
+            .as_array()
+            .expect("schemas")
+            .iter()
+            .any(|urn| urn.as_str()
+                == Some("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User")),
+        "the resource must declare the extension schema: {created}"
+    );
+
+    // A FRESH READ, which is the assertion that separates "echoed the request" from "stored it".
+    let (status, fetched) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{id}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let parsed: Value = serde_json::from_str(&fetched).expect("json");
+    assert_eq!(
+        parsed["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["employeeNumber"]
+            .as_str(),
+        Some("701"),
+        "the extension must survive a fresh read: {fetched}"
+    );
+
+    // AND ON THE LISTING, because a client filtering on an extension attribute evaluates the
+    // filter against the listed document; an omitted extension makes a legitimate filter match
+    // nothing.
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    let parsed: Value = serde_json::from_str(&listed).expect("json");
+    assert_eq!(
+        parsed["Resources"][0]["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+            ["department"]
+            .as_str(),
+        Some("Tools"),
+        "the listing must carry the extension too: {listed}"
+    );
+}
+
+/// Both vendors' PATCH dialects reach the extension, and both write the same trait.
+///
+/// Entra sends the URN-qualified path
+/// (`urn:...:enterprise:2.0:User:employeeNumber`); Okta sends the whole extension object under
+/// its URN inside a no-path value. Neither reached the extension before, so a `department`
+/// change from either vendor was answered `400 unsupported attribute`.
+///
+/// The two are driven against the SAME person in sequence, so the second also proves the first
+/// did not clear what it did not mention.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn both_vendor_patch_dialects_reach_the_enterprise_extension() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    activate_enterprise_trait_schema(&db, &env, scope).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "grace@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // ENTRA: a URN-qualified path.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{id}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
+                "value": "902",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&patched).expect("json")
+            ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["employeeNumber"]
+            .as_str(),
+        Some("902"),
+        "Entra's dialect must reach the extension: {patched}"
+    );
+
+    // OKTA: the whole extension object in a no-path value.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{id}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "value": {
+                    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                        "department": "Platform",
+                    },
+                },
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let parsed: Value = serde_json::from_str(&patched).expect("json");
+    let extension = &parsed["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"];
+    assert_eq!(
+        extension["department"].as_str(),
+        Some("Platform"),
+        "Okta's dialect must reach the extension: {patched}"
+    );
+    // AND THE EARLIER ATTRIBUTE SURVIVED. A write that replaced the traits document rather than
+    // merging into it would clear this, and the client would never know: it did not mention
+    // `employeeNumber`, so it has no reason to check.
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("902"),
+        "a PATCH must not clear extension attributes it did not mention: {patched}"
+    );
+
+    // CASE-INSENSITIVELY, per RFC 7643 section 2.1, and onto the SAME trait. A second spelling
+    // writing a second trait is the two-spellings defect the path parser refuses paths for.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{id}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:EMPLOYEENUMBER",
+                "value": "903",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let extension = serde_json::from_str::<Value>(&patched).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("903"),
+        "a differently-cased attribute must write the SAME trait: {patched}"
+    );
+    assert!(
+        extension.get("EMPLOYEENUMBER").is_none(),
+        "a second spelling must not become a second attribute: {patched}"
+    );
+}
+
+/// An extension attribute the environment cannot hold is REFUSED, not dropped.
+///
+/// Two ways it cannot hold one, and they are different refusals:
+///
+///   * The attribute is outside RFC 7643's Enterprise User set, so this server does not store
+///     it whatever the environment declares.
+///   * The environment has no ACTIVE trait schema, so it holds no declared identity attributes
+///     at all. That is an operator configuration a provisioning client cannot fix, and it must
+///     be told rather than having the value accepted and discarded.
+///
+/// Both matter because the failure they replace is identical from the client's side: a `201`
+/// and a resource that does not carry what was sent.
+#[tokio::test]
+async fn an_extension_attribute_the_environment_cannot_hold_is_refused_rather_than_dropped() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    // NO ACTIVE SCHEMA YET. A well-formed extension attribute is refused, and the refusal says
+    // which configuration is missing.
+    let (status, refused) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "nodeclared@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "1",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an environment with no active trait schema must refuse rather than drop: {refused}"
+    );
+    assert!(
+        refused.contains("trait schema"),
+        "the refusal must name the missing configuration: {refused}"
+    );
+
+    activate_enterprise_trait_schema(&db, &env, scope).await;
+
+    // AN ATTRIBUTE OUTSIDE THE EXTENSION'S OWN SET, refused even with a schema active.
+    let (status, refused) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "unknown@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "favouriteColour": "blue",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an attribute outside the extension must be refused: {refused}"
+    );
+    // AND THE REFUSAL DOES NOT ECHO THE ATTRIBUTE NAME. Extension keys arrive as raw JSON and
+    // are bounded by nothing, so reflecting one makes this surface a reflection gadget -- the
+    // policy `unsupported_attribute` states for parsed paths, applied where it matters more.
+    assert!(
+        !refused.contains("favouriteColour"),
+        "the refusal must not echo the caller's own input: {refused}"
+    );
+
+    // THE CONTROL. With the schema active, a declared attribute is accepted -- so the refusals
+    // above are about what cannot be held, not about a surface that refuses every extension.
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "declared@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "2",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    // And nothing from the two refused creates landed.
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(1),
+        "a refused create landed a person anyway: {listed}"
+    );
+}

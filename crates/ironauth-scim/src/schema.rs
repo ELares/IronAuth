@@ -106,9 +106,19 @@ pub fn core_schemas() -> Vec<Value> {
             "id": ENTERPRISE_USER_SCHEMA,
             "name": "EnterpriseUser",
             "description": "Enterprise User",
+            // ALL SEVEN RFC 7643 section 4.3 defines, not the three this document used to
+            // name. The three were what a hand-written list happened to contain, and the model
+            // now stores all seven -- so publishing three would tell a client not to send
+            // `costCenter`, which this server would have stored. The pairing is asserted by
+            // `the_enterprise_schema_and_the_model_name_the_same_attributes`, in both
+            // directions.
             "attributes": [
                 attribute("employeeNumber", "string", false, false, Mutability::ReadWrite),
+                attribute("costCenter", "string", false, false, Mutability::ReadWrite),
+                attribute("organization", "string", false, false, Mutability::ReadWrite),
+                attribute("division", "string", false, false, Mutability::ReadWrite),
                 attribute("department", "string", false, false, Mutability::ReadWrite),
+                attribute("employeeType", "string", false, false, Mutability::ReadWrite),
                 attribute("manager", "complex", false, false, Mutability::ReadWrite),
             ],
         }),
@@ -164,6 +174,9 @@ mod tests {
         // The wire names `ScimUser` deserializes. This list is hand-written -- serde field
         // names are not reflectable at runtime -- so what keeps it honest is the EXHAUSTIVE
         // destructure below, which stops compiling the moment the struct grows a field.
+        // The EXTENSION is checked against its own schema, not this one: its attributes are
+        // published under `ENTERPRISE_USER_SCHEMA` and arrive under that URN, so requiring the
+        // core document to name them would be requiring the wrong document.
         let modelled = ["userName", "externalId", "active"];
         let missing: Vec<&&str> = modelled
             .iter()
@@ -183,15 +196,58 @@ mod tests {
             user_name: _,
             external_id: _,
             active: _,
+            enterprise: _,
         } = crate::resource::ScimUser {
             user_name: String::new(),
             external_id: None,
             active: true,
+            enterprise: None,
         };
         assert_eq!(
             modelled.len(),
             3,
-            "the destructure above and this list must describe the same struct"
+            "the destructure above and this list must describe the same CORE struct; \
+             `enterprise` is the fourth field and is covered by the extension check below"
+        );
+    }
+
+    /// And the EXTENSION document publishes every attribute the model accepts.
+    ///
+    /// The same direction as the test above, for the schema the test above deliberately does
+    /// not cover. `ScimUser::enterprise_traits` refuses anything outside
+    /// `ENTERPRISE_ATTRIBUTES`, so that constant is what the model accepts, and a published
+    /// document naming fewer would tell a client not to send an attribute this server stores.
+    ///
+    /// Both directions, because each fails differently: an attribute published and not stored
+    /// is silently dropped, and one stored and not published is never sent.
+    #[test]
+    fn the_enterprise_schema_and_the_model_name_the_same_attributes() {
+        let published: Vec<String> = core_schemas()
+            .iter()
+            .find(|schema| schema["id"] == ENTERPRISE_USER_SCHEMA)
+            .expect("the enterprise schema is published")["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|attribute| {
+                attribute["name"]
+                    .as_str()
+                    .expect("a name")
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let mut accepted: Vec<String> = crate::resource::ENTERPRISE_ATTRIBUTES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        accepted.sort();
+        let mut published = published;
+        published.sort();
+        assert_eq!(
+            published, accepted,
+            "the published Enterprise User attributes and the ones the model stores must be \
+             the same set: one published and not stored is silently dropped, one stored and \
+             not published is never sent"
         );
     }
 }

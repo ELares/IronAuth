@@ -29,11 +29,44 @@ pub struct ScimUser {
     /// Whether the account is enabled.
     #[serde(default = "default_active")]
     pub active: bool,
+    /// The Enterprise User extension attributes (RFC 7643 section 4.3), as sent.
+    ///
+    /// KEYED BY THE URN, which is how SCIM carries an extension: the attributes arrive under
+    /// `urn:ietf:params:scim:schemas:extension:enterprise:2.0:User`, not at the top level.
+    ///
+    /// This surface PUBLISHED that extension in `/Schemas` from the day it shipped and parsed
+    /// none of it, so an Entra push carrying `employeeNumber` and `department` was answered
+    /// `201 Created` with the attributes silently dropped -- the advertise-what-you-do-not-do
+    /// defect this crate has now been caught by twice.
+    ///
+    /// Held as a raw map rather than a struct of the three attributes RFC 7643 names. A struct
+    /// would silently drop a fourth, and [`ScimUser::enterprise_traits`] is where the set this
+    /// server stores is decided, in one place, rather than by what a type happened to declare.
+    #[serde(
+        rename = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User",
+        default
+    )]
+    pub enterprise: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 fn default_active() -> bool {
     true
 }
+
+/// The Enterprise User attributes this server stores, lower-cased for matching.
+///
+/// EXACTLY RFC 7643 section 4.3's list, and a closed one. An extension attribute this server
+/// does not store must be REFUSED rather than accepted and dropped, because a provisioning
+/// client that reads `201` has been told the value round-trips.
+pub const ENTERPRISE_ATTRIBUTES: [&str; 7] = [
+    "employeenumber",
+    "costcenter",
+    "organization",
+    "division",
+    "department",
+    "manager",
+    "employeetype",
+];
 
 impl ScimUser {
     /// The canonical identifier this resource maps to.
@@ -56,6 +89,30 @@ impl ScimUser {
         };
         canonicalize_identifier(kind, &self.user_name)
     }
+
+    /// The extension attributes to store, with their SCIM names preserved.
+    ///
+    /// Returns `Err` naming the first attribute this server does not store. Refusing rather
+    /// than dropping is the whole point: `/Schemas` publishes what the extension carries, and a
+    /// client that sends an attribute and gets a 201 is entitled to read it back.
+    ///
+    /// # Errors
+    ///
+    /// The offending attribute name, when the extension carries one outside
+    /// [`ENTERPRISE_ATTRIBUTES`].
+    pub fn enterprise_traits(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let Some(extension) = self.enterprise.as_ref() else {
+            return Ok(serde_json::Map::new());
+        };
+        let mut traits = serde_json::Map::new();
+        for (name, value) in extension {
+            if !ENTERPRISE_ATTRIBUTES.contains(&name.to_ascii_lowercase().as_str()) {
+                return Err(name.clone());
+            }
+            traits.insert(name.clone(), value.clone());
+        }
+        Ok(traits)
+    }
 }
 
 #[cfg(test)]
@@ -64,6 +121,7 @@ mod tests {
 
     fn scim(user_name: &str) -> ScimUser {
         ScimUser {
+            enterprise: None,
             user_name: user_name.to_owned(),
             external_id: None,
             active: true,
