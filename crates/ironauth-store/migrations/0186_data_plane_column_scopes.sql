@@ -11,9 +11,24 @@
 --
 -- WHY A NEW MIGRATION RATHER THAN AN EDIT. 0178, 0181 and 0182 are shipped and their whole
 -- file content is checksummed, so editing one is not available even though it is where the
--- mistake is. The grants are therefore REVOKED and re-issued here, and the revoke has to name
--- the table-wide privilege explicitly: `REVOKE UPDATE ON t` removes the table-wide grant and
--- leaves any column-scoped grant standing, which is exactly the shape wanted.
+-- mistake is. The grants are therefore REVOKED and re-issued here.
+--
+-- READ THIS BEFORE COPYING THIS FILE FOR A FOURTH TABLE. `REVOKE UPDATE ON t FROM role` clears
+-- BOTH FORMS: the table-wide grant AND every column-scoped grant on that table. It is not a
+-- narrowing operator. Measured:
+--
+--   GRANT  UPDATE (a) ON probe TO r;   -- column t, table f
+--   GRANT  UPDATE     ON probe TO r;   -- column t, table t
+--   REVOKE UPDATE     ON probe FROM r; -- column f, table f   <-- the column grant is gone too
+--
+-- So the GRANT that follows a REVOKE must re-issue the WHOLE intended set, not just the part
+-- being added. It is safe on these three tables only because none of them carried a prior
+-- column-scoped UPDATE grant for `ironauth_app` -- checked across all 186 migrations. That is
+-- NOT true of every table: `scim_membership_activation` holds
+-- `GRANT UPDATE (active, updated_at) ... TO ironauth_app` from 0185, and a later migration
+-- written to a "revoke leaves column grants standing" reading would silently delete both and
+-- break the SCIM activation writer at runtime with SQLSTATE 42501 -- the exact failure this
+-- header exists to prevent. An earlier version of this paragraph said precisely that, backwards.
 --
 -- HOW THE COLUMN LISTS WERE DERIVED. Not from what each surface conceptually does, but from
 -- the SET list of every statement the data plane actually executes against the table. Postgres

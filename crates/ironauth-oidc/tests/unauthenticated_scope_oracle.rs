@@ -182,7 +182,15 @@ fn cases() -> Vec<Case> {
         // anything up, so a live and a ghost scope must be one answer. Driving it with a
         // real client_id instead would measure the cross-scope refusal, which
         // `scoped_authorize.rs` owns, and would say nothing about the ghost case.
-        // The CIBA approval page (issue #128). DRIVEN rather than excluded, even though it is
+        Case {
+            template: "/t/{tenant_id}/e/{environment_id}/authorize",
+            query: "",
+            method: "GET",
+            content_type: "text/plain",
+            body: "",
+            live_status: StatusCode::BAD_REQUEST,
+        },
+        // The CIBA approval page (issue #131 criterion 1). DRIVEN rather than excluded, even though it is
         // session gated like the account pages: it is cheap to drive, and an exclusion is a
         // promise about a code path while a case is a measurement of the answer. It shipped
         // neither, which is what
@@ -198,14 +206,6 @@ fn cases() -> Vec<Case> {
             content_type: "text/plain",
             body: "",
             live_status: StatusCode::UNAUTHORIZED,
-        },
-        Case {
-            template: "/t/{tenant_id}/e/{environment_id}/authorize",
-            query: "",
-            method: "GET",
-            content_type: "text/plain",
-            body: "",
-            live_status: StatusCode::BAD_REQUEST,
         },
         Case {
             template: "/t/{tenant_id}/e/{environment_id}/device",
