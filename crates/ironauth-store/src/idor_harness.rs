@@ -197,6 +197,39 @@ impl IdorHarness {
         self
     }
 
+    /// Register the inbound SCIM probes (issue #135, criterion 5).
+    ///
+    /// The criterion is that a valid token for organization A "cannot read, create, or mutate
+    /// any resource in org B via any encoding, path traversal, filter, or bulk trick". Those
+    /// are SURFACE questions and `ironauth-scim`'s own suites drive them through the router.
+    /// What belongs HERE is the layer beneath: the repository operations that resolve a SCIM
+    /// resource by identifier, exercised against an identifier from another scope.
+    ///
+    /// It matters separately because the surface's fence and the store's fence are different
+    /// defences. `authenticate` derives the scope from the credential, so a surface test can
+    /// never present a foreign id under a caller's own scope -- which is exactly the shape this
+    /// harness constructs, and exactly what a future handler that took an id from a path would
+    /// hand the store.
+    ///
+    /// ONE PROBE, and the reason is a real limit of this trait rather than a gap. An
+    /// [`IsolationProbe`] receives ONE untrusted identifier, and the rest of the SCIM
+    /// operations resolve on TWO -- `(organization, user)` for the Enterprise attributes and
+    /// the activation, `(connection, user)` for the external-id mapping. Handed one foreign id
+    /// and a locally-minted second, they address a pair that names no row in ANY scope, so they
+    /// answer not-found for a reason that has nothing to do with isolation.
+    ///
+    /// That was not a hypothesis: four such probes were written, registered, and measured
+    /// BLIND -- run against the caller's own scope, where nothing fences them, only the
+    /// connection listing could see a row at all. They live in
+    /// `ironauth-scim/tests/idor.rs` now, driven with both foreign identifiers and with the
+    /// same can-it-see-a-row control that caught them.
+    ///
+    /// Run this with the DATA-plane store: SCIM is mounted on the public plane.
+    pub fn register_scim_probes(&mut self) -> &mut Self {
+        self.register(Box::new(ScimConnectionListProbe));
+        self
+    }
+
     /// Register the OIDC data-plane probes (issue #12, #15): the scoped-resource
     /// resolve-by-id operations of the authorization-code grant. Today that is
     /// `authorization_codes.redeem` (a cross-scope code must never be consumable),
@@ -474,6 +507,41 @@ impl IsolationProbe for UserIdentifierListProbe {
                 .scoped(caller)
                 .user_identifiers()
                 .list_for_user(&id)
+                .await
+            {
+                Ok(rows) if rows.is_empty() => ProbeOutcome::Denied,
+                Ok(_) => ProbeOutcome::Leaked,
+                Err(_) => ProbeOutcome::Denied,
+            }
+        })
+    }
+}
+
+/// SCIM probe: listing a FOREIGN organization's provisioning connections.
+///
+/// The listing is the operator's inventory of credentials that can provision. Reading another
+/// organization's would name the connections an attacker would then try to use.
+struct ScimConnectionListProbe;
+
+impl IsolationProbe for ScimConnectionListProbe {
+    fn name(&self) -> &'static str {
+        "scim_connections.list_for_organization"
+    }
+
+    fn probe<'a>(
+        &'a self,
+        store: &'a Store,
+        caller: Scope,
+        foreign_id: &'a str,
+    ) -> BoxProbeFuture<'a> {
+        Box::pin(async move {
+            let Ok(id) = OrganizationId::parse_in_scope(foreign_id, &caller) else {
+                return ProbeOutcome::Denied;
+            };
+            match store
+                .scoped(caller)
+                .scim_connections()
+                .list_for_organization(&id, PROBE_PAGE_LIMIT, None)
                 .await
             {
                 Ok(rows) if rows.is_empty() => ProbeOutcome::Denied,

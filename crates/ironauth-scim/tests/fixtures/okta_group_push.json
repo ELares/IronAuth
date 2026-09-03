@@ -1,0 +1,13 @@
+{
+  "source": "Okta group push: creating the group, RFC 7643 section 4.2",
+  "path": "/Groups",
+  "method": "POST",
+  "body": {
+    "schemas": [
+      "urn:ietf:params:scim:schemas:core:2.0:Group"
+    ],
+    "displayName": "Engineering"
+  },
+  "expect_status": 201,
+  "expect_why": "criterion 1 names GROUP PUSH, and the corpus drove only a membership REMOVAL through a filtered PATCH path. Pushing a group is first the create; okta_group_membership.json is what happens afterwards. A corpus that covered only the second reported on group push while never creating one."
+}
