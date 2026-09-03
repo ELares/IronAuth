@@ -44,11 +44,12 @@
 //! itself the scope check, so a foreign id is refused there and the operation is never reached.
 //! That is fine when the operation's own fence is what the parse enforces.
 //!
-//! NOT ALL of them: `FederationLoginStateConsumeProbe` hands `foreign_id` straight to
-//! `consume()` and does reach the operation, which a review measured by making it report a leak
-//! on arrival. An earlier version of this paragraph said "every probe here is written this
-//! way", which is the kind of universal that is easy to write and one counterexample away from
-//! false -- and the counterexample was in this file.
+//! NOT ALL of them, and not by a narrow margin: FOURTEEN of the sixty-two probes here hand the
+//! identifier over unparsed. `FederationLoginStateConsumeProbe` passes `foreign_id` straight to
+//! `consume()`, which a review measured by making the operation report a leak on arrival, and
+//! `UserByIdentifierProbe` has the same shape. An earlier version of this paragraph said "every
+//! probe here is written this way"; the version after it named one exception and called it "the
+//! counterexample", which reads as exhaustive and is wrong by thirteen.
 //!
 //! It stops working for an operation that resolves on TWO identifiers. Handed one foreign id
 //! and a locally-minted second, such a probe addresses a pair that names no row in ANY scope,
@@ -59,11 +60,12 @@
 //! `OrganizationId` embeds its scope and so `parse_in_scope` refused every id before the call.
 //!
 //! So the inbound SCIM operations are driven directly, with both identifiers foreign, in
-//! `ironauth-scim/tests/idor.rs` -- which also measured that each is fenced THREE times (a Rust
-//! scope check, the query predicates, and row-level security) and that only removing all three
-//! makes the read return the victim's row. `ironauth-store/tests/scim_connections.rs` covers
-//! the single-key `list_for_organization` the same way. Nothing is registered here for SCIM,
-//! and this section is why rather than an omission.
+//! `ironauth-scim/tests/idor.rs`. That file measured the fences too, and they are not uniform:
+//! the READS carry three (a Rust scope check, the query predicates, and row-level security) and
+//! removing any one leaks nothing, while the WRITES carry ONE, because they bind the caller's
+//! scope into the row rather than filtering on it and so have no predicate to fence.
+//! `ironauth-store/tests/scim_connections.rs` covers the remaining SCIM operations the same
+//! way. Nothing is registered here for SCIM, and this section is why rather than an omission.
 
 use std::future::Future;
 use std::pin::Pin;

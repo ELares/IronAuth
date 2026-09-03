@@ -15,14 +15,20 @@
 //! thing a future handler that took an id from a request path would hand the store. This file
 //! constructs exactly that.
 //!
-//! NOT EVERY SCIM OPERATION, and the count is worth stating rather than implying. Ten resolve a
-//! resource by identifier across the four SCIM repositories. Seven are driven here; three more
-//! are driven the same way in `ironauth-store/tests/scim_connections.rs` (a foreign
-//! `list_for_organization`, `exists_in_organization` and `resolve`). Two of the seven --
-//! `ScimActivationRepo::set_active` and `::active_elsewhere` -- were covered NOWHERE until a
-//! review deleted both their scope guards and watched 193 tests pass. `active_elsewhere` is the
-//! read that decides whether deprovisioning disables the account; `set_active` is the
-//! cross-scope deactivation WRITE.
+//! NOT EVERY SCIM OPERATION, and the partition is worth stating exactly rather than implying.
+//! Ten operations across the four SCIM repositories take an identifier and fence on it. SEVEN
+//! are driven here. The other THREE -- `ScimConnectionRepo::exists_in_organization`,
+//! `ScimExternalIdRepo::bind` and `::resolve` -- are driven the same way in
+//! `ironauth-store/tests/scim_connections.rs`, which ALSO drives a foreign
+//! `list_for_organization`. That last one is covered in both places, which is why seven plus
+//! what the other file drives does not add to ten: a review counted it as an eighth operation
+//! and the arithmetic only balanced by cancelling against an operation the sentence had
+//! forgotten.
+//!
+//! Two of the seven -- `ScimActivationRepo::set_active` and `::active_elsewhere` -- were covered
+//! NOWHERE until a review deleted both their scope guards and watched 193 tests pass.
+//! `active_elsewhere` is the read that decides whether deprovisioning disables the account;
+//! `set_active` is the cross-scope deactivation WRITE.
 //!
 //! The criterion says the harness is "extended with SCIM-specific cases"; before this the word
 //! SCIM did not appear in any `idor.rs` in the workspace.
@@ -34,9 +40,26 @@ use ironauth_store::identifier::{IdentifierType, UniquenessMode};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, EnterpriseWrite, NewAdminUser, NewMembership, NewScimConnection,
-    NewUserIdentifier, OrgMembershipId, OrganizationId, ScimConnectionId, Scope, UserId,
+    NewUserIdentifier, OrgMembershipId, OrganizationId, ScimConnectionId, Scope, StoreError, UserId,
     UserIdentifierId, UserState,
 };
+
+/// What a fenced operation answered, with the refusal folded into the value a caller with no
+/// entitlement should see.
+///
+/// `unwrap_or(default)` was what every probe below used, and it folds THREE outcomes into one:
+/// the fence refusing, the operation genuinely finding nothing, and the database failing. The
+/// third is the problem. A connection fault, a missing table, a permission error -- any of them
+/// becomes the value that makes the assertion pass, so a suite whose fixture stopped working
+/// would report the isolation it can no longer test. Only [`StoreError::NotFound`] is the
+/// fence's own answer, so only that one is folded, and anything else panics naming itself.
+fn past_the_fence<T>(what: &str, result: Result<T, StoreError>, refused: T) -> T {
+    match result {
+        Ok(value) => value,
+        Err(StoreError::NotFound) => refused,
+        Err(other) => panic!("{what} failed for a reason that is not the fence: {other:?}"),
+    }
+}
 
 fn now_micros(env: &Env) -> i64 {
     i64::try_from(
@@ -55,13 +78,21 @@ fn now_micros(env: &Env) -> i64 {
 /// answers not-found for a person who does not exist, whatever the fence does. Each read here
 /// has a real row to leak.
 ///
-/// SIX ROWS FOR FIVE READS. The login identifier and the organization membership are read by
-/// nothing in this file and are not foreign-key prerequisites -- `scim_membership_activation`
-/// references only `tenants` and `environments`. They are here because a victim with a
-/// provisioning document and no membership is not a person any SCIM run would have produced,
-/// and a fixture that could not have arisen is a fixture whose absences prove less than they
-/// look like they do. An earlier version of this sentence said "one row for every probe", which
-/// a review counted and found false.
+/// WHAT EACH ROW IS FOR, since they do not correspond one-to-one with the probes and an earlier
+/// version of this doc twice claimed they did.
+///
+/// The externalId mapping, the deactivation and the Enterprise document are each read by a
+/// probe. The SECOND organization and its membership exist for `active_elsewhere`, which asks
+/// whether any organization OTHER than the one named still holds the person active: with a
+/// single organization that answer is `false` for structural reasons, so the probe asserting
+/// `!active_elsewhere(...)` would pass with every fence removed. A review measured exactly that
+/// and it is the reason a second organization is here. The FIRST membership makes the person a
+/// member of the organization the probes name, which is what `active_elsewhere` excludes. The
+/// login identifier is read by nothing and is not a foreign-key prerequisite --
+/// `scim_membership_activation` references only `tenants` and `environments` -- and is here
+/// because a provisioned person with no way to sign in is not a person any SCIM run would have
+/// produced, and a fixture that could not have arisen proves less by its absences than it
+/// looks like it does.
 ///
 /// THE THREE SCIM TABLES ARE PLANTED THROUGH THE DATA-PLANE STORE, because that is the plane
 /// that owns them: 0184, 0185 and 0187 all grant INSERT to `ironauth_app` and give the control
@@ -115,10 +146,10 @@ async fn plant_victim(db: &TestDatabase, env: &Env, scope: Scope) -> Victim {
         .await
         .expect("create the victim person");
 
-    // A login identifier, a membership, a provisioning connection, an externalId mapping, a
-    // deactivation and an Enterprise User document: one for each read below, plus the
-    // two named in this function's doc that make the victim a person a SCIM run could
-    // actually have produced.
+    // A login identifier, two memberships in two organizations, a provisioning connection, an
+    // externalId mapping, a deactivation and an Enterprise User document. What each is for is
+    // in this function's doc; the second organization in particular is load bearing, and the
+    // probe it makes non-vacuous is named there.
     db.control_store()
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
@@ -156,6 +187,48 @@ async fn plant_victim(db: &TestDatabase, env: &Env, scope: Scope) -> Victim {
         )
         .await
         .expect("plant the membership");
+
+    // THE SECOND ORGANIZATION, and it is not decoration. `active_elsewhere(excluding, user)` is
+    // `EXISTS(... WHERE user_id = $3 AND organization_id <> $4 ...)`, so with one organization
+    // -- the excluded one -- it answers `false` no matter what the fence does, and a probe
+    // asserting `!active_elsewhere(...)` passes against a completely unfenced store. A review
+    // measured that directly: run in the victim's OWN scope with every guard removed, it still
+    // answered false. A person the victim organization deactivated while another organization
+    // still holds them active is also the ordinary shape of the question, so this makes the
+    // fixture more realistic and the probe able to fail at the same time.
+    //
+    // NO ACTIVATION ROW for this one, deliberately: absent reads as ACTIVE (migration 0185), so
+    // this membership alone is what makes `active_elsewhere` answer `true` in the victim's own
+    // scope.
+    let elsewhere = OrganizationId::generate(env, &scope);
+    acting
+        .organizations(scope)
+        .create(
+            env,
+            &elsewhere,
+            now_micros(env),
+            "Victim Second Organization",
+            None,
+        )
+        .await
+        .expect("create the second organization");
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_memberships(scope)
+        .create(
+            env,
+            NewMembership {
+                id: &OrgMembershipId::generate(env, &scope),
+                organization_id: &elsewhere,
+                user_id: &user,
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("plant the second membership");
 
     let connection = ScimConnectionId::generate(env, &scope);
     db.control_store()
@@ -284,24 +357,31 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
     // somebody in another organization is a denial of service against their sign-in.
     for victim in [&victim_tenant, &victim_environment] {
         assert!(
-            db.store()
-                .scoped(caller)
-                .scim_activation()
-                .set_active(&victim.organization, &victim.user, true, now_micros(&env))
-                .await
-                .is_err(),
+            matches!(
+                db.store()
+                    .scoped(caller)
+                    .scim_activation()
+                    .set_active(&victim.organization, &victim.user, true, now_micros(&env))
+                    .await,
+                Err(StoreError::NotFound)
+            ),
             "a foreign organization's activation was writable"
         );
         // ABSENT READS AS FALSE here: `active_elsewhere` asks whether ANY OTHER organization
-        // holds the person active, so a caller who can see none must get `false`. The victim IS
-        // held active elsewhere in its own scope, so a leak reads as `true`.
+        // holds the person active, so a caller who can see none must get `false`. The victim is
+        // held active by its SECOND organization (see `plant_victim`), so a leak reads `true`
+        // and this can fail. With one organization it could not: the excluded one is the only
+        // one, and `false` is then the answer at maximum leak.
         assert!(
-            !db.store()
-                .scoped(caller)
-                .scim_activation()
-                .active_elsewhere(&victim.organization, &victim.user)
-                .await
-                .unwrap_or(false),
+            !past_the_fence(
+                "active_elsewhere",
+                db.store()
+                    .scoped(caller)
+                    .scim_activation()
+                    .active_elsewhere(&victim.organization, &victim.user)
+                    .await,
+                false,
+            ),
             "a foreign organization's activation state was observable through active_elsewhere"
         );
     }
@@ -325,62 +405,92 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
     for victim in [&victim_tenant, &victim_environment] {
         let scoped = db.store().scoped(caller);
         assert!(
-            scoped
-                .scim_enterprise()
-                .document_for(&victim.organization, &victim.user)
-                .await
-                .unwrap_or(None)
-                .is_none(),
+            past_the_fence(
+                "document_for",
+                scoped
+                    .scim_enterprise()
+                    .document_for(&victim.organization, &victim.user)
+                    .await,
+                None,
+            )
+            .is_none(),
             "a foreign organization's Enterprise attributes were readable"
         );
         assert!(
-            scoped
-                .scim_external_ids()
-                .external_id_for(&victim.connection, &victim.user)
-                .await
-                .unwrap_or(None)
-                .is_none(),
+            past_the_fence(
+                "external_id_for",
+                scoped
+                    .scim_external_ids()
+                    .external_id_for(&victim.connection, &victim.user)
+                    .await,
+                None,
+            )
+            .is_none(),
             "a foreign connection's externalId mapping was readable"
         );
         // ABSENT READS AS ACTIVE by design (migration 0185), so `true` is the not-found answer
         // and only an explicit `false` could have come from the victim's row -- which is what
         // `plant_victim` wrote.
         assert!(
-            scoped
-                .scim_activation()
-                .is_active(&victim.organization, &victim.user)
-                .await
-                .unwrap_or(true),
+            past_the_fence(
+                "is_active",
+                scoped
+                    .scim_activation()
+                    .is_active(&victim.organization, &victim.user)
+                    .await,
+                true,
+            ),
             "a foreign organization's deactivation was observable"
         );
         // THE WRITE, which matters more than any read: planting attributes on somebody else's
         // person is a takeover of what their organization believes about them.
+        //
+        // ITS RESULT IS ASSERTED, and that is the whole point of this block. The first version
+        // discarded it with `let _ =` and leaned on the victims-untouched read below, and a
+        // review measured what that actually covered: with `write`'s scope guard deleted
+        // entirely the suite stayed green. `write` BINDS the caller's scope into the row rather
+        // than filtering on it, so an unfenced cross-scope write lands in the CALLER's own
+        // scope and structurally cannot touch the victim's row. The read below can never see
+        // it. Only the refusal itself can.
         let planted = serde_json::json!({ "employeeNumber": "planted-across-a-scope" });
-        let _ = db
-            .store()
-            .scoped(caller)
-            .scim_enterprise()
-            .write(
-                &env,
-                &victim.organization,
-                &victim.user,
-                &planted,
-                EnterpriseWrite::Replace,
-                now_micros(&env),
-            )
-            .await;
+        assert!(
+            matches!(
+                db.store()
+                    .scoped(caller)
+                    .scim_enterprise()
+                    .write(
+                        &env,
+                        &victim.organization,
+                        &victim.user,
+                        &planted,
+                        EnterpriseWrite::Replace,
+                        now_micros(&env),
+                    )
+                    .await,
+                Err(StoreError::NotFound)
+            ),
+            "a foreign organization's Enterprise attributes were writable"
+        );
     }
 
     // THE CONTROL, and this suite is worth nothing without it.
     //
-    // Every one of these operations is fenced THREE times: a Rust scope check on both
-    // identifiers before any query runs, the explicit `tenant_id`/`environment_id` predicates
-    // in the query itself, and the row-level-security policy the scoped transaction binds.
-    // Removing any one leaks nothing, because the other two hold -- measured, one at a time and
-    // then two at a time. Only with all three gone does the read return the victim's row, which
-    // is what proves this assertion can fail at all.
+    // The READS are fenced three times over: a Rust scope check on both identifiers before any
+    // query runs, the explicit `tenant_id`/`environment_id` predicates in the query itself, and
+    // the row-level-security policy the scoped transaction binds. Removing any one leaks
+    // nothing, because the other two hold -- measured on `document_for`, one at a time and then
+    // two at a time. Only with all three gone does the read return the victim's row.
     //
-    // So the refusals above are equally consistent with reads that cannot observe a row.
+    // THE WRITES ARE FENCED ONCE, and an earlier version of this paragraph claimed three for
+    // them too. `set_active` and `write` do not FILTER on the scope, they BIND it: the row they
+    // insert carries the caller's own `tenant_id` and `environment_id`, so there is no
+    // predicate to fence and row-level security is satisfied by construction. A review deleted
+    // the single Rust guard in `set_active` and the suite failed immediately, which is the
+    // measurement, and it is why that guard is the only thing between a caller and deactivating
+    // somebody in another organization.
+    //
+    // Either way the refusals above are equally consistent with operations that cannot observe
+    // or touch a row at all.
     //
     // What separates the two is asking for the CALLER's own rows, where there is no fence to
     // pass. Each read must then find what `plant_victim` wrote.
@@ -423,10 +533,29 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
             .is_empty(),
         "the connection listing is blind"
     );
+    // `active_elsewhere` needs its own control more than any read here, because its refusal
+    // value and its can-see-nothing value are the SAME (`false`). This is the assertion that
+    // separates them: in the caller's own scope, with no fence in the way, the second
+    // organization `plant_victim` created must make it answer `true`.
+    assert!(
+        scoped
+            .scim_activation()
+            .active_elsewhere(&local.organization, &local.user)
+            .await
+            .expect("read"),
+        "active_elsewhere cannot see the second organization holding this person active, so \
+         its `false` above is not the fence and this suite proves nothing about it"
+    );
 
     // AND THE VICTIMS ARE UNTOUCHED. The write probe attempts a real write, so "denied" has to
     // mean "changed nothing" and not merely "answered an error". Read back in the victim's OWN
     // scope, which is the only place the answer is visible.
+    //
+    // This is a SECOND check rather than the write probe's only one, and the difference matters:
+    // because `write` binds the caller's scope rather than filtering on it, an unfenced write
+    // would land in the caller's scope and leave the victim's row exactly as it is here. So this
+    // cannot catch a missing guard -- the assertion at the probe does that -- and what it does
+    // catch is a fence that refuses the caller while still having written something.
     for victim in [&victim_tenant, &victim_environment] {
         let document = db
             .control_store()
