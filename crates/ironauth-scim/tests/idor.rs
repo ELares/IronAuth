@@ -23,7 +23,6 @@
 
 use ironauth_env::Env;
 use ironauth_store::identifier::{IdentifierType, UniquenessMode};
-use ironauth_store::idor_harness::IdorHarness;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, EnterpriseWrite, NewAdminUser, NewMembership, NewScimConnection,
@@ -44,9 +43,17 @@ fn now_micros(env: &Env) -> i64 {
 
 /// A victim organization with one provisioned person, everything a SCIM run would leave behind.
 ///
-/// PLANTED IN FULL, because a probe against an EMPTY scope proves nothing: every operation
-/// answers not-found for a person who does not exist, whatever the fence does. Each probe here
+/// PLANTED IN FULL, because a read against an EMPTY scope proves nothing: every operation
+/// answers not-found for a person who does not exist, whatever the fence does. Each read here
 /// has a real row to leak.
+///
+/// SIX ROWS FOR FIVE READS. The login identifier and the organization membership are read by
+/// nothing in this file and are not foreign-key prerequisites -- `scim_membership_activation`
+/// references only `tenants` and `environments`. They are here because a victim with a
+/// provisioning document and no membership is not a person any SCIM run would have produced,
+/// and a fixture that could not have arisen is a fixture whose absences prove less than they
+/// look like they do. An earlier version of this sentence said "one row for every probe", which
+/// a review counted and found false.
 ///
 /// THE THREE SCIM TABLES ARE PLANTED THROUGH THE DATA-PLANE STORE, because that is the plane
 /// that owns them: 0184, 0185 and 0187 all grant INSERT to `ironauth_app` and give the control
@@ -226,32 +233,53 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
     let victim_tenant = plant_victim(&db, &env, other_tenant).await;
     let victim_environment = plant_victim(&db, &env, other_environment).await;
 
-    // And a well-formed identifier of the CALLER's own scope naming nothing, so the suite
-    // covers the absent case with the same probes: a fence that answered differently for
-    // "foreign" and "absent" would tell a caller which scopes exist.
-    let absent_here = UserId::generate(&env, &caller).to_string();
+    // And a pair of the CALLER's own scope naming nothing, so the suite covers the ABSENT case
+    // with the same reads: a fence that answered differently for "foreign" and "absent" would
+    // tell a caller which scopes exist. Both halves are generated, because a read that resolves
+    // on two identifiers needs two -- an earlier version passed a `usr_` id to a probe that
+    // parsed it as an organization, so it was rejected as MALFORMED and never reached the
+    // absent case at all.
+    let absent_org = OrganizationId::generate(&env, &caller);
+    let absent_user = UserId::generate(&env, &caller);
 
-    let mut harness = IdorHarness::new();
-    harness.register_scim_probes();
-    assert_eq!(
-        harness.probe_names(),
-        vec!["scim_connections.list_for_organization"],
-        "the harness carries the SCIM operations that resolve on ONE identifier; the two-key \
-         ones are driven below, because a probe handed one foreign id and a locally-minted \
-         second addresses a pair that names no row in any scope"
-    );
+    // NOTHING IS REGISTERED IN THE HARNESS FOR SCIM, and that is a measurement rather than an
+    // omission. An `IsolationProbe` receives one identifier and must parse it first, and for a
+    // scope-EMBEDDING id `parse_in_scope` IS the scope check -- so a foreign id is refused
+    // there and the operation is never reached. A review planted an assert inside
+    // `list_for_organization` and it never fired for any id the probe was fed: the probe tested
+    // the parser, which `OrganizationGetProbe` already tests.
+    //
+    // `ironauth-store/tests/scim_connections.rs` drives that one directly with a foreign
+    // organization. Everything below drives the two-key operations the same way.
 
-    let foreign = [
-        victim_tenant.organization.to_string(),
-        victim_environment.organization.to_string(),
-        absent_here.clone(),
-    ];
-    let refs: Vec<&str> = foreign.iter().map(String::as_str).collect();
-    // THE DATA-PLANE store, because that is the plane SCIM is mounted on.
-    let leaks = harness.run(db.store(), caller, &refs).await;
+    // THE SINGLE-KEY LISTING, driven directly for the reason above.
+    for organization in [
+        &victim_tenant.organization,
+        &victim_environment.organization,
+    ] {
+        assert!(
+            db.store()
+                .scoped(caller)
+                .scim_connections()
+                .list_for_organization(organization, 100, None)
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a foreign organization's provisioning connections were listable"
+        );
+    }
+
+    // AND THE ABSENT PAIR, which must answer exactly as the foreign ones do: a fence that told
+    // "foreign" from "absent" would tell a caller which scopes exist.
     assert!(
-        leaks.is_empty(),
-        "cross-scope SCIM leak detected: {leaks:?}"
+        db.store()
+            .scoped(caller)
+            .scim_enterprise()
+            .document_for(&absent_org, &absent_user)
+            .await
+            .expect("an in-scope pair naming nothing is a clean read")
+            .is_none(),
+        "an absent in-scope pair must read as absent"
     );
 
     // THE TWO-KEY OPERATIONS, driven with BOTH identifiers foreign, which is the only shape

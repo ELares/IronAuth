@@ -11,5 +11,9 @@
     "externalId": "okta-00u1a2b3c4"
   },
   "expect_status": 200,
-  "expect_why": "criterion 1 names UPDATE alongside create and deactivate, and the corpus drove neither a PUT nor anything else that replaces a resource. Okta re-sends the whole profile on every change, so this is the shape most of its traffic takes. The userName matches the seeded person because a changed one is refused as immutable, which is a different contract this fixture is not about."
+  "expect_why": "criterion 1 names UPDATE alongside create and deactivate, and the corpus drove neither a PUT nor anything else that replaces a resource. Okta re-sends the whole profile on every change, so this is the shape most of its traffic takes. The userName matches the seeded person because a changed one is refused as immutable, which is a different contract this fixture is not about. THE BODY FRAGMENTS ARE THE POINT: a review deleted all three of `replace_user`'s effects, leaving a PUT that authenticates, parses and renders the UNCHANGED resource with 200, and a status-only fixture passed. Both fragments are things the replay's own seeding leaves FALSE beforehand -- the seeded person is deactivated and has no externalId -- so each one can only be true if this request did the work.",
+  "expect_body_contains": [
+    "\"active\":true",
+    "\"externalId\":\"okta-00u1a2b3c4\""
+  ]
 }

@@ -9,5 +9,8 @@
     "displayName": "Engineering"
   },
   "expect_status": 201,
-  "expect_why": "criterion 1 names GROUP PUSH, and the corpus drove only a membership REMOVAL through a filtered PATCH path. Pushing a group is first the create; okta_group_membership.json is what happens afterwards. A corpus that covered only the second reported on group push while never creating one."
+  "expect_why": "criterion 1 names GROUP PUSH, and the corpus drove only a membership REMOVAL through a filtered PATCH path -- the step AFTER the push. A corpus that covered only the second reported on group push while never creating one. The replay's own seeding also creates a group, so this fixture's contribution is the CORPUS entry the coverage guard requires by name rather than a code path nothing else reaches; the body fragment is what stops it being a status code with no evidence behind it.",
+  "expect_body_contains": [
+    "\"displayName\":\"Engineering\""
+  ]
 }
