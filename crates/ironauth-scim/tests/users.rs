@@ -4759,9 +4759,10 @@ async fn a_malformed_filter_is_refused_at_the_surface_rather_than_matching_every
     let group = make_group_for_filter(&db, &env, &okta.token, "Engineering").await;
     assert!(!group.is_empty());
 
-    // OVER THE LENGTH BOUND (4096 bytes) and OVER THE DEPTH BOUND (20), built rather than
-    // written out: a literal of either would be unreadable and would silently stop matching the
-    // bound if the constant moved.
+    // OVER THE LENGTH BOUND (4096 bytes) and OVER THE DEPTH BOUND (20). Assembled rather than
+    // written out for READABILITY only: both sizes are still literals, because the bounds are
+    // private to `filter.rs` and an integration test cannot name them. What stops a moved bound
+    // from silently costing coverage is the `detail` assertion below, not this.
     let too_long = format!("userName eq \"{}\"", "a".repeat(4200));
     let too_deep = format!("{}userName pr{}", "(".repeat(30), ")".repeat(30));
     for (what, filter, detail) in [
