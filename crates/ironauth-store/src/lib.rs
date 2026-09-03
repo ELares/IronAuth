@@ -286,7 +286,7 @@ pub use repository::{
     DeviceApproval, DeviceApproveOutcome, DeviceAttemptOutcome, DeviceClientProfile,
     DeviceCodeRepo, DevicePollOutcome, DeviceRedeemOutcome, DeviceUserCodeLookup,
     DiagnosticExpectation, DpopProofReplayRepo, DynamicClientRecord, DynamicClientRegistration,
-    DynamicClientUpdate, EffectiveRoleGrant, EffectiveRoleSource, EnvelopeRepo,
+    DynamicClientUpdate, EffectiveRoleGrant, EffectiveRoleSource, EnterpriseWrite, EnvelopeRepo,
     EnvironmentGuardrailRepo, EnvironmentRecord, EnvironmentRepo, EnvironmentSecretMetadata,
     EnvironmentSecretRepo, EnvironmentServingState, EnvironmentVariableRecord,
     EnvironmentVariableRepo, EventCursor, EventPage, ExportedCredential, ExportedRecoveryCode,

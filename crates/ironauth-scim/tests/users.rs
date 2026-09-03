@@ -46,6 +46,41 @@ struct Tenant {
     organization: OrganizationId,
 }
 
+/// A SECOND connection into an organization that already has one.
+///
+/// What a credential rotation produces: `scim_connections` grants UPDATE only on
+/// `(revoked_at, updated_at)`, so a token cannot be rotated in place and a rotation is a new
+/// row with a new id.
+async fn seed_connection_for(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    secret: &str,
+) -> String {
+    let id = ScimConnectionId::generate(env, &scope);
+    let token = mint_token(&id, secret);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .scim_connections()
+        .create(
+            env,
+            NewScimConnection {
+                id: &id,
+                organization_id: organization,
+                display_name: "rotated",
+                provider: "entra",
+                token_digest: &digest_of(&token),
+                expires_at_unix_micros: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the second connection");
+    token
+}
+
 async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret: &str) -> Tenant {
     let org = OrganizationId::generate(env, &scope);
     db.control_store()
@@ -2565,7 +2600,7 @@ async fn an_attribute_outside_the_extension_is_refused_rather_than_dropped() {
 /// the number that person has at that organization, and two organizations provisioning one
 /// human legitimately have different ones.
 #[tokio::test]
-async fn one_connections_enterprise_attributes_are_invisible_to_another() {
+async fn one_organizations_enterprise_attributes_are_invisible_to_another() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -3015,4 +3050,415 @@ async fn a_create_and_a_patch_spelling_one_attribute_differently_write_one_attri
         Some("902"),
         "the PATCH must replace what the create wrote: {patched}"
     );
+}
+
+/// A SECOND connection into the SAME organization sees what the first wrote.
+///
+/// This is the half the per-connection key got wrong. `scim_connections` grants UPDATE only on
+/// `(revoked_at, updated_at)`, so a token rotation is necessarily a NEW connection row with a
+/// new id -- and keyed per connection, every attribute the old one wrote became unreadable
+/// through the surface. A review measured exactly that. An Okta-to-Entra cutover inside one
+/// organization is the same shape.
+///
+/// An employee number is a fact the ORGANIZATION holds about the person, which is why the key
+/// is the organization and not the credential that happened to write it.
+#[tokio::test]
+async fn a_second_connection_into_one_organization_sees_what_the_first_wrote() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let first = seed_org(&db, &env, scope, "Acme", "s-first").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&first.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "rotated@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "701",
+                "department": "Tools",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // THE ROTATION: a second connection into the SAME organization, as a credential rotation
+    // or a vendor cutover produces.
+    let second = seed_connection_for(&db, &env, scope, &first.organization, "s-second").await;
+
+    let (status, seen) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&second),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    let extension = serde_json::from_str::<Value>(&seen).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("701"),
+        "a rotated credential must still see its organization's attributes: {seen}"
+    );
+    assert_eq!(extension["department"].as_str(), Some("Tools"), "{seen}");
+
+    // AND IT WRITES INTO THE SAME DOCUMENT, so the first connection sees the update rather than
+    // two organizations' worth of divergent state.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&second),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+                "value": "Platform",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let (_, first_sees) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&first.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&first_sees).expect("json")
+            ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["department"]
+            .as_str(),
+        Some("Platform"),
+        "{first_sees}"
+    );
+}
+
+/// A `PUT` REPLACES the extension: what the body omits is gone.
+///
+/// RFC 7644 section 3.5.1 makes PUT a replace, and the write was a merge -- a review measured a
+/// PUT carrying one attribute answering 200 and leaving the other two standing, and a PUT
+/// carrying no extension at all leaving the whole document. `rebind_external_id` next door
+/// writes an explicit argument for its own deviation from PUT semantics; this write had none.
+#[tokio::test]
+async fn a_put_replaces_the_extension_rather_than_merging_into_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "replaced@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "701",
+                "department": "Tools",
+                "costCenter": "CC-1",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // A PUT carrying ONE attribute: the other two are gone.
+    let (status, replaced) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "replaced@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "902",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    let extension = serde_json::from_str::<Value>(&replaced).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    assert_eq!(
+        extension.as_object().map(serde_json::Map::len),
+        Some(1),
+        "a PUT must replace the extension, not merge into it: {replaced}"
+    );
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("902"),
+        "{replaced}"
+    );
+
+    // AND A PUT CARRYING NO EXTENSION CLEARS IT. That is the same rule, and it is the case a
+    // bail-out on an empty document silently got wrong.
+    let (status, cleared) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "replaced@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    let parsed: Value = serde_json::from_str(&cleared).expect("json");
+    assert!(
+        parsed
+            .get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User")
+            .is_none(),
+        "a PUT carrying no extension must clear it: {cleared}"
+    );
+}
+
+/// `add` on the complex `manager` keeps sub-attributes it did not name.
+///
+/// RFC 7644 section 3.5.2.1 makes `add` on a complex attribute add SUB-attributes to the
+/// existing value. `||` is a shallow merge, so a review measured
+/// `{"op":"add","path":"...:manager","value":{"value":"boss-2"}}` destroying the stored
+/// manager's `displayName` and `$ref` -- silently, since the client did not mention them.
+///
+/// `replace` is the control: it is defined to replace, and must still do so.
+#[tokio::test]
+async fn add_on_the_complex_manager_keeps_sub_attributes_it_did_not_name() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "managed@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "manager": {
+                    "value": "boss-1",
+                    "displayName": "Boss One",
+                    "$ref": "https://example.test/scim/v2/Users/boss-1",
+                },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, added) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "add",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:manager",
+                "value": { "value": "boss-2" },
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    let manager = serde_json::from_str::<Value>(&added).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["manager"]
+        .clone();
+    assert_eq!(manager["value"].as_str(), Some("boss-2"), "{added}");
+    assert_eq!(
+        manager["displayName"].as_str(),
+        Some("Boss One"),
+        "an add on a complex attribute must keep sub-attributes it did not name: {added}"
+    );
+
+    // `replace` IS defined to replace, and must still do so -- otherwise the fix above would
+    // have made every write a merge, which is the opposite error.
+    let (status, replaced) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:manager",
+                "value": { "value": "boss-3" },
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    let manager = serde_json::from_str::<Value>(&replaced).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["manager"]
+        .clone();
+    assert!(
+        manager.get("displayName").is_none(),
+        "replace on a complex attribute must replace it: {replaced}"
+    );
+}
+
+/// A valueless `add` or `replace` is a client error, not a remove.
+///
+/// The value defaulted to `Value::Null`, which feeds the null-means-remove convention: a review
+/// measured `{"op":"replace","path":"...:department"}` with no `value` member answering 200 and
+/// DELETING the attribute. RFC 7644 sections 3.5.2.1 and 3.5.2.3 make both a client error, and
+/// the two sibling arms in the same match already refuse one.
+///
+/// And a WRONG-TYPED value is refused too: `/Schemas` publishes `employeeNumber` as a string,
+/// and a review measured an object accepted and round-tripped verbatim.
+#[tokio::test]
+async fn a_valueless_or_wrong_typed_enterprise_operation_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "typed@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "department": "Tools",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    for (label, operation) in [
+        (
+            "a replace with no value",
+            json!({"op": "replace",
+                   "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department"}),
+        ),
+        (
+            "an add with no value",
+            json!({"op": "add",
+                   "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department"}),
+        ),
+        (
+            "a string where the document publishes complex",
+            json!({"op": "replace",
+                   "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:manager",
+                   "value": "a bare string"}),
+        ),
+        (
+            "an object where the document publishes string",
+            json!({"op": "replace",
+                   "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+                   "value": {"nested": true}}),
+        ),
+    ] {
+        let (status, refused) = call(
+            &db,
+            &env,
+            "PATCH",
+            &format!("/scim/v2/Users/{user}"),
+            Some(&acme.token),
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [operation],
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label} was accepted: {refused}"
+        );
+    }
+
+    // AND NOTHING WAS DESTROYED. The first two would have deleted the attribute; the last two
+    // would have stored a value the published document says cannot be there.
+    let (_, after) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&after).expect("json")
+            ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["department"]
+            .as_str(),
+        Some("Tools"),
+        "a refused operation changed the document: {after}"
+    );
+
+    // A CREATE carrying a wrong-typed value is refused too, so the rule is not PATCH-only.
+    let (status, refused) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "wrongtype@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": {"nested": ["an", "object"]},
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
 }

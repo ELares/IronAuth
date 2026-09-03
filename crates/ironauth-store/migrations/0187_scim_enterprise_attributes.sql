@@ -18,10 +18,20 @@
 -- THAT ORGANIZATION, and two organizations provisioning one human legitimately have different
 -- ones.
 --
--- It is the same argument 0184 makes for `externalId`, and the same namespace: the CONNECTION.
--- Keyed that way, "what does this identity provider say about this person" is unambiguous for
--- every provider at once, and revoking a connection leaves its attributes addressable for an
--- operator reconstructing what it did.
+-- THE KEY IS THE ORGANIZATION, not the connection, and the difference is not cosmetic.
+--
+-- 0184 keys `externalId` per CONNECTION because an external id is the IDENTITY PROVIDER's own
+-- handle for a person: Okta's is a directory id, Entra's is an object id, and two providers
+-- naming one person differently is correct. An employee number is not that. It is a fact the
+-- ORGANIZATION holds about the person, and two connections into one organization -- Okta and
+-- Entra during a cutover, or the old and new rows of a credential rotation -- are describing
+-- the same fact.
+--
+-- A first revision of this table keyed it per connection, and a review measured what that
+-- costs: `scim_connections` grants UPDATE only on `(revoked_at, updated_at)`, so a token
+-- rotation is necessarily a NEW row with a new id, and every attribute the old connection wrote
+-- became unreadable through the surface. The attributes were stranded by a routine credential
+-- rotation.
 --
 -- Two more things fell out of the trait storage that this shape removes rather than fixes. The
 -- write was a read-modify-write across two transactions, and a review measured six concurrent
@@ -30,7 +40,7 @@
 -- ACTIVE trait schema, so an operator who had not declared these attributes had a surface that
 -- refused them -- and the refusal landed AFTER the account was created.
 --
--- ONE ROW PER (connection, user), holding the whole extension as JSON.
+-- ONE ROW PER (organization, user), holding the whole extension as JSON.
 --
 -- Not a column per attribute. The set is fixed by RFC 7643 today and the handler refuses
 -- anything outside it, so a column per attribute would be defensible -- but `manager` is a
@@ -43,8 +53,8 @@ CREATE TABLE scim_enterprise_attributes (
     id                 text        PRIMARY KEY,
     tenant_id          text        NOT NULL,
     environment_id     text        NOT NULL,
-    -- The connection whose namespace these attributes live in.
-    connection_id      text        NOT NULL,
+    -- The organization whose view of this person these attributes are.
+    organization_id    text        NOT NULL,
     -- The person they describe.
     user_id            text        NOT NULL,
     -- The extension document, exactly as the handler validated it. An OBJECT, enforced here so
@@ -60,15 +70,20 @@ CREATE TABLE scim_enterprise_attributes (
 
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
+    -- BOTH ENDS EXIST. `organization_id` is the isolation boundary this table is keyed on, so
+    -- unlike 0184's `connection_id` -- which names a credential and is not a boundary -- it
+    -- carries a foreign key: a row that named an organization the database does not have would
+    -- be a boundary with nothing behind it.
+    FOREIGN KEY (organization_id) REFERENCES organizations (id),
     -- The user must exist. Users are soft-deleted, so a row never dangles.
     FOREIGN KEY (user_id) REFERENCES users (id)
 );
 
--- ONE DOCUMENT PER (connection, user), which is what makes the write a single upsert rather
+-- ONE DOCUMENT PER (organization, user), which is what makes the write a single upsert rather
 -- than a read-modify-write. The lost-update window the trait storage had is not narrowed here,
 -- it is absent: there is nothing to read first.
 CREATE UNIQUE INDEX scim_enterprise_attributes_by_user
-    ON scim_enterprise_attributes (tenant_id, environment_id, connection_id, user_id);
+    ON scim_enterprise_attributes (tenant_id, environment_id, organization_id, user_id);
 
 ALTER TABLE scim_enterprise_attributes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE scim_enterprise_attributes FORCE ROW LEVEL SECURITY;
@@ -88,17 +103,18 @@ CREATE POLICY scim_enterprise_attributes_scope ON scim_enterprise_attributes
 --
 -- The UPDATE is COLUMN-SCOPED to what the upsert's SET list names, per the issue #31 lesson and
 -- the rule 0186's header spells out: a REVOKE clears both grant forms, so this is the whole
--- intended set in one statement. `connection_id` and `user_id` are absent deliberately -- they
+-- intended set in one statement. `organization_id` and `user_id` are absent deliberately -- they
 -- are the row's identity, and a data plane that could repoint either could move one identity
 -- provider's attributes onto another's person.
 GRANT SELECT, INSERT ON scim_enterprise_attributes TO ironauth_app;
 GRANT UPDATE (attributes, updated_at) ON scim_enterprise_attributes TO ironauth_app;
 
--- A DELETE, unlike 0184's table, and the difference is what the two hold. An `externalId` is
--- how an IdP finds a person again after a delete, so removing it would break a rehire. These
--- are ATTRIBUTES: `{"op":"remove","path":"...:department"}` is an ordinary provisioning act,
--- and a server that answered "unsupported" to it would be making a false statement about an
--- attribute it publishes as readWrite. Clearing the last one leaves an empty document rather
--- than a missing row, so the DELETE is for the row's own lifecycle and nothing calls it yet --
--- it is granted with the read below on the same precedent 0184 records.
+-- NO DELETE, and the paragraph that used to sit here claimed one. It argued for a DELETE grant
+-- at length and the file issued none -- a review measured `has_table_privilege` false and the
+-- statement refused -- which would have frozen a false sentence into a checksummed file.
+--
+-- None is needed. Clearing every attribute leaves an EMPTY DOCUMENT, not a missing row:
+-- `{"op":"remove"}` and a `PUT` that omits the extension both express themselves as the value
+-- of `attributes`, so the row's lifecycle is entirely within the UPDATE granted above. A row
+-- with `{}` and no row at all render identically, and the handler treats them the same.
 GRANT SELECT ON scim_enterprise_attributes TO ironauth_control;

@@ -42,8 +42,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::identifier::{IdentifierType, canonicalize_identifier};
 use ironauth_store::{
-    CorrelationId, NewMembership, NewUserIdentifier, OffboardingSchedule, OrgMembershipId,
-    ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId, UserState,
+    CorrelationId, EnterpriseWrite, NewMembership, NewUserIdentifier, OffboardingSchedule,
+    OrgMembershipId, ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId,
+    UserState,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -158,11 +159,12 @@ fn user_resource(
     body
 }
 
-/// The Enterprise User attributes THIS CONNECTION holds for a person.
+/// The Enterprise User attributes THIS ORGANIZATION holds for a person.
 ///
-/// Scoped to `auth.connection.id`, which is what makes the read as private as the write. No
+/// Scoped to `auth.connection.organization_id`, which is what makes the read as private as the
+/// write and what lets a rotated credential still see what its predecessor wrote. No
 /// attribute-name filter is needed or wanted: the table holds only what a SCIM client sent,
-/// and it holds it per connection, so there is nothing of anybody else's in it to filter out.
+/// and it holds it per organization, so there is nothing of anybody else's in it to filter out.
 /// The trait storage this replaces needed such a filter and a review measured that nothing
 /// killed its removal -- an operator's own declared `department` leaked to every provisioning
 /// client that read the person.
@@ -179,7 +181,7 @@ async fn enterprise_of(
         .store()
         .scoped(auth.scope)
         .scim_enterprise()
-        .document_for(&auth.connection.id, user)
+        .document_for(&auth.connection.organization_id, user)
         .await
     else {
         return serde_json::Map::new();
@@ -354,7 +356,17 @@ pub(crate) async fn create_user(
             return response;
         }
     }
-    if let Err(response) = store_enterprise_attributes(&state, &auth, &user_id, &enterprise).await {
+    // A create REPLACES: there is nothing stored for a fresh person, and a re-admit must not
+    // inherit what a previous membership left behind.
+    if let Err(response) = store_enterprise_attributes(
+        &state,
+        &auth,
+        &user_id,
+        &enterprise,
+        EnterpriseWrite::Replace,
+    )
+    .await
+    {
         return response;
     }
     match rendered_user(&state, &auth, &user_id).await {
@@ -379,16 +391,43 @@ fn enterprise_path_change(op: &str, path: &str, value: Option<&Value>) -> Result
     // A `remove` CLEARS the attribute rather than being refused: an operator taking somebody
     // out of a department is an ordinary provisioning act, and answering "unsupported" to it
     // would be a false sentence about an attribute this surface does serve.
+    //
+    // AND A VALUELESS `add` OR `replace` IS A CLIENT ERROR, not a remove. This read
+    // `value.cloned().unwrap_or(Value::Null)`, which fed a missing value straight into the
+    // null-means-remove convention: a review measured
+    // `{"op":"replace","path":"urn:...:department"}` with no `value` member answering 200 and
+    // DELETING the attribute. RFC 7644 sections 3.5.2.1 and 3.5.2.3 make both a client error,
+    // and the two sibling arms in this same match already refuse one (`active must carry a
+    // boolean value`).
     let written = if op == "remove" {
         Value::Null
     } else {
-        value.cloned().unwrap_or(Value::Null)
+        let Some(value) = value else {
+            return Err(scim_error(
+                StatusCode::BAD_REQUEST,
+                Some("invalidValue"),
+                "an add or replace must carry a value; use remove to clear an attribute",
+            ));
+        };
+        if !crate::resource::enterprise_type_matches(attribute, value) {
+            return Err(unsupported_enterprise_attribute());
+        }
+        value.clone()
     };
     // The CANONICAL spelling from the extension's own list, not the caller's, so a client
     // patching `EMPLOYEENUMBER` writes the same trait a create writes.
-    let mut traits = serde_json::Map::new();
-    traits.insert(canonical_enterprise_name(attribute).to_owned(), written);
-    Ok(Change::Enterprise(traits))
+    let mut attributes = serde_json::Map::new();
+    attributes.insert(canonical_enterprise_name(attribute).to_owned(), written);
+    // `add` on a COMPLEX attribute adds sub-attributes to what is stored (RFC 7644 section
+    // 3.5.2.1); `replace` and `remove` set or clear the attribute outright. A review measured
+    // the difference: under a single merge mode, `add` of `{"manager":{"value":"b"}}` destroyed
+    // the stored manager's `displayName` and `$ref`.
+    let mode = if op == "add" {
+        EnterpriseWrite::Add
+    } else {
+        EnterpriseWrite::Merge
+    };
+    Ok(Change::Enterprise(attributes, mode))
 }
 
 /// One `Change` from a whole Enterprise User extension object.
@@ -423,9 +462,17 @@ fn enterprise_change(op: &str, value: &Value) -> Result<Change, Response> {
         } else {
             extension_value.clone()
         };
+        if !written.is_null() && !crate::resource::enterprise_type_matches(&lowered, &written) {
+            return Err(unsupported_enterprise_attribute());
+        }
         traits.insert(canonical_enterprise_name(&lowered).to_owned(), written);
     }
-    Ok(Change::Enterprise(traits))
+    let mode = if op == "add" {
+        EnterpriseWrite::Add
+    } else {
+        EnterpriseWrite::Merge
+    };
+    Ok(Change::Enterprise(traits, mode))
 }
 
 /// The lower-cased `urn:...:enterprise:2.0:User:` prefix a URN-qualified PATCH path carries.
@@ -674,8 +721,13 @@ async fn store_enterprise_attributes(
     auth: &Authenticated,
     user: &UserId,
     incoming: &serde_json::Map<String, Value>,
+    mode: EnterpriseWrite,
 ) -> Result<(), Response> {
-    if incoming.is_empty() {
+    // AN EMPTY DOCUMENT IS ONLY A NO-OP FOR A MERGE. A `PUT` carrying no extension is a replace
+    // with nothing in it, which RFC 7644 section 3.5.1 makes a request to CLEAR what is stored
+    // -- bailing out here answered 200 and left the document standing, which is a replace that
+    // did not replace.
+    if incoming.is_empty() && mode != EnterpriseWrite::Replace {
         return Ok(());
     }
     let env = state.env().clone();
@@ -683,11 +735,12 @@ async fn store_enterprise_attributes(
         .store()
         .scoped(auth.scope)
         .scim_enterprise()
-        .merge(
+        .write(
             &env,
-            &auth.connection.id,
+            &auth.connection.organization_id,
             user,
             &Value::Object(incoming.clone()),
+            mode,
             epoch_micros(state),
         )
         .await
@@ -984,7 +1037,13 @@ pub(crate) async fn replace_user(
     {
         return response;
     }
-    if let Err(response) = store_enterprise_attributes(&state, &auth, &user, &enterprise).await {
+    // PUT is a REPLACE (RFC 7644 section 3.5.1): what the body does not carry is gone. A merge
+    // here was measured answering 200 to a body carrying one attribute and leaving the other two
+    // standing.
+    if let Err(response) =
+        store_enterprise_attributes(&state, &auth, &user, &enterprise, EnterpriseWrite::Replace)
+            .await
+    {
         return response;
     }
     match rendered_user(&state, &auth, &user).await {
@@ -1143,8 +1202,8 @@ enum Change {
     Active(bool),
     /// Point this connection's `externalId` at a value.
     ExternalId(String),
-    /// Set Enterprise User extension attributes, merged into the person's traits.
-    Enterprise(serde_json::Map<String, Value>),
+    /// Set Enterprise User extension attributes, with the write mode the verb implies.
+    Enterprise(serde_json::Map<String, Value>, EnterpriseWrite),
 }
 
 /// `PATCH` is ATOMIC: everything is validated, then everything is applied.
@@ -1175,8 +1234,8 @@ async fn apply_operations(
             Change::ExternalId(external_id) => {
                 rebind_external_id(state, auth, user, Some(external_id.as_str())).await?;
             }
-            Change::Enterprise(traits) => {
-                store_enterprise_attributes(state, auth, user, traits).await?;
+            Change::Enterprise(attributes, mode) => {
+                store_enterprise_attributes(state, auth, user, attributes, *mode).await?;
             }
         }
     }

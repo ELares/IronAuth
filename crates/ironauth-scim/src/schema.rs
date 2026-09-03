@@ -72,17 +72,27 @@ fn attribute(name: &str, kind: &str, multi: bool, required: bool, mutability: Mu
 ///
 /// # This document describes the TARGET surface, not only what this slice stores
 ///
-/// `displayName`, `emails`, `name` and the three enterprise attributes are published and are
-/// not yet parsed by [`crate::ScimUser`], so a `PUT` carrying them drops them and a no-path
-/// PATCH object ignores them. That is a real gap between the document and the behaviour, and
+/// `displayName`, `emails` and `name` are published and are not yet parsed by
+/// [`crate::ScimUser`], so a `PUT` carrying them drops them and a no-path PATCH object ignores
+/// them. That is a real gap between the document and the behaviour, and
 /// it is recorded here rather than hidden: the alternative, publishing only `userName`,
 /// `externalId` and `active`, would make a provisioning client's schema discovery report a
 /// surface no identity provider would attempt to use, and would have to be reverted attribute
 /// by attribute as each lands.
 ///
+/// THE ENTERPRISE ATTRIBUTES ARE NO LONGER PART OF THAT GAP. This paragraph said "and the
+/// three enterprise attributes", and it stayed there through the change that parsed and stored
+/// all seven -- a review caught it. It is the same artifact class as the
+/// `entra_enterprise_user` fixture that went on asserting `expect_status: 400` after the gap it
+/// named was closed: a sentence recording a gap is exactly as stale-able as a number recording
+/// one, and the sweep that fixed the fixture did not reach the prose.
+///
 /// The test `the_user_schema_covers_every_attribute_the_model_parses` checks the
-/// direction that MUST hold: everything the model parses is published. The reverse direction
-/// is deliberately not asserted, for the reason above.
+/// direction that MUST hold for the CORE schema: everything the model parses is published. The
+/// reverse direction is deliberately not asserted there, for the reason above. For the
+/// EXTENSION both directions are asserted, by
+/// `the_enterprise_schema_and_the_model_name_the_same_attributes` -- there is no target-surface
+/// gap left in it to preserve.
 #[must_use]
 pub fn core_schemas() -> Vec<Value> {
     vec![

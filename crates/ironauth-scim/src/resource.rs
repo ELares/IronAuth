@@ -53,6 +53,22 @@ fn default_active() -> bool {
     true
 }
 
+/// Whether a value matches the type `/Schemas` publishes for an Enterprise User attribute.
+///
+/// `manager` is the one complex attribute (RFC 7643 section 4.3); the other six are strings.
+/// Paired with the published document by `the_enterprise_schema_and_the_model_agree_on_types`,
+/// so a document that changed a type without this changing fails rather than drifting.
+///
+/// A `null` is not type-checked by callers: it means REMOVE on this surface, not a value.
+#[must_use]
+pub fn enterprise_type_matches(lowered: &str, value: &serde_json::Value) -> bool {
+    if lowered == "manager" {
+        value.is_object()
+    } else {
+        value.is_string()
+    }
+}
+
 /// The canonical SCIM spelling of an Enterprise User attribute, from its lower-cased form.
 ///
 /// PAIRED WITH [`ENTERPRISE_ATTRIBUTES`] by `the_canonical_spelling_covers_every_attribute`,
@@ -139,6 +155,15 @@ impl ScimUser {
         for (name, value) in extension {
             let lowered = name.to_ascii_lowercase();
             if !ENTERPRISE_ATTRIBUTES.contains(&lowered.as_str()) {
+                return Err(name.clone());
+            }
+            // AND THE TYPE THE DOCUMENT PUBLISHES. `/Schemas` says `employeeNumber` is a
+            // string and `manager` is complex; a review measured
+            // `{"employeeNumber":{"nested":[]},"department":42,"manager":"a bare string"}`
+            // answering 201 and round-tripping verbatim. Refusing an unknown attribute NAME and
+            // accepting any VALUE is the advertise-what-you-do-not-do shape this crate has been
+            // caught by twice already, one level down.
+            if !value.is_null() && !enterprise_type_matches(&lowered, value) {
                 return Err(name.clone());
             }
             // THE CANONICAL SPELLING, not the caller's. SCIM matches attribute names
@@ -253,6 +278,79 @@ mod tests {
     ///
     /// Both directions. Every listed attribute maps to a distinct non-empty name, so a missing
     /// arm fails; and the mapping is one-to-one, so two attributes sharing a spelling fails too.
+    /// Every attribute's canonical spelling is the EXACT one RFC 7643 section 4.3 gives.
+    ///
+    /// `the_canonical_spelling_covers_every_attribute_exactly_once` asserts only that the
+    /// canonical form lower-cases back to the input, which ANY casing satisfies, and the
+    /// schema-pairing test lower-cases both sides -- so a review measured
+    /// `"manager" => "MANAGER"` surviving the whole crate. The spelling is the one thing
+    /// `canonical_enterprise_name` exists to hold, and nothing held it.
+    #[test]
+    fn the_canonical_spelling_is_the_exact_rfc_7643_one() {
+        for (lowered, expected) in [
+            ("employeenumber", "employeeNumber"),
+            ("costcenter", "costCenter"),
+            ("organization", "organization"),
+            ("division", "division"),
+            ("department", "department"),
+            ("manager", "manager"),
+            ("employeetype", "employeeType"),
+        ] {
+            assert_eq!(
+                canonical_enterprise_name(lowered),
+                expected,
+                "{lowered} must be stored under the exact spelling RFC 7643 section 4.3 gives, \
+                 because a provisioning client reads the key back"
+            );
+        }
+    }
+
+    /// The model's type rule and the published document agree, attribute by attribute.
+    ///
+    /// `enterprise_type_matches` is a hand-written rule and `core_schemas` is a hand-written
+    /// document; either can move without the other. A `manager` published as a string, or an
+    /// `employeeNumber` accepted as an object, is the advertise-what-you-do-not-do shape one
+    /// level down from the one this extension already closed.
+    #[test]
+    fn the_enterprise_schema_and_the_model_agree_on_types() {
+        let published = crate::schema::core_schemas()
+            .into_iter()
+            .find(|schema| schema["id"] == crate::schema::ENTERPRISE_USER_SCHEMA)
+            .expect("the enterprise schema is published");
+        for attribute in published["attributes"].as_array().expect("attributes") {
+            let name = attribute["name"]
+                .as_str()
+                .expect("a name")
+                .to_ascii_lowercase();
+            let kind = attribute["type"].as_str().expect("a type");
+            let object = serde_json::json!({ "sub": "value" });
+            let string = serde_json::json!("value");
+            match kind {
+                "string" => {
+                    assert!(
+                        enterprise_type_matches(&name, &string),
+                        "{name} is published as a string and the model refuses one"
+                    );
+                    assert!(
+                        !enterprise_type_matches(&name, &object),
+                        "{name} is published as a string and the model accepts an object"
+                    );
+                }
+                "complex" => {
+                    assert!(
+                        enterprise_type_matches(&name, &object),
+                        "{name} is published as complex and the model refuses an object"
+                    );
+                    assert!(
+                        !enterprise_type_matches(&name, &string),
+                        "{name} is published as complex and the model accepts a string"
+                    );
+                }
+                other => panic!("{name} publishes an unhandled type {other}"),
+            }
+        }
+    }
+
     #[test]
     fn the_canonical_spelling_covers_every_attribute_exactly_once() {
         let mut spellings: Vec<&str> = ENTERPRISE_ATTRIBUTES
