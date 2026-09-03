@@ -1503,7 +1503,7 @@ fn registry() -> Vec<Migration> {
         },
         Migration {
             version: 187,
-            name: "scim enterprise attributes",
+            name: "scim_enterprise_attributes",
             // EXPAND: one new table with its policy and grants. Nothing existing is altered, no
             // privilege is removed and no data is moved, so an old binary running beside a
             // migrated database never reads it and never exercises the writes it permits.

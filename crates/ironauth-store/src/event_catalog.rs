@@ -2660,6 +2660,57 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The ORGANIZATION-GRAIN deprovisioning notice (issue #136): a SCIM `DELETE` removed
+        // this person from this organization's directory.
+        //
+        // It is a DIFFERENT FACT from `user.state_changed` and both are emitted, because the
+        // membership and the account are different things in this model. A person provisioned
+        // into two organizations who is deleted from one is gone from that directory and can
+        // still sign in, so `user.state_changed` is not emitted at all: the account did not
+        // move. A consumer watching only account state would never learn the termination
+        // happened. That is the case this type exists for, and it is the ordinary one in any
+        // deployment where a person belongs to more than one organization.
+        //
+        // `organization_id` rides the payload rather than being implied by the endpoint that
+        // receives it, because an environment's webhook endpoints and its event feed both
+        // carry every organization's events. A receiver that assumed its own would attribute
+        // one organization's terminations to another.
+        "user.deprovisioned",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id", "organization_id"]
+        }"#,
+    ),
+    (
+        // The same organization-grain notice for `active: false` (issue #136), and a separate
+        // type rather than a field on the one above because RFC 7643 section 4.1.1 makes it a
+        // different act from a delete: the MEMBERSHIP SURVIVES, so the person stays addressable
+        // and a later `active: true` from the same client reactivates them.
+        //
+        // A consumer reconciling its own directory has to tell those apart and cannot ask
+        // afterwards: both leave a person who cannot sign in here, and only the type says
+        // whether the resource is still there to be reactivated. Sending one type with a
+        // discriminating field would work equally well for a consumer that parses payloads,
+        // and not at all for one that subscribes by type.
+        "user.deactivated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["user_id", "organization_id"]
+        }"#,
+    ),
+    (
         // A RESEND invalidates the prior token and issues a fresh one, so the news is that
         // any token a holder already has stopped working. That is why it is its own type and
         // not a second `invitation.created`: the invitation did not begin, it was reissued,

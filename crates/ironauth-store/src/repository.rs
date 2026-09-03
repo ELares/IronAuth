@@ -75263,6 +75263,49 @@ impl ScimActivationRepo<'_> {
         active: bool,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.write_active(organization, user, active, now_micros, None)
+            .await
+    }
+
+    /// [`Self::set_active`], additionally emitting an organization-grain event (issue #136).
+    ///
+    /// The event rides THIS transaction rather than being enqueued after it, because the
+    /// activation row is what makes the deprovisioning true for this organization: a
+    /// deactivation that committed while its notice was lost leaves a person who cannot sign
+    /// in here and a downstream directory that still lists them, and nothing later would
+    /// reconcile the two. Enqueuing after the commit is the shape that has that failure.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_active`], plus whatever the enqueue returns, including the unique
+    /// violation a second enqueue under the same event id raises.
+    pub async fn set_active_with_event(
+        &self,
+        env: &Env,
+        organization: &OrganizationId,
+        user: &UserId,
+        active: bool,
+        now_micros: i64,
+        event: &DomainEvent<'_>,
+    ) -> Result<(), StoreError> {
+        self.write_active(organization, user, active, now_micros, Some((env, event)))
+            .await
+    }
+
+    /// The one activation write both spellings above share.
+    ///
+    /// `emit` carries the env and the event TOGETHER rather than as two options, so the
+    /// combination that would drop an event on the floor (an event with no env to enqueue it
+    /// under) cannot be written. A dropped event is exactly the failure the emitting spelling
+    /// exists to prevent, and a shape that cannot express it needs no check and no test.
+    async fn write_active(
+        &self,
+        organization: &OrganizationId,
+        user: &UserId,
+        active: bool,
+        now_micros: i64,
+        emit: Option<(&Env, &DomainEvent<'_>)>,
+    ) -> Result<(), StoreError> {
         if organization.scope() != self.scope || user.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -75278,6 +75321,9 @@ impl ScimActivationRepo<'_> {
         .bind(now_micros)
         .execute(&mut *tx)
         .await?;
+        if let Some((env, event)) = emit {
+            enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
