@@ -104,9 +104,30 @@ impl core::error::Error for VerifyError {}
 /// [`crate::Element`] exposes neither. This type does, and it exists only at the end of a
 /// successful [`verify`]: the subtree it holds is the one whose digest was checked, MOVED here
 /// rather than looked up again.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedAssertion {
     signed: RichElement,
+}
+
+/// NOT DERIVED, AND THAT IS THE POINT.
+///
+/// [`VerifiedAssertion::attribute`] refuses namespace declarations because exclusive
+/// canonicalization emits only the ones a subtree visibly USES: an unused `xmlns:evil="..."` on
+/// the assertion is never digested, so a signature that covers the assertion does not cover it.
+/// The derived `Debug` printed every attribute of the retained element, declarations included,
+/// so `format!("{assertion:?}")` handed the same undigested attacker-controlled bytes straight
+/// back to a caller who believes everything it can see was signed -- into a log line, an error
+/// message, or a trace, which is exactly where they get read as trustworthy.
+///
+/// So the formatter shows what the type IS, not what it holds. A caller that wants a value asks
+/// for one through an accessor that knows which values were covered.
+impl core::fmt::Debug for VerifiedAssertion {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("VerifiedAssertion")
+            .field("name", &self.signed.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedAssertion {
@@ -191,18 +212,18 @@ pub fn verify(
     // element that happened to be called `Signature` was one, and an attacker's element in any
     // namespace was one too.
     let scope = scope_at(&root, signed);
-    let signatures = signature_children(signed, &scope);
+    let apex = Scoped::new(signed, scope);
+    let signatures = apex.indexed_children(DSIG_NS, "Signature");
     let [(signature_index, signature)] = signatures.as_slice() else {
         return Err(VerifyError::SignatureMissing);
     };
-    let (signature_index, signature) = (*signature_index, *signature);
-    // The scope INSIDE the signature, which every lookup below it resolves against.
-    let signature_scope = scope_within(signature, &scope_within(signed, &scope));
+    let signature_index = *signature_index;
 
-    let signed_info = child_ns(signature, &signature_scope, DSIG_NS, "SignedInfo")
+    let signed_info = signature
+        .child(DSIG_NS, "SignedInfo")
         .ok_or(VerifyError::SignatureMissing)?;
-    check_canonicalization(signed_info, &signature_scope)?;
-    let algorithm = signature_algorithm(signed_info, &signature_scope)?;
+    check_canonicalization(&signed_info)?;
+    let algorithm = signature_algorithm(&signed_info)?;
     // ONE Reference, and the COUNT is checked before anything reads one. A `SignedInfo` with two
     // says two different things are signed, and choosing one is choosing which half of a
     // contradiction to believe.
@@ -211,17 +232,25 @@ pub fn verify(
     // which answers `None` for two references, so the request was refused as "no signature" and
     // this check was unreachable. A test written for the two-reference case is what found it --
     // the guard was dead, and the wrong word reached the caller.
-    let references = collect_ns(signed_info, &signature_scope, DSIG_NS, "Reference");
+    let references = signed_info.children(DSIG_NS, "Reference");
     let [reference] = references.as_slice() else {
         return Err(VerifyError::ReferenceRefused);
     };
-    check_transforms(reference, &signature_scope)?;
+    check_transforms(reference)?;
 
     // THE REFERENCE MUST NAME THE ELEMENT THE CALLER WILL READ. A same-document reference is
-    // `#id`, and the id must be the one on the candidate. An empty URI (the whole document) is
-    // refused: this crate returns a subtree, so "the whole document" would be a signature over
-    // something other than what it hands back.
-    let uri = attribute(reference, "URI").ok_or(VerifyError::ReferenceRefused)?;
+    // `#id`, and the id must be the one on the candidate.
+    //
+    // THE `#` IS NOT DECORATION. Without it the URI is a RELATIVE reference, which XMLDSIG-CORE
+    // 4.4.3.1 makes an EXTERNAL one: a conforming verifier dereferences it and digests whatever
+    // comes back. This crate does no dereferencing at all, so accepting `URI="_assertion"` would
+    // digest the local element while claiming to have checked a reference to somewhere else. An
+    // empty URI (the whole document) is refused for the mirror reason: this crate returns a
+    // subtree, so "the whole document" would be a signature over something other than what it
+    // hands back.
+    let uri = reference
+        .attribute("URI")
+        .ok_or(VerifyError::ReferenceRefused)?;
     let named = uri.strip_prefix('#').ok_or(VerifyError::ReferenceRefused)?;
     let id = signed_identifier(signed).ok_or(VerifyError::ReferenceRefused)?;
     if named != id {
@@ -229,7 +258,9 @@ pub fn verify(
     }
     // AND NOTHING ELSE IN THE DOCUMENT MAY CLAIM IT. Duplicated identifiers are the wrapping
     // class that needs no schema trick at all: two elements answer to one reference and the
-    // verifier and the consumer pick differently.
+    // verifier and the consumer pick differently. The other element does NOT have to be a second
+    // candidate -- a `samlp:Response` carrying the same `ID` as the assertion it wraps is one
+    // element of each kind, so the exactly-one-candidate rule above never sees it.
     if count_identifier(&root, named) != 1 {
         return Err(VerifyError::ReferenceRefused);
     }
@@ -253,19 +284,19 @@ pub fn verify(
     // consume" is only true if they are the same value, and now they are one.
     let mut digested: RichElement = (*signed).clone();
     strip_enveloped_signature(&mut digested, signature_index);
-    let digest_algorithm = digest_algorithm(reference, &signature_scope)?;
+    let digest_algorithm = digest_algorithm(reference)?;
     // THE ANCESTORS' DECLARATIONS TRAVEL WITH THE SUBTREE. Exclusive canonicalization resolves a
     // prefix against every declaration in scope, including the ones on ancestors OUTSIDE what is
     // signed -- an identity provider that declares `xmlns:saml` on the `Response` and uses it on
     // the `Assertion` is the ordinary case, not an exotic one.
-    let assertion_scope = scope_at(&root, signed);
     let computed = xml_digest(
         digest_algorithm,
-        &canonicalize(&digested, &assertion_scope)
+        &canonicalize(&digested, &apex.inherited)
             .map_err(|_| VerifyError::Malformed(SamlError::Malformed))?,
     );
-    let declared = child_ns(reference, &signature_scope, DSIG_NS, "DigestValue")
-        .map(text_content)
+    let declared = reference
+        .child(DSIG_NS, "DigestValue")
+        .map(|value| value.text())
         .ok_or(VerifyError::SignatureMissing)?;
     let declared = decode_base64(&declared).ok_or(VerifyError::SignatureInvalid)?;
     if !constant_time_eq(&computed, &declared) {
@@ -275,13 +306,37 @@ pub fn verify(
     // AND THE SIGNATURE, over the canonical SignedInfo. Note the order: the digest of the
     // element is checked first and the signature over SignedInfo second, and BOTH must pass.
     // Checking only the second is the Keycloak CVE-2024-8698 shape.
-    let signature_value = child_ns(signature, &signature_scope, DSIG_NS, "SignatureValue")
-        .map(text_content)
+    let signature_value = signature
+        .child(DSIG_NS, "SignatureValue")
+        .map(|value| value.text())
         .ok_or(VerifyError::SignatureMissing)?;
     let signature_bytes = decode_base64(&signature_value).ok_or(VerifyError::SignatureInvalid)?;
-    let signed_info_scope = scope_at(&root, signed_info);
-    let message = canonicalize(signed_info, &signed_info_scope)
+    let message = canonicalize(signed_info.element, &signed_info.inherited)
         .map_err(|_| VerifyError::Malformed(SamlError::Malformed))?;
+    // AN ALGORITHM NO PINNED KEY CAN CARRY IS A REFUSAL, NOT A BAD SIGNATURE.
+    //
+    // RFC 4051 2.3.6 names the ECDSA URIs by their DIGEST only -- `#ecdsa-sha256` says SHA-256
+    // and says nothing about the curve, which comes from the key. So a P-384 anchor with an
+    // `#ecdsa-sha256` signature is a conforming combination. This crate cannot check it: `ring`
+    // exposes fixed-width `r||s` verification, which XMLDSIG requires, only for the matched
+    // pairs P-256/SHA-256 and P-384/SHA-384, and the cross pairs exist only in ASN.1 form.
+    //
+    // Refusing it is honest; refusing it as `SignatureInvalid` was not. That is the word for a
+    // forgery, and an operator who reads it about a genuine signature from their own identity
+    // provider goes looking for an attacker instead of for the unsupported combination.
+    //
+    // AND THE EMPTY ANCHOR LIST IS NOT AN UNSUPPORTED ALGORITHM. A caller who pins nothing
+    // trusts nothing, so the answer is `SignatureInvalid` and it must stay that way: the first
+    // version of this check read `!anchors.iter().any(..)`, which is vacuously true of an empty
+    // list, and turned "no key trusts this document" into "this server refuses that algorithm".
+    // `no_pinned_key_means_no_signature_verifies` caught it.
+    if !anchors.is_empty()
+        && !anchors
+            .iter()
+            .any(|anchor| anchor_can_carry(algorithm, anchor))
+    {
+        return Err(VerifyError::AlgorithmRefused);
+    }
     if !anchors
         .iter()
         .any(|anchor| verify_xml_signature(algorithm, anchor, &message, &signature_bytes))
@@ -297,13 +352,14 @@ pub fn verify(
 /// SHA-1 IS ABSENT AND THAT IS THE POINT. `rsa-sha1` is still the default in a great deal of
 /// deployed SAML, and it is the algorithm the collision work retired. A verifier that accepted
 /// it "for compatibility" would be the weakest link in every deployment that has one.
-fn signature_algorithm(
-    signed_info: &RichElement,
-    scope: &[Binding],
-) -> Result<XmlSigAlg, VerifyError> {
-    let method = child_ns(signed_info, scope, DSIG_NS, "SignatureMethod")
+fn signature_algorithm(signed_info: &Scoped<'_>) -> Result<XmlSigAlg, VerifyError> {
+    let method = signed_info
+        .child(DSIG_NS, "SignatureMethod")
         .ok_or(VerifyError::SignatureMissing)?;
-    match attribute(method, "Algorithm").ok_or(VerifyError::AlgorithmRefused)? {
+    match method
+        .attribute("Algorithm")
+        .ok_or(VerifyError::AlgorithmRefused)?
+    {
         "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" => Ok(XmlSigAlg::RsaSha256),
         "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => Ok(XmlSigAlg::RsaSha384),
         "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512" => Ok(XmlSigAlg::RsaSha512),
@@ -314,13 +370,14 @@ fn signature_algorithm(
 }
 
 /// Map the `DigestMethod` URI onto the allowlist.
-fn digest_algorithm(
-    reference: &RichElement,
-    scope: &[Binding],
-) -> Result<XmlDigestAlg, VerifyError> {
-    let method =
-        child_ns(reference, scope, DSIG_NS, "DigestMethod").ok_or(VerifyError::SignatureMissing)?;
-    match attribute(method, "Algorithm").ok_or(VerifyError::AlgorithmRefused)? {
+fn digest_algorithm(reference: &Scoped<'_>) -> Result<XmlDigestAlg, VerifyError> {
+    let method = reference
+        .child(DSIG_NS, "DigestMethod")
+        .ok_or(VerifyError::SignatureMissing)?;
+    match method
+        .attribute("Algorithm")
+        .ok_or(VerifyError::AlgorithmRefused)?
+    {
         "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(XmlDigestAlg::Sha256),
         // NOT `xmlenc#sha384`, which looks right beside the other two and is not the URI.
         // RFC 4051 puts SHA-384 in `xmldsig-more`, and a research pass that summarised the spec
@@ -332,10 +389,11 @@ fn digest_algorithm(
 }
 
 /// The canonicalization must be exclusive, and must carry no prefix list.
-fn check_canonicalization(signed_info: &RichElement, scope: &[Binding]) -> Result<(), VerifyError> {
-    let method = child_ns(signed_info, scope, DSIG_NS, "CanonicalizationMethod")
+fn check_canonicalization(signed_info: &Scoped<'_>) -> Result<(), VerifyError> {
+    let method = signed_info
+        .child(DSIG_NS, "CanonicalizationMethod")
         .ok_or(VerifyError::SignatureMissing)?;
-    if attribute(method, "Algorithm") != Some(EXCLUSIVE_C14N) {
+    if method.attribute("Algorithm") != Some(EXCLUSIVE_C14N) {
         return Err(VerifyError::AlgorithmRefused);
     }
     // A PREFIX LIST IS A REFUSAL, NOT AN OMISSION. `InclusiveNamespaces` changes which
@@ -344,7 +402,7 @@ fn check_canonicalization(signed_info: &RichElement, scope: &[Binding]) -> Resul
     // ELEMENT children, not any children: an earlier version refused whitespace, so a
     // pretty-printed `<ds:CanonicalizationMethod ...>\n</ds:CanonicalizationMethod>` was reported
     // as naming an algorithm this server refuses.
-    if has_element_child(method) {
+    if has_element_child(method.element) {
         return Err(VerifyError::AlgorithmRefused);
     }
     Ok(())
@@ -357,28 +415,35 @@ fn check_canonicalization(signed_info: &RichElement, scope: &[Binding]) -> Resul
 /// to change what is digested and are refused; so is a transform list that omits the enveloped
 /// one, because this verifier removes the signature unconditionally and would then be digesting
 /// something the signer did not.
-fn check_transforms(reference: &RichElement, scope: &[Binding]) -> Result<(), VerifyError> {
-    let transforms =
-        child_ns(reference, scope, DSIG_NS, "Transforms").ok_or(VerifyError::AlgorithmRefused)?;
-    let listed: Vec<&str> = transforms
+fn check_transforms(reference: &Scoped<'_>) -> Result<(), VerifyError> {
+    let transforms = reference
+        .child(DSIG_NS, "Transforms")
+        .ok_or(VerifyError::AlgorithmRefused)?;
+    // EVERY ELEMENT CHILD, then the ones that are really `ds:Transform`, and the two lists must
+    // be the same length. Reading only the `ds:Transform` children would let an attacker park an
+    // extra transform in another namespace between them: the allowlist below would not see it,
+    // and a conforming verifier -- which applies every child of `Transforms` in order -- would.
+    let element_children = transforms
+        .element
         .children
         .iter()
-        .filter_map(|child| match child {
-            RichNode::Element(element) if local_name(&element.name) == "Transform" => {
-                attribute(element, "Algorithm")
-            }
-            _ => None,
-        })
+        .filter(|child| matches!(child, RichNode::Element(_)))
+        .count();
+    let transform_children = transforms.children(DSIG_NS, "Transform");
+    if transform_children.len() != element_children {
+        return Err(VerifyError::AlgorithmRefused);
+    }
+    let listed: Vec<&str> = transform_children
+        .iter()
+        .filter_map(|transform| transform.attribute("Algorithm"))
         .collect();
     if listed != [ENVELOPED, EXCLUSIVE_C14N] {
         return Err(VerifyError::AlgorithmRefused);
     }
     // And no `Transform` may carry parameters, for the reason the canonicalization one may not.
-    for child in &transforms.children {
-        if let RichNode::Element(element) = child {
-            if has_element_child(element) {
-                return Err(VerifyError::AlgorithmRefused);
-            }
+    for transform in &transform_children {
+        if has_element_child(transform.element) {
+            return Err(VerifyError::AlgorithmRefused);
         }
     }
     Ok(())
@@ -464,32 +529,111 @@ fn strip_enveloped_signature(element: &mut RichElement, index: usize) {
     }
 }
 
-/// The direct children of `element` that really are `ds:Signature`, with their indices.
+/// An element together with the namespace scope its ANCESTORS put in force.
 ///
-/// NAMESPACE-CHECKED, by resolving the prefix against the declarations in scope. The local name
-/// alone is not the element's identity, and an earlier version compared only that.
-fn signature_children<'a>(
+/// # Why the scope travels WITH the element instead of beside it
+///
+/// A qualified name means nothing without the declarations in force where it is written, so
+/// every lookup under the signature needs two things: the element to look in, and that
+/// element's scope. An earlier version passed them as two arguments, and the second one was
+/// wrong three times out of eight.
+///
+/// The scope of the `Signature` was threaded all the way down to the `Reference`'s children,
+/// which are two levels deeper, so `SignedInfo`'s own declarations were skipped. It cost both
+/// directions at once. A conforming signature that declares `xmlns:ds` on `ds:SignedInfo`
+/// rather than on `ds:Signature` -- byte-identical canonical `SignedInfo`, same key, same
+/// digest -- was refused as `AlgorithmRefused`, which tells an operator to go loosen an
+/// algorithm allowlist that was never the problem. And in the other direction, rebinding a
+/// prefix on `SignedInfo` to `urn:evil` left `<e:Transforms>`, `<e:DigestMethod>` and
+/// `<e:DigestValue>` outside XMLDSIG entirely while this crate still read the transform list
+/// and the digest algorithm out of them.
+///
+/// So the level is no longer something a call site can get wrong: the only way to look inside
+/// an element is to ask the [`Scoped`] that FOUND it, and it computes the child scope itself.
+#[derive(Clone)]
+struct Scoped<'a> {
     element: &'a RichElement,
-    inherited: &[Binding],
-) -> Vec<(usize, &'a RichElement)> {
-    // THE CHILD'S OWN DECLARATIONS COUNT. A signer that writes `xmlns:ds` on the `ds:Signature`
-    // itself is the ordinary case, so resolving the child's prefix against only the PARENT's
-    // scope finds nothing -- which is how the first version of this check refused every document
-    // the crate's own signer produces.
-    let parent_scope = scope_within(element, inherited);
-    element
-        .children
-        .iter()
-        .enumerate()
-        .filter_map(|(index, child)| match child {
-            RichNode::Element(nested) if local_name(&nested.name) == "Signature" => {
-                let scope = scope_within(nested, &parent_scope);
-                (resolve(&nested.name, &scope).as_deref() == Some(DSIG_NS))
-                    .then_some((index, nested))
-            }
+    /// What the ancestors declared. NOT this element's own declarations: those belong to its
+    /// children's scope, and to the resolution of its own name.
+    inherited: Vec<Binding>,
+}
+
+impl<'a> Scoped<'a> {
+    /// The apex, with whatever its ancestors declared.
+    fn new(element: &'a RichElement, inherited: Vec<Binding>) -> Self {
+        Self { element, inherited }
+    }
+
+    /// The scope in force INSIDE this element: what it inherited, plus its own declarations.
+    ///
+    /// This is also the scope its own NAME resolves against, because a signer that writes
+    /// `xmlns:ds` on the `ds:Signature` element itself is the ordinary case, not an exotic one.
+    fn scope(&self) -> Vec<Binding> {
+        scope_within(self.element, &self.inherited)
+    }
+
+    /// Whether this element is `namespace`:`local`, resolved rather than string-matched.
+    ///
+    /// The local name alone is not an element's identity. An earlier version compared only
+    /// that, so an application element called `Signature`, and an attacker's element in any
+    /// namespace at all, both answered to the name.
+    fn is(&self, namespace: &str, local: &str) -> bool {
+        local_name(&self.element.name) == local
+            && resolve(&self.element.name, &self.scope()).as_deref() == Some(namespace)
+    }
+
+    /// Every DIRECT child that is `namespace`:`local`, with its index among ALL children.
+    ///
+    /// Direct rather than descendant, and that is a wrapping defence: a `SignedInfo` nested
+    /// three levels down inside an attacker's element is not this signature's `SignedInfo`.
+    ///
+    /// The index is what the enveloped-signature transform removes by, so it must be the index
+    /// in `children`, not in the filtered result.
+    fn indexed_children(&self, namespace: &str, local: &str) -> Vec<(usize, Scoped<'a>)> {
+        let inherited = self.scope();
+        self.element
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|(index, child)| match child {
+                RichNode::Element(nested) => {
+                    let scoped = Scoped::new(nested, inherited.clone());
+                    scoped.is(namespace, local).then_some((index, scoped))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every DIRECT child that is `namespace`:`local`.
+    fn children(&self, namespace: &str, local: &str) -> Vec<Scoped<'a>> {
+        self.indexed_children(namespace, local)
+            .into_iter()
+            .map(|(_, scoped)| scoped)
+            .collect()
+    }
+
+    /// The single direct child that is `namespace`:`local`, if there is EXACTLY ONE.
+    ///
+    /// Two is not one. A `Signature` with two `SignatureValue` children says two different
+    /// things, and picking either is picking which half of a contradiction to believe.
+    fn child(&self, namespace: &str, local: &str) -> Option<Scoped<'a>> {
+        let mut found = self.children(namespace, local);
+        match found.len() {
+            1 => found.pop(),
             _ => None,
-        })
-        .collect()
+        }
+    }
+
+    /// An attribute of this element by qualified name.
+    fn attribute(&self, name: &str) -> Option<&'a str> {
+        attribute(self.element, name)
+    }
+
+    /// All the text under this element, concatenated.
+    fn text(&self) -> String {
+        text_content(self.element)
+    }
 }
 
 /// The namespace scope inside `element`: what it inherited, plus its own declarations.
@@ -542,46 +686,30 @@ fn collect<'a>(root: &'a RichElement, name: &str) -> Vec<&'a RichElement> {
     found
 }
 
-/// Every DIRECT child in `namespace` with `local`.
+/// Whether a pinned key could carry this algorithm at all.
 ///
-/// Direct rather than descendant, and that is a wrapping defence: a `SignedInfo` nested three
-/// levels down inside an attacker's element is not this signature's `SignedInfo`.
+/// # Why this is separate from verification, and why it answers before it
 ///
-/// AND THE NAMESPACE IS CHECKED. An earlier version took the argument and discarded it, so an
-/// element in any namespace at all answered to a name. Since everything below the `Signature`
-/// carries the signature's own scope, that is resolved once by the caller and threaded down.
-fn collect_ns<'a>(
-    element: &'a RichElement,
-    scope: &[Binding],
-    namespace: &str,
-    local: &str,
-) -> Vec<&'a RichElement> {
-    let parent_scope = scope_within(element, scope);
-    element
-        .children
-        .iter()
-        .filter_map(|child| match child {
-            RichNode::Element(nested) if local_name(&nested.name) == local => {
-                let scope = scope_within(nested, &parent_scope);
-                (resolve(&nested.name, &scope).as_deref() == Some(namespace)).then_some(nested)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// The single direct child in `namespace` with `local`, if there is exactly one.
-fn child_ns<'a>(
-    element: &'a RichElement,
-    scope: &[Binding],
-    namespace: &str,
-    local: &str,
-) -> Option<&'a RichElement> {
-    let found = collect_ns(element, scope, namespace, local);
-    match found.as_slice() {
-        [single] => Some(single),
-        _ => None,
-    }
+/// `ring` exposes fixed-width `r||s` ECDSA verification -- the encoding RFC 4051 2.3.6 requires
+/// for XMLDSIG -- only for the matched pairs P-256 with SHA-256 and P-384 with SHA-384. The
+/// cross pairs, which RFC 4051 permits because the URI names only the digest, exist there in
+/// ASN.1 form alone. So a P-384 anchor with an `#ecdsa-sha256` signature is a combination this
+/// crate cannot check.
+///
+/// It used to fall through the match inside `verify_xml_signature` to `_ => false`, which the
+/// caller reported as `SignatureInvalid`. That is the word for a forgery. An operator whose own
+/// identity provider signs that way would read it as an attack on their tenant rather than as
+/// an unsupported pairing, and the crate's own note about ECDSA encodings says exactly what
+/// happens next: it "gets fixed by turning ECDSA off".
+fn anchor_can_carry(algorithm: XmlSigAlg, anchor: &TrustAnchor) -> bool {
+    matches!(
+        (algorithm, anchor),
+        (
+            XmlSigAlg::RsaSha256 | XmlSigAlg::RsaSha384 | XmlSigAlg::RsaSha512,
+            XmlSigKey::Rsa { .. }
+        ) | (XmlSigAlg::EcdsaP256Sha256, XmlSigKey::EcdsaP256(_))
+            | (XmlSigAlg::EcdsaP384Sha384, XmlSigKey::EcdsaP384(_))
+    )
 }
 
 /// The first descendant with this qualified name.

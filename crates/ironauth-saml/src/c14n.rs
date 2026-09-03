@@ -92,10 +92,18 @@ pub(crate) fn canonicalize(
 ///
 /// XML-C14N 2.6 prescribes the target, a SINGLE space, then the instruction, and omits the space
 /// entirely where there is no instruction. An earlier version wrote the raw bytes between `<?`
-/// and `?>` straight back out, so `<?t   data?>` canonicalised as itself while every conforming
-/// implementation produced `<?t data?>`. A differential run against libxml2 disagreed on 7 of 13
-/// shapes -- a FALSE REJECTION of conforming signatures, which is the failure mode that gets
-/// fixed by loosening something rather than by fixing the canonicalizer.
+/// and `?>` straight back out, so `<?t   data?>` canonicalised as itself while a conforming
+/// implementation produces `<?t data?>`.
+///
+/// The rule here is the SPECIFICATION's, and nothing else. An earlier version of this comment
+/// also cited a differential run against libxml2 disagreeing on "7 of 13 shapes". No such run
+/// exists: this workspace has no libxml2, no differential harness and no vector file, and the
+/// figure came from a review rather than from anything that was executed here. A measurement
+/// nobody can reproduce is worse than none, because the next reader spends it as evidence.
+///
+/// The direction is what makes this worth a guard: it forges nothing, it makes this crate
+/// compute a different digest from the signer and REFUSE valid signatures, which is the failure
+/// mode that gets fixed by loosening something rather than by fixing the canonicalizer.
 fn write_processing_instruction(out: &mut String, pi: &str) {
     out.push_str("<?");
     match pi.split_once(|c: char| c.is_ascii_whitespace()) {

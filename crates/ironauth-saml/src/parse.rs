@@ -243,9 +243,14 @@ pub const DEPTH_CEILING: usize = 512;
 ///
 /// # The order is the contract
 ///
-/// Size, then DOCTYPE, then structure. Nothing about a signature happens here, and no consumer
-/// of this crate can reach a signature check without having come through this function first,
-/// because the type a signature check takes is the one only this function makes.
+/// Size, then DOCTYPE, then structure. Nothing about a signature happens here.
+///
+/// AND THE ORDER IS NOT ENFORCED BY THIS TYPE. An earlier version of this note said no consumer
+/// could reach a signature check without coming through here first, "because the type a
+/// signature check takes is the one only this function makes". [`crate::verify`] takes bytes and
+/// runs the same refusals itself, through the same reader configuration, before it looks at a
+/// signature. So the guarantee is real and it is an ORDERING inside `verify`, not a property of
+/// [`Document`]; the sentence claimed a structural argument the code does not make.
 ///
 /// # Errors
 ///

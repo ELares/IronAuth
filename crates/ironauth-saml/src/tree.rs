@@ -177,6 +177,23 @@ pub(crate) fn build(bytes: &[u8], limits: &Limits) -> Result<RichElement, SamlEr
                     open.children.push(RichNode::ProcessingInstruction(text));
                 }
             }
+            // A COMMENT DOES NOT BREAK THE TEXT RUN, and it never becomes a node: there is
+            // no `RichNode::Comment`. Both matter for CVE-2017-11427 and the February 2018
+            // batch beside it, where canonicalization dropped the comment (so the digest
+            // covered `user@evil.com.example.com` as one string) and the consumer then asked
+            // a DOM for the element's text and got only the FIRST text node,
+            // `user@evil.com`. Signature valid, identity different.
+            //
+            // MEASURED, because the obvious sentence to write here is wrong. Adding a
+            // `flush_text` call for `Event::Comment` -- the mutation that supposedly
+            // "reintroduces the class" -- does NOT break `tests/wrapping.rs`, because
+            // `text_content` concatenates every text child. Nor does making `text_content`
+            // return only the first child, because falling through here leaves only one. The
+            // corpus fails only when BOTH are mutated.
+            //
+            // So this is defence in depth and neither half is load-bearing alone. The
+            // property a caller can rely on is the observable one -- a value split by a
+            // comment reads back whole -- and that is what the corpus pins.
             _ => {}
         }
         seen_anything = true;

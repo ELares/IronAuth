@@ -32,6 +32,8 @@ use ironauth_saml::{Limits, TrustAnchor, VerifyError, verify};
 struct Fixture {
     anchors: Vec<TrustAnchor>,
     document: String,
+    /// Kept so a test can re-seal a signature it edited. See `test_util::reseal`.
+    key: XmlTestKey,
 }
 
 impl Fixture {
@@ -41,6 +43,7 @@ impl Fixture {
         Self {
             anchors: vec![TrustAnchor::EcdsaP256(key.public_point())],
             document,
+            key,
         }
     }
 
@@ -567,4 +570,574 @@ fn two_genuinely_signed_assertions_are_refused_rather_than_resolved() {
         1,
     );
     assert_eq!(check(&both), Err(VerifyError::ReferenceRefused));
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE GUARDS THAT HAD NO TEST.
+//
+// A mutation sweep over this crate removed each security check in turn and ran the whole suite.
+// Nine of them could be deleted outright with all 57 tests still green. Every test below was
+// written against one of those, and each was confirmed to FAIL with its guard removed -- which
+// is the only evidence that a guard is doing anything at all.
+//
+// They are here rather than in a new file because they are the same corpus: each is a document
+// that a verifier missing one check accepts, or a conforming document it refuses.
+// ---------------------------------------------------------------------------------------------
+
+/// A `Reference` URI without its `#` is refused.
+///
+/// # An external reference is not a same-document reference
+///
+/// `URI="#_assertion"` is a same-document reference. `URI="_assertion"` is a RELATIVE one, which
+/// XMLDSIG-CORE 4.4.3.1 makes EXTERNAL: a conforming verifier dereferences it and digests
+/// whatever comes back. This crate dereferences nothing, so accepting the second form would mean
+/// digesting the local element while the signature claimed to cover something else entirely.
+///
+/// `a_whole_document_reference_is_refused` was named for this guard and does not reach it: its
+/// `URI=""` is caught two guards later by the identifier comparison. With the `#` requirement
+/// deleted, that test stayed green and this document verified.
+#[test]
+fn a_reference_uri_without_a_fragment_is_refused() {
+    let fixture = Fixture::new();
+    let attacked = ironauth_saml::test_util::reseal(
+        &fixture.key,
+        &fixture
+            .document
+            .replacen("URI=\"#_assertion\"", "URI=\"_assertion\"", 1),
+        "ds:SignedInfo",
+        "ds:SignatureValue",
+    );
+    assert_eq!(
+        fixture.verify(&attacked),
+        Err(VerifyError::ReferenceRefused)
+    );
+}
+
+/// A truncated or empty `DigestValue` is refused.
+///
+/// # The length check IS the comparison
+///
+/// The digest comparison folds over `left.iter().zip(right)`, and `zip` stops at the shorter
+/// side. So the length equality that precedes it is not a fast path, it is the whole of the
+/// check: without it the empty string is a prefix of every digest and compares EQUAL to all of
+/// them. Deleting those three lines left `changing_a_signed_value_breaks_the_digest` -- the test
+/// whose entire job is this comparison -- green, while a genuinely signed document carrying an
+/// empty `DigestValue` verified and handed back the assertion.
+///
+/// This is "bound satisfied by zero" sitting in the one line that decides whether the digest
+/// matched.
+#[test]
+fn a_digest_that_is_only_a_prefix_of_the_real_one_is_refused() {
+    let fixture = Fixture::new();
+    let real = fixture
+        .document
+        .split("<ds:DigestValue>")
+        .nth(1)
+        .and_then(|rest| rest.split("</ds:DigestValue>").next())
+        .expect("the fixture carries a digest")
+        .to_owned();
+
+    for (what, forged) in [
+        ("an empty digest", String::new()),
+        ("a four character prefix", real[..4].to_owned()),
+        // NOT "one character short": a 32 byte digest is 44 base64 characters of which the last
+        // is padding, so dropping one still decodes to the same 32 bytes. Two is the smallest
+        // edit that actually shortens the value, and finding that out is what this row records.
+        ("two characters short", real[..real.len() - 2].to_owned()),
+    ] {
+        // Re-sealed, so the SIGNATURE over SignedInfo is valid and the only thing that can
+        // refuse the document is the digest comparison itself.
+        let attacked = ironauth_saml::test_util::reseal(
+            &fixture.key,
+            &fixture.document.replacen(
+                &format!("<ds:DigestValue>{real}</ds:DigestValue>"),
+                &format!("<ds:DigestValue>{forged}</ds:DigestValue>"),
+                1,
+            ),
+            "ds:SignedInfo",
+            "ds:SignatureValue",
+        );
+        assert_eq!(
+            fixture.verify(&attacked),
+            Err(VerifyError::SignatureInvalid),
+            "{what} must be refused"
+        );
+    }
+}
+
+/// A second element claiming the reference's identifier is refused even when it is not a second
+/// candidate.
+///
+/// # Why the exactly-one-candidate rule does not cover this
+///
+/// `two_elements_claiming_one_identifier_are_refused` adds a second `saml:Assertion`, so the
+/// candidate count refuses it before the identifier logic runs at all. Deleting the duplicate-id
+/// guard left that test green. The shape that needs it has ONE candidate: the enclosing
+/// `samlp:Response` carrying `ID="_assertion"`. One assertion, one signature, two elements
+/// answering `#_assertion` -- and a verifier that resolves the reference by scanning for the id
+/// can land on either.
+#[test]
+fn an_enclosing_element_claiming_the_same_identifier_is_refused() {
+    let fixture = Fixture::new();
+    // The response already carries `ID="_response"`; ADDING a second `ID` is a duplicate
+    // attribute and the parser refuses it as malformed long before any of this. Replacing the
+    // value is the shape that reaches the guard.
+    let attacked = fixture
+        .document
+        .replacen(r#"ID="_response""#, r#"ID="_assertion""#, 1);
+    assert_ne!(
+        attacked, fixture.document,
+        "the identifier must actually collide"
+    );
+    assert_eq!(
+        fixture.verify(&attacked),
+        Err(VerifyError::ReferenceRefused)
+    );
+}
+
+/// An element called `Signature` in another namespace, as a DIRECT CHILD, is not the signature.
+///
+/// # Why the two existing tests do not cover this
+///
+/// `an_element_named_signature_in_another_namespace_is_not_stripped` and
+/// `a_nested_signature_is_not_stripped` both splice their decoy inside `<saml:Subject>`, making
+/// it a GRANDCHILD. The signature lookup only ever examines DIRECT children, so neither test
+/// touches its namespace check: deleting the check left both green.
+///
+/// Moved up one level, the decoy is a direct child, and without the namespace check the document
+/// has two signatures and is refused as having none -- an attacker-supplied denial of service on
+/// every assertion, from one element that says nothing.
+#[test]
+fn a_foreign_signature_as_a_direct_child_is_not_a_signature() {
+    let fixture = Fixture::new();
+    let decoy = r#"<x:Signature xmlns:x="urn:evil"><x:SignedInfo/></x:Signature>"#;
+    // RE-SIGNED. The decoy sits INSIDE the assertion, so it is inside what the digest covers:
+    // splicing it into an already-signed document would break the digest and the test would pass
+    // for the wrong reason. Re-signing makes it exactly what it claims to be -- ordinary content
+    // the identity provider signed, which happens to be called Signature.
+    let attacked = ironauth_saml::test_util::resign(
+        &fixture.key,
+        &fixture
+            .document
+            .replacen("<saml:Issuer>", &format!("{decoy}<saml:Issuer>"), 1),
+    );
+    // It verifies: the decoy is not a signature, so there is still exactly one, and the decoy is
+    // inside the digest like any other content the identity provider signed.
+    let assertion = fixture
+        .verify(&attacked)
+        .expect("a foreign element named Signature is ordinary content");
+    assert_eq!(
+        assertion.text_of("saml:NameID").as_deref(),
+        Some("victim@example.test")
+    );
+}
+
+/// A prefix rebound under `SignedInfo` does not make hostile elements answer to XMLDSIG names.
+///
+/// # The false ACCEPT the scope bug opened
+///
+/// Every lookup under the signature used to resolve against the scope of the `Signature`
+/// element, two levels above the `Reference`'s children. So a document could declare
+/// `xmlns:e="http://www.w3.org/2000/09/xmldsig#"` on the `Signature` and REBIND `e` to
+/// `urn:evil` on the `SignedInfo`, and `<e:Transforms>`, `<e:DigestMethod>` and
+/// `<e:DigestValue>` -- which are then not XMLDSIG elements at all -- were still read as the
+/// transform list, the digest algorithm and the digest. A conforming verifier sees a `Reference`
+/// with none of those three and rejects the document.
+#[test]
+fn a_prefix_rebound_under_signed_info_is_not_the_signature_namespace() {
+    let fixture = Fixture::new();
+    let rebound = fixture
+        .document
+        .replacen(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+            concat!(
+                r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" "#,
+                r#"xmlns:e="http://www.w3.org/2000/09/xmldsig#">"#
+            ),
+            1,
+        )
+        .replacen(
+            "<ds:SignedInfo>",
+            r#"<ds:SignedInfo xmlns:e="urn:evil">"#,
+            1,
+        )
+        .replace("<ds:Transforms>", "<e:Transforms>")
+        .replace("</ds:Transforms>", "</e:Transforms>")
+        .replace("<ds:Transform ", "<e:Transform ")
+        .replace("<ds:DigestMethod ", "<e:DigestMethod ")
+        .replace("<ds:DigestValue>", "<e:DigestValue>")
+        .replace("</ds:DigestValue>", "</e:DigestValue>");
+    let attacked = ironauth_saml::test_util::reseal(
+        &fixture.key,
+        &rebound,
+        "ds:SignedInfo",
+        "ds:SignatureValue",
+    );
+    assert_eq!(
+        fixture.verify(&attacked),
+        Err(VerifyError::AlgorithmRefused)
+    );
+}
+
+/// A conforming signature that declares XMLDSIG on `SignedInfo` rather than on `Signature`
+/// verifies.
+///
+/// # The false REJECT the same scope bug caused, and the direction that matters more
+///
+/// Where a declaration is WRITTEN is not part of a document's meaning: exclusive
+/// canonicalization renders a visibly-used declaration on the apex whichever ancestor declared
+/// it. So the two documents in this test have byte-identical canonical `SignedInfo`, the same
+/// key and the same digest, and the identity provider's `SignatureValue` covers both.
+///
+/// One of them used to be refused as `AlgorithmRefused` -- "the signature names an algorithm
+/// this server refuses" -- which is not merely wrong, it points the operator at an allowlist
+/// that was never the problem, and the fix a hurried operator reaches for is to loosen it.
+///
+/// The assertion on canonical equality is what makes this a test of scope resolution rather than
+/// of two unrelated documents.
+#[test]
+fn a_declaration_on_signed_info_is_in_scope_for_its_children() {
+    let fixture = Fixture::new();
+    let moved = fixture
+        .document
+        .replacen(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+            r#"<dsig:Signature xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">"#,
+            1,
+        )
+        .replacen(
+            "<ds:SignedInfo>",
+            r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+            1,
+        )
+        .replacen("</ds:Signature>", "</dsig:Signature>", 1)
+        .replace("<ds:SignatureValue>", "<dsig:SignatureValue>")
+        .replace("</ds:SignatureValue>", "</dsig:SignatureValue>");
+    // NOTHING CRYPTOGRAPHIC MOVED: same canonical SignedInfo, so the original signature value
+    // still covers it. If this assertion ever fails, the test below proves nothing.
+    assert_eq!(
+        ironauth_saml::test_util::canonicalize(&fixture.document, "ds:SignedInfo")
+            .expect("canonicalises"),
+        ironauth_saml::test_util::canonicalize(&moved, "ds:SignedInfo").expect("canonicalises"),
+        "the two documents must present the same signed octets"
+    );
+    let assertion = fixture
+        .verify(&moved)
+        .expect("a conforming signature must not be refused for where it declares its prefix");
+    assert_eq!(
+        assertion.text_of("saml:NameID").as_deref(),
+        Some("victim@example.test")
+    );
+}
+
+/// A line-wrapped `SignatureValue` and `DigestValue` decode.
+///
+/// # The interoperability guard nothing drove
+///
+/// `xmlsec` and `OpenSAML` wrap base64 at 64 or 76 columns, so almost every real signature
+/// arrives with newlines inside it. The decoder skips ASCII whitespace for that reason, and no
+/// test fed it any: the crate's own signer emits one unbroken run. With the skip deleted the
+/// whole suite stayed green while every wrapped document was refused as `SignatureInvalid`,
+/// which reads as a forgery rather than as a decoder that cannot handle a newline.
+#[test]
+fn a_line_wrapped_base64_value_decodes() {
+    let fixture = Fixture::new();
+    let wrap = |document: &str, tag: &str| -> String {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let start = document.find(&open).expect("the tag is present") + open.len();
+        let end = document.find(&close).expect("the tag is present");
+        let mut wrapped = String::from("\n");
+        for (index, byte) in document[start..end].chars().enumerate() {
+            if index > 0 && index % 20 == 0 {
+                wrapped.push_str("\r\n  ");
+            }
+            wrapped.push(byte);
+        }
+        wrapped.push('\n');
+        [&document[..start], wrapped.as_str(), &document[end..]].concat()
+    };
+    // ORDER MATTERS. `DigestValue` lives INSIDE `SignedInfo`, so wrapping it changes the octets
+    // the signature covers: it has to be re-sealed before the `SignatureValue` is wrapped in
+    // turn. Doing it the other way round produces a document with a genuinely broken signature,
+    // which is refused for a reason that has nothing to do with whitespace.
+    let wrapped = wrap(
+        &ironauth_saml::test_util::reseal(
+            &fixture.key,
+            &wrap(&fixture.document, "ds:DigestValue"),
+            "ds:SignedInfo",
+            "ds:SignatureValue",
+        ),
+        "ds:SignatureValue",
+    );
+    assert_ne!(
+        wrapped, fixture.document,
+        "the test must actually wrap something"
+    );
+    let assertion = fixture
+        .verify(&wrapped)
+        .expect("a wrapped base64 value is the ordinary case, not a forgery");
+    assert_eq!(
+        assertion.text_of("saml:NameID").as_deref(),
+        Some("victim@example.test")
+    );
+}
+
+/// Two of anything the signature needs exactly one of is a refusal.
+///
+/// # "Exactly one" was a documented guarantee with no test
+///
+/// `SignatureMissing` is documented as "the document carries no signature, or MORE THAN ONE
+/// where one was expected", and the child lookup as "the single direct child, if there is
+/// exactly one". Both halves could be replaced with "take the first" and the whole suite stayed
+/// green: no document in the corpus carried two `ds:Signature` children, two `ds:SignedInfo`,
+/// two `ds:DigestValue` or two `ds:SignatureValue`.
+///
+/// Taking the first is choosing which half of a contradiction to believe, and an attacker who
+/// can add an element chooses which half a verifier reads. `SignatureValue` matters most: it
+/// sits OUTSIDE `SignedInfo`, so a second one is not covered by the digest at all.
+#[test]
+fn two_of_anything_the_signature_needs_one_of_is_refused() {
+    let fixture = Fixture::new();
+    let duplicate = |open: &str, close: &str| -> String {
+        let start = fixture.document.find(open).expect("the element is present");
+        let end = fixture
+            .document
+            .find(close)
+            .expect("the element is present")
+            + close.len();
+        let element = &fixture.document[start..end];
+        [&fixture.document[..end], element, &fixture.document[end..]].concat()
+    };
+    for (what, open, close) in [
+        ("two signatures", "<ds:Signature ", "</ds:Signature>"),
+        ("two SignedInfo", "<ds:SignedInfo>", "</ds:SignedInfo>"),
+        ("two DigestValue", "<ds:DigestValue>", "</ds:DigestValue>"),
+        (
+            "two SignatureValue",
+            "<ds:SignatureValue>",
+            "</ds:SignatureValue>",
+        ),
+    ] {
+        let attacked = duplicate(open, close);
+        assert_ne!(
+            attacked, fixture.document,
+            "{what} must change the document"
+        );
+        assert!(
+            matches!(
+                fixture.verify(&attacked),
+                Err(VerifyError::SignatureMissing | VerifyError::ReferenceRefused)
+            ),
+            "{what} must be refused, got {:?}",
+            fixture.verify(&attacked)
+        );
+    }
+}
+
+/// A transform in another namespace, smuggled between the two legitimate ones, is refused.
+///
+/// # Reading only the elements you recognise is not reading the list
+///
+/// A conforming verifier applies EVERY child of `Transforms` in order. An allowlist that
+/// collects only the `ds:Transform` children compares a list the document does not have: an
+/// `<x:Transform xmlns:x="urn:evil">` between them is invisible to the check and visible to
+/// every other implementation. So the count of element children must equal the count of real
+/// transforms before the sequence is compared at all.
+#[test]
+fn a_foreign_element_inside_the_transform_list_is_refused() {
+    let fixture = Fixture::new();
+    let smuggled = fixture.document.replacen(
+        "</ds:Transforms>",
+        r#"<x:Transform xmlns:x="urn:evil" Algorithm="urn:evil"/></ds:Transforms>"#,
+        1,
+    );
+    let attacked = ironauth_saml::test_util::reseal(
+        &fixture.key,
+        &smuggled,
+        "ds:SignedInfo",
+        "ds:SignatureValue",
+    );
+    assert_eq!(
+        fixture.verify(&attacked),
+        Err(VerifyError::AlgorithmRefused)
+    );
+}
+
+/// A pinned key that cannot carry the named algorithm is an ALGORITHM refusal, not a bad
+/// signature.
+///
+/// # RFC 4051 2.3.6 names the hash, and the curve comes from the key
+///
+/// `#ecdsa-sha256` says SHA-256 and says nothing about the curve, so a P-384 anchor with an
+/// `#ecdsa-sha256` signature is a conforming combination. This crate cannot check it: `ring`
+/// offers fixed-width `r||s` verification, which XMLDSIG requires, only for P-256 with SHA-256
+/// and P-384 with SHA-384, and the cross pairs exist there only in ASN.1 form.
+///
+/// The refusal is fine. Reporting it as `SignatureInvalid` was not: that is the word for a
+/// forgery, and an operator reading it about their own identity provider's genuine signature
+/// goes hunting for an attacker instead of for the unsupported pairing.
+///
+/// The anchor below is a well-formed P-384 POINT LENGTH rather than a real key, because the
+/// refusal happens before any verification and a real key would prove nothing extra. The control
+/// is what carries the test: the same document, with a P-256 anchor that CAN carry the
+/// algorithm, verifies.
+#[test]
+fn an_anchor_that_cannot_carry_the_named_algorithm_is_refused_as_an_algorithm() {
+    let fixture = Fixture::new();
+    let mut point = vec![0x04_u8];
+    point.extend(core::iter::repeat_n(0x01_u8, 96));
+    assert_eq!(
+        verify(
+            fixture.document.as_bytes(),
+            &Limits::default(),
+            &[TrustAnchor::EcdsaP384(point)],
+            "saml:Assertion",
+        ),
+        Err(VerifyError::AlgorithmRefused)
+    );
+    // CONTROL: the pairing is the only thing being refused.
+    assert!(fixture.verify(&fixture.document).is_ok());
+}
+
+/// A namespace declaration the digest never covered is not visible through `Debug` either.
+///
+/// # Closing the accessor without closing the formatter closes nothing
+///
+/// Exclusive canonicalization emits only the declarations a subtree visibly USES, so an unused
+/// `xmlns:evil="..."` on the assertion is not digested -- which is why the document below
+/// verifies. The accessor refuses to return it. The DERIVED `Debug` printed it, so one
+/// `format!("{assertion:?}")` into a log line or an error message handed the same undigested
+/// attacker-controlled bytes to a reader who believes everything in a `VerifiedAssertion` was
+/// signed.
+#[test]
+fn a_namespace_declaration_is_not_visible_through_debug() {
+    let fixture = Fixture::new();
+    let payload = "urn:undigested-attacker-payload";
+    let attacked = fixture.document.replacen(
+        r#"<saml:Assertion ID="_assertion""#,
+        &format!(r#"<saml:Assertion xmlns:evil="{payload}" ID="_assertion""#),
+        1,
+    );
+    let assertion = fixture
+        .verify(&attacked)
+        .expect("an unused declaration is not digested, so the document still verifies");
+    assert_eq!(assertion.attribute("xmlns:evil"), None);
+    let rendered = format!("{assertion:?}");
+    assert!(
+        !rendered.contains(payload),
+        "Debug must not render an undigested declaration: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE COMMENT-TRUNCATION CORPUS (issue #138, criterion 2).
+//
+// CVE-2017-11427 and the batch around it (Duo's "Duo Finds SAML Vulnerabilities Affecting
+// Multiple Implementations", February 2018) are all one bug with one shape. Canonicalization
+// REMOVES comments, so the digest is taken over the joined text: `user@evil.com<!--x-->.
+// example.com` digests as one string. The consumer then asked a DOM for the element's text and
+// got only the FIRST text node, `user@evil.com`. Signature valid, identity different. It hit
+// OneLogin, Clever, OmniAuth, Shibboleth and python-saml independently, because every one of
+// them used a different component for each half.
+//
+// The answer here is two independent mechanisms, and it is worth being exact about them because
+// the tidy version of this paragraph is false. Comments never become nodes, so a run split by
+// one stays a single text node; AND the text accessor concatenates every text child, so it
+// would join them even if they were two. MUTATION SHOWS NEITHER IS LOAD-BEARING ALONE: breaking
+// either one leaves this corpus green, and only breaking BOTH makes it fail. That is defence in
+// depth, not a single structural guarantee, and a reader who came here to find the one line
+// that stops the attack should know there is not one.
+//
+// What the corpus pins is therefore the OBSERVABLE property, which is the one a caller can rely
+// on: a signed value split by a comment reads back FULL and UNSPLIT.
+// ---------------------------------------------------------------------------------------------
+
+/// A comment inside a signed `NameID` does not truncate the value.
+///
+/// # Both directions, and the second is the one that catches a half fix
+///
+/// The first case is the attack as published: a document signed over `victim@example.test` with
+/// a comment spliced into the middle afterwards. The digest is over the joined text either way,
+/// so it still verifies -- and the value read back must be the WHOLE string, not the part before
+/// the comment.
+///
+/// The second case is the same document RE-SIGNED with the comment in place, which is what an
+/// identity provider that pretty-prints its output actually emits. A crate that refused comments
+/// outright would pass the first case and break the second.
+#[test]
+fn a_comment_inside_a_signed_value_does_not_truncate_it() {
+    let fixture = Fixture::new();
+    let split = fixture.document.replacen(
+        "victim@example.test",
+        "victim<!-- comment -->@example.test",
+        1,
+    );
+
+    // (a) SPLICED IN AFTER SIGNING. The comment is not part of the canonical form, so the
+    // identity provider's digest still covers exactly the text that is read back.
+    let assertion = fixture
+        .verify(&split)
+        .expect("a comment is not part of the digest, so the document still verifies");
+    assert_eq!(
+        assertion.text_of("saml:NameID").as_deref(),
+        Some("victim@example.test"),
+        "the value must be the full string, not the part before the comment"
+    );
+
+    // (b) RE-SIGNED with the comment in place.
+    let resigned = ironauth_saml::test_util::resign(&fixture.key, &split);
+    assert_eq!(
+        fixture
+            .verify(&resigned)
+            .expect("a re-signed document with a comment in it verifies")
+            .text_of("saml:NameID")
+            .as_deref(),
+        Some("victim@example.test")
+    );
+}
+
+/// Every place a comment can be written inside a signed value reads back whole.
+///
+/// # Why the positions are enumerated rather than sampled
+///
+/// The published exploits differ only in WHERE the comment sits, because each targeted a
+/// different consumer's idea of "the first text node": before the value, in the middle, at the
+/// end, several at once, and one immediately after the start tag. A crate that joined text
+/// across a comment in the middle but not at the edges would pass a single-position test.
+///
+/// The control at the end is what makes the rest mean something: changing the text PAST the
+/// comment must break the digest. Without it, a verifier that returned a constant would pass
+/// every row above.
+#[test]
+fn a_comment_anywhere_in_a_signed_value_reads_back_whole() {
+    let fixture = Fixture::new();
+    for (what, spliced) in [
+        ("before the value", "<!--c-->victim@example.test"),
+        ("in the middle", "victim@<!--c-->example.test"),
+        ("at the end", "victim@example.test<!--c-->"),
+        ("twice", "vic<!--c-->tim@exam<!--c-->ple.test"),
+        ("an empty comment", "victim@<!---->example.test"),
+    ] {
+        let document = fixture.document.replacen("victim@example.test", spliced, 1);
+        let assertion = fixture
+            .verify(&document)
+            .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+        assert_eq!(
+            assertion.text_of("saml:NameID").as_deref(),
+            Some("victim@example.test"),
+            "{what}"
+        );
+    }
+
+    // CONTROL: the digest really is covering this text.
+    let tampered =
+        fixture
+            .document
+            .replacen("victim@example.test", "victim@<!--c-->attacker.test", 1);
+    assert_eq!(
+        fixture.verify(&tampered),
+        Err(VerifyError::SignatureInvalid),
+        "changing the text past a comment must break the digest"
+    );
 }

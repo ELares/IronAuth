@@ -237,8 +237,9 @@ fn an_unused_declaration_is_not_rendered() {
 /// XML-C14N 2.6 prescribes the target, a single space, then the instruction, and omits the
 /// space entirely where there is no instruction. An earlier version of this crate wrote the raw
 /// bytes between `<?` and `?>` back out unchanged, so `<?t   data?>` canonicalised as
-/// `<?t   data?>` while every conforming implementation produced `<?t data?>`. A differential
-/// run against libxml2 disagreed on 7 of 13 shapes.
+/// `<?t   data?>` while a conforming implementation produces `<?t data?>`. The rows below are
+/// the specification's rule applied case by case; they are not a differential against another
+/// implementation, and an earlier version of this comment claimed one that was never run.
 ///
 /// The direction of that bug is what makes it worth a test: it does not forge anything, it makes
 /// this crate compute a different digest from the signer and REFUSE valid signatures -- and a
@@ -261,4 +262,48 @@ fn a_processing_instruction_separator_is_normalised_to_one_space() {
             "canonical form of {input}"
         );
     }
+}
+
+/// An unbound prefix on an ELEMENT NAME is refused, not just one on an attribute.
+///
+/// # Two guards, and only one of them was ever driven
+///
+/// There are two independent unbound-prefix refusals: the visibly-utilised loop that walks
+/// element and attribute names, and the attribute sort key, which resolves a prefix to build the
+/// `(uri, local)` ordering. `an_unbound_prefix_is_refused` puts the prefix on an ATTRIBUTE, so
+/// the sort key catches it and the element-name guard is never reached. Deleting the element
+/// guard left the whole suite green while `<a><p:b/></a>` canonicalised to `<p:b></p:b>` -- a
+/// prefix written into the digest with no namespace URI anywhere near it, which is the collision
+/// the guard exists to prevent: any two documents binding `p` differently digest identically.
+#[test]
+fn an_unbound_prefix_on_an_element_name_is_refused() {
+    assert!(canonicalize("<a><p:b/></a>", "p:b").is_err());
+    assert!(canonicalize("<a><p:b/></a>", "a").is_err());
+    // CONTROL: bound, and it canonicalises.
+    assert_eq!(
+        canonicalize(r#"<a xmlns:p="urn:p"><p:b/></a>"#, "p:b").expect("canonicalises"),
+        r#"<p:b xmlns:p="urn:p"></p:b>"#
+    );
+}
+
+/// Two declarations on one element are rendered in PREFIX order, default first.
+///
+/// # The ordering the digest depends on, which nothing exercised
+///
+/// XML-C14N 2.2 sorts namespace declarations before attributes, and the declarations among
+/// themselves by prefix, with the default declaration first. Every fixture in this suite and in
+/// the crate's own signer emits at most ONE declaration per element, so the sort was never
+/// exercised: replacing it with `emitted.reverse()` left all 57 tests green.
+///
+/// The shape it breaks is not exotic, it is the ordinary apex of a signed SAML assertion --
+/// `<saml:Assertion xmlns:saml="..." xmlns:xsi="..." xsi:type="...">` -- so a wrong order here
+/// is a blanket false rejection of real signatures.
+#[test]
+fn declarations_are_rendered_default_first_then_by_prefix() {
+    let document =
+        r#"<r xmlns="urn:d" xmlns:bb="urn:b" xmlns:aa="urn:a"><e aa:x="1" bb:y="2"/></r>"#;
+    assert_eq!(
+        canonicalize(document, "e").expect("canonicalises"),
+        r#"<e xmlns="urn:d" xmlns:aa="urn:a" xmlns:bb="urn:b" aa:x="1" bb:y="2"></e>"#
+    );
 }

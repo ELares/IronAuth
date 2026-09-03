@@ -3,13 +3,18 @@
 //! Issue #138 criterion 3: "documents containing DTDs, external entities, or oversized/deep
 //! structures are rejected before signature processing".
 //!
-//! # "Before signature processing" is a property of the TYPE here, not of an ordering
+//! # "Before signature processing" is an ORDERING, and it is worth saying so accurately
 //!
-//! There is no ordering to get wrong, because there is nothing to order against: the only way
-//! to obtain a [`Document`] is [`parse`], and every signature step this crate will grow takes a
-//! `Document`. A refused document produces no value at all, so no later stage can receive one.
-//! That is why these tests assert on the error rather than on "the signature step was not
-//! reached" -- the second is unrepresentable.
+//! An earlier version of this note claimed the ordering was a property of the TYPE: that the
+//! only way to obtain a `Document` is `parse`, and that every signature step takes a `Document`,
+//! so no later stage could receive a refused one. The first half is true and the second is not
+//! -- `verify` takes bytes. What is true is that `verify` builds its tree through the same
+//! reader configuration and the same refusals, and returns before it looks at a signature, so
+//! every document refused here is refused there too.
+//!
+//! `a_refused_algorithm_is_refused_before_anything_is_verified` in `tests/wrapping.rs` is where
+//! that ordering is asserted against `verify` itself. These tests assert on the error, because
+//! what they are checking is the refusal, not the order.
 //!
 //! Needs no database.
 

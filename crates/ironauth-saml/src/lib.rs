@@ -106,12 +106,20 @@
 //! # Signature verification, and the one rule the whole design turns on
 //!
 //! [`verify`] is now here, and the shape of its API is the answer to the wrapping bug described
-//! at the top of this note. THE ONLY WAY TO READ A VALUE IS THROUGH A [`VerifiedAssertion`],
-//! and that struct holds the subtree the digest was computed over -- not the document, not the
-//! element the caller named, not a byte range into either. There is no accessor on [`Document`]
-//! at all. So "the component that decides signed-ness" and "the component that reads the
-//! values" cannot disagree about which bytes they meant, because there is only one copy of
-//! those bytes and only one function that produced it.
+//! at the top of this note. IN A NORMAL BUILD THE ONLY WAY TO READ A VALUE IS THROUGH A
+//! [`VerifiedAssertion`], and that struct holds the subtree the digest was computed over -- not
+//! the document, not the element the caller named, not a byte range into either. There is no
+//! accessor on [`Document`] at all. So "the component that decides signed-ness" and "the
+//! component that reads the values" cannot disagree about which bytes they meant, because there
+//! is only one copy of those bytes and only one function that produced it.
+//!
+//! "IN A NORMAL BUILD" IS LOAD-BEARING AND AN EARLIER DRAFT OMITTED IT. [`test_util`] is behind
+//! a feature this crate's own dependents never enable, and it exposes `canonicalize`, which
+//! returns the canonical octets of any named element of any document with no signature check
+//! anywhere on the path. That is a reader for unverified content. It exists because the
+//! canonicalizer cannot be tested through the verifier -- a signer and a verifier sharing a
+//! canonicalization bug agree perfectly -- and the argument for it is in [`test_util`] itself.
+//! It is still a door, and a sentence that says there is no door is worse than the door.
 //!
 //! That is a stronger claim than it looks, and the review of this PR is why it is stated so
 //! flatly: an earlier draft of [`verify`] digested a stripped copy of the assertion and then
@@ -138,15 +146,32 @@
 //!   this crate would be making on a caller's behalf about whose identity was asserted, and
 //!   that choice is the one that has to be visible at the call site. The same rule applies
 //!   inside an assertion: two elements of one name resolve to `None`, never to the first.
+//!
+//!   THE SAME RULE HAS A COST THE SP FLOW WILL HAVE TO PAY, and it is named here rather than
+//!   discovered later. The ordinary bearer assertion carries TWO `saml:NameID` elements: the
+//!   subject's, and one inside `saml:SubjectConfirmation` naming the confirming party, which
+//!   SAML core 2.4.1.2 distinguishes by POSITION and not by name. So
+//!   `text_of("saml:NameID")` answers `None` for the commonest assertion in the field. That is
+//!   the right answer for a name-only accessor, and it means #139 needs a POSITIONAL one --
+//!   `Subject` then `NameID`, as a path -- rather than a loosening of this rule.
+//! * A pinned key that cannot carry the named algorithm is `AlgorithmRefused`, not
+//!   `SignatureInvalid`. RFC 4051 2.3.6 names the ECDSA URIs by their DIGEST, taking the curve
+//!   from the key, so P-384 with `#ecdsa-sha256` is conforming; `ring` offers the fixed-width
+//!   verification XMLDSIG needs only for the matched pairs, so this crate refuses the cross
+//!   pairs. Refusing is fine. Calling a genuine signature invalid was not.
 //! * Namespace declarations are NOT attributes. [`VerifiedAssertion::attribute`] refuses
 //!   `xmlns` and `xmlns:*`, so a caller cannot read a URI as though the identity provider had
 //!   asserted it.
 //!
 //! # What this crate does NOT do yet
 //!
-//! Comment-truncation handling, encrypted assertions, and the fuzz targets are the rest of
-//! #138 and are not here. Metadata parsing, anchor rotation, and the SP protocol flow are
-//! #139.
+//! Encrypted assertions and the fuzz targets are the rest of #138 and are not here. Metadata
+//! parsing, anchor rotation, and the SP protocol flow are #139.
+//!
+//! COMMENT TRUNCATION IS HERE, and an earlier version of this list said it was not. A value
+//! split by a comment reads back whole, `tests/wrapping.rs` carries the corpus, and the note on
+//! the `Event::Comment` arm in `tree.rs` records which mechanism actually does the work -- which
+//! is not the one the obvious explanation would give.
 
 #![forbid(unsafe_code)]
 
@@ -206,6 +231,47 @@ pub mod test_util {
             &document[end..],
         ]
         .concat()
+    }
+
+    /// Re-seal a document whose SIGNATURE ELEMENT has been edited, leaving the assertion alone.
+    ///
+    /// # Why [`resign`] is not enough
+    ///
+    /// [`resign`] rebuilds the whole `SignedInfo` from one fixed template, so it can only ever
+    /// produce the shape this crate's own signer produces. Half the properties worth testing are
+    /// about a DIFFERENT shape: a `SignedInfo` that declares its own prefix, one that rebinds a
+    /// prefix to a hostile URI, a `Reference` URI written without its fragment, a `DigestValue`
+    /// that has been truncated, a base64 run broken across lines. Each of those has to remain
+    /// GENUINELY SIGNED, or the test proves only that a document with a broken signature is
+    /// refused, which every document is.
+    ///
+    /// So this takes the `SignedInfo` exactly as it now sits, canonicalises it in place, signs
+    /// that, and writes the value back. `signed_info` and `signature_value` are the qualified
+    /// names to look for, because the point of several of these documents is that those names
+    /// are not the usual ones.
+    ///
+    /// # Panics
+    ///
+    /// If the named elements are absent or the document does not canonicalise.
+    #[must_use]
+    pub fn reseal(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        document: &str,
+        signed_info: &str,
+        signature_value: &str,
+    ) -> String {
+        let message = canonicalize(document, signed_info).expect("the SignedInfo canonicalises");
+        let value = base64(&key.sign(message.as_bytes()));
+        let open = ["<", signature_value].concat();
+        let close = ["</", signature_value, ">"].concat();
+        let start = document.find(&open).expect("a SignatureValue to replace");
+        let start = start
+            + document[start..]
+                .find('>')
+                .expect("the SignatureValue start tag closes")
+            + 1;
+        let end = document.find(&close).expect("a SignatureValue to replace");
+        [&document[..start], &value, &document[end..]].concat()
     }
 
     /// The `SignedInfo` for one reference and digest.
