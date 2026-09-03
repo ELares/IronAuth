@@ -53,7 +53,8 @@ impl Fixture {
             document.as_bytes(),
             &Limits::default(),
             &self.anchors,
-            "saml:Assertion",
+            ironauth_saml::ASSERTION_NS,
+            "Assertion",
         )
     }
 }
@@ -72,7 +73,9 @@ fn the_unmodified_document_verifies_and_carries_its_values() {
     assert_eq!(assertion.name(), "saml:Assertion");
     assert_eq!(assertion.attribute("ID"), Some("_assertion"));
     assert_eq!(
-        assertion.text_of("saml:NameID").as_deref(),
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
         Some("victim@example.test")
     );
 }
@@ -250,7 +253,8 @@ fn a_valid_signature_from_an_unpinned_key_is_refused() {
             document.as_bytes(),
             &Limits::default(),
             &anchors,
-            "saml:Assertion"
+            ironauth_saml::ASSERTION_NS,
+            "Assertion"
         ),
         Err(VerifyError::SignatureInvalid)
     );
@@ -262,7 +266,8 @@ fn a_valid_signature_from_an_unpinned_key_is_refused() {
         document.as_bytes(),
         &Limits::default(),
         &anchors,
-        "saml:Assertion",
+        ironauth_saml::ASSERTION_NS,
+        "Assertion",
     )
     .expect("the signer's own key verifies it");
 }
@@ -276,7 +281,8 @@ fn no_pinned_key_means_no_signature_verifies() {
             fixture.document.as_bytes(),
             &Limits::default(),
             &[],
-            "saml:Assertion"
+            ironauth_saml::ASSERTION_NS,
+            "Assertion"
         ),
         Err(VerifyError::SignatureInvalid)
     );
@@ -391,7 +397,9 @@ fn content_added_inside_the_signature_is_not_returned() {
         .verify(&attacked)
         .expect("the signature is untouched, so this still verifies");
     assert_eq!(
-        assertion.text_of("saml:NameID").as_deref(),
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
         Some("victim@example.test"),
         "a NameID smuggled inside the signature was returned as though it had been signed"
     );
@@ -404,7 +412,7 @@ fn content_added_inside_the_signature_is_not_returned() {
             .replacen("</ds:Signature>", &format!("{smuggled}</ds:Signature>"), 1);
     let assertion = fixture.verify(&attacked).expect("still verifies");
     assert_eq!(
-        assertion.text_of("saml:AttributeValue"),
+        assertion.text_of(ironauth_saml::ASSERTION_NS, "AttributeValue"),
         None,
         "an attribute smuggled inside the signature was readable"
     );
@@ -499,11 +507,12 @@ fn two_elements_of_one_name_are_not_silently_resolved_to_the_first() {
         resigned.as_bytes(),
         &Limits::default(),
         &anchors,
-        "saml:Assertion",
+        ironauth_saml::ASSERTION_NS,
+        "Assertion",
     )
     .expect("a document with two NameIDs is signed like any other");
     assert_eq!(
-        assertion.text_of("saml:NameID"),
+        assertion.text_of(ironauth_saml::ASSERTION_NS, "NameID"),
         None,
         "two candidates must not resolve silently to the first"
     );
@@ -538,7 +547,8 @@ fn two_genuinely_signed_assertions_are_refused_rather_than_resolved() {
             document.as_bytes(),
             &Limits::default(),
             &anchors,
-            "saml:Assertion",
+            ironauth_saml::ASSERTION_NS,
+            "Assertion",
         )
     };
 
@@ -727,7 +737,9 @@ fn a_foreign_signature_as_a_direct_child_is_not_a_signature() {
         .verify(&attacked)
         .expect("a foreign element named Signature is ordinary content");
     assert_eq!(
-        assertion.text_of("saml:NameID").as_deref(),
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
         Some("victim@example.test")
     );
 }
@@ -825,7 +837,9 @@ fn a_declaration_on_signed_info_is_in_scope_for_its_children() {
         .verify(&moved)
         .expect("a conforming signature must not be refused for where it declares its prefix");
     assert_eq!(
-        assertion.text_of("saml:NameID").as_deref(),
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
         Some("victim@example.test")
     );
 }
@@ -878,7 +892,9 @@ fn a_line_wrapped_base64_value_decodes() {
         .verify(&wrapped)
         .expect("a wrapped base64 value is the ordinary case, not a forgery");
     assert_eq!(
-        assertion.text_of("saml:NameID").as_deref(),
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
         Some("victim@example.test")
     );
 }
@@ -964,39 +980,62 @@ fn a_foreign_element_inside_the_transform_list_is_refused() {
     );
 }
 
-/// A pinned key that cannot carry the named algorithm is an ALGORITHM refusal, not a bad
-/// signature.
+/// The error a document gets does not depend on WHICH KEY the deployment pinned.
 ///
-/// # RFC 4051 2.3.6 names the hash, and the curve comes from the key
+/// # An error that varies with the server's configuration is an oracle
 ///
-/// `#ecdsa-sha256` says SHA-256 and says nothing about the curve, so a P-384 anchor with an
-/// `#ecdsa-sha256` signature is a conforming combination. This crate cannot check it: `ring`
-/// offers fixed-width `r||s` verification, which XMLDSIG requires, only for P-256 with SHA-256
-/// and P-384 with SHA-384, and the cross pairs exist there only in ASN.1 form.
+/// A previous revision refused a document whose algorithm no pinned anchor could carry with
+/// `AlgorithmRefused` rather than `SignatureInvalid`, so that an operator would not read
+/// "forgery" about their own identity provider's genuine signature. Both reviewers who looked at
+/// it found the same thing: everything ahead of that check is attacker-controlled or
+/// self-computable -- the reference digest is UNKEYED, so an attacker computes it over content
+/// they wrote -- so an attacker holding no key at all reached it, and three requests naming
+/// `#rsa-sha256`, `#ecdsa-sha256` and `#ecdsa-sha384` in turn read the pinned key's kind
+/// straight out of which one answered differently.
 ///
-/// The refusal is fine. Reporting it as `SignatureInvalid` was not: that is the word for a
-/// forgery, and an operator reading it about their own identity provider's genuine signature
-/// goes hunting for an attacker instead of for the unsupported pairing.
+/// It was also wrong about the ORDINARY case: an SP pinning RSA, sent an ECDSA-signed document,
+/// was told this server refuses an algorithm it accepts.
 ///
-/// The anchor below is a well-formed P-384 POINT LENGTH rather than a real key, because the
-/// refusal happens before any verification and a real key would prove nothing extra. The control
-/// is what carries the test: the same document, with a P-256 anchor that CAN carry the
-/// algorithm, verifies.
+/// So the contract is the one `VerifyError`'s own doc states -- one variant per DECISION about
+/// the DOCUMENT -- and this test is what holds it. The narrowing it replaced (ECDSA is supported
+/// for the matched hash/curve pairs only) is recorded in the crate documentation instead, where
+/// an operator can find it and an attacker cannot query it.
 #[test]
-fn an_anchor_that_cannot_carry_the_named_algorithm_is_refused_as_an_algorithm() {
+fn the_error_does_not_reveal_which_key_kind_was_pinned() {
     let fixture = Fixture::new();
-    let mut point = vec![0x04_u8];
-    point.extend(core::iter::repeat_n(0x01_u8, 96));
-    assert_eq!(
-        verify(
-            fixture.document.as_bytes(),
-            &Limits::default(),
-            &[TrustAnchor::EcdsaP384(point)],
-            "saml:Assertion",
+    let point = |len: usize| {
+        let mut point = vec![0x04_u8];
+        point.extend(core::iter::repeat_n(0x01_u8, len));
+        point
+    };
+    let elsewhere = [
+        ("a P-384 anchor", TrustAnchor::EcdsaP384(point(96))),
+        (
+            "a different P-256 anchor",
+            TrustAnchor::EcdsaP256(point(64)),
         ),
-        Err(VerifyError::AlgorithmRefused)
-    );
-    // CONTROL: the pairing is the only thing being refused.
+        (
+            "an RSA anchor",
+            TrustAnchor::Rsa {
+                modulus: vec![0x01; 256],
+                exponent: vec![0x01, 0x00, 0x01],
+            },
+        ),
+    ];
+    for (what, anchor) in elsewhere {
+        assert_eq!(
+            verify(
+                fixture.document.as_bytes(),
+                &Limits::default(),
+                &[anchor],
+                ironauth_saml::ASSERTION_NS,
+                "Assertion",
+            ),
+            Err(VerifyError::SignatureInvalid),
+            "{what} must give the same answer as every other wrong key"
+        );
+    }
+    // CONTROL: the right key still verifies, so the sameness above is not "everything fails".
     assert!(fixture.verify(&fixture.document).is_ok());
 }
 
@@ -1080,7 +1119,9 @@ fn a_comment_inside_a_signed_value_does_not_truncate_it() {
         .verify(&split)
         .expect("a comment is not part of the digest, so the document still verifies");
     assert_eq!(
-        assertion.text_of("saml:NameID").as_deref(),
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
         Some("victim@example.test"),
         "the value must be the full string, not the part before the comment"
     );
@@ -1091,7 +1132,7 @@ fn a_comment_inside_a_signed_value_does_not_truncate_it() {
         fixture
             .verify(&resigned)
             .expect("a re-signed document with a comment in it verifies")
-            .text_of("saml:NameID")
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
             .as_deref(),
         Some("victim@example.test")
     );
@@ -1124,7 +1165,9 @@ fn a_comment_anywhere_in_a_signed_value_reads_back_whole() {
             .verify(&document)
             .unwrap_or_else(|error| panic!("{what}: {error:?}"));
         assert_eq!(
-            assertion.text_of("saml:NameID").as_deref(),
+            assertion
+                .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+                .as_deref(),
             Some("victim@example.test"),
             "{what}"
         );
@@ -1139,5 +1182,209 @@ fn a_comment_anywhere_in_a_signed_value_reads_back_whole() {
         fixture.verify(&tampered),
         Err(VerifyError::SignatureInvalid),
         "changing the text past a comment must break the digest"
+    );
+}
+
+/// A second assertion under a DIFFERENT PREFIX but the SAME namespace is refused.
+///
+/// # A prefix is not an identity, and treating it as one was a bypass
+///
+/// The exactly-one-candidate rule is this crate's first wrapping defence, and it used to compare
+/// the RAW QUALIFIED NAME. So it was a rule about prefix SPELLING: the identity provider's
+/// genuinely signed `<saml:Assertion>` plus an attacker's unsigned
+/// `<saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">` was reported as
+/// carrying exactly ONE assertion and verified, while the byte-identical document spelling the
+/// second one `saml:` was refused. Two prefixes bound to one URI name one thing.
+///
+/// The two arms below are the same document differing ONLY in the second assertion's prefix, so
+/// a verifier that still keys on spelling fails exactly one of them.
+#[test]
+fn a_second_assertion_under_another_prefix_is_still_a_second_assertion() {
+    let fixture = Fixture::new();
+    for (what, forged) in [
+        (
+            "the same prefix",
+            concat!(
+                r#"<saml:Assertion ID="_forged"><saml:Subject>"#,
+                "<saml:NameID>attacker@evil.test</saml:NameID>",
+                "</saml:Subject></saml:Assertion>"
+            ),
+        ),
+        (
+            "a different prefix bound to the same namespace",
+            concat!(
+                r#"<saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+                r#"ID="_forged"><saml2:Subject>"#,
+                "<saml2:NameID>attacker@evil.test</saml2:NameID>",
+                "</saml2:Subject></saml2:Assertion>"
+            ),
+        ),
+    ] {
+        let attacked = fixture.document.replacen(
+            "</samlp:Response>",
+            &format!("{forged}</samlp:Response>"),
+            1,
+        );
+        assert_eq!(
+            fixture.verify(&attacked),
+            Err(VerifyError::ReferenceRefused),
+            "{what}"
+        );
+    }
+
+    // AND THE OTHER HALF: an element with the same LOCAL name in a DIFFERENT namespace is not a
+    // candidate at all, so it must not be refused. Without this the fix would be "refuse
+    // anything called Assertion", which breaks every document carrying an unrelated element of
+    // that name.
+    let unrelated = r#"<x:Assertion xmlns:x="urn:unrelated" ID="_other"/>"#;
+    let benign = fixture.document.replacen(
+        "</samlp:Response>",
+        &format!("{unrelated}</samlp:Response>"),
+        1,
+    );
+    assert!(
+        fixture.verify(&benign).is_ok(),
+        "an element of the same local name in another namespace is not an assertion"
+    );
+}
+
+/// An `InclusiveNamespaces` prefix list is refused, on the canonicalization method and on the
+/// transform.
+///
+/// # Both refusals existed and neither had a test
+///
+/// Exclusive canonicalization with a `PrefixList` emits a DIFFERENT set of declarations, so a
+/// verifier that ignores the list digests under rules the signer did not use and rejects a valid
+/// signature -- or, with the tables turned, accepts one it should not. `VerifyError`'s own doc
+/// names this refusal explicitly. Both places it is implemented could be deleted with the whole
+/// suite still green, and each document below then verified.
+///
+/// Refusing is the honest answer: this crate does not implement prefix lists, and pretending to
+/// honour one would compute a different digest from the signer.
+#[test]
+fn an_inclusive_namespaces_prefix_list_is_refused() {
+    let fixture = Fixture::new();
+    let list = concat!(
+        r#"<ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" "#,
+        r#"PrefixList="saml"/>"#
+    );
+    for (what, before, after) in [
+        (
+            "on the canonicalization method",
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            format!(
+                r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">{list}</ds:CanonicalizationMethod>"#
+            ),
+        ),
+        (
+            "on the exclusive transform",
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            format!(
+                r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">{list}</ds:Transform>"#
+            ),
+        ),
+    ] {
+        let edited = fixture.document.replacen(before, &after, 1);
+        assert_ne!(edited, fixture.document, "{what} must change the document");
+        // Re-sealed, so the signature over SignedInfo is genuine and the refusal is about the
+        // prefix list rather than about a signature the edit broke.
+        let attacked = ironauth_saml::test_util::reseal(
+            &fixture.key,
+            &edited,
+            "ds:SignedInfo",
+            "ds:SignatureValue",
+        );
+        assert_eq!(
+            fixture.verify(&attacked),
+            Err(VerifyError::AlgorithmRefused),
+            "{what}"
+        );
+    }
+}
+
+/// A `ds:Transform` with no `Algorithm` does not vanish from the list that is compared.
+///
+/// # The combinator was the bug
+///
+/// The allowlist is over a SEQUENCE, and it was built with `filter_map`, which silently DROPS a
+/// transform carrying no unprefixed `Algorithm`. That element is a real `ds:Transform`, so it
+/// was counted on both sides of the element-count guard added for the foreign-namespace case,
+/// and then disappeared before the comparison: a three-transform list compared equal to the
+/// two-element allowlist and the document verified.
+///
+/// `Algorithm` is `use="required"` in the XMLDSIG schema, so every other implementation refuses
+/// these documents. That is the accept-more asymmetry the count guard was added for, moved from
+/// a foreign namespace into the XMLDSIG one.
+#[test]
+fn a_transform_without_an_algorithm_is_refused() {
+    let fixture = Fixture::new();
+    let enveloped =
+        r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#;
+    for (what, extra) in [
+        ("no Algorithm attribute at all", "<ds:Transform/>"),
+        (
+            "a PREFIXED Algorithm attribute",
+            r#"<ds:Transform ds:Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"/>"#,
+        ),
+    ] {
+        let edited = fixture
+            .document
+            .replacen(enveloped, &format!("{enveloped}{extra}"), 1);
+        assert_ne!(edited, fixture.document, "{what} must change the document");
+        let attacked = ironauth_saml::test_util::reseal(
+            &fixture.key,
+            &edited,
+            "ds:SignedInfo",
+            "ds:SignatureValue",
+        );
+        assert_eq!(
+            fixture.verify(&attacked),
+            Err(VerifyError::AlgorithmRefused),
+            "{what}"
+        );
+    }
+}
+
+/// Bytes after the base64 padding are refused.
+///
+/// # A second encoding of the same signature
+///
+/// `SignatureValue` sits OUTSIDE `SignedInfo`, so no digest and no signature covers it. The
+/// decoder used to stop at the first `=` and never look at the rest, so one captured response
+/// could be minted into unboundedly many byte-distinct documents that all verify. That is the
+/// same property this crate refuses ECDSA DER for: a verifier that accepts a second encoding of
+/// one signature accepts a document its own audit trail cannot tell apart.
+///
+/// Whitespace after the padding is still fine, because that is what a line-wrapped value looks
+/// like.
+#[test]
+fn bytes_after_the_base64_padding_are_refused() {
+    let fixture = Fixture::new();
+    let start = fixture
+        .document
+        .find("<ds:SignatureValue>")
+        .expect("the fixture is signed")
+        + "<ds:SignatureValue>".len();
+    let end = fixture
+        .document
+        .find("</ds:SignatureValue>")
+        .expect("the fixture is signed");
+    let value = &fixture.document[start..end];
+    assert!(value.ends_with('='), "the fixture value must carry padding");
+
+    for suffix in ["QUJD", "ZZZZZZZZ", "aGVsbG8"] {
+        let attacked = [&fixture.document[..end], suffix, &fixture.document[end..]].concat();
+        assert_eq!(
+            fixture.verify(&attacked),
+            Err(VerifyError::SignatureInvalid),
+            "trailing {suffix} must be refused"
+        );
+    }
+
+    // CONTROL: whitespace after the padding is a line-wrapped value, not a second encoding.
+    let wrapped = [&fixture.document[..end], "\n  ", &fixture.document[end..]].concat();
+    assert!(
+        fixture.verify(&wrapped).is_ok(),
+        "whitespace after the padding is the ordinary wrapped form"
     );
 }

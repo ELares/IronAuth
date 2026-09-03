@@ -108,8 +108,13 @@
 //! [`verify`] is now here, and the shape of its API is the answer to the wrapping bug described
 //! at the top of this note. IN A NORMAL BUILD THE ONLY WAY TO READ A VALUE IS THROUGH A
 //! [`VerifiedAssertion`], and that struct holds the subtree the digest was computed over -- not
-//! the document, not the element the caller named, not a byte range into either. There is no
-//! accessor on [`Document`] at all. So "the component that decides signed-ness" and "the
+//! the document, not the element the caller named, not a byte range into either. [`Document`]
+//! exposes the SHAPE of what was parsed and no values: [`Element::name`] and
+//! [`Element::children`], never an attribute and never a text node. An earlier draft said there
+//! was "no accessor on `Document` at all", which is false -- [`Document::root`] is public, and
+//! an element NAME is attacker-controlled bytes out of an unverified document. What is true is
+//! the property this paragraph needs: no VALUE can be read without a signature.
+//! So "the component that decides signed-ness" and "the
 //! component that reads the values" cannot disagree about which bytes they meant, because there
 //! is only one copy of those bytes and only one function that produced it.
 //!
@@ -154,11 +159,24 @@
 //!   `text_of("saml:NameID")` answers `None` for the commonest assertion in the field. That is
 //!   the right answer for a name-only accessor, and it means #139 needs a POSITIONAL one --
 //!   `Subject` then `NameID`, as a path -- rather than a loosening of this rule.
-//! * A pinned key that cannot carry the named algorithm is `AlgorithmRefused`, not
-//!   `SignatureInvalid`. RFC 4051 2.3.6 names the ECDSA URIs by their DIGEST, taking the curve
-//!   from the key, so P-384 with `#ecdsa-sha256` is conforming; `ring` offers the fixed-width
-//!   verification XMLDSIG needs only for the matched pairs, so this crate refuses the cross
-//!   pairs. Refusing is fine. Calling a genuine signature invalid was not.
+//! * ECDSA is supported for the MATCHED pairs only: P-256 with SHA-256 and P-384 with SHA-384.
+//!   RFC 4051 2.3.6 names the URIs by their DIGEST and takes the curve from the key, so P-384
+//!   with `#ecdsa-sha256` is conforming and this crate cannot check it: `ring` offers the
+//!   fixed-width `r||s` verification XMLDSIG requires only for the matched pairs. Such a
+//!   document answers `SignatureInvalid`.
+//!
+//!   THAT NARROWING IS RECORDED HERE RATHER THAN IN THE ERROR, and the attempt to put it in the
+//!   error is why. A previous revision returned `AlgorithmRefused` for the cross pairs so an
+//!   operator would not read "forgery" about their own identity provider. It made two things
+//!   worse at once. The error then depended on the SERVER's pinned key rather than on the
+//!   document, so an unauthenticated attacker naming each of the three algorithm URIs in turn
+//!   read the pinned key's kind out of which one answered differently -- the oracle
+//!   [`VerifyError`] is explicitly shaped to avoid. And it relabelled the ORDINARY wrong-key
+//!   case: an SP pinning RSA, sent an ECDSA-signed document, was told this server refuses an
+//!   algorithm it in fact accepts.
+//!
+//!   So the error channel says only what the DOCUMENT decides, and the narrowing lives in this
+//!   paragraph, where an operator can find it and an attacker cannot query it.
 //! * Namespace declarations are NOT attributes. [`VerifiedAssertion::attribute`] refuses
 //!   `xmlns` and `xmlns:*`, so a caller cannot read a URI as though the identity provider had
 //!   asserted it.
@@ -181,6 +199,17 @@ mod tree;
 mod verify;
 
 pub use parse::{DEPTH_CEILING, Document, Element, Limits, SamlError, parse};
+
+/// The SAML 2.0 assertion namespace, which is what an `Assertion` element is IN.
+///
+/// Exported because [`verify`] takes a namespace and a local name rather than a qualified name,
+/// and every caller would otherwise write this URI out by hand. A prefix is not an identity:
+/// Okta emits `saml2:Assertion`, Entra emits `Assertion` under a default declaration, and both
+/// are this namespace.
+pub const ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+
+/// The SAML 2.0 protocol namespace, which `Response` and `AuthnRequest` are in.
+pub const PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.

@@ -107,6 +107,14 @@ impl core::error::Error for VerifyError {}
 #[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedAssertion {
     signed: RichElement,
+    /// What the ANCESTORS of the signed element declared.
+    ///
+    /// Kept because a prefix used inside the assertion is very often declared on the enclosing
+    /// `Response`, which is outside the subtree: exclusive canonicalization resolves against
+    /// every declaration in scope, and so must a reader. Without this, `text_of` could not tell
+    /// `saml:NameID` in the SAML assertion namespace from an attacker's `saml:NameID` bound to
+    /// something else.
+    inherited: Vec<Binding>,
 }
 
 /// NOT DERIVED, AND THAT IS THE POINT.
@@ -155,7 +163,8 @@ impl VerifiedAssertion {
             .map(|attribute| attribute.value.as_str())
     }
 
-    /// The text of the descendant with this qualified name, if there is EXACTLY ONE.
+    /// The text of the descendant in `namespace` with local name `local`, if there is EXACTLY
+    /// ONE.
     ///
     /// # An ambiguous read is no read
     ///
@@ -166,8 +175,8 @@ impl VerifiedAssertion {
     /// defect class this crate is about, so ambiguity answers `None` and the caller decides what
     /// to do about it.
     #[must_use]
-    pub fn text_of(&self, name: &str) -> Option<String> {
-        let found = collect(&self.signed, name);
+    pub fn text_of(&self, namespace: &str, local: &str) -> Option<String> {
+        let found = collect(&self.signed, &self.inherited, namespace, local);
         match found.as_slice() {
             [single] => Some(text_content(single)),
             _ => None,
@@ -177,10 +186,24 @@ impl VerifiedAssertion {
 
 /// Verify `bytes` against `anchors`, returning the element the signature covers.
 ///
-/// `signed_element` is the qualified name of the element a caller intends to read, and it is an
-/// ARGUMENT rather than something inferred: a verifier that accepted whatever the document said
-/// it had signed would accept a signature over a node nobody cares about and then be asked for
-/// values from a node nobody signed.
+/// `namespace` and `local` name the element a caller intends to read, and they are an ARGUMENT
+/// rather than something inferred: a verifier that accepted whatever the document said it had
+/// signed would accept a signature over a node nobody cares about and then be asked for values
+/// from a node nobody signed.
+///
+/// # A NAMESPACE AND A LOCAL NAME, NOT A QUALIFIED NAME, AND THAT WAS A BYPASS
+///
+/// An earlier version took one string and compared it to `element.name` -- the raw, PREFIXED
+/// name -- so the exactly-one-candidate rule, which is this crate's first wrapping defence, was
+/// a rule about prefix SPELLING rather than about the document. A response holding the identity
+/// provider's genuinely signed `<saml:Assertion ID="_assertion">` plus an attacker's unsigned
+/// `<saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_forged">` was
+/// reported as carrying exactly ONE assertion and verified, while the byte-identical document
+/// spelling the second one `saml:` was refused. A prefix is not an identity, and two prefixes
+/// bound to one URI name one thing.
+///
+/// It also made the crate unusable against the field: Okta emits `saml2:Assertion` and Entra
+/// emits `Assertion` under a default `xmlns`, and neither could be named at all.
 ///
 /// # Errors
 ///
@@ -189,13 +212,14 @@ pub fn verify(
     bytes: &[u8],
     limits: &Limits,
     anchors: &[TrustAnchor],
-    signed_element: &str,
+    namespace: &str,
+    local: &str,
 ) -> Result<VerifiedAssertion, VerifyError> {
     let root = crate::tree::build(bytes, limits).map_err(VerifyError::Malformed)?;
 
     // EXACTLY ONE candidate, and exactly one signature on it. "More than one" is not a case to
     // pick a winner from: it is the shape every wrapping attack takes, so it is a refusal.
-    let candidates = collect(&root, signed_element);
+    let candidates = collect(&root, &[], namespace, local);
     let [signed] = candidates.as_slice() else {
         return Err(VerifyError::ReferenceRefused);
     };
@@ -256,11 +280,14 @@ pub fn verify(
     if named != id {
         return Err(VerifyError::ReferenceRefused);
     }
-    // AND NOTHING ELSE IN THE DOCUMENT MAY CLAIM IT. Duplicated identifiers are the wrapping
-    // class that needs no schema trick at all: two elements answer to one reference and the
-    // verifier and the consumer pick differently. The other element does NOT have to be a second
-    // candidate -- a `samlp:Response` carrying the same `ID` as the assertion it wraps is one
-    // element of each kind, so the exactly-one-candidate rule above never sees it.
+    // AND NOTHING ELSE IN THE DOCUMENT MAY CLAIM IT THROUGH AN `ID`. Duplicated identifiers are
+    // the wrapping class that needs no schema trick at all: two elements answer to one reference
+    // and the verifier and the consumer pick differently. The other element does NOT have to be
+    // a second candidate -- a `samlp:Response` carrying the same `ID` as the assertion it wraps
+    // is one element of each kind, so the exactly-one-candidate rule above never sees it.
+    //
+    // `ID` and not also `xml:id`: see `count_identifier` for what that leaves uncovered and why
+    // it is a divergence rather than a hole.
     if count_identifier(&root, named) != 1 {
         return Err(VerifyError::ReferenceRefused);
     }
@@ -313,30 +340,6 @@ pub fn verify(
     let signature_bytes = decode_base64(&signature_value).ok_or(VerifyError::SignatureInvalid)?;
     let message = canonicalize(signed_info.element, &signed_info.inherited)
         .map_err(|_| VerifyError::Malformed(SamlError::Malformed))?;
-    // AN ALGORITHM NO PINNED KEY CAN CARRY IS A REFUSAL, NOT A BAD SIGNATURE.
-    //
-    // RFC 4051 2.3.6 names the ECDSA URIs by their DIGEST only -- `#ecdsa-sha256` says SHA-256
-    // and says nothing about the curve, which comes from the key. So a P-384 anchor with an
-    // `#ecdsa-sha256` signature is a conforming combination. This crate cannot check it: `ring`
-    // exposes fixed-width `r||s` verification, which XMLDSIG requires, only for the matched
-    // pairs P-256/SHA-256 and P-384/SHA-384, and the cross pairs exist only in ASN.1 form.
-    //
-    // Refusing it is honest; refusing it as `SignatureInvalid` was not. That is the word for a
-    // forgery, and an operator who reads it about a genuine signature from their own identity
-    // provider goes looking for an attacker instead of for the unsupported combination.
-    //
-    // AND THE EMPTY ANCHOR LIST IS NOT AN UNSUPPORTED ALGORITHM. A caller who pins nothing
-    // trusts nothing, so the answer is `SignatureInvalid` and it must stay that way: the first
-    // version of this check read `!anchors.iter().any(..)`, which is vacuously true of an empty
-    // list, and turned "no key trusts this document" into "this server refuses that algorithm".
-    // `no_pinned_key_means_no_signature_verifies` caught it.
-    if !anchors.is_empty()
-        && !anchors
-            .iter()
-            .any(|anchor| anchor_can_carry(algorithm, anchor))
-    {
-        return Err(VerifyError::AlgorithmRefused);
-    }
     if !anchors
         .iter()
         .any(|anchor| verify_xml_signature(algorithm, anchor, &message, &signature_bytes))
@@ -344,7 +347,10 @@ pub fn verify(
         return Err(VerifyError::SignatureInvalid);
     }
 
-    Ok(VerifiedAssertion { signed: digested })
+    Ok(VerifiedAssertion {
+        signed: digested,
+        inherited: apex.inherited,
+    })
 }
 
 /// Map the `SignatureMethod` URI onto the allowlist.
@@ -433,10 +439,19 @@ fn check_transforms(reference: &Scoped<'_>) -> Result<(), VerifyError> {
     if transform_children.len() != element_children {
         return Err(VerifyError::AlgorithmRefused);
     }
-    let listed: Vec<&str> = transform_children
+    // EVERY transform must CARRY an Algorithm, and `filter_map` was the wrong combinator: it
+    // silently DROPPED a `<ds:Transform/>` with no `Algorithm`, and a `<ds:Transform
+    // ds:Algorithm="..."/>` whose attribute is prefixed. Both are counted on both sides of the
+    // check above, so a three-transform list compared equal to the two-element allowlist and a
+    // document with an undeclared transform in the middle verified. `Algorithm` is
+    // `use="required"` in the XMLDSIG schema, so every other implementation refuses that
+    // document -- the same accept-more asymmetry the count check was added for, moved from a
+    // foreign namespace into the XMLDSIG one.
+    let listed: Option<Vec<&str>> = transform_children
         .iter()
-        .filter_map(|transform| transform.attribute("Algorithm"))
+        .map(|transform| transform.attribute("Algorithm"))
         .collect();
+    let listed = listed.ok_or(VerifyError::AlgorithmRefused)?;
     if listed != [ENVELOPED, EXCLUSIVE_C14N] {
         return Err(VerifyError::AlgorithmRefused);
     }
@@ -670,46 +685,26 @@ fn resolve(name: &str, scope: &[Binding]) -> Option<String> {
 }
 
 /// Every descendant (and the root itself) whose qualified name matches.
-fn collect<'a>(root: &'a RichElement, name: &str) -> Vec<&'a RichElement> {
+fn collect<'a>(
+    root: &'a RichElement,
+    inherited: &[Binding],
+    namespace: &str,
+    local: &str,
+) -> Vec<&'a RichElement> {
     let mut found = Vec::new();
-    let mut pending = vec![root];
-    while let Some(element) = pending.pop() {
-        if element.name == name {
-            found.push(element);
+    let mut pending = vec![Scoped::new(root, inherited.to_vec())];
+    while let Some(scoped) = pending.pop() {
+        if scoped.is(namespace, local) {
+            found.push(scoped.element);
         }
-        for child in &element.children {
+        let inner = scoped.scope();
+        for child in &scoped.element.children {
             if let RichNode::Element(nested) = child {
-                pending.push(nested);
+                pending.push(Scoped::new(nested, inner.clone()));
             }
         }
     }
     found
-}
-
-/// Whether a pinned key could carry this algorithm at all.
-///
-/// # Why this is separate from verification, and why it answers before it
-///
-/// `ring` exposes fixed-width `r||s` ECDSA verification -- the encoding RFC 4051 2.3.6 requires
-/// for XMLDSIG -- only for the matched pairs P-256 with SHA-256 and P-384 with SHA-384. The
-/// cross pairs, which RFC 4051 permits because the URI names only the digest, exist there in
-/// ASN.1 form alone. So a P-384 anchor with an `#ecdsa-sha256` signature is a combination this
-/// crate cannot check.
-///
-/// It used to fall through the match inside `verify_xml_signature` to `_ => false`, which the
-/// caller reported as `SignatureInvalid`. That is the word for a forgery. An operator whose own
-/// identity provider signs that way would read it as an attack on their tenant rather than as
-/// an unsupported pairing, and the crate's own note about ECDSA encodings says exactly what
-/// happens next: it "gets fixed by turning ECDSA off".
-fn anchor_can_carry(algorithm: XmlSigAlg, anchor: &TrustAnchor) -> bool {
-    matches!(
-        (algorithm, anchor),
-        (
-            XmlSigAlg::RsaSha256 | XmlSigAlg::RsaSha384 | XmlSigAlg::RsaSha512,
-            XmlSigKey::Rsa { .. }
-        ) | (XmlSigAlg::EcdsaP256Sha256, XmlSigKey::EcdsaP256(_))
-            | (XmlSigAlg::EcdsaP384Sha384, XmlSigKey::EcdsaP384(_))
-    )
 }
 
 /// The first descendant with this qualified name.
@@ -750,7 +745,18 @@ fn signed_identifier(element: &RichElement) -> Option<&str> {
     attribute(element, "ID")
 }
 
-/// How many elements in the document claim `id`.
+/// How many elements in the document claim `id` through an UNPREFIXED `ID` attribute.
+///
+/// # What this does not count, and why the call site says so
+///
+/// `xml:id` is also an ID-typed attribute by the W3C `xml:id` recommendation, and libxml2 --
+/// the engine under `xmlsec` and most deployed SAML stacks -- resolves a same-document reference
+/// through it. This counts only `ID`, which is what SAML assertions carry.
+///
+/// A document where an `xml:id` twin shadows the assertion's `ID` therefore passes this count.
+/// It is not a bypass HERE, because the caller receives the subtree this crate DIGESTED and no
+/// second lookup happens; it is a divergence from what another implementation would resolve, so
+/// the call site claims only what this function checks.
 fn count_identifier(root: &RichElement, id: &str) -> usize {
     let mut count = 0;
     let mut pending = vec![root];
@@ -783,7 +789,17 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
             continue;
         }
         if byte == b'=' {
-            break;
+            // AND NOTHING BUT PADDING AND WHITESPACE MAY FOLLOW. An earlier version broke out of
+            // the loop here and never looked at the rest, so `<value>==QUJD` decoded to the same
+            // bytes as `<value>==`. `SignatureValue` sits outside `SignedInfo`, so no digest and
+            // no signature covers it: one captured response could be minted into unboundedly
+            // many byte-distinct documents that all verify. That is the same "a second encoding
+            // of the same signature" this crate refuses ECDSA DER for.
+            return text
+                .bytes()
+                .skip_while(|candidate| *candidate != b'=')
+                .all(|candidate| candidate == b'=' || candidate.is_ascii_whitespace())
+                .then_some(out);
         }
         let index = TABLE.iter().position(|candidate| *candidate == byte)?;
         accumulator = (accumulator << 6) | u32::try_from(index).ok()?;
