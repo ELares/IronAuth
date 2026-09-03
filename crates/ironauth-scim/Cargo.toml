@@ -32,10 +32,12 @@ serde_json.workspace = true
 name = "surface"
 path = "tests/surface.rs"
 
-# THE USERS RESOURCE and the SCIM IDOR suite (issue #135 criterion 5): that every method
-# authenticates, that a credential reaches exactly its own organization through every path
-# shape, filter and encoding, and that both vendor PATCH dialects actually deactivate.
-# Needs a database.
+# THE USERS RESOURCE (issue #135): that every method authenticates, that a credential reaches
+# exactly its own organization through every path shape, filter and encoding, and that both
+# vendor PATCH dialects actually deactivate. Needs a database.
+#
+# The cross-scope IDOR suite is tests/idor.rs, which needs no block of its own -- this crate
+# leaves `autotests` on, so it is discovered.
 [[test]]
 name = "users"
 path = "tests/users.rs"

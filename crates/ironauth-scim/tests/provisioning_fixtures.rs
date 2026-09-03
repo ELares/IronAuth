@@ -194,6 +194,12 @@ fn the_corpus_covers_every_operation_the_criterion_names() {
     let names: Vec<String> = fixtures().into_iter().map(|(name, _)| name).collect();
     for required in [
         "okta_create_user.json",
+        // UPDATE and GROUP PUSH, both named by criterion 1 and neither driven until now: the
+        // corpus had no request that REPLACES a resource at all, and its only group-push
+        // fixture was a membership removal -- the step AFTER the push. A required list is only
+        // as good as the criterion's own words, so these are checked against them.
+        "okta_update_user.json",
+        "okta_group_push.json",
         "okta_deactivate_user.json",
         "okta_group_membership.json",
         "entra_patch_dialect.json",

@@ -36,6 +36,36 @@
 //! ```
 //!
 //! The harness then covers that operation in CI automatically.
+//!
+//! # What this trait CANNOT express, and where those operations are covered
+//!
+//! A probe receives ONE untrusted identifier. MOST probes here parse it first, and for an id
+//! that EMBEDS its scope -- which is every `ScopedId` in this store -- `parse_in_scope` is
+//! itself the scope check, so a foreign id is refused there and the operation is never reached.
+//! That is fine when the operation's own fence is what the parse enforces.
+//!
+//! NOT ALL of them, and not by a narrow margin: FOURTEEN of the sixty-two probes here hand the
+//! identifier over unparsed. `FederationLoginStateConsumeProbe` passes `foreign_id` straight to
+//! `consume()`, which a review measured by making the operation report a leak on arrival, and
+//! `UserByIdentifierProbe` has the same shape. An earlier version of this paragraph said "every
+//! probe here is written this way"; the version after it named one exception and called it "the
+//! counterexample", which reads as exhaustive and is wrong by thirteen.
+//!
+//! It stops working for an operation that resolves on TWO identifiers. Handed one foreign id
+//! and a locally-minted second, such a probe addresses a pair that names no row in ANY scope,
+//! so it answers not-found for a reason that has nothing to do with isolation. Five SCIM probes
+//! were written for issue #135 criterion 5 and MEASURED against the caller's own scope, where
+//! nothing fences them: four could not see a row at all. A reviewer then planted an assert
+//! inside the fifth's operation and found it never fired -- it was testing the parser, because
+//! `OrganizationId` embeds its scope and so `parse_in_scope` refused every id before the call.
+//!
+//! So the inbound SCIM operations are driven directly, with both identifiers foreign, in
+//! `ironauth-scim/tests/idor.rs`. That file measured the fences too, and they are not uniform:
+//! the READS carry three (a Rust scope check, the query predicates, and row-level security) and
+//! removing any one leaks nothing, while the WRITES carry ONE, because they bind the caller's
+//! scope into the row rather than filtering on it and so have no predicate to fence.
+//! `ironauth-store/tests/scim_connections.rs` covers the remaining SCIM operations the same
+//! way. Nothing is registered here for SCIM, and this section is why rather than an omission.
 
 use std::future::Future;
 use std::pin::Pin;
