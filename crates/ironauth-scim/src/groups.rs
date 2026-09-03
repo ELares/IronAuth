@@ -409,10 +409,28 @@ async fn resolve_members(
 struct MemberPlan {
     /// Members to bind, in request order.
     adding: Vec<ResolvedMember>,
-    /// Bindings to remove, each paired with the person it binds. Always empty unless the
-    /// request REPLACES the membership: a SCIM `add` operation names what to add and says
-    /// nothing about the rest of the group.
-    removing: Vec<(ResolvedMember, ironauth_store::OrgGroupMemberId)>,
+    /// Bindings to remove, each with the MEMBERSHIP it binds and, when there is one, the person
+    /// behind it. Always empty unless the request REPLACES the membership: a SCIM `add`
+    /// operation names what to add and says nothing about the rest of the group.
+    ///
+    /// THE PERSON IS OPTIONAL AND THE REMOVAL IS NOT. A binding can hang off a membership that
+    /// names no user: `createServiceAccountMembership` is a shipped route and nothing stops an
+    /// operator binding a service account into a group. An earlier version dropped such a
+    /// binding from the plan when its user did not resolve, so a `PUT` declaring an empty member
+    /// set answered 200 and left it live, still conferring the group's roles. That is a
+    /// deprovisioning that silently did not happen, on the criterion this file is about.
+    removing: Vec<DepartingBinding>,
+}
+
+/// One binding a replace will remove.
+struct DepartingBinding {
+    /// The binding row to soft-delete.
+    binding: ironauth_store::OrgGroupMemberId,
+    /// The membership it binds, which the per-member event names.
+    membership: OrgMembershipId,
+    /// The person behind that membership, when it is a person. `None` for a service account,
+    /// which the delta cannot name because its arrays are user ids.
+    user: Option<UserId>,
 }
 
 impl MemberPlan {
@@ -454,13 +472,19 @@ async fn plan_members(
             })
             .map(|binding| binding.membership_id)
             .collect();
-        // THE PEOPLE, not just the bindings, and in ONE query. A removal delta names who LEFT,
-        // and this is the only place that knows: the binding row records the membership and the
-        // request named the members who STAY, so a departing person appears in neither.
+        // THE PEOPLE, and in ONE query. A removal delta names who LEFT, and this is the only
+        // place that knows: the binding row records the membership and the request named the
+        // members who STAY, so a departing person appears in neither.
         //
         // Asked once rather than per member, because the loop is bounded by the scan bound: a
         // replace that empties a full group would otherwise pay a thousand sequential round
         // trips before writing anything.
+        //
+        // A MISS NARROWS THE ANNOUNCEMENT AND NEVER THE PLAN. `users_for` answers only for
+        // memberships that name a USER, so a service account's binding resolves to nothing --
+        // and it is still removed, because the request declared a member set it is not in. Only
+        // the delta loses it, and only because that type's arrays are user ids and a service
+        // account has none. The per-member event still names its binding.
         let users = state
             .store()
             .scoped(auth.scope)
@@ -469,19 +493,17 @@ async fn plan_members(
             .await
             .map_err(|error| store_failure(&error))?;
         for binding in existing {
-            let Some((_, user)) = users
-                .iter()
-                .find(|(membership, _)| *membership == binding.membership_id)
-            else {
+            if !departing.contains(&binding.membership_id) {
                 continue;
-            };
-            removing.push((
-                ResolvedMember {
-                    user: *user,
-                    membership: binding.membership_id,
-                },
-                binding.id,
-            ));
+            }
+            removing.push(DepartingBinding {
+                binding: binding.id,
+                membership: binding.membership_id,
+                user: users
+                    .iter()
+                    .find(|(membership, _)| *membership == binding.membership_id)
+                    .map(|(_, user)| *user),
+            });
         }
     }
     Ok(MemberPlan { adding, removing })
@@ -540,7 +562,7 @@ async fn set_members(
     // AN EARLY RETURN, NOT THE GUARANTEE, and the difference is worth stating because it reads
     // like one. Nothing-changed announces nothing because the delta only ever rides an actual
     // write: with zero writes there is nothing for it to ride, so deleting this line changes no
-    // behaviour and a review measured that (25 tests green with it gone). It is here because a
+    // behaviour and a review measured that: the suite stayed green with it gone. It is here because a
     // `PUT` restating a group's current membership is the ordinary output of a sync sweep and
     // there is no reason to build an event nobody will send.
     if writes == 0 {
@@ -559,7 +581,7 @@ async fn set_members(
             .collect(),
         plan.removing
             .iter()
-            .map(|(member, _)| member.user.to_string())
+            .filter_map(|departing| departing.user.map(|user| user.to_string()))
             .collect(),
     ) else {
         return Err(internal_error());
@@ -578,7 +600,7 @@ async fn set_members(
         )
         .await?;
     }
-    for (member, binding_id) in &plan.removing {
+    for departing in &plan.removing {
         written += 1;
         let Some(per_member) = crate::events::group_member_event(
             state,
@@ -586,7 +608,7 @@ async fn set_members(
             crate::events::GROUP_MEMBER_REMOVED,
             &group_text,
             &organization,
-            &member.membership.to_string(),
+            &departing.membership.to_string(),
         ) else {
             return Err(internal_error());
         };
@@ -595,7 +617,7 @@ async fn set_members(
             .remove_with_event(
                 &env,
                 &auth.connection.organization_id,
-                binding_id,
+                &departing.binding,
                 Some(&per_member.borrowed()),
                 (written == writes).then(|| delta.borrowed()).as_ref(),
             )

@@ -2193,7 +2193,7 @@ async fn a_replace_that_drops_a_member_announces_the_removal() {
 ///
 /// The twin of the two-member ADD test, and it exists for the same measured reason: round 1
 /// added the plural case on the add path only, and a review then moved the delta to ride the
-/// FIRST removal on both removal loops and watched 25 tests pass. The design decision was
+/// FIRST removal on both removal loops and watched the whole suite pass. The design decision was
 /// covered on one of three write loops.
 #[tokio::test]
 async fn a_two_member_removal_announces_one_delta_naming_both_after_both_writes() {
@@ -2461,7 +2461,171 @@ async fn an_operator_can_convert_a_pushed_binding_to_their_own() {
         roles_of(&db, scope, &acme.organization, &subject)
             .await
             .contains("deployer"),
-        "the converted binding did not survive the revoke, so 0188's account of what an \\
+        "the converted binding did not survive the revoke, so 0188's account of what an \
          operator can do is wrong"
+    );
+}
+
+/// How many live bindings a group holds, read through the control plane.
+async fn live_bindings(
+    db: &TestDatabase,
+    scope: Scope,
+    org: &OrganizationId,
+    group: &ironauth_store::OrgGroupId,
+) -> usize {
+    db.control_store()
+        .management()
+        .org_group_members(scope)
+        .list_for_group(org, group, 100, None)
+        .await
+        .expect("list the bindings")
+        .len()
+}
+
+/// A machine identity with an organization membership: a client, its service-account
+/// principal, and the membership itself. Returns the membership.
+async fn machine_member_of(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+) -> OrgMembershipId {
+    let client = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .clients()
+        .create(env, "a machine client")
+        .await
+        .expect("create the client");
+    let principal = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .service_accounts()
+        .ensure(env, &client)
+        .await
+        .expect("mint the principal");
+    let membership = OrgMembershipId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_memberships()
+        .create_for_service_account(
+            env,
+            ironauth_store::NewServiceAccountMembership {
+                id: &membership,
+                organization_id: org,
+                service_account_id: &principal,
+                metadata: None,
+            },
+            now_micros(env),
+        )
+        .await
+        .expect("the machine joins the organization");
+    membership
+}
+
+/// A replace removes a SERVICE ACCOUNT's binding too, even though the delta cannot name it
+/// (issue #136, criterion 4).
+///
+/// # The regression this pins
+///
+/// The removal plan resolves each departing membership to the person behind it, so the delta
+/// can name who left. A membership can belong to a SERVICE ACCOUNT and then names nobody, and
+/// an earlier version dropped such a binding from the plan entirely when its user did not
+/// resolve: a `PUT` declaring an empty member set answered 200 and left the binding live, still
+/// conferring the group's roles. A review measured it. That is a deprovisioning that silently
+/// did not happen, on the criterion this file is about.
+///
+/// The shape is ordinary, not exotic. `createServiceAccountMembership` is a shipped route and
+/// the binding write's membership check carries no `owner_kind` predicate, so an operator can
+/// put a machine identity in a group today.
+///
+/// What the announcement does is narrow, not disappear: the per-member `member_removed` names
+/// the binding, and the delta's arrays are user ids so they carry only the people.
+#[tokio::test]
+async fn a_replace_removes_a_service_accounts_binding_and_cannot_name_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let group_id = ironauth_store::OrgGroupId::parse_in_scope(&group, &scope).expect("a group id");
+
+    // A person, pushed by the connection.
+    let person = provision(&db, &env, &acme.token, "person@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &person).await;
+
+    // AND A MACHINE, bound by an operator: a client, its service-account principal, an
+    // organization membership for it, and a group binding on that membership.
+    let machine_membership = machine_member_of(&db, &env, scope, &acme.organization).await;
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_group_members(scope)
+        .add(
+            &env,
+            ironauth_store::NewOrgGroupMember {
+                id: &ironauth_store::OrgGroupMemberId::generate(&env, &scope),
+                organization_id: &acme.organization,
+                group_id: &group_id,
+                membership_id: &machine_membership,
+                source_scim_connection_id: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("the operator puts the machine in the group");
+
+    assert_eq!(
+        live_bindings(&db, scope, &acme.organization, &group_id).await,
+        2,
+        "both bindings must be live before the replace, or losing one proves nothing"
+    );
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "displayName": "Engineering",
+            "members": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        live_bindings(&db, scope, &acme.organization, &group_id).await,
+        0,
+        "a replace declaring an empty member set left a binding live, so it answered 200 to a \
+         deprovisioning it did not perform"
+    );
+
+    // AND THE DELTA NAMES ONLY THE PERSON, because its arrays are user ids.
+    let events = events_about_group(&db, scope, &group, 5).await;
+    let delta = events
+        .iter()
+        .rev()
+        .find(|event| event.payload["type"] == "org_group.membership_changed")
+        .expect("the removal delta");
+    assert_eq!(
+        delta.payload["payload"]["removed_user_ids"],
+        json!([person]),
+        "the delta must name the person and cannot name the machine"
+    );
+    assert_eq!(
+        event_types(&events)
+            .iter()
+            .filter(|kind| *kind == "org_group.member_removed")
+            .count(),
+        2,
+        "both removals are announced per-member, which is the form that CAN name a binding \
+         whose membership is a service account's"
     );
 }

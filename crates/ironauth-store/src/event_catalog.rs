@@ -593,6 +593,14 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // these arrays to its own copy of a group's membership, and it keys people by user; the
         // organization twin's arrays are user ids for the same reason. The per-member events
         // carry the join row's own id because that is what they are about.
+        //
+        // WHICH MEANS A SERVICE ACCOUNT'S BINDING IS NOT IN THESE ARRAYS. A group binding hangs
+        // off an organization membership, and a membership can belong to a service account,
+        // which has no user id to name. Such a binding is created, removed and torn down exactly
+        // like anyone else's and is announced by `org_group.member_added` / `member_removed`,
+        // which carry the membership; this type simply has nothing to put in its arrays for it.
+        // The organization twin draws the same line, which is why
+        // `organization.service_account_added` exists beside `organization.member_added`.
         "org_group.membership_changed",
         1,
         r#"{

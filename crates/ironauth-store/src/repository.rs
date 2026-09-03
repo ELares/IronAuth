@@ -75256,9 +75256,11 @@ async fn tear_down_connection_bindings(
     // that emptied it. Every other binding write in this crate announces itself; the one
     // path that can remove tens of thousands must not be the exception.
     //
-    // The join to `org_memberships` is what turns a binding into the PERSON who left, which
-    // is what `org_group.membership_changed` carries. It cannot drop a row: 0088's foreign
-    // key makes `membership_id` resolvable for every binding that exists.
+    // The join to `org_memberships` is what turns a binding into the PERSON who left, which is
+    // what `org_group.membership_changed` carries. It cannot drop a ROW: 0088's foreign key
+    // makes `membership_id` resolvable for every binding that exists. It can produce a NULL
+    // `user_id`, because a membership may belong to a service account, so the loop below reads
+    // that column fallibly.
     let torn_down_rows = sqlx::query(
         "UPDATE org_group_members gm SET \
              deleted_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
@@ -75303,7 +75305,13 @@ async fn tear_down_connection_bindings(
     for row in &torn_down_rows {
         let group: String = row.get("group_id");
         let organization: String = row.get("organization_id");
-        let user: String = row.get("user_id");
+        // `try_get`, because the join carries no `owner_kind` predicate and a membership row can
+        // name no user. Nothing shipped creates a service account's binding WITH a source today,
+        // so this is latent rather than reachable, and a `get` would have PANICKED on it. The
+        // binding is torn down either way; only the announcement narrows.
+        let Ok(user) = row.try_get::<String, _>("user_id") else {
+            continue;
+        };
         if let Some(entry) = by_group.iter_mut().find(|(g, _, _)| *g == group) {
             entry.2.push(user);
         } else {

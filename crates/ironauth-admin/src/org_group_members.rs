@@ -505,9 +505,20 @@ async fn group_membership_delta_for(
         .await
     {
         Ok(record) => record,
-        // NOT-FOUND IS THE ONLY MISS THIS MAY SWALLOW. The store answers the authoritative
-        // not-found for the write itself a moment later, so building no event is correct: there
-        // is nothing to announce.
+        // NOT-FOUND MEANS THIS MEMBERSHIP NAMES NO LIVE USER, and that is a real, ordinary
+        // case rather than a miss to be swallowed on the way past: `get` filters to user
+        // memberships, so a SERVICE ACCOUNT's answers not-found here while the binding write
+        // accepts it happily. This type's arrays are user ids and a service account has none,
+        // so there is nothing for a delta to carry.
+        //
+        // An earlier version justified this by saying the write answers the authoritative
+        // not-found a moment later. It does not: `remove_with_event` addresses the BINDING, and
+        // `add_with_event` resolves the membership through a check that carries no `owner_kind`
+        // predicate. So the write succeeds and only the delta is absent, which is stated here
+        // rather than left to look like a swallowed error.
+        //
+        // The per-member `org_group.member_added` / `member_removed` still names the binding, so
+        // an integrator watching one person is not blind to it.
         Err(ironauth_store::StoreError::NotFound) => return Ok(None),
         // ANYTHING ELSE FAILS THE REQUEST. `remove_with_event` promises a consumer sees "never
         // one form without the other", and the first version of this ended the read with
