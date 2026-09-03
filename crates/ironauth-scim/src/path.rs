@@ -123,13 +123,40 @@ fn is_legal_segment_byte(byte: u8) -> bool {
 pub fn parse_resource_path(raw: &str) -> Result<ResourceRef, PathError> {
     // A single leading slash is expected and stripped; anything else (an empty path, a
     // scheme-relative `//host`, a backslash) is not a path this server addresses.
-    let trimmed = raw.strip_prefix('/').unwrap_or(raw);
+    // THE LEADING SLASH IS REQUIRED, not optional. RFC 7644 section 3.7.2 writes a bulk
+    // operation's path as `/Users`, and `unwrap_or(raw)` accepted `Users` as well -- measured
+    // over the real route: `{"method":"POST","path":"Users"}` created a user. Two spellings for
+    // one collection is a second interpretation of a path, which is the one property this
+    // module exists to remove; it sat against that claim while the trailing-slash case beside
+    // it was being tightened for exactly the same reason.
+    let Some(trimmed) = raw.strip_prefix('/') else {
+        // ILLEGAL, not EMPTY. `Empty`'s Display is "the path names no resource" and its doc is
+        // "the path was empty or had no resource type"; neither is true of `Users`, which
+        // names a resource in a spelling this server does not accept. `IllegalSegment` is the
+        // bucket this module's own doctrine gives a path that is refused for its shape, and it
+        // is deliberately one variant so a refusal never says which trick was tried.
+        return Err(PathError::IllegalSegment);
+    };
     if trimmed.is_empty() {
         return Err(PathError::Empty);
     }
-    // A trailing slash names the collection, so it is allowed and dropped; two trailing
-    // slashes are an empty segment and are not.
-    let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    // NO TRAILING SLASH, in EITHER form. `/Users/` and `/Users/{id}/` are both refused.
+    //
+    // This was `strip_suffix('/')` applied unconditionally, then applied only to the collection
+    // form on the reasoning that "a trailing slash names the collection". Both readings were
+    // wrong, and the second was wrong in a way worth recording because a review measured the
+    // premise the fix was built on and it did not hold: AXUM REFUSES BOTH.
+    //
+    //   POST /scim/v2/Users/       single request -> 404, no content type
+    //   {"method":"POST","path":"/Users/"}  in a batch -> 201, user landed
+    //
+    // So the narrowed rule closed the item form and left the collection form as exactly the
+    // thing it was closing -- one spelling reachable only from inside a batch, which is the
+    // second interpretation of a path this module's header says it exists to remove, and the
+    // same argument that requires the leading slash twenty lines up.
+    if trimmed.ends_with('/') {
+        return Err(PathError::IllegalSegment);
+    }
 
     let mut segments = trimmed.split('/');
     let Some(type_segment) = segments.next() else {
@@ -185,13 +212,52 @@ mod tests {
                 id: Some("usr_abc-123".to_owned()),
             }
         );
-        assert_eq!(
-            parse_resource_path("/Groups/").expect("trailing slash names the collection"),
-            ResourceRef {
-                resource_type: ResourceType::Group,
-                id: None
-            }
-        );
+    }
+
+    /// THE SPELLING RULE, at the parser rather than only through a batch.
+    ///
+    /// One collection, one spelling. Every variant here is refused by axum's router as a single
+    /// request -- measured, not assumed -- so accepting any of them would make a batch the one
+    /// place a second spelling works, which is the property this module exists to remove.
+    ///
+    /// It lives here because the rule is the PARSER's. Its only guard was a database-backed
+    /// integration test, and a review measured that reverting the leading-slash rule left
+    /// `--lib` green.
+    #[test]
+    fn one_collection_has_exactly_one_spelling() {
+        for refused in [
+            // No leading slash. RFC 7644 section 3.7.2 writes the path with it.
+            "Users",
+            "Groups",
+            "Users/usr_abc",
+            // A trailing slash, in BOTH forms. An earlier version accepted the collection form
+            // on the reasoning that "a trailing slash names the collection"; a review measured
+            // the premise and axum refuses `POST /scim/v2/Users/` with a bare 404 exactly as it
+            // refuses the item form.
+            "/Users/",
+            "/Groups/",
+            "/Users/usr_abc/",
+        ] {
+            assert!(
+                parse_resource_path(refused).is_err(),
+                "{refused:?} must be refused: one collection has one spelling"
+            );
+        }
+
+        // THE CONTROL. The accepted spellings still parse, so the rule above is a rule about
+        // spelling and not a parser that refuses everything.
+        for (accepted, expected) in [
+            ("/Users", ResourceType::User),
+            ("/Groups", ResourceType::Group),
+        ] {
+            assert_eq!(
+                parse_resource_path(accepted).expect("the canonical spelling parses"),
+                ResourceRef {
+                    resource_type: expected,
+                    id: None
+                }
+            );
+        }
     }
 
     #[test]

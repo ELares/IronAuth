@@ -1371,11 +1371,14 @@ mod seed_corpus_tests {
             ("/Users/usr_abc-123", Some(("User", Some("usr_abc-123")))),
             ("/Groups/grp_7f31", Some(("Group", Some("grp_7f31")))),
             ("/Users/usr_2c9a8b", Some(("User", Some("usr_2c9a8b")))),
-            // A trailing slash is the COLLECTION, not a refusal. Writing this row as a
-            // refusal is what I assumed and the table said otherwise on the first run, which
-            // is the whole argument for a table over a count.
-            ("/Users/", Some(("User", None))),
             // The REFUSALS, which are half of what this parser is for.
+            //
+            // `/Users/` is here now and was in the accepted half. The row read "a trailing
+            // slash is the COLLECTION, not a refusal", and a review measured the premise: axum
+            // answers a bare 404 to `POST /scim/v2/Users/` as a single request, so accepting it
+            // made a batch the one place that spelling worked. The table was right that my
+            // first guess was wrong; it was wrong about which way.
+            ("/Users/", None),
             ("/Users/usr_a/extra", None),
             ("/Users/%2e%2e", None),
             ("/Users/a.b", None),

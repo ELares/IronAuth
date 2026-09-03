@@ -36,12 +36,14 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use ironauth_store::identifier::UniquenessMode;
 use ironauth_store::{ActorRef, ScimConnection, ServiceId, Store};
 use serde_json::json;
 
+use crate::bulk::{BulkError, BulkOperationResult, BulkOutcome, BulkRequest, validate_bulk};
+use crate::path::{ResourceRef, ResourceType};
 use crate::service_provider_config::{ScimLimits, ServiceProviderConfig};
 
 // WHERE THE PRE-AUTHENTICATION BOUND ACTUALLY LIVES, and why there is no semaphore here.
@@ -98,7 +100,33 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// separates them once a mounted route can legitimately answer 404 for an absent resource.
 /// Rewriting every framework response would destroy that discriminator.
 ///
-/// No handler here produces a 413, so a 413 is always the body-limit layer's.
+/// # Why it also checks the content type
+///
+/// This used to say "no handler here produces a 413, so a 413 is always the body-limit
+/// layer's", and mounting `/Bulk` falsified it in the same commit that mounted it: RFC 7644
+/// section 3.7.3 answers 413 when a batch exceeds `maxOperations`, and that refusal NAMES the
+/// advertised limit so a client can resize. This layer rewrote it into the generic body-size
+/// message, so the number the whole advertised-equals-enforced argument rests on never reached
+/// the client. It was caught by a mutation: deleting the operations-count check left
+/// `the_advertised_limits_are_the_enforced_ones_over_the_real_route` green, because the
+/// assertion could not see which limit had answered.
+///
+/// `maxPayloadSize` is deliberately NOT named above. At the shipped defaults it is EQUAL to
+/// [`MAX_REQUEST_BYTES`] -- `the_two_payload_bounds_agree` pins that equality -- so this
+/// layer's own refusal fires first and `validate_bulk`'s payload branch is unreachable. A
+/// review measured it: a 1 048 666-byte batch answers the generic body-size message, not the
+/// bulk-specific one. That is the correct answer (the body genuinely exceeded what this server
+/// accepts) and it is stated here rather than left as a claim that the bulk message appears.
+///
+/// The branch is live only where an operator configures `max_payload_bytes` BELOW the request
+/// bound, and `a_payload_over_the_configured_bulk_budget_is_refused_by_name` is what drives
+/// that. An earlier version of this sentence named `the_advertised_limits_...` instead, which
+/// does the OPPOSITE -- its own comment says it sets the payload budget to the default so that
+/// only the operation count can fire -- and a review measured the consequence: replacing the
+/// whole payload arm with an empty result left the suite green.
+///
+/// So a 413 that is ALREADY a SCIM document is left alone. The layer exists for the framework's
+/// `text/plain` rejection, and that is the only thing it now rewrites.
 ///
 /// # Why a response map and not a fallback
 ///
@@ -115,6 +143,15 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// a future route that reads the body some other way would not inherit it.
 async fn scim_shaped_refusal(response: Response) -> Response {
     if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    // A handler's own SCIM 413 passes through untouched; only the framework's is rewritten.
+    let already_scim = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with(SCIM_CONTENT_TYPE));
+    if already_scim {
         return response;
     }
     scim_error(
@@ -241,6 +278,7 @@ pub fn scim_router(state: ScimState) -> Router {
             get(service_provider_config),
         )
         .route("/scim/v2/ResourceTypes", get(resource_types))
+        .route("/scim/v2/Bulk", post(bulk))
         .route("/scim/v2/Schemas", get(schemas))
         .route(
             "/scim/v2/Users",
@@ -276,6 +314,296 @@ pub fn scim_router(state: ScimState) -> Router {
         // to an oversized body is a SCIM error like every other refusal here.
         .layer(map_response(scim_shaped_refusal))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+}
+
+/// The URN a bulk request must declare (RFC 7644 section 3.7).
+const BULK_REQUEST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:BulkRequest";
+
+/// `POST /scim/v2/Bulk` (RFC 7644 section 3.7, issue #135 criterion 4).
+///
+/// # Why this dispatches to the single-request handlers rather than reimplementing them
+///
+/// A bulk operation is a request. The moment this module grows its own create-a-user path,
+/// there are two implementations of what a SCIM create means, and they agree only until
+/// somebody changes one. Worse, the one that is easy to forget is the one carrying the
+/// checks: `addressed_user` is what fences a resource to the authenticated connection's
+/// organization, and a bulk path that fetched by id directly would be the cross-organization
+/// read this whole surface exists to prevent, reachable from inside an authorized batch.
+///
+/// So every operation is dispatched to the very function `scim_router` routes to, with the
+/// caller's own `Authorization` header. It re-authenticates per operation. That is one store
+/// round trip per operation, and it is deliberate: an operation that skipped it would be an
+/// operation authorized by a different code path than the one the tests drive.
+///
+/// # The status codes
+///
+/// Each operation's result carries the status its handler produced, as SCIM renders it: a
+/// string. The BATCH answers 200 whenever it ran, even if every operation inside it failed,
+/// because a batch that ran is not a batch that was refused -- and the two are distinguished
+/// by the presence of `Operations` in the response, not by a status the client has to
+/// disambiguate. A batch REFUSED before any operation ran (over a limit, malformed envelope,
+/// no credential) answers with a SCIM error and no `Operations` at all.
+pub(crate) async fn bulk(
+    State(state): State<ScimState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    // AUTHENTICATED FIRST, before the envelope is even parsed. An unauthenticated caller must
+    // not be able to tell a malformed batch from a well-formed one, and must not reach the
+    // limit checks either: those report the advertised numbers, and a surface that reports
+    // them to anyone has published its own budget.
+    if let Err(refusal) = state.authenticate(&headers).await {
+        return refusal.response();
+    }
+
+    let Ok(request) = serde_json::from_str::<BulkRequest>(&body) else {
+        return scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "the request body is not a SCIM bulk request",
+        );
+    };
+    // THE ENVELOPE IS CHECKED, exactly as `patch_user` checks the PatchOp URN. Both fields are
+    // `#[serde(default)]`, so `{}` and a batch whose `Operations` key is misspelled both
+    // parsed into an empty request and answered `200` with an empty `Operations` array. This
+    // handler's own doc says the presence of `Operations` is how a client distinguishes a
+    // batch that RAN from one that was refused, so answering that to a typo made the stated
+    // discriminator not discriminate.
+    if !request
+        .schemas
+        .iter()
+        .any(|urn| urn.eq_ignore_ascii_case(BULK_REQUEST_SCHEMA))
+    {
+        return scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "a BulkRequest must declare the BulkRequest schema URN",
+        );
+    }
+    if request.operations.is_empty() {
+        return scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "a BulkRequest must carry at least one operation",
+        );
+    }
+
+    // MEASURED ON THE BODY THIS HANDLER RECEIVED, in bytes, not on a count of operations or a
+    // re-serialization. `body.len()` is the number of bytes that crossed the wire into this
+    // process, which is the quantity `maxPayloadSize` names.
+    let outcomes = match validate_bulk(&request, body.len(), state.limits().bulk) {
+        Ok(outcomes) => outcomes,
+        Err(BulkError::TooManyOperations { limit }) => {
+            return scim_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Some("tooLarge"),
+                &format!("a bulk request may carry at most {limit} operations"),
+            );
+        }
+        Err(BulkError::PayloadTooLarge { limit }) => {
+            return scim_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Some("tooLarge"),
+                &format!("a bulk request payload may be at most {limit} bytes"),
+            );
+        }
+    };
+
+    // `failOnErrors` (RFC 7644 section 3.7.3): after this many operations have failed, the
+    // server stops processing. Operations already done keep their results; the ones never
+    // attempted are simply absent, which is what the RFC specifies and is why a client reads
+    // the results rather than assuming its batch ran to the end.
+    //
+    // ZERO IS NOT A BUDGET OF ZERO. The check below sits at the TOP of the loop, so a literal
+    // `0` broke before the first operation: a review measured `{"failOnErrors":0}` with two
+    // valid creates answering `200 OK` with an empty `Operations` array and nothing
+    // provisioned, while the client that sent it meant "abort on the first error". A batch
+    // that ran nothing and reported success is the worst answer available.
+    //
+    // The RFC calls it "the number of errors that the service provider will accept before the
+    // operation is terminated", and every provisioning client that sends `1` means "stop at
+    // the first error" -- which is what `failures >= budget` gives. `0` is the degenerate
+    // reading of the same sentence and means the same thing a client could possibly want:
+    // tolerate no errors, so the first one stops the batch. It cannot mean "attempt nothing",
+    // because a client that wanted nothing attempted would not have sent operations.
+    //
+    // So the floor is one, and the comparison stays `>=`. Asking what degenerate input
+    // satisfies a bound is the habit this repo keeps needing: zero, empty, missing.
+    let fail_on_errors = request.fail_on_errors.map(|budget| budget.max(1));
+    let mut failures = 0_usize;
+    let mut results = Vec::with_capacity(outcomes.len());
+    // ZIPPED WITH THE OPERATIONS THEY CAME FROM. `validate_bulk` maps over the operations in
+    // order and yields exactly one outcome per operation, so index i of each is the same
+    // operation. An earlier version looked the body up by `bulkId` and method instead, which
+    // is wrong on input a client may legitimately send: `bulkId` is optional, so two bodyless
+    // POSTs both matched the FIRST operation and the second one was dispatched with the
+    // first's body.
+    for (outcome, operation) in outcomes.into_iter().zip(&request.operations) {
+        if let Some(budget) = fail_on_errors
+            && failures >= budget
+        {
+            break;
+        }
+        let result = match outcome {
+            BulkOutcome::Refused(refused) => refused,
+            BulkOutcome::Resolved {
+                bulk_id,
+                method,
+                resource,
+            } => {
+                dispatch(
+                    &state,
+                    &headers,
+                    operation.data.as_ref(),
+                    bulk_id,
+                    &method,
+                    &resource,
+                )
+                .await
+            }
+        };
+        if !result.status.starts_with('2') {
+            failures += 1;
+        }
+        results.push(result);
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, SCIM_CONTENT_TYPE)],
+        Json(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkResponse"],
+            "Operations": results,
+        })),
+    )
+        .into_response()
+}
+
+/// Run one resolved operation through the handler a single request would reach.
+async fn dispatch(
+    state: &ScimState,
+    headers: &HeaderMap,
+    data: Option<&serde_json::Value>,
+    bulk_id: Option<String>,
+    method: &str,
+    resource: &ResourceRef,
+) -> BulkOperationResult {
+    // The operation's own body, re-serialized from the `data` the client sent. It is handed to
+    // the handler as a string because that is what the handler takes: the same parse, the same
+    // refusals, the same error text a single request would get.
+    let body = data.map(serde_json::Value::to_string).unwrap_or_default();
+
+    let response = match (resource.resource_type(), resource.id(), method) {
+        (ResourceType::User, None, "POST") => {
+            crate::users::create_user(State(state.clone()), headers.clone(), body).await
+        }
+        (ResourceType::User, Some(id), "PUT") => {
+            crate::users::replace_user(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(id.to_owned()),
+                body,
+            )
+            .await
+        }
+        (ResourceType::User, Some(id), "PATCH") => {
+            crate::users::patch_user(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(id.to_owned()),
+                body,
+            )
+            .await
+        }
+        (ResourceType::User, Some(id), "DELETE") => {
+            crate::users::delete_user(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(id.to_owned()),
+            )
+            .await
+        }
+        (ResourceType::Group, None, "POST") => {
+            crate::groups::create_group(State(state.clone()), headers.clone(), body).await
+        }
+        (ResourceType::Group, Some(id), "PUT") => {
+            crate::groups::replace_group(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(id.to_owned()),
+                body,
+            )
+            .await
+        }
+        (ResourceType::Group, Some(id), "PATCH") => {
+            crate::groups::patch_group(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(id.to_owned()),
+                body,
+            )
+            .await
+        }
+        (ResourceType::Group, Some(id), "DELETE") => {
+            crate::groups::delete_group(
+                State(state.clone()),
+                headers.clone(),
+                axum::extract::Path(id.to_owned()),
+            )
+            .await
+        }
+        // A method the collection or the item does not offer: a POST to `/Users/{id}`, a PUT
+        // to `/Users`. The single-request router answers 405 for these, and so does this.
+        _ => {
+            // CARRIES ITS `response` LIKE EVERY OTHER REFUSAL. This arm was missed when the
+            // pre-dispatch refusals gained one, so the single refusal a client is most likely
+            // to hit by hand -- a POST to an item, a PUT to a collection -- was the one that
+            // gave a spec-following client nothing to read. RFC 7644 section 3.7.3 defines
+            // `response` and defines no operation-level `detail`.
+            let detail = "that method is not offered at that path";
+            return BulkOperationResult {
+                bulk_id,
+                method: method.to_owned(),
+                status: "405".to_owned(),
+                detail: Some(detail.to_owned()),
+                location: None,
+                response: Some(crate::bulk::method_not_allowed_document(detail)),
+            };
+        }
+    };
+
+    let status = response.status();
+    let payload = body_json(response).await;
+    // The LOCATION comes off the handler's own response document, not off the path this module
+    // parsed. A create is the case that matters: the client does not know the id it is about
+    // to get, and reading it back out of the resource the handler returned is the only way to
+    // report one that is certainly the row that landed.
+    let location = payload
+        .as_ref()
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|id| format!("/scim/v2/{}/{id}", resource.resource_type().as_str()));
+    let failed = !status.is_success();
+    BulkOperationResult {
+        bulk_id,
+        method: method.to_owned(),
+        status: status.as_u16().to_string(),
+        detail: None,
+        location: if failed { None } else { location },
+        // RFC 7644 section 3.7.3: a FAILED operation carries the error response it would have
+        // received on its own. A successful one does not -- the resource is retrievable at the
+        // location above, and echoing every created resource would make a fifty-operation
+        // response fifty resource documents long.
+        response: if failed { payload } else { None },
+    }
+}
+
+/// Read a handler's response body back as JSON, for embedding in a bulk result.
+async fn body_json(response: Response) -> Option<serde_json::Value> {
+    let bytes = axum::body::to_bytes(response.into_body(), MAX_REQUEST_BYTES)
+        .await
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Why a SCIM request was refused before any handler ran.
