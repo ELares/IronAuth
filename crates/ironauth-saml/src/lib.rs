@@ -112,6 +112,157 @@
 
 #![forbid(unsafe_code)]
 
+mod c14n;
 mod parse;
+mod tree;
+mod verify;
 
 pub use parse::{DEPTH_CEILING, Document, Element, Limits, SamlError, parse};
+pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
+
+/// Test-only access to the canonicalizer.
+///
+/// # Why this is exposed at all
+///
+/// The canonicalizer is the one component whose correctness cannot be checked through the
+/// verifier: a signer and a verifier that share a canonicalization bug agree with each other
+/// perfectly. So it gets its own suite, driven against the canonical forms the specification
+/// prescribes rather than against anything this crate produces -- and that suite has to be able
+/// to call it.
+///
+/// Behind a feature, so the surface does not exist in a normal build.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    /// Build a SAML response whose assertion carries a genuinely valid enveloped signature.
+    ///
+    /// # Why the corpus needs this
+    ///
+    /// A wrapping corpus built against an UNSIGNED document proves nothing: every entry would be
+    /// refused for being unsigned, and the suite would pass against a verifier that refused
+    /// everything. Each forgery has to start from a document that really verifies.
+    ///
+    /// # What it cannot prove
+    ///
+    /// This canonicalises with the crate's own canonicalizer, so a document it produces and the
+    /// verifier accepts shows the two AGREE, not that either is right. That is what
+    /// `tests/canonical.rs` is for, and neither suite substitutes for the other.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_response(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        id: &str,
+    ) -> String {
+        // `xmlns:ds` sits on the `Signature`, so `SignedInfo` INHERITS it -- which exercises the
+        // inherited-scope path the canonicalizer got wrong, rather than sidestepping it.
+        let assertion = [
+            r#"<saml:Assertion ID=""#,
+            id,
+            r#""><saml:Issuer>urn:idp</saml:Issuer>"#,
+            "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
+            "</saml:Assertion>",
+        ]
+        .concat();
+        let unsigned = wrap(&assertion);
+        // The digest is over the assertion with its signature removed, and there is none yet:
+        // the enveloped transform makes those the same thing.
+        let digest = digest_of(&unsigned, "saml:Assertion");
+
+        let signed_info = [
+            "<ds:SignedInfo>",
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/>"#,
+            "<ds:Reference URI=\"#",
+            id,
+            "\"><ds:Transforms>",
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            "</ds:Transforms>",
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            "<ds:DigestValue>",
+            &digest,
+            "</ds:DigestValue></ds:Reference></ds:SignedInfo>",
+        ]
+        .concat();
+        // Canonicalise SignedInfo in the place it will sit, so its inherited `ds` resolves.
+        let staged = wrap(&with_signature(&assertion, &signed_info, ""));
+        let message = canonicalize(&staged, "ds:SignedInfo").expect("the staged SignedInfo parses");
+        let value = base64(&key.sign(message.as_bytes()));
+        wrap(&with_signature(&assertion, &signed_info, &value))
+    }
+
+    /// Put an assertion inside a response.
+    fn wrap(assertion: &str) -> String {
+        [
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_response">"#,
+            assertion,
+            "</samlp:Response>",
+        ]
+        .concat()
+    }
+
+    /// Splice a signature into an assertion, immediately after its issuer.
+    fn with_signature(assertion: &str, signed_info: &str, value: &str) -> String {
+        let signature = format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info}<ds:SignatureValue>{value}</ds:SignatureValue></ds:Signature>"#
+        );
+        let marker = "</saml:Issuer>";
+        let at = assertion.find(marker).expect("the issuer is there") + marker.len();
+        format!("{}{signature}{}", &assertion[..at], &assertion[at..])
+    }
+
+    /// The base64 digest of an element, as a `DigestValue` carries it.
+    fn digest_of(document: &str, element: &str) -> String {
+        let canonical = canonicalize(document, element).expect("the document parses");
+        base64(&ironauth_jose::xmldsig::xml_digest(
+            ironauth_jose::xmldsig::XmlDigestAlg::Sha256,
+            canonical.as_bytes(),
+        ))
+    }
+
+    /// Standard base64, which is what XML Signature carries.
+    #[must_use]
+    pub fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut buffer = [0_u8; 3];
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            let packed =
+                (u32::from(buffer[0]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[2]);
+            for index in 0..4 {
+                if index <= chunk.len() {
+                    let shift = 18 - index * 6;
+                    out.push(char::from(TABLE[((packed >> shift) & 0x3F) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// Canonicalise the first element named `element` in `document`, exclusively.
+    ///
+    /// The element is located by name and canonicalised WITH the namespace declarations its
+    /// ancestors put in scope, which is what a signed subtree gets.
+    ///
+    /// # Errors
+    ///
+    /// The parse error, or a marker string if the subtree uses a prefix nothing binds.
+    pub fn canonicalize(document: &str, element: &str) -> Result<String, String> {
+        let limits = crate::Limits::default();
+        let root = crate::tree::build(document.as_bytes(), &limits)
+            .map_err(|error| format!("parse: {error}"))?;
+        let target = crate::verify::find_for_test(&root, element)
+            .ok_or_else(|| format!("no element named {element}"))?;
+        let scope = crate::verify::scope_at_for_test(&root, target);
+        let bytes =
+            crate::c14n::canonicalize(target, &scope).map_err(|_| "unbound prefix".to_owned())?;
+        String::from_utf8(bytes).map_err(|_| "not utf-8".to_owned())
+    }
+}
