@@ -725,6 +725,14 @@ async fn a_method_the_path_does_not_offer_is_that_operations_405_rather_than_the
     // spec-following client nothing to read -- and the test that claims to cover "every failed
     // operation" drives no 405 at all.
     for result in &results[..2] {
+        // BOTH FIELDS. Asserting the status alone left the document's `schemas` key unpinned:
+        // a review measured that deleting it kept the suite green, which made this guard
+        // strictly weaker than the sibling assertion twenty lines away that does check it.
+        assert_eq!(
+            result["response"]["schemas"][0].as_str(),
+            Some("urn:ietf:params:scim:api:messages:2.0:Error"),
+            "a 405's response must be a SCIM error document: {result}"
+        );
         assert_eq!(
             result["response"]["status"].as_str(),
             Some("405"),
@@ -875,7 +883,11 @@ async fn a_trailing_slash_is_read_the_same_way_inside_a_batch_as_the_router_read
                 {"method": "PATCH", "path": format!("/Users/{id}/"), "bulkId": "slash",
                  "data": {"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
                           "Operations": [{"op": "replace", "path": "active", "value": false}]}},
-                // The COLLECTION form, which the strip existed for and must still work.
+                // The COLLECTION form, refused too. This row asserted 201 on the reasoning
+                // that "a trailing slash names the collection" -- and a review measured the
+                // premise: axum answers a bare 404 to `POST /scim/v2/Users/` as a single
+                // request exactly as it does to the item form, so accepting it made a batch
+                // the one place that spelling worked.
                 {"method": "POST", "path": "/Groups/", "bulkId": "collection",
                  "data": {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
                           "displayName": "Engineering"}},
@@ -892,8 +904,10 @@ async fn a_trailing_slash_is_read_the_same_way_inside_a_batch_as_the_router_read
     );
     assert_eq!(
         results[1]["status"].as_str(),
-        Some("201"),
-        "the COLLECTION form must still work, or the fix broke what the strip was for: {body}"
+        Some("400"),
+        "a collection path with a trailing slash must be refused too -- axum refuses it as a \
+         single request, so accepting it here is the second spelling this module removes: \
+         {body}"
     );
 
     // And the patch did not apply.
@@ -1277,5 +1291,73 @@ async fn a_path_without_its_leading_slash_is_refused() {
         serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
         Some(1),
         "the refused spelling created a user anyway: {listed}"
+    );
+}
+
+/// A method spelled in lower case is refused, so one method has one spelling.
+///
+/// `validate_bulk` uppercased before matching, so `post`, `Post` and `pOsT` all reached the
+/// create handler while `post /scim/v2/Users` as a single request answers 405. HTTP methods are
+/// case-sensitive (RFC 9110 section 9.1) and RFC 7644 section 3.7.2 writes them uppercase; a
+/// review measured a batch creating a user from `post`.
+///
+/// This is the same defect as the path spellings beside it, on the field next door, and
+/// `a_bulk_batch_earns_no_laxer_reading_than_the_single_requests_it_wraps` never varied a
+/// method spelling -- its name outran what it measured.
+#[tokio::test]
+async fn a_method_spelled_in_lower_case_is_refused_and_echoed_as_the_client_sent_it() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"method": "post", "path": "/Users", "bulkId": "lower",
+                 "data": user("lower@example.com")},
+                {"method": "pOsT", "path": "/Users", "bulkId": "mixed",
+                 "data": user("mixed@example.com")},
+                // The CONTROL, so the refusals are about the spelling and not the fixture.
+                {"method": "POST", "path": "/Users", "bulkId": "upper",
+                 "data": user("upper@example.com")},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = operations(&body);
+    for (index, spelling) in [(0, "post"), (1, "pOsT")] {
+        assert_eq!(
+            results[index]["status"].as_str(),
+            Some("400"),
+            "the method {spelling:?} was accepted inside a batch while a single request \
+             answers 405: {body}"
+        );
+        // ECHOED AS SENT. RFC 7644 section 3.7.3 requires the result to carry the operation's
+        // method, and a client matching results to what it sent needs its own spelling back --
+        // an uppercased echo would tell it the server saw something it did not send.
+        assert_eq!(
+            results[index]["method"].as_str(),
+            Some(spelling),
+            "the result must echo the method the client sent: {body}"
+        );
+    }
+    assert_eq!(
+        results[2]["status"].as_str(),
+        Some("201"),
+        "the canonical spelling must still work: {body}"
+    );
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(1),
+        "only the canonical spelling created a user: {listed}"
     );
 }

@@ -267,9 +267,22 @@ pub fn validate_bulk(
         .operations
         .iter()
         .map(|operation| {
+            // ECHOED AS THE CLIENT SPELLED IT, and matched EXACTLY. Both halves changed
+            // together, and both were the same defect as the path beside them.
+            //
+            // The match used to uppercase first, so `post`, `Post` and `pOsT` all reached the
+            // create handler while `post /scim/v2/Users` as a single request answers 405. HTTP
+            // methods are case-sensitive (RFC 9110 section 9.1), RFC 7644 section 3.7.2 writes
+            // them uppercase, and `path.rs` states the governing rule for the field next door:
+            // accepting two spellings for one thing is a second interpretation for something
+            // else to disagree with. A review measured the batch creating a user from `post`.
+            //
+            // And the ECHO is what the client sent rather than an uppercased or empty string,
+            // because RFC 7644 section 3.7.3 requires the result to carry the operation's
+            // method and a client matching results to what it sent needs its own spelling back.
             let method = scalar(operation.method.as_ref())
                 .unwrap_or_default()
-                .to_ascii_uppercase();
+                .to_owned();
             let refuse = |detail: &str| {
                 BulkOutcome::Refused(BulkOperationResult {
                     bulk_id: scalar(operation.bulk_id.as_ref()).map(str::to_owned),
