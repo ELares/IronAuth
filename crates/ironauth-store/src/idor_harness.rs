@@ -39,18 +39,24 @@
 //!
 //! # What this trait CANNOT express, and where those operations are covered
 //!
-//! A probe receives ONE untrusted identifier, and it has to parse it before it can use it. For
-//! an id that EMBEDS its scope -- which is every `ScopedId` in this store -- `parse_in_scope`
-//! is itself the scope check, so a foreign id is refused there and the operation is never
-//! reached. That is fine when the operation's own fence is what the parse enforces, and it is
-//! why every probe here is written this way.
+//! A probe receives ONE untrusted identifier. MOST probes here parse it first, and for an id
+//! that EMBEDS its scope -- which is every `ScopedId` in this store -- `parse_in_scope` is
+//! itself the scope check, so a foreign id is refused there and the operation is never reached.
+//! That is fine when the operation's own fence is what the parse enforces.
+//!
+//! NOT ALL of them: `FederationLoginStateConsumeProbe` hands `foreign_id` straight to
+//! `consume()` and does reach the operation, which a review measured by making it report a leak
+//! on arrival. An earlier version of this paragraph said "every probe here is written this
+//! way", which is the kind of universal that is easy to write and one counterexample away from
+//! false -- and the counterexample was in this file.
 //!
 //! It stops working for an operation that resolves on TWO identifiers. Handed one foreign id
 //! and a locally-minted second, such a probe addresses a pair that names no row in ANY scope,
 //! so it answers not-found for a reason that has nothing to do with isolation. Five SCIM probes
 //! were written for issue #135 criterion 5 and MEASURED against the caller's own scope, where
 //! nothing fences them: four could not see a row at all. A reviewer then planted an assert
-//! inside the fifth's operation and found it never fired -- it was testing the parser.
+//! inside the fifth's operation and found it never fired -- it was testing the parser, because
+//! `OrganizationId` embeds its scope and so `parse_in_scope` refused every id before the call.
 //!
 //! So the inbound SCIM operations are driven directly, with both identifiers foreign, in
 //! `ironauth-scim/tests/idor.rs` -- which also measured that each is fenced THREE times (a Rust

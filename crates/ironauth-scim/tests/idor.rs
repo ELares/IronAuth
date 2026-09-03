@@ -12,9 +12,17 @@
 //! This file answers the layer beneath, and the distinction is not bookkeeping. `authenticate`
 //! derives the scope FROM THE CREDENTIAL, so a surface test structurally cannot present a
 //! foreign identifier under a caller's own scope -- the one thing it cannot construct is the one
-//! thing a future handler that took an id from a request path would hand the store. The harness
-//! constructs exactly that, for every SCIM repository operation that resolves a resource by
-//! identifier.
+//! thing a future handler that took an id from a request path would hand the store. This file
+//! constructs exactly that.
+//!
+//! NOT EVERY SCIM OPERATION, and the count is worth stating rather than implying. Ten resolve a
+//! resource by identifier across the four SCIM repositories. Seven are driven here; three more
+//! are driven the same way in `ironauth-store/tests/scim_connections.rs` (a foreign
+//! `list_for_organization`, `exists_in_organization` and `resolve`). Two of the seven --
+//! `ScimActivationRepo::set_active` and `::active_elsewhere` -- were covered NOWHERE until a
+//! review deleted both their scope guards and watched 193 tests pass. `active_elsewhere` is the
+//! read that decides whether deprovisioning disables the account; `set_active` is the
+//! cross-scope deactivation WRITE.
 //!
 //! The criterion says the harness is "extended with SCIM-specific cases"; before this the word
 //! SCIM did not appear in any `idor.rs` in the workspace.
@@ -108,7 +116,9 @@ async fn plant_victim(db: &TestDatabase, env: &Env, scope: Scope) -> Victim {
         .expect("create the victim person");
 
     // A login identifier, a membership, a provisioning connection, an externalId mapping, a
-    // deactivation and an Enterprise User document: one row for every probe.
+    // deactivation and an Enterprise User document: one for each read below, plus the
+    // two named in this function's doc that make the victim a person a SCIM run could
+    // actually have produced.
     db.control_store()
         .scoped(scope)
         .acting(db.test_actor(env), CorrelationId::generate(env))
@@ -266,6 +276,33 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
                 .unwrap_or_default()
                 .is_empty(),
             "a foreign organization's provisioning connections were listable"
+        );
+    }
+
+    // THE ACTIVATION PAIR, which nothing covered until a review deleted both scope guards and
+    // watched the whole workspace stay green. The write is the one that matters: deactivating
+    // somebody in another organization is a denial of service against their sign-in.
+    for victim in [&victim_tenant, &victim_environment] {
+        assert!(
+            db.store()
+                .scoped(caller)
+                .scim_activation()
+                .set_active(&victim.organization, &victim.user, true, now_micros(&env))
+                .await
+                .is_err(),
+            "a foreign organization's activation was writable"
+        );
+        // ABSENT READS AS FALSE here: `active_elsewhere` asks whether ANY OTHER organization
+        // holds the person active, so a caller who can see none must get `false`. The victim IS
+        // held active elsewhere in its own scope, so a leak reads as `true`.
+        assert!(
+            !db.store()
+                .scoped(caller)
+                .scim_activation()
+                .active_elsewhere(&victim.organization, &victim.user)
+                .await
+                .unwrap_or(false),
+            "a foreign organization's activation state was observable through active_elsewhere"
         );
     }
 
