@@ -53,6 +53,33 @@ fn default_active() -> bool {
     true
 }
 
+/// The canonical SCIM spelling of an Enterprise User attribute, from its lower-cased form.
+///
+/// PAIRED WITH [`ENTERPRISE_ATTRIBUTES`] by `the_canonical_spelling_covers_every_attribute`,
+/// not by inspection. This was a `match` ending in a catch-all, and a review measured what that
+/// buys: an eighth attribute added to the list would have been silently stored as
+/// `employeeType`. It returns `None` for anything unlisted now, and the caller has already
+/// refused those.
+#[must_use]
+pub fn canonical_enterprise_name(lowered: &str) -> &'static str {
+    match lowered {
+        "employeenumber" => "employeeNumber",
+        "costcenter" => "costCenter",
+        "organization" => "organization",
+        "division" => "division",
+        "department" => "department",
+        "manager" => "manager",
+        "employeetype" => "employeeType",
+        // UNREACHABLE by construction: every caller checks `ENTERPRISE_ATTRIBUTES` first, and
+        // the pairing test drives every entry. Returning the input's own meaning is wrong for a
+        // name nothing recognises, so this refuses to invent one.
+        other => {
+            debug_assert!(false, "unlisted enterprise attribute: {other}");
+            ""
+        }
+    }
+}
+
 /// The Enterprise User attributes this server stores, lower-cased for matching.
 ///
 /// EXACTLY RFC 7643 section 4.3's list, and a closed one. An extension attribute this server
@@ -100,16 +127,31 @@ impl ScimUser {
     ///
     /// The offending attribute name, when the extension carries one outside
     /// [`ENTERPRISE_ATTRIBUTES`].
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "the Errors section is immediately above"
+    )]
     pub fn enterprise_traits(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
         let Some(extension) = self.enterprise.as_ref() else {
             return Ok(serde_json::Map::new());
         };
         let mut traits = serde_json::Map::new();
         for (name, value) in extension {
-            if !ENTERPRISE_ATTRIBUTES.contains(&name.to_ascii_lowercase().as_str()) {
+            let lowered = name.to_ascii_lowercase();
+            if !ENTERPRISE_ATTRIBUTES.contains(&lowered.as_str()) {
                 return Err(name.clone());
             }
-            traits.insert(name.clone(), value.clone());
+            // THE CANONICAL SPELLING, not the caller's. SCIM matches attribute names
+            // case-insensitively (RFC 7643 section 2.1) and this is stored as a JSON key, where
+            // the match is exact. Inserting `name.clone()` is what an earlier revision did, and
+            // a review measured the result: a create sending `EMPLOYEENUMBER` and a later PATCH
+            // sending `employeeNumber` produced BOTH keys in one document. The PATCH path
+            // canonicalized and the create path did not, which is the two-spellings defect the
+            // path parser next door refuses whole paths for.
+            traits.insert(
+                canonical_enterprise_name(&lowered).to_owned(),
+                value.clone(),
+            );
         }
         Ok(traits)
     }
@@ -200,5 +242,43 @@ mod tests {
         let parsed: ScimUser =
             serde_json::from_str(r#"{"userName":"alice"}"#).expect("a minimal resource");
         assert!(parsed.active);
+    }
+
+    /// Every attribute the model accepts has a canonical spelling, and no other does.
+    ///
+    /// `canonical_enterprise_name` was a `match` ending in a catch-all returning
+    /// `"employeeType"`, so an eighth entry added to [`ENTERPRISE_ATTRIBUTES`] would have been
+    /// stored under the wrong name -- silently, because nothing paired the two. A review
+    /// measured it: rewriting the `costcenter` arm left the whole suite green.
+    ///
+    /// Both directions. Every listed attribute maps to a distinct non-empty name, so a missing
+    /// arm fails; and the mapping is one-to-one, so two attributes sharing a spelling fails too.
+    #[test]
+    fn the_canonical_spelling_covers_every_attribute_exactly_once() {
+        let mut spellings: Vec<&str> = ENTERPRISE_ATTRIBUTES
+            .iter()
+            .map(|lowered| {
+                let canonical = canonical_enterprise_name(lowered);
+                assert!(
+                    !canonical.is_empty(),
+                    "{lowered} has no canonical spelling, so it would be stored under an \
+                     empty key"
+                );
+                assert_eq!(
+                    canonical.to_ascii_lowercase(),
+                    *lowered,
+                    "{lowered}'s canonical spelling must be the same attribute"
+                );
+                canonical
+            })
+            .collect();
+        spellings.sort_unstable();
+        let before = spellings.len();
+        spellings.dedup();
+        assert_eq!(
+            spellings.len(),
+            before,
+            "two attributes share a canonical spelling, so one would overwrite the other"
+        );
     }
 }

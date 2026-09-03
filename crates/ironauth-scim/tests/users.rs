@@ -2258,40 +2258,6 @@ async fn a_deactivated_member_is_a_conflict_rather_than_a_re_admit() {
     assert_eq!(parsed["totalResults"], json!(1), "{body}");
 }
 
-/// Seed and activate a trait schema declaring the Enterprise User attributes.
-///
-/// An environment's trait schema is what decides which identity attributes it holds, so this is
-/// the operator configuration a deployment that wants the extension has to make. The tests that
-/// call it are the ones about a configured environment; the one that does NOT call it drives
-/// the refusal.
-async fn activate_enterprise_trait_schema(db: &TestDatabase, env: &Env, scope: Scope) {
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "employeeNumber": { "type": "string" },
-            "department": { "type": "string" },
-            "costCenter": { "type": "string" },
-        },
-    })
-    .to_string();
-    let acting = db
-        .control_store()
-        .scoped(scope)
-        .acting(db.test_actor(env), CorrelationId::generate(env));
-    let (_, version) = acting
-        .trait_schemas()
-        .create_version(env, &schema, now_micros(env))
-        .await
-        .expect("register a trait schema");
-    db.control_store()
-        .scoped(scope)
-        .acting(db.test_actor(env), CorrelationId::generate(env))
-        .trait_schemas()
-        .activate_version(env, version)
-        .await
-        .expect("activate it");
-}
-
 /// The Enterprise User extension round-trips: sent on create, read back on GET and on the list.
 ///
 /// `/Schemas` published this extension from the day the surface shipped and `ScimUser` parsed
@@ -2304,7 +2270,6 @@ async fn the_enterprise_extension_round_trips_through_create_and_read() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    activate_enterprise_trait_schema(&db, &env, scope).await;
     let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
 
     let body = json!({
@@ -2401,7 +2366,6 @@ async fn both_vendor_patch_dialects_reach_the_enterprise_extension() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    activate_enterprise_trait_schema(&db, &env, scope).await;
     let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
 
     let (status, created) = call(
@@ -2519,56 +2483,18 @@ async fn both_vendor_patch_dialects_reach_the_enterprise_extension() {
     );
 }
 
-/// An extension attribute the environment cannot hold is REFUSED, not dropped.
+/// An extension attribute outside RFC 7643's set is REFUSED, not dropped.
 ///
-/// Two ways it cannot hold one, and they are different refusals:
-///
-///   * The attribute is outside RFC 7643's Enterprise User set, so this server does not store
-///     it whatever the environment declares.
-///   * The environment has no ACTIVE trait schema, so it holds no declared identity attributes
-///     at all. That is an operator configuration a provisioning client cannot fix, and it must
-///     be told rather than having the value accepted and discarded.
-///
-/// Both matter because the failure they replace is identical from the client's side: a `201`
-/// and a resource that does not carry what was sent.
+/// `/Schemas` publishes what the extension carries, so a client that sends an attribute and
+/// gets a 201 is entitled to read it back. Accepting and discarding is the defect this whole
+/// change replaces, and it must not survive on the attributes the server does not know.
 #[tokio::test]
-async fn an_extension_attribute_the_environment_cannot_hold_is_refused_rather_than_dropped() {
+async fn an_attribute_outside_the_extension_is_refused_rather_than_dropped() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
 
-    // NO ACTIVE SCHEMA YET. A well-formed extension attribute is refused, and the refusal says
-    // which configuration is missing.
-    let (status, refused) = call(
-        &db,
-        &env,
-        "POST",
-        "/scim/v2/Users",
-        Some(&acme.token),
-        Some(json!({
-            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
-            "userName": "nodeclared@example.com",
-            "active": true,
-            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
-                "employeeNumber": "1",
-            },
-        })),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "an environment with no active trait schema must refuse rather than drop: {refused}"
-    );
-    assert!(
-        refused.contains("trait schema"),
-        "the refusal must name the missing configuration: {refused}"
-    );
-
-    activate_enterprise_trait_schema(&db, &env, scope).await;
-
-    // AN ATTRIBUTE OUTSIDE THE EXTENSION'S OWN SET, refused even with a schema active.
     let (status, refused) = call(
         &db,
         &env,
@@ -2598,8 +2524,17 @@ async fn an_extension_attribute_the_environment_cannot_hold_is_refused_rather_th
         "the refusal must not echo the caller's own input: {refused}"
     );
 
-    // THE CONTROL. With the schema active, a declared attribute is accepted -- so the refusals
-    // above are about what cannot be held, not about a surface that refuses every extension.
+    // REFUSED BEFORE ANYTHING IS WRITTEN. The extension is validated at the top of the handler,
+    // so a refusal must not leave a person behind for a retry to collide with.
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(0),
+        "a refused create landed a person anyway: {listed}"
+    );
+
+    // THE CONTROL: a declared attribute is accepted, so the refusal is about the vocabulary and
+    // not about a surface that refuses every extension.
     let (status, created) = call(
         &db,
         &env,
@@ -2617,12 +2552,467 @@ async fn an_extension_attribute_the_environment_cannot_hold_is_refused_rather_th
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
+}
 
-    // And nothing from the two refused creates landed.
-    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+/// One organization's Enterprise attributes are INVISIBLE to another's connection.
+///
+/// The attributes were identity TRAITS, which live on the `users` row and are environment
+/// wide. A review drove two organizations holding one person: Acme created them with
+/// `employeeNumber: "ACME-SECRET-701"`, Globex's own token READ it back, and Globex then
+/// overwrote `department` -- which Acme's next read returned.
+///
+/// Migration 0187 keys the document on the CONNECTION for that reason: an employee number is
+/// the number that person has at that organization, and two organizations provisioning one
+/// human legitimately have different ones.
+#[tokio::test]
+async fn one_connections_enterprise_attributes_are_invisible_to_another() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s-globex").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "shared@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "ACME-SECRET-701",
+                "department": "Acme Internal Tools",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // The SAME person, also a member of Globex. A shared person is how two identity providers
+    // legitimately end up describing one human.
+    also_a_member_of(
+        &db,
+        &env,
+        scope,
+        &globex.organization,
+        &ironauth_store::UserId::parse_in_scope(&user, &scope).expect("a user id"),
+    )
+    .await;
+
+    // GLOBEX READS NOTHING OF ACME'S.
+    let (status, seen) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&globex.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert!(
+        !seen.contains("ACME-SECRET-701") && !seen.contains("Acme Internal Tools"),
+        "one organization's Enterprise attributes leaked to another: {seen}"
+    );
+
+    // AND GLOBEX'S OWN WRITE DOES NOT DISTURB ACME'S.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&globex.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+                "value": "Globex Sales",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+
+    let (_, acme_sees) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    let extension = serde_json::from_str::<Value>(&acme_sees).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
     assert_eq!(
-        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        extension["department"].as_str(),
+        Some("Acme Internal Tools"),
+        "another organization's write overwrote this one's attributes: {acme_sees}"
+    );
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("ACME-SECRET-701"),
+        "{acme_sees}"
+    );
+}
+
+/// `remove` CLEARS an attribute, in both vendor dialects, and neither writes on a remove.
+///
+/// The URN-path arm mapped `remove` to a `null` value that a trait schema then refused, so a
+/// remove answered 400 and left the attribute set. The no-path arm never read `op` at all, so
+/// `{"op":"remove","value":{URN:{"department":"Tools"}}}` answered 200 and SET `department` --
+/// a remove that writes. A review measured both.
+#[tokio::test]
+async fn remove_clears_an_enterprise_attribute_in_both_dialects() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "clearme@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "701",
+                "department": "Tools",
+                "costCenter": "CC-1",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // ENTRA'S DIALECT: a URN-qualified path.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "remove",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a remove must not be refused: {patched}"
+    );
+    let extension = serde_json::from_str::<Value>(&patched).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    assert!(
+        extension.get("department").is_none(),
+        "the removed attribute is still there: {patched}"
+    );
+    // AND ONLY THAT ONE. A remove that cleared the document would pass the assertion above.
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("701"),
+        "{patched}"
+    );
+
+    // OKTA'S DIALECT: the extension object in a no-path value. The value names `costCenter`
+    // with a real string, so a handler that ignored `op` would SET it rather than clear it --
+    // which is exactly what happened.
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "remove",
+                "value": {
+                    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                        "costCenter": "CC-1",
+                    },
+                },
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let extension = serde_json::from_str::<Value>(&patched).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    assert!(
+        extension.get("costCenter").is_none(),
+        "a remove in the no-path dialect SET the attribute instead of clearing it: {patched}"
+    );
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("701"),
+        "{patched}"
+    );
+}
+
+/// Concurrent writes to one person's extension all land.
+///
+/// The attributes were stored by reading the traits document in one transaction and writing it
+/// back in another. A review drove six concurrent `PATCH`es, each setting a different attribute:
+/// all six answered 200 and ONE survived. Migration 0187 makes the write a single upsert whose
+/// merge happens inside the statement, so there is no window rather than a narrower one.
+#[tokio::test]
+async fn concurrent_writes_to_one_persons_extension_all_land() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "concurrent@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let attributes = [
+        "employeeNumber",
+        "costCenter",
+        "organization",
+        "division",
+        "department",
+        "employeeType",
+    ];
+    // SPAWNED, not awaited in turn: a sequential loop would have passed against the
+    // read-modify-write this replaces, because each read would have seen the previous write.
+    // Each task takes its own connection from the pool, which is what makes them concurrent.
+    let db = std::sync::Arc::new(db);
+    let mut handles = Vec::new();
+    for attribute in attributes {
+        let db = std::sync::Arc::clone(&db);
+        let env = env.clone();
+        let token = acme.token.clone();
+        let user = user.clone();
+        handles.push(tokio::spawn(async move {
+            call(
+                &db,
+                &env,
+                "PATCH",
+                &format!("/scim/v2/Users/{user}"),
+                Some(&token),
+                Some(json!({
+                    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                    "Operations": [{
+                        "op": "replace",
+                        "path": format!(
+                            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:{attribute}"
+                        ),
+                        "value": format!("set-{attribute}"),
+                    }],
+                })),
+            )
+            .await
+        }));
+    }
+    for (attribute, handle) in attributes.iter().zip(handles) {
+        let (status, body) = handle.await.expect("the write task completes");
+        assert_eq!(status, StatusCode::OK, "{attribute}: {body}");
+    }
+
+    // EVERY ONE OF THEM SURVIVED. This is the assertion the trait storage failed: six answers
+    // of 200 and one attribute in the document.
+    let (_, read) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    let extension = serde_json::from_str::<Value>(&read).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    for attribute in attributes {
+        assert_eq!(
+            extension[attribute].as_str(),
+            Some(format!("set-{attribute}").as_str()),
+            "a concurrent write answered 200 and was lost: {read}"
+        );
+    }
+}
+
+/// A filter on an extension attribute matches, in both the qualified and the bare spelling.
+///
+/// The listing renders the extension so that "a client that filters on `employeeNumber`" can
+/// match -- and a review measured that neither spelling matched anything, because the filter
+/// resolved names against the top level while the extension sits nested under its URN. The
+/// stated benefit of rendering it was simply not obtained.
+#[tokio::test]
+async fn a_filter_on_an_extension_attribute_matches_in_both_spellings() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    for (handle, number) in [("found@example.com", "701984"), ("other@example.com", "2")] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Users",
+            Some(&acme.token),
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": handle,
+                "active": true,
+                "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                    "employeeNumber": number,
+                },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // BOTH SPELLINGS. Entra sends the qualified one; the bare one is what a hand-written filter
+    // uses, and RFC 7644 section 3.4.2.2 permits either.
+    for filter in [
+        "urn%3Aietf%3Aparams%3Ascim%3Aschemas%3Aextension%3Aenterprise%3A2.0%3AUser%3AemployeeNumber%20eq%20%22701984%22",
+        "employeeNumber%20eq%20%22701984%22",
+    ] {
+        let (status, listed) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users?filter={filter}"),
+            Some(&acme.token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let parsed: Value = serde_json::from_str(&listed).expect("json");
+        assert_eq!(
+            parsed["totalResults"].as_u64(),
+            Some(1),
+            "a filter on an extension attribute matched nothing: {listed}"
+        );
+        assert_eq!(
+            parsed["Resources"][0]["userName"].as_str(),
+            Some("found@example.com"),
+            "the filter matched the wrong person: {listed}"
+        );
+    }
+}
+
+/// A create and a PATCH spelling one attribute differently write ONE attribute.
+///
+/// SCIM matches attribute names case-insensitively (RFC 7643 section 2.1) and this is stored as
+/// a JSON key, where the match is exact. The PATCH path canonicalized and the create path
+/// inserted the caller's own casing, so a review measured a document holding BOTH:
+///
+/// ```json
+/// {"EMPLOYEENUMBER":"701","employeeNumber":"902"}
+/// ```
+///
+/// That is the two-spellings defect the path parser next door refuses whole paths for, on an
+/// attribute instead of a path -- and the helper whose doc says it exists to prevent exactly
+/// this was called from one of the two writers.
+#[tokio::test]
+async fn a_create_and_a_patch_spelling_one_attribute_differently_write_one_attribute() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    // CREATED in a spelling no client would choose, which is the point: it must land under the
+    // canonical one, or the PATCH below writes a second key.
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "spelling@example.com",
+            "active": true,
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "EMPLOYEENUMBER": "701",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let parsed: Value = serde_json::from_str(&created).expect("json");
+    let user = parsed["id"].as_str().expect("id").to_owned();
+    // The CREATE already answers in the canonical spelling, which is what a client reads back.
+    assert_eq!(
+        parsed["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]["employeeNumber"]
+            .as_str(),
+        Some("701"),
+        "a create must store the canonical spelling: {created}"
+    );
+
+    let (status, patched) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{
+                "op": "replace",
+                "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
+                "value": "902",
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    let extension = serde_json::from_str::<Value>(&patched).expect("json")
+        ["urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"]
+        .clone();
+    assert_eq!(
+        extension.as_object().map(serde_json::Map::len),
         Some(1),
-        "a refused create landed a person anyway: {listed}"
+        "one attribute spelled two ways became two attributes: {patched}"
+    );
+    assert_eq!(
+        extension["employeeNumber"].as_str(),
+        Some("902"),
+        "the PATCH must replace what the create wrote: {patched}"
     );
 }

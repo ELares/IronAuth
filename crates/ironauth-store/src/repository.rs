@@ -97,12 +97,12 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimExternalIdId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId,
-    SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId,
-    TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
-    WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimEnterpriseId, ScimExternalIdId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -171,6 +171,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_activation(&self) -> ScimActivationRepo<'a> {
         ScimActivationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The SCIM Enterprise User attributes for this scope (issue #135, migration 0187).
+    #[must_use]
+    pub fn scim_enterprise(&self) -> ScimEnterpriseRepo<'a> {
+        ScimEnterpriseRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -75013,6 +75022,116 @@ impl ActingScimConnectionRepo<'_> {
 pub struct ScimExternalIdRepo<'a> {
     store: &'a Store,
     scope: Scope,
+}
+
+/// The SCIM Enterprise User attributes one CONNECTION sent about a person (issue #135,
+/// migration 0187).
+///
+/// Per connection, not per person: an employee number is the number that person has AT THAT
+/// ORGANIZATION, and two organizations provisioning one human legitimately have different ones.
+/// A review measured the alternative -- these were identity TRAITS, which are environment wide,
+/// and one organization's token read and then overwrote another's.
+pub struct ScimEnterpriseRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimEnterpriseRepo<'_> {
+    /// The extension document this connection holds for a person, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn document_for(
+        &self,
+        connection: &ScimConnectionId,
+        user: &UserId,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        if connection.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT attributes FROM scim_enterprise_attributes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND user_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(user.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<serde_json::Value, _>("attributes")))
+    }
+
+    /// Merge `incoming` into this connection's document for a person, in ONE statement.
+    ///
+    /// NOT A READ-MODIFY-WRITE. The merge is `attributes || EXCLUDED.attributes` inside the
+    /// upsert, so two concurrent writes both land: Postgres serializes them on the unique index
+    /// and the second sees the first's row. The trait storage this replaces read in one
+    /// transaction and wrote in another, and a review measured six concurrent writes answering
+    /// 200 with five of them lost.
+    ///
+    /// A key whose incoming value is JSON `null` is REMOVED rather than stored as null, which is
+    /// what `{"op":"remove"}` means on this surface. `||` would store the null; `- key` after it
+    /// is what deletes it, and doing both in one expression keeps a remove and a set the same
+    /// statement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn merge(
+        &self,
+        env: &Env,
+        connection: &ScimConnectionId,
+        user: &UserId,
+        incoming: &serde_json::Value,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if connection.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let removed: Vec<String> = incoming
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, value)| value.is_null())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let id = ScimEnterpriseId::generate(env, &self.scope);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_enterprise_attributes \
+                 (id, tenant_id, environment_id, connection_id, user_id, attributes, \
+                  created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, ($6::jsonb - $7::text[]), \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, connection_id, user_id) DO UPDATE \
+             SET attributes = \
+                     (scim_enterprise_attributes.attributes || EXCLUDED.attributes) \
+                     - $7::text[], \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection.to_string())
+        .bind(user.to_string())
+        .bind(incoming)
+        .bind(&removed)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Whether an organization considers a person active (issue #135, migration 0185).

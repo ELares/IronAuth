@@ -1501,6 +1501,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0186_data_plane_column_scopes.sql"),
         },
+        Migration {
+            version: 187,
+            name: "scim enterprise attributes",
+            // EXPAND: one new table with its policy and grants. Nothing existing is altered, no
+            // privilege is removed and no data is moved, so an old binary running beside a
+            // migrated database never reads it and never exercises the writes it permits.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0187_scim_enterprise_attributes.sql"),
+        },
     ]
 }
 

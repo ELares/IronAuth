@@ -31,9 +31,15 @@
 //! are substituted for the seeded ones at replay time, which is what keeps a fixture a
 //! verbatim-ish document rather than something the harness has to be taught about.
 //!
-//! An `expect_status` of 400 is a STATED GAP, not a pass: `entra_enterprise_user` records that
-//! the enterprise extension is published in the schema document and not parsed onto the
-//! resource, so widening that is a visible change to this file.
+//! An `expect_status` of 400 is a STATED GAP, not a pass -- and `entra_enterprise_user` was
+//! the one that carried it, recording that the enterprise extension was published in the schema
+//! document and not parsed onto the resource. It expects 200 now: the extension is parsed and
+//! stored per connection (migration 0187).
+//!
+//! Worth keeping in view, because a review caught it: the fixture NAMED FOR the extension was
+//! asserting the extension was refused, and the suite passed. A criterion can stay unmet
+//! indefinitely while the suite that exists to measure it is green, if the number it holds the
+//! server to is the number the defect produces.
 
 use std::fs;
 use std::path::Path;

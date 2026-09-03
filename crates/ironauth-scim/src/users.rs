@@ -48,7 +48,7 @@ use ironauth_store::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::resource::{ENTERPRISE_ATTRIBUTES, ScimUser};
+use crate::resource::{ENTERPRISE_ATTRIBUTES, ScimUser, canonical_enterprise_name};
 use crate::schema::ENTERPRISE_USER_SCHEMA;
 use crate::server::{Authenticated, ScimState, scim_error, scim_json};
 
@@ -158,30 +158,33 @@ fn user_resource(
     body
 }
 
-/// The Enterprise User attributes stored for a person, read back out of their traits.
+/// The Enterprise User attributes THIS CONNECTION holds for a person.
 ///
-/// FILTERED TO THE EXTENSION'S OWN ATTRIBUTES. A deployment's trait schema holds whatever the
-/// operator declared, and most of it is not SCIM's: rendering the whole document would publish
-/// an environment's private identity model to every provisioning client that reads a user.
+/// Scoped to `auth.connection.id`, which is what makes the read as private as the write. No
+/// attribute-name filter is needed or wanted: the table holds only what a SCIM client sent,
+/// and it holds it per connection, so there is nothing of anybody else's in it to filter out.
+/// The trait storage this replaces needed such a filter and a review measured that nothing
+/// killed its removal -- an operator's own declared `department` leaked to every provisioning
+/// client that read the person.
 ///
-/// A read failure is an empty map rather than an error, on the same argument
-/// [`external_id_of`] makes: the extension is a rendering detail, and a traits read that fails
-/// must not turn a successful provisioning call into a 500 the identity provider will retry.
+/// A read failure is an empty map rather than an error, on the same argument [`external_id_of`]
+/// makes: the extension is a rendering detail, and a read that fails must not turn a successful
+/// provisioning call into a 500 the identity provider will retry.
 async fn enterprise_of(
     state: &ScimState,
     auth: &Authenticated,
     user: &UserId,
 ) -> serde_json::Map<String, Value> {
-    let Ok(Some((_, traits))) = state.store().scoped(auth.scope).users().traits(user).await else {
+    let Ok(Some(Value::Object(document))) = state
+        .store()
+        .scoped(auth.scope)
+        .scim_enterprise()
+        .document_for(&auth.connection.id, user)
+        .await
+    else {
         return serde_json::Map::new();
     };
-    let Value::Object(traits) = traits else {
-        return serde_json::Map::new();
-    };
-    traits
-        .into_iter()
-        .filter(|(name, _)| ENTERPRISE_ATTRIBUTES.contains(&name.to_ascii_lowercase().as_str()))
-        .collect()
+    document
 }
 
 /// Read the `externalId` this connection knows a user by, or `None`.
@@ -282,9 +285,6 @@ pub(crate) async fn create_user(
     let Ok(enterprise) = parsed.enterprise_traits() else {
         return unsupported_enterprise_attribute();
     };
-    if let Err(response) = preflight_enterprise_traits(&state, &auth, &enterprise).await {
-        return response;
-    }
     let canonical = parsed.canonical_identifier();
     // An all-invisible or whitespace-only userName canonicalizes to nothing. The seam refuses
     // to store that, and refusing it HERE names the reason rather than surfacing the seam's
@@ -354,7 +354,7 @@ pub(crate) async fn create_user(
             return response;
         }
     }
-    if let Err(response) = store_enterprise_traits(&state, &auth, &user_id, &enterprise).await {
+    if let Err(response) = store_enterprise_attributes(&state, &auth, &user_id, &enterprise).await {
         return response;
     }
     match rendered_user(&state, &auth, &user_id).await {
@@ -400,7 +400,7 @@ fn enterprise_path_change(op: &str, path: &str, value: Option<&Value>) -> Result
     reason = "every refusal on this surface is a Response, as \
      `plan_operation` and its siblings all are; boxing one would make this the odd one out"
 )]
-fn enterprise_change(value: &Value) -> Result<Change, Response> {
+fn enterprise_change(op: &str, value: &Value) -> Result<Change, Response> {
     let Value::Object(extension) = value else {
         return Err(scim_error(
             StatusCode::BAD_REQUEST,
@@ -414,10 +414,16 @@ fn enterprise_change(value: &Value) -> Result<Change, Response> {
         if !ENTERPRISE_ATTRIBUTES.contains(&lowered.as_str()) {
             return Err(unsupported_enterprise_attribute());
         }
-        traits.insert(
-            canonical_enterprise_name(&lowered).to_owned(),
-            extension_value.clone(),
-        );
+        // A `remove` CLEARS every attribute it names, whatever value the operation carries.
+        // This arm never read `op` at all, and a review measured the result:
+        // `{"op":"remove","value":{URN:{"department":"Tools"}}}` answered 200 and SET
+        // `department` to "Tools" -- a remove that writes.
+        let written = if op == "remove" {
+            Value::Null
+        } else {
+            extension_value.clone()
+        };
+        traits.insert(canonical_enterprise_name(&lowered).to_owned(), written);
     }
     Ok(Change::Enterprise(traits))
 }
@@ -427,24 +433,6 @@ fn enterprise_change(value: &Value) -> Result<Change, Response> {
 /// Derived from [`ENTERPRISE_USER_SCHEMA`] rather than written out, so the two cannot drift.
 static ENTERPRISE_PATH_PREFIX_LOWER: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{ENTERPRISE_USER_SCHEMA}:").to_ascii_lowercase());
-
-/// The canonical SCIM spelling of an Enterprise User attribute, from its lower-cased form.
-///
-/// SCIM matches attribute names case-insensitively (RFC 7643 section 2.1) and this server
-/// stores them as traits, where the key is exact. Without this, `EMPLOYEENUMBER` from a PATCH
-/// and `employeeNumber` from a create would be two different traits for one attribute -- the
-/// two-spellings defect the path parser next door refuses paths for.
-fn canonical_enterprise_name(lowered: &str) -> &'static str {
-    match lowered {
-        "employeenumber" => "employeeNumber",
-        "costcenter" => "costCenter",
-        "organization" => "organization",
-        "division" => "division",
-        "department" => "department",
-        "manager" => "manager",
-        _ => "employeeType",
-    }
-}
 
 /// The refusal for an extension attribute this server does not store.
 ///
@@ -667,77 +655,21 @@ async fn restore_membership(
         .map_err(|error| store_failure(&error))
 }
 
-/// Refuse, BEFORE anything is written, an extension this environment cannot hold.
+/// Store this connection's Enterprise User attributes for a person.
 ///
-/// `store_enterprise_traits` runs last in a create, after the account, the membership and the
-/// identifier row. So a refusal from it leaves a person behind, and a review of my own test
-/// caught exactly that: an environment with no active trait schema answered 400 and had
-/// created the user anyway. A client that retries then hits a duplicate.
+/// PER CONNECTION, in `scim_enterprise_attributes` (migration 0187), not as identity traits. A
+/// review measured the trait storage with two organizations holding one person: Globex's token
+/// read back Acme's `employeeNumber` and then overwrote Acme's `department`. Traits live on the
+/// `users` row and are environment wide; an employee number is the number that person has at
+/// THAT organization.
 ///
-/// This runs the same two checks the write would, against the same active schema, before the
-/// first write. It cannot be a promise that the write then succeeds -- the schema could be
-/// deactivated in between -- but it removes every case a client can reach, which is the same
-/// standard `apply_operations` sets for PATCH atomicity.
-async fn preflight_enterprise_traits(
-    state: &ScimState,
-    auth: &Authenticated,
-    incoming: &serde_json::Map<String, Value>,
-) -> Result<(), Response> {
-    if incoming.is_empty() {
-        return Ok(());
-    }
-    let active = state
-        .store()
-        .scoped(auth.scope)
-        .trait_schemas()
-        .active()
-        .await
-        .map_err(|error| store_failure(&error))?;
-    let Some(active) = active else {
-        return Err(scim_error(
-            StatusCode::BAD_REQUEST,
-            Some("invalidValue"),
-            "this environment has no active identity trait schema, so Enterprise User \
-             attributes cannot be stored; register and activate one that declares them",
-        ));
-    };
-    let Ok(schema) = ironauth_store::trait_schema::TraitSchema::compile(&active.schema_json) else {
-        return Err(scim_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            "this environment's active identity trait schema cannot be read",
-        ));
-    };
-    // VALIDATED AGAINST THE SAME DOCUMENT THE WRITE BUILDS: the incoming attributes alone, not
-    // merged with what is stored. A merged document could fail on a trait this request never
-    // mentioned, which would report somebody else's problem as this client's.
-    if !schema.validate(&Value::Object(incoming.clone())).is_empty() {
-        return Err(scim_error(
-            StatusCode::BAD_REQUEST,
-            Some("invalidValue"),
-            "the Enterprise User attributes are not accepted by this environment's active \
-             identity trait schema",
-        ));
-    }
-    Ok(())
-}
-
-/// Store the Enterprise User extension attributes as identity TRAITS.
+/// ONE STATEMENT, so there is no read-modify-write window. The same review measured six
+/// concurrent writes against the trait storage answering 200 with five of them lost.
 ///
-/// THROUGH THE TRAITS SEAM, not into a table of SCIM's own, and the choice is the same one
-/// `resource.rs` makes about canonicalization: these are identity attributes an operator wants
-/// in claims and in the admin console, not provisioning bookkeeping. A SCIM-owned table would
-/// make `department` mean one thing through this door and nothing through any other.
-///
-/// SO THE DEPLOYMENT'S TRAIT SCHEMA DECIDES. `set_traits` validates against the environment's
-/// ACTIVE schema, so an operator who has not declared `employeeNumber` has an environment that
-/// does not hold one, and a provisioning client is told so rather than having the value
-/// accepted and dropped. That refusal is the point: publishing the extension in `/Schemas`
-/// while silently discarding what arrives is what this replaces.
-///
-/// MERGED, not replaced. The traits document holds whatever else the operator declared, and a
-/// SCIM write that carried only its own attributes would clear the rest.
-async fn store_enterprise_traits(
+/// NO SCHEMA GATE, so there is no late refusal either. The vocabulary is RFC 7643's and
+/// [`ScimUser::enterprise_traits`] has already refused anything outside it, before this runs
+/// and before anything else is written.
+async fn store_enterprise_attributes(
     state: &ScimState,
     auth: &Authenticated,
     user: &UserId,
@@ -746,50 +678,20 @@ async fn store_enterprise_traits(
     if incoming.is_empty() {
         return Ok(());
     }
-    let existing = state
-        .store()
-        .scoped(auth.scope)
-        .users()
-        .traits(user)
-        .await
-        .ok()
-        .flatten()
-        .map(|(_, traits)| traits);
-    let mut document = match existing {
-        Some(Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    for (name, value) in incoming {
-        document.insert(name.clone(), value.clone());
-    }
-    let serialized = Value::Object(document).to_string();
     let env = state.env().clone();
     state
         .store()
         .scoped(auth.scope)
-        .acting(auth.actor, CorrelationId::generate(&env))
-        .users()
-        .set_traits(&env, user, &serialized)
+        .scim_enterprise()
+        .merge(
+            &env,
+            &auth.connection.id,
+            user,
+            &Value::Object(incoming.clone()),
+            epoch_micros(state),
+        )
         .await
-        .map(|_| ())
-        .map_err(|error| match error {
-            // THE OPERATOR HAS NOT DECLARED THESE ATTRIBUTES, which is a client-visible fact
-            // and not a server fault. Answering 500 would send an identity provider into
-            // retry against a configuration only a human can change.
-            ironauth_store::StoreError::NoActiveTraitSchema => scim_error(
-                StatusCode::BAD_REQUEST,
-                Some("invalidValue"),
-                "this environment has no active identity trait schema, so Enterprise User \
-                 attributes cannot be stored; register and activate one that declares them",
-            ),
-            ironauth_store::StoreError::TraitsInvalid(_) => scim_error(
-                StatusCode::BAD_REQUEST,
-                Some("invalidValue"),
-                "the Enterprise User attributes are not accepted by this environment's active \
-                 identity trait schema",
-            ),
-            other => store_failure(&other),
-        })
+        .map_err(|error| store_failure(&error))
 }
 
 /// Register the account, bind it into the credential's organization, and index its login
@@ -1074,9 +976,6 @@ pub(crate) async fn replace_user(
     let Ok(enterprise) = parsed.enterprise_traits() else {
         return unsupported_enterprise_attribute();
     };
-    if let Err(response) = preflight_enterprise_traits(&state, &auth, &enterprise).await {
-        return response;
-    }
     if let Err(response) = set_active(&state, &auth, &user, parsed.active).await {
         return response;
     }
@@ -1085,7 +984,7 @@ pub(crate) async fn replace_user(
     {
         return response;
     }
-    if let Err(response) = store_enterprise_traits(&state, &auth, &user, &enterprise).await {
+    if let Err(response) = store_enterprise_attributes(&state, &auth, &user, &enterprise).await {
         return response;
     }
     match rendered_user(&state, &auth, &user).await {
@@ -1277,7 +1176,7 @@ async fn apply_operations(
                 rebind_external_id(state, auth, user, Some(external_id.as_str())).await?;
             }
             Change::Enterprise(traits) => {
-                store_enterprise_traits(state, auth, user, traits).await?;
+                store_enterprise_attributes(state, auth, user, traits).await?;
             }
         }
     }
@@ -1381,7 +1280,7 @@ fn plan_operation(operation: &PatchOperation) -> Result<Vec<Change>, Response> {
                 // inside the no-path value. Handled before the lower-cased match below because
                 // the URN is a key, not an attribute name.
                 if name.eq_ignore_ascii_case(ENTERPRISE_USER_SCHEMA) {
-                    changes.push(enterprise_change(value)?);
+                    changes.push(enterprise_change(&op, value)?);
                     continue;
                 }
                 match name.to_ascii_lowercase().as_str() {

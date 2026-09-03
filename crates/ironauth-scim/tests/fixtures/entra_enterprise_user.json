@@ -16,6 +16,6 @@
       }
     ]
   },
-  "expect_status": 400,
-  "expect_why": "GAP: the enterprise extension is published in the schema document but not parsed onto the resource, so this attribute is refused. Widening it changes this number."
+  "expect_status": 200,
+  "expect_why": "The Enterprise User extension is parsed onto the resource and stored per connection (migration 0187), so Entra's URN-qualified PATCH applies. This read 400 with the reason 'GAP: published in the schema document but not parsed onto the resource', which is the defect the extension work closed -- and the fixture NAMED FOR the extension asserting its own refusal is how a criterion stays unmet while its suite passes."
 }

@@ -682,19 +682,48 @@ pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
 /// emails.value ew "@example.com"` may be satisfied by two DIFFERENT addresses, while
 /// `emails[type eq "work" and value ew "@example.com"]` requires one address to be both.
 ///
-/// The schema URN half of a qualified path is IGNORED rather than matched. A resource is
-/// rendered as ONE flat JSON object regardless of which schema declares each attribute, so
-/// there is nothing for a URN to select between: `urn:...:core:2.0:User:userName` and
-/// `userName` name the same member of the same object. (The surface does publish the
-/// enterprise User extension alongside the core schema, so "one schema per resource type"
-/// would be false; what is true is that one RESOURCE is one object here.) Matching the URN
-/// would make a fully qualified filter, which Entra sends for extension attributes, miss the
-/// attribute it correctly named.
+/// The schema URN half of a qualified path is IGNORED rather than matched, and the attribute
+/// is then looked for at the top level FIRST and inside any extension object SECOND.
+///
+/// This used to say a resource "is rendered as ONE flat JSON object regardless of which schema
+/// declares each attribute, so there is nothing for a URN to select between". That was true
+/// when nothing nested, and the Enterprise User extension made it false: RFC 7643 section 3
+/// carries an extension's attributes under its URN as a member object, so
+/// `urn:...:enterprise:2.0:User:employeeNumber` names a key inside that object and a top-level
+/// lookup finds nothing. A review measured the consequence -- a user with `employeeNumber`
+/// rendered on the listing, and both the qualified and the bare filter matching zero -- which
+/// is exactly the "a legitimate filter matches nothing" failure the listing render was added to
+/// avoid, still standing.
+///
+/// The fallback is written against the SHAPE (a member whose key is a schema URN) rather than
+/// against the enterprise URN by name, so a second extension is reachable the day it exists
+/// rather than the day somebody remembers this function. Top level wins, so a core attribute
+/// can never be shadowed by an extension that happens to reuse its name.
+///
+/// Matching the URN instead of ignoring it would make a fully qualified filter, which Entra
+/// sends for extension attributes, miss the attribute it correctly named.
+/// An attribute inside one of the resource's extension objects.
+///
+/// A member whose KEY is a schema URN is an extension (RFC 7643 section 3), so this looks in
+/// each of them rather than naming the enterprise URN. Case-insensitively, like every other
+/// attribute lookup here.
+fn extension_member<'a>(
+    resource: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    resource
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| key.starts_with("urn:ietf:params:scim:schemas:"))
+        .find_map(|(_, extension)| member(extension, name))
+}
+
 fn attribute_values<'a>(
     resource: &'a serde_json::Value,
     path: &AttributePath,
 ) -> Vec<&'a serde_json::Value> {
-    let Some(found) = member(resource, &path.name) else {
+    let found = member(resource, &path.name).or_else(|| extension_member(resource, &path.name));
+    let Some(found) = found else {
         return Vec::new();
     };
     match (path.sub.as_deref(), found) {
