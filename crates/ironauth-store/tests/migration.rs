@@ -5477,36 +5477,56 @@ async fn org_groups_carries_its_isolation_indexes_and_least_privilege_grants() {
         !role_has_table_privilege(pool, "ironauth_app", "org_groups", "UPDATE").await,
         "the data-plane UPDATE on org_groups must never be table-wide"
     );
-    for (column, granted) in [
-        // The label a SCIM rename moves, and the JSON blob the shared UPDATE statement always
-        // names even when it changes nothing.
-        ("display_name", true),
-        ("metadata", true),
-        ("updated_at", true),
-        ("deleted_at", true),
-        // THE TWO THAT ARE NOT GRANTED. `slug` is the stable name a token claim carries, so a
-        // data plane that could move it could move what a claim means -- and that one is
-        // complete, because `slug` is absent from the INSERT statement's own concerns only in
-        // the sense that a new group's slug is the caller's to choose, which it always was.
-        //
-        // `parent_id` is NARROWER THAN IT LOOKS, and saying so is the point. Withholding
-        // UPDATE on it stops a group being REPARENTED in place. It does not stop the same
-        // outcome being reached by creation: 0185 grants `INSERT ON org_groups` table-wide,
-        // the shared INSERT names `parent_id`, and the effective-role closure walks upward, so
-        // the data-plane role could create a group under a role-bearing parent and bind a
-        // membership to it. Nothing on that plane does -- the SCIM handler always passes
-        // `parent_id: None` -- but that is a HANDLER invariant, and this block is about what
-        // the ROLE can point at. A reviewer measured the gap; it is recorded here rather than
-        // closed, because narrowing 0185's INSERT is a change to a shipped migration's intent
-        // and belongs with the SCIM group-push work that owns it.
-        ("slug", false),
-        ("parent_id", false),
-    ] {
-        assert_eq!(
-            role_has_column_privilege(pool, "ironauth_app", "org_groups", column, "UPDATE").await,
-            granted,
-            "the data plane's UPDATE on org_groups.{column} must be present exactly when \
-             migration 0185 grants it"
+    // THE EXACT SET, enumerated from the catalog. Not a hand-written column list: this file's
+    // own `writable_columns` doc condemns those, and a review measured why -- the list this
+    // replaces named six of `org_groups`' eleven columns, the pre-existing block above pins
+    // four more, and `GRANT UPDATE (created_at) ON org_groups TO ironauth_app` survived all
+    // 91 store tests. `created_at` is in the admin pagination key `org_groups_org_idx`, so a
+    // data plane that could rewrite it reorders an operator's group listing; and any column
+    // the table gains later joined it in being covered by nothing.
+    let mut writable = writable_columns(pool, "ironauth_app", "org_groups").await;
+    writable.sort();
+    assert_eq!(
+        writable,
+        vec![
+            // The label a SCIM rename moves, the JSON blob the shared UPDATE statement always
+            // names even when it changes nothing, and the soft-delete pair.
+            "deleted_at".to_owned(),
+            "display_name".to_owned(),
+            "metadata".to_owned(),
+            "updated_at".to_owned(),
+        ],
+        "the data plane's UPDATE on org_groups must be exactly what migration 0185 grants"
+    );
+
+    // WHAT THE TWO INTERESTING ABSENCES ACTUALLY BUY, which is less than either sounds.
+    //
+    // `slug` is the stable name a token claim carries -- `effective_group_slugs` is what feeds
+    // the `groups` claim -- and withholding UPDATE stops a RENAME in place. It does NOT stop
+    // SUBSTITUTION, and a reviewer drove it as the data-plane role:
+    // `org_groups_org_slug_live_uniq` is PARTIAL on `deleted_at IS NULL`, and 0185 grants both
+    // `UPDATE (deleted_at)` and a table-wide INSERT. Soft-delete the group holding a slug and
+    // the slug is free; insert a new group carrying it and the claim value now names a
+    // different group. The victim cannot then be revived -- reviving it violates the same
+    // partial index -- so the substitution is not reversible by the plane that did it.
+    //
+    // `parent_id` withholds a REPARENT in place, and the same INSERT reaches the same outcome:
+    // the effective-role closure walks upward, so a group created under a role-bearing parent
+    // inherits its roles.
+    //
+    // AND THE TWO COMPOSE, which is why they are written together rather than as two bullets.
+    // One INSERT carries the victim's slug AND a parent of the caller's choosing, so the claim
+    // value an operator expects can be pointed at a group in a role-bearing subtree in a single
+    // statement.
+    //
+    // RECORDED, NOT CLOSED. Nothing on that plane does it -- the SCIM handler always passes
+    // `parent_id: None` and never re-takes a slug -- but that is a HANDLER invariant and this
+    // block is about what the ROLE can point at. Narrowing 0185's table-wide INSERT is a change
+    // to a shipped migration's intent and belongs with the SCIM group-push work that owns it.
+    for column in ["slug", "parent_id", "created_at", "organization_id"] {
+        assert!(
+            !role_has_column_privilege(pool, "ironauth_app", "org_groups", column, "UPDATE").await,
+            "the data plane must hold no UPDATE on org_groups.{column}"
         );
     }
     // It still creates no foreign-key reference of its own.
@@ -8307,15 +8327,23 @@ async fn the_narrowed_tables_grant_the_data_plane_exactly_their_writers_columns(
         );
     }
 
-    // The CONTROL, and it is the one this whole file's helper doc warns about: an empty sweep
-    // would satisfy every assertion above. The control plane holds a WIDER set on the same
-    // tables, so the helper is answering rather than returning nothing.
+    // THE CONTROL, and its reason is NOT that an empty sweep would pass. It would not: every
+    // expected set above is non-empty, so a helper returning nothing fails the FIRST
+    // assertion, which a reviewer measured. Writing the wrong reason down is the same defect
+    // as writing the wrong number.
+    //
+    // What an exact-set assertion cannot see on its own is a sweep that ignores which ROLE it
+    // was asked about -- `has_column_privilege` inherits, so a helper answering for the wrong
+    // role could agree by coincidence. The control therefore asks for a set that must DIFFER:
+    // the control plane writes `decided_by` and the data plane must not. Verified by mutation:
+    // a `writable_columns` that ignores its `role` argument fails HERE and nowhere else.
     assert!(
         writable_columns(pool, "ironauth_control", "agent_vault_approvals")
             .await
             .contains(&"decided_by".to_owned()),
-        "the column sweep reports a real answer: the CONTROL plane holds the decided_by \
-         write the data plane is denied above"
+        "the sweep answers for the role it was given: the CONTROL plane holds the decided_by \
+         write the data plane is denied above, so a helper ignoring its role argument cannot \
+         satisfy both"
     );
 }
 

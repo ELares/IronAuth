@@ -22,7 +22,19 @@
 --   REVOKE UPDATE     ON probe FROM r; -- column f, table f   <-- the column grant is gone too
 --
 -- So the GRANT that follows a REVOKE must re-issue the WHOLE intended set, not just the part
--- being added. It is safe on these three tables only because none of them carried a prior
+-- being added.
+--
+-- TWO QUALIFICATIONS, both measured, because a rule aimed at a future author has to be usable
+-- rather than merely true:
+--
+--   * `REVOKE UPDATE ON t FROM r` does NOT clear what `r` holds through PUBLIC or through role
+--     membership -- `has_column_privilege` still answers true. Inert here (the ironauth roles
+--     have no memberships and no PUBLIC grant reaches an app table), but a narrowing that has
+--     to be complete cannot rely on this statement alone.
+--   * The converse trap: `REVOKE UPDATE (a) ON t FROM r` against a TABLE-WIDE grant removes
+--     NOTHING. An author narrowing by revoking the columns they want gone silently achieves
+--     nothing at all, which is the same failure this header exists to prevent approached from
+--     the other side. Revoke the privilege, then re-grant the columns. It is safe on these three tables only because none of them carried a prior
 -- column-scoped UPDATE grant for `ironauth_app` -- checked across all 186 migrations. That is
 -- NOT true of every table: `scim_membership_activation` holds
 -- `GRANT UPDATE (active, updated_at) ... TO ironauth_app` from 0185, and a later migration
