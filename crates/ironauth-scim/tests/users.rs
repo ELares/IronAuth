@@ -1307,19 +1307,10 @@ async fn the_create_door_and_the_read_door_agree_on_who_exists() {
         assert_eq!(status, StatusCode::CONFLICT, "{spelling:?}: {body}");
 
         // So the read door must find them.
-        // Percent-encode every byte that is not an unreserved character, so the spelling
-        // reaches the handler exactly as written: the interesting cases are a space, a
-        // zero-width joiner and surrounding whitespace, none of which survive a raw query
-        // string.
-        let mut encoded = String::new();
-        for byte in spelling.as_bytes() {
-            if byte.is_ascii_alphanumeric() {
-                encoded.push(char::from(*byte));
-            } else {
-                use std::fmt::Write as _;
-                let _ = write!(encoded, "%{byte:02X}");
-            }
-        }
+        // Percent-encoded, so the spelling reaches the handler exactly as written: the
+        // interesting cases are a space, a zero-width joiner and surrounding whitespace, none
+        // of which survive a raw query string.
+        let encoded = urlencoding(spelling);
         let (status, body) = call(
             &db,
             &env,
@@ -4127,7 +4118,12 @@ async fn audit_rows(db: &TestDatabase, scope: Scope, action: &str) -> usize {
 /// deactivate announces `user.deactivated` and `user.state_changed` under a different
 /// `user_id`, which `events_through` can see because it looks for its sentinel on the whole
 /// feed.
-async fn provision_and_deactivate(db: &TestDatabase, env: &Env, token: &str, handle: &str) -> String {
+async fn provision_and_deactivate(
+    db: &TestDatabase,
+    env: &Env,
+    token: &str,
+    handle: &str,
+) -> String {
     let (status, created) = call(
         db,
         env,
@@ -4387,7 +4383,11 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
     .await;
     assert_eq!(
         types(&events),
-        vec!["user.deactivated", "user.state_changed", "user.state_changed"],
+        vec![
+            "user.deactivated",
+            "user.state_changed",
+            "user.state_changed"
+        ],
         "exactly three: the deactivation on both grains, and the account coming back. A fourth \
          means the repeated deactivate announced itself again, which a receiver would count as \
          a second termination; a missing third means the reactivation is silent on both grains"
@@ -4700,21 +4700,36 @@ async fn a_delete_ends_offline_consent_even_when_the_account_was_already_disable
     );
 }
 
-/// A malformed filter is refused at the SURFACE with a SCIM error (issue #135, criterion 3).
+/// A malformed filter is refused at BOTH list surfaces with a SCIM error (issue #135,
+/// criterion 3).
 ///
 /// # Why this exists when the parser already has refusal tests
 ///
 /// The criterion says the parser "rejects malformed input with SCIM errors", and every refusal
-/// test in the crate was a unit test on `parse_filter`. The handler arms that turn a
-/// `FilterError` into a 400 SCIM document were executed by nothing: an audit measured that
-/// every one of the twenty `filter=` requests in these suites sends a WELL-FORMED filter. A
-/// handler that swallowed the error and listed everything instead would have left the whole
-/// suite green, which is the failure that matters most here -- a filter that silently matches
-/// everything is a cross-organization read on any surface where the filter is the only fence.
+/// test in the crate was a unit test on `parse_filter`. The handler arms in `list_users` and
+/// `list_groups` that turn a `FilterError` into a 400 SCIM document were executed by nothing:
+/// of the 19 `filter=` request sites in these suites (counted, and one further grep hit is a
+/// comment), every one sends a WELL-FORMED filter. A handler that swallowed the error and
+/// listed everything instead left the whole suite green.
 ///
-/// So this drives the route. The shapes are the parser's own refusal cases, sent as a client
-/// would send them, and each is asserted to be a 400 carrying the uniform `invalidFilter`
-/// `scimType` rather than merely a non-200.
+/// What that failure actually costs is worth stating exactly rather than dramatically. On
+/// `/Users` the filter is NOT the isolation fence -- `collect_matches` walks the credential's
+/// own organization, and `no_filter_returns_a_user_from_another_organization` proves an
+/// unfiltered listing does not cross organizations -- so a swallowed filter answers 200 with
+/// this organization's whole directory rather than a foreign one's. That is still the wrong
+/// answer to a client that asked a question, and it is the difference between "no such person"
+/// and "here is everyone".
+///
+/// # All four refusal variants, and both routes
+///
+/// `FilterError` has four variants and an earlier version of this drove two: `TooLong` and
+/// `TooDeep` were absent, and `TooLong` is the one most likely to be refused by a DIFFERENT
+/// layer (a multi-kilobyte query string), which is exactly the passing-for-the-wrong-reason
+/// this test exists to rule out. All four are here now.
+///
+/// `/Groups` carries a byte-identical arm and was covered by nothing: a review deleted it,
+/// replaced it with `.ok().flatten()`, and the whole crate stayed green while
+/// `tests/groups.rs` drove that handler seven times.
 #[tokio::test]
 async fn a_malformed_filter_is_refused_at_the_surface_rather_than_matching_everything() {
     let db = TestDatabase::start().await;
@@ -4726,70 +4741,121 @@ async fn a_malformed_filter_is_refused_at_the_surface_rather_than_matching_every
     // organization is empty". A handler that dropped the bad filter would list this row.
     provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
 
+    // A GROUP TOO, so the `/Groups` control below finds something and the refusals there are
+    // distinguishable from an empty environment.
+    make_group_for_filter(&db, &env, &okta.token, "Engineering").await;
+
+    // OVER THE LENGTH BOUND (4096 bytes) and OVER THE DEPTH BOUND (20), built rather than
+    // written out: a literal of either would be unreadable and would silently stop matching the
+    // bound if the constant moved.
+    let too_long = format!("userName eq \"{}\"", "a".repeat(4200));
+    let too_deep = format!("{}userName pr{}", "(".repeat(30), ")".repeat(30));
     for (what, filter) in [
-        ("trailing input", "userName eq \"a\" garbage"),
-        ("an unterminated string", "userName eq \"alice"),
-        ("a truncated escape", "userName eq \"alice\\\""),
-        ("an unknown operator", "userName like \"a\""),
-        ("an empty filter", ""),
-        ("a bare attribute", "userName"),
+        ("trailing input", "userName eq \"a\" garbage".to_owned()),
+        ("an unterminated string", "userName eq \"alice".to_owned()),
+        ("a truncated escape", "userName eq \"alice\\\"".to_owned()),
+        ("an unknown operator", "userName like \"a\"".to_owned()),
+        ("an empty filter", String::new()),
+        ("a bare attribute", "userName".to_owned()),
+        ("a filter over the length bound", too_long),
+        ("a filter over the depth bound", too_deep),
+    ] {
+        for (route, resource) in [
+            ("/scim/v2/Users", "alice@example.test"),
+            ("/scim/v2/Groups", "Engineering"),
+        ] {
+            let (status, body) = call(
+                &db,
+                &env,
+                "GET",
+                &format!("{route}?filter={}", urlencoding(&filter)),
+                Some(&okta.token),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{what} was not refused at {route}: {body}"
+            );
+            let parsed = serde_json::from_str::<Value>(&body).expect("a SCIM error document");
+            assert_eq!(
+                parsed["scimType"], "invalidFilter",
+                "{what} at {route} must carry the uniform scimType a client branches on: {body}"
+            );
+            assert_eq!(
+                parsed["schemas"][0], "urn:ietf:params:scim:api:messages:2.0:Error",
+                "{what} at {route} must be a SCIM error document, not a bare string: {body}"
+            );
+            // The 400 above already excludes a listing, so this is not a second guard on the
+            // same fact: it names the RESOURCE, so a 400 that somehow carried one would say so.
+            assert!(
+                !body.contains(resource),
+                "{what} at {route} answered 400 and still carried a resource: {body}"
+            );
+        }
+    }
+
+    // THE CONTROLS, one per route. A well-formed filter still answers 200 and finds the
+    // resource, so the refusals above are the parser rather than a route that refuses
+    // everything.
+    for (route, filter, expected) in [
+        (
+            "/scim/v2/Users",
+            "userName eq \"alice@example.test\"",
+            "alice@example.test",
+        ),
+        (
+            "/scim/v2/Groups",
+            "displayName eq \"Engineering\"",
+            "Engineering",
+        ),
     ] {
         let (status, body) = call(
             &db,
             &env,
             "GET",
-            &format!("/scim/v2/Users?filter={}", urlencoding(filter)),
+            &format!("{route}?filter={}", urlencoding(filter)),
             Some(&okta.token),
             None,
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{what} was not refused: {body}"
-        );
-        let parsed = serde_json::from_str::<Value>(&body).expect("a SCIM error document");
-        assert_eq!(
-            parsed["scimType"], "invalidFilter",
-            "{what} must carry the uniform scimType a client branches on: {body}"
-        );
-        assert_eq!(
-            parsed["schemas"][0], "urn:ietf:params:scim:api:messages:2.0:Error",
-            "{what} must be a SCIM error document, not a bare string: {body}"
-        );
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
         assert!(
-            !body.contains("alice@example.test"),
-            "{what} listed the organization's people instead of refusing: {body}"
+            body.contains(expected),
+            "the control filter at {route} matched nothing, so the refusals above prove \
+             nothing: {body}"
         );
     }
-
-    // THE CONTROL. A well-formed filter over the same route still answers 200 and finds the
-    // person, so the refusals above are the parser rather than a route that refuses everything.
-    let (status, body) = call(
-        &db,
-        &env,
-        "GET",
-        &format!(
-            "/scim/v2/Users?filter={}",
-            urlencoding("userName eq \"alice@example.test\"")
-        ),
-        Some(&okta.token),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body.contains("alice@example.test"),
-        "the control filter matched nothing, so the refusals above prove nothing: {body}"
-    );
 }
 
-/// Percent-encode a query-string value.
+/// Create a group through the surface, returning its id.
+async fn make_group_for_filter(db: &TestDatabase, env: &Env, token: &str, name: &str) -> String {
+    let (status, body) = call(
+        db,
+        env,
+        "POST",
+        "/scim/v2/Groups",
+        Some(token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "displayName": name,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned()
+}
+
+/// Percent-encode a query-string value, leaving the RFC 3986 unreserved set alone.
 ///
-/// Hand-rolled because these suites take no URL crate, and because what has to be encoded here
-/// is narrow and worth being explicit about: a raw `"` or space in a query string is what a
-/// hostile client sends, and letting the harness send it unencoded would test the router's
-/// tolerance rather than the filter parser.
+/// Hand-rolled because these suites take no URL crate. ONE of these, because there were two
+/// with different unreserved sets: an unencoded `"` or space does not merely reach the server
+/// oddly, `Request::builder().uri(...)` refuses to build it and the test panics before it has
+/// asked the server anything.
 fn urlencoding(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() * 3);
     for byte in raw.bytes() {
