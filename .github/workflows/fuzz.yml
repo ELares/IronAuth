@@ -184,6 +184,15 @@ jobs:
             target: claim_mapping
           - dir: crates/ironauth-connector
             target: connector_def
+          # The SAML harness (issue #138, criterion 6). One target per path the issue
+          # names: the XML parse, exclusive canonicalization, and signature verification.
+          # All three read bytes an unauthenticated party posts to an assertion consumer.
+          - dir: crates/ironauth-saml
+            target: saml_parse
+          - dir: crates/ironauth-saml
+            target: saml_canonicalize
+          - dir: crates/ironauth-saml
+            target: saml_verify
     steps:
       - uses: actions/checkout@v7
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The

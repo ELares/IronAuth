@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The cargo-fuzz harness for ironauth-saml (issue #138, criterion 6). Deliberately
+# NOT a workspace member (the empty [workspace] table below detaches it): its
+# libFuzzer dependency needs a nightly toolchain and must not constrain the stable
+# workspace or enter the cargo-deny graph, mirroring the root fuzz/ crate and the
+# sibling per-crate harnesses.
+#
+# Issue #138 asks for targets over "the XML parse, canonicalization, and
+# signature-verification paths" by name, and there is one per path below. All three
+# read bytes an UNAUTHENTICATED party posts to an assertion consumer service, which
+# is the whole reason this crate exists ahead of any SAML feature.
+[package]
+name = "ironauth-saml-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `test-util` because the canonicalizer is not on the normal public surface: it is
+# reachable only through that feature, and a target that could not call it would
+# leave one of the three paths #138 names untouched.
+ironauth-saml = { path = "..", features = ["test-util"] }
+
+[[bin]]
+name = "saml_parse"
+path = "fuzz_targets/saml_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "saml_canonicalize"
+path = "fuzz_targets/saml_canonicalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "saml_verify"
+path = "fuzz_targets/saml_verify.rs"
+test = false
+doc = false
+bench = false
