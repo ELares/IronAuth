@@ -1463,16 +1463,14 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
             &scope.tenant().to_string(),
             &scope.environment().to_string(),
             at,
-            // MEMBERSHIP ids, and the field names say so. v1 of this type named them
-            // `added_user_ids` while every producer filled them with `omb_` ids, so a consumer
-            // resolving them as users found nothing; this test hand-wrote the same mistake.
-            // See the type's own note in `event_catalog.rs` for why the values are right and
-            // the names were wrong.
+            // USER ids. This test used to hand-write MEMBERSHIP ids into arrays the schema
+            // names `added_user_ids`, which is the same mistake every producer made: see the
+            // type's note in `event_catalog.rs`.
             &serde_json::json!({
                 "org_group_id": group.to_string(),
                 "organization_id": org.to_string(),
-                "added_membership_ids": added,
-                "removed_membership_ids": removed,
+                "added_user_ids": added,
+                "removed_user_ids": removed,
                 "truncated": false,
                 "total": 1,
             }),
@@ -1497,7 +1495,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
 
     let added_event = per_member("evt_group_member_added", "org_group.member_added", 1);
     let added_delta = delta_of(
-        vec![membership.to_string()],
+        vec![user.to_string()],
         Vec::new(),
         1,
         "evt_group_delta_add",
@@ -1543,8 +1541,8 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
         .expect("the delta form");
     assert_eq!(changed["payload"]["org_group_id"], group.to_string());
     assert_eq!(
-        changed["payload"]["added_membership_ids"][0],
-        membership.to_string()
+        changed["payload"]["added_user_ids"][0],
+        user.to_string()
     );
     for event in &events {
         ironauth_store::event_catalog::validate_event(event)
@@ -1554,7 +1552,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
     let removed_event = per_member("evt_group_member_removed", "org_group.member_removed", 2);
     let removed_delta = delta_of(
         Vec::new(),
-        vec![membership.to_string()],
+        vec![user.to_string()],
         2,
         "evt_group_delta_remove",
     );
@@ -1591,8 +1589,8 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
         .find(|event| event["type"] == "org_group.membership_changed")
         .expect("the delta form on the removal");
     assert_eq!(
-        removal["payload"]["removed_membership_ids"][0],
-        membership.to_string(),
+        removal["payload"]["removed_user_ids"][0],
+        user.to_string(),
         "a group removal must move the id to the REMOVED array"
     );
 }

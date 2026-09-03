@@ -3608,7 +3608,7 @@ as a sentinel, so an absent one means absent.
 | `org_group.deleted` | 1 |
 | `org_group.member_added` | 1 |
 | `org_group.member_removed` | 1 |
-| `org_group.membership_changed` | 2 |
+| `org_group.membership_changed` | 1 |
 | `org_group.reparented` | 1 |
 | `org_group.updated` | 1 |
 
@@ -3760,13 +3760,13 @@ as a sentinel, so an absent one means absent.
 }
 ```
 
-### `org_group.membership_changed` v2
+### `org_group.membership_changed` v1
 
 ```json
 {
   "additionalProperties": false,
   "properties": {
-    "added_membership_ids": {
+    "added_user_ids": {
       "items": {
         "minLength": 1,
         "type": "string"
@@ -3781,7 +3781,7 @@ as a sentinel, so an absent one means absent.
       "minLength": 1,
       "type": "string"
     },
-    "removed_membership_ids": {
+    "removed_user_ids": {
       "items": {
         "minLength": 1,
         "type": "string"
@@ -3799,8 +3799,8 @@ as a sentinel, so an absent one means absent.
   "required": [
     "org_group_id",
     "organization_id",
-    "added_membership_ids",
-    "removed_membership_ids",
+    "added_user_ids",
+    "removed_user_ids",
     "truncated",
     "total"
   ],
@@ -3816,11 +3816,11 @@ as a sentinel, so an absent one means absent.
 {
   "org_group_id": "org_group_id_example",
   "organization_id": "organization_id_example",
-  "added_membership_ids": [
-    "added_membership_id_1"
+  "added_user_ids": [
+    "added_user_id_1"
   ],
-  "removed_membership_ids": [
-    "removed_membership_id_1"
+  "removed_user_ids": [
+    "removed_user_id_1"
   ],
   "truncated": true,
   "total": 1

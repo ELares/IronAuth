@@ -205,8 +205,12 @@ pub(crate) fn group_member_event(
 /// dumps", and this is that pattern: the arrays, the truncation flag and the true total, with
 /// the cap decided by `ironauth_store::membership_change` so no producer re-derives it.
 ///
-/// It carries MEMBERSHIP ids, and says so in its field names. A group binding binds a
-/// membership rather than a user, which is also what the per-member events above carry.
+/// It carries USER ids, which is what the schema has always declared and what a mirror needs:
+/// a mirror applies these arrays to its own copy of a group's membership and keys people by
+/// user. The per-member events above carry the MEMBERSHIP instead, because that is the row they
+/// are about. Both producers of this type used to put membership ids in these arrays, so a
+/// consumer resolving them as the names say found nothing; `event_catalog.rs` records why the
+/// fix was the producer rather than the schema.
 pub(crate) fn group_membership_delta_event(
     state: &ScimState,
     scope: Scope,
@@ -216,11 +220,8 @@ pub(crate) fn group_membership_delta_event(
     removed: Vec<String>,
 ) -> Option<OwnedDomainEvent> {
     let change = ironauth_store::membership_change(added, removed);
-    let mut payload = ironauth_store::membership_delta_payload(
-        &change,
-        "added_membership_ids",
-        "removed_membership_ids",
-    );
+    let mut payload =
+        ironauth_store::membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
     payload["org_group_id"] = serde_json::json!(group);
     payload["organization_id"] = serde_json::json!(organization);
     envelope_for(

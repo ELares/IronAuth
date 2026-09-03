@@ -111,6 +111,7 @@ crates/ironauth-store/src/repository.rs:set_state_with_event:2
 crates/ironauth-store/src/repository.rs:set_traits_with_visibility:1
 crates/ironauth-store/src/repository.rs:set_with_event:12
 crates/ironauth-store/src/repository.rs:store_connection_with_event:1
+crates/ironauth-store/src/repository.rs:tear_down_connection_bindings:1
 crates/ironauth-store/src/repository.rs:transition:1
 crates/ironauth-store/src/repository.rs:transition_with_event:1
 crates/ironauth-store/src/repository.rs:unassign_with_event:3

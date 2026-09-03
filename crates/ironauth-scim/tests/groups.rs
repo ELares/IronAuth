@@ -1511,12 +1511,12 @@ async fn a_group_membership_push_maps_roles_immediately_and_announces_the_delta(
         membership.to_string()
     );
     assert_eq!(
-        events[1].payload["payload"]["added_membership_ids"],
-        json!([membership.to_string()]),
-        "the delta names WHAT was added, and names it as a membership: that is what a group \
-         binding binds, and what the per-member event beside it carries"
+        events[1].payload["payload"]["added_user_ids"],
+        json!([user]),
+        "the delta names the PERSON who joined, which is what a mirror keys on and what this \
+         type's arrays have always declared; the per-member event beside it names the BINDING"
     );
-    assert_eq!(events[1].payload["payload"]["removed_membership_ids"], json!([]));
+    assert_eq!(events[1].payload["payload"]["removed_user_ids"], json!([]));
     assert_eq!(events[1].payload["payload"]["truncated"], false);
     assert_eq!(events[1].payload["payload"]["total"], 1);
     for event in &events {
@@ -1550,10 +1550,7 @@ async fn a_group_membership_push_maps_roles_immediately_and_announces_the_delta(
         ["org_group.member_removed", "org_group.membership_changed"],
         "the removal announces the same pair"
     );
-    assert_eq!(
-        events[3].payload["payload"]["removed_membership_ids"],
-        json!([membership.to_string()])
-    );
+    assert_eq!(events[3].payload["payload"]["removed_user_ids"], json!([user]));
 }
 
 /// Removing a mapping rule removes ONLY the derived assignments (issue #136, criterion 5).
@@ -1659,6 +1656,19 @@ async fn removing_a_mapping_rule_leaves_a_direct_grant_standing() {
         "removing the mapping rule must take the DERIVED role and leave the direct grant, which \
          an operator made for this person and no identity provider is responsible for"
     );
+}
+
+/// How many teardown audit rows `scope` holds.
+async fn teardown_audit_rows(db: &TestDatabase, scope: Scope) -> usize {
+    db.control_store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("read the audit log")
+        .into_iter()
+        .filter(|row| row.action == "scim_connection.bindings.revoke")
+        .count()
 }
 
 /// Revoking a connection tears down the bindings IT pushed, and audits the teardown
@@ -1773,5 +1783,367 @@ async fn revoking_a_connection_tears_down_the_bindings_it_pushed() {
         teardown_rows[0].target_id,
         acme.connection.to_string(),
         "targeted at the connection, which is the thing the operator acted on"
+    );
+
+}
+
+/// And the teardown ANNOUNCES itself (issue #136, criterion 6).
+///
+/// The first version enqueued nothing: a review measured the group's feed as byte-identical
+/// before and after a revoke that emptied it, while `effective_roles` had already stopped
+/// returning the role. Access was taken away and no consumer was told, so every downstream
+/// mirror kept the membership forever.
+#[tokio::test]
+async fn a_teardown_announces_who_it_removed_from_which_group() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let pushed = provision(&db, &env, &acme.token, "pushed@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &pushed).await;
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("revoke the connection");
+
+    // measured the group's feed as byte-identical before and after a revoke that emptied it,
+    // while `effective_roles` had already stopped returning the role. Access was taken away and
+    // no consumer was told, so every downstream mirror kept the membership forever.
+    //
+    // One delta per affected group, naming who left as USER ids, which is the shape a mirror
+    // applies. The per-member form is deliberately not used here: a connection can hold tens of
+    // thousands of bindings, and the delta is the only form that can say "there was more than I
+    // could carry".
+    let events = events_about_group(&db, scope, &group, 3).await;
+    assert_eq!(
+        event_types(&events)[2..],
+        ["org_group.membership_changed"],
+        "the teardown removed a membership and announced nothing"
+    );
+    assert_eq!(
+        events[2].payload["payload"]["removed_user_ids"],
+        json!([pushed]),
+        "it must name the person the revoke removed, and only them: the operator's member is \
+         still in the group"
+    );
+    assert_eq!(events[2].payload["payload"]["added_user_ids"], json!([]));
+    assert_eq!(events[2].payload["payload"]["total"], 1);
+    ironauth_store::event_catalog::validate_event(&events[2].payload)
+        .expect("the envelope validates against the registry the fan-out enforces");
+}
+
+/// Revoking a connection that pushed nothing audits nothing, and a second revoke tears down
+/// nothing twice (issue #136, criterion 6).
+///
+/// A teardown row claiming a removal that did not happen is the phantom-audit-row defect the
+/// membership-attachment cascade documents, and an operator reading the log to answer "what did
+/// revoking this credential take away" would be told a number that is not true.
+#[tokio::test]
+async fn a_revoke_that_tears_down_nothing_audits_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    // A connection that provisioned a person but never put them in a group.
+    provision(&db, &env, &acme.token, "nobody@example.com").await;
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("revoke the connection");
+    assert_eq!(
+        teardown_audit_rows(&db, scope).await,
+        0,
+        "a revoke that removed no bindings wrote a row saying it had"
+    );
+
+    // AND AGAIN. The early return on an already-revoked connection is what stops a second
+    // teardown; without it a repeat revoke would re-date every binding it had already removed,
+    // destroying the record of when that access actually stopped.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("a repeat revoke is not an error");
+    assert_eq!(teardown_audit_rows(&db, scope).await, 0);
+}
+
+/// A binding the connection had ALREADY removed is not torn down again (issue #136,
+/// criterion 6).
+///
+/// The teardown's `deleted_at IS NULL` is what keeps a soft-deleted binding's timestamp: it is
+/// the record of when that person's access actually stopped, and re-dating it destroys the only
+/// evidence of that. A review deleted the guard and every suite stayed green, because nothing
+/// drove a revoke over a group the connection had already emptied.
+///
+/// The audit count is the observable: with the guard gone the teardown matches the dead row,
+/// writes a row claiming one removal, and an operator reading the log is told the revoke took
+/// away access that had already been taken away weeks earlier.
+#[tokio::test]
+async fn a_binding_already_removed_is_not_torn_down_again() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let user = provision(&db, &env, &acme.token, "left@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &user).await;
+
+    // The connection removes them itself, first.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(patch(&json!([{
+            "op": "remove",
+            "path": format!("members[value eq \"{user}\"]"),
+        }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        members(&db, &env, &acme.token, &group).await.is_empty(),
+        "the removal did not happen, so the revoke below has a live binding to find"
+    );
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("revoke the connection");
+
+    assert_eq!(
+        teardown_audit_rows(&db, scope).await,
+        0,
+        "the teardown counted a binding that was already removed, so it re-dated the record of \
+         when that access stopped"
+    );
+}
+
+/// A binding attributed to another scope's connection is refused (issue #136, criterion 6).
+///
+/// The provenance column is the id a revoke SCANS on, so a binding attributed across a scope is
+/// a row this scope's teardown can never reach and another scope's teardown must never see. A
+/// review deleted this check and every suite stayed green.
+#[tokio::test]
+async fn a_binding_cannot_be_attributed_to_another_scopes_connection() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let here = db.seed_scope(&env).await;
+    let elsewhere = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, here, "Acme", "s-acme").await;
+    let foreign = seed_provisioner(&db, &env, elsewhere, "Foreign", "s-foreign").await;
+
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let group_id = ironauth_store::OrgGroupId::parse_in_scope(&group, &here).expect("a group id");
+    let user = provision(&db, &env, &acme.token, "engineer@example.com").await;
+    let subject = UserId::parse_in_scope(&user, &here).expect("a user id");
+    let membership = membership_of(&db, here, &acme.organization, &subject).await;
+
+    let outcome = db
+        .control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_group_members(here)
+        .add(
+            &env,
+            ironauth_store::NewOrgGroupMember {
+                id: &ironauth_store::OrgGroupMemberId::generate(&env, &here),
+                organization_id: &acme.organization,
+                group_id: &group_id,
+                membership_id: &membership,
+                source_scim_connection_id: Some(&foreign.connection),
+            },
+            now_micros(&env),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+        "a binding was attributed to another scope's connection: {outcome:?}"
+    );
+
+    // THE CONTROL: the same write with this scope's own connection succeeds, so the refusal is
+    // the scope check rather than anything else about the row.
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_group_members(here)
+        .add(
+            &env,
+            ironauth_store::NewOrgGroupMember {
+                id: &ironauth_store::OrgGroupMemberId::generate(&env, &here),
+                organization_id: &acme.organization,
+                group_id: &group_id,
+                membership_id: &membership,
+                source_scim_connection_id: Some(&acme.connection),
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("this scope's own connection may attribute a binding");
+}
+
+/// A PATCH adding TWO members announces ONE delta naming both, riding the last write
+/// (issue #136, criterion 4).
+///
+/// # Why the plural case has its own test
+///
+/// Every other test here drives exactly ONE binding write per operation, and a review measured
+/// what that leaves uncovered: with the delta moved to ride the FIRST write instead of the last,
+/// all eighteen tests still passed. `MemberPlan`, `writes()` and the whole "computed up front so
+/// the delta can ride the LAST write" design existed for a property nothing could observe.
+///
+/// Two members is the smallest input that can tell them apart. The delta must appear ONCE, name
+/// BOTH people, and arrive AFTER both per-member events -- which is what "the operation
+/// completed" means, and is the only thing that makes the announcement safe to act on.
+#[tokio::test]
+async fn a_two_member_push_announces_one_delta_naming_both_after_both_writes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+
+    let first = provision(&db, &env, &acme.token, "first@example.com").await;
+    let second = provision(&db, &env, &acme.token, "second@example.com").await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(patch(&json!([{
+            "op": "add",
+            "path": "members",
+            "value": [{"value": first}, {"value": second}],
+        }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let events = events_about_group(&db, scope, &group, 3).await;
+    assert_eq!(
+        event_types(&events),
+        vec![
+            "org_group.member_added",
+            "org_group.member_added",
+            "org_group.membership_changed",
+        ],
+        "one delta, LAST: riding the first write would announce a set change while the second \
+         binding had not been written, and a later failure would leave the announcement standing"
+    );
+    let mut announced: Vec<String> = events[2].payload["payload"]["added_user_ids"]
+        .as_array()
+        .expect("the delta names who joined")
+        .iter()
+        .map(|value| value.as_str().expect("a user id").to_owned())
+        .collect();
+    announced.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(
+        announced, expected,
+        "the delta must name BOTH people the operation added, as USER ids"
+    );
+    assert_eq!(events[2].payload["payload"]["total"], 2);
+}
+
+/// A group write that changes nothing announces nothing (issue #136, criterion 4).
+///
+/// The ordinary output of an identity provider's sync sweep is a request that restates what is
+/// already true. A delta claiming a change nobody made is the phantom-event defect the user
+/// surface's activation upsert also guards against, and here it would have a mirror re-apply a
+/// membership it already has and log a change that did not happen.
+#[tokio::test]
+async fn a_group_write_that_changes_nothing_announces_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let user = provision(&db, &env, &acme.token, "engineer@example.com").await;
+
+    push_member(&db, &env, &acme.token, &group, &user).await;
+    let after_first = events_about_group(&db, scope, &group, 2).await;
+    assert_eq!(after_first.len(), 2, "the first push announces both forms");
+
+    // THE SAME PUSH AGAIN, and then a DIFFERENT write whose events fence the count: waiting for
+    // a number cannot say "and no more", because an extra event that has not crossed the feed's
+    // visibility watermark looks exactly like one that was never emitted.
+    push_member(&db, &env, &acme.token, &group, &user).await;
+    let sentinel = make_group(&db, &env, &acme.token, "Sales").await;
+    let other = provision(&db, &env, &acme.token, "sales@example.com").await;
+    push_member(&db, &env, &acme.token, &sentinel, &other).await;
+    let _ = events_about_group(&db, scope, &sentinel, 2).await;
+
+    assert_eq!(
+        event_types(&events_about_group(&db, scope, &group, 2).await),
+        vec!["org_group.member_added", "org_group.membership_changed"],
+        "re-pushing a member the group already holds announced the change again"
+    );
+}
+
+/// A PUT that drops a member announces the removal on both forms (issue #136, criterion 4).
+///
+/// The replace path is how a sync sweep deprovisions somebody out of a group, and a review
+/// measured that it could be made silent -- per-member event and delta both `None` -- with every
+/// test still passing: the only removal any test drove went through the PATCH `remove` path.
+#[tokio::test]
+async fn a_replace_that_drops_a_member_announces_the_removal() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let user = provision(&db, &env, &acme.token, "leaving@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &user).await;
+
+    // A PUT naming an EMPTY member set: the whole membership is declared, so the person leaves.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "displayName": "Engineering",
+            "members": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let events = events_about_group(&db, scope, &group, 4).await;
+    assert_eq!(
+        event_types(&events)[2..],
+        ["org_group.member_removed", "org_group.membership_changed"],
+        "a replace that drops somebody must announce it exactly as a PATCH remove does"
+    );
+    assert_eq!(
+        events[3].payload["payload"]["removed_user_ids"],
+        json!([user]),
+        "and must name the PERSON who left"
+    );
+    assert!(
+        members(&db, &env, &acme.token, &group).await.is_empty(),
+        "the replace did not actually remove them, so the events above describe nothing"
     );
 }

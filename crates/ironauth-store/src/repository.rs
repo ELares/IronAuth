@@ -22880,13 +22880,13 @@ pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> Membership
 ///
 /// # Why the array names are arguments
 ///
-/// The two producers of this shape carry DIFFERENT ids, and collapsing that was a shipped
-/// defect. An organization membership change adds and removes USERS, so
-/// `organization.membership_changed` names its arrays `added_user_ids` and fills them with
-/// `usr_` ids. A group binding binds a MEMBERSHIP, so `org_group.membership_changed` carries
-/// `omb_` ids -- and it inherited the user-id names by sharing one builder, which told every
-/// consumer to resolve them as users and find nothing. Passing the names makes each producer
-/// state its own vocabulary.
+/// Both types this builds for name their arrays `added_user_ids` and `removed_user_ids` today,
+/// so the parameters look redundant. They are here because the alternative -- baking the names
+/// in -- is what let a THIRD producer inherit them silently: the group form filled the same
+/// arrays with `omb_` membership ids for as long as it existed, and every consumer resolving
+/// them as the names said found nothing. Naming them at the call site makes each producer state
+/// its own vocabulary instead of borrowing one, so the next type with a different one cannot
+/// acquire these by accident.
 ///
 /// # What is shared, and is genuinely the same for both
 ///
@@ -75142,20 +75142,7 @@ impl ActingScimConnectionRepo<'_> {
         // `deleted_at IS NULL` so a binding an operator had already removed keeps the
         // `deleted_at` it earned. Rewriting it would destroy the record of when that person's
         // access actually stopped, which is the forensic value the soft delete exists for.
-        let torn_down = sqlx::query(
-            "UPDATE org_group_members SET \
-                 deleted_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
-                 updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
-             WHERE tenant_id = $2 AND environment_id = $3 \
-             AND source_scim_connection_id = $4 AND deleted_at IS NULL",
-        )
-        .bind(now_micros)
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .bind(id.to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let torn_down = tear_down_connection_bindings(&mut tx, env, scope, id, now_micros).await?;
 
         let spec = AuditedWrite {
             store: self.store,
@@ -75187,6 +75174,107 @@ impl ActingScimConnectionRepo<'_> {
         tx.commit().await?;
         Ok(true)
     }
+}
+
+/// Soft-delete every live group binding `connection` pushed, announcing each affected group,
+/// inside the caller's transaction (issue #136, criterion 6).
+///
+/// Returns how many bindings were removed, which the caller audits.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault; [`StoreError::Conflict`] if the delta type
+/// is not registered, which is unreachable while it is.
+async fn tear_down_connection_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    connection: &ScimConnectionId,
+    now_micros: i64,
+) -> Result<u64, StoreError> {
+    // RETURNING WHO LEFT WHICH GROUP, because the teardown has to ANNOUNCE itself and a
+    // count cannot. It removes access -- possibly from thousands of people at once -- and
+    // the first version of this enqueued nothing, so every downstream mirror kept those
+    // memberships forever while `effective_roles` had already stopped returning the roles.
+    // A review measured it: the group's feed was byte-identical before and after a revoke
+    // that emptied it. Every other binding write in this crate announces itself; the one
+    // path that can remove tens of thousands must not be the exception.
+    //
+    // The join to `org_memberships` is what turns a binding into the PERSON who left, which
+    // is what `org_group.membership_changed` carries. It cannot drop a row: 0088's foreign
+    // key makes `membership_id` resolvable for every binding that exists.
+    let torn_down_rows = sqlx::query(
+        "UPDATE org_group_members gm SET \
+             deleted_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
+             updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
+         FROM org_memberships m \
+         WHERE m.id = gm.membership_id \
+         AND gm.tenant_id = $2 AND gm.environment_id = $3 \
+         AND gm.source_scim_connection_id = $4 AND gm.deleted_at IS NULL \
+         RETURNING gm.group_id, gm.organization_id, m.user_id",
+    )
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(connection.to_string())
+    .fetch_all(&mut **tx)
+    .await?;
+    let torn_down = torn_down_rows.len() as u64;
+
+    // ONE DELTA PER GROUP, which is the grain the type is about: its subject is the group
+    // and its ordering key is the group, so a consumer applying one group's changes in
+    // sequence gets them in sequence. A single event spanning groups would have to pick one
+    // subject and would put every other group's change on a stranger's ordering key.
+    //
+    // The removals are announced as a DELTA rather than as one `member_removed` each,
+    // because this is the shape the cap exists for: a connection can hold tens of thousands
+    // of bindings, and `membership_change` truncates with `truncated` and the true `total`
+    // so a mirror knows to reconcile instead of applying a prefix.
+    let mut by_group: Vec<(String, String, Vec<String>)> = Vec::new();
+    for row in &torn_down_rows {
+        let group: String = row.get("group_id");
+        let organization: String = row.get("organization_id");
+        let user: String = row.get("user_id");
+        if let Some(entry) = by_group.iter_mut().find(|(g, _, _)| *g == group) {
+            entry.2.push(user);
+        } else {
+            by_group.push((group, organization, vec![user]));
+        }
+    }
+    for (group, organization, users) in by_group {
+        let change = membership_change(Vec::new(), users);
+        let mut payload =
+            membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
+        payload["org_group_id"] = serde_json::json!(group);
+        payload["organization_id"] = serde_json::json!(organization);
+        let event_id = format!("evt_{}", CorrelationId::generate(env));
+        let Some(envelope) = crate::event_catalog::envelope(
+            &event_id,
+            "org_group.membership_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            now_micros / 1000,
+            &payload,
+        ) else {
+            // UNREACHABLE while the type is registered, and a failure rather than a silent
+            // skip: a teardown that removed access and announced nothing is the defect this
+            // whole block exists to close.
+            return Err(StoreError::Conflict);
+        };
+        enqueue_domain_event(
+            tx,
+            env,
+            scope,
+            Some(&DomainEvent {
+                id: &event_id,
+                subject: &group,
+                envelope: &envelope,
+            }),
+        )
+        .await?;
+    }
+
+    Ok(torn_down)
 }
 
 /// The SCIM `externalId` mappings for one scope (issue #135).

@@ -9,10 +9,41 @@
 -- an operator revoking a compromised identity provider has disarmed the credential without
 -- undoing anything it did.
 --
--- A binding is where a role actually comes from on this path. The data plane holds NOTHING on
--- `org_group_roles` (0185 says so and means it), so a provisioning connection cannot attach a
--- role to a group; all it can do is put people into groups an operator has already given
--- roles. The derived assignment IS the binding, and this column is what makes it attributable.
+-- A binding is where a role actually comes from on this path. The data plane holds SELECT on
+-- `org_group_roles` and nothing else -- 0089 grants exactly that, under its own words "the DATA
+-- plane needs SELECT and NOTHING ELSE", because that table is what token issuance reads -- so a
+-- provisioning connection can see what a group confers and can never change it. All it can do
+-- is put people into groups an operator has already given roles. The derived assignment IS the
+-- binding, and this column is what makes it attributable.
+--
+-- (0185 says only that IT grants nothing there, which is a statement about that migration
+-- rather than about the plane's holdings. An earlier draft of this paragraph restated it as
+-- the latter and was wrong twice over: the data plane does hold SELECT, and 0185 never claimed
+-- otherwise. Migration text is checksummed whole-file, so a sentence that ships here can never
+-- be corrected in place, which is exactly what 0185 says about 0087 and 0088.)
+--
+-- ONE ROW PER (GROUP, MEMBERSHIP), SO PROVENANCE IS FIRST-WRITER-WINS, and that is a real
+-- limitation rather than an oversight. 0088's live-unique index makes a person a member of a
+-- group at most once, so this column records who bound them FIRST and there is nowhere to
+-- record a second asserter.
+--
+-- What follows, measured, and stated here because it is the sharpest edge of the design: with
+-- two connections provisioning one organization, the second one's push of a person the first
+-- already bound is accepted and writes nothing, and revoking the FIRST connection removes a
+-- binding the second still asserts. The second restores it on its next full-membership sync (a
+-- PUT or a replace-PATCH names the whole set, so the missing binding is rewritten), but a
+-- client that sends only incremental changes will not, and the person loses that group's roles
+-- until somebody notices.
+--
+-- The same asymmetry runs the other way: an operator cannot take over a binding a connection
+-- already made, because the insert is refused as a conflict. So "an operator's binding survives
+-- a teardown" is true of the bindings an operator wrote FIRST, and there is no way to convert
+-- one afterwards.
+--
+-- Fixing either needs a second table recording every asserter of a binding, which is a
+-- different schema and a different issue. This column answers the question criterion 6 asks --
+-- which bindings did THIS credential create -- and not "which credentials would still assert
+-- this binding".
 --
 -- NULLABLE, AND NULL MEANS OPERATOR.
 --
@@ -22,7 +53,8 @@
 -- touch them. Criterion 5's "directly granted roles survive" is this column being NULL, and the
 -- teardown's predicate is `source_scim_connection_id = $1`, which no NULL row can satisfy --
 -- in SQL a NULL comparison is never true, so the survival property is a consequence of the type
--- rather than of remembering to write the exclusion.
+-- rather than of remembering to write the exclusion. It holds for the bindings an operator
+-- wrote FIRST; see the note above for what that leaves out.
 --
 -- WHY NOT ON `org_groups` TOO.
 --

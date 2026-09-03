@@ -71,11 +71,6 @@ pub(crate) fn not_found() -> Response {
     )
 }
 
-/// Map a store failure onto a SCIM response.
-///
-/// [`StoreError::NotFound`] becomes the uniform 404 rather than anything more specific: the
-/// store returns it for an out-of-scope id, which is exactly the case a caller must not be
-/// able to tell from an absent one.
 /// The 500 a producer that could not build its event answers with.
 ///
 /// UNREACHABLE while every type a producer names is registered, and a 500 rather than an
@@ -91,6 +86,11 @@ pub(crate) fn internal_error() -> Response {
     )
 }
 
+/// Map a store failure onto a SCIM response.
+///
+/// [`StoreError::NotFound`] becomes the uniform 404 rather than anything more specific: the
+/// store returns it for an out-of-scope id, which is exactly the case a caller must not be
+/// able to tell from an absent one.
 pub(crate) fn store_failure(error: &StoreError) -> Response {
     match error {
         StoreError::NotFound => not_found(),
