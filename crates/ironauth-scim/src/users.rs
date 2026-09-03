@@ -973,6 +973,23 @@ async fn set_active(
 /// any organization still consider this person active? The answer is computed from the whole
 /// relation rather than tracked incrementally, so a sequence of deactivations and
 /// reactivations in any order lands on the same state as the set of facts implies.
+///
+/// # There is no revocation SLO here, because there is no queue
+///
+/// Issue #136 criterion 1 asks for revocation "within the documented SLO", and its What section
+/// asks that the delay be "measured and exposed as a metric". Neither is shipped, and the
+/// reason is that the thing they would measure does not exist: the sessions, the refresh
+/// families and their grants are revoked in the SAME TRANSACTION as the state change, before
+/// the SCIM response is written. There is no worker, no queue and no lag to bound, so a metric
+/// would report zero by construction and an SLO would be a bound on a number that cannot move.
+///
+/// What IS asynchronous is the delivery that follows: back-channel logout and the webhook
+/// fan-out drain the outbox. Those have their own bounds and their own issues, and neither is
+/// what this criterion is about -- an application still holding a live token is a different
+/// exposure from one that has not yet been told.
+///
+/// The tests assert the stronger property the synchronous design makes available: immediately
+/// after the response, with nothing run in between, the families and the session are dead.
 async fn reconcile_account_state(
     state: &ScimState,
     auth: &Authenticated,
@@ -1023,11 +1040,30 @@ async fn reconcile_account_state(
         // still live afterwards.
         //
         // So the CASCADE runs on its own here. `set_state` cannot: it re-checks `state = from`
-        // inside its transaction and a same-state transition is refused. Revoking directly is
-        // idempotent (a second deprovisioning finds nothing live and flips nothing), and it
-        // reaches this line only when `should_be_active` was false, so the person is held
-        // active by no organization at all.
-        if target == UserState::Disabled {
+        // inside its transaction and a same-state transition is refused. It reaches this line
+        // only when `should_be_active` was false, so the person is held active by no
+        // organization at all.
+        //
+        // ASKED FIRST, AND THAT IS NOT AN OPTIMISATION. `revoke_all_for_user` audits
+        // UNCONDITIONALLY -- `write_audited` appends its row whether or not the UPDATE matched
+        // anything -- so calling it speculatively appends a `user.sessions.revoke_all` row on
+        // every request that finds nothing live. A review measured it: three repeated
+        // deactivates wrote three such rows while the request that actually revoked everything
+        // wrote none, because that one goes through `set_state_with_event` under a different
+        // action. The audit log would have said the opposite of what happened, and the ordinary
+        // shapes that produce it are the ones this file calls ordinary: an identity provider's
+        // sync sweep, and the issue's own "deactivate then delete".
+        //
+        // The read-then-write window is closed by the state this branch is in rather than by a
+        // lock: reaching here means the account cannot authenticate, and a session and a
+        // refresh family are both minted by an authorization such an account is refused.
+        if target == UserState::Disabled
+            && scoped
+                .sessions()
+                .any_live_session_or_family(user)
+                .await
+                .map_err(|error| store_failure(&error))?
+        {
             scoped
                 .acting(auth.actor, CorrelationId::generate(&env))
                 .sessions()
@@ -1068,12 +1104,24 @@ async fn reconcile_account_state(
     // but such a person makes `should_be_active` true, so `target` is `Active` and this
     // transition is not a deprovisioning at all.
     //
-    // NO MUTATION OF THIS EXPRESSION CAN FAIL A TEST, and that is a property of where the flag
-    // is READ rather than a gap in coverage: `set_state_with_event` consults `hard_kill` only
-    // inside `if to.ends_sessions()`, and the only session-ending target this path can produce
-    // is `Disabled`. A review measured it, replacing the expression with `true` and watching 53
-    // tests pass. It is written as the fact it means rather than as the constant it evaluates
-    // to, because the fact is what the line above and the early return both turn on.
+    // IT HAS TWO READERS AND THEY ARE NOT SYMMETRIC, which an earlier version of this comment
+    // got wrong in both directions.
+    //
+    // `set_state_with_event` consults it only inside `if to.ends_sessions()`, and the only
+    // session-ending target this path can produce is `Disabled`, so AT THAT READER the
+    // expression is equivalent to `true` and mutating it there changes nothing. That much was
+    // measured and is why an earlier version called it a tautology.
+    //
+    // The OTHER reader is four lines below: the value rides the `user.state_changed` payload
+    // unconditionally, because a receiver cannot work out afterwards whether the offline
+    // families died. So a mutation IS caught -- replacing this with `false` fails two tests,
+    // one on the surviving refresh family and one on the payload -- and the previous claim that
+    // no mutation could fail was itself false.
+    //
+    // What prevents over-reach is `should_be_active`, not this flag. An earlier comment
+    // defended the expression as "a condition and not a constant" on the grounds that a person
+    // active in another organization must keep their consent; such a person makes
+    // `should_be_active` true, so `target` is `Active` and this is not a deprovisioning at all.
     let hard_kill = !should_be_active;
 
     // THE ACCOUNT GRAIN, announced separately from the organization grain and only when the

@@ -3685,10 +3685,16 @@ async fn a_delete_that_takes_the_account_dark_ends_offline_consent_too() {
         .to_owned();
     let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
 
-    // TWO LIVE FAMILIES, one of each kind, on one person. One kind alone cannot tell a cascade
-    // that reached far enough from one that reached too far.
+    // TWO LIVE FAMILIES, one of each kind, AND A LIVE SESSION. One kind of family alone cannot
+    // tell a cascade that reached far enough from one that reached too far, and the criterion
+    // asks in its own words for a test that holds "live sessions and tokens" across the delete.
     let session_bound = plant_family(&db, &env, scope, &subject, false).await;
     let offline = plant_family(&db, &env, scope, &subject, true).await;
+    let session = plant_session(&db, &env, scope, &subject).await;
+    assert!(
+        session_is_live(&db, scope, &session).await,
+        "the session must be live before the delete, or its absence afterwards proves nothing"
+    );
 
     // Both live BEFORE, which is what makes the assertions after the delete attributable.
     for (label, token) in [("session-bound", &session_bound), ("offline", &offline)] {
@@ -3715,6 +3721,12 @@ async fn a_delete_that_takes_the_account_dark_ends_offline_consent_too() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(
+        !session_is_live(&db, scope, &session).await,
+        "the live SSO session outlived the deprovisioning, so the person could keep using the \
+         browser they were already signed in on"
+    );
 
     // BOTH are dead. The session-bound one was already covered by `ends_sessions`; the offline
     // one is what this change adds, and it is the one an application would otherwise keep using.
@@ -3795,6 +3807,62 @@ async fn a_delete_from_one_organization_leaves_a_person_active_elsewhere_untouch
         "one organization's deprovisioning revoked environment-wide consent another \
          organization's people rely on"
     );
+}
+
+/// Plant a LIVE SSO session for `subject`, returning its id.
+///
+/// Criterion 1 asks for "an integration test that holds live sessions AND tokens during the
+/// delete", and until this existed the SCIM crate never created a session at all: `plant_family`
+/// passes `session_ref: None`, so the session half of the cascade was driven with nothing to
+/// revoke and the criterion's own words were quoted over a test that met half of them.
+///
+/// The expiries are far-future so a session that stops resolving can only have stopped because
+/// it was ENDED, never because it timed out.
+async fn plant_session(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    subject: &UserId,
+) -> ironauth_store::SessionId {
+    const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
+    let id = ironauth_store::SessionId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .sessions()
+        .rotate(
+            env,
+            &id,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: &subject.to_string(),
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: FAR_FUTURE_MICROS,
+                absolute_expires_micros: FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("plant a live session");
+    id
+}
+
+/// Whether `session` still resolves as live.
+async fn session_is_live(
+    db: &TestDatabase,
+    scope: Scope,
+    session: &ironauth_store::SessionId,
+) -> bool {
+    db.store()
+        .scoped(scope)
+        .sessions()
+        .get(session, 0, 0)
+        .await
+        .expect("read the session")
+        .is_some()
 }
 
 /// Plant a live refresh family on `subject`, returning the presented token that resolves it.
@@ -3951,14 +4019,19 @@ async fn events_about(
 /// exactly that, removing the guard that makes a repeated deactivate a no-op and watching the
 /// assertion pass, then inserting a 1500ms sleep before the same read and watching it fail.
 ///
-/// The sentinel closes it. `events_after` withholds a row until its `xmin` is below
-/// `pg_snapshot_xmin`, and `xmin` is assigned when a transaction STARTS, so a write that began
-/// before the sentinel's carries a smaller one. Once the sentinel is visible, every write this
-/// test began earlier is visible too, and a count taken then is complete rather than merely
-/// current.
+/// The sentinel closes it, and the mechanism is worth getting right because an earlier version
+/// of this paragraph stated it wrongly. `events_after` withholds a row until its `xmin` is
+/// below `pg_snapshot_xmin`. Postgres assigns a transaction its xid at its FIRST WRITE, not at
+/// `BEGIN` -- `events_after`'s own doc says so, and says why it matters there: two producers can
+/// take a lock in one order, commit in that order, and still have inverted xmins.
 ///
-/// The sentinel must therefore be produced by a write STARTED AFTER the ones under test, which
-/// in these tests means a later request through the router.
+/// So "started later" is NOT sufficient in general. What makes the sentinel sound HERE is that
+/// these requests are strictly sequential: each one commits before the next is issued, so first
+/// -write order is request order, and the sentinel's xid is above every earlier request's. Once
+/// it is visible, everything this test wrote before it is visible too, and a count taken then
+/// is complete rather than merely current.
+///
+/// A test that issued its requests CONCURRENTLY could not use this helper as written.
 async fn events_through(
     db: &TestDatabase,
     scope: Scope,
@@ -3975,12 +4048,15 @@ async fn events_through(
         else {
             panic!("the beginning cursor cannot age out; nothing here prunes")
         };
-        let mine: Vec<OutboxMessage> = events
-            .into_iter()
-            .filter(|event| event.payload["payload"]["user_id"] == user)
-            .collect();
-        if mine.iter().any(&sentinel) {
-            return mine;
+        // THE SENTINEL IS LOOKED FOR ON THE WHOLE FEED, not among this user's events. A
+        // completeness claim about one person is often fenced by a write about ANOTHER -- there
+        // is no later write about somebody who has just been deleted -- and a predicate that
+        // could only see the filtered list could not express that.
+        if events.iter().any(&sentinel) {
+            return events
+                .into_iter()
+                .filter(|event| event.payload["payload"]["user_id"] == user)
+                .collect();
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -4030,6 +4106,62 @@ fn types(events: &[OutboxMessage]) -> Vec<String> {
         .collect()
 }
 
+/// How many audit rows in `scope` carry `action`.
+async fn audit_rows(db: &TestDatabase, scope: Scope, action: &str) -> usize {
+    db.control_store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("read the audit log")
+        .into_iter()
+        .filter(|row| row.action == action)
+        .count()
+}
+
+/// Provision a person and immediately deactivate them, returning their id.
+///
+/// A SENTINEL producer. A completeness claim about one person's events needs a LATER write to
+/// fence it, and after a delete there is no later write about that person -- they are gone. So
+/// the fence is a write about somebody else, and this is the cheapest one that emits: a
+/// deactivate announces `user.deactivated` and `user.state_changed` under a different
+/// `user_id`, which `events_through` can see because it looks for its sentinel on the whole
+/// feed.
+async fn provision_and_deactivate(db: &TestDatabase, env: &Env, token: &str, handle: &str) -> String {
+    let (status, created) = call(
+        db,
+        env,
+        "POST",
+        "/scim/v2/Users",
+        Some(token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": handle,
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, body) = call(
+        db,
+        env,
+        "PATCH",
+        &format!("/scim/v2/Users/{id}"),
+        Some(token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    id
+}
+
 /// A SCIM DELETE announces the termination on BOTH grains, and a consumer can replay both from
 /// a cursor (issue #136 criterion 3).
 ///
@@ -4077,12 +4209,22 @@ async fn a_delete_announces_the_termination_on_both_grains_and_replays_by_cursor
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
-    let events = events_about(&db, scope, &user, 2).await;
+    // A SECOND PERSON, PROVISIONED AND DEACTIVATED AFTER THE DELETE, is the SENTINEL that makes
+    // the count below a completeness claim rather than a floor. There is no later write about
+    // the deleted person to fence it with -- they are gone -- so the fence is a write about
+    // somebody else, which is why `events_through` looks for its sentinel on the whole feed.
+    let sentinel_user =
+        provision_and_deactivate(&db, &env, &acme.token, "sentinel@example.com").await;
+
+    let events = events_through(&db, scope, &user, |event| {
+        event.payload["payload"]["user_id"] == sentinel_user.as_str()
+    })
+    .await;
     assert_eq!(
         types(&events),
         vec!["user.deprovisioned", "user.state_changed"],
-        "the delete must announce the directory removal and the account transition, in that \
-         order: the organization stops holding the person before the account can go dark"
+        "exactly two, in that order: the organization stops holding the person before the \
+         account can go dark. A third would mean the delete announced itself twice"
     );
 
     assert_eq!(events[0].payload["payload"]["user_id"], user);
@@ -4184,10 +4326,14 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // A FLOOR, NOT A COMPLETENESS CLAIM, and the difference is stated because the shape looks
+    // like one: `events_about` returns as soon as two rows are visible, so it cannot say "and
+    // no more". The completeness assertion for this person is the sentinel-fenced one at the
+    // end of this test; this one is here to pin the TYPES and the payload of the pair.
     let events = events_about(&db, scope, &user, 2).await;
     assert_eq!(
-        types(&events),
-        vec!["user.deactivated", "user.state_changed"],
+        types(&events)[..2],
+        ["user.deactivated", "user.state_changed"],
         "a deactivate must be distinguishable from a delete by TYPE, not by parsing a payload: \
          a receiver subscribes by type"
     );
@@ -4249,6 +4395,20 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
     assert_eq!(
         events[2].payload["payload"]["state"], "active",
         "the account transition back to active IS announced; only the organization grain is not"
+    );
+
+    // AND NO PHANTOM AUDIT ROW. The reconciliation runs a revoke-everything cascade on the path
+    // where the account is already in the state it would move to, and `revoke_all_for_user`
+    // audits UNCONDITIONALLY. Calling it speculatively appended a `user.sessions.revoke_all`
+    // row on every request that revoked nothing -- including the repeat above, and including the
+    // issue's own "deactivate then delete" -- while the request that actually revoked
+    // everything wrote none, because that one audits under a different action. The audit log
+    // said the opposite of what happened. Nothing here has anything live to revoke, so the
+    // right number is zero.
+    assert_eq!(
+        audit_rows(&db, scope, "user.sessions.revoke_all").await,
+        0,
+        "a cascade that revoked nothing wrote an audit row claiming it had"
     );
 }
 

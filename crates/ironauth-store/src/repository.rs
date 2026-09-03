@@ -20255,6 +20255,57 @@ pub struct SessionRepo<'a> {
 }
 
 impl SessionRepo<'_> {
+    /// Whether `subject` holds anything a revoke-everything would flip: a live session, or a
+    /// live refresh family (issue #136).
+    ///
+    /// # Why a caller asks before revoking
+    ///
+    /// [`ActingSessionRepo::revoke_all_for_user`] audits UNCONDITIONALLY: `write_audited`
+    /// appends its row whether or not the UPDATE matched anything. That is right for an
+    /// operator's explicit "revoke everything for this person", which is an act worth recording
+    /// even when it found nothing live. It is wrong for a caller that runs the cascade
+    /// SPECULATIVELY on a path that is usually a no-op: every such request would append a row
+    /// claiming a revocation it did not perform, which is the phantom-audit-row defect
+    /// [`revoke_membership_attachments_audited`] documents from the other direction.
+    ///
+    /// # The check-to-use window this leaves, and why it is closed
+    ///
+    /// A caller reads `false` here and skips the revoke; something creates a session or a
+    /// family in between; the caller has now missed it. That cannot happen on the path this
+    /// exists for, because it runs only for an account that CANNOT AUTHENTICATE: a session and
+    /// a refresh family are both minted by an authorization this store refuses such an account.
+    /// A caller on any other path must not rely on that.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn any_live_session_or_family(&self, subject: &UserId) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT (EXISTS ( \
+                 SELECT 1 FROM sessions \
+                 WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND revoked_at IS NULL AND ended_at IS NULL \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM refresh_families \
+                 WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND revoked_at IS NULL \
+             )) AS present",
+        )
+        .bind(subject.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.get("present"))
+    }
+
     /// Resolve a session by id within scope, returning [`None`] when it is absent,
     /// out of scope, revoked, rotated away (superseded), ended, or expired at
     /// `now_micros`.
