@@ -1644,11 +1644,15 @@ async fn the_data_plane_can_write_a_refreshed_credential_and_cannot_insert_a_new
         .await
         .expect("the data plane may replace a refreshed credential");
 
+    // `connection_with_refresh`, not `connection`. The plain reader deliberately does NOT
+    // open the refresh token -- its own doc says so -- so it answers `None` for that field
+    // whatever the row holds, and the assertion below was unsatisfiable against it. It read
+    // as a grant or an encryption failure; it was the wrong reader, and it shipped red.
     let after = db
         .store()
         .scoped(scope)
         .agent_vault()
-        .connection(&agent, "google")
+        .connection_with_refresh(&agent, "google")
         .await
         .expect("read")
         .expect("exists");
@@ -1657,6 +1661,20 @@ async fn the_data_plane_can_write_a_refreshed_credential_and_cannot_insert_a_new
         after.refresh_token.as_deref(),
         Some("1//A-ROTATED-REFRESH-TOKEN"),
         "the rotated refresh token replaced the stored one"
+    );
+    // And the PLAIN reader still hides it, so the line above is reading the with-refresh
+    // variant on purpose rather than by accident.
+    let hidden = db
+        .store()
+        .scoped(scope)
+        .agent_vault()
+        .connection(&agent, "google")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        hidden.refresh_token, None,
+        "the plain reader must not open the refresh token"
     );
 
     // And the INSERT it does not hold. Without this the assertion above would be satisfied by

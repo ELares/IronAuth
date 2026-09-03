@@ -3081,20 +3081,15 @@ async fn the_data_plane_can_read_the_join_tables_but_never_write_one() {
     // SAME SQLSTATE, which is exactly the trap this avoids: a probe writing literal
     // foreign-scope values would be refused by the policy no matter how far the grant
     // was widened, and could never observe the grant at all.
-    assert_denied(
-        pool,
-        &tenant,
-        &environment,
-        "INSERT INTO org_group_members \
-         (id, tenant_id, environment_id, organization_id, group_id, membership_id) \
-         VALUES ('gmb_probe', $1, $2, $3, $4, $5)",
-        &[
-            &org.to_string(),
-            &group.to_string(),
-            &membership.to_string(),
-        ],
-    )
-    .await;
+    // `org_group_members` IS NO LONGER ONE OF THEM, and it used to be. Migration 0185 granted
+    // the data plane INSERT on it because SCIM group push is mounted on the PUBLIC plane: an
+    // identity provider adding a member to a group is a data-plane write by construction. This
+    // probe asserted the opposite and was RED on main; it is a positive control now, below.
+    //
+    // The other two stay denied, and the asymmetry is the security statement. `org_group_roles`
+    // and `org_membership_roles` GRANT ROLES, and a data plane that could write either could
+    // give a person any permission the environment defines. SCIM pushes group MEMBERSHIP and
+    // never a role, so nothing on that plane needs them.
     assert_denied(
         pool,
         &tenant,
@@ -3115,6 +3110,35 @@ async fn the_data_plane_can_read_the_join_tables_but_never_write_one() {
         &[&org.to_string(), &membership.to_string(), &role.to_string()],
     )
     .await;
+
+    // THE POSITIVE CONTROL for the one INSERT 0185 did grant. Without it a narrowing that
+    // broke SCIM group push would pass this test in silence: every denial above still holds
+    // against a data plane granted nothing at all.
+    //
+    // A FRESH membership, not the one seeded above, because that one is already bound to this
+    // group and the live-uniqueness index would refuse a second binding with SQLSTATE 23505 --
+    // which is exactly how this probe failed while it was still an `assert_denied`: it
+    // reported "refused" for a reason that had nothing to do with the grant.
+    {
+        let (_spare_user, spare) =
+            create_member(&db, &env, scope, &org, "spare-for-grant-probe@example.test").await;
+        let mut tx = pool.begin().await.expect("begin app tx");
+        bind_scope(&mut tx, &tenant, &environment).await;
+        sqlx::query(
+            "INSERT INTO org_group_members \
+             (id, tenant_id, environment_id, organization_id, group_id, membership_id) \
+             VALUES ('gmb_probe', $1, $2, $3, $4, $5)",
+        )
+        .bind(&tenant)
+        .bind(&environment)
+        .bind(org.to_string())
+        .bind(group.to_string())
+        .bind(spare.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("the data plane holds INSERT on org_group_members (0185, SCIM group push)");
+        let _ = tx.rollback().await;
+    }
 
     // Neither role may REPOINT a live row at a different endpoint. That is what keeps
     // the same-organization containment resolved at write time from being undone

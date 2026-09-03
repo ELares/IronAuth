@@ -1725,19 +1725,16 @@ async fn the_data_plane_can_read_a_group_but_never_write_one() {
     assert_eq!(who.get::<String, _>("u"), "ironauth_app");
     assert!(!who.get::<bool, _>("is_super"));
 
-    // Every MUTATING statement is refused as insufficient privilege.
+    // WHAT THE DATA PLANE MAY NOT DO, and this list SHRANK: migration 0185 gave it INSERT and
+    // a column-scoped UPDATE because SCIM group push is mounted on the PUBLIC plane, so an
+    // identity provider creating or renaming a group is a data-plane write by construction.
+    // The three probes that moved (`display_name`, `deleted_at`, the INSERT) are positive
+    // controls further down now. These are what is left, and they are the ones that carry the
+    // security argument rather than the ones that happened to be easy to assert.
     assert_denied_in_scope(pool, &tenant, &environment, &org, "DELETE FROM org_groups").await;
-    assert_denied_in_scope(
-        pool,
-        &tenant,
-        &environment,
-        &org,
-        "UPDATE org_groups SET display_name = 'tampered'",
-    )
-    .await;
     // Reparenting is the one that matters most on this plane: a data plane that could
     // rewrite parent_id could reshape the hierarchy that decides which roles a token
-    // carries.
+    // carries. 0185 deliberately left it out of the grant for exactly this reason.
     assert_denied_in_scope(
         pool,
         &tenant,
@@ -1746,30 +1743,26 @@ async fn the_data_plane_can_read_a_group_but_never_write_one() {
         "UPDATE org_groups SET parent_id = NULL",
     )
     .await;
+    // And the SLUG, which is the stable name a token claim carries: a rename through SCIM
+    // moves the label and never what a claim means.
     assert_denied_in_scope(
         pool,
         &tenant,
         &environment,
         &org,
-        "UPDATE org_groups SET deleted_at = now()",
+        "UPDATE org_groups SET slug = 'tampered'",
     )
     .await;
-    // The forge probe writes a row that is valid in EVERY respect but the grant: the
-    // session's own scope, a real organization of that scope, and a slug and display
-    // name the CHECKs accept. If the data plane ever gained INSERT, whether
-    // table-wide or column-scoped, this statement would SUCCEED rather than fail with
-    // a different error, so the assertion cannot be satisfied by a refusal that has
-    // nothing to do with privilege. Postgres reports a policy refusal and a privilege
-    // refusal under the SAME SQLSTATE, which is exactly the trap this avoids.
+    // Nor may it move a group between organizations in place.
     assert_denied_in_scope(
         pool,
         &tenant,
         &environment,
         &org,
-        "INSERT INTO org_groups (id, tenant_id, environment_id, organization_id, slug, \
-         display_name) VALUES ('grp_probe', $1, $2, $3, 'probe', 'probe')",
+        "UPDATE org_groups SET organization_id = $3",
     )
     .await;
+    assert_the_data_plane_holds_what_0185_granted(pool, &tenant, &environment, &org).await;
 
     // The slug is immutable by GRANT on BOTH roles: not even the control plane, which
     // owns the whole group lifecycle, may rewrite the stable name.
@@ -1804,6 +1797,43 @@ async fn the_data_plane_can_read_a_group_but_never_write_one() {
             .expect("the control role holds column-scoped UPDATE on display_name and parent_id");
         let _ = tx.rollback().await;
     }
+}
+
+/// The positive controls for the writes migration 0185 granted the data plane.
+///
+/// Split out of the probe test only because the two together exceed the crate's
+/// function-length lint.
+async fn assert_the_data_plane_holds_what_0185_granted(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    environment: &str,
+    org: &OrganizationId,
+) {
+    // THE POSITIVE CONTROLS for what 0185 did grant. Without them a narrowing that broke SCIM
+    // group push would pass this test in silence, which is the same failure in the other
+    // direction: the refusals above would all still hold against a data plane granted nothing
+    // at all.
+    let mut tx = pool.begin().await.expect("begin app tx");
+    bind_scope(&mut tx, tenant, environment).await;
+    sqlx::query("UPDATE org_groups SET display_name = 'renamed by scim'")
+        .execute(&mut *tx)
+        .await
+        .expect("the data plane holds column-scoped UPDATE on display_name (0185)");
+    sqlx::query("UPDATE org_groups SET deleted_at = now()")
+        .execute(&mut *tx)
+        .await
+        .expect("the data plane holds column-scoped UPDATE on deleted_at (0088, 0185)");
+    sqlx::query(
+        "INSERT INTO org_groups (id, tenant_id, environment_id, organization_id, slug, \
+             display_name) VALUES ('grp_probe', $1, $2, $3, 'probe', 'probe')",
+    )
+    .bind(tenant)
+    .bind(environment)
+    .bind(org.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("the data plane holds INSERT on org_groups (0185, SCIM group push)");
+    let _ = tx.rollback().await;
 }
 
 /// Run `statement` in a scoped transaction on `pool` and assert it is refused as

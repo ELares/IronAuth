@@ -1489,6 +1489,18 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0185_scim_group_push.sql"),
         },
+        Migration {
+            version: 186,
+            name: "data_plane_column_scopes",
+            // EXPAND, and it is the one migration in this chain that REMOVES a privilege, so
+            // the classification needs its argument rather than its label. The columns it
+            // grants are the union of the SET lists of every statement the data plane executes
+            // against the three tables, so no write an old binary performs is refused after it
+            // runs. What it removes is the ability to write columns no statement names, which
+            // no binary, old or new, exercises.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0186_data_plane_column_scopes.sql"),
+        },
     ]
 }
 
