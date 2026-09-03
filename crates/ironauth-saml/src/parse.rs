@@ -18,8 +18,8 @@ pub struct Limits {
     /// The largest document accepted, in bytes.
     ///
     /// A SAML response carrying an encrypted assertion and a certificate chain is a few tens of
-    /// kilobytes; a megabyte is generous by two orders of magnitude and still small enough that
-    /// a parse cannot be a memory attack. The bound is checked BEFORE parsing begins, so an
+    /// kilobytes; a megabyte is twenty to fifty times that and still small enough that a parse
+    /// cannot be a memory attack. The bound is checked BEFORE parsing begins, so an
     /// oversized document costs one length comparison rather than a parse.
     pub max_bytes: usize,
     /// The deepest element nesting accepted, clamped at [`DEPTH_CEILING`].
@@ -227,8 +227,13 @@ impl Document {
 /// its own recursion. A review measured all of them aborting the process at depth 60000. This is
 /// the ceiling that makes those unreachable rather than merely undocumented.
 ///
-/// 512 is two orders of magnitude past what SAML's own schema nests, and shallow enough that a
-/// recursive walk of the tree costs a few tens of kilobytes of stack.
+/// 512 is about fifty times what SAML's own schema nests. The stack a recursive walk costs at
+/// that depth was MEASURED rather than estimated, because an earlier version of this sentence
+/// said "a few tens of kilobytes" and was wrong by four to sixteen times: the derived `Debug`,
+/// `Clone` and `PartialEq` overflow a 128 KiB stack in release and a 256 KiB one in debug, and
+/// survive at 256 KiB and 512 KiB respectively. On a spawned thread's default two megabytes --
+/// what a tokio worker gets -- one walk takes about a quarter. That is a real margin and not the
+/// hundredfold the old sentence implied, and the constant is chosen knowing it.
 pub const DEPTH_CEILING: usize = 512;
 
 /// Parse `bytes` as a SAML document, refusing anything outside `limits`.
@@ -272,8 +277,10 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
     let mut stack: Vec<Element> = Vec::new();
     let mut root: Option<Element> = None;
     let mut elements = 0_usize;
+    let mut seen_anything = false;
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        match event {
             Err(_) => return Err(SamlError::Malformed),
             Ok(Event::Eof) => break,
             // THE REFUSAL THAT CLOSES XXE. A DOCTYPE is where an external entity would be
@@ -352,6 +359,14 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
             // conforming peer to read it differently from how this reads it, and two components
             // reading one document differently is the whole defect class this crate is about.
             Ok(Event::Decl(decl)) => {
+                // AND IT MUST BE FIRST. XML 1.0 puts the declaration at the very start of the
+                // document, before any comment, whitespace or element. The prolog rule was
+                // extended to text, CDATA and references and not to this, so `<R><?xml
+                // version="1.0"?></R>` and three other placements were accepted -- the same
+                // class of differential as the trailing junk that rule exists to close.
+                if seen_anything {
+                    return Err(SamlError::Malformed);
+                }
                 if let Some(Ok(encoding)) = decl.encoding() {
                     if !encoding.eq_ignore_ascii_case(b"utf-8") {
                         return Err(SamlError::EncodingNotUtf8);
@@ -376,6 +391,14 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
             Ok(Event::CData(ref data)) if !stack.is_empty() => {
                 check_literal_characters(data.as_ref())?;
             }
+            // COMMENTS AND PROCESSING INSTRUCTIONS CARRY CHARACTER DATA TOO, and an earlier
+            // version said "wherever they appear" while checking three of the five places. A
+            // review measured `<NameID>a<!--\0-->b</NameID>` and `<NameID>a<?p \0?>b</NameID>`
+            // accepted beside the literal NUL in the text being refused, and #138 names a
+            // comment-truncation corpus as its own criterion: comments are a declared attack
+            // surface here.
+            Ok(Event::Comment(ref text)) => check_literal_characters(text.as_ref())?,
+            Ok(Event::PI(ref pi)) => check_literal_characters(pi.as_ref())?,
             Ok(Event::Text(text)) if stack.is_empty() => {
                 // XML's `S` production is space, tab, carriage return and newline. Rust's
                 // `is_ascii_whitespace` also admits form feed, which is not even a legal `Char`:
@@ -388,6 +411,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
             Ok(Event::CData(_)) if stack.is_empty() => return Err(SamlError::Malformed),
             Ok(_) => {}
         }
+        seen_anything = true;
     }
     // NO UNCLOSED-STACK CHECK HERE. `check_end_names` refuses an unclosed element at EOF, so a
     // check on the stack afterwards is unreachable -- a review deleted one that used to sit here
@@ -438,10 +462,11 @@ fn check_reference(name: &[u8]) -> Result<(), SamlError> {
     }
     let text = core::str::from_utf8(digits).map_err(|_| SamlError::UnknownEntity)?;
     let code = u32::from_str_radix(text, radix).map_err(|_| SamlError::UnknownEntity)?;
-    // `char::from_u32` is exactly the specification's `Char` production minus the control
-    // characters: it refuses surrogates and anything above the last code point. The remaining
-    // exclusions (NUL and the other forbidden controls) are checked here because a reference
-    // that produced one would be a document a conforming peer rejects.
+    // `char::from_u32` refuses surrogates and anything above the last code point, which is two
+    // of `Char`'s exclusions and not all of them: it admits the forbidden C0 controls AND
+    // U+FFFE and U+FFFF, none of which is in the production. `is_forbidden_char` is what covers
+    // the rest, and an earlier version of this comment described it as covering "the control
+    // characters" only.
     let Some(resolved) = char::from_u32(code) else {
         return Err(SamlError::UnknownEntity);
     };
@@ -508,6 +533,13 @@ fn element_name(
         // A malformed or DUPLICATED attribute. The duplicate is the one worth naming: two `ID`
         // attributes on one element is a wrapping primitive, and quick-xml's own checker is what
         // catches it.
+        //
+        // ON THE RAW NAME, NOT THE EXPANDED ONE, which is the limit of what this catches:
+        // `<A xmlns:a="u" xmlns:b="u" a:ID="1" b:ID="2"/>` carries two attributes with the same
+        // EXPANDED name, violates Namespaces in XML section 6.3, and is accepted here because
+        // the two raw keys differ. It cannot duplicate SAML's own `ID`, which is unprefixed, and
+        // closing it needs namespace resolution -- which the signature half performs and this
+        // module deliberately does not.
         let attribute = attribute.map_err(|_| SamlError::Malformed)?;
         attributes += 1;
         if attributes > limits.max_attributes {
@@ -558,21 +590,51 @@ fn check_name(raw: &[u8]) -> Result<(), SamlError> {
     Ok(())
 }
 
-/// Whether `value` may START a name: a letter, `_` or `:`, or a non-ASCII character that is not
-/// whitespace, a control or the byte-order mark.
+/// Whether `value` may START a name: a letter, `_` or `:`.
+///
+/// ASCII AND NON-ASCII ALIKE, which an earlier version got wrong: it delegated to
+/// [`is_name_char`] above 0x7F, so there was effectively no start rule for a non-ASCII name and
+/// `<\u{301}a/>` (a leading combining acute), `<\u{b7}a/>` and `<\u{660}a/>` (an Arabic-Indic
+/// digit) were all accepted. A review measured each; none is a `NameStartChar`.
 fn is_name_start(value: char) -> bool {
     if value.is_ascii() {
         return value.is_ascii_alphabetic() || matches!(value, '_' | ':');
     }
-    is_name_char(value)
+    value.is_alphabetic()
 }
 
 /// Whether `value` may appear anywhere in a name.
+///
+/// # An ALLOWLIST, because a denylist kept missing invisible characters
+///
+/// The previous rule was "not whitespace, not a control, not the byte-order mark", and a review
+/// walked `Sig\u{202e}nature` (a right-to-left override), `Sig\u{200b}nature` (a zero-width
+/// space), `Sig\u{ad}nature` (a soft hyphen) and `Sig\u{2064}nature` through it, plus
+/// `a\u{ffff}b` -- which this crate's own [`is_forbidden_char`] refuses in text and in a
+/// reference. One character, five positions, and the name was the position that accepted it.
+/// The name is exactly what a signature-locating step matches on.
+///
+/// So this admits only what a name is made of: letters and digits in any script, the four ASCII
+/// name punctuation characters, and the combining marks and middle dot XML's `NameChar` adds.
+/// Everything else is out, which is the direction that cannot be wrong by omission.
+///
+/// It is CONSERVATIVE in one known place and that is deliberate: `\u{1680}` (OGHAM SPACE MARK)
+/// is a legal `NameStartChar` and is refused here, because Rust reports it as whitespace.
+/// Refusing a legal name nobody sends is the safe side of this trade.
 fn is_name_char(value: char) -> bool {
     if value.is_ascii() {
         return value.is_ascii_alphanumeric() || matches!(value, '-' | '.' | '_' | ':');
     }
-    !value.is_whitespace() && !value.is_control() && value != '\u{feff}'
+    if value.is_whitespace() || value.is_control() || is_forbidden_char(value) {
+        return false;
+    }
+    // `NameChar` beyond `NameStartChar`: the combining-mark block, the middle dot, and the two
+    // joiners the production names.
+    value.is_alphanumeric()
+        || matches!(
+            value,
+            '\u{b7}' | '\u{300}'..='\u{36f}' | '\u{203f}' | '\u{2040}'
+        )
 }
 
 /// Apply the entity rule to a raw attribute value.

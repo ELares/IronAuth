@@ -661,3 +661,134 @@ fn a_malformed_comment_is_refused() {
     )
     .expect("an ordinary comment parses");
 }
+
+/// A name is an ALLOWLIST, so the invisible characters cannot spoof one.
+///
+/// # What the denylist kept missing
+///
+/// The rule was "not whitespace, not a control, not the byte-order mark", and a review walked a
+/// right-to-left override, a zero-width space, a soft hyphen and an invisible plus through it --
+/// plus `U+FFFF`, which this crate refuses in text and in a reference. One character, five
+/// positions, and the NAME was the position that accepted it. The name is exactly what a
+/// signature-locating step matches on, which is the primitive the crate doc opens by naming.
+#[test]
+fn an_invisible_character_cannot_hide_in_a_name() {
+    for spoof in [
+        '\u{202e}', // right-to-left override
+        '\u{200b}', // zero-width space
+        '\u{ad}',   // soft hyphen
+        '\u{2064}', // invisible plus
+        '\u{fffe}', // not a character
+        '\u{ffff}', // not a character
+    ] {
+        for document in [
+            format!("<Response><Sig{spoof}nature/></Response>"),
+            format!("<Response><Signature a{spoof}b=\"x\"/></Response>"),
+        ] {
+            assert_eq!(
+                parse(document.as_bytes(), &Limits::default()),
+                Err(SamlError::Malformed),
+                "{spoof:?} hid in a name"
+            );
+        }
+    }
+
+    // AND A NON-ASCII NAME MUST START LIKE ONE. The first-character rule was ASCII-only, so a
+    // leading combining acute, a middle dot and an Arabic-Indic digit were all accepted as the
+    // start of a name; none is a `NameStartChar`.
+    for start in ['\u{301}', '\u{b7}', '\u{660}'] {
+        let document = format!("<{start}a/>");
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::Malformed),
+            "{start:?} started a name"
+        );
+    }
+
+    // THE CONTROLS. Each of those three IS legal later in a name, and a non-ASCII letter is
+    // legal anywhere: a rule that refused them would refuse legal documents.
+    for name in [
+        "a\u{301}",
+        "a\u{b7}",
+        "a\u{660}",
+        "Ünterschrift",
+        "\u{4e2d}\u{6587}",
+    ] {
+        let document = format!("<{name}/>");
+        parse(document.as_bytes(), &Limits::default())
+            .unwrap_or_else(|_| panic!("{name} is a legal name"));
+    }
+}
+
+/// A comment and a processing instruction carry character data, and obey the same rule.
+///
+/// "Refused wherever they appear" covered three of the five places. #138 names a
+/// comment-truncation corpus as its own criterion, so a NUL inside a comment is not an
+/// afterthought here.
+#[test]
+fn a_control_character_in_a_comment_or_processing_instruction_is_refused() {
+    for (what, prefix, suffix) in [
+        (
+            "a comment",
+            "<Response><NameID>a<!--",
+            "--></NameID></Response>",
+        ),
+        (
+            "a processing instruction",
+            "<Response><NameID>a<?target ",
+            "?></NameID></Response>",
+        ),
+        (
+            "a processing instruction target",
+            "<Response><NameID>a<?target",
+            " x?></NameID></Response>",
+        ),
+    ] {
+        let mut document = prefix.as_bytes().to_vec();
+        document.push(0);
+        document.extend_from_slice(suffix.as_bytes());
+        assert_eq!(
+            parse(&document, &Limits::default()),
+            Err(SamlError::Malformed),
+            "a NUL in {what} was accepted"
+        );
+    }
+
+    // THE CONTROLS: ordinary comments and processing instructions still parse.
+    parse(
+        b"<Response><!-- ordinary --><?target value?><NameID>a</NameID></Response>",
+        &Limits::default(),
+    )
+    .expect("an ordinary comment and PI parse");
+}
+
+/// The XML declaration must be the first thing in the document.
+///
+/// The prolog rule was extended to text, CDATA and references and not to the declaration, so all
+/// four of these were accepted while every conforming processor rejects them. Same class as the
+/// trailing junk that rule exists to close.
+#[test]
+fn a_misplaced_xml_declaration_is_refused() {
+    for (what, document) in [
+        (
+            "inside the document element",
+            r#"<R><?xml version="1.0"?></R>"#,
+        ),
+        ("after the document element", r#"<R/><?xml version="1.0"?>"#),
+        ("after a comment", r#"<!-- c --><?xml version="1.0"?><R/>"#),
+        ("after whitespace", " <?xml version=\"1.0\"?><R/>"),
+    ] {
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::Malformed),
+            "a declaration {what} was accepted"
+        );
+    }
+
+    // THE CONTROL: first is where it belongs.
+    parse(
+        br#"<?xml version="1.0" encoding="UTF-8"?><R/>"#,
+        &Limits::default(),
+    )
+    .expect("a declaration in its place parses");
+}
