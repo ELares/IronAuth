@@ -3897,11 +3897,13 @@ async fn plant_family(
 /// cursor is itself a watermarked read: a baseline that under-read would silently widen the
 /// delta into somebody else's events and the assertion would still pass.
 ///
-/// WHAT THE FILTER ACTUALLY REMOVES TODAY IS NOTHING, measured: instrumenting this helper to
-/// dump the unfiltered feed shows two rows, two rows and one row in the three tests below, all
-/// of them this file's own. The fixtures are NOT producers -- seeding an organization and a
+/// WHAT THE FILTER ACTUALLY REMOVES TODAY IS NOTHING, measured. Instrumenting this helper and
+/// [`events_through`] to report the unfiltered row count beside the filtered one gives an
+/// identical pair at every call site in this file (2/2, 1/1, 2/2, 1/1 and 3/3): the whole feed
+/// is this file's own events. The fixtures are NOT producers -- seeding an organization and a
 /// connection through the management store emits nothing on this path -- so an earlier version
-/// of this paragraph justified the filter with a reason that does not exist.
+/// of this paragraph justified the filter with a reason that does not exist, and a version
+/// after that enumerated three call sites when there were four.
 ///
 /// It is kept because the reason it will exist is already visible: 17 of the catalog's 157
 /// types carry `user_id`, including `organization.member_added`, `organization.member_removed`
@@ -3938,6 +3940,53 @@ async fn events_about(
     panic!(
         "fewer than {want} events about {user} became visible on the feed within five seconds: \
          either nothing produced them, or the feed's watermark is stalled by an open transaction"
+    );
+}
+
+/// Wait until an event about `user` satisfies `sentinel`, then return everything about `user`.
+///
+/// THIS IS HOW AN ABSENCE IS ASSERTED ON A WATERMARKED FEED, and [`events_about`] cannot do it.
+/// That one returns the moment `want` rows are visible, so a regression that emits an EXTRA
+/// event is indistinguishable from one that has not become visible yet: a review measured
+/// exactly that, removing the guard that makes a repeated deactivate a no-op and watching the
+/// assertion pass, then inserting a 1500ms sleep before the same read and watching it fail.
+///
+/// The sentinel closes it. `events_after` withholds a row until its `xmin` is below
+/// `pg_snapshot_xmin`, and `xmin` is assigned when a transaction STARTS, so a write that began
+/// before the sentinel's carries a smaller one. Once the sentinel is visible, every write this
+/// test began earlier is visible too, and a count taken then is complete rather than merely
+/// current.
+///
+/// The sentinel must therefore be produced by a write STARTED AFTER the ones under test, which
+/// in these tests means a later request through the router.
+async fn events_through(
+    db: &TestDatabase,
+    scope: Scope,
+    user: &str,
+    sentinel: impl Fn(&OutboxMessage) -> bool,
+) -> Vec<OutboxMessage> {
+    let outbox = db.store().scoped(scope);
+    for _ in 0..100 {
+        let EventPage::Page(events) = outbox
+            .outbox()
+            .events_page_after(EventCursor::beginning(), 200)
+            .await
+            .expect("read the event feed")
+        else {
+            panic!("the beginning cursor cannot age out; nothing here prunes")
+        };
+        let mine: Vec<OutboxMessage> = events
+            .into_iter()
+            .filter(|event| event.payload["payload"]["user_id"] == user)
+            .collect();
+        if mine.iter().any(&sentinel) {
+            return mine;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "the sentinel event about {user} never became visible within five seconds: either the \
+         write that was to produce it did not, or the feed's watermark is stalled"
     );
 }
 
@@ -4147,36 +4196,31 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
         acme.organization.to_string()
     );
 
-    // A REPEAT OF THE SAME PATCH ANNOUNCES NOTHING, which is what makes the id minted per write
-    // safe. Delivery is at-least-once and a receiver deduplicates on the event id, so a second
-    // event under a second id for one change is the shape dedup cannot collapse: the receiver
-    // would count two terminations. An identity provider re-sending a deactivate on a sync
+    // A REPEAT OF THE SAME PATCH MUST ANNOUNCE NOTHING, which is what makes the id minted per
+    // write safe. Delivery is at-least-once and a receiver deduplicates on the event id, so a
+    // second event under a second id for one change is the shape dedup cannot collapse: the
+    // receiver counts two terminations. An identity provider re-sending a deactivate on a sync
     // sweep is the ordinary way that happens, not an edge case.
+    let repeat = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": false}],
+    });
     let (status, body) = call(
         &db,
         &env,
         "PATCH",
         &format!("/scim/v2/Users/{user}"),
         Some(&acme.token),
-        Some(json!({
-            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-            "Operations": [{"op": "replace", "path": "active", "value": false}],
-        })),
+        Some(repeat),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        types(&events_about(&db, scope, &user, 2).await),
-        vec!["user.deactivated", "user.state_changed"],
-        "re-sending a deactivate for somebody already deactivated announced it twice"
-    );
 
-    // AND A REACTIVATION ANNOUNCES NOTHING, which is a real gap and is asserted rather than
-    // left to be discovered. A consumer mirroring this directory sees the person deactivated
-    // and never learns they came back. Issue #136 asks for the termination events and nothing
-    // more, and a `user.reactivated` needs a producer, a schema and a place in the published
-    // catalog that nobody has settled; adding one here on the way past is how a registry fills
-    // with types whose meaning was never agreed. It is recorded on the issue.
+    // A REACTIVATION FOLLOWS, and it is doing two jobs. It pins the asymmetry -- the account
+    // grain IS announced on the way back, the organization grain is not -- and it is the
+    // SENTINEL that makes the repeat above assertable at all: waiting for a count cannot say
+    // "and no more", because an extra event that has not yet crossed the feed's watermark looks
+    // exactly like an event that was never emitted. A review measured that directly.
     let (status, body) = call(
         &db,
         &env,
@@ -4190,10 +4234,21 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let events = events_through(&db, scope, &user, |event| {
+        event.payload["type"] == "user.state_changed"
+            && event.payload["payload"]["state"] == "active"
+    })
+    .await;
     assert_eq!(
-        types(&events_about(&db, scope, &user, 3).await),
+        types(&events),
         vec!["user.deactivated", "user.state_changed", "user.state_changed"],
-        "the account transition back to active IS announced; the organization grain is not"
+        "exactly three: the deactivation on both grains, and the account coming back. A fourth \
+         means the repeated deactivate announced itself again, which a receiver would count as \
+         a second termination; a missing third means the reactivation is silent on both grains"
+    );
+    assert_eq!(
+        events[2].payload["payload"]["state"], "active",
+        "the account transition back to active IS announced; only the organization grain is not"
     );
 }
 
@@ -4380,5 +4435,107 @@ async fn a_deactivate_by_one_organization_announces_no_account_change() {
         status,
         StatusCode::OK,
         "a deactivated person must stay addressable, or nothing could reactivate them: {body}"
+    );
+}
+
+/// An account an operator had ALREADY disabled still loses its offline consent when the last
+/// organization deprovisions it (issue #136, criterion 1).
+///
+/// # The hole this closes
+///
+/// `reconcile_account_state` returns early when the account is already in the state it would
+/// move to, and that early return used to end the request. A plain operator disable
+/// deliberately leaves the offline refresh families alive (the management state route takes
+/// `hard_kill` from the request body, so `{"state": "disabled", "hard_kill": false}` is one
+/// call away, and it is the right default for somebody who may be coming back). Deprovisioning
+/// that person then moved no state, ran no cascade, and left the long-lived consent an
+/// application holds to act for them intact after their identity provider had said they are
+/// gone.
+///
+/// Nothing else ends that consent: an offline grant needs no session and no interaction. So
+/// the cascade now runs on the early-return path too, and this drives the ordinary sequence
+/// that reaches it.
+#[tokio::test]
+async fn a_delete_ends_offline_consent_even_when_the_account_was_already_disabled() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "already-disabled@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    let offline = plant_family(&db, &env, scope, &subject, true).await;
+
+    // THE OPERATOR'S DISABLE, without a hard kill. This is the precondition, and it is asserted
+    // rather than assumed: if a plain disable already ended offline consent, the delete below
+    // would have nothing left to prove.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(
+            &env,
+            &subject,
+            ironauth_store::UserState::Disabled,
+            ironauth_store::OffboardingSchedule {
+                at_unix_micros: None,
+                wake_payload: None,
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("an operator disables the account without a hard kill");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&offline)
+            .await
+            .expect("read")
+            .expect("the family is there")
+            .active,
+        "a plain disable must leave offline consent alone, or this test proves nothing"
+    );
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&offline)
+            .await
+            .expect("read")
+            .expect("the family row survives, revoked")
+            .active,
+        "the account's state did not move, so nothing ran, and an application kept the consent \
+         to act for somebody their identity provider had deprovisioned"
     );
 }

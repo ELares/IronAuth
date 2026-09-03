@@ -910,16 +910,22 @@ async fn set_active(
     let scoped = state.store().scoped(auth.scope);
     let activation = scoped.scim_activation();
     let now = epoch_micros(state);
-    // A DEACTIVATION IS ANNOUNCED AND A REACTIVATION IS NOT, which is an asymmetry worth
-    // stating rather than leaving a reader to notice. Issue #136 is about deprovisioning:
-    // criteria 1 to 3 name the termination, the cascade it runs and the events it emits, and
-    // nothing here asks that a re-enable be published. A `user.reactivated` would need a
-    // producer, a schema and a place in the published catalog, and adding one on the way past
-    // is how a registry fills with types whose meaning nobody settled.
+    // NO ORGANIZATION-GRAIN EVENT ON A REACTIVATION, which is an asymmetry worth stating rather
+    // than leaving a reader to notice. The ACCOUNT grain is not silent: a reactivation that
+    // moves the account back out of `Disabled` emits `user.state_changed` from the
+    // reconciliation below, exactly as the deactivation did. Only the per-organization notice
+    // is missing, and an earlier version of this comment overstated it as "a reactivation is
+    // not announced", which the test below disproves in the same file.
     //
-    // It is a REAL gap for a consumer that mirrors this directory, and it is recorded on the
-    // issue rather than half-closed here: such a consumer sees the person deactivated and
-    // never learns they came back.
+    // Issue #136 is about deprovisioning: criteria 1 to 3 name the termination, the cascade it
+    // runs and the events it emits, and nothing here asks that a re-enable be published. A
+    // `user.reactivated` would need a producer, a schema and a place in the published catalog,
+    // and adding one on the way past is how a registry fills with types whose meaning nobody
+    // settled.
+    //
+    // The residual gap is REAL and is recorded on the issue: a consumer mirroring one
+    // organization's directory sees that person deactivated HERE and never learns this
+    // organization took them back, even though it can see the account came back.
     if active {
         return match activation
             .set_active(&auth.connection.organization_id, user, active, now)
@@ -1001,6 +1007,34 @@ async fn reconcile_account_state(
         UserState::Disabled
     };
     if record.state == target {
+        // THE STATE DOES NOT MOVE, WHICH IS NOT THE SAME AS NOTHING TO DO.
+        //
+        // An account an operator had already disabled WITHOUT a hard kill (the management
+        // state route takes `hard_kill` straight from the request body, so `{"state":
+        // "disabled", "hard_kill": false}` is one call away) still holds its offline refresh
+        // families and their grants: a plain disable deliberately leaves them, because the
+        // person may be coming back.
+        //
+        // When the last organization that held such a person then deprovisions them, this
+        // early return used to end the request. `set_state` was never called, the hard kill
+        // never ran, and the long-lived consent an application holds to act for them survived
+        // an offboarding -- the exact leak the comment below says nothing else would ever end.
+        // A review drove it: operator disable, then a SCIM DELETE, and the offline family was
+        // still live afterwards.
+        //
+        // So the CASCADE runs on its own here. `set_state` cannot: it re-checks `state = from`
+        // inside its transaction and a same-state transition is refused. Revoking directly is
+        // idempotent (a second deprovisioning finds nothing live and flips nothing), and it
+        // reaches this line only when `should_be_active` was false, so the person is held
+        // active by no organization at all.
+        if target == UserState::Disabled {
+            scoped
+                .acting(auth.actor, CorrelationId::generate(&env))
+                .sessions()
+                .revoke_all_for_user(&env, user, true, None)
+                .await
+                .map_err(|error| store_failure(&error))?;
+        }
         return Ok(());
     }
     // REACTIVATION is narrower than deactivation, deliberately. Moving somebody out of
@@ -1028,13 +1062,19 @@ async fn reconcile_account_state(
     // it is not a small one -- an offline grant needs no session and no interaction, so
     // nothing else would ever end it.
     //
-    // The converse matters just as much, which is why this is a condition and not a
-    // constant `true`. Offline consent is ENVIRONMENT-WIDE, not organization-scoped, so
-    // if the person is still active in another organization, killing it would let one
-    // identity provider revoke consent that another organization's people rely on. The
-    // condition is exactly "the account is going dark", and `should_be_active` is
-    // already the expression of that.
-    let hard_kill = target == UserState::Disabled;
+    // WHAT STOPS IT OVER-REACHING IS `should_be_active`, NOT THIS FLAG, and an earlier version
+    // of this comment had that backwards. It argued the flag "is a condition and not a constant
+    // `true`" because a person still active in another organization must keep their consent --
+    // but such a person makes `should_be_active` true, so `target` is `Active` and this
+    // transition is not a deprovisioning at all.
+    //
+    // NO MUTATION OF THIS EXPRESSION CAN FAIL A TEST, and that is a property of where the flag
+    // is READ rather than a gap in coverage: `set_state_with_event` consults `hard_kill` only
+    // inside `if to.ends_sessions()`, and the only session-ending target this path can produce
+    // is `Disabled`. A review measured it, replacing the expression with `true` and watching 53
+    // tests pass. It is written as the fact it means rather than as the constant it evaluates
+    // to, because the fact is what the line above and the early return both turn on.
+    let hard_kill = !should_be_active;
 
     // THE ACCOUNT GRAIN, announced separately from the organization grain and only when the
     // account actually moves. Everything above this line has already returned when it did not,
@@ -1537,25 +1577,33 @@ pub(crate) async fn delete_user(
     // first version did exactly that and defended it by arguing the person had been
     // deactivated, which is what the OTHER type means.
     //
-    // Attached to the LAST removal in the plan, so the event is enqueued if and only if every
-    // removal committed. If one fails, nothing is announced, the request answers 500, and the
-    // client's retry is answered 404 by `addressed_user` once the memberships are gone.
+    // ONE MEMBERSHIP, not a loop over several, and the schema is why: migration 0084's
+    // `org_memberships_org_user_live_uniq` is UNIQUE on (tenant, environment, organization,
+    // user) among live rows, so a person is a member of an organization at most once. A first
+    // version of this iterated and attached the event to whichever removal came last, which
+    // read as careful and was unexercisable: nothing can construct the second iteration.
     //
     // The ACTIVATION write above stays eventless and stays FIRST, for the reason it always did:
     // the reconciliation below reads it, and writing it after the removal would leave a row for
     // a membership that no longer exists.
     let acting = scoped.acting(auth.actor, CorrelationId::generate(&env));
-    let leaving: Vec<_> = memberships
+    let leaving = memberships
         .iter()
-        .filter(|membership| membership.organization_id == auth.connection.organization_id)
-        .collect();
-    if leaving.is_empty() {
-        // UNREACHABLE: `addressed_user` resolved this person as a live member of the
-        // credential's organization, so there is at least one membership to remove. Answering
-        // the uniform not-found rather than 204 means a future change that loosened that check
-        // cannot make this route report success while announcing nothing.
+        .find(|membership| membership.organization_id == auth.connection.organization_id);
+    let Some(leaving) = leaving else {
+        // REACHABLE, though only barely, and an earlier version of this called it unreachable.
+        // `addressed_user` resolves through `OrgMembershipRepo::exists`, which is an unbounded
+        // EXISTS; this list comes from `list_for_user`, which carries the management list hard
+        // cap of 1000. A person in more than a thousand organizations whose membership in THIS
+        // one sorts past the cap passes the first check and is absent from the second.
+        //
+        // The uniform not-found rather than a 204, because 204 would report a removal that did
+        // not happen. What it cannot undo is the activation write above, which has already
+        // committed: such a request leaves the person deactivated here without removing the
+        // membership. That is the same partial state any failure between the two writes leaves,
+        // and it is repaired the same way, by the client's retry.
         return not_found();
-    }
+    };
     let Some(event) = crate::events::membership_event(
         &state,
         auth.scope,
@@ -1569,20 +1617,12 @@ pub(crate) async fn delete_user(
             "the request could not be completed",
         );
     };
-    for (position, membership) in leaving.iter().enumerate() {
-        let last = position + 1 == leaving.len();
-        if let Err(error) = acting
-            .org_memberships()
-            .remove_with_event(
-                &env,
-                &membership.id,
-                last.then(|| event.borrowed()).as_ref(),
-                None,
-            )
-            .await
-        {
-            return store_failure(&error);
-        }
+    if let Err(error) = acting
+        .org_memberships()
+        .remove_with_event(&env, &leaving.id, Some(&event.borrowed()), None)
+        .await
+    {
+        return store_failure(&error);
     }
     if let Err(response) = reconcile_account_state(&state, &auth, &user).await {
         return response;

@@ -47,10 +47,20 @@
 //! and drops the second.
 //!
 //! It is minted fresh per WRITE rather than derived from the subject, and that is deliberate
-//! rather than convenient: the enqueue raises a unique violation on a repeated key, inside the
-//! caller's transaction, so a derived key would make the SECOND deprovisioning of a person
-//! fail the whole request permanently. A client re-sending a `DELETE` after a network timeout
-//! would be answered `500` forever.
+//! rather than convenient: the enqueue raises a unique violation on a repeated key, INSIDE the
+//! caller's transaction, so a derived key would make the second deprovisioning of one person
+//! fail the whole request permanently. That is not hypothetical -- a person deprovisioned,
+//! re-provisioned when they return, and deprovisioned again is an ordinary employment history,
+//! and the second `DELETE` would answer `500` for as long as the first event was retained.
+//!
+//! A retried `DELETE` is NOT that case, and an earlier version of this paragraph offered it as
+//! the illustration: the first delete removes the membership, so `addressed_user` answers the
+//! retry `404` before anything reaches the enqueue.
+//!
+//! What a per-write id costs is the converse: two events for one change cannot be collapsed by
+//! a receiver deduplicating on the id. That is why the writes here refuse to announce a change
+//! they did not make -- the activation upsert's conflict arm makes a repeated `active: false` a
+//! no-op, and a `DELETE` after a `DELETE` is a 404.
 
 use ironauth_store::{OwnedDomainEvent, Scope};
 
