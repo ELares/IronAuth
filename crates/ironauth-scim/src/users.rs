@@ -1515,15 +1515,47 @@ pub(crate) async fn delete_user(
     // The activation row is written FIRST and the membership removed second, so the account
     // reconciliation below sees this organization as no longer holding the person by both
     // measures. Writing it after the removal would leave a row for a membership that is gone.
-    // THE DELETE'S OWN ANNOUNCEMENT rides this write, not the membership removal below.
+    if let Err(error) = scoped
+        .scim_activation()
+        .set_active(
+            &auth.connection.organization_id,
+            &user,
+            false,
+            epoch_micros(&state),
+        )
+        .await
+    {
+        return store_failure(&error);
+    }
+    // THE DELETE'S OWN ANNOUNCEMENT RIDES THE LAST MEMBERSHIP REMOVAL, not the activation write
+    // above, and the difference is what the event MEANS.
     //
-    // The activation row is what a deprovisioning IS in this model: it is what `is_active` and
-    // `active_elsewhere` read, and therefore what decides the account cascade. The membership
-    // removal that follows changes ADDRESSABILITY, which matters to the provisioning client
-    // and not to a downstream directory. So this is the write the notice must be transactional
-    // with, and it announces something true even if the removals below fail and the request
-    // answers 500: this organization has deactivated the person, and the client's retry of the
-    // idempotent DELETE finishes the rest.
+    // `user.deprovisioned` says the person is out of this organization's directory. Riding the
+    // activation write announces that BEFORE it is true: the removals below run in their own
+    // transactions afterwards, so a failure among them answers 500 with the event already
+    // committed and delivered, describing a person `GET /scim/v2/Users` still returns. The
+    // first version did exactly that and defended it by arguing the person had been
+    // deactivated, which is what the OTHER type means.
+    //
+    // Attached to the LAST removal in the plan, so the event is enqueued if and only if every
+    // removal committed. If one fails, nothing is announced, the request answers 500, and the
+    // client's retry is answered 404 by `addressed_user` once the memberships are gone.
+    //
+    // The ACTIVATION write above stays eventless and stays FIRST, for the reason it always did:
+    // the reconciliation below reads it, and writing it after the removal would leave a row for
+    // a membership that no longer exists.
+    let acting = scoped.acting(auth.actor, CorrelationId::generate(&env));
+    let leaving: Vec<_> = memberships
+        .iter()
+        .filter(|membership| membership.organization_id == auth.connection.organization_id)
+        .collect();
+    if leaving.is_empty() {
+        // UNREACHABLE: `addressed_user` resolved this person as a live member of the
+        // credential's organization, so there is at least one membership to remove. Answering
+        // the uniform not-found rather than 204 means a future change that loosened that check
+        // cannot make this route report success while announcing nothing.
+        return not_found();
+    }
     let Some(event) = crate::events::membership_event(
         &state,
         auth.scope,
@@ -1537,26 +1569,18 @@ pub(crate) async fn delete_user(
             "the request could not be completed",
         );
     };
-    if let Err(error) = scoped
-        .scim_activation()
-        .set_active_with_event(
-            state.env(),
-            &auth.connection.organization_id,
-            &user,
-            false,
-            epoch_micros(&state),
-            &event.borrowed(),
-        )
-        .await
-    {
-        return store_failure(&error);
-    }
-    let acting = scoped.acting(auth.actor, CorrelationId::generate(&env));
-    for membership in memberships
-        .iter()
-        .filter(|membership| membership.organization_id == auth.connection.organization_id)
-    {
-        if let Err(error) = acting.org_memberships().remove(&env, &membership.id).await {
+    for (position, membership) in leaving.iter().enumerate() {
+        let last = position + 1 == leaving.len();
+        if let Err(error) = acting
+            .org_memberships()
+            .remove_with_event(
+                &env,
+                &membership.id,
+                last.then(|| event.borrowed()).as_ref(),
+                None,
+            )
+            .await
+        {
             return store_failure(&error);
         }
     }

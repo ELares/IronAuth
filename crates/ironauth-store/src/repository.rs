@@ -75310,8 +75310,18 @@ impl ScimActivationRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        sqlx::query(
-            "INSERT INTO scim_membership_activation                  (tenant_id, environment_id, organization_id, user_id, active, updated_at)              VALUES ($1, $2, $3, $4, $5,                      TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)              ON CONFLICT (tenant_id, environment_id, organization_id, user_id)              DO UPDATE SET active = EXCLUDED.active, updated_at = EXCLUDED.updated_at",
+        let changed = sqlx::query(
+            // THE `WHERE` ON THE CONFLICT ARM IS WHAT MAKES A REPEAT WRITE A NO-OP (issue #136).
+            //
+            // Without it, an identity provider re-sending `active: false` for somebody already
+            // deactivated re-dated the row and, with an event attached, announced a second
+            // deprovisioning under a second id. Delivery is at-least-once and a receiver
+            // deduplicates on the event id, so two ids for one change is precisely the shape
+            // dedup CANNOT collapse: the receiver counts two terminations.
+            //
+            // It also stops the redundant write destroying `updated_at`, which is the record of
+            // when this organization's view of the person actually changed.
+            "INSERT INTO scim_membership_activation                  (tenant_id, environment_id, organization_id, user_id, active, updated_at)              VALUES ($1, $2, $3, $4, $5,                      TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)              ON CONFLICT (tenant_id, environment_id, organization_id, user_id)              DO UPDATE SET active = EXCLUDED.active, updated_at = EXCLUDED.updated_at              WHERE scim_membership_activation.active IS DISTINCT FROM EXCLUDED.active",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -75320,9 +75330,16 @@ impl ScimActivationRepo<'_> {
         .bind(active)
         .bind(now_micros)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        // ONLY WHEN SOMETHING CHANGED. A no-op write announcing a change is the phantom-event
+        // twin of the phantom audit row `revoke_membership_attachments_audited` documents, and
+        // here it is worse: the audit row is read by an operator, the event is ACTED ON by a
+        // downstream system that would terminate somebody twice.
         if let Some((env, event)) = emit {
-            enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
+            if changed > 0 {
+                enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
+            }
         }
         tx.commit().await?;
         Ok(())

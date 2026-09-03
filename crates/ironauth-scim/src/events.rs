@@ -11,10 +11,17 @@
 //! application that keeps its own copy of the directory (the ordinary case for anything doing
 //! entitlement checks offline) keeps serving somebody the identity provider terminated.
 //!
-//! So the writes here emit onto the same queue every other producer uses. One enqueue reaches
-//! both delivery surfaces: `WEBHOOK_EVENT_CONSUMER` rows are what the webhook fan-out explodes
-//! into per-endpoint deliveries AND what the ordered event feed pages over, so a consumer that
-//! cannot take a push replays exactly the same events by cursor.
+//! So the writes here emit onto the same queue every other producer uses, and ONE ENQUEUE
+//! REACHES BOTH DELIVERY SURFACES: the webhook fan-out claims `WEBHOOK_EVENT_CONSUMER` rows and
+//! explodes each into one delivery per endpoint, while the ordered feed pages over the same
+//! rows, so a consumer that cannot take a push replays exactly the same events by cursor.
+//!
+//! The feed's read is the WIDER of the two and it is worth being exact about which is which:
+//! `OutboxRepo::events_after` filters on scope, sequence and the visibility watermark and names
+//! no consumer at all, so it serves every outbox row in the scope rather than only the events.
+//! What is true is the direction this relies on: an event enqueued here is on the feed and is
+//! delivered. The converse, that everything on the feed is an event, is not, and
+//! `repository.rs`'s own note on that query says so.
 //!
 //! # Two grains, and both are emitted
 //!

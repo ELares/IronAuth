@@ -3893,11 +3893,23 @@ async fn plant_family(
 /// after a write can legitimately return nothing. A missing producer never converges and panics
 /// naming the watermark, which is a loud failure rather than a silently empty assertion.
 ///
-/// It selects by USER rather than by a cursor taken before the request. A baseline cursor is
-/// itself a watermarked read, so a baseline that under-read would silently widen the delta; and
-/// the fixtures seed organizations and connections through the management store, which are
-/// producers too. Each test creates its own person, so the person's id is an exact selector
-/// that no other producer can enter.
+/// It selects by USER rather than by a cursor taken before the request, because a baseline
+/// cursor is itself a watermarked read: a baseline that under-read would silently widen the
+/// delta into somebody else's events and the assertion would still pass.
+///
+/// WHAT THE FILTER ACTUALLY REMOVES TODAY IS NOTHING, measured: instrumenting this helper to
+/// dump the unfiltered feed shows two rows, two rows and one row in the three tests below, all
+/// of them this file's own. The fixtures are NOT producers -- seeding an organization and a
+/// connection through the management store emits nothing on this path -- so an earlier version
+/// of this paragraph justified the filter with a reason that does not exist.
+///
+/// It is kept because the reason it will exist is already visible: 17 of the catalog's 157
+/// types carry `user_id`, including `organization.member_added`, `organization.member_removed`
+/// and `user.created`, and criteria 4 to 6 of this issue emit membership deltas from these same
+/// fixtures. The filter is therefore narrowing against a producer this file will acquire, not
+/// against one it has. It is not an exact selector for all time: any of those 17 types about
+/// the same person would enter the count, and a test whose expectations changed under one would
+/// fail on the type list rather than silently pass.
 async fn events_about(
     db: &TestDatabase,
     scope: Scope,
@@ -4135,6 +4147,30 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
         acme.organization.to_string()
     );
 
+    // A REPEAT OF THE SAME PATCH ANNOUNCES NOTHING, which is what makes the id minted per write
+    // safe. Delivery is at-least-once and a receiver deduplicates on the event id, so a second
+    // event under a second id for one change is the shape dedup cannot collapse: the receiver
+    // would count two terminations. An identity provider re-sending a deactivate on a sync
+    // sweep is the ordinary way that happens, not an edge case.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        types(&events_about(&db, scope, &user, 2).await),
+        vec!["user.deactivated", "user.state_changed"],
+        "re-sending a deactivate for somebody already deactivated announced it twice"
+    );
+
     // AND A REACTIVATION ANNOUNCES NOTHING, which is a real gap and is asserted rather than
     // left to be discovered. A consumer mirroring this directory sees the person deactivated
     // and never learns they came back. Issue #136 asks for the termination events and nothing
@@ -4161,17 +4197,21 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
     );
 }
 
-/// A deactivate by ONE organization announces the organization grain and NOT the account grain
+/// A DELETE by ONE organization announces the organization grain and NOT the account grain
 /// (issue #136 criteria 2 and 3).
 ///
 /// This is the case the two grains exist for, and it is the ordinary one in any deployment
-/// where a person belongs to more than one organization. Acme deactivates somebody Globex still
+/// where a person belongs to more than one organization. Acme deletes somebody Globex still
 /// holds active: the person is gone from Acme's directory and can still sign in, so
 /// `user.state_changed` would be a lie and is not emitted. A consumer watching only account
 /// state learns NOTHING about this termination, which is why the organization-grain event is
 /// not redundant with it.
+///
+/// The DEACTIVATE half of the same case is the test after this one. An earlier version of this
+/// file had only this test and called it `a_deactivate_by_one_organization...`, which named a
+/// path it did not drive and hid the fact that nothing covered it.
 #[tokio::test]
-async fn a_deactivate_by_one_organization_announces_no_account_change() {
+async fn a_delete_by_one_organization_announces_no_account_change() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -4242,5 +4282,103 @@ async fn a_deactivate_by_one_organization_announces_no_account_change() {
         events[0].payload["payload"]["organization_id"],
         acme.organization.to_string(),
         "the terminating organization, not the one that still holds them"
+    );
+}
+
+/// And the DEACTIVATE half of the same case: `user.deactivated` alone, no account grain.
+///
+/// The path this drives is not the one above. A delete removes the membership; `active: false`
+/// leaves it, so the person stays addressable to Acme and reactivatable by resource id, and the
+/// only thing the two share is that the account must not move while Globex still holds them.
+/// That is exactly the pair criterion 2 asks to be distinguishable, driven in the case where
+/// the account grain is silent, so the ONLY thing a consumer can tell them apart by is the
+/// type.
+#[tokio::test]
+async fn a_deactivate_by_one_organization_announces_no_account_change() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s-globex").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "shared-deactivate@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    also_a_member_of(&db, &env, scope, &globex.organization, &subject).await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The deterministic half, as in the delete twin: `user.state_changed` is emitted on exactly
+    // the path that MOVES the state, so an unmoved account and an unemitted account grain are
+    // one fact, and this read is not subject to the feed's watermark.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .get(&subject)
+            .await
+            .expect("read the account")
+            .state,
+        ironauth_store::UserState::Active,
+        "Globex still holds this person active, so the account must not have moved"
+    );
+
+    let events = events_about(&db, scope, &user, 1).await;
+    assert_eq!(
+        types(&events),
+        vec!["user.deactivated"],
+        "a deactivate that leaves the person active elsewhere announces the organization grain \
+         and nothing else, and only the TYPE tells it from the delete that does the same"
+    );
+    assert_eq!(
+        events[0].payload["payload"]["organization_id"],
+        acme.organization.to_string()
+    );
+
+    // AND THE PERSON IS STILL ADDRESSABLE, which is the difference from the delete: the
+    // membership survives a deactivate, so the same client can reactivate by resource id. A
+    // consumer told only "this person is inactive here" cannot tell whether that is still
+    // possible; the type is what says so.
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a deactivated person must stay addressable, or nothing could reactivate them: {body}"
     );
 }
