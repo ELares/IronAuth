@@ -4699,3 +4699,109 @@ async fn a_delete_ends_offline_consent_even_when_the_account_was_already_disable
          to act for somebody their identity provider had deprovisioned"
     );
 }
+
+/// A malformed filter is refused at the SURFACE with a SCIM error (issue #135, criterion 3).
+///
+/// # Why this exists when the parser already has refusal tests
+///
+/// The criterion says the parser "rejects malformed input with SCIM errors", and every refusal
+/// test in the crate was a unit test on `parse_filter`. The handler arms that turn a
+/// `FilterError` into a 400 SCIM document were executed by nothing: an audit measured that
+/// every one of the twenty `filter=` requests in these suites sends a WELL-FORMED filter. A
+/// handler that swallowed the error and listed everything instead would have left the whole
+/// suite green, which is the failure that matters most here -- a filter that silently matches
+/// everything is a cross-organization read on any surface where the filter is the only fence.
+///
+/// So this drives the route. The shapes are the parser's own refusal cases, sent as a client
+/// would send them, and each is asserted to be a 400 carrying the uniform `invalidFilter`
+/// `scimType` rather than merely a non-200.
+#[tokio::test]
+async fn a_malformed_filter_is_refused_at_the_surface_rather_than_matching_everything() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let okta = seed_org(&db, &env, scope, "Globex", "s3cret-globex").await;
+
+    // A REAL PERSON FIRST, so "refused" is distinguishable from "matched nothing because the
+    // organization is empty". A handler that dropped the bad filter would list this row.
+    provision(&db, &env, &okta.token, "alice@example.test", "00u1alice").await;
+
+    for (what, filter) in [
+        ("trailing input", "userName eq \"a\" garbage"),
+        ("an unterminated string", "userName eq \"alice"),
+        ("a truncated escape", "userName eq \"alice\\\""),
+        ("an unknown operator", "userName like \"a\""),
+        ("an empty filter", ""),
+        ("a bare attribute", "userName"),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "GET",
+            &format!("/scim/v2/Users?filter={}", urlencoding(filter)),
+            Some(&okta.token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{what} was not refused: {body}"
+        );
+        let parsed = serde_json::from_str::<Value>(&body).expect("a SCIM error document");
+        assert_eq!(
+            parsed["scimType"], "invalidFilter",
+            "{what} must carry the uniform scimType a client branches on: {body}"
+        );
+        assert_eq!(
+            parsed["schemas"][0], "urn:ietf:params:scim:api:messages:2.0:Error",
+            "{what} must be a SCIM error document, not a bare string: {body}"
+        );
+        assert!(
+            !body.contains("alice@example.test"),
+            "{what} listed the organization's people instead of refusing: {body}"
+        );
+    }
+
+    // THE CONTROL. A well-formed filter over the same route still answers 200 and finds the
+    // person, so the refusals above are the parser rather than a route that refuses everything.
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!(
+            "/scim/v2/Users?filter={}",
+            urlencoding("userName eq \"alice@example.test\"")
+        ),
+        Some(&okta.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("alice@example.test"),
+        "the control filter matched nothing, so the refusals above prove nothing: {body}"
+    );
+}
+
+/// Percent-encode a query-string value.
+///
+/// Hand-rolled because these suites take no URL crate, and because what has to be encoded here
+/// is narrow and worth being explicit about: a raw `"` or space in a query string is what a
+/// hostile client sends, and letting the harness send it unencoded would test the router's
+/// tolerance rather than the filter parser.
+fn urlencoding(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 3);
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
