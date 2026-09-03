@@ -229,3 +229,36 @@ fn an_unused_declaration_is_not_rendered() {
         "an assertion signed in one document must canonicalise identically in another"
     );
 }
+
+/// A processing instruction's target and data are separated by exactly ONE space.
+///
+/// # The defect that rejected conforming signatures
+///
+/// XML-C14N 2.6 prescribes the target, a single space, then the instruction, and omits the
+/// space entirely where there is no instruction. An earlier version of this crate wrote the raw
+/// bytes between `<?` and `?>` back out unchanged, so `<?t   data?>` canonicalised as
+/// `<?t   data?>` while every conforming implementation produced `<?t data?>`. A differential
+/// run against libxml2 disagreed on 7 of 13 shapes.
+///
+/// The direction of that bug is what makes it worth a test: it does not forge anything, it makes
+/// this crate compute a different digest from the signer and REFUSE valid signatures -- and a
+/// refusal is the failure mode nobody reports as a security bug, they report it as "SAML is
+/// broken with your product" and it gets fixed by loosening something.
+#[test]
+fn a_processing_instruction_separator_is_normalised_to_one_space() {
+    for (input, expected) in [
+        ("<a><?t   data?></a>", "<a><?t data?></a>"),
+        ("<a><?t\tdata?></a>", "<a><?t data?></a>"),
+        ("<a><?t\ndata  here?></a>", "<a><?t data  here?></a>"),
+        ("<a><?t data?></a>", "<a><?t data?></a>"),
+        // No instruction at all: no separator either, not a trailing space.
+        ("<a><?t?></a>", "<a><?t?></a>"),
+        ("<a><?t   ?></a>", "<a><?t?></a>"),
+    ] {
+        assert_eq!(
+            canonicalize(input, "a").expect("canonicalises"),
+            expected,
+            "canonical form of {input}"
+        );
+    }
+}

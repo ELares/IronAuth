@@ -567,6 +567,20 @@ pub(crate) fn element_name(
 /// names in any XML processor and were accepted here.
 pub(crate) fn check_name(raw: &[u8]) -> Result<(), SamlError> {
     let name = core::str::from_utf8(raw).map_err(|_| SamlError::Malformed)?;
+    // A QNAME HAS AT MOST ONE COLON AND NEITHER PART IS EMPTY. `a:b:c`, `:a` and `a:` are not
+    // names in any namespace-aware processor, and the last one matters most here: an attribute
+    // literally called `xmlns:` was taken as the DEFAULT namespace declaration by the
+    // canonicalizer, so `xmlns:="urn:x"` and `xmlns="urn:x"` produced identical canonical octets
+    // -- two different documents under one digest, and one signature covering both.
+    let colons = name.bytes().filter(|byte| *byte == b':').count();
+    if colons > 1 {
+        return Err(SamlError::Malformed);
+    }
+    if let Some((prefix, local)) = name.split_once(':') {
+        if prefix.is_empty() || local.is_empty() {
+            return Err(SamlError::Malformed);
+        }
+    }
     let mut characters = name.chars();
     let Some(first) = characters.next() else {
         return Err(SamlError::Malformed);

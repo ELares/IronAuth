@@ -792,3 +792,51 @@ fn a_misplaced_xml_declaration_is_refused() {
     )
     .expect("a declaration in its place parses");
 }
+
+/// A name with an empty prefix, an empty local part, or two colons is not a name.
+///
+/// # The collision this closes
+///
+/// `xmlns:` is not a namespace declaration and it is not an attribute either -- it is a `QName`
+/// with an empty local part, which no namespace-aware processor accepts. This crate's
+/// canonicalizer split declarations on the literal prefix `xmlns:` with no check on what
+/// followed, so `xmlns:="urn:x"` was taken as a declaration of the DEFAULT namespace and
+/// rendered as `xmlns="urn:x"`.
+///
+/// That is a two-documents-one-digest collision, and it was measured rather than reasoned about:
+/// with this check removed, `<a xmlns:="urn:x"><b/></a>` and `<a xmlns="urn:x"><b/></a>` both
+/// canonicalise to the octets `<a xmlns="urn:x"><b></b></a>`, so one signature covered both. It also produced an
+/// attribute the digest could not see and an accessor could -- the exact split this crate
+/// exists to prevent.
+///
+/// Refusing it at PARSE time is what makes the fix hold: a fix in the canonicalizer would leave
+/// every other consumer of the tree to make the same decision again.
+#[test]
+fn a_malformed_qualified_name_is_refused() {
+    for (what, document) in [
+        ("an attribute whose prefix is empty", r#"<a :x="1"/>"#),
+        (
+            "a declaration whose local part is empty",
+            r#"<a xmlns:="urn:x"/>"#,
+        ),
+        ("an attribute whose local part is empty", r#"<a p:="1"/>"#),
+        ("an attribute with two colons", r#"<a p:q:r="1"/>"#),
+        ("an element whose prefix is empty", "<:a/>"),
+        ("an element whose local part is empty", "<a:/>"),
+        ("an element with two colons", "<a:b:c/>"),
+    ] {
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::Malformed),
+            "{what} must be refused"
+        );
+    }
+
+    // CONTROL: an ordinary prefixed name and an ordinary declaration still parse, so the check
+    // above is not passing because everything is refused.
+    parse(
+        r#"<a xmlns:p="urn:x" p:q="1"/>"#.as_bytes(),
+        &Limits::default(),
+    )
+    .expect("a well formed qualified name parses");
+}

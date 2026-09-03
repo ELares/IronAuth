@@ -88,6 +88,30 @@ pub(crate) fn canonicalize(
 }
 
 /// Write one element and its descendants.
+/// Render a processing instruction in its canonical form.
+///
+/// XML-C14N 2.6 prescribes the target, a SINGLE space, then the instruction, and omits the space
+/// entirely where there is no instruction. An earlier version wrote the raw bytes between `<?`
+/// and `?>` straight back out, so `<?t   data?>` canonicalised as itself while every conforming
+/// implementation produced `<?t data?>`. A differential run against libxml2 disagreed on 7 of 13
+/// shapes -- a FALSE REJECTION of conforming signatures, which is the failure mode that gets
+/// fixed by loosening something rather than by fixing the canonicalizer.
+fn write_processing_instruction(out: &mut String, pi: &str) {
+    out.push_str("<?");
+    match pi.split_once(|c: char| c.is_ascii_whitespace()) {
+        Some((target, rest)) => {
+            out.push_str(target);
+            let rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            if !rest.is_empty() {
+                out.push(' ');
+                out.push_str(rest);
+            }
+        }
+        None => out.push_str(pi),
+    }
+    out.push_str("?>");
+}
+
 fn write_element(
     out: &mut String,
     element: &RichElement,
@@ -209,11 +233,7 @@ fn write_element(
             // by the algorithm this crate accepts, and an earlier version dropped processing
             // instructions at parse time -- so content inside the signature's own coverage could
             // be added or removed without changing the digest.
-            RichNode::ProcessingInstruction(pi) => {
-                out.push_str("<?");
-                out.push_str(pi);
-                out.push_str("?>");
-            }
+            RichNode::ProcessingInstruction(pi) => write_processing_instruction(out, pi),
         }
     }
     out.push_str("</");

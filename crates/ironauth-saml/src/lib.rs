@@ -103,12 +103,50 @@
 //! measures the buffer AFTER something else produced it. Whatever performs that decode has to
 //! carry its own output bound, and it is not written yet.
 //!
+//! # Signature verification, and the one rule the whole design turns on
+//!
+//! [`verify`] is now here, and the shape of its API is the answer to the wrapping bug described
+//! at the top of this note. THE ONLY WAY TO READ A VALUE IS THROUGH A [`VerifiedAssertion`],
+//! and that struct holds the subtree the digest was computed over -- not the document, not the
+//! element the caller named, not a byte range into either. There is no accessor on [`Document`]
+//! at all. So "the component that decides signed-ness" and "the component that reads the
+//! values" cannot disagree about which bytes they meant, because there is only one copy of
+//! those bytes and only one function that produced it.
+//!
+//! That is a stronger claim than it looks, and the review of this PR is why it is stated so
+//! flatly: an earlier draft of [`verify`] digested a stripped copy of the assertion and then
+//! handed back the ORIGINAL subtree. Every test passed. A document whose `NameID` said
+//! `victim@example.test` verified and read back as `admin@corp.test`, because the attacker's
+//! content sat inside the `Signature` element, which the digest removed and the returned value
+//! kept. `tests/wrapping.rs` now carries that exact document.
+//!
+//! # What verification covers, and what it deliberately refuses
+//!
+//! * ONE signature, and it is a CHILD of the element being verified. A `Signature` deeper in
+//!   the tree is not searched for, because "find the signature" is the search that XSW attacks:
+//!   the attacker supplies a second one somewhere the finder looks and the reader does not.
+//! * The enveloped-signature transform removes exactly ONE element -- the `Signature` holding
+//!   the transform, identified by its POSITION among the children. Removing every element whose
+//!   local name is `Signature` (the obvious implementation, and the one this crate had first)
+//!   deletes a legitimately signed `<Signature>` in an unrelated namespace and any nested one,
+//!   and both are now regression tests.
+//! * `SignatureValue` for ECDSA is fixed-width `r||s` per RFC 4051 2.3.6, NOT ASN.1 DER. A
+//!   verifier that accepts DER accepts a second encoding of the same signature.
+//! * ONE assertion. A `Response` carrying several signed assertions is REFUSED rather than
+//!   resolved to the first, and this is a real narrowing: such a response is conforming, and
+//!   some identity providers emit one. It is refused because "the first assertion" is a choice
+//!   this crate would be making on a caller's behalf about whose identity was asserted, and
+//!   that choice is the one that has to be visible at the call site. The same rule applies
+//!   inside an assertion: two elements of one name resolve to `None`, never to the first.
+//! * Namespace declarations are NOT attributes. [`VerifiedAssertion::attribute`] refuses
+//!   `xmlns` and `xmlns:*`, so a caller cannot read a URI as though the identity provider had
+//!   asserted it.
+//!
 //! # What this crate does NOT do yet
 //!
-//! Signature verification, the XSW corpus, comment-truncation handling, and encrypted
-//! assertions are the rest of #138 and are not here. This crate currently gives a caller a
-//! parsed document and NO way to read a value out of it, which is deliberate: see
-//! [`Document`].
+//! Comment-truncation handling, encrypted assertions, and the fuzz targets are the rest of
+//! #138 and are not here. Metadata parsing, anchor rotation, and the SP protocol flow are
+//! #139.
 
 #![forbid(unsafe_code)]
 
@@ -133,6 +171,75 @@ pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
 /// Behind a feature, so the surface does not exist in a normal build.
 #[cfg(feature = "test-util")]
 pub mod test_util {
+    /// Re-sign a document whose assertion has been edited, so the edit is genuinely SIGNED.
+    ///
+    /// The ambiguity case needs a document that verifies and is ambiguous, which is not a
+    /// forgery: an identity provider may legitimately sign an assertion with two `NameID`s, and
+    /// the question is what a reader does with it.
+    ///
+    /// # Panics
+    ///
+    /// If the document does not parse or carries no signature to replace.
+    #[must_use]
+    pub fn resign(key: &ironauth_jose::xmldsig::test_util::XmlTestKey, document: &str) -> String {
+        let start = document
+            .find("<ds:Signature")
+            .expect("a signature to replace");
+        let end = document
+            .find("</ds:Signature>")
+            .expect("a signature to replace")
+            + "</ds:Signature>".len();
+        let stripped = [&document[..start], &document[end..]].concat();
+        let digest = digest_of(&stripped, "saml:Assertion");
+        let signed_info = signed_info_for("_assertion", &digest);
+        let staged = [
+            &document[..start],
+            &signature_element(&signed_info, ""),
+            &document[end..],
+        ]
+        .concat();
+        let message = canonicalize(&staged, "ds:SignedInfo").expect("the staged SignedInfo parses");
+        let value = base64(&key.sign(message.as_bytes()));
+        [
+            &document[..start],
+            &signature_element(&signed_info, &value),
+            &document[end..],
+        ]
+        .concat()
+    }
+
+    /// The `SignedInfo` for one reference and digest.
+    fn signed_info_for(id: &str, digest: &str) -> String {
+        [
+            "<ds:SignedInfo>",
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/>"#,
+            "<ds:Reference URI=\"#",
+            id,
+            "\"><ds:Transforms>",
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            "</ds:Transforms>",
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            "<ds:DigestValue>",
+            digest,
+            "</ds:DigestValue></ds:Reference></ds:SignedInfo>",
+        ]
+        .concat()
+    }
+
+    /// A `ds:Signature` element around a `SignedInfo` and a value.
+    fn signature_element(signed_info: &str, value: &str) -> String {
+        [
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+            signed_info,
+            "<ds:SignatureValue>",
+            value,
+            "</ds:SignatureValue></ds:Signature>",
+        ]
+        .concat()
+    }
+
     /// Build a SAML response whose assertion carries a genuinely valid enveloped signature.
     ///
     /// # Why the corpus needs this

@@ -359,3 +359,212 @@ fn a_second_reference_is_refused() {
         Err(VerifyError::ReferenceRefused)
     );
 }
+
+/// CONTENT SMUGGLED INSIDE THE SIGNATURE IS NOT READABLE AFTERWARDS.
+///
+/// # The structural gap this closes
+///
+/// Every case above MOVES a node, and the exactly-one-candidate rule catches all of them. Not
+/// one ADDS a node in the part of the subtree the enveloped transform deletes -- and there was
+/// no case at all where verification SUCCEEDS and the returned values are then checked against
+/// what the signer actually signed. That missing shape, not a missing row, is what let three
+/// independent reviews forge an assertion through this crate.
+///
+/// The attack needs nothing cryptographic. Append a `ds:Object` carrying a forged
+/// `saml:Subject` to the identity provider's OWN signature: the whole signature is removed
+/// before the digest, so the digest and the signature are untouched and verification succeeds --
+/// and the old code handed back the UNSTRIPPED subtree, where `text_of` walks depth first and
+/// meets the signature before the subject, the order SAML's schema mandates.
+#[test]
+fn content_added_inside_the_signature_is_not_returned() {
+    let fixture = Fixture::new();
+    let smuggled = r"<ds:Object><saml:Subject><saml:NameID>admin@evil.test</saml:NameID></saml:Subject></ds:Object>";
+    let attacked =
+        fixture
+            .document
+            .replacen("</ds:Signature>", &format!("{smuggled}</ds:Signature>"), 1);
+
+    let assertion = fixture
+        .verify(&attacked)
+        .expect("the signature is untouched, so this still verifies");
+    assert_eq!(
+        assertion.text_of("saml:NameID").as_deref(),
+        Some("victim@example.test"),
+        "a NameID smuggled inside the signature was returned as though it had been signed"
+    );
+
+    // AND AN ATTRIBUTE STATEMENT the same way, which is how a role is forged.
+    let smuggled = r#"<ds:Object><saml:AttributeStatement><saml:Attribute Name="role"><saml:AttributeValue>admin</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></ds:Object>"#;
+    let attacked =
+        fixture
+            .document
+            .replacen("</ds:Signature>", &format!("{smuggled}</ds:Signature>"), 1);
+    let assertion = fixture.verify(&attacked).expect("still verifies");
+    assert_eq!(
+        assertion.text_of("saml:AttributeValue"),
+        None,
+        "an attribute smuggled inside the signature was readable"
+    );
+}
+
+/// AN ELEMENT NAMED `Signature` IN SOMEBODY ELSE'S NAMESPACE IS NOT A SIGNATURE.
+///
+/// The second door to the same bypass. An earlier version's enveloped transform deleted every
+/// element whose LOCAL name was `Signature`, at any depth, in any namespace -- so
+/// `<x:Signature xmlns:x="urn:evil">` buried inside the subject was removed before the digest
+/// and read after it, with no access to the real signature needed at all.
+///
+/// It is now removed by INDEX: exactly the one element that carries this reference, which is
+/// what XMLDSIG-CORE 6.6.4 says the transform removes.
+#[test]
+fn an_element_named_signature_in_another_namespace_is_not_stripped() {
+    let fixture = Fixture::new();
+    let smuggled = r#"<x:Signature xmlns:x="urn:evil"><saml:NameID>admin@evil.test</saml:NameID></x:Signature>"#;
+    let attacked =
+        fixture
+            .document
+            .replacen("<saml:Subject>", &format!("<saml:Subject>{smuggled}"), 1);
+    // It is NOT stripped, so it changes what is digested, so the digest no longer matches.
+    assert_eq!(
+        fixture.verify(&attacked),
+        Err(VerifyError::SignatureInvalid),
+        "an element named Signature in a foreign namespace must not be removed from the digest"
+    );
+}
+
+/// A `ds:Signature` NESTED DEEPER IN THE ASSERTION IS NOT THIS SIGNATURE EITHER.
+#[test]
+fn a_nested_signature_is_not_stripped() {
+    let fixture = Fixture::new();
+    let smuggled = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><saml:NameID>admin@evil.test</saml:NameID></ds:Signature>"#;
+    let attacked =
+        fixture
+            .document
+            .replacen("<saml:Subject>", &format!("<saml:Subject>{smuggled}"), 1);
+    assert_eq!(
+        fixture.verify(&attacked),
+        Err(VerifyError::SignatureInvalid),
+        "only the signature carrying this reference is removed from the digest"
+    );
+}
+
+/// A NAMESPACE DECLARATION IS NOT AN ATTRIBUTE a caller can read.
+///
+/// Canonicalization emits only the declarations the subtree VISIBLY USES, so an unused one is
+/// not digested -- and it was still readable through the accessor, which is undigested
+/// attacker-controlled data reaching a caller that believes everything it sees was signed.
+#[test]
+fn a_namespace_declaration_is_not_a_readable_attribute() {
+    let fixture = Fixture::new();
+    let attacked = fixture.document.replacen(
+        r#"<saml:Assertion ID="_assertion""#,
+        r#"<saml:Assertion xmlns:evil="urn:evil" ID="_assertion""#,
+        1,
+    );
+    let assertion = fixture
+        .verify(&attacked)
+        .expect("an unused declaration is not digested, so this still verifies");
+    assert_eq!(
+        assertion.attribute("xmlns:evil"),
+        None,
+        "an undigested namespace declaration was readable as an attribute"
+    );
+    // THE CONTROL: a real attribute is still readable.
+    assert_eq!(assertion.attribute("ID"), Some("_assertion"));
+}
+
+/// AN AMBIGUOUS READ IS NO READ.
+///
+/// `text_of` used to return the first match and its doc justified that by a duplicate refusal
+/// `verify` does not perform: two signed `NameID`s verified and the second was silently dropped,
+/// so the caller got one of two answers with nothing to tell it there had been a choice.
+#[test]
+fn two_elements_of_one_name_are_not_silently_resolved_to_the_first() {
+    let key = XmlTestKey::generate();
+    let document = ironauth_saml::test_util::signed_response(&key, "_assertion");
+    let anchors = vec![TrustAnchor::EcdsaP256(key.public_point())];
+
+    // Both are SIGNED -- the digest is recomputed over the document as it stands, so this is not
+    // a forgery. It is an ambiguity, and the caller must not be handed a coin flip.
+    let twinned = document.replacen(
+        "<saml:NameID>victim@example.test</saml:NameID>",
+        "<saml:NameID>victim@example.test</saml:NameID><saml:NameID>other@example.test</saml:NameID>",
+        1,
+    );
+    let resigned = ironauth_saml::test_util::resign(&key, &twinned);
+    let assertion = verify(
+        resigned.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        "saml:Assertion",
+    )
+    .expect("a document with two NameIDs is signed like any other");
+    assert_eq!(
+        assertion.text_of("saml:NameID"),
+        None,
+        "two candidates must not resolve silently to the first"
+    );
+}
+
+/// Two GENUINELY SIGNED assertions are refused rather than resolved to one of them.
+///
+/// # This one is not an attack, and that is the point
+///
+/// Every other entry in this suite is a forgery. This document is not: both assertions carry
+/// their own valid enveloped signature from the pinned key, both would verify alone, and a
+/// `Response` bearing several signed assertions is permitted by the SAML core schema. Some
+/// identity providers emit one.
+///
+/// It is refused anyway, and the refusal is a real narrowing of what this crate accepts. The
+/// reason is that "which assertion" is a question about WHOSE IDENTITY WAS ASSERTED, and the
+/// answer cannot be a default buried in a verifier -- picking the first is how XSW3 pays off in
+/// every implementation that does it. A caller that genuinely needs multi-assertion responses
+/// has to ask for a named one, and that surface does not exist yet.
+///
+/// The controls below are what make the assertion mean anything: without them this would pass
+/// against a verifier that refused both documents for being unsigned.
+#[test]
+fn two_genuinely_signed_assertions_are_refused_rather_than_resolved() {
+    let key = XmlTestKey::generate();
+    let anchors = vec![TrustAnchor::EcdsaP256(key.public_point())];
+    let first = ironauth_saml::test_util::signed_response(&key, "_assertion");
+    let second = ironauth_saml::test_util::signed_response(&key, "_second");
+
+    let check = |document: &str| {
+        verify(
+            document.as_bytes(),
+            &Limits::default(),
+            &anchors,
+            "saml:Assertion",
+        )
+    };
+
+    // CONTROL: each response verifies on its own, so neither is being refused for its own sake.
+    assert!(
+        check(&first).is_ok(),
+        "the first response must verify alone"
+    );
+    assert!(
+        check(&second).is_ok(),
+        "the second response must verify alone"
+    );
+
+    // The second assertion, lifted out with its signature intact. Its enclosing scope is the
+    // same `Response` element, so its canonical form -- and therefore its digest -- is unchanged
+    // by the move: this is a document with two valid signatures, not a broken one.
+    let start = second
+        .find("<saml:Assertion")
+        .expect("the second response has an assertion");
+    let end = second
+        .find("</saml:Assertion>")
+        .expect("the second response has an assertion")
+        + "</saml:Assertion>".len();
+    let lifted = &second[start..end];
+
+    let both = first.replacen(
+        "</samlp:Response>",
+        &format!("{lifted}</samlp:Response>"),
+        1,
+    );
+    assert_eq!(check(&both), Err(VerifyError::ReferenceRefused));
+}
