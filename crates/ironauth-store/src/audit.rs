@@ -1333,6 +1333,19 @@ pub enum Action {
     /// An inbound SCIM connection was REVOKED (issue #135). The row targets the `scim_`
     /// handle. The row is retained rather than deleted, so this action stays resolvable.
     ScimConnectionRevoked,
+    /// The group bindings a revoked SCIM connection had pushed were TORN DOWN (issue #136,
+    /// criterion 6). The row targets the `scim_` handle, in the same transaction as the revoke.
+    ///
+    /// ONE ROW WITH A COUNT rather than one per binding, matching
+    /// [`Action::OrganizationMembershipAttachmentsRevoke`], which faces the same choice for the
+    /// same reason: the teardown is one act by one operator, and an enterprise connection can
+    /// hold tens of thousands of bindings. The per-binding record is not lost, because the rows
+    /// are soft-deleted and keep their `deleted_at`.
+    ///
+    /// WRITTEN ONLY WHEN SOMETHING WAS ACTUALLY REMOVED, for the reason the attachments cascade
+    /// documents: a revoke of an already-revoked connection that emitted this anyway would
+    /// claim a teardown that removed nothing.
+    ScimConnectionBindingsRevoked,
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
     /// authorization after checking the permission and the justification. The row targets the
     /// `imp_` authorization.
@@ -1842,6 +1855,7 @@ impl Action {
             Action::ApiKeyCreated => "api_key.created",
             Action::ScimConnectionCreated => "scim_connection.created",
             Action::ScimConnectionRevoked => "scim_connection.revoked",
+            Action::ScimConnectionBindingsRevoked => "scim_connection.bindings.revoke",
             Action::ApiKeyRevoked => "api_key.revoked",
             Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",

@@ -353,8 +353,8 @@ pub use repository::{
     WebauthnCeremony, WebauthnChallengeRepo, WebauthnCredentialDescriptor,
     WebauthnCredentialOutcome, WebauthnCredentialRecord, WebauthnCredentialRepo,
     WebauthnFactorStrength, device_code_digest, invitation_token_digest, magic_link_binding_digest,
-    magic_link_token_digest, membership_change, mint_invitation_token, mint_invitation_token_for,
-    opaque_access_token_digest, refresh_token_digest, user_code_hash,
+    magic_link_token_digest, membership_change, membership_delta_payload, mint_invitation_token,
+    mint_invitation_token_for, opaque_access_token_digest, refresh_token_digest, user_code_hash,
 };
 pub use repository::{
     ActingWebhookEndpointRepo, AsyncFlowDeliveries, DeliveryAttemptRecord, DeliveryTargetLookup,

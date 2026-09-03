@@ -573,6 +573,34 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The GROUP twin, same contract. Groups are where the cap actually bites: an
         // enterprise group is the thing with tens of thousands of members, which is why
         // issue #107 named group dumps as the failure mode.
+        //
+        // THE ARRAYS CARRY USER IDS, AND THE PRODUCERS USED TO BE WRONG ABOUT THAT. Every one
+        // of them filled these with `omb_` ORGANIZATION MEMBERSHIP ids, because a group binding
+        // binds a membership, so a consumer resolving them as the names say found nothing --
+        // every time, silently. The schema was right and the code was wrong.
+        //
+        // A REVIEW TALKED ME OUT OF FIXING IT THE OTHER WAY. Renaming the fields to
+        // `added_membership_ids` matches what the producers had and matches the per-member
+        // events beside this one, which carry `membership_id`. It is also BREAKING, and this
+        // registry holds one row per wire type, so the bump would have edited v1 out of
+        // existence: `validate_event` then answers `VersionMismatch` for every v1 envelope
+        // still sitting in `outbox_messages` at deploy, and the fan-out classifies that as a
+        // permanent failure and drops it with a log line. That is silent data loss on the
+        // repository's first ever version bump, to fix a defect the published contract did not
+        // have.
+        //
+        // A membership id is also the wrong VALUE for what this event is for. A mirror applies
+        // these arrays to its own copy of a group's membership, and it keys people by user; the
+        // organization twin's arrays are user ids for the same reason. The per-member events
+        // carry the join row's own id because that is what they are about.
+        //
+        // WHICH MEANS A SERVICE ACCOUNT'S BINDING IS NOT IN THESE ARRAYS. A group binding hangs
+        // off an organization membership, and a membership can belong to a service account,
+        // which has no user id to name. Such a binding is created, removed and torn down exactly
+        // like anyone else's and is announced by `org_group.member_added` / `member_removed`,
+        // which carry the membership; this type simply has nothing to put in its arrays for it.
+        // The organization twin draws the same line, which is why
+        // `organization.service_account_added` exists beside `organization.member_added`.
         "org_group.membership_changed",
         1,
         r#"{

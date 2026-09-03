@@ -206,20 +206,22 @@ pub async fn add_org_group_member(
         response_status: 201,
         response_body: &body_string,
     };
-    // NEITHER endpoint is resolved here before the store. The store resolves both as
+    // NEITHER endpoint is resolved here as a PRECONDITION of the write. The store resolves both as
     // live rows of THIS organization INSIDE the audited write transaction and BEFORE
     // any conflict reasoning, so a pre-read here would be redundant, would be stale
     // by the time the write ran, and would answer "does that group exist" a request
     // early: the ordering is what keeps the 409 reachable only by a caller who has
     // already proved they can see both endpoints.
-    let delta = group_membership_delta_event(
-        &state,
-        scope,
-        &group,
-        &org_id,
-        vec![membership.to_string()],
-        Vec::new(),
-    );
+    // THE ARRAYS CARRY USER IDS, so the membership is resolved to the person it binds. A
+    // membership id in a field the schema names `added_user_ids` is what every producer of this
+    // type used to send, and a consumer resolving it as a user found nothing.
+    //
+    // A MISS BUILDS NO EVENT AND CHANGES NO RESPONSE. The store resolves both endpoints inside
+    // its own write transaction and answers the authoritative not-found; this read only decides
+    // whether an event can be built, so the ordering the comment above preserves is intact and
+    // an absent membership announces nothing rather than announcing a guess.
+    let delta =
+        group_membership_delta_for(&state, scope, &group, &org_id, &membership, true).await?;
     let pending = org_group_member_event(
         &state,
         scope,
@@ -242,6 +244,7 @@ pub async fn add_org_group_member(
                 organization_id: &org_id,
                 group_id: &group,
                 membership_id: &membership,
+                source_scim_connection_id: None,
             },
             created_at_micros,
             Some(write),
@@ -400,14 +403,15 @@ pub async fn remove_org_group_member(
         .await?;
     // The organization rides into the UPDATE as a predicate as well, so the write is
     // fenced independently of the read that addressed it.
-    let delta = group_membership_delta_event(
+    let delta = group_membership_delta_for(
         &state,
         scope,
         &binding.group_id,
         &org_id,
-        Vec::new(),
-        vec![binding.membership_id.to_string()],
-    );
+        &binding.membership_id,
+        false,
+    )
+    .await?;
     let pending = org_group_member_event(
         &state,
         scope,
@@ -474,6 +478,70 @@ fn org_group_member_event(
     })
 }
 
+/// The delta for one membership joining or leaving one group, resolved to the PERSON.
+///
+/// THE ARRAYS CARRY USER IDS, so the membership is resolved to whom it binds. A membership id in
+/// a field the schema names `added_user_ids` is what every producer of this type used to send,
+/// and a consumer resolving it as a user found nothing.
+///
+/// A MISS BUILDS NO EVENT AND CHANGES NO RESPONSE. The store resolves both endpoints inside its
+/// own write transaction and answers the authoritative not-found; this read only decides whether
+/// an event can be built, so the handler's deliberate ordering (no pre-read, so a 409 is reachable
+/// only by a caller who can already see both endpoints) is intact, and an absent membership
+/// announces nothing rather than announcing a guess.
+async fn group_membership_delta_for(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    group_id: &ironauth_store::OrgGroupId,
+    organization_id: &ironauth_store::OrganizationId,
+    membership_id: &ironauth_store::OrgMembershipId,
+    joining: bool,
+) -> Result<Option<crate::events::PendingEvent>, ApiError> {
+    let record = match state
+        .store()
+        .management()
+        .org_memberships(scope)
+        .get(membership_id)
+        .await
+    {
+        Ok(record) => record,
+        // NOT-FOUND MEANS THIS MEMBERSHIP NAMES NO LIVE USER, and that is a real, ordinary
+        // case rather than a miss to be swallowed on the way past: `get` filters to user
+        // memberships, so a SERVICE ACCOUNT's answers not-found here while the binding write
+        // accepts it happily. This type's arrays are user ids and a service account has none,
+        // so there is nothing for a delta to carry.
+        //
+        // An earlier version justified this by saying the write answers the authoritative
+        // not-found a moment later. It does not: `remove_with_event` addresses the BINDING, and
+        // `add_with_event` resolves the membership through a check that carries no `owner_kind`
+        // predicate. So the write succeeds and only the delta is absent, which is stated here
+        // rather than left to look like a swallowed error.
+        //
+        // The per-member `org_group.member_added` / `member_removed` still names the binding, so
+        // an integrator watching one person is not blind to it.
+        Err(ironauth_store::StoreError::NotFound) => return Ok(None),
+        // ANYTHING ELSE FAILS THE REQUEST. `remove_with_event` promises a consumer sees "never
+        // one form without the other", and the first version of this ended the read with
+        // `.ok()?`: a transient database fault dropped the delta while the binding committed and
+        // the per-member event was enqueued, silently and with no way to notice.
+        Err(_) => return Err(ApiError::Internal),
+    };
+    let user = record.user_id.to_string();
+    let (added, removed) = if joining {
+        (vec![user], Vec::new())
+    } else {
+        (Vec::new(), vec![user])
+    };
+    Ok(group_membership_delta_event(
+        state,
+        scope,
+        group_id,
+        organization_id,
+        added,
+        removed,
+    ))
+}
+
 /// The GROUP membership delta (issue #107's criterion, issue #108's registry), the twin of
 /// the organization form.
 ///
@@ -496,7 +564,8 @@ fn group_membership_delta_event(
 ) -> Option<crate::events::PendingEvent> {
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let change = ironauth_store::membership_change(added, removed);
-    let mut payload = crate::events::membership_delta_payload(&change);
+    let mut payload =
+        ironauth_store::membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
     let subject = group_id.to_string();
     payload["org_group_id"] = serde_json::json!(subject);
     payload["organization_id"] = serde_json::json!(organization_id.to_string());

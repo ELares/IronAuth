@@ -280,6 +280,7 @@ async fn bind_member(
                 organization_id: org,
                 group_id: group,
                 membership_id: membership,
+                source_scim_connection_id: None,
             },
             now_micros(env),
             None,

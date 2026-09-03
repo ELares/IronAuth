@@ -22876,6 +22876,56 @@ pub fn membership_change(added: Vec<String>, removed: Vec<String>) -> Membership
     }
 }
 
+/// Flatten a [`MembershipChange`] into the wire payload a delta event carries.
+///
+/// # Why the array names are arguments
+///
+/// Both types this builds for name their arrays `added_user_ids` and `removed_user_ids` today,
+/// so the parameters look redundant. They are here because the alternative -- baking the names
+/// in -- is what let a THIRD producer inherit them silently: the group form filled the same
+/// arrays with `omb_` membership ids for as long as it existed, and every consumer resolving
+/// them as the names said found nothing. Naming them at the call site makes each producer state
+/// its own vocabulary instead of borrowing one, so the next type with a different one cannot
+/// acquire these by accident.
+///
+/// # What is shared, and is genuinely the same for both
+///
+/// The cap and the truncation contract. [`MembershipChange`] is an ENUM rather than arrays
+/// beside a boolean precisely so a consumer cannot read the members without having matched on
+/// completeness, and this is the one place that flattens it. `truncated` is emitted as a
+/// REQUIRED field so the wire form keeps that property: an absent flag is a schema violation
+/// refused at the fan-out, never a default that quietly reads as "complete".
+#[must_use]
+pub fn membership_delta_payload(
+    change: &MembershipChange,
+    added_key: &str,
+    removed_key: &str,
+) -> serde_json::Value {
+    match change {
+        MembershipChange::Complete { added, removed } => serde_json::json!({
+            added_key: added,
+            removed_key: removed,
+            "truncated": false,
+            // Complete, so the total IS what was sent. Stated rather than left to the consumer
+            // to add up, so the two variants read the same way.
+            "total": added.len() + removed.len(),
+        }),
+        MembershipChange::Truncated {
+            added,
+            removed,
+            total,
+        } => serde_json::json!({
+            // A PREFIX. The consumer must not apply these as a delta; it reconciles by
+            // re-reading the membership through the management API.
+            added_key: added,
+            removed_key: removed,
+            "truncated": true,
+            // How many changed in total, so a consumer can log exactly what it missed.
+            "total": total,
+        }),
+    }
+}
+
 /// How many times the event feed has been READ in this process (issue #107 criterion 5).
 ///
 /// The metering fold is a read of the feed followed by [`UsageTally::absorb`]. The criterion
@@ -48061,6 +48111,15 @@ pub struct NewOrgGroupMember<'a> {
     /// The membership to bind. Must be a LIVE membership of `organization_id`,
     /// under the same uniform not-found.
     pub membership_id: &'a OrgMembershipId,
+    /// The SCIM connection that pushed this binding, or `None` when an operator made it
+    /// directly through the management API (issue #136, criterion 6).
+    ///
+    /// It is what makes a binding attributable, and attribution is what a connection revoke
+    /// tears down: without it, revoking a compromised identity provider disarms the credential
+    /// and undoes nothing it did. `None` is not a missing value, it is the statement that no
+    /// connection is responsible for this row, and the teardown's `= $1` predicate can never
+    /// match it.
+    pub source_scim_connection_id: Option<&'a ScimConnectionId>,
 }
 
 /// An organization group-role row (issue #97): one role granted to one group, and
@@ -49189,6 +49248,62 @@ pub struct OrgMembershipRepo<'a> {
 }
 
 impl OrgMembershipRepo<'_> {
+    /// The person each of `memberships` binds, in ONE query.
+    ///
+    /// A caller that needs the user behind several memberships had been calling
+    /// [`Self::get`] in a loop, and the loop is bounded by the management list cap: a SCIM
+    /// replace that empties a full group paid a thousand sequential round trips before it
+    /// wrote anything. This asks once.
+    ///
+    /// A membership that is absent or out of this scope is simply not in the result. The caller
+    /// gets a map, not a promise that every id resolved, because the write that follows is what
+    /// answers for an id that names nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn users_for(
+        &self,
+        memberships: &[OrgMembershipId],
+    ) -> Result<Vec<(OrgMembershipId, UserId)>, StoreError> {
+        if memberships.iter().any(|id| id.scope() != self.scope) {
+            return Err(StoreError::NotFound);
+        }
+        if memberships.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = self.scope;
+        let ids: Vec<String> = memberships.iter().map(ToString::to_string).collect();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, user_id FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND id = ANY($3) AND deleted_at IS NULL AND owner_kind = 'user'",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get("id");
+            let user: String = row.get("user_id");
+            let (Ok(id), Ok(user)) = (
+                OrgMembershipId::parse_in_scope(&id, &scope),
+                UserId::parse_in_scope(&user, &scope),
+            ) else {
+                // A row this scope's own query returned whose ids do not parse in it is
+                // corruption, not a miss, and answering `NotFound` would hide it.
+                return Err(StoreError::Database(sqlx::Error::RowNotFound));
+            };
+            out.push((id, user));
+        }
+        Ok(out)
+    }
+
     /// Parse an untrusted membership identifier under this scope. A malformed id and
     /// one minted in another scope both return the uniform not-found.
     ///
@@ -57499,10 +57614,16 @@ impl ActingOrgGroupMemberRepo<'_> {
         event: Option<&DomainEvent<'_>>,
         delta_event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
+        // THE SOURCE IS SCOPE CHECKED LIKE EVERY OTHER IDENTIFIER HERE. It is the id a revoke
+        // scans on, so a binding attributed to another scope's connection would be a row this
+        // scope's teardown can never reach and another scope's teardown must never see.
         if spec.id.scope() != self.scope
             || spec.organization_id.scope() != self.scope
             || spec.group_id.scope() != self.scope
             || spec.membership_id.scope() != self.scope
+            || spec
+                .source_scim_connection_id
+                .is_some_and(|connection| connection.scope() != self.scope)
         {
             return Err(StoreError::NotFound);
         }
@@ -57511,6 +57632,7 @@ impl ActingOrgGroupMemberRepo<'_> {
         let organization_id = *spec.organization_id;
         let group_id = *spec.group_id;
         let membership_id = *spec.membership_id;
+        let source = spec.source_scim_connection_id.copied();
         write_audited(
             AuditedWrite {
                 store: self.store,
@@ -57526,10 +57648,10 @@ impl ActingOrgGroupMemberRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO org_group_members \
                      (id, tenant_id, environment_id, organization_id, group_id, membership_id, \
-                      created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+                      source_scim_connection_id, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -57537,6 +57659,7 @@ impl ActingOrgGroupMemberRepo<'_> {
                 .bind(organization_id.to_string())
                 .bind(group_id.to_string())
                 .bind(membership_id.to_string())
+                .bind(source.map(|connection| connection.to_string()))
                 .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await;
@@ -75052,6 +75175,31 @@ impl ActingScimConnectionRepo<'_> {
             return Ok(false);
         }
 
+        // THE TEARDOWN (issue #136, criterion 6), in the revoke's OWN transaction.
+        //
+        // Revoking the credential disarms the identity provider and, before this, undid nothing
+        // it had done: every person it had pushed into a group kept every role that group
+        // confers, indefinitely, because nothing recorded which bindings were its doing.
+        // Migration 0188 records it and this is what reads it back.
+        //
+        // ATOMIC WITH THE REVOKE deliberately. Two transactions would leave a window in which
+        // the credential is dead and the access it granted is live, and a failure between them
+        // would leave that state permanently with nothing to reconcile it: the retry finds the
+        // connection already revoked, takes the early return above, and never reaches here.
+        //
+        // NO ORGANIZATION PREDICATE, and that is correct rather than an omission, for the same
+        // reason the membership-attachment cascade gives: a connection belongs to exactly one
+        // organization and every binding it wrote copied that organization from it, so the
+        // connection id already names the organization. Requiring the caller to pass one it has
+        // no independent reason to know, and silently under-revoking when it passed the wrong
+        // one, is the failure that argument avoids. The scope predicates above row-level
+        // security are carried as everywhere else.
+        //
+        // `deleted_at IS NULL` so a binding an operator had already removed keeps the
+        // `deleted_at` it earned. Rewriting it would destroy the record of when that person's
+        // access actually stopped, which is the forensic value the soft delete exists for.
+        let torn_down = tear_down_connection_bindings(&mut tx, env, scope, id, now_micros).await?;
+
         let spec = AuditedWrite {
             store: self.store,
             scope,
@@ -75061,12 +75209,148 @@ impl ActingScimConnectionRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // THE TEARDOWN'S OWN ROW, and only when it removed something. A revoke that tore down
+        // nothing writing this anyway would claim a teardown it did not perform, which is the
+        // phantom-audit-row defect `revoke_membership_attachments_audited` documents.
+        if torn_down > 0 {
+            let torn_down_spec = AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScimConnectionBindingsRevoked,
+                target: id,
+            };
+            let detail = format!("bindings={torn_down}");
+            insert_audit_row(&mut tx, &torn_down_spec, Some(detail.as_str())).await?;
+        }
         // IN THE SAME TRANSACTION as the revocation and its audit row, and only on the
         // already-revoked-returns-early path above having NOT been taken.
         enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(true)
     }
+}
+
+/// Soft-delete every live group binding `connection` pushed, announcing each affected group,
+/// inside the caller's transaction (issue #136, criterion 6).
+///
+/// Returns how many bindings were removed, which the caller audits.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on a persistence fault; [`StoreError::Conflict`] if the delta type
+/// is not registered, which is unreachable while it is.
+async fn tear_down_connection_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    connection: &ScimConnectionId,
+    now_micros: i64,
+) -> Result<u64, StoreError> {
+    // RETURNING WHO LEFT WHICH GROUP, because the teardown has to ANNOUNCE itself and a
+    // count cannot. It removes access -- possibly from thousands of people at once -- and
+    // the first version of this enqueued nothing, so every downstream mirror kept those
+    // memberships forever while `effective_roles` had already stopped returning the roles.
+    // A review measured it: the group's feed was byte-identical before and after a revoke
+    // that emptied it. Every other binding write in this crate announces itself; the one
+    // path that can remove tens of thousands must not be the exception.
+    //
+    // The join to `org_memberships` is what turns a binding into the PERSON who left, which is
+    // what `org_group.membership_changed` carries. It cannot drop a ROW: 0088's foreign key
+    // makes `membership_id` resolvable for every binding that exists. It can produce a NULL
+    // `user_id`, because a membership may belong to a service account, so the loop below reads
+    // that column fallibly.
+    let torn_down_rows = sqlx::query(
+        "UPDATE org_group_members gm SET \
+             deleted_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
+             updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
+         FROM org_memberships m \
+         WHERE m.id = gm.membership_id \
+         AND gm.tenant_id = $2 AND gm.environment_id = $3 \
+         AND gm.source_scim_connection_id = $4 AND gm.deleted_at IS NULL \
+         RETURNING gm.group_id, gm.organization_id, m.user_id",
+    )
+    .bind(now_micros)
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(connection.to_string())
+    .fetch_all(&mut **tx)
+    .await?;
+    let torn_down = torn_down_rows.len() as u64;
+
+    // ONE DELTA PER GROUP, which is the grain the type is about: its subject is the group
+    // and its ordering key is the group, so a consumer applying one group's changes in
+    // sequence gets them in sequence. A single event spanning groups would have to pick one
+    // subject and would put every other group's change on a stranger's ordering key.
+    //
+    // The removals are announced as a DELTA rather than as one `member_removed` each, because
+    // the delta is the only form that can say "there was more than I could carry":
+    // `membership_change` truncates the arrays at the cap and sets `truncated` with the true
+    // `total`, so a mirror reconciles instead of applying a prefix.
+    //
+    // WHAT THE CAP DOES NOT BOUND, since "the shape the cap exists for" invites the assumption
+    // that it bounds the work: it truncates each event's ARRAY and nothing else. The rows are
+    // all fetched into memory, grouped here, and one outbox row is written per distinct group,
+    // so a connection holding bindings across many groups makes this transaction proportionally
+    // large in memory and in rows written. That is bounded in practice by how many groups one
+    // connection pushes into, not by the cap.
+    //
+    // AND ONLY THE DELTA IS EMITTED, not the per-member `org_group.member_removed` that every
+    // other removal path in this crate emits beside it. An integrator subscribed to the
+    // per-member type does not see a teardown. That is a deliberate trade against writing one
+    // outbox row per binding for a path whose whole point is that it can remove tens of
+    // thousands at once, and it is the one asymmetry in this crate's event coverage.
+    let mut by_group: Vec<(String, String, Vec<String>)> = Vec::new();
+    for row in &torn_down_rows {
+        let group: String = row.get("group_id");
+        let organization: String = row.get("organization_id");
+        // `try_get`, because the join carries no `owner_kind` predicate and a membership row can
+        // name no user. Nothing shipped creates a service account's binding WITH a source today,
+        // so this is latent rather than reachable, and a `get` would have PANICKED on it. The
+        // binding is torn down either way; only the announcement narrows.
+        let Ok(user) = row.try_get::<String, _>("user_id") else {
+            continue;
+        };
+        if let Some(entry) = by_group.iter_mut().find(|(g, _, _)| *g == group) {
+            entry.2.push(user);
+        } else {
+            by_group.push((group, organization, vec![user]));
+        }
+    }
+    for (group, organization, users) in by_group {
+        let change = membership_change(Vec::new(), users);
+        let mut payload = membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
+        payload["org_group_id"] = serde_json::json!(group);
+        payload["organization_id"] = serde_json::json!(organization);
+        let event_id = format!("evt_{}", CorrelationId::generate(env));
+        let Some(envelope) = crate::event_catalog::envelope(
+            &event_id,
+            "org_group.membership_changed",
+            &scope.tenant().to_string(),
+            &scope.environment().to_string(),
+            now_micros / 1000,
+            &payload,
+        ) else {
+            // UNREACHABLE while the type is registered, and a failure rather than a silent
+            // skip: a teardown that removed access and announced nothing is the defect this
+            // whole block exists to close.
+            return Err(StoreError::Conflict);
+        };
+        enqueue_domain_event(
+            tx,
+            env,
+            scope,
+            Some(&DomainEvent {
+                id: &event_id,
+                subject: &group,
+                envelope: &envelope,
+            }),
+        )
+        .await?;
+    }
+
+    Ok(torn_down)
 }
 
 /// The SCIM `externalId` mappings for one scope (issue #135).
