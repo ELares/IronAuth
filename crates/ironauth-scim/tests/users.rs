@@ -4127,7 +4127,12 @@ async fn audit_rows(db: &TestDatabase, scope: Scope, action: &str) -> usize {
 /// deactivate announces `user.deactivated` and `user.state_changed` under a different
 /// `user_id`, which `events_through` can see because it looks for its sentinel on the whole
 /// feed.
-async fn provision_and_deactivate(db: &TestDatabase, env: &Env, token: &str, handle: &str) -> String {
+async fn provision_and_deactivate(
+    db: &TestDatabase,
+    env: &Env,
+    token: &str,
+    handle: &str,
+) -> String {
     let (status, created) = call(
         db,
         env,
@@ -4387,7 +4392,11 @@ async fn a_deactivate_announces_a_different_type_than_a_delete() {
     .await;
     assert_eq!(
         types(&events),
-        vec!["user.deactivated", "user.state_changed", "user.state_changed"],
+        vec![
+            "user.deactivated",
+            "user.state_changed",
+            "user.state_changed"
+        ],
         "exactly three: the deactivation on both grains, and the account coming back. A fourth \
          means the repeated deactivate announced itself again, which a receiver would count as \
          a second termination; a missing third means the reactivation is silent on both grains"

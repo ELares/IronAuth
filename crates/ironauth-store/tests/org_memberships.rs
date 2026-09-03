@@ -1494,12 +1494,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
     };
 
     let added_event = per_member("evt_group_member_added", "org_group.member_added", 1);
-    let added_delta = delta_of(
-        vec![user.to_string()],
-        Vec::new(),
-        1,
-        "evt_group_delta_add",
-    );
+    let added_delta = delta_of(vec![user.to_string()], Vec::new(), 1, "evt_group_delta_add");
     db.control_store()
         .management()
         .acting(actor(&env), CorrelationId::generate(&env))
@@ -1540,10 +1535,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
         .find(|event| event["type"] == "org_group.membership_changed")
         .expect("the delta form");
     assert_eq!(changed["payload"]["org_group_id"], group.to_string());
-    assert_eq!(
-        changed["payload"]["added_user_ids"][0],
-        user.to_string()
-    );
+    assert_eq!(changed["payload"]["added_user_ids"][0], user.to_string());
     for event in &events {
         ironauth_store::event_catalog::validate_event(event)
             .expect("both envelopes validate against the registry the fan-out enforces");

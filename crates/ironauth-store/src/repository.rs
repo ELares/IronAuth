@@ -49248,6 +49248,62 @@ pub struct OrgMembershipRepo<'a> {
 }
 
 impl OrgMembershipRepo<'_> {
+    /// The person each of `memberships` binds, in ONE query.
+    ///
+    /// A caller that needs the user behind several memberships had been calling
+    /// [`Self::get`] in a loop, and the loop is bounded by the management list cap: a SCIM
+    /// replace that empties a full group paid a thousand sequential round trips before it
+    /// wrote anything. This asks once.
+    ///
+    /// A membership that is absent or out of this scope is simply not in the result. The caller
+    /// gets a map, not a promise that every id resolved, because the write that follows is what
+    /// answers for an id that names nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if any id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn users_for(
+        &self,
+        memberships: &[OrgMembershipId],
+    ) -> Result<Vec<(OrgMembershipId, UserId)>, StoreError> {
+        if memberships.iter().any(|id| id.scope() != self.scope) {
+            return Err(StoreError::NotFound);
+        }
+        if memberships.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = self.scope;
+        let ids: Vec<String> = memberships.iter().map(ToString::to_string).collect();
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, user_id FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND id = ANY($3) AND deleted_at IS NULL AND owner_kind = 'user'",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get("id");
+            let user: String = row.get("user_id");
+            let (Ok(id), Ok(user)) = (
+                OrgMembershipId::parse_in_scope(&id, &scope),
+                UserId::parse_in_scope(&user, &scope),
+            ) else {
+                // A row this scope's own query returned whose ids do not parse in it is
+                // corruption, not a miss, and answering `NotFound` would hide it.
+                return Err(StoreError::Database(sqlx::Error::RowNotFound));
+            };
+            out.push((id, user));
+        }
+        Ok(out)
+    }
+
     /// Parse an untrusted membership identifier under this scope. A malformed id and
     /// one minted in another scope both return the uniform not-found.
     ///
@@ -75226,10 +75282,23 @@ async fn tear_down_connection_bindings(
     // sequence gets them in sequence. A single event spanning groups would have to pick one
     // subject and would put every other group's change on a stranger's ordering key.
     //
-    // The removals are announced as a DELTA rather than as one `member_removed` each,
-    // because this is the shape the cap exists for: a connection can hold tens of thousands
-    // of bindings, and `membership_change` truncates with `truncated` and the true `total`
-    // so a mirror knows to reconcile instead of applying a prefix.
+    // The removals are announced as a DELTA rather than as one `member_removed` each, because
+    // the delta is the only form that can say "there was more than I could carry":
+    // `membership_change` truncates the arrays at the cap and sets `truncated` with the true
+    // `total`, so a mirror reconciles instead of applying a prefix.
+    //
+    // WHAT THE CAP DOES NOT BOUND, since "the shape the cap exists for" invites the assumption
+    // that it bounds the work: it truncates each event's ARRAY and nothing else. The rows are
+    // all fetched into memory, grouped here, and one outbox row is written per distinct group,
+    // so a connection holding bindings across many groups makes this transaction proportionally
+    // large in memory and in rows written. That is bounded in practice by how many groups one
+    // connection pushes into, not by the cap.
+    //
+    // AND ONLY THE DELTA IS EMITTED, not the per-member `org_group.member_removed` that every
+    // other removal path in this crate emits beside it. An integrator subscribed to the
+    // per-member type does not see a teardown. That is a deliberate trade against writing one
+    // outbox row per binding for a path whose whole point is that it can remove tens of
+    // thousands at once, and it is the one asymmetry in this crate's event coverage.
     let mut by_group: Vec<(String, String, Vec<String>)> = Vec::new();
     for row in &torn_down_rows {
         let group: String = row.get("group_id");
@@ -75243,8 +75312,7 @@ async fn tear_down_connection_bindings(
     }
     for (group, organization, users) in by_group {
         let change = membership_change(Vec::new(), users);
-        let mut payload =
-            membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
+        let mut payload = membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
         payload["org_group_id"] = serde_json::json!(group);
         payload["organization_id"] = serde_json::json!(organization);
         let event_id = format!("evt_{}", CorrelationId::generate(env));

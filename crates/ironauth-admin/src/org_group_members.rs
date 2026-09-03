@@ -206,7 +206,7 @@ pub async fn add_org_group_member(
         response_status: 201,
         response_body: &body_string,
     };
-    // NEITHER endpoint is resolved here before the store. The store resolves both as
+    // NEITHER endpoint is resolved here as a PRECONDITION of the write. The store resolves both as
     // live rows of THIS organization INSIDE the audited write transaction and BEFORE
     // any conflict reasoning, so a pre-read here would be redundant, would be stale
     // by the time the write ran, and would answer "does that group exist" a request
@@ -221,7 +221,7 @@ pub async fn add_org_group_member(
     // whether an event can be built, so the ordering the comment above preserves is intact and
     // an absent membership announces nothing rather than announcing a guess.
     let delta =
-        group_membership_delta_for(&state, scope, &group, &org_id, &membership, true).await;
+        group_membership_delta_for(&state, scope, &group, &org_id, &membership, true).await?;
     let pending = org_group_member_event(
         &state,
         scope,
@@ -411,7 +411,7 @@ pub async fn remove_org_group_member(
         &binding.membership_id,
         false,
     )
-    .await;
+    .await?;
     let pending = org_group_member_event(
         &state,
         scope,
@@ -478,18 +478,6 @@ fn org_group_member_event(
     })
 }
 
-/// The GROUP membership delta (issue #107's criterion, issue #108's registry), the twin of
-/// the organization form.
-///
-/// Groups are where the cap actually bites. An enterprise group is the thing with tens of
-/// thousands of members, and issue #107 named full group dumps as the failure mode this
-/// contract exists to avoid: past the cap the arrays become a PREFIX, `truncated` says so,
-/// and the consumer re-reads the membership through the management API rather than applying
-/// a delta that would leave it confidently wrong about everyone it was not sent.
-///
-/// Emitted beside `org_group.member_added`/`member_removed`, in the same transaction, for the
-/// reason the organization twin documents: the per-member type says WHO, this says what the
-/// SET did, and only this one can say "there was more than I could carry".
 /// The delta for one membership joining or leaving one group, resolved to the PERSON.
 ///
 /// THE ARRAYS CARRY USER IDS, so the membership is resolved to whom it binds. A membership id in
@@ -508,23 +496,53 @@ async fn group_membership_delta_for(
     organization_id: &ironauth_store::OrganizationId,
     membership_id: &ironauth_store::OrgMembershipId,
     joining: bool,
-) -> Option<crate::events::PendingEvent> {
-    let record = state
+) -> Result<Option<crate::events::PendingEvent>, ApiError> {
+    let record = match state
         .store()
         .management()
         .org_memberships(scope)
         .get(membership_id)
         .await
-        .ok()?;
+    {
+        Ok(record) => record,
+        // NOT-FOUND IS THE ONLY MISS THIS MAY SWALLOW. The store answers the authoritative
+        // not-found for the write itself a moment later, so building no event is correct: there
+        // is nothing to announce.
+        Err(ironauth_store::StoreError::NotFound) => return Ok(None),
+        // ANYTHING ELSE FAILS THE REQUEST. `remove_with_event` promises a consumer sees "never
+        // one form without the other", and the first version of this ended the read with
+        // `.ok()?`: a transient database fault dropped the delta while the binding committed and
+        // the per-member event was enqueued, silently and with no way to notice.
+        Err(_) => return Err(ApiError::Internal),
+    };
     let user = record.user_id.to_string();
     let (added, removed) = if joining {
         (vec![user], Vec::new())
     } else {
         (Vec::new(), vec![user])
     };
-    group_membership_delta_event(state, scope, group_id, organization_id, added, removed)
+    Ok(group_membership_delta_event(
+        state,
+        scope,
+        group_id,
+        organization_id,
+        added,
+        removed,
+    ))
 }
 
+/// The GROUP membership delta (issue #107's criterion, issue #108's registry), the twin of
+/// the organization form.
+///
+/// Groups are where the cap actually bites. An enterprise group is the thing with tens of
+/// thousands of members, and issue #107 named full group dumps as the failure mode this
+/// contract exists to avoid: past the cap the arrays become a PREFIX, `truncated` says so,
+/// and the consumer re-reads the membership through the management API rather than applying
+/// a delta that would leave it confidently wrong about everyone it was not sent.
+///
+/// Emitted beside `org_group.member_added`/`member_removed`, in the same transaction, for the
+/// reason the organization twin documents: the per-member type says WHO, this says what the
+/// SET did, and only this one can say "there was more than I could carry".
 fn group_membership_delta_event(
     state: &AdminState,
     scope: ironauth_store::Scope,

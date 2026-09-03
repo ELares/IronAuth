@@ -445,19 +445,39 @@ async fn plan_members(
         .collect();
     let mut removing = Vec::new();
     if replace {
+        let departing: Vec<OrgMembershipId> = existing
+            .iter()
+            .filter(|binding| {
+                !wanted
+                    .iter()
+                    .any(|member| member.membership == binding.membership_id)
+            })
+            .map(|binding| binding.membership_id)
+            .collect();
+        // THE PEOPLE, not just the bindings, and in ONE query. A removal delta names who LEFT,
+        // and this is the only place that knows: the binding row records the membership and the
+        // request named the members who STAY, so a departing person appears in neither.
+        //
+        // Asked once rather than per member, because the loop is bounded by the scan bound: a
+        // replace that empties a full group would otherwise pay a thousand sequential round
+        // trips before writing anything.
+        let users = state
+            .store()
+            .scoped(auth.scope)
+            .org_memberships()
+            .users_for(&departing)
+            .await
+            .map_err(|error| store_failure(&error))?;
         for binding in existing {
-            if wanted
+            let Some((_, user)) = users
                 .iter()
-                .any(|member| member.membership == binding.membership_id)
-            {
+                .find(|(membership, _)| *membership == binding.membership_id)
+            else {
                 continue;
-            }
-            // THE PERSON, not just the binding. A removal delta names who LEFT, and this is the
-            // only place that knows: the binding row records the membership and the request
-            // named the members who stay, so a departing person appears in neither.
+            };
             removing.push((
                 ResolvedMember {
-                    user: user_of_membership(state, auth, &binding.membership_id).await?,
+                    user: *user,
                     membership: binding.membership_id,
                 },
                 binding.id,
@@ -465,22 +485,6 @@ async fn plan_members(
         }
     }
     Ok(MemberPlan { adding, removing })
-}
-
-/// The person an organization membership binds.
-async fn user_of_membership(
-    state: &ScimState,
-    auth: &Authenticated,
-    membership: &OrgMembershipId,
-) -> Result<UserId, Response> {
-    state
-        .store()
-        .scoped(auth.scope)
-        .org_memberships()
-        .get(membership)
-        .await
-        .map(|record| record.user_id)
-        .map_err(|error| store_failure(&error))
 }
 
 /// A member this request named, resolved to both the person and the binding endpoint.
@@ -533,11 +537,13 @@ async fn set_members(
         ));
     }
     let writes = plan.writes();
+    // AN EARLY RETURN, NOT THE GUARANTEE, and the difference is worth stating because it reads
+    // like one. Nothing-changed announces nothing because the delta only ever rides an actual
+    // write: with zero writes there is nothing for it to ride, so deleting this line changes no
+    // behaviour and a review measured that (25 tests green with it gone). It is here because a
+    // `PUT` restating a group's current membership is the ordinary output of a sync sweep and
+    // there is no reason to build an event nobody will send.
     if writes == 0 {
-        // NOTHING CHANGED, so nothing is announced. A `PUT` that restates a group's current
-        // membership is the ordinary output of an identity provider's sync sweep, and a delta
-        // claiming a change it did not make is the phantom-event defect the activation upsert's
-        // conflict arm exists to prevent on the user side.
         return Ok(());
     }
     let organization = auth.connection.organization_id.to_string();
@@ -672,6 +678,9 @@ async fn drop_members(
                 .map(|binding| (*member, binding.id))
         })
         .collect();
+    // The same early return as `set_members`, and the same note: it is an optimisation. RFC 7644
+    // makes a remove of an absent member a no-op rather than an error, and the delta rides a
+    // write, so an operation with nothing to remove announces nothing either way.
     if removing.is_empty() {
         return Ok(());
     }

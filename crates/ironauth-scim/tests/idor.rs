@@ -40,8 +40,8 @@ use ironauth_store::identifier::{IdentifierType, UniquenessMode};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, EnterpriseWrite, NewAdminUser, NewMembership, NewScimConnection,
-    NewUserIdentifier, OrgMembershipId, OrganizationId, ScimConnectionId, Scope, StoreError, UserId,
-    UserIdentifierId, UserState,
+    NewUserIdentifier, OrgMembershipId, OrganizationId, ScimConnectionId, Scope, StoreError,
+    UserId, UserIdentifierId, UserState,
 };
 
 /// What a fenced operation answered, with the refusal folded into the value a caller with no

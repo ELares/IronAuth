@@ -27,18 +27,26 @@
 -- group at most once, so this column records who bound them FIRST and there is nowhere to
 -- record a second asserter.
 --
--- What follows, measured, and stated here because it is the sharpest edge of the design: with
--- two connections provisioning one organization, the second one's push of a person the first
--- already bound is accepted and writes nothing, and revoking the FIRST connection removes a
--- binding the second still asserts. The second restores it on its next full-membership sync (a
--- PUT or a replace-PATCH names the whole set, so the missing binding is rewritten), but a
--- client that sends only incremental changes will not, and the person loses that group's roles
--- until somebody notices.
+-- What follows with TWO CONNECTIONS PROVISIONING ONE ORGANIZATION, which is the sharpest edge
+-- of the design and is what `two_connections_on_one_organization_share_one_binding` drives:
 --
--- The same asymmetry runs the other way: an operator cannot take over a binding a connection
--- already made, because the insert is refused as a conflict. So "an operator's binding survives
--- a teardown" is true of the bindings an operator wrote FIRST, and there is no way to convert
--- one afterwards.
+--   * the second connection's push of a person the first already bound is accepted and writes
+--     nothing, so the binding stays attributed to the first;
+--   * revoking the FIRST removes a binding the second still asserts. The second rewrites it on
+--     its next full-membership sync (a PUT or a replace-PATCH names the whole set), and an
+--     incremental client that sends only changes does not, so the person loses that group's
+--     roles until somebody notices;
+--   * and the second connection's ORDINARY full-membership PUT deletes the FIRST connection's
+--     binding whenever it does not name that person, because a replace reconciles against every
+--     existing binding regardless of who wrote it. That is the case that needs no revoke at
+--     all, and it is the reason two connections should not push into one group.
+--
+-- The same asymmetry runs the other way: an operator cannot ADD a binding a connection already
+-- made, because the insert is refused as a conflict. They can CONVERT one, with two calls the
+-- management surface already exposes -- remove the binding, then add it back with no source --
+-- and after that a revoke of the connection leaves it alone. So "an operator's binding survives
+-- a teardown" is true of the bindings an operator wrote or re-wrote, and the operator has a way
+-- to make it true of any binding they choose. It is not automatic and nothing prompts them.
 --
 -- Fixing either needs a second table recording every asserter of a binding, which is a
 -- different schema and a different issue. This column answers the question criterion 6 asks --
@@ -51,7 +59,7 @@
 -- management API afterwards, carries NULL. That is the correct value rather than a gap to be
 -- backfilled: those bindings were not derived from any connection and the teardown must never
 -- touch them. Criterion 5's "directly granted roles survive" is this column being NULL, and the
--- teardown's predicate is `source_scim_connection_id = $1`, which no NULL row can satisfy --
+-- teardown's predicate is `source_scim_connection_id = $4`, which no NULL row can satisfy --
 -- in SQL a NULL comparison is never true, so the survival property is a consequence of the type
 -- rather than of remembering to write the exclusion. It holds for the bindings an operator
 -- wrote FIRST; see the note above for what that leaves out.

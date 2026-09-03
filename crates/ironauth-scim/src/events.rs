@@ -224,13 +224,7 @@ pub(crate) fn group_membership_delta_event(
         ironauth_store::membership_delta_payload(&change, "added_user_ids", "removed_user_ids");
     payload["org_group_id"] = serde_json::json!(group);
     payload["organization_id"] = serde_json::json!(organization);
-    envelope_for(
-        state,
-        scope,
-        GROUP_MEMBERSHIP_CHANGED,
-        group,
-        &payload,
-    )
+    envelope_for(state, scope, GROUP_MEMBERSHIP_CHANGED, group, &payload)
 }
 
 #[cfg(test)]

@@ -1550,7 +1550,10 @@ async fn a_group_membership_push_maps_roles_immediately_and_announces_the_delta(
         ["org_group.member_removed", "org_group.membership_changed"],
         "the removal announces the same pair"
     );
-    assert_eq!(events[3].payload["payload"]["removed_user_ids"], json!([user]));
+    assert_eq!(
+        events[3].payload["payload"]["removed_user_ids"],
+        json!([user])
+    );
 }
 
 /// Removing a mapping rule removes ONLY the derived assignments (issue #136, criterion 5).
@@ -1656,6 +1659,44 @@ async fn removing_a_mapping_rule_leaves_a_direct_grant_standing() {
         "removing the mapping rule must take the DERIVED role and leave the direct grant, which \
          an operator made for this person and no identity provider is responsible for"
     );
+}
+
+/// A SECOND provisioning credential for an organization that already has one.
+///
+/// `seed_provisioner` always creates a new organization, so nothing could drive two connections
+/// against one until this existed.
+async fn second_connection(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    secret: &str,
+) -> Provisioner {
+    let id = ScimConnectionId::generate(env, &scope);
+    let token = mint_token(&id, secret);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .scim_connections()
+        .create(
+            env,
+            NewScimConnection {
+                id: &id,
+                organization_id: organization,
+                display_name: "second",
+                provider: "entra",
+                token_digest: &digest_of(&token),
+                expires_at_unix_micros: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the second connection");
+    Provisioner {
+        token,
+        organization: *organization,
+        connection: id,
+    }
 }
 
 /// How many teardown audit rows `scope` holds.
@@ -1784,7 +1825,6 @@ async fn revoking_a_connection_tears_down_the_bindings_it_pushed() {
         acme.connection.to_string(),
         "targeted at the connection, which is the thing the operator acted on"
     );
-
 }
 
 /// And the teardown ANNOUNCES itself (issue #136, criterion 6).
@@ -2145,5 +2185,283 @@ async fn a_replace_that_drops_a_member_announces_the_removal() {
     assert!(
         members(&db, &env, &acme.token, &group).await.is_empty(),
         "the replace did not actually remove them, so the events above describe nothing"
+    );
+}
+
+/// A PATCH removing TWO members announces ONE delta naming both, riding the last write
+/// (issue #136, criterion 4).
+///
+/// The twin of the two-member ADD test, and it exists for the same measured reason: round 1
+/// added the plural case on the add path only, and a review then moved the delta to ride the
+/// FIRST removal on both removal loops and watched 25 tests pass. The design decision was
+/// covered on one of three write loops.
+#[tokio::test]
+async fn a_two_member_removal_announces_one_delta_naming_both_after_both_writes() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let first = provision(&db, &env, &acme.token, "first@example.com").await;
+    let second = provision(&db, &env, &acme.token, "second@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &first).await;
+    push_member(&db, &env, &acme.token, &group, &second).await;
+    let before = events_about_group(&db, scope, &group, 4).await.len();
+
+    // ONE remove operation naming TWO members, which `drop_members` applies as one plan. Two
+    // SEPARATE remove operations would be two plans and two deltas, which is also correct: the
+    // delta's grain is the operation, not the request. Only one operation can exercise "the
+    // last write of a plan with more than one write in it".
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(patch(&json!([{
+            "op": "remove",
+            "path": "members",
+            "value": [{"value": first}, {"value": second}],
+        }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let events = events_about_group(&db, scope, &group, before + 3).await;
+    let tail = event_types(&events)[before..].to_vec();
+    assert_eq!(
+        tail,
+        vec![
+            "org_group.member_removed",
+            "org_group.member_removed",
+            "org_group.membership_changed",
+        ],
+        "one delta, LAST: riding the first removal would announce a set change while the second \
+         binding was still live"
+    );
+    let mut announced: Vec<String> = events[before + 2].payload["payload"]["removed_user_ids"]
+        .as_array()
+        .expect("the delta names who left")
+        .iter()
+        .map(|value| value.as_str().expect("a user id").to_owned())
+        .collect();
+    announced.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(announced, expected);
+}
+
+/// And the REPLACE path's removal loop, which is a different loop from the PATCH remove
+/// (issue #136, criterion 4).
+///
+/// `set_members` removes as the tail of an operation that may also have added, so its "last
+/// write" is the last write OVERALL rather than the last removal. A PUT that drops two people
+/// and adds none is the smallest input that separates it from riding the first.
+#[tokio::test]
+async fn a_replace_that_drops_two_members_announces_one_delta_naming_both() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let first = provision(&db, &env, &acme.token, "first@example.com").await;
+    let second = provision(&db, &env, &acme.token, "second@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &first).await;
+    push_member(&db, &env, &acme.token, &group, &second).await;
+    let before = events_about_group(&db, scope, &group, 4).await.len();
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "displayName": "Engineering",
+            "members": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let events = events_about_group(&db, scope, &group, before + 3).await;
+    assert_eq!(
+        event_types(&events)[before..],
+        [
+            "org_group.member_removed",
+            "org_group.member_removed",
+            "org_group.membership_changed",
+        ]
+    );
+    let mut announced: Vec<String> = events[before + 2].payload["payload"]["removed_user_ids"]
+        .as_array()
+        .expect("the delta names who left")
+        .iter()
+        .map(|value| value.as_str().expect("a user id").to_owned())
+        .collect();
+    announced.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(announced, expected);
+}
+
+/// TWO CONNECTIONS ON ONE ORGANIZATION SHARE ONE BINDING, which is what migration 0188's
+/// provenance note describes (issue #136, criterion 6).
+///
+/// The note used to say "measured" over behaviour nothing drove: `seed_provisioner` always
+/// creates a NEW organization, so no test anywhere had two connections in one. This is that
+/// test, and it pins all three consequences the note now states.
+#[tokio::test]
+async fn two_connections_on_one_organization_share_one_binding() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let second = second_connection(&db, &env, scope, &acme.organization, "s-second").await;
+
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let user = provision(&db, &env, &acme.token, "shared@example.com").await;
+    // Provisioned NOW, while the first connection's token is still live: it is revoked below.
+    let third = provision(&db, &env, &acme.token, "third@example.com").await;
+    push_member(&db, &env, &acme.token, &group, &user).await;
+
+    // THE SECOND CONNECTION'S PUSH IS ACCEPTED AND WRITES NOTHING. The binding stays attributed
+    // to the first, because there is one row per (group, membership) and it already exists.
+    push_member(&db, &env, &second.token, &group, &user).await;
+
+    // REVOKING THE FIRST REMOVES A BINDING THE SECOND STILL ASSERTS.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("revoke the first connection");
+    assert!(
+        members(&db, &env, &second.token, &group).await.is_empty(),
+        "the second connection still asserts this membership and can no longer see it"
+    );
+
+    // AND ITS NEXT FULL-MEMBERSHIP SYNC REWRITES IT, which is the repair path the note names.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&second.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "displayName": "Engineering",
+            "members": [{"value": user}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        members(&db, &env, &second.token, &group).await,
+        vec![user.clone()],
+        "a full-membership sync must restore what the revoke removed, or the note's repair path \
+         does not exist"
+    );
+
+    // AND THE SHARPER CASE: a replace reconciles against every existing binding regardless of
+    // who wrote it, so one connection's ordinary sync DELETES another's binding whenever it does
+    // not name that person. No revoke involved. This is why two connections should not push into
+    // one group.
+    push_member(&db, &env, &second.token, &group, &third).await;
+    let (status, body) = call(
+        &db,
+        &env,
+        "PUT",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&second.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "displayName": "Engineering",
+            "members": [{"value": third}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        members(&db, &env, &second.token, &group).await,
+        vec![third],
+        "a replace naming only its own person left the other one behind, so 0188's warning \
+         describes something that does not happen"
+    );
+}
+
+/// An operator CAN convert a connection's binding to their own, with two calls the management
+/// surface already exposes (issue #136, criterion 5).
+///
+/// Migration 0188 used to say there was no way to do this. There is: remove the binding, add it
+/// back with no source. It is not automatic and nothing prompts an operator to do it, which is
+/// what the note says now.
+#[tokio::test]
+async fn an_operator_can_convert_a_pushed_binding_to_their_own() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let group_id = ironauth_store::OrgGroupId::parse_in_scope(&group, &scope).expect("a group id");
+    let role = define_role(&db, &env, scope, &acme.organization, "deployer").await;
+    map_group_to_role(&db, &env, scope, &acme.organization, &group_id, &role).await;
+
+    let user = provision(&db, &env, &acme.token, "converted@example.com").await;
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    let membership = membership_of(&db, scope, &acme.organization, &subject).await;
+    push_member(&db, &env, &acme.token, &group, &user).await;
+
+    // THE CONVERSION: remove, then add back with no source.
+    let acting = || {
+        db.control_store()
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+    };
+    let binding = db
+        .control_store()
+        .management()
+        .org_group_members(scope)
+        .get_binding(&acme.organization, &group_id, &membership)
+        .await
+        .expect("the pushed binding");
+    acting()
+        .org_group_members(scope)
+        .remove(&env, &acme.organization, &binding.id)
+        .await
+        .expect("the operator removes it");
+    acting()
+        .org_group_members(scope)
+        .add(
+            &env,
+            ironauth_store::NewOrgGroupMember {
+                id: &ironauth_store::OrgGroupMemberId::generate(&env, &scope),
+                organization_id: &acme.organization,
+                group_id: &group_id,
+                membership_id: &membership,
+                source_scim_connection_id: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("the operator adds it back as their own");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("revoke the connection");
+
+    assert!(
+        roles_of(&db, scope, &acme.organization, &subject)
+            .await
+            .contains("deployer"),
+        "the converted binding did not survive the revoke, so 0188's account of what an \\
+         operator can do is wrong"
     );
 }
