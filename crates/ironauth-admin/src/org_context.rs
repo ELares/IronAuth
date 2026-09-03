@@ -306,24 +306,30 @@ pub async fn resolve_live_org(
     // "prove the parent, then address the child".
     //
     // The precondition also inherits its ORDERING from the one call site each handler
-    // already had. SEVEN of the twenty two organization-addressed writes carry an
-    // Idempotency-Key (the three creates and the four assigns), and every one of them
-    // performs the replay BEFORE it calls this function, which is the ordering the
+    // already had. The organization-addressed writes that carry an Idempotency-Key perform
+    // the replay BEFORE they call this function, which is the ordering the
     // sibling environment-scoped creates observe: a genuine replay still returns the
     // original response even if the environment went away in between, so a retry of a
     // request that ALREADY SUCCEEDED never becomes a 404 the client cannot tell from
-    // "my write never landed". The other fifteen carry no key, so there is nothing to
-    // order against and the precondition is simply the first thing after the scope is
-    // authorized.
+    // "my write never landed". The ones that carry no key have nothing to order against, so
+    // for them the precondition is simply the first thing after the scope is authorized.
     //
     // That ordering is a client-visible property, so it is PINNED rather than merely
     // observed: `a_keyed_writes_replay_survives_the_environments_deletion` in
-    // `tests/deleted_environment.rs` drives all seven, storing each response while the
+    // `tests/deleted_environment.rs` drives them, storing each response while the
     // environment is live, deleting the environment, and then requiring the same key to
-    // return the original 201 while a FRESH key at the same route is the uniform
+    // return the original response while a FRESH key at the same route is the uniform
     // not-found. Hoisting this precondition above the replay in `create_org_role` was
-    // measured to fail that test and nothing else in the file; the other six are driven
-    // by the same loop, which reports the route by name.
+    // measured to fail that test and nothing else in the file; the rest are driven by the
+    // same loop, which reports the route by name.
+    //
+    // NO COUNT HERE, deliberately. This comment used to say "SEVEN of the twenty two ... (the
+    // three creates and the four assigns)", and that was false when written and staler every
+    // release: the committed contract records the header per operation, and it now records
+    // FIFTEEN. The retraction landed in `deleted_environment.rs` and did not reach this file,
+    // which is why the number is gone rather than corrected --
+    // `the_keyed_write_list_is_measured_against_the_contract` derives it from the document and
+    // pins the undriven remainder exactly, so no prose has to hold it.
     if access == EnvironmentAccess::Write {
         require_live_environment(state, &scope).await?;
     }

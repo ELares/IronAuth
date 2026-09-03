@@ -72,6 +72,7 @@ mod invitations;
 mod keys;
 mod locales;
 mod messages;
+mod scim_connections;
 pub mod usage;
 mod whoami;
 
@@ -580,6 +581,18 @@ pub fn management_router(state: AdminState) -> Router {
         // API keys owned by an organization (issue #99, criterion 6). Read-only for now;
         // create, rotate and revoke follow. The store operations behind them all exist and
         // are audited, so this is the HTTP layer catching up rather than new capability.
+        // The SCIM connection surface (issue #135). Beside api-keys because it is the same
+        // kind of thing: a credential that authenticates AS the organization, minted here and
+        // returned exactly once.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
+            axum::routing::get(scim_connections::list_scim_connections)
+                .post(scim_connections::create_scim_connection),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
+            delete(scim_connections::revoke_scim_connection),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
             axum::routing::get(api_keys::list_organization_api_keys)

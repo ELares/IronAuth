@@ -99,6 +99,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrgRole",
     "createOrganizationApiKey",
     "createProjectGrant",
+    "createScimConnection",
     "createServiceAccountMembership",
     "decideAgentVaultApproval",
     "deleteMembership",
@@ -110,6 +111,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "registerAgent",
     "removeOrgGroupMember",
     "revokeOrganizationApiKey",
+    "revokeScimConnection",
     "rotateOrganizationApiKey",
     "setAgentState",
     "setOrgDefaultRole",
@@ -174,6 +176,14 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
     (
         "revokeOrganizationApiKey",
         include_str!("../src/api_keys.rs"),
+    ),
+    (
+        "createScimConnection",
+        include_str!("../src/scim_connections.rs"),
+    ),
+    (
+        "revokeScimConnection",
+        include_str!("../src/scim_connections.rs"),
     ),
     (
         "rotateOrganizationApiKey",

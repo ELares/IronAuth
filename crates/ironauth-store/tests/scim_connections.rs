@@ -84,6 +84,7 @@ async fn connect(
                 token_digest: &digest(token),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await
         .expect("create the connection");
@@ -226,7 +227,7 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org)
+        .list_for_organization(&org, 100, None)
         .await
         .expect("list");
     assert_eq!(listed.len(), 1, "the revoked connection is still listed");
@@ -250,7 +251,7 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org)
+        .list_for_organization(&org, 100, None)
         .await
         .expect("list");
     assert_eq!(
@@ -283,6 +284,7 @@ async fn an_expired_token_stops_authenticating_without_being_revoked() {
                 // One second in the past.
                 expires_at_unix_micros: Some(now - 1_000_000),
             },
+            None,
         )
         .await
         .expect("create");
@@ -303,7 +305,7 @@ async fn an_expired_token_stops_authenticating_without_being_revoked() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org)
+        .list_for_organization(&org, 100, None)
         .await
         .expect("list");
     assert!(!listed[0].revoked, "expired is not revoked");
@@ -325,7 +327,7 @@ async fn the_listing_is_per_organization_and_not_per_environment() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org_a)
+        .list_for_organization(&org_a, 100, None)
         .await
         .expect("list");
     assert_eq!(listed.len(), 1);
@@ -364,6 +366,7 @@ async fn a_connection_cannot_be_bound_to_another_tenants_organization() {
                 token_digest: &digest("scim_tok_cross"),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await;
     assert!(
@@ -385,9 +388,13 @@ async fn a_connection_cannot_be_bound_to_another_tenants_organization() {
 
 #[tokio::test]
 async fn every_scope_guard_refuses_a_foreign_id() {
-    // The three `NotFound` paths the repo documents. None was driven, which is the blind spot
-    // that let the cross-tenant bind above ship: a guard nothing exercises is a guard nobody
-    // notices the absence of.
+    // EVERY `NotFound` path the repo documents. None was driven at first, which is the blind
+    // spot that let the cross-tenant bind above ship: a guard nothing exercises is a guard
+    // nobody notices the absence of. It happened AGAIN with `exists_in_organization`: that
+    // function landed with a scope guard, this test's own doc still said "the three paths",
+    // and a reviewer measured that deleting both of its checks broke nothing across 30 tests.
+    // So the count is gone from this comment and the loop below drives whatever the repo
+    // documents.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope_a = db.seed_scope(&env).await;
@@ -412,6 +419,7 @@ async fn every_scope_guard_refuses_a_foreign_id() {
                 token_digest: &digest("scim_tok_foreign_id"),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await;
     assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
@@ -431,9 +439,45 @@ async fn every_scope_guard_refuses_a_foreign_id() {
         .store()
         .scoped(scope_a)
         .scim_connections()
-        .list_for_organization(&org_b)
+        .list_for_organization(&org_b, 100, None)
         .await;
     assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
+
+    // `exists_in_organization`, which fences on BOTH arguments, so both are driven. It is the
+    // revoke handler's ownership check: without the connection-id guard a handle minted in
+    // another tenant would answer the same as one of ours, and the handler would go on to
+    // revoke it.
+    let local_org = seed_org(&db, &env, scope_a, "Alpha two").await;
+    let local_id = ScimConnectionId::generate(&env, &scope_a);
+    for (label, org, id) in [
+        ("a foreign ORGANIZATION", &org_b, &local_id),
+        ("a foreign CONNECTION id", &local_org, &foreign_id),
+        ("both foreign", &org_b, &foreign_id),
+    ] {
+        let outcome = db
+            .store()
+            .scoped(scope_a)
+            .scim_connections()
+            .exists_in_organization(org, id)
+            .await;
+        assert!(
+            matches!(outcome, Err(ironauth_store::StoreError::NotFound)),
+            "exists_in_organization accepted {label}: {outcome:?}"
+        );
+    }
+
+    // The CONTROL. Both arguments in scope answers `Ok(false)` for a handle nothing created,
+    // so the refusals above are the scope guard and not this function refusing everything.
+    let outcome = db
+        .store()
+        .scoped(scope_a)
+        .scim_connections()
+        .exists_in_organization(&local_org, &local_id)
+        .await;
+    assert!(
+        matches!(outcome, Ok(false)),
+        "an in-scope pair naming no row must answer Ok(false), not a refusal: {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -861,6 +905,7 @@ async fn the_column_checks_refuse_a_malformed_digest_and_an_unknown_provider() {
                     token_digest,
                     expires_at_unix_micros: None,
                 },
+                None,
             )
             .await;
         assert!(

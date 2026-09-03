@@ -324,6 +324,9 @@ struct Fixture {
     /// an id that never resolved (issue #102).
     project_grant: String,
     api_key: String,
+    /// A LIVE SCIM connection, so the revoke case measures the environment fence rather than
+    /// a handle that never resolved (issue #135).
+    scim_connection: String,
     /// A real `sva_` principal, so the service-account key cases address a live owner rather
     /// than an id that never resolved (issue #99).
     service_account: String,
@@ -828,6 +831,23 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create api key: {body}");
         let api_key = field(&body, "/id", "seed api key");
+        // A REAL connection, on the same argument as the key above: revoking a handle that
+        // does not exist is the uniform not-found at a live environment too, so a bogus one
+        // would make the deleted-environment half indistinguishable from the live half.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/scim-connections"),
+                "seed-scim-connection",
+                &serde_json::json!({ "display_name": "sweep connection", "provider": "okta" })
+                    .to_string(),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create scim connection: {body}"
+        );
+        let scim_connection = field(&body, "/id", "seed scim connection");
         let session = h.seed_session(scope, &user).await;
         let family = h
             .seed_refresh_family(scope, &user, &client, &session, false)
@@ -1325,6 +1345,7 @@ impl Fixture {
             routing_rule,
             project_grant,
             api_key,
+            scim_connection,
             service_account,
             agent,
             approval,
@@ -1388,6 +1409,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         routing_rule,
         project_grant,
         api_key,
+        scim_connection,
         service_account,
         agent,
         approval,
@@ -2623,6 +2645,24 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{org_base}/api-keys/{api_key}"),
         ),
+        // The SCIM connection surface (issue #135), on the same three shapes as the API key
+        // above it, and against the REAL connection seeded with them.
+        Case::json(
+            "scim_connections.createScimConnection",
+            "POST",
+            format!("{org_base}/scim-connections"),
+            &serde_json::json!({ "display_name": "sweep connection", "provider": "okta" }),
+        ),
+        Case::empty(
+            "scim_connections.listScimConnections",
+            "GET",
+            format!("{org_base}/scim-connections"),
+        ),
+        Case::empty(
+            "scim_connections.revokeScimConnection",
+            "DELETE",
+            format!("{org_base}/scim-connections/{scim_connection}"),
+        ),
         // The service-account surface, same four shapes. Not nested under an organization:
         // `service_accounts` has no organization column, so the path addresses the
         // environment directly.
@@ -3153,6 +3193,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         routing_rule: "rrl_0".to_owned(),
         project_grant: "pgt_0".to_owned(),
         api_key: "akey_0".to_owned(),
+        scim_connection: "scimconn_0".to_owned(),
         connector: "con_0".to_owned(),
         log_stream: "lgs_0".to_owned(),
         flow_target: "ftg_0".to_owned(),
@@ -4038,6 +4079,22 @@ fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
             "migration.deleteOutboundVerification",
             StatusCode::NO_CONTENT,
         ),
+        // REVOKING a SCIM provisioning credential (issue #135), exempt on exactly the
+        // argument the entry above makes and for the same class of reason.
+        //
+        // `ScimConnectionRepo::authenticate` joins only `organizations` and checks
+        // `deleted_at`/`state` there, so soft-deleting an ENVIRONMENT stops nothing: a
+        // minted token goes on provisioning an organization's whole user population, which
+        // was measured by presenting one to the real `scim_router` after the delete. That
+        // is the same shape as the credential oracle above -- something that outlives the
+        // environment -- and fencing its off switch is the same one-way door.
+        //
+        // It still requires the environment to EXIST, and `tests/absent_environment.rs`
+        // drives this route to require the uniform not-found there.
+        (
+            "scim_connections.revokeScimConnection",
+            StatusCode::NO_CONTENT,
+        ),
     ])
 }
 
@@ -4062,8 +4119,10 @@ fn documented_write_row_effects() -> BTreeMap<String, i64> {
     BTreeMap::from([
         // The disarm destroys THIS environment's outbound-verification secret.
         ("environment_secrets".to_owned(), -1),
-        // And audits `environment_secret.delete` in the same transaction.
-        ("audit_log".to_owned(), 1),
+        // And audits `environment_secret.delete` in the same transaction. Two, not one: the
+        // SCIM connection revoke audits `scim_connection.revoked` the same way. See the note
+        // on `outbox_messages` below for why this map sums across exceptions.
+        ("audit_log".to_owned(), 2),
         // And ANNOUNCES it in the same transaction (issue #108), which belongs here for
         // the same reason the exception itself does. A soft-deleted environment KEEPS
         // answering the verify endpoint -- that is why the off switch must not be fenced
@@ -4076,7 +4135,12 @@ fn documented_write_row_effects() -> BTreeMap<String, i64> {
         // producer quietly dropped from the disarm leaves this at zero and fails here,
         // and a write that starts announcing something ELSE shows up as an unexpected
         // row rather than being absorbed by a tolerance.
-        ("outbox_messages".to_owned(), 1),
+        //
+        // The counts below are the SUM over both row-changing exceptions, because this map
+        // is per TABLE and not per operation. The SCIM revoke UPDATEs `scim_connections` in
+        // place, so that table's count does not move; what it adds is one audit row and one
+        // announcement, in the same transaction as the update. Hence two of each.
+        ("outbox_messages".to_owned(), 2),
     ])
 }
 

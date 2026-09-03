@@ -74566,6 +74566,8 @@ pub struct ScimConnection {
     pub revoked_at_unix_micros: Option<i64>,
     /// Whether it has been revoked.
     pub revoked: bool,
+    /// Creation time, which is the listing's sort key and therefore its cursor position.
+    pub created_at_unix_micros: i64,
 }
 
 /// Everything creating a SCIM connection needs (issue #135).
@@ -74637,6 +74639,7 @@ impl ScimConnectionRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(
             "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                    (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
                     (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
                     (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us \
              FROM scim_connections c \
@@ -74669,15 +74672,59 @@ impl ScimConnectionRepo<'_> {
             expires_at_unix_micros: row.get("expires_us"),
             revoked_at_unix_micros: row.get("revoked_us"),
             revoked: false,
+            created_at_unix_micros: row.get("created_us"),
         }))
     }
 
-    /// Every connection for one organization, oldest first.
+    /// Whether one connection handle names a LIVE OR REVOKED row inside one organization.
+    ///
+    /// A POINT LOOKUP rather than a scan of [`Self::list_for_organization`]. The revoke handler
+    /// used the listing, which was correct only while that listing was unbounded: the moment it
+    /// took a page limit, a connection past the first page stopped being revokable, and the
+    /// operator racing to kill a leaked credential would have been told it did not exist. The
+    /// bound and this function landed together for that reason.
+    ///
+    /// Revoked rows COUNT as present, so revoking twice is idempotent rather than a not-found.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn exists_in_organization(
+        &self,
+        organization_id: &OrganizationId,
+        id: &ScimConnectionId,
+    ) -> Result<bool, StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT 1 AS present FROM scim_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 AND id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.is_some())
+    }
+
+    /// One PAGE of connections for one organization, oldest first.
     ///
     /// Revoked and expired rows are INCLUDED, unlike [`Self::authenticate`]. This is the
     /// operator's inventory, and a revoked connection disappearing from it would make "this
     /// credential was revoked at 14:02" indistinguishable from "no such credential" -- which is
     /// the question an operator investigating a leak is actually asking.
+    ///
+    /// BOUNDED, like every other management listing. The first version took no limit and
+    /// returned every row, so one organization with a large enough inventory made a single
+    /// response arbitrarily large -- and `MANAGEMENT_LIST_HARD_CAP` existed precisely so no
+    /// caller could ask for that. `limit` is clamped to `CAP + 1` here, and the extra row is
+    /// what the handler turns into a `next_cursor` rather than a silent truncation.
     ///
     /// # Errors
     ///
@@ -74686,23 +74733,32 @@ impl ScimConnectionRepo<'_> {
     pub async fn list_for_organization(
         &self,
         organization_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
     ) -> Result<Vec<ScimConnection>, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
+        let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, organization_id, display_name, provider, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
                     (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
                     (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
                     (revoked_at IS NOT NULL) AS revoked \
              FROM scim_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
-             ORDER BY created_at, id",
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(organization_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -74722,6 +74778,7 @@ impl ScimConnectionRepo<'_> {
                     expires_at_unix_micros: row.get("expires_us"),
                     revoked_at_unix_micros: row.get("revoked_us"),
                     revoked: row.get("revoked"),
+                    created_at_unix_micros: row.get("created_us"),
                 })
             })
             .collect()
@@ -74748,7 +74805,35 @@ impl ActingScimConnectionRepo<'_> {
     /// reused a token rather than generating one) OR a handle already used, since `id` is
     /// unique too. [`StoreError::Database`] otherwise, including a provider outside the
     /// column's closed vocabulary.
-    pub async fn create(&self, env: &Env, spec: NewScimConnection<'_>) -> Result<(), StoreError> {
+    /// # `idempotency` is not optional in practice
+    ///
+    /// A retried create MINTS A SECOND CREDENTIAL: the secret is fresh, so its digest is fresh,
+    /// and the unique index that would otherwise catch a duplicate sees two different rows. The
+    /// caller believes it holds one token while the organization has two live connections, and
+    /// only one of them is in anybody's hands. Passing `None` is legal because the store cannot
+    /// know whether its caller has a request to be idempotent about, but the management surface
+    /// requires the header.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewScimConnection<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+    ) -> Result<(), StoreError> {
+        self.create_with_event(env, spec, idempotency, None).await
+    }
+
+    /// [`Self::create`], additionally emitting `scim_connection.created`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`].
+    pub async fn create_with_event(
+        &self,
+        env: &Env,
+        spec: NewScimConnection<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         let NewScimConnection {
             id,
             organization_id,
@@ -74808,6 +74893,14 @@ impl ActingScimConnectionRepo<'_> {
                         error.into()
                     }
                 })?;
+                // IN THE SAME TRANSACTION as the row. A record written afterwards would leave
+                // a window in which the connection exists and the retry that created it can
+                // still mint a second one.
+                insert_idempotency(tx, idempotency).await?;
+                // IN THE SAME TRANSACTION as the row, so a receiver is never told a
+                // provisioning credential exists before it does, and never told at all if the
+                // write rolls back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -74843,6 +74936,25 @@ impl ActingScimConnectionRepo<'_> {
         env: &Env,
         id: &ScimConnectionId,
         now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        self.revoke_with_event(env, id, now_micros, None).await
+    }
+
+    /// [`Self::revoke`], additionally emitting `scim_connection.revoked`.
+    ///
+    /// The event is emitted only on a REAL revocation, exactly as the audit row is: a retried
+    /// revoke changes nothing, audits nothing, and announces nothing, so a receiver counting
+    /// revocations never sees two because a client retried.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`].
+    pub async fn revoke_with_event(
+        &self,
+        env: &Env,
+        id: &ScimConnectionId,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         if id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -74889,6 +75001,9 @@ impl ActingScimConnectionRepo<'_> {
             target: id,
         };
         insert_audit_row(&mut tx, &spec, None).await?;
+        // IN THE SAME TRANSACTION as the revocation and its audit row, and only on the
+        // already-revoked-returns-early path above having NOT been taken.
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
         tx.commit().await?;
         Ok(true)
     }

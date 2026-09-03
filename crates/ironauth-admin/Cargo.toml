@@ -68,6 +68,10 @@ bytes.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 # Opaque cursor encoding (URL-safe, no padding), matching the identifier codec.
+# For the SCIM bearer-token format only (issue #135). The management plane MINTS the token
+# and the public plane VERIFIES it, so both call mint_token/digest_of rather than each
+# carrying a copy of `{scim_id}.{secret}` that would agree until somebody changed one.
+ironauth-scim.workspace = true
 base64.workspace = true
 # SHA-256 for management-key hashing and the Idempotency-Key request fingerprint.
 # Pure Rust, permissive, already in the tree via ironauth-store; no new crate.
@@ -174,6 +178,15 @@ required-features = ["testing"]
 [[test]]
 name = "management_permissions"
 path = "tests/management_permissions.rs"
+
+# The SCIM connection surface (issue #135). The one test that matters here takes the minted
+# token and presents it to the real scim_router: the management plane MINTS and the public
+# plane VERIFIES, in different crates, and nothing else in the tree would catch them
+# disagreeing about the token format.
+[[test]]
+name = "scim_connections"
+path = "tests/scim_connections.rs"
+required-features = ["testing"]
 
 [[test]]
 name = "api_keys"

@@ -58,6 +58,7 @@ async fn seed(db: &TestDatabase, env: &Env, scope: Scope) -> String {
                 token_digest: &digest_of(&token),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await
         .expect("create connection");

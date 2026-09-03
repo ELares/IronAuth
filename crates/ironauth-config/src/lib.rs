@@ -810,19 +810,18 @@ pub struct TraitsConfig {
 /// the open internet, so it mounts on the PUBLIC plane. Turning it on is a decision to serve a
 /// new authenticated surface publicly.
 ///
-/// # There is NO route that mints a connection credential yet
+/// # Minting a connection credential
 ///
-/// Said plainly, because an earlier version of this comment said the opposite and it ships in
-/// `docs/config-schema.json`, which is a release artifact. The management API has no SCIM
-/// endpoint: `crates/ironauth-admin` contains no reference to SCIM and `docs/openapi/management.json`
-/// publishes no SCIM path. The store surface that creates a connection
-/// (`ActingScimConnectionRepo::create`) is reachable only from inside the process.
+/// Over the management API: `POST` to
+/// `/v1/tenants/{t}/environments/{e}/organizations/{o}/scim-connections`, which returns the
+/// bearer token exactly once and stores only its digest. The credential is per connection and
+/// carries its own organization, so a token for one organization is unusable against another
+/// by construction rather than by a check a handler could forget.
 ///
-/// So enabling this today gives you a surface that authenticates correctly and that nobody can
-/// obtain a credential for through any shipped interface. It is safe -- every route refuses an
-/// unknown token, and refuses it identically to a malformed one -- but it is not yet useful,
-/// and an operator turning it on should know that rather than discover it. The minting route
-/// belongs with the self-service portal that owns SCIM token lifecycle.
+/// That route did not exist when this surface was first mounted, and this comment said so at
+/// length. It is corrected rather than deleted because the text ships in
+/// `docs/config-schema.json`, a release artifact: an operator reading it was told the surface
+/// was safe but unusable, and should now be told where the door is.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ScimConfig {

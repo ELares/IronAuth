@@ -67,6 +67,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         "project_grants.rs",
         include_str!("../src/project_grants.rs"),
     ),
+    (
+        "scim_connections.rs",
+        include_str!("../src/scim_connections.rs"),
+    ),
 ];
 
 /// The number of organization-addressed operations the sources declare.
@@ -81,7 +85,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 47;
+const ORG_ADDRESSED_OPERATIONS: usize = 50;
 
 /// The path segment that makes an operation organization-addressed.
 fn org_addressed(attr: &str) -> bool {

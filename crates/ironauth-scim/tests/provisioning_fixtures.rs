@@ -264,6 +264,7 @@ async fn seeded_connection() -> (
                 token_digest: &digest_of(&token),
                 expires_at_unix_micros: None,
             },
+            None,
         )
         .await
         .expect("create connection");

@@ -6,6 +6,29 @@ range per docs/RELEASING.md.
 
 ## Unreleased
 
+### SCIM provisioning connections on the management plane (issue #135)
+
+Three routes under an organization -- `POST`, `GET` and `DELETE`
+`.../organizations/{id}/scim-connections` -- that mint, list and revoke the bearer credential an
+identity provider presents to the SCIM surface. Before them the SCIM surface shipped mounted and
+unusable: it authenticated every route against a per-connection token and nothing reachable could
+create one, which is a control with no door to it.
+
+The token is returned exactly ONCE, on the create, and never again. A retry of the same
+`Idempotency-Key` answers `200` carrying `token_already_issued` and no token, rather than the
+`201` every other keyed create replays: `idempotency_keys.response_body` is plaintext retained 24
+hours, and storing the created body verbatim would put a live provisioning credential there --
+the recoverable copy migration 0183 exists to prevent, in a different table.
+
+Minting and revoking are `management.write_credentials` and sudo-gated, on the same argument as
+an organization API key: a connection token provisions and deprovisions an organization's whole
+user population. The listing is `management.read` and cursor paginated.
+
+Revoking survives the environment being SOFT-DELETED, which minting does not. Soft-deleting an
+environment cascades to neither the organization's `deleted_at` nor its state, so a minted token
+goes on provisioning after the environment is decommissioned; requiring liveness to disarm would
+make the soft delete a one-way door on the strongest credential this surface issues.
+
 ### Experimental: the AuthZEN agent tool profile (issue #133)
 
 A PROTOTYPE answering `may this agent call this tool` on the AuthZEN PDP, off by default behind

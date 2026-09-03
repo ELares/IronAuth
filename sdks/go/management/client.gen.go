@@ -316,6 +316,13 @@ func (c *Client) CreateRoutingRule(tenant_id string, environment_id string, quer
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/routing-rules", query, body)
 }
 
+// CreateScimConnection performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
+//
+// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
+func (c *Client) CreateScimConnection(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, body)
+}
+
 // CreateServiceAccountApiKey performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys.
 //
 // createServiceAccountApiKey.
@@ -1296,6 +1303,13 @@ func (c *Client) ListRoutingRules(tenant_id string, environment_id string, query
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/routing-rules", query, nil)
 }
 
+// ListScimConnections performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections.
+//
+// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`.
+func (c *Client) ListScimConnections(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, nil)
+}
+
 // ListSecrets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets.
 //
 // List the secrets of an environment (metadata only, cursor paginated).
@@ -1637,6 +1651,13 @@ func (c *Client) RevokeInvitation(tenant_id string, environment_id string, invit
 // revokeOrganizationApiKey.
 func (c *Client) RevokeOrganizationApiKey(tenant_id string, environment_id string, organization_id string, key_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/api-keys/" + escape(key_id), query, nil)
+}
+
+// RevokeScimConnection performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}.
+//
+// `DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}`.
+func (c *Client) RevokeScimConnection(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections/" + escape(connection_id), query, nil)
 }
 
 // RevokeServiceAccountApiKey performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}.

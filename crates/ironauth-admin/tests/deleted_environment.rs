@@ -333,6 +333,12 @@ struct Fixture {
     /// service-account membership route: the case would pass without distinguishing
     /// anything.
     service_account: String,
+    /// A live SCIM connection (issue #135), seeded while the environment is LIVE so the
+    /// listing case has a row to NAME. Without it the read case answers an empty page at both
+    /// environments and the "a decommissioned environment stays auditable" contract would be
+    /// unmeasurable on this route -- which is the exact vacuity `Intent::Read` carries a
+    /// payload to prevent.
+    scim_connection: String,
 }
 
 impl Fixture {
@@ -441,6 +447,15 @@ impl Fixture {
         let (agent, approval) = Self::seed_agent(h, tenant, environment, &base, &user, key).await;
         let member_user = user.clone();
 
+        let scim_connection = seed_row(
+            h,
+            &format!("{base}/scim-connections"),
+            &format!("{key}-sc"),
+            &serde_json::json!({ "display_name": "Seeded Okta", "provider": "okta" }).to_string(),
+            "scim connection",
+        )
+        .await;
+
         let fixture = Self {
             base,
             org,
@@ -459,6 +474,7 @@ impl Fixture {
             agent,
             approval,
             service_account,
+            scim_connection,
         };
         fixture.seed_relations(h, key).await;
         fixture
@@ -682,6 +698,15 @@ impl Fixture {
     fn cases(&self) -> Vec<Case> {
         let mut cases = self.read_cases();
         cases.extend(self.amending_write_cases());
+        // BEFORE the destructive cases, not after. The live pass runs these in order and
+        // `destructive_write_cases` ends by DELETING the organization every path here hangs
+        // off, so a case appended after it addresses an organization that is already gone and
+        // answers 404 at a LIVE environment. Measured, by putting them there first.
+        cases.extend(
+            self.scim_connection_cases()
+                .into_iter()
+                .filter(|case| case.method != "GET"),
+        );
         cases.extend(self.destructive_write_cases());
         cases
     }
@@ -697,6 +722,11 @@ impl Fixture {
     /// [`a_soft_deleted_environments_organization_content_is_still_readable`].
     fn read_cases(&self) -> Vec<Case> {
         let mut cases = self.organization_read_cases();
+        cases.extend(
+            self.scim_connection_cases()
+                .into_iter()
+                .filter(|case| case.method == "GET"),
+        );
         cases.extend(self.group_and_membership_read_cases());
         cases.extend(self.agent_read_cases());
         cases
@@ -730,6 +760,51 @@ impl Fixture {
                 path: format!("{base}/agent-approvals"),
                 body: None,
                 intent: Intent::Read(vec![approval.clone()]),
+                live: StatusCode::OK,
+            },
+        ]
+    }
+
+    /// The SCIM connection surface (issue #135), split out only because the reads together
+    /// exceed the crate's function-length lint.
+    fn scim_connection_cases(&self) -> Vec<Case> {
+        let Self {
+            base,
+            scim_connection,
+            ..
+        } = self;
+        vec![
+            Case {
+                label: "scim_connections.createScimConnection",
+                method: "POST",
+                path: format!("{base}/scim-connections"),
+                body: Some(
+                    "{\"display_name\":\"sweep connection\",\"provider\":\"okta\"}".to_owned(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
+                label: "scim_connections.revokeScimConnection",
+                method: "DELETE",
+                path: format!("{base}/scim-connections/{scim_connection}"),
+                body: None,
+                // The SEEDED connection, not an absent handle. An absent one answers the
+                // uniform not-found at a LIVE environment too, so driving it at a
+                // soft-deleted one would measure nothing about the fence. The api-key revoke
+                // beside it predates that lesson.
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "scim_connections.listScimConnections",
+                method: "GET",
+                path: format!("{base}/scim-connections"),
+                body: None,
+                // The listing must stay AUDITABLE at a decommissioned environment, which is
+                // what `EnvironmentAccess::Read` buys. It names the connection the create
+                // above landed, so an empty page cannot pass for an audit.
+                intent: Intent::Read(vec!["Seeded Okta".to_owned()]),
                 live: StatusCode::OK,
             },
         ]
@@ -1346,6 +1421,7 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         agent: "agp_x".to_owned(),
         approval: "ava_x".to_owned(),
         service_account: "sva_x".to_owned(),
+        scim_connection: "scim_x".to_owned(),
     };
     let cases = fixture.cases();
     let documented = documented_organization_operations();
@@ -1420,6 +1496,52 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
     }
 }
 
+/// The organization-addressed writes whose answer at a soft-deleted environment is NOT the
+/// uniform not-found, and the reason each one cannot be.
+///
+/// `live_surface.rs::documented_write_exceptions` is the same list for the environment-scoped
+/// surface, granted for the same reason and on the same terms.
+fn documented_write_exceptions() -> BTreeMap<&'static str, StatusCode> {
+    BTreeMap::from([
+        // REVOKING a SCIM provisioning credential, which is the CLOSING direction, and a
+        // closing write never requires its parent to be live.
+        //
+        // `ScimConnectionRepo::authenticate` joins only `organizations` and checks
+        // `deleted_at`/`state` there. Soft-deleting an ENVIRONMENT cascades to neither, so a
+        // minted token goes on provisioning an organization's whole user population after the
+        // environment is decommissioned -- measured, by presenting one to the real
+        // `scim_router` after the delete. Fencing the route that DESTROYS that credential
+        // would turn the soft delete into a one-way door on the strongest credential this
+        // surface issues, with no remedy short of a direct database write.
+        //
+        // It still requires the environment to EXIST, and `resolve_scope` is what provides
+        // that: its `exists_in_any_state` read runs before any of this. `absent_environment.rs`
+        // drives the same route at an environment that was never created and requires the
+        // uniform not-found, which is the test that would fail if that read were removed.
+        //
+        // This is the one exempted write here that LANDS A ROW CHANGE, which is the whole
+        // point of it, so it is also the one entry in [`documented_write_row_effects`].
+        (
+            "scim_connections.revokeScimConnection",
+            StatusCode::NO_CONTENT,
+        ),
+    ])
+}
+
+/// The row-count deltas the documented write exceptions are permitted to leave behind, per
+/// table. Nothing else may move.
+///
+/// The revoke UPDATEs `scim_connections` in place, so that table's COUNT does not change; what
+/// it adds is the audit row and the announcement, both in the same transaction. Recorded
+/// exactly rather than as a tolerance: a producer quietly dropped from the revoke leaves one of
+/// these at zero and fails here.
+fn documented_write_row_effects() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("audit_log".to_owned(), 1),
+        ("outbox_messages".to_owned(), 1),
+    ])
+}
+
 #[tokio::test]
 async fn every_organization_nested_write_refuses_a_soft_deleted_environment() {
     // The whole-surface guard. It drives every organization-addressed operation twice:
@@ -1466,11 +1588,25 @@ async fn every_organization_nested_write_refuses_a_soft_deleted_environment() {
     let mut observed: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
     let mut refusals: Vec<(&str, BTreeMap<String, Vec<String>>)> = Vec::new();
+    let exceptions = documented_write_exceptions();
     for (index, case) in fixture.cases().iter().enumerate() {
         let (status, headers, body) = drive(&h, case, &format!("k-doomed-{index}")).await;
         observed.push(format!("{:7} {:55} {status}", case.method, case.label));
         match &case.intent {
             Intent::Write => {
+                if let Some(&expected) = exceptions.get(case.label) {
+                    if status != expected {
+                        wrong.push(format!(
+                            "{} answered {status}, expected the documented exception \
+                             {expected}: {body}",
+                            case.label
+                        ));
+                    }
+                    // NOT pushed into `refusals`: it is not a refusal, and comparing its
+                    // headers against the uniform not-found's would be comparing a 204 to
+                    // a 404.
+                    continue;
+                }
                 if status != not_found_status || body != not_found_body {
                     wrong.push(format!(
                         "{} answered {status} for a WRITE into a soft-deleted environment, \
@@ -1544,13 +1680,59 @@ async fn every_organization_nested_write_refuses_a_soft_deleted_environment() {
     // And nothing the deleted pass touched wrote a row ANYWHERE, audit log included.
     // This is read as the database owner, so row-level security cannot hide a write,
     // and it covers the reads as well as the refusals.
-    let after = snapshot(h.db().owner_pool()).await;
-    assert_eq!(
-        before,
-        after,
-        "a request into a soft-deleted environment landed a row:\n{}",
+    assert_only_the_documented_rows_moved(&before, &after_snapshot(&h).await, &observed);
+}
+
+/// Assert that the only rows the deleted pass moved are the ones a documented write exception
+/// is permitted to move.
+///
+/// Split out of the sweep only because the two together exceed the crate's function-length
+/// lint.
+fn assert_only_the_documented_rows_moved(
+    before: &BTreeMap<String, i64>,
+    after: &BTreeMap<String, i64>,
+    observed: &[String],
+) {
+    //
+    // "Nothing" is no longer literally nothing, because one exempted write DESTROYS a
+    // credential and audits doing so. The permitted deltas are enumerated per table in
+    // [`documented_write_row_effects`], so a write that starts touching something ELSE shows
+    // up as an unexpected table rather than being absorbed by a tolerance.
+    let permitted = documented_write_row_effects();
+    let mut unexpected: Vec<String> = Vec::new();
+    for (table, before_count) in before {
+        let after_count = after.get(table).copied().unwrap_or(0);
+        let delta = after_count - before_count;
+        let allowed = permitted.get(table).copied().unwrap_or(0);
+        if delta != allowed {
+            unexpected.push(format!(
+                "{table}: {before_count} -> {after_count} (delta {delta}, permitted {allowed})"
+            ));
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "a request into a soft-deleted environment moved rows it may not:\n{}\n\nthe whole \
+         table:\n{}",
+        unexpected.join("\n"),
         observed.join("\n")
     );
+    // And every table the exceptions DO name actually moved, so an exception that stopped
+    // writing what it documents fails here instead of quietly passing the check above.
+    for (table, allowed) in &permitted {
+        let delta =
+            after.get(table).copied().unwrap_or(0) - before.get(table).copied().unwrap_or(0);
+        assert_eq!(
+            delta, *allowed,
+            "{table} was permitted a delta of {allowed} and moved by {delta}, so a documented \
+             write exception has stopped writing what it claims to"
+        );
+    }
+}
+
+/// The owner-pool row snapshot, named so the sweep reads as a before and an after.
+async fn after_snapshot(h: &Harness) -> BTreeMap<String, i64> {
+    snapshot(h.db().owner_pool()).await
 }
 
 #[tokio::test]
@@ -1763,6 +1945,15 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             format!("{base}/groups/{group}/members"),
             serde_json::json!({ "membership_id": spare_membership }).to_string(),
         ),
+        // The SCIM connection mint (issue #135). It is here rather than in the undriven
+        // remainder because it needs nothing the fixture does not already seed -- just the
+        // organization at `base` -- and a review measured exactly that: the remainder's stated
+        // reason ("needs seed rows this fixture does not have") did not cover this entry.
+        (
+            "scim_connections.createScimConnection",
+            format!("{base}/scim-connections"),
+            serde_json::json!({ "display_name": "Replay Okta", "provider": "okta" }).to_string(),
+        ),
         // Added with the agent cases, because this change is what brings `registerAgent` into
         // the sweep: a keyed write reaching the surface without reaching the replay fence is
         // the gap the derived assertion below exists to make visible.
@@ -1789,16 +1980,23 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
 ///    fails rather than quietly testing a route that no longer takes a key;
 /// 2. the operations NOT driven are pinned EXACTLY. A hand-written list with no such pin
 ///    silently stops covering the surface every time a keyed route is added, which is what
-///    happened here: the doc claimed seven were all of them while six went undriven.
+///    happened here: the doc claimed seven were all of them while six went undriven, and
+///    again when `createScimConnection` landed keyed and undriven.
 ///
 /// The remainder is a pin, not an aspiration. Driving the other six needs seed rows this
 /// fixture does not have (an API key, a service-account membership, a second organization to
 /// disable), and inventing them is a bigger change than the one that found this. Adding a
 /// keyed route without driving it now fails HERE, with its name in the message.
+///
+/// A review checked that reason against the remainder and found it did not cover every entry:
+/// `createScimConnection` had been added to the undriven set while needing nothing beyond the
+/// organization the fixture already seeds. It is driven now. The lesson is the one this whole
+/// doc block is about -- a remainder with a prose reason is a place a new entry hides behind
+/// somebody else's justification.
 #[test]
 fn the_keyed_write_list_is_measured_against_the_contract() {
     const ORGANIZATION_PREFIX_LOCAL: &str = ORGANIZATION_PREFIX;
-    // MEASURED, not chosen: the contract records 14 and this list drives 8. Both halves come
+    // MEASURED, not chosen: the contract records 15 and this list drives 9. Both halves come
     // out of the assertion below, so neither is a number anybody typed from memory.
     const UNDRIVEN: usize = 6;
     let doc: Value = serde_json::from_str(COMMITTED_SPEC).expect("the committed spec parses");
@@ -1867,6 +2065,12 @@ fn the_keyed_write_list_is_measured_against_the_contract() {
     );
 }
 
+/// The one keyed create whose replay is NOT its original response.
+///
+/// Named once, here, rather than spelled at each of the three places that branch on it: a
+/// string repeated at three sites is three places for it to stop matching the route.
+const SECRET_BEARING_CREATE: &str = "scim_connections.createScimConnection";
+
 /// A [`Fixture`] with placeholder ids, for the database-free checks.
 ///
 /// The keyed-write list only needs the SHAPE of each request, and building it needs a fixture.
@@ -1890,6 +2094,7 @@ fn replay_fixture() -> Fixture {
         agent: "agp_x".to_owned(),
         approval: "ava_x".to_owned(),
         service_account: "sva_x".to_owned(),
+        scim_connection: "scim_x".to_owned(),
     }
 }
 
@@ -1922,7 +2127,9 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
     let writes = keyed_writes(&fixture);
 
     // Each keyed write once, while the environment is LIVE. The response it stores is
-    // what the replay after the delete has to reproduce, byte for byte.
+    // what the replay after the delete has to reproduce, byte for byte -- with the one
+    // documented exception named at `SECRET_BEARING_CREATE`, whose stored body deliberately
+    // differs from the response it first gave.
     let mut stored: Vec<(String, String)> = Vec::new();
     for (index, (label, path, body)) in writes.iter().enumerate() {
         let key = format!("k-replay-{index}");
@@ -1932,6 +2139,24 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
             StatusCode::CREATED,
             "{label} at a LIVE environment: {response}"
         );
+        if *label == SECRET_BEARING_CREATE {
+            // The FIRST response carries the credential exactly once; the replay below must
+            // not. Storing the first response here would make the "no token" assertion after
+            // the delete compare against a body that had one, so the stored value is what the
+            // replay is expected to be, and the difference is asserted right now.
+            assert!(
+                response.contains("\"token\""),
+                "{label} must hand back the credential on the FIRST response: {response}"
+            );
+            let (replay_status, _, replayed) = h.post(path, &key, body).await;
+            assert_eq!(
+                replay_status,
+                StatusCode::OK,
+                "{label} replays 200 rather than 201: {replayed}"
+            );
+            stored.push((key, replayed));
+            continue;
+        }
         stored.push((key, response));
     }
 
@@ -1943,17 +2168,47 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
         // The SAME key and the same body: a genuine replay of a request that already
         // succeeded, which must still answer with what it answered the first time.
         let (status, _, response) = h.post(path, key, body).await;
+        let expected = if *label == SECRET_BEARING_CREATE {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        };
         assert_eq!(
-            status,
-            StatusCode::CREATED,
+            status, expected,
             "{label} replayed its original Idempotency-Key after the environment was \
              soft-deleted and got {status} instead of the response it already gave; the \
              environment precondition has been hoisted above the replay: {response}"
         );
-        assert_eq!(
-            &response, original,
-            "{label} replayed a DIFFERENT body than the one it stored"
-        );
+        if *label == SECRET_BEARING_CREATE {
+            // THE ONE ROUTE WHOSE REPLAY IS DELIBERATELY NOT THE ORIGINAL RESPONSE, and the
+            // exemption is pinned rather than merely skipped.
+            //
+            // `idempotency_keys.response_body` is plaintext retained 24 hours. Storing this
+            // route's 201 verbatim would put a live provisioning credential there -- the
+            // recoverable copy migration 0183 exists to prevent, in a different table. So the
+            // stored body carries `token_already_issued` and no token, and it is a 200 because
+            // a 201 announcing a resource whose credential is absent is a worse lie than an
+            // honest "you already have this".
+            //
+            // What this file's property actually is, and what still holds here: a replay of a
+            // request that ALREADY SUCCEEDED never becomes a 404 because the environment went
+            // away. The status and body below are asserted so the exemption cannot widen into
+            // "this route answers whatever it likes".
+            assert_eq!(&response, original, "{label} replayed a DIFFERENT body");
+            assert!(
+                response.contains("\"token_already_issued\":true"),
+                "{label}'s replay must say the credential was already issued: {response}"
+            );
+            assert!(
+                !response.contains("\"token\""),
+                "{label}'s replay handed back the provisioning credential again: {response}"
+            );
+        } else {
+            assert_eq!(
+                &response, original,
+                "{label} replayed a DIFFERENT body than the one it stored"
+            );
+        }
 
         // And the anchor, without which the assertion above would pass just as well with
         // no fence at all: the same route, the same body, a FRESH key, refused. So the
@@ -2082,8 +2337,8 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 32;
-    const READS: usize = 15;
+    const WRITES: usize = 34;
+    const READS: usize = 16;
 
     let cases = replay_fixture_cases();
     let writes = cases

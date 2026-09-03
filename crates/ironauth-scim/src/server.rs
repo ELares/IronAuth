@@ -436,6 +436,40 @@ async fn authenticate(
             .as_micros(),
     )
     .map_err(|_| AuthRefusal::Unknown)?;
+    // THE LIFECYCLE FENCE, read on EVERY request and FAIL CLOSED, exactly as
+    // `ironauth-oidc`'s issuer resolution does (issue #46). It runs BEFORE the digest lookup
+    // so a fenced scope costs one read and never reaches the credential table.
+    //
+    // Without it this plane consulted no lifecycle state at all. `authenticate`'s query joins
+    // `organizations` and checks that row's `deleted_at` and `state`, and nothing anywhere
+    // read `environments.deleted_at`, `tenants.deleted_at`, or `environment_states`. A review
+    // measured what that meant, and it was worse than a stale read:
+    //
+    //   - Soft-delete an environment and a connection token still answered
+    //     `POST /scim/v2/Users` with 201 Created. Every management sweep in `ironauth-admin`
+    //     exists to prove no write lands in a decommissioned environment, and an identity
+    //     provider could create and DELETE a whole user population inside one.
+    //   - Soft-delete the TENANT and the token kept provisioning while every management route
+    //     answered 404 -- so the credential was live, invisible, and unrevokable, with no
+    //     remedy short of a direct database write. That is the one-way door the revoke's own
+    //     `require_present_environment` argument is about, one level up and strictly worse.
+    //   - Suspend the tenant and the token kept provisioning.
+    //
+    // One predicate closes all three, because all three write `serving_status = 'suspended'`.
+    //
+    // FENCED READS AS UNKNOWN, not as unavailable. A fenced scope is an administrative
+    // decision, and the client this refusal reaches is an identity provider that will retry:
+    // `Unavailable` is a 503 it backs off on, which is right for a database it cannot reach
+    // and wrong for a tenant an operator decommissioned. `Unknown` is the same 401 an invented
+    // token gets, so a caller cannot tell a fenced scope from one that never existed.
+    match state.inner.store.scoped(scope).environment_state().await {
+        Ok(serving) if serving.is_fenced() => return Err(AuthRefusal::Unknown),
+        Ok(_) => {}
+        // Fail closed on a read that did not happen, and report it as what it is: the state
+        // was never read, so this is not evidence the credential is bad.
+        Err(_) => return Err(AuthRefusal::Unavailable),
+    }
+
     let found = state
         .inner
         .store
@@ -456,11 +490,13 @@ async fn authenticate(
 /// makes it a credential. Returned once by whatever creates the connection, and stored
 /// nowhere: only the SHA-256 of the whole string is written.
 ///
-/// NO SHIPPED CALLER creates one today. An earlier version of this sentence said "the
-/// management surface that creates the connection", and there is none: `ironauth-admin`
-/// contains no reference to SCIM and the published management API has no SCIM path. The
-/// minting route belongs with the self-service portal that owns SCIM token lifecycle, and
-/// until it lands a connection can only be created from inside the process.
+/// CALLED BY THE MANAGEMENT PLANE, which is why this is `pub`: `ironauth-admin`'s
+/// `create_scim_connection` mints here and stores only the digest, and `authenticate` above
+/// hashes the presented token with `digest_of`. ONE definition of the format, used by both,
+/// rather than two that would agree until somebody changed one.
+///
+/// An earlier version of this said no shipped caller existed, which was true when the surface
+/// was mounted and the minting route had not landed.
 #[must_use]
 pub fn mint_token(id: &ironauth_store::ScimConnectionId, secret: &str) -> String {
     format!("{id}.{secret}")
