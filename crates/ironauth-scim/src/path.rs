@@ -123,7 +123,15 @@ fn is_legal_segment_byte(byte: u8) -> bool {
 pub fn parse_resource_path(raw: &str) -> Result<ResourceRef, PathError> {
     // A single leading slash is expected and stripped; anything else (an empty path, a
     // scheme-relative `//host`, a backslash) is not a path this server addresses.
-    let trimmed = raw.strip_prefix('/').unwrap_or(raw);
+    // THE LEADING SLASH IS REQUIRED, not optional. RFC 7644 section 3.7.2 writes a bulk
+    // operation's path as `/Users`, and `unwrap_or(raw)` accepted `Users` as well -- measured
+    // over the real route: `{"method":"POST","path":"Users"}` created a user. Two spellings for
+    // one collection is a second interpretation of a path, which is the one property this
+    // module exists to remove; it sat against that claim while the trailing-slash case beside
+    // it was being tightened for exactly the same reason.
+    let Some(trimmed) = raw.strip_prefix('/') else {
+        return Err(PathError::Empty);
+    };
     if trimmed.is_empty() {
         return Err(PathError::Empty);
     }

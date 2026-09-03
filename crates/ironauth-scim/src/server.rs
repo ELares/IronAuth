@@ -115,10 +115,15 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// [`MAX_REQUEST_BYTES`] -- `the_two_payload_bounds_agree` pins that equality -- so this
 /// layer's own refusal fires first and `validate_bulk`'s payload branch is unreachable. A
 /// review measured it: a 1 048 666-byte batch answers the generic body-size message, not the
-/// bulk-specific one. That is the correct answer (the body genuinely exceeded what this
-/// server accepts) and it is stated here rather than left as a claim that the bulk message
-/// appears. The branch is live only where an operator configures `max_payload_bytes` BELOW
-/// the request bound, which `the_advertised_limits_...` drives.
+/// bulk-specific one. That is the correct answer (the body genuinely exceeded what this server
+/// accepts) and it is stated here rather than left as a claim that the bulk message appears.
+///
+/// The branch is live only where an operator configures `max_payload_bytes` BELOW the request
+/// bound, and `a_payload_over_the_configured_bulk_budget_is_refused_by_name` is what drives
+/// that. An earlier version of this sentence named `the_advertised_limits_...` instead, which
+/// does the OPPOSITE -- its own comment says it sets the payload budget to the default so that
+/// only the operation count can fire -- and a review measured the consequence: replacing the
+/// whole payload arm with an empty result left the suite green.
 ///
 /// So a 413 that is ALREADY a SCIM document is left alone. The layer exists for the framework's
 /// `text/plain` rejection, and that is the only thing it now rewrites.
@@ -311,6 +316,9 @@ pub fn scim_router(state: ScimState) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
 }
 
+/// The URN a bulk request must declare (RFC 7644 section 3.7).
+const BULK_REQUEST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:BulkRequest";
+
 /// `POST /scim/v2/Bulk` (RFC 7644 section 3.7, issue #135 criterion 4).
 ///
 /// # Why this dispatches to the single-request handlers rather than reimplementing them
@@ -335,9 +343,6 @@ pub fn scim_router(state: ScimState) -> Router {
 /// by the presence of `Operations` in the response, not by a status the client has to
 /// disambiguate. A batch REFUSED before any operation ran (over a limit, malformed envelope,
 /// no credential) answers with a SCIM error and no `Operations` at all.
-/// The URN a bulk request must declare (RFC 7644 section 3.7).
-const BULK_REQUEST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:BulkRequest";
-
 pub(crate) async fn bulk(
     State(state): State<ScimState>,
     headers: HeaderMap,
@@ -550,13 +555,19 @@ async fn dispatch(
         // A method the collection or the item does not offer: a POST to `/Users/{id}`, a PUT
         // to `/Users`. The single-request router answers 405 for these, and so does this.
         _ => {
+            // CARRIES ITS `response` LIKE EVERY OTHER REFUSAL. This arm was missed when the
+            // pre-dispatch refusals gained one, so the single refusal a client is most likely
+            // to hit by hand -- a POST to an item, a PUT to a collection -- was the one that
+            // gave a spec-following client nothing to read. RFC 7644 section 3.7.3 defines
+            // `response` and defines no operation-level `detail`.
+            let detail = "that method is not offered at that path";
             return BulkOperationResult {
                 bulk_id,
                 method: method.to_owned(),
                 status: "405".to_owned(),
-                detail: Some("that method is not offered at that path".to_owned()),
+                detail: Some(detail.to_owned()),
                 location: None,
-                response: None,
+                response: Some(crate::bulk::method_not_allowed_document(detail)),
             };
         }
     };

@@ -590,11 +590,37 @@ async fn a_bulk_request_without_a_credential_reaches_nothing_and_reveals_no_limi
             body.contains("urn:ietf:params:scim:api:messages:2.0:Error"),
             "the refusal is a SCIM document: {body}"
         );
-        // The batch was 50 operations against a limit of 2, so a route that checked limits
-        // first would answer 413 and name the number.
-        assert!(
-            !body.contains('2') || !body.contains("maxOperations"),
-            "the refusal leaked an advertised limit to an unauthenticated caller: {body}"
+        // AND THE OVER-LIMIT BATCH IS ANSWERED IDENTICALLY TO A FINE ONE, byte for byte.
+        //
+        // That is the property, and it is the only formulation that cannot be gamed. This
+        // began as `!body.contains('2') || !body.contains("maxOperations")` -- and no refusal
+        // here contains the literal `maxOperations`, so the right disjunct was always true and
+        // the assertion could not fail; a review measured the authenticate call moved below the
+        // limit checks and this line still reporting ok. The obvious repair, scanning for the
+        // limit numbers as substrings, is the same mistake one layer down: `"2"` occurs in
+        // `urn:...:2.0:Error`, so it failed on the schema URN of a refusal that leaked nothing.
+        //
+        // Comparing the two responses asks the real question instead: can an unauthenticated
+        // caller tell an over-limit batch from a fine one? If the limits were checked first,
+        // one of these is a 413 naming a number and the other a 401, and they differ.
+        let (fine_status, fine_body) = call_with(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Bulk",
+            token,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+                "Operations": [{"method": "POST", "path": "/Users", "bulkId": "one"}],
+            })),
+            limits,
+        )
+        .await;
+        assert_eq!(
+            (status, &body),
+            (fine_status, &fine_body),
+            "an unauthenticated caller can tell an over-limit batch from a fine one, so the \
+             limits are being checked before the credential is"
         );
     }
 }
@@ -694,6 +720,17 @@ async fn a_method_the_path_does_not_offer_is_that_operations_405_rather_than_the
     let results = operations(&body);
     assert_eq!(results[0]["status"].as_str(), Some("405"), "{body}");
     assert_eq!(results[1]["status"].as_str(), Some("405"), "{body}");
+    // AND EACH CARRIES ITS `response`. This arm was missed when the pre-dispatch refusals
+    // gained one, so the refusal a client is most likely to hit by hand was the one giving a
+    // spec-following client nothing to read -- and the test that claims to cover "every failed
+    // operation" drives no 405 at all.
+    for result in &results[..2] {
+        assert_eq!(
+            result["response"]["status"].as_str(),
+            Some("405"),
+            "a 405 must carry the RFC's `response` field like every other refusal: {result}"
+        );
+    }
     assert_eq!(
         results[2]["status"].as_str(),
         Some("201"),
@@ -1017,4 +1054,228 @@ async fn a_broken_operation_shape_refuses_that_operation_rather_than_the_batch()
              refused before dispatch: {result}"
         );
     }
+}
+
+/// A payload over the CONFIGURED bulk budget is refused, and the refusal names that budget.
+///
+/// `validate_bulk`'s payload arm is unreachable at the shipped defaults, because
+/// `max_payload_bytes` equals `MAX_REQUEST_BYTES` and the request bound fires first. So nothing
+/// drove it: a review replaced the entire arm with an empty result -- answering
+/// `200 {"Operations":[]}` to an over-budget batch -- and the whole suite stayed green, while
+/// the handler's doc named a test that deliberately does the opposite (it sets the payload
+/// budget to the default so only the operation count can fire).
+///
+/// This is the configuration the arm exists for: an operator who wants batches smaller than the
+/// request bound.
+#[tokio::test]
+async fn a_payload_over_the_configured_bulk_budget_is_refused_by_name() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    // A payload budget well below the request bound, and an operation count high enough that
+    // it cannot be what refuses: the two limits answer the same status, so a batch tripping
+    // both could not say which one fired.
+    let limits = ScimLimits {
+        bulk: ironauth_scim::BulkLimits {
+            max_operations: 1000,
+            max_payload_bytes: 400,
+        },
+        ..ScimLimits::default()
+    };
+
+    // UNDER the budget: accepted. Without this half the refusal below would pass against a
+    // route that refused every batch.
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"method": "POST", "path": "/Users", "bulkId": "s", "data": user("s@example.com")},
+            ],
+        })),
+        limits,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a small batch must be accepted: {body}"
+    );
+
+    // OVER it: refused, and the refusal names the PAYLOAD budget rather than the count.
+    let padding = "p".repeat(600);
+    let (status, body) = call_with(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"method": "POST", "path": "/Users", "bulkId": &padding,
+                 "data": user("big@example.com")},
+            ],
+        })),
+        limits,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a batch over the configured payload budget must be refused: {body}"
+    );
+    assert!(
+        body.contains("payload may be at most 400 bytes"),
+        "the refusal must name the PAYLOAD budget, not the operation count: {body}"
+    );
+
+    // And nothing from the refused batch landed: exactly the one user the accepted batch made.
+    let (_, listed) = call_with(
+        &db,
+        &env,
+        "GET",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        None,
+        limits,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(1),
+        "the refused batch wrote rows anyway: {listed}"
+    );
+}
+
+/// A WRONG-TYPED operation field costs that operation, not the batch.
+///
+/// `Option<String>` was half a repair: it tolerates ABSENT and never WRONG-TYPED, so
+/// `{"path": 5}` still failed the envelope parse and took every valid sibling with it, while
+/// the field's own doc claimed it had cured "a missing `method` or a non-string `path`". A
+/// review measured both the behaviour and the fact that nothing in the suite noticed either
+/// way: making `path` accept any JSON left the whole suite green.
+///
+/// Each field is driven separately, because one shared assertion would pass if only one of the
+/// three had been widened.
+#[tokio::test]
+async fn a_wrong_typed_operation_field_costs_that_operation_rather_than_the_batch() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    for (field, bad) in [
+        (
+            "path",
+            json!({"method": "POST", "path": 5, "bulkId": "bad"}),
+        ),
+        (
+            "method",
+            json!({"method": 7, "path": "/Users", "bulkId": "bad"}),
+        ),
+        (
+            "bulkId",
+            json!({"method": "POST", "path": "/Users", "bulkId": ["a"]}),
+        ),
+    ] {
+        let (status, body) = call(
+            &db,
+            &env,
+            "POST",
+            "/scim/v2/Bulk",
+            Some(&acme.token),
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+                "Operations": [
+                    bad,
+                    {"method": "POST", "path": "/Users", "bulkId": "fine",
+                     "data": user(&format!("{field}@example.com"))},
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a wrong-typed {field} killed the whole envelope: {body}"
+        );
+        let results = operations(&body);
+        assert_eq!(results.len(), 2, "{field}: {body}");
+        assert_eq!(
+            results[0]["status"].as_str(),
+            Some("400"),
+            "{field}: {body}"
+        );
+        assert!(
+            results[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(field)),
+            "the refusal must name the field that was wrong-typed: {body}"
+        );
+        assert_eq!(
+            results[1]["status"].as_str(),
+            Some("201"),
+            "{field}: the valid sibling still ran: {body}"
+        );
+    }
+}
+
+/// A path with no leading slash is refused, so one collection has one spelling.
+///
+/// `parse_resource_path` stripped an OPTIONAL leading slash, so `Users` and `/Users` both
+/// addressed the collection -- measured over the real route: `{"method":"POST","path":"Users"}`
+/// created a user. RFC 7644 section 3.7.2 writes the path with the slash, and two spellings for
+/// one collection is a second interpretation of a path, which is the property this module
+/// exists to remove.
+#[tokio::test]
+async fn a_path_without_its_leading_slash_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Bulk",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"],
+            "Operations": [
+                {"method": "POST", "path": "Users", "bulkId": "no-slash",
+                 "data": user("noslash@example.com")},
+                // The spelled-correctly control, so the refusal is about the slash and not
+                // about this fixture.
+                {"method": "POST", "path": "/Users", "bulkId": "slash",
+                 "data": user("slash@example.com")},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = operations(&body);
+    assert_eq!(
+        results[0]["status"].as_str(),
+        Some("400"),
+        "a path with no leading slash must be refused: {body}"
+    );
+    assert_eq!(
+        results[1]["status"].as_str(),
+        Some("201"),
+        "the correctly spelled sibling must still work: {body}"
+    );
+    let (_, listed) = call(&db, &env, "GET", "/scim/v2/Users", Some(&acme.token), None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed).expect("json")["totalResults"].as_u64(),
+        Some(1),
+        "the refused spelling created a user anyway: {listed}"
+    );
 }

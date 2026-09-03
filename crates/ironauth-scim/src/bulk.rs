@@ -28,6 +28,7 @@
 //! earns a laxer reading of its path.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::path::{ResourceRef, parse_resource_path};
 
@@ -59,26 +60,28 @@ impl Default for BulkLimits {
 
 /// One operation in a bulk request.
 ///
-/// EVERY FIELD IS OPTIONAL AT THE SERDE LAYER, and that is the point rather than laxity. They
-/// were required, so one operation with a missing `method` or a non-string `path` failed the
-/// whole envelope parse: a review measured a two-operation batch where the first named no
-/// method answering `400 the request body is not a SCIM bulk request`, with the valid sibling
-/// never run and nothing saying which operation was bad. That is exactly the retry-all-fifty
-/// outcome this module's own header opens by condemning, and the header claimed the opposite.
+/// EVERY SCALAR FIELD IS A RAW `Value`, and that is the point rather than laxity. They were
+/// `String`, so one operation with a missing or wrong-typed `method` failed the WHOLE envelope
+/// parse: a review measured a two-operation batch whose first operation named no method
+/// answering `400 the request body is not a SCIM bulk request`, with the valid sibling never
+/// run and nothing saying which operation was bad. That is exactly the retry-all-fifty outcome
+/// this module's header opens by condemning.
 ///
-/// Shape problems are now per-OPERATION refusals like every other one, so a bad operation
-/// costs its own slot and nothing else.
+/// `Option<String>` was the first repair and it was HALF a repair: it tolerates ABSENT and
+/// never WRONG-TYPED, so `"path": 5` still killed the envelope while the doc claimed
+/// otherwise. A review measured that too, and measured that nothing in the suite noticed
+/// either way. A raw `Value` is the only shape that cannot fail the envelope parse, so shape
+/// problems are per-OPERATION refusals like every other one and a bad operation costs its own
+/// slot and nothing else.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BulkOperation {
-    /// `POST`, `PUT`, `PATCH` or `DELETE`. Absent is refused as this operation's own 400.
-    #[serde(default)]
-    pub method: Option<String>,
+    /// `POST`, `PUT`, `PATCH` or `DELETE`. Absent or not a string is this operation's own 400.
+    pub method: Option<Value>,
     /// The resource path this operation addresses.
-    #[serde(default)]
-    pub path: Option<String>,
+    pub path: Option<Value>,
     /// The client's correlation id for this operation.
-    #[serde(rename = "bulkId", default)]
-    pub bulk_id: Option<String>,
+    #[serde(rename = "bulkId")]
+    pub bulk_id: Option<Value>,
     /// The resource body, for the methods that carry one.
     ///
     /// Kept as a raw `Value` and re-serialized when the operation is dispatched, rather than
@@ -165,6 +168,33 @@ pub enum BulkError {
     },
 }
 
+/// The SCIM error document a 405 refusal carries.
+///
+/// Separate from [`scim_error_document`] only in its status and `scimType`: a method the path
+/// does not offer is not an `invalidValue`.
+#[must_use]
+pub fn method_not_allowed_document(detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+        "detail": detail,
+        "status": "405",
+    })
+}
+
+/// One of the operation's scalar fields as a string, or `None` if it is absent OR not a string.
+///
+/// The two are deliberately the same answer here and different refusals at the call site: a
+/// field that is present and wrong-typed is a client bug worth naming, and an absent one is a
+/// different client bug worth naming, but neither may reach the envelope parse.
+fn scalar(field: Option<&Value>) -> Option<&str> {
+    field.and_then(Value::as_str)
+}
+
+/// Whether one of the operation's scalar fields is present but not a string.
+fn wrong_typed(field: Option<&Value>) -> bool {
+    field.is_some_and(|value| !value.is_string())
+}
+
 /// The SCIM error document a per-operation refusal carries.
 ///
 /// The same shape `crate::server::scim_error` renders, built here because this module has no
@@ -237,14 +267,12 @@ pub fn validate_bulk(
         .operations
         .iter()
         .map(|operation| {
-            let method = operation
-                .method
-                .as_deref()
+            let method = scalar(operation.method.as_ref())
                 .unwrap_or_default()
                 .to_ascii_uppercase();
             let refuse = |detail: &str| {
                 BulkOutcome::Refused(BulkOperationResult {
-                    bulk_id: operation.bulk_id.clone(),
+                    bulk_id: scalar(operation.bulk_id.as_ref()).map(str::to_owned),
                     method: method.clone(),
                     status: "400".to_owned(),
                     detail: Some(detail.to_owned()),
@@ -259,13 +287,25 @@ pub fn validate_bulk(
                     response: Some(scim_error_document(detail)),
                 })
             };
+            // WRONG-TYPED FIRST, and named as its own refusal. `"method": 5` and a missing
+            // method are different client bugs, and telling them apart is the difference
+            // between a client fixing its serializer and a client hunting a phantom.
+            for (name, field) in [
+                ("method", operation.method.as_ref()),
+                ("path", operation.path.as_ref()),
+                ("bulkId", operation.bulk_id.as_ref()),
+            ] {
+                if wrong_typed(field) {
+                    return refuse(&format!("the operation's {name} is not a string"));
+                }
+            }
             if operation.method.is_none() {
                 return refuse("the operation names no method");
             }
             if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
                 return refuse("unsupported bulk method");
             }
-            let Some(path) = operation.path.as_deref() else {
+            let Some(path) = scalar(operation.path.as_ref()) else {
                 return refuse("the operation names no path");
             };
             // A `bulkId:` REFERENCE, which RFC 7644 section 3.7.2 lets a client use to point a
@@ -284,7 +324,7 @@ pub fn validate_bulk(
             // exactly where an attacker would hope it were.
             match parse_resource_path(path) {
                 Ok(resource) => BulkOutcome::Resolved {
-                    bulk_id: operation.bulk_id.clone(),
+                    bulk_id: scalar(operation.bulk_id.as_ref()).map(str::to_owned),
                     method,
                     resource,
                 },
@@ -467,14 +507,21 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_batch_is_allowed_and_yields_no_results() {
-        // The control on the limit checks: they must not refuse a legitimate empty batch,
-        // which is what a client sends when it has nothing to do.
+    fn an_empty_batch_is_allowed_by_the_validator_and_refused_by_the_route() {
+        // The control on the limit checks: they must not refuse an empty batch, which is what a
+        // bound applied to `len()` would do if it were written the wrong way round.
+        //
+        // AND THE ROUTE REFUSES IT ANYWAY, one layer up. That is not a contradiction and the
+        // asymmetry is deliberate: `#[serde(default)]` on `Operations` means a body of `{}` and
+        // a body whose key is misspelled BOTH arrive here as an empty batch, and answering
+        // `200 {"Operations":[]}` to a typo is how a client learns its batch ran when it did
+        // not. RFC 7644 section 3.7 does not forbid an empty batch; it also gives a client no
+        // reason to send one. So the validator stays honest about what it checks, and
+        // `crate::server::bulk` owns the refusal --
+        // `a_malformed_bulk_envelope_is_refused_rather_than_answered_as_an_empty_batch` drives
+        // it. An earlier version of this comment said the opposite of what the server does.
         let parsed = request(r#"{"Operations":[]}"#);
-        assert!(
-            validate_bulk(&parsed, 10, BulkLimits::default())
-                .expect("allowed")
-                .is_empty()
-        );
+        let results = validate_bulk(&parsed, 20, BulkLimits::default()).expect("within limits");
+        assert!(results.is_empty());
     }
 }
