@@ -1,0 +1,11 @@
+error[E0599]: no method named `attribute` found for reference `&ironauth_saml::Element` in the current scope
+  --> tests/compile-fail/read_a_value_from_an_unverified_document.rs:16:29
+   |
+16 |     let _ = document.root().attribute("Destination");
+   |                             ^^^^^^^^^ method not found in `&ironauth_saml::Element`
+
+error[E0599]: no method named `text` found for struct `ironauth_saml::Element` in the current scope
+  --> tests/compile-fail/read_a_value_from_an_unverified_document.rs:18:43
+   |
+18 |     let _ = document.root().children()[0].text();
+   |                                           ^^^^ method not found in `ironauth_saml::Element`

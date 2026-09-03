@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-saml"
+version = "0.1.0"
+description = "IronAuth hostile-input SAML harness: the single choke point through which SAML XML may enter, with DTDs and external entities structurally impossible, size and depth bounds, and an API that offers no way to read an attribute from a document nobody has verified"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# THE ONE XML LIBRARY. See the crate doc for the evaluation and the rejected
+# alternatives. Default features OFF: `quick-xml` gains nothing here from
+# serialisation or async, and every feature is a parser surface this crate would
+# then have to reason about.
+quick-xml = { workspace = true }
+
+[dev-dependencies]
+# trybuild drives the compile-fail proof that a value cannot be read out of an
+# unverified document, which is the shape `ironauth-jose` uses for the same job.
+trybuild.workspace = true
+
+[lints]
+workspace = true

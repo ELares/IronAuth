@@ -25,6 +25,7 @@ table is the authoritative list of artifacts and their versions at HEAD.
 | ironauth-kms | 0.1.0 | library | 1.85 |
 | ironauth-oidc | 0.1.0 | library | 1.85 |
 | ironauth-quota | 0.1.0 | library | 1.85 |
+| ironauth-saml | 0.1.0 | library | 1.85 |
 | ironauth-scim | 0.1.0 | library | 1.85 |
 | ironauth-screening | 0.1.0 | library | 1.85 |
 | ironauth-server | 0.1.0 | library | 1.85 |
