@@ -1463,11 +1463,16 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
             &scope.tenant().to_string(),
             &scope.environment().to_string(),
             at,
+            // MEMBERSHIP ids, and the field names say so. v1 of this type named them
+            // `added_user_ids` while every producer filled them with `omb_` ids, so a consumer
+            // resolving them as users found nothing; this test hand-wrote the same mistake.
+            // See the type's own note in `event_catalog.rs` for why the values are right and
+            // the names were wrong.
             &serde_json::json!({
                 "org_group_id": group.to_string(),
                 "organization_id": org.to_string(),
-                "added_user_ids": added,
-                "removed_user_ids": removed,
+                "added_membership_ids": added,
+                "removed_membership_ids": removed,
                 "truncated": false,
                 "total": 1,
             }),
@@ -1508,6 +1513,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
                 organization_id: &org,
                 group_id: &group,
                 membership_id: &membership,
+                source_scim_connection_id: None,
             },
             now_micros(&env),
             None,
@@ -1537,7 +1543,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
         .expect("the delta form");
     assert_eq!(changed["payload"]["org_group_id"], group.to_string());
     assert_eq!(
-        changed["payload"]["added_user_ids"][0],
+        changed["payload"]["added_membership_ids"][0],
         membership.to_string()
     );
     for event in &events {
@@ -1585,7 +1591,7 @@ async fn a_group_membership_change_carries_the_delta_beside_the_per_member_event
         .find(|event| event["type"] == "org_group.membership_changed")
         .expect("the delta form on the removal");
     assert_eq!(
-        removal["payload"]["removed_user_ids"][0],
+        removal["payload"]["removed_membership_ids"][0],
         membership.to_string(),
         "a group removal must move the id to the REMOVED array"
     );

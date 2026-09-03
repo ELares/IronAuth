@@ -1745,7 +1745,7 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
-          "added_user_ids": {
+          "added_membership_ids": {
             "items": {
               "minLength": 1,
               "type": "string"
@@ -1760,7 +1760,7 @@
             "minLength": 1,
             "type": "string"
           },
-          "removed_user_ids": {
+          "removed_membership_ids": {
             "items": {
               "minLength": 1,
               "type": "string"
@@ -1778,14 +1778,14 @@
         "required": [
           "org_group_id",
           "organization_id",
-          "added_user_ids",
-          "removed_user_ids",
+          "added_membership_ids",
+          "removed_membership_ids",
           "truncated",
           "total"
         ],
         "type": "object"
       },
-      "payload_schema_version": 1,
+      "payload_schema_version": 2,
       "type": "org_group.membership_changed"
     },
     {

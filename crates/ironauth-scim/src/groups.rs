@@ -37,7 +37,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::server::{Authenticated, ScimState, scim_error, scim_json};
-use crate::users::{ListQuery, addressed_user, epoch_micros, not_found, store_failure};
+use crate::users::{
+    ListQuery, addressed_user, epoch_micros, internal_error, not_found, store_failure,
+};
 
 /// The SCIM core group schema URN (RFC 7643 section 4.2).
 const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
@@ -402,6 +404,59 @@ async fn resolve_members(
 /// so anybody not named is removed; a PATCH `add` names only additions, so nothing is removed.
 /// Getting that backwards in either direction is a silent deprovisioning or a silent grant,
 /// which is why it is a parameter rather than two nearly identical functions that could drift.
+/// What one `/Groups` write will do to a group's membership, decided before any of it happens.
+///
+/// Computed up front for one reason: the delta event has to ride the LAST write of the
+/// operation. Each binding write is its own transaction, so a delta enqueued anywhere else
+/// would announce a set change that a later failure left half done. Knowing the whole plan is
+/// what makes "the last one" nameable, and what makes the announcement mean "all of this
+/// happened".
+struct MemberPlan {
+    /// Memberships to bind, in request order.
+    adding: Vec<OrgMembershipId>,
+    /// Bindings to remove. Always empty unless the request REPLACES the membership: a SCIM
+    /// `add` operation names what to add and says nothing about the rest of the group.
+    removing: Vec<ironauth_store::OrgGroupMemberRecord>,
+}
+
+impl MemberPlan {
+    /// How many writes the plan performs. The delta rides the last of them.
+    fn writes(&self) -> usize {
+        self.adding.len() + self.removing.len()
+    }
+}
+
+/// Decide [`MemberPlan`] from what the group holds and what the request asked for.
+///
+/// Returns the plan rather than a `Result`, and the scan-bound refusal lives at the caller: a
+/// `Response` is a large error variant and threading one out of a pure decision function buys
+/// nothing, since the caller is the only thing that can answer the request anyway.
+fn plan_members(
+    existing: &[ironauth_store::OrgGroupMemberRecord],
+    wanted: &[OrgMembershipId],
+    replace: bool,
+) -> MemberPlan {
+    let adding: Vec<OrgMembershipId> = wanted
+        .iter()
+        .copied()
+        .filter(|membership| {
+            !existing
+                .iter()
+                .any(|binding| binding.membership_id == *membership)
+        })
+        .collect();
+    let removing: Vec<ironauth_store::OrgGroupMemberRecord> = if replace {
+        existing
+            .iter()
+            .filter(|binding| !wanted.contains(&binding.membership_id))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    MemberPlan { adding, removing }
+}
+
 async fn set_members(
     state: &ScimState,
     auth: &Authenticated,
@@ -415,22 +470,14 @@ async fn set_members(
         .store()
         .management()
         .acting(auth.actor, CorrelationId::generate(&env));
-
+    let plan = plan_members(&existing, wanted, replace);
     // The RESULTING size, which `resolve_members` cannot know: an `add` of two members to a
-    // group that already holds the bound takes it over. Computed before any write, so the
+    // group that already holds the bound takes it over. Checked before any write, so the
     // refusal leaves the group exactly as it was.
-    let arriving = wanted
-        .iter()
-        .filter(|membership| {
-            !existing
-                .iter()
-                .any(|binding| binding.membership_id == **membership)
-        })
-        .count();
     let resulting = if replace {
         wanted.len()
     } else {
-        existing.len() + arriving
+        existing.len() + plan.adding.len()
     };
     if resulting > state.limits().scan_bound() {
         return Err(scim_error(
@@ -439,50 +486,94 @@ async fn set_members(
             "this change would leave the group with more members than one request may examine",
         ));
     }
-    let mut keep = Vec::with_capacity(wanted.len());
-    for membership in wanted.iter().copied() {
-        if existing
+    let writes = plan.writes();
+    if writes == 0 {
+        // NOTHING CHANGED, so nothing is announced. A `PUT` that restates a group's current
+        // membership is the ordinary output of an identity provider's sync sweep, and a delta
+        // claiming a change it did not make is the phantom-event defect the activation upsert's
+        // conflict arm exists to prevent on the user side.
+        return Ok(());
+    }
+    let organization = auth.connection.organization_id.to_string();
+    let group_text = group.to_string();
+    let Some(delta) = crate::events::group_membership_delta_event(
+        state,
+        auth.scope,
+        &group_text,
+        &organization,
+        plan.adding.iter().map(ToString::to_string).collect(),
+        plan.removing
             .iter()
-            .any(|binding| binding.membership_id == membership)
-        {
-            keep.push(membership);
-            continue;
-        }
+            .map(|binding| binding.membership_id.to_string())
+            .collect(),
+    ) else {
+        return Err(internal_error());
+    };
+
+    let mut written = 0_usize;
+    for membership in &plan.adding {
+        written += 1;
         let binding_id = OrgGroupMemberId::generate(&env, &auth.scope);
+        let Some(per_member) = crate::events::group_member_event(
+            state,
+            auth.scope,
+            crate::events::GROUP_MEMBER_ADDED,
+            &group_text,
+            &organization,
+            &membership.to_string(),
+        ) else {
+            return Err(internal_error());
+        };
         acting
             .org_group_members(auth.scope)
-            .add(
+            .add_with_event(
                 &env,
                 NewOrgGroupMember {
                     id: &binding_id,
                     organization_id: &auth.connection.organization_id,
                     group_id: group,
-                    membership_id: &membership,
+                    membership_id: membership,
+                    // ATTRIBUTED TO THIS CONNECTION (issue #136, criterion 6). It is what a
+                    // revoke of this credential tears down: a compromised identity provider
+                    // must not leave the people it pushed holding the roles their groups
+                    // confer after an operator has disarmed it.
+                    source_scim_connection_id: Some(&auth.connection.id),
                 },
                 epoch_micros(state),
                 None,
+                Some(&per_member.borrowed()),
+                (written == writes).then(|| delta.borrowed()).as_ref(),
             )
             .await
             .map_err(|error| store_failure(&error))?;
-        keep.push(membership);
     }
-    if !replace {
-        return Ok(());
-    }
-    for binding in &existing {
-        if keep.contains(&binding.membership_id) {
-            continue;
-        }
+    for binding in &plan.removing {
+        written += 1;
+        let Some(per_member) = crate::events::group_member_event(
+            state,
+            auth.scope,
+            crate::events::GROUP_MEMBER_REMOVED,
+            &group_text,
+            &organization,
+            &binding.membership_id.to_string(),
+        ) else {
+            return Err(internal_error());
+        };
         acting
             .org_group_members(auth.scope)
-            .remove(&env, &auth.connection.organization_id, &binding.id)
+            .remove_with_event(
+                &env,
+                &auth.connection.organization_id,
+                &binding.id,
+                Some(&per_member.borrowed()),
+                (written == writes).then(|| delta.borrowed()).as_ref(),
+            )
             .await
             .map_err(|error| store_failure(&error))?;
     }
     Ok(())
 }
 
-/// Remove named members from a group, leaving the rest.
 async fn drop_members(
     state: &ScimState,
     auth: &Authenticated,
@@ -495,22 +586,64 @@ async fn drop_members(
         .store()
         .management()
         .acting(auth.actor, CorrelationId::generate(&env));
-    for membership in unwanted.iter().copied() {
-        for binding in existing
+    // THE PLAN FIRST, for the reason `set_members` gives: each removal is its own transaction,
+    // so the delta has to ride the last one to mean "all of this happened". A named member who
+    // is not in the group contributes nothing -- RFC 7644 makes a remove of an absent member a
+    // no-op rather than an error, and announcing one would be a delta claiming a change nobody
+    // made.
+    let removing: Vec<_> = unwanted
+        .iter()
+        .filter_map(|membership| {
+            existing
+                .iter()
+                .find(|binding| binding.membership_id == *membership)
+        })
+        .collect();
+    if removing.is_empty() {
+        return Ok(());
+    }
+    let organization = auth.connection.organization_id.to_string();
+    let group_text = group.to_string();
+    let Some(delta) = crate::events::group_membership_delta_event(
+        state,
+        auth.scope,
+        &group_text,
+        &organization,
+        Vec::new(),
+        removing
             .iter()
-            .filter(|binding| binding.membership_id == membership)
-        {
-            acting
-                .org_group_members(auth.scope)
-                .remove(&env, &auth.connection.organization_id, &binding.id)
-                .await
-                .map_err(|error| store_failure(&error))?;
-        }
+            .map(|binding| binding.membership_id.to_string())
+            .collect(),
+    ) else {
+        return Err(internal_error());
+    };
+    for (position, binding) in removing.iter().enumerate() {
+        let Some(per_member) = crate::events::group_member_event(
+            state,
+            auth.scope,
+            crate::events::GROUP_MEMBER_REMOVED,
+            &group_text,
+            &organization,
+            &binding.membership_id.to_string(),
+        ) else {
+            return Err(internal_error());
+        };
+        let last = position + 1 == removing.len();
+        acting
+            .org_group_members(auth.scope)
+            .remove_with_event(
+                &env,
+                &auth.connection.organization_id,
+                &binding.id,
+                Some(&per_member.borrowed()),
+                last.then(|| delta.borrowed()).as_ref(),
+            )
+            .await
+            .map_err(|error| store_failure(&error))?;
     }
     Ok(())
 }
 
-/// `GET /scim/v2/Groups/{id}`.
 pub(crate) async fn get_group(
     State(state): State<ScimState>,
     headers: HeaderMap,

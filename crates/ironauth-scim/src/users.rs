@@ -76,6 +76,21 @@ pub(crate) fn not_found() -> Response {
 /// [`StoreError::NotFound`] becomes the uniform 404 rather than anything more specific: the
 /// store returns it for an out-of-scope id, which is exactly the case a caller must not be
 /// able to tell from an absent one.
+/// The 500 a producer that could not build its event answers with.
+///
+/// UNREACHABLE while every type a producer names is registered, and a 500 rather than an
+/// eventless write because emitting nothing is precisely the failure the announcement exists to
+/// prevent: the change commits and every downstream copy of the directory stays wrong, with
+/// nothing later to reconcile it. `every_type_this_crate_emits_is_registered` is what keeps it
+/// unreachable.
+pub(crate) fn internal_error() -> Response {
+    scim_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        None,
+        "the request could not be completed",
+    )
+}
+
 pub(crate) fn store_failure(error: &StoreError) -> Response {
     match error {
         StoreError::NotFound => not_found(),
@@ -942,16 +957,7 @@ async fn set_active(
         &user.to_string(),
         &auth.connection.organization_id.to_string(),
     ) else {
-        // UNREACHABLE while the type is registered, and a 500 rather than a silent eventless
-        // write because emitting nothing is precisely the failure this announcement exists to
-        // prevent: the person stops being able to sign in here and every downstream directory
-        // keeps listing them, with nothing later to reconcile the two.
-        // `every_type_this_crate_emits_is_registered` is what keeps it unreachable.
-        return Err(scim_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            "the request could not be completed",
-        ));
+        return Err(internal_error());
     };
     activation
         .set_active_with_event(
@@ -1137,11 +1143,7 @@ async fn reconcile_account_state(
         target.as_str(),
         hard_kill,
     ) else {
-        return Err(scim_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            "the request could not be completed",
-        ));
+        return Err(internal_error());
     };
     scoped
         .acting(auth.actor, CorrelationId::generate(&env))
@@ -1659,11 +1661,7 @@ pub(crate) async fn delete_user(
         &user.to_string(),
         &auth.connection.organization_id.to_string(),
     ) else {
-        return scim_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            "the request could not be completed",
-        );
+        return internal_error();
     };
     if let Err(error) = acting
         .org_memberships()

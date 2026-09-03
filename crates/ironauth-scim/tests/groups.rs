@@ -25,7 +25,10 @@ use ironauth_env::Env;
 use ironauth_scim::ScimLimits;
 use ironauth_scim::server::{ScimState, digest_of, mint_token, scim_router};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, NewScimConnection, OrganizationId, ScimConnectionId, Scope};
+use ironauth_store::{
+    CorrelationId, NewScimConnection, OrgMembershipId, OrganizationId, ScimConnectionId, Scope,
+    UserId,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -40,7 +43,29 @@ fn now_micros(env: &Env) -> i64 {
     .expect("fits i64")
 }
 
+/// A seeded organization and the provisioning credential for it.
+///
+/// The ids are returned as well as the token because issue #136's criteria are ABOUT them: a
+/// binding is torn down by the CONNECTION that pushed it, and a role is resolved within the
+/// ORGANIZATION. Tests that only ever call the SCIM surface need the token alone, and
+/// [`seed_org`] still hands them that.
+struct Provisioner {
+    token: String,
+    organization: OrganizationId,
+    connection: ScimConnectionId,
+}
+
 async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret: &str) -> String {
+    seed_provisioner(db, env, scope, name, secret).await.token
+}
+
+async fn seed_provisioner(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    name: &str,
+    secret: &str,
+) -> Provisioner {
     let org = OrganizationId::generate(env, &scope);
     db.control_store()
         .management()
@@ -69,7 +94,11 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str, secret
         )
         .await
         .expect("create connection");
-    token
+    Provisioner {
+        token,
+        organization: org,
+        connection: id,
+    }
 }
 
 async fn call(
@@ -1226,4 +1255,523 @@ async fn one_oversized_group_does_not_hide_the_rest_of_the_listing() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let parsed: Value = serde_json::from_str(&body).expect("a resource");
     assert_eq!(parsed["members"], json!([]), "{body}");
+}
+
+// =========================================================================================
+// Issue #136 criteria 4 to 6: group-to-role mapping.
+//
+// THE MAPPING MODEL ALREADY EXISTED, and measuring that before building one is why this
+// section is tests and a teardown rather than a new subsystem. The issue asks for "per
+// connection mapping rules from directory group to IronAuth roles, including group-level role
+// assignment (assign a role to the group object, membership implies the role)". That is
+// `org_group_roles`, which #97 shipped, plus SCIM group push, which #135 shipped: a SCIM group
+// IS an `org_group`, so an operator attaches the role and a push puts people into the group.
+//
+// The rule is enforced by a GRANT rather than by a convention. Migration 0185 gives the data
+// plane nothing at all on `org_group_roles`, so a provisioning connection cannot attach a role
+// to a group: all it can do is put people into groups whose roles an operator already chose.
+// That is what makes the whole mapping safe to drive from the public internet.
+//
+// What was missing, and is here: the events (criterion 4), a test that a rule removal spares
+// direct grants (criterion 5), and the teardown when a connection is revoked (criterion 6),
+// which needed the provenance column migration 0188 adds.
+// =========================================================================================
+
+/// The membership binding `user` holds in `org`.
+async fn membership_of(
+    db: &TestDatabase,
+    scope: Scope,
+    org: &OrganizationId,
+    user: &UserId,
+) -> OrgMembershipId {
+    db.control_store()
+        .management()
+        .org_memberships(scope)
+        .list_for_user(user)
+        .await
+        .expect("list memberships")
+        .into_iter()
+        .find(|membership| membership.organization_id == *org)
+        .expect("the provisioned person is a member")
+        .id
+}
+
+/// The effective role slugs `user` holds in `org`, through the control plane.
+async fn roles_of(
+    db: &TestDatabase,
+    scope: Scope,
+    org: &OrganizationId,
+    user: &UserId,
+) -> std::collections::BTreeSet<String> {
+    db.control_store()
+        .management()
+        .org_groups(scope)
+        .effective_roles(org, user, 8)
+        .await
+        .expect("resolve effective roles")
+}
+
+/// The feed events about `group`, waiting until at least `want` are visible.
+///
+/// POLLED, because `events_page_after` withholds a row until every transaction open anywhere on
+/// the instance has finished, so one read after a write can legitimately return nothing. It
+/// selects on the SUBJECT, which for every type here is the group: that is also what orders one
+/// group's events against each other, so filtering on it is filtering on the ordering key
+/// rather than on a payload field that happens to be present.
+async fn events_about_group(
+    db: &TestDatabase,
+    scope: Scope,
+    group: &str,
+    want: usize,
+) -> Vec<ironauth_store::OutboxMessage> {
+    let outbox = db.store().scoped(scope);
+    for _ in 0..100 {
+        let ironauth_store::EventPage::Page(events) = outbox
+            .outbox()
+            .events_page_after(ironauth_store::EventCursor::beginning(), 200)
+            .await
+            .expect("read the event feed")
+        else {
+            panic!("the beginning cursor cannot age out; nothing here prunes")
+        };
+        let mine: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.ordering_key == group)
+            .collect();
+        if mine.len() >= want {
+            return mine;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("fewer than {want} events about {group} became visible within five seconds");
+}
+
+/// The `type` of each event, in feed order.
+fn event_types(events: &[ironauth_store::OutboxMessage]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| {
+            event.payload["type"]
+                .as_str()
+                .expect("every envelope carries a type")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Define a role in `org` through the control plane, returning its id.
+///
+/// The CONTROL plane, because there is no other option and that is the point: migration 0185
+/// grants the data plane nothing at all on `org_roles` or `org_group_roles`, so a provisioning
+/// connection can put people into groups and can never decide what a group confers.
+async fn define_role(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    slug: &str,
+) -> ironauth_store::OrgRoleId {
+    let role = ironauth_store::OrgRoleId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_roles(scope)
+        .create(
+            env,
+            ironauth_store::NewOrgRole {
+                id: &role,
+                organization_id: org,
+                slug,
+                display_name: slug,
+                metadata: None,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("create the role");
+    role
+}
+
+/// Attach `role` to `group`: the mapping rule itself. Every live member of the group holds the
+/// role, and stops holding it the moment the binding or this assignment goes away.
+async fn map_group_to_role(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    org: &OrganizationId,
+    group: &ironauth_store::OrgGroupId,
+    role: &ironauth_store::OrgRoleId,
+) -> ironauth_store::OrgGroupRoleId {
+    let mapping = ironauth_store::OrgGroupRoleId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_group_roles(scope)
+        .assign(
+            env,
+            ironauth_store::NewOrgGroupRole {
+                id: &mapping,
+                organization_id: org,
+                group_id: group,
+                role_id: role,
+            },
+            now_micros(env),
+            None,
+        )
+        .await
+        .expect("map the directory group to the role");
+    mapping
+}
+
+/// Push `user` into `group` through the SCIM surface, asserting it was accepted.
+async fn push_member(db: &TestDatabase, env: &Env, token: &str, group: &str, user: &str) {
+    let (status, body) = call(
+        db,
+        env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(token),
+        Some(patch(&json!([{
+            "op": "add",
+            "path": "members",
+            "value": [{"value": user}],
+        }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A SCIM group membership PATCH re-maps roles immediately and announces the delta
+/// (issue #136, criterion 4).
+///
+/// # "Immediately" is a property of the model, and this is what proves it
+///
+/// There is no derived-assignment cache to re-evaluate. Effective roles are resolved from the
+/// LIVE group bindings every time they are asked for, so the binding write IS the re-mapping
+/// and nothing can lag behind it. The assertion that says so is the role read taken straight
+/// after the PATCH's response, with no worker run and no sleep between them.
+///
+/// # Both event forms, because they answer different questions
+///
+/// The per-member types say WHO changed and are what an integrator deprovisioning one person
+/// subscribes to. The delta says what the SET did and is what a mirror applies, and it is the
+/// only one that can ever say "I could not fit it all, go and reconcile". Criterion 4 asks for
+/// "added/removed, the delta-payload pattern, rather than full-state dumps", and a full-state
+/// dump is exactly what the group form cannot afford: an enterprise group is the thing with
+/// tens of thousands of members.
+#[tokio::test]
+async fn a_group_membership_push_maps_roles_immediately_and_announces_the_delta() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let group_id = ironauth_store::OrgGroupId::parse_in_scope(&group, &scope).expect("a group id");
+
+    // THE MAPPING RULE, attached by an OPERATOR through the control plane. The data plane holds
+    // no grant on `org_group_roles` at all (migration 0185), so this is the only way it can be
+    // attached, and that is the property that makes group push safe on a public surface.
+    let role = define_role(&db, &env, scope, &acme.organization, "deployer").await;
+    map_group_to_role(&db, &env, scope, &acme.organization, &group_id, &role).await;
+
+    let user = provision(&db, &env, &acme.token, "engineer@example.com").await;
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    let membership = membership_of(&db, scope, &acme.organization, &subject).await;
+
+    assert!(
+        roles_of(&db, scope, &acme.organization, &subject)
+            .await
+            .is_empty(),
+        "the person holds the role BEFORE being put in the group, so the assertion after the \
+         push would pass without the push"
+    );
+
+    push_member(&db, &env, &acme.token, &group, &user).await;
+
+    // IMMEDIATELY: read straight after the response, with nothing run in between.
+    assert!(
+        roles_of(&db, scope, &acme.organization, &subject)
+            .await
+            .contains("deployer"),
+        "a directory group membership must confer the group's role at once, not at the next \
+         sweep of some job"
+    );
+
+    let events = events_about_group(&db, scope, &group, 2).await;
+    assert_eq!(
+        event_types(&events),
+        vec!["org_group.member_added", "org_group.membership_changed"],
+        "both forms are emitted: the per-member type for an integrator watching one person, \
+         the delta for a mirror applying a set change"
+    );
+    assert_eq!(
+        events[0].payload["payload"]["membership_id"],
+        membership.to_string()
+    );
+    assert_eq!(
+        events[1].payload["payload"]["added_membership_ids"],
+        json!([membership.to_string()]),
+        "the delta names WHAT was added, and names it as a membership: that is what a group \
+         binding binds, and what the per-member event beside it carries"
+    );
+    assert_eq!(events[1].payload["payload"]["removed_membership_ids"], json!([]));
+    assert_eq!(events[1].payload["payload"]["truncated"], false);
+    assert_eq!(events[1].payload["payload"]["total"], 1);
+    for event in &events {
+        ironauth_store::event_catalog::validate_event(&event.payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+
+    // AND THE REMOVAL, which is the half that actually takes access away.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Groups/{group}"),
+        Some(&acme.token),
+        Some(patch(&json!([{
+            "op": "remove",
+            "path": format!("members[value eq \"{user}\"]"),
+        }]))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !roles_of(&db, scope, &acme.organization, &subject)
+            .await
+            .contains("deployer"),
+        "removing somebody from a mapped group must take the derived role away at once"
+    );
+    let events = events_about_group(&db, scope, &group, 4).await;
+    assert_eq!(
+        event_types(&events)[2..],
+        ["org_group.member_removed", "org_group.membership_changed"],
+        "the removal announces the same pair"
+    );
+    assert_eq!(
+        events[3].payload["payload"]["removed_membership_ids"],
+        json!([membership.to_string()])
+    );
+}
+
+/// Removing a mapping rule removes ONLY the derived assignments (issue #136, criterion 5).
+///
+/// The two grant paths are different rows in different tables: a role attached to a GROUP
+/// (`org_group_roles`) reaches every member of it, and a role granted to a MEMBERSHIP
+/// (`org_membership_roles`) reaches one person and nothing else. Un-mapping the group touches
+/// the first and cannot touch the second, which is what makes "directly granted roles survive"
+/// a property of the schema rather than of remembering to exclude them.
+#[tokio::test]
+async fn removing_a_mapping_rule_leaves_a_direct_grant_standing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let group_id = ironauth_store::OrgGroupId::parse_in_scope(&group, &scope).expect("a group id");
+    let management = db.control_store();
+
+    let mut role_ids = Vec::new();
+    for slug in ["derived", "direct"] {
+        let role = ironauth_store::OrgRoleId::generate(&env, &scope);
+        management
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .org_roles(scope)
+            .create(
+                &env,
+                ironauth_store::NewOrgRole {
+                    id: &role,
+                    organization_id: &acme.organization,
+                    slug,
+                    display_name: slug,
+                    metadata: None,
+                },
+                now_micros(&env),
+                None,
+            )
+            .await
+            .expect("create the role");
+        role_ids.push(role);
+    }
+    let mapping = ironauth_store::OrgGroupRoleId::generate(&env, &scope);
+    management
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_group_roles(scope)
+        .assign(
+            &env,
+            ironauth_store::NewOrgGroupRole {
+                id: &mapping,
+                organization_id: &acme.organization,
+                group_id: &group_id,
+                role_id: &role_ids[0],
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("map the group to the derived role");
+
+    let user = provision(&db, &env, &acme.token, "engineer@example.com").await;
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    let membership = membership_of(&db, scope, &acme.organization, &subject).await;
+    management
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_membership_roles(scope)
+        .assign(
+            &env,
+            ironauth_store::NewOrgMembershipRole {
+                id: &ironauth_store::OrgMembershipRoleId::generate(&env, &scope),
+                organization_id: &acme.organization,
+                membership_id: &membership,
+                role_id: &role_ids[1],
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("grant the direct role");
+
+    push_member(&db, &env, &acme.token, &group, &user).await;
+    assert_eq!(
+        roles_of(&db, scope, &acme.organization, &subject).await,
+        ["derived".to_owned(), "direct".to_owned()]
+            .into_iter()
+            .collect(),
+        "both paths must be live before the un-mapping, or losing one proves nothing"
+    );
+
+    management
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_group_roles(scope)
+        .unassign(&env, &acme.organization, &mapping)
+        .await
+        .expect("remove the mapping rule");
+
+    assert_eq!(
+        roles_of(&db, scope, &acme.organization, &subject).await,
+        ["direct".to_owned()].into_iter().collect(),
+        "removing the mapping rule must take the DERIVED role and leave the direct grant, which \
+         an operator made for this person and no identity provider is responsible for"
+    );
+}
+
+/// Revoking a connection tears down the bindings IT pushed, and audits the teardown
+/// (issue #136, criterion 6).
+///
+/// # Why this needed a schema change and the rest of the criteria did not
+///
+/// Nothing recorded who created a binding, so "the assignments derived from this connection"
+/// had no answer: revoking a compromised identity provider disarmed the credential and undid
+/// nothing it had done. Migration 0188 adds the provenance column, this is what reads it back,
+/// and NULL (an operator's own binding) is the value the teardown's `= $1` predicate can never
+/// match.
+#[tokio::test]
+async fn revoking_a_connection_tears_down_the_bindings_it_pushed() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_provisioner(&db, &env, scope, "Acme", "s-acme").await;
+    let group = make_group(&db, &env, &acme.token, "Engineering").await;
+    let group_id = ironauth_store::OrgGroupId::parse_in_scope(&group, &scope).expect("a group id");
+
+    let role = define_role(&db, &env, scope, &acme.organization, "deployer").await;
+    map_group_to_role(&db, &env, scope, &acme.organization, &group_id, &role).await;
+
+    // ONE PERSON PUSHED BY THE CONNECTION, and one an OPERATOR bound by hand into the same
+    // group. The pair is the whole test: a teardown that took both would be revoking access
+    // nobody asked it to touch, and one that took neither would leave the compromise in place.
+    let pushed = provision(&db, &env, &acme.token, "pushed@example.com").await;
+    let pushed_subject = UserId::parse_in_scope(&pushed, &scope).expect("a user id");
+    push_member(&db, &env, &acme.token, &group, &pushed).await;
+
+    let by_hand = provision(&db, &env, &acme.token, "byhand@example.com").await;
+    let by_hand_subject = UserId::parse_in_scope(&by_hand, &scope).expect("a user id");
+    let by_hand_membership = membership_of(&db, scope, &acme.organization, &by_hand_subject).await;
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_group_members(scope)
+        .add(
+            &env,
+            ironauth_store::NewOrgGroupMember {
+                id: &ironauth_store::OrgGroupMemberId::generate(&env, &scope),
+                organization_id: &acme.organization,
+                group_id: &group_id,
+                membership_id: &by_hand_membership,
+                // NULL: an operator's binding, which no connection is responsible for.
+                source_scim_connection_id: None,
+            },
+            now_micros(&env),
+            None,
+        )
+        .await
+        .expect("bind the operator's member by hand");
+
+    for (who, subject) in [("pushed", &pushed_subject), ("by hand", &by_hand_subject)] {
+        assert!(
+            roles_of(&db, scope, &acme.organization, subject)
+                .await
+                .contains("deployer"),
+            "the {who} person must hold the derived role before the revoke, or losing it proves \
+             nothing"
+        );
+    }
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &acme.connection, now_micros(&env))
+        .await
+        .expect("revoke the connection");
+
+    assert!(
+        !roles_of(&db, scope, &acme.organization, &pushed_subject)
+            .await
+            .contains("deployer"),
+        "revoking the connection left the person it pushed holding the role its group confers"
+    );
+    assert!(
+        roles_of(&db, scope, &acme.organization, &by_hand_subject)
+            .await
+            .contains("deployer"),
+        "the teardown reached a binding an operator made, which no identity provider is \
+         responsible for and which the revoke was never asked to touch"
+    );
+
+    // AND IT IS AUDITED, with the count, in the revoke's own transaction.
+    let teardown_rows: Vec<_> = db
+        .control_store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("read the audit log")
+        .into_iter()
+        .filter(|row| row.action == "scim_connection.bindings.revoke")
+        .collect();
+    assert_eq!(
+        teardown_rows.len(),
+        1,
+        "the teardown writes exactly one row, carrying the count, rather than one per binding: \
+         an enterprise connection holds tens of thousands and the per-binding record is not \
+         lost, because the rows are soft-deleted and keep their deleted_at"
+    );
+    assert_eq!(
+        teardown_rows[0].detail.as_deref(),
+        Some("bindings=1"),
+        "the row carries how many bindings the teardown removed, so its blast radius is \
+         readable from the audit log alone"
+    );
+    assert_eq!(
+        teardown_rows[0].target_id,
+        acme.connection.to_string(),
+        "targeted at the connection, which is the thing the operator acted on"
+    );
 }

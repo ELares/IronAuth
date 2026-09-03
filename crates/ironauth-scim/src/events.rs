@@ -77,6 +77,16 @@ pub(crate) const USER_DEACTIVATED: &str = "user.deactivated";
 /// moved. Emitted by the reconciliation, and only when the state actually changed.
 pub(crate) const USER_STATE_CHANGED: &str = "user.state_changed";
 
+/// A person was bound into an organization group, or unbound from one (issue #136,
+/// criterion 4). Shared with the management API, which emits the same pair for an operator's
+/// write: a group binding pushed by an identity provider confers exactly what an
+/// operator-created one does, so it must announce itself the same way.
+pub(crate) const GROUP_MEMBER_ADDED: &str = "org_group.member_added";
+/// The removal half of [`GROUP_MEMBER_ADDED`].
+pub(crate) const GROUP_MEMBER_REMOVED: &str = "org_group.member_removed";
+/// What one group write did to the group's membership SET, as a delta.
+pub(crate) const GROUP_MEMBERSHIP_CHANGED: &str = "org_group.membership_changed";
+
 /// Build an organization-grain provisioning event, or `None` if the catalog does not register
 /// `event_type`.
 ///
@@ -160,9 +170,74 @@ fn envelope_for(
     })
 }
 
+/// Build an `org_group.member_added` or `org_group.member_removed` event (issue #136,
+/// criterion 4).
+///
+/// The SUBJECT is the group, matching the management producer of the same types: changes to
+/// one group must stay ordered against each other, which is what lets a consumer apply them as
+/// a sequence. Keying on the membership instead would put a group's own adds and removes in
+/// different ordering groups.
+pub(crate) fn group_member_event(
+    state: &ScimState,
+    scope: Scope,
+    event_type: &str,
+    group: &str,
+    organization: &str,
+    membership: &str,
+) -> Option<OwnedDomainEvent> {
+    envelope_for(
+        state,
+        scope,
+        event_type,
+        group,
+        &serde_json::json!({
+            "org_group_id": group,
+            "organization_id": organization,
+            "membership_id": membership,
+        }),
+    )
+}
+
+/// Build the `org_group.membership_changed` delta for one group write (issue #136,
+/// criterion 4).
+///
+/// Criterion 4 asks for "added/removed, the delta-payload pattern, rather than full-state
+/// dumps", and this is that pattern: the arrays, the truncation flag and the true total, with
+/// the cap decided by `ironauth_store::membership_change` so no producer re-derives it.
+///
+/// It carries MEMBERSHIP ids, and says so in its field names. A group binding binds a
+/// membership rather than a user, which is also what the per-member events above carry.
+pub(crate) fn group_membership_delta_event(
+    state: &ScimState,
+    scope: Scope,
+    group: &str,
+    organization: &str,
+    added: Vec<String>,
+    removed: Vec<String>,
+) -> Option<OwnedDomainEvent> {
+    let change = ironauth_store::membership_change(added, removed);
+    let mut payload = ironauth_store::membership_delta_payload(
+        &change,
+        "added_membership_ids",
+        "removed_membership_ids",
+    );
+    payload["org_group_id"] = serde_json::json!(group);
+    payload["organization_id"] = serde_json::json!(organization);
+    envelope_for(
+        state,
+        scope,
+        GROUP_MEMBERSHIP_CHANGED,
+        group,
+        &payload,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{USER_DEACTIVATED, USER_DEPROVISIONED, USER_STATE_CHANGED};
+    use super::{
+        GROUP_MEMBER_ADDED, GROUP_MEMBER_REMOVED, GROUP_MEMBERSHIP_CHANGED, USER_DEACTIVATED,
+        USER_DEPROVISIONED, USER_STATE_CHANGED,
+    };
 
     /// Every type this crate emits is in the catalog.
     ///
@@ -178,7 +253,14 @@ mod tests {
     /// termination.
     #[test]
     fn every_type_this_crate_emits_is_registered() {
-        for wire in [USER_DEPROVISIONED, USER_DEACTIVATED, USER_STATE_CHANGED] {
+        for wire in [
+            USER_DEPROVISIONED,
+            USER_DEACTIVATED,
+            USER_STATE_CHANGED,
+            GROUP_MEMBER_ADDED,
+            GROUP_MEMBER_REMOVED,
+            GROUP_MEMBERSHIP_CHANGED,
+        ] {
             assert!(
                 ironauth_store::event_catalog::registered(wire).is_some(),
                 "{wire} is emitted by this crate and is not in the event catalog"

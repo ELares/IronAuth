@@ -242,6 +242,7 @@ pub async fn add_org_group_member(
                 organization_id: &org_id,
                 group_id: &group,
                 membership_id: &membership,
+                source_scim_connection_id: None,
             },
             created_at_micros,
             Some(write),
@@ -496,7 +497,13 @@ fn group_membership_delta_event(
 ) -> Option<crate::events::PendingEvent> {
     let id = format!("evt_{}", CorrelationId::generate(state.env()));
     let change = ironauth_store::membership_change(added, removed);
-    let mut payload = crate::events::membership_delta_payload(&change);
+    // THE MEMBERSHIP NAMES, because that is what these arrays carry. See
+    // `membership_delta_payload_named` for the defect that sharing the user-id names shipped.
+    let mut payload = ironauth_store::membership_delta_payload(
+        &change,
+        "added_membership_ids",
+        "removed_membership_ids",
+    );
     let subject = group_id.to_string();
     payload["org_group_id"] = serde_json::json!(subject);
     payload["organization_id"] = serde_json::json!(organization_id.to_string());

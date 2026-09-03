@@ -335,6 +335,7 @@ impl Fixture {
                     organization_id: &self.org,
                     group_id: group,
                     membership_id: &self.membership,
+                    source_scim_connection_id: None,
                 },
                 AT,
                 None,

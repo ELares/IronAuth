@@ -1510,6 +1510,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0187_scim_enterprise_attributes.sql"),
         },
+        Migration {
+            version: 188,
+            name: "group_binding_provenance",
+            // EXPAND: one nullable column and one partial index on an existing table. An old
+            // binary's INSERT names every column it knows and omits this one, which is exactly
+            // what a NULL default is for, and its reads select a fixed column list that does
+            // not include it. Nothing is removed and no data is moved.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0188_group_binding_provenance.sql"),
+        },
     ]
 }
 

@@ -573,24 +573,44 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // The GROUP twin, same contract. Groups are where the cap actually bites: an
         // enterprise group is the thing with tens of thousands of members, which is why
         // issue #107 named group dumps as the failure mode.
+        //
+        // VERSION 2, AND THE BUMP IS A CORRECTION. v1 declared `added_user_ids` and
+        // `removed_user_ids`, copied from the organization twin, and the producer filled them
+        // with `omb_` ORGANIZATION MEMBERSHIP ids -- because that is what a group binding binds.
+        // A consumer resolving them as user ids found nothing, every time, and the schema was
+        // what told it to. The organization twin's arrays really are user ids, so the copy was
+        // wrong here and only here.
+        //
+        // MEMBERSHIP IDS ARE THE RIGHT VALUE, not the wrong name to be fixed by resolving
+        // users: `org_group.member_added` and `member_removed`, the per-member events this one
+        // summarizes, both carry `membership_id`, so a consumer of group events already speaks
+        // them. Emitting user ids here would make the delta and the per-member events describe
+        // the same change in two vocabularies.
+        //
+        // A rename is breaking (a property disappears), so it mints a new version rather than
+        // editing v1 in place, which is what `scripts/event-registry-compat.py` enforces.
         "org_group.membership_changed",
-        1,
+        2,
         r#"{
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "org_group_id": {"type": "string", "minLength": 1},
                 "organization_id": {"type": "string", "minLength": 1},
-                "added_user_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
-                "removed_user_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "added_membership_ids": {
+                    "type": "array", "items": {"type": "string", "minLength": 1}
+                },
+                "removed_membership_ids": {
+                    "type": "array", "items": {"type": "string", "minLength": 1}
+                },
                 "truncated": {"type": "boolean"},
                 "total": {"type": "integer", "minimum": 0}
             },
             "required": [
                 "org_group_id",
                 "organization_id",
-                "added_user_ids",
-                "removed_user_ids",
+                "added_membership_ids",
+                "removed_membership_ids",
                 "truncated",
                 "total"
             ]
