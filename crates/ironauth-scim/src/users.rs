@@ -908,13 +908,59 @@ async fn set_active(
     active: bool,
 ) -> Result<(), Response> {
     let scoped = state.store().scoped(auth.scope);
-    scoped
-        .scim_activation()
-        .set_active(
+    let activation = scoped.scim_activation();
+    let now = epoch_micros(state);
+    // NO ORGANIZATION-GRAIN EVENT ON A REACTIVATION, which is an asymmetry worth stating rather
+    // than leaving a reader to notice. The ACCOUNT grain is not silent: a reactivation that
+    // moves the account back out of `Disabled` emits `user.state_changed` from the
+    // reconciliation below, exactly as the deactivation did. Only the per-organization notice
+    // is missing, and an earlier version of this comment overstated it as "a reactivation is
+    // not announced", which the test below disproves in the same file.
+    //
+    // Issue #136 is about deprovisioning: criteria 1 to 3 name the termination, the cascade it
+    // runs and the events it emits, and nothing here asks that a re-enable be published. A
+    // `user.reactivated` would need a producer, a schema and a place in the published catalog,
+    // and adding one on the way past is how a registry fills with types whose meaning nobody
+    // settled.
+    //
+    // The residual gap is REAL and is recorded on the issue: a consumer mirroring one
+    // organization's directory sees that person deactivated HERE and never learns this
+    // organization took them back, even though it can see the account came back.
+    if active {
+        return match activation
+            .set_active(&auth.connection.organization_id, user, active, now)
+            .await
+        {
+            Ok(()) => reconcile_account_state(state, auth, user).await,
+            Err(error) => Err(store_failure(&error)),
+        };
+    }
+    let Some(event) = crate::events::membership_event(
+        state,
+        auth.scope,
+        crate::events::USER_DEACTIVATED,
+        &user.to_string(),
+        &auth.connection.organization_id.to_string(),
+    ) else {
+        // UNREACHABLE while the type is registered, and a 500 rather than a silent eventless
+        // write because emitting nothing is precisely the failure this announcement exists to
+        // prevent: the person stops being able to sign in here and every downstream directory
+        // keeps listing them, with nothing later to reconcile the two.
+        // `every_type_this_crate_emits_is_registered` is what keeps it unreachable.
+        return Err(scim_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "the request could not be completed",
+        ));
+    };
+    activation
+        .set_active_with_event(
+            state.env(),
             &auth.connection.organization_id,
             user,
             active,
-            epoch_micros(state),
+            now,
+            &event.borrowed(),
         )
         .await
         .map_err(|error| store_failure(&error))?;
@@ -927,6 +973,23 @@ async fn set_active(
 /// any organization still consider this person active? The answer is computed from the whole
 /// relation rather than tracked incrementally, so a sequence of deactivations and
 /// reactivations in any order lands on the same state as the set of facts implies.
+///
+/// # There is no revocation SLO here, because there is no queue
+///
+/// Issue #136 criterion 1 asks for revocation "within the documented SLO", and its What section
+/// asks that the delay be "measured and exposed as a metric". Neither is shipped, and the
+/// reason is that the thing they would measure does not exist: the sessions, the refresh
+/// families and their grants are revoked in the SAME TRANSACTION as the state change, before
+/// the SCIM response is written. There is no worker, no queue and no lag to bound, so a metric
+/// would report zero by construction and an SLO would be a bound on a number that cannot move.
+///
+/// What IS asynchronous is the delivery that follows: back-channel logout and the webhook
+/// fan-out drain the outbox. Those have their own bounds and their own issues, and neither is
+/// what this criterion is about -- an application still holding a live token is a different
+/// exposure from one that has not yet been told.
+///
+/// The tests assert the stronger property the synchronous design makes available: immediately
+/// after the response, with nothing run in between, the families and the session are dead.
 async fn reconcile_account_state(
     state: &ScimState,
     auth: &Authenticated,
@@ -961,6 +1024,53 @@ async fn reconcile_account_state(
         UserState::Disabled
     };
     if record.state == target {
+        // THE STATE DOES NOT MOVE, WHICH IS NOT THE SAME AS NOTHING TO DO.
+        //
+        // An account an operator had already disabled WITHOUT a hard kill (the management
+        // state route takes `hard_kill` straight from the request body, so `{"state":
+        // "disabled", "hard_kill": false}` is one call away) still holds its offline refresh
+        // families and their grants: a plain disable deliberately leaves them, because the
+        // person may be coming back.
+        //
+        // When the last organization that held such a person then deprovisions them, this
+        // early return used to end the request. `set_state` was never called, the hard kill
+        // never ran, and the long-lived consent an application holds to act for them survived
+        // an offboarding -- the exact leak the comment below says nothing else would ever end.
+        // A review drove it: operator disable, then a SCIM DELETE, and the offline family was
+        // still live afterwards.
+        //
+        // So the CASCADE runs on its own here. `set_state` cannot: it re-checks `state = from`
+        // inside its transaction and a same-state transition is refused. It reaches this line
+        // only when `should_be_active` was false, so the person is held active by no
+        // organization at all.
+        //
+        // ASKED FIRST, AND THAT IS NOT AN OPTIMISATION. `revoke_all_for_user` audits
+        // UNCONDITIONALLY -- `write_audited` appends its row whether or not the UPDATE matched
+        // anything -- so calling it speculatively appends a `user.sessions.revoke_all` row on
+        // every request that finds nothing live. A review measured it: three repeated
+        // deactivates wrote three such rows while the request that actually revoked everything
+        // wrote none, because that one goes through `set_state_with_event` under a different
+        // action. The audit log would have said the opposite of what happened, and the ordinary
+        // shapes that produce it are the ones this file calls ordinary: an identity provider's
+        // sync sweep, and the issue's own "deactivate then delete".
+        //
+        // The read-then-write window is closed by the state this branch is in rather than by a
+        // lock: reaching here means the account cannot authenticate, and a session and a
+        // refresh family are both minted by an authorization such an account is refused.
+        if target == UserState::Disabled
+            && scoped
+                .sessions()
+                .any_live_session_or_family(user)
+                .await
+                .map_err(|error| store_failure(&error))?
+        {
+            scoped
+                .acting(auth.actor, CorrelationId::generate(&env))
+                .sessions()
+                .revoke_all_for_user(&env, user, true, None)
+                .await
+                .map_err(|error| store_failure(&error))?;
+        }
         return Ok(());
     }
     // REACTIVATION is narrower than deactivation, deliberately. Moving somebody out of
@@ -970,10 +1080,73 @@ async fn reconcile_account_state(
     if should_be_active && record.state != UserState::Disabled {
         return Ok(());
     }
+    // HARD KILL WHEN THE ACCOUNT IS GOING DARK, and not otherwise. Issue #136 is where
+    // this decision belongs and this is it.
+    //
+    // The transition itself already ends the cascade's main body: `UserState::Disabled`
+    // is `ends_sessions()`, so `set_state` revokes every live session and every
+    // NON-offline refresh family in the same transaction and publishes to the
+    // session-ended fan-out. What `hard_kill` adds is the OFFLINE refresh families and
+    // their grants -- the long-lived consent an application holds to act for the person
+    // while they are away.
+    //
+    // That consent must end exactly when the person does. Reaching this line with
+    // `target == Disabled` means `should_be_active` was false, which means no
+    // organization in this environment holds them active any more: an identity provider
+    // has said the person is gone. Leaving an application able to act for them
+    // indefinitely after that is the deprovisioning leak this criterion is about, and
+    // it is not a small one -- an offline grant needs no session and no interaction, so
+    // nothing else would ever end it.
+    //
+    // WHAT STOPS IT OVER-REACHING IS `should_be_active`, NOT THIS FLAG, and an earlier version
+    // of this comment had that backwards. It argued the flag "is a condition and not a constant
+    // `true`" because a person still active in another organization must keep their consent --
+    // but such a person makes `should_be_active` true, so `target` is `Active` and this
+    // transition is not a deprovisioning at all.
+    //
+    // IT HAS TWO READERS AND THEY ARE NOT SYMMETRIC, which an earlier version of this comment
+    // got wrong in both directions.
+    //
+    // `set_state_with_event` consults it only inside `if to.ends_sessions()`, and the only
+    // session-ending target this path can produce is `Disabled`, so AT THAT READER the
+    // expression is equivalent to `true` and mutating it there changes nothing. That much was
+    // measured and is why an earlier version called it a tautology.
+    //
+    // The OTHER reader is four lines below: the value rides the `user.state_changed` payload
+    // unconditionally, because a receiver cannot work out afterwards whether the offline
+    // families died. So a mutation IS caught -- replacing this with `false` fails two tests,
+    // one on the surviving refresh family and one on the payload -- and the previous claim that
+    // no mutation could fail was itself false.
+    //
+    // What prevents over-reach is `should_be_active`, not this flag. An earlier comment
+    // defended the expression as "a condition and not a constant" on the grounds that a person
+    // active in another organization must keep their consent; such a person makes
+    // `should_be_active` true, so `target` is `Active` and this is not a deprovisioning at all.
+    let hard_kill = !should_be_active;
+
+    // THE ACCOUNT GRAIN, announced separately from the organization grain and only when the
+    // account actually moves. Everything above this line has already returned when it did not,
+    // so reaching here means the transition is real. A receiver that keeps its own copy of the
+    // directory acts on the organization event; a receiver that gates on "can this person sign
+    // in at all" acts on this one, and the two are different questions whenever a person
+    // belongs to more than one organization.
+    let Some(event) = crate::events::state_changed_event(
+        state,
+        auth.scope,
+        &user.to_string(),
+        target.as_str(),
+        hard_kill,
+    ) else {
+        return Err(scim_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "the request could not be completed",
+        ));
+    };
     scoped
         .acting(auth.actor, CorrelationId::generate(&env))
         .users()
-        .set_state(
+        .set_state_with_event(
             &env,
             user,
             target,
@@ -981,22 +1154,9 @@ async fn reconcile_account_state(
                 at_unix_micros: None,
                 wake_payload: None,
             },
-            // `hard_kill: false`, and what that does and does not mean is worth being exact
-            // about, because an earlier version of this comment had it backwards.
-            //
-            // The transition ITSELF already ends the cascade's main body:
-            // `UserState::Disabled` is `ends_sessions()`, so `set_state` revokes every live
-            // session and every non-offline refresh family in the same transaction and
-            // publishes to the session-ended fan-out. A SCIM deactivate therefore does stop
-            // the person authenticating, today, without this flag.
-            //
-            // What `hard_kill` would additionally revoke is the OFFLINE refresh families and
-            // their grants -- the long-lived consent an application holds to act for the
-            // person while they are away. Whether a provisioning client's deactivate should
-            // reach that far, and within what documented SLO, is the deprovisioning-cascade
-            // issue's decision rather than this surface's, so it is left alone here.
-            false,
+            hard_kill,
             None,
+            Some(&event.borrowed()),
         )
         .await
         .map_err(|error| store_failure(&error))
@@ -1455,14 +1615,62 @@ pub(crate) async fn delete_user(
     {
         return store_failure(&error);
     }
+    // THE DELETE'S OWN ANNOUNCEMENT RIDES THE LAST MEMBERSHIP REMOVAL, not the activation write
+    // above, and the difference is what the event MEANS.
+    //
+    // `user.deprovisioned` says the person is out of this organization's directory. Riding the
+    // activation write announces that BEFORE it is true: the removals below run in their own
+    // transactions afterwards, so a failure among them answers 500 with the event already
+    // committed and delivered, describing a person `GET /scim/v2/Users` still returns. The
+    // first version did exactly that and defended it by arguing the person had been
+    // deactivated, which is what the OTHER type means.
+    //
+    // ONE MEMBERSHIP, not a loop over several, and the schema is why: migration 0084's
+    // `org_memberships_org_user_live_uniq` is UNIQUE on (tenant, environment, organization,
+    // user) among live rows, so a person is a member of an organization at most once. A first
+    // version of this iterated and attached the event to whichever removal came last, which
+    // read as careful and was unexercisable: nothing can construct the second iteration.
+    //
+    // The ACTIVATION write above stays eventless and stays FIRST, for the reason it always did:
+    // the reconciliation below reads it, and writing it after the removal would leave a row for
+    // a membership that no longer exists.
     let acting = scoped.acting(auth.actor, CorrelationId::generate(&env));
-    for membership in memberships
+    let leaving = memberships
         .iter()
-        .filter(|membership| membership.organization_id == auth.connection.organization_id)
+        .find(|membership| membership.organization_id == auth.connection.organization_id);
+    let Some(leaving) = leaving else {
+        // REACHABLE, though only barely, and an earlier version of this called it unreachable.
+        // `addressed_user` resolves through `OrgMembershipRepo::exists`, which is an unbounded
+        // EXISTS; this list comes from `list_for_user`, which carries the management list hard
+        // cap of 1000. A person in more than a thousand organizations whose membership in THIS
+        // one sorts past the cap passes the first check and is absent from the second.
+        //
+        // The uniform not-found rather than a 204, because 204 would report a removal that did
+        // not happen. What it cannot undo is the activation write above, which has already
+        // committed: such a request leaves the person deactivated here without removing the
+        // membership. That is the same partial state any failure between the two writes leaves,
+        // and it is repaired the same way, by the client's retry.
+        return not_found();
+    };
+    let Some(event) = crate::events::membership_event(
+        &state,
+        auth.scope,
+        crate::events::USER_DEPROVISIONED,
+        &user.to_string(),
+        &auth.connection.organization_id.to_string(),
+    ) else {
+        return scim_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "the request could not be completed",
+        );
+    };
+    if let Err(error) = acting
+        .org_memberships()
+        .remove_with_event(&env, &leaving.id, Some(&event.borrowed()), None)
+        .await
     {
-        if let Err(error) = acting.org_memberships().remove(&env, &membership.id).await {
-            return store_failure(&error);
-        }
+        return store_failure(&error);
     }
     if let Err(response) = reconcile_account_state(&state, &auth, &user).await {
         return response;

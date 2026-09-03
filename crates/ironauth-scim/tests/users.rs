@@ -25,7 +25,11 @@ use ironauth_env::Env;
 use ironauth_scim::ScimLimits;
 use ironauth_scim::server::{ScimState, digest_of, mint_token, scim_router};
 use ironauth_store::test_support::TestDatabase;
-use ironauth_store::{CorrelationId, NewScimConnection, OrganizationId, ScimConnectionId, Scope};
+use ironauth_store::{
+    AuthorizationCodeId, ClientId, CorrelationId, EventCursor, EventPage, GrantId, IssueCode,
+    NewRefreshFamily, NewScimConnection, OrganizationId, OutboxMessage, RefreshFamilyId,
+    RefreshTokenId, ScimConnectionId, Scope, StoredClientId, UserId, refresh_token_digest,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -3636,4 +3640,1062 @@ async fn an_add_naming_a_null_sub_attribute_stores_nothing_for_it() {
     );
     // AND THE SIBLING SURVIVED, so the null cleared one sub-attribute rather than the value.
     assert_eq!(manager["value"].as_str(), Some("boss"), "{patched}");
+}
+
+/// A SCIM DELETE ends OFFLINE consent too, when the account is going dark.
+///
+/// Criterion 1 of issue #136 asks that a delete revoke "all of the user's sessions and
+/// refresh-token families", "verified by an integration test that holds live sessions and
+/// tokens during the delete". Both halves matter and the second is why this test plants real
+/// rows rather than asserting a state field.
+///
+/// `UserState::Disabled` is `ends_sessions()`, so `set_state` already revoked every session and
+/// every SESSION-BOUND refresh family. What it did not touch is the OFFLINE families and their
+/// grants -- the long-lived consent an application holds to act for the person while they are
+/// away -- because `reconcile_account_state` passed `hard_kill: false`, and its own comment
+/// deferred the decision to this issue.
+///
+/// That gap is not small. An offline grant needs no session and no interaction, so nothing else
+/// would ever end it: an identity provider says the person is gone and an application goes on
+/// acting for them indefinitely.
+#[tokio::test]
+async fn a_delete_that_takes_the_account_dark_ends_offline_consent_too() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "leaving@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+
+    // TWO LIVE FAMILIES, one of each kind, AND A LIVE SESSION. One kind of family alone cannot
+    // tell a cascade that reached far enough from one that reached too far, and the criterion
+    // asks in its own words for a test that holds "live sessions and tokens" across the delete.
+    let session_bound = plant_family(&db, &env, scope, &subject, false).await;
+    let offline = plant_family(&db, &env, scope, &subject, true).await;
+    let session = plant_session(&db, &env, scope, &subject).await;
+    assert!(
+        session_is_live(&db, scope, &session).await,
+        "the session must be live before the delete, or its absence afterwards proves nothing"
+    );
+
+    // Both live BEFORE, which is what makes the assertions after the delete attributable.
+    for (label, token) in [("session-bound", &session_bound), ("offline", &offline)] {
+        assert!(
+            db.store()
+                .scoped(scope)
+                .refresh()
+                .load(token)
+                .await
+                .expect("read")
+                .expect("the family is there")
+                .active,
+            "the {label} family must be live before the delete"
+        );
+    }
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(
+        !session_is_live(&db, scope, &session).await,
+        "the live SSO session outlived the deprovisioning, so the person could keep using the \
+         browser they were already signed in on"
+    );
+
+    // BOTH are dead. The session-bound one was already covered by `ends_sessions`; the offline
+    // one is what this change adds, and it is the one an application would otherwise keep using.
+    for (label, token) in [("session-bound", &session_bound), ("offline", &offline)] {
+        assert!(
+            !db.store()
+                .scoped(scope)
+                .refresh()
+                .load(token)
+                .await
+                .expect("read")
+                .expect("the family row survives, revoked")
+                .active,
+            "the {label} refresh family outlived the deprovisioning"
+        );
+    }
+}
+
+/// And a person still active in ANOTHER organization keeps their offline consent.
+///
+/// The converse, and it is why the cascade is a condition rather than a constant. Offline
+/// consent is ENVIRONMENT-WIDE, not organization-scoped: if one identity provider could end it
+/// by deprovisioning from its own organization, it would be revoking consent that another
+/// organization's people rely on.
+#[tokio::test]
+async fn a_delete_from_one_organization_leaves_a_person_active_elsewhere_untouched() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s-globex").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "shared@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+
+    // The SAME person, also held by Globex. That is what makes the account not go dark.
+    also_a_member_of(&db, &env, scope, &globex.organization, &subject).await;
+
+    let offline = plant_family(&db, &env, scope, &subject, true).await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&offline)
+            .await
+            .expect("read")
+            .expect("the family is there")
+            .active,
+        "one organization's deprovisioning revoked environment-wide consent another \
+         organization's people rely on"
+    );
+}
+
+/// Plant a LIVE SSO session for `subject`, returning its id.
+///
+/// Criterion 1 asks for "an integration test that holds live sessions AND tokens during the
+/// delete", and until this existed the SCIM crate never created a session at all: `plant_family`
+/// passes `session_ref: None`, so the session half of the cascade was driven with nothing to
+/// revoke and the criterion's own words were quoted over a test that met half of them.
+///
+/// The expiries are far-future so a session that stops resolving can only have stopped because
+/// it was ENDED, never because it timed out.
+async fn plant_session(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    subject: &UserId,
+) -> ironauth_store::SessionId {
+    const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
+    let id = ironauth_store::SessionId::generate(env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .sessions()
+        .rotate(
+            env,
+            &id,
+            None,
+            ironauth_store::NewSession {
+                impersonation: None,
+                subject: &subject.to_string(),
+                auth_methods: "pwd",
+                auth_time_micros: 0,
+                idle_expires_micros: FAR_FUTURE_MICROS,
+                absolute_expires_micros: FAR_FUTURE_MICROS,
+                user_agent: None,
+                peer_ip: None,
+            },
+        )
+        .await
+        .expect("plant a live session");
+    id
+}
+
+/// Whether `session` still resolves as live.
+async fn session_is_live(
+    db: &TestDatabase,
+    scope: Scope,
+    session: &ironauth_store::SessionId,
+) -> bool {
+    db.store()
+        .scoped(scope)
+        .sessions()
+        .get(session, 0, 0)
+        .await
+        .expect("read the session")
+        .is_some()
+}
+
+/// Plant a live refresh family on `subject`, returning the presented token that resolves it.
+///
+/// `offline` is the whole point of the parameter: the two kinds are revoked by different halves
+/// of the cascade, and a test that planted only one could not tell them apart.
+async fn plant_family(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    subject: &UserId,
+    offline: bool,
+) -> String {
+    const FAR_FUTURE_MICROS: i64 = 4_102_444_800_000_000;
+    let grant_id = GrantId::generate(env, &scope);
+    let client = ClientId::generate(env, &scope);
+    let subject_text = subject.to_string();
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .authorization()
+        .issue(
+            env,
+            IssueCode {
+                code_id: &AuthorizationCodeId::generate(env, &scope),
+                grant_id: &grant_id,
+                client_id: StoredClientId::Registered(&client),
+                redirect_uri: "https://client.test/cb",
+                browserless: false,
+                nonce: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                subject: &subject_text,
+                oauth_scope: Some("openid offline_access"),
+                auth_methods: "pwd",
+                auth_time_micros: None,
+                session_ref: None,
+                org_id: None,
+                consent_ref: None,
+                claims_request: None,
+                granted_resources: &[],
+                dpop_jkt: None,
+                expires_at_micros: FAR_FUTURE_MICROS,
+                created_at_micros: 0,
+            },
+        )
+        .await
+        .expect("plant the grant");
+
+    let family_id = RefreshFamilyId::generate(env, &scope);
+    let jti = RefreshTokenId::generate(env, &scope);
+    let presented = format!("ira_rt_{jti}~deprovisioning");
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .refresh()
+        .issue(
+            env,
+            NewRefreshFamily {
+                family_id: &family_id,
+                token_jti: &jti,
+                token_digest: &refresh_token_digest(&presented),
+                grant_id: &grant_id,
+                subject: &subject_text,
+                client_id: &client.to_string(),
+                scope: Some("openid offline_access"),
+                auth_methods: "pwd",
+                auth_time_unix_micros: None,
+                offline,
+                created_at_unix_micros: 0,
+                idle_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                absolute_expires_at_unix_micros: FAR_FUTURE_MICROS,
+                dpop_jkt: None,
+            },
+        )
+        .await
+        .expect("plant the refresh family");
+    presented
+}
+
+// =========================================================================================
+// Issue #136 criterion 3: "deprovisioning emits webhook and ordered-events-API events with
+// idempotency keys; consumers can replay them via cursor".
+// =========================================================================================
+
+/// The feed events about `user`, waiting until at least `want` of them are visible.
+///
+/// THREE THINGS ARE DELIBERATE HERE.
+///
+/// It reads through `events_page_after`, the ordered feed's OWN surface, not a query against
+/// `outbox_messages`. The criterion is about what a CONSUMER can get: a direct query would
+/// assert the rows exist and say nothing about whether anything can page over them.
+///
+/// It POLLS. `events_page_after` withholds a row until every transaction open anywhere on the
+/// instance has finished (the `pg_snapshot_xmin` watermark on `events_after`), so a single read
+/// after a write can legitimately return nothing. A missing producer never converges and panics
+/// naming the watermark, which is a loud failure rather than a silently empty assertion.
+///
+/// It selects by USER rather than by a cursor taken before the request, because a baseline
+/// cursor is itself a watermarked read: a baseline that under-read would silently widen the
+/// delta into somebody else's events and the assertion would still pass.
+///
+/// WHAT THE FILTER ACTUALLY REMOVES TODAY IS NOTHING, measured. Instrumenting this helper and
+/// [`events_through`] to report the unfiltered row count beside the filtered one gives an
+/// identical pair at every call site in this file (2/2, 1/1, 2/2, 1/1 and 3/3): the whole feed
+/// is this file's own events. The fixtures are NOT producers -- seeding an organization and a
+/// connection through the management store emits nothing on this path -- so an earlier version
+/// of this paragraph justified the filter with a reason that does not exist, and a version
+/// after that enumerated three call sites when there were four.
+///
+/// It is kept because the reason it will exist is already visible: 17 of the catalog's 157
+/// types carry `user_id`, including `organization.member_added`, `organization.member_removed`
+/// and `user.created`, and criteria 4 to 6 of this issue emit membership deltas from these same
+/// fixtures. The filter is therefore narrowing against a producer this file will acquire, not
+/// against one it has. It is not an exact selector for all time: any of those 17 types about
+/// the same person would enter the count, and a test whose expectations changed under one would
+/// fail on the type list rather than silently pass.
+async fn events_about(
+    db: &TestDatabase,
+    scope: Scope,
+    user: &str,
+    want: usize,
+) -> Vec<OutboxMessage> {
+    let outbox = db.store().scoped(scope);
+    for _ in 0..100 {
+        let EventPage::Page(events) = outbox
+            .outbox()
+            .events_page_after(EventCursor::beginning(), 200)
+            .await
+            .expect("read the event feed")
+        else {
+            panic!("the beginning cursor cannot age out; nothing here prunes")
+        };
+        let mine: Vec<OutboxMessage> = events
+            .into_iter()
+            .filter(|event| event.payload["payload"]["user_id"] == user)
+            .collect();
+        if mine.len() >= want {
+            return mine;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "fewer than {want} events about {user} became visible on the feed within five seconds: \
+         either nothing produced them, or the feed's watermark is stalled by an open transaction"
+    );
+}
+
+/// Wait until an event about `user` satisfies `sentinel`, then return everything about `user`.
+///
+/// THIS IS HOW AN ABSENCE IS ASSERTED ON A WATERMARKED FEED, and [`events_about`] cannot do it.
+/// That one returns the moment `want` rows are visible, so a regression that emits an EXTRA
+/// event is indistinguishable from one that has not become visible yet: a review measured
+/// exactly that, removing the guard that makes a repeated deactivate a no-op and watching the
+/// assertion pass, then inserting a 1500ms sleep before the same read and watching it fail.
+///
+/// The sentinel closes it, and the mechanism is worth getting right because an earlier version
+/// of this paragraph stated it wrongly. `events_after` withholds a row until its `xmin` is
+/// below `pg_snapshot_xmin`. Postgres assigns a transaction its xid at its FIRST WRITE, not at
+/// `BEGIN` -- `events_after`'s own doc says so, and says why it matters there: two producers can
+/// take a lock in one order, commit in that order, and still have inverted xmins.
+///
+/// So "started later" is NOT sufficient in general. What makes the sentinel sound HERE is that
+/// these requests are strictly sequential: each one commits before the next is issued, so first
+/// -write order is request order, and the sentinel's xid is above every earlier request's. Once
+/// it is visible, everything this test wrote before it is visible too, and a count taken then
+/// is complete rather than merely current.
+///
+/// A test that issued its requests CONCURRENTLY could not use this helper as written.
+async fn events_through(
+    db: &TestDatabase,
+    scope: Scope,
+    user: &str,
+    sentinel: impl Fn(&OutboxMessage) -> bool,
+) -> Vec<OutboxMessage> {
+    let outbox = db.store().scoped(scope);
+    for _ in 0..100 {
+        let EventPage::Page(events) = outbox
+            .outbox()
+            .events_page_after(EventCursor::beginning(), 200)
+            .await
+            .expect("read the event feed")
+        else {
+            panic!("the beginning cursor cannot age out; nothing here prunes")
+        };
+        // THE SENTINEL IS LOOKED FOR ON THE WHOLE FEED, not among this user's events. A
+        // completeness claim about one person is often fenced by a write about ANOTHER -- there
+        // is no later write about somebody who has just been deleted -- and a predicate that
+        // could only see the filtered list could not express that.
+        if events.iter().any(&sentinel) {
+            return events
+                .into_iter()
+                .filter(|event| event.payload["payload"]["user_id"] == user)
+                .collect();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "the sentinel event about {user} never became visible within five seconds: either the \
+         write that was to produce it did not, or the feed's watermark is stalled"
+    );
+}
+
+/// One page of the feed from `cursor`, narrowed to the events about `user`.
+///
+/// Unpolled and deliberately so: it is only ever called after [`events_about`] has already
+/// waited for the same events, so what it measures is the CURSOR -- whether a held position
+/// returns the same events again, and whether one advanced past a row returns the rest.
+async fn page_about(
+    db: &TestDatabase,
+    scope: Scope,
+    user: &str,
+    cursor: EventCursor,
+) -> Vec<OutboxMessage> {
+    let EventPage::Page(events) = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .events_page_after(cursor, 200)
+        .await
+        .expect("read a page from a held cursor")
+    else {
+        panic!("a cursor at or below a live row cannot have aged out")
+    };
+    events
+        .into_iter()
+        .filter(|event| event.payload["payload"]["user_id"] == user)
+        .collect()
+}
+
+/// The `type` of each event, in feed order.
+fn types(events: &[OutboxMessage]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| {
+            event.payload["type"]
+                .as_str()
+                .expect("every envelope carries a type")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// How many audit rows in `scope` carry `action`.
+async fn audit_rows(db: &TestDatabase, scope: Scope, action: &str) -> usize {
+    db.control_store()
+        .scoped(scope)
+        .audit()
+        .list()
+        .await
+        .expect("read the audit log")
+        .into_iter()
+        .filter(|row| row.action == action)
+        .count()
+}
+
+/// Provision a person and immediately deactivate them, returning their id.
+///
+/// A SENTINEL producer. A completeness claim about one person's events needs a LATER write to
+/// fence it, and after a delete there is no later write about that person -- they are gone. So
+/// the fence is a write about somebody else, and this is the cheapest one that emits: a
+/// deactivate announces `user.deactivated` and `user.state_changed` under a different
+/// `user_id`, which `events_through` can see because it looks for its sentinel on the whole
+/// feed.
+async fn provision_and_deactivate(db: &TestDatabase, env: &Env, token: &str, handle: &str) -> String {
+    let (status, created) = call(
+        db,
+        env,
+        "POST",
+        "/scim/v2/Users",
+        Some(token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": handle,
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, body) = call(
+        db,
+        env,
+        "PATCH",
+        &format!("/scim/v2/Users/{id}"),
+        Some(token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    id
+}
+
+/// A SCIM DELETE announces the termination on BOTH grains, and a consumer can replay both from
+/// a cursor (issue #136 criterion 3).
+///
+/// # Why two events and not one
+///
+/// The organization grain (`user.deprovisioned`) says this directory no longer holds the
+/// person. The account grain (`user.state_changed`) says they can no longer sign in anywhere in
+/// the environment. For a person who belongs to one organization both are true at once, which
+/// is what this test drives; the test after it drives the case where only the first is, and
+/// that pair is the whole reason the events are separate.
+#[tokio::test]
+async fn a_delete_announces_the_termination_on_both_grains_and_replays_by_cursor() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "terminated@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // A SECOND PERSON, PROVISIONED AND DEACTIVATED AFTER THE DELETE, is the SENTINEL that makes
+    // the count below a completeness claim rather than a floor. There is no later write about
+    // the deleted person to fence it with -- they are gone -- so the fence is a write about
+    // somebody else, which is why `events_through` looks for its sentinel on the whole feed.
+    let sentinel_user =
+        provision_and_deactivate(&db, &env, &acme.token, "sentinel@example.com").await;
+
+    let events = events_through(&db, scope, &user, |event| {
+        event.payload["payload"]["user_id"] == sentinel_user.as_str()
+    })
+    .await;
+    assert_eq!(
+        types(&events),
+        vec!["user.deprovisioned", "user.state_changed"],
+        "exactly two, in that order: the organization stops holding the person before the \
+         account can go dark. A third would mean the delete announced itself twice"
+    );
+
+    assert_eq!(events[0].payload["payload"]["user_id"], user);
+    assert_eq!(
+        events[0].payload["payload"]["organization_id"],
+        acme.organization.to_string(),
+        "a receiver cannot assume its own organization: an environment's endpoints and its feed \
+         both carry every organization's events"
+    );
+    assert_eq!(events[1].payload["payload"]["state"], "disabled");
+    assert_eq!(
+        events[1].payload["payload"]["hard_kill"], true,
+        "the account went dark, so offline consent ended with it, and a receiver cannot work \
+         that out afterwards"
+    );
+
+    // THE IDEMPOTENCY KEY. `outbox_messages.idempotency_key` is the event id, which becomes the
+    // `webhook-id` header of every delivery and the `id` on the envelope a feed reader sees. A
+    // receiver deduplicates on it, so it has to be the same value in both places and different
+    // between two events.
+    for event in &events {
+        assert_eq!(
+            event.payload["id"].as_str(),
+            Some(event.idempotency_key.as_str()),
+            "the envelope's id and the queue's idempotency key must be one value: a receiver \
+             dedups on what it was SENT"
+        );
+        ironauth_store::event_catalog::validate_event(&event.payload)
+            .expect("the envelope validates against the registry the fan-out enforces");
+    }
+    assert_ne!(
+        events[0].idempotency_key, events[1].idempotency_key,
+        "two events under one key would make a receiver drop the second as a redelivery"
+    );
+
+    // REPLAY, which is the half of the criterion a webhook cannot satisfy. Reading again from
+    // the same position returns the same events -- the feed is a position, not a drain -- and a
+    // consumer that acknowledged the first resumes at the second.
+    //
+    // Both reads go through `events_page_after` with a REAL cursor rather than the beginning,
+    // which is the shape a consumer uses and the only shape that can answer `Gone`.
+    let held = EventCursor::after_sequence(events[0].sequence - 1);
+    assert_eq!(
+        types(&page_about(&db, scope, &user, held).await),
+        types(&events),
+        "re-reading from the same cursor must return the same events"
+    );
+    let acknowledged = EventCursor::after_sequence(events[0].sequence);
+    assert_eq!(
+        types(&page_about(&db, scope, &user, acknowledged).await),
+        vec!["user.state_changed"],
+        "a consumer that acknowledged the first event resumes at the second"
+    );
+}
+
+/// `active: false` announces a DIFFERENT type from a delete (issue #136 criterion 2).
+///
+/// RFC 7643 section 4.1.1 makes them different acts: a deactivate leaves the membership, so the
+/// person stays addressable and the same client can reactivate them by resource id, while a
+/// delete removes it. A consumer reconciling its own directory has to tell those apart and
+/// cannot ask afterwards -- both leave a person who cannot sign in here.
+#[tokio::test]
+async fn a_deactivate_announces_a_different_type_than_a_delete() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "suspended@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A FLOOR, NOT A COMPLETENESS CLAIM, and the difference is stated because the shape looks
+    // like one: `events_about` returns as soon as two rows are visible, so it cannot say "and
+    // no more". The completeness assertion for this person is the sentinel-fenced one at the
+    // end of this test; this one is here to pin the TYPES and the payload of the pair.
+    let events = events_about(&db, scope, &user, 2).await;
+    assert_eq!(
+        types(&events)[..2],
+        ["user.deactivated", "user.state_changed"],
+        "a deactivate must be distinguishable from a delete by TYPE, not by parsing a payload: \
+         a receiver subscribes by type"
+    );
+    assert_eq!(
+        events[0].payload["payload"]["organization_id"],
+        acme.organization.to_string()
+    );
+
+    // A REPEAT OF THE SAME PATCH MUST ANNOUNCE NOTHING, which is what makes the id minted per
+    // write safe. Delivery is at-least-once and a receiver deduplicates on the event id, so a
+    // second event under a second id for one change is the shape dedup cannot collapse: the
+    // receiver counts two terminations. An identity provider re-sending a deactivate on a sync
+    // sweep is the ordinary way that happens, not an edge case.
+    let repeat = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": false}],
+    });
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(repeat),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A REACTIVATION FOLLOWS, and it is doing two jobs. It pins the asymmetry -- the account
+    // grain IS announced on the way back, the organization grain is not -- and it is the
+    // SENTINEL that makes the repeat above assertable at all: waiting for a count cannot say
+    // "and no more", because an extra event that has not yet crossed the feed's watermark looks
+    // exactly like an event that was never emitted. A review measured that directly.
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": true}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = events_through(&db, scope, &user, |event| {
+        event.payload["type"] == "user.state_changed"
+            && event.payload["payload"]["state"] == "active"
+    })
+    .await;
+    assert_eq!(
+        types(&events),
+        vec!["user.deactivated", "user.state_changed", "user.state_changed"],
+        "exactly three: the deactivation on both grains, and the account coming back. A fourth \
+         means the repeated deactivate announced itself again, which a receiver would count as \
+         a second termination; a missing third means the reactivation is silent on both grains"
+    );
+    assert_eq!(
+        events[2].payload["payload"]["state"], "active",
+        "the account transition back to active IS announced; only the organization grain is not"
+    );
+
+    // AND NO PHANTOM AUDIT ROW. The reconciliation runs a revoke-everything cascade on the path
+    // where the account is already in the state it would move to, and `revoke_all_for_user`
+    // audits UNCONDITIONALLY. Calling it speculatively appended a `user.sessions.revoke_all`
+    // row on every request that revoked nothing -- including the repeat above, and including the
+    // issue's own "deactivate then delete" -- while the request that actually revoked
+    // everything wrote none, because that one audits under a different action. The audit log
+    // said the opposite of what happened. Nothing here has anything live to revoke, so the
+    // right number is zero.
+    assert_eq!(
+        audit_rows(&db, scope, "user.sessions.revoke_all").await,
+        0,
+        "a cascade that revoked nothing wrote an audit row claiming it had"
+    );
+}
+
+/// A DELETE by ONE organization announces the organization grain and NOT the account grain
+/// (issue #136 criteria 2 and 3).
+///
+/// This is the case the two grains exist for, and it is the ordinary one in any deployment
+/// where a person belongs to more than one organization. Acme deletes somebody Globex still
+/// holds active: the person is gone from Acme's directory and can still sign in, so
+/// `user.state_changed` would be a lie and is not emitted. A consumer watching only account
+/// state learns NOTHING about this termination, which is why the organization-grain event is
+/// not redundant with it.
+///
+/// The DEACTIVATE half of the same case is the test after this one. An earlier version of this
+/// file had only this test and called it `a_deactivate_by_one_organization...`, which named a
+/// path it did not drive and hid the fact that nothing covered it.
+#[tokio::test]
+async fn a_delete_by_one_organization_announces_no_account_change() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s-globex").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "shared@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Globex holds the SAME person, which is what makes the account grain false below. Added as
+    // a membership rather than by a second SCIM create, because `userName` is unique across the
+    // environment: a second `POST` for the same handle is answered 409, which is the create
+    // door refusing to make a second account for one person, not a limit on sharing them.
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    also_a_member_of(&db, &env, scope, &globex.organization, &subject).await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // THE DETERMINISTIC HALF FIRST. `user.state_changed` is emitted on exactly the path that
+    // MOVES the state, so "the account is still active" and "no account-grain event was
+    // emitted" are the same fact, and this read is not subject to the feed's watermark.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .get(&subject)
+            .await
+            .expect("read the account")
+            .state,
+        ironauth_store::UserState::Active,
+        "Globex still holds this person active, so the account must not have moved"
+    );
+
+    let events = events_about(&db, scope, &user, 1).await;
+    assert_eq!(
+        types(&events),
+        vec!["user.deprovisioned"],
+        "Globex still holds this person active, so the ACCOUNT did not move and announcing that \
+         it had would be false. The organization grain is the only true fact here, and a \
+         consumer watching account state alone would never learn the termination happened"
+    );
+    assert_eq!(
+        events[0].payload["payload"]["organization_id"],
+        acme.organization.to_string(),
+        "the terminating organization, not the one that still holds them"
+    );
+}
+
+/// And the DEACTIVATE half of the same case: `user.deactivated` alone, no account grain.
+///
+/// The path this drives is not the one above. A delete removes the membership; `active: false`
+/// leaves it, so the person stays addressable to Acme and reactivatable by resource id, and the
+/// only thing the two share is that the account must not move while Globex still holds them.
+/// That is exactly the pair criterion 2 asks to be distinguishable, driven in the case where
+/// the account grain is silent, so the ONLY thing a consumer can tell them apart by is the
+/// type.
+#[tokio::test]
+async fn a_deactivate_by_one_organization_announces_no_account_change() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+    let globex = seed_org(&db, &env, scope, "Globex", "s-globex").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "shared-deactivate@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    also_a_member_of(&db, &env, scope, &globex.organization, &subject).await;
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "PATCH",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": false}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The deterministic half, as in the delete twin: `user.state_changed` is emitted on exactly
+    // the path that MOVES the state, so an unmoved account and an unemitted account grain are
+    // one fact, and this read is not subject to the feed's watermark.
+    assert_eq!(
+        db.store()
+            .scoped(scope)
+            .users()
+            .get(&subject)
+            .await
+            .expect("read the account")
+            .state,
+        ironauth_store::UserState::Active,
+        "Globex still holds this person active, so the account must not have moved"
+    );
+
+    let events = events_about(&db, scope, &user, 1).await;
+    assert_eq!(
+        types(&events),
+        vec!["user.deactivated"],
+        "a deactivate that leaves the person active elsewhere announces the organization grain \
+         and nothing else, and only the TYPE tells it from the delete that does the same"
+    );
+    assert_eq!(
+        events[0].payload["payload"]["organization_id"],
+        acme.organization.to_string()
+    );
+
+    // AND THE PERSON IS STILL ADDRESSABLE, which is the difference from the delete: the
+    // membership survives a deactivate, so the same client can reactivate by resource id. A
+    // consumer told only "this person is inactive here" cannot tell whether that is still
+    // possible; the type is what says so.
+    let (status, body) = call(
+        &db,
+        &env,
+        "GET",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a deactivated person must stay addressable, or nothing could reactivate them: {body}"
+    );
+}
+
+/// An account an operator had ALREADY disabled still loses its offline consent when the last
+/// organization deprovisions it (issue #136, criterion 1).
+///
+/// # The hole this closes
+///
+/// `reconcile_account_state` returns early when the account is already in the state it would
+/// move to, and that early return used to end the request. A plain operator disable
+/// deliberately leaves the offline refresh families alive (the management state route takes
+/// `hard_kill` from the request body, so `{"state": "disabled", "hard_kill": false}` is one
+/// call away, and it is the right default for somebody who may be coming back). Deprovisioning
+/// that person then moved no state, ran no cascade, and left the long-lived consent an
+/// application holds to act for them intact after their identity provider had said they are
+/// gone.
+///
+/// Nothing else ends that consent: an offline grant needs no session and no interaction. So
+/// the cascade now runs on the early-return path too, and this drives the ordinary sequence
+/// that reaches it.
+#[tokio::test]
+async fn a_delete_ends_offline_consent_even_when_the_account_was_already_disabled() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme", "s-acme").await;
+
+    let (status, created) = call(
+        &db,
+        &env,
+        "POST",
+        "/scim/v2/Users",
+        Some(&acme.token),
+        Some(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "already-disabled@example.com",
+            "active": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let user = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let subject = UserId::parse_in_scope(&user, &scope).expect("a user id");
+    let offline = plant_family(&db, &env, scope, &subject, true).await;
+
+    // THE OPERATOR'S DISABLE, without a hard kill. This is the precondition, and it is asserted
+    // rather than assumed: if a plain disable already ended offline consent, the delete below
+    // would have nothing left to prove.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .set_state(
+            &env,
+            &subject,
+            ironauth_store::UserState::Disabled,
+            ironauth_store::OffboardingSchedule {
+                at_unix_micros: None,
+                wake_payload: None,
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("an operator disables the account without a hard kill");
+    assert!(
+        db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&offline)
+            .await
+            .expect("read")
+            .expect("the family is there")
+            .active,
+        "a plain disable must leave offline consent alone, or this test proves nothing"
+    );
+
+    let (status, body) = call(
+        &db,
+        &env,
+        "DELETE",
+        &format!("/scim/v2/Users/{user}"),
+        Some(&acme.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(
+        !db.store()
+            .scoped(scope)
+            .refresh()
+            .load(&offline)
+            .await
+            .expect("read")
+            .expect("the family row survives, revoked")
+            .active,
+        "the account's state did not move, so nothing ran, and an application kept the consent \
+         to act for somebody their identity provider had deprovisioned"
+    );
 }

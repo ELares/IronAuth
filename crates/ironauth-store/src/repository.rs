@@ -20255,6 +20255,57 @@ pub struct SessionRepo<'a> {
 }
 
 impl SessionRepo<'_> {
+    /// Whether `subject` holds anything a revoke-everything would flip: a live session, or a
+    /// live refresh family (issue #136).
+    ///
+    /// # Why a caller asks before revoking
+    ///
+    /// [`ActingSessionRepo::revoke_all_for_user`] audits UNCONDITIONALLY: `write_audited`
+    /// appends its row whether or not the UPDATE matched anything. That is right for an
+    /// operator's explicit "revoke everything for this person", which is an act worth recording
+    /// even when it found nothing live. It is wrong for a caller that runs the cascade
+    /// SPECULATIVELY on a path that is usually a no-op: every such request would append a row
+    /// claiming a revocation it did not perform, which is the phantom-audit-row defect
+    /// [`revoke_membership_attachments_audited`] documents from the other direction.
+    ///
+    /// # The check-to-use window this leaves, and why it is closed
+    ///
+    /// A caller reads `false` here and skips the revoke; something creates a session or a
+    /// family in between; the caller has now missed it. That cannot happen on the path this
+    /// exists for, because it runs only for an account that CANNOT AUTHENTICATE: a session and
+    /// a refresh family are both minted by an authorization this store refuses such an account.
+    /// A caller on any other path must not rely on that.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `subject` is out of this scope; [`StoreError::Database`] on
+    /// a persistence failure.
+    pub async fn any_live_session_or_family(&self, subject: &UserId) -> Result<bool, StoreError> {
+        if subject.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT (EXISTS ( \
+                 SELECT 1 FROM sessions \
+                 WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND revoked_at IS NULL AND ended_at IS NULL \
+             ) OR EXISTS ( \
+                 SELECT 1 FROM refresh_families \
+                 WHERE subject = $1 AND tenant_id = $2 AND environment_id = $3 \
+                 AND revoked_at IS NULL \
+             )) AS present",
+        )
+        .bind(subject.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.get("present"))
+    }
+
     /// Resolve a session by id within scope, returning [`None`] when it is absent,
     /// out of scope, revoked, rotated away (superseded), ended, or expired at
     /// `now_micros`.
@@ -75263,12 +75314,65 @@ impl ScimActivationRepo<'_> {
         active: bool,
         now_micros: i64,
     ) -> Result<(), StoreError> {
+        self.write_active(organization, user, active, now_micros, None)
+            .await
+    }
+
+    /// [`Self::set_active`], additionally emitting an organization-grain event (issue #136).
+    ///
+    /// The event rides THIS transaction rather than being enqueued after it, because the
+    /// activation row is what makes the deprovisioning true for this organization: a
+    /// deactivation that committed while its notice was lost leaves a person who cannot sign
+    /// in here and a downstream directory that still lists them, and nothing later would
+    /// reconcile the two. Enqueuing after the commit is the shape that has that failure.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_active`], plus whatever the enqueue returns, including the unique
+    /// violation a second enqueue under the same event id raises.
+    pub async fn set_active_with_event(
+        &self,
+        env: &Env,
+        organization: &OrganizationId,
+        user: &UserId,
+        active: bool,
+        now_micros: i64,
+        event: &DomainEvent<'_>,
+    ) -> Result<(), StoreError> {
+        self.write_active(organization, user, active, now_micros, Some((env, event)))
+            .await
+    }
+
+    /// The one activation write both spellings above share.
+    ///
+    /// `emit` carries the env and the event TOGETHER rather than as two options, so the
+    /// combination that would drop an event on the floor (an event with no env to enqueue it
+    /// under) cannot be written. A dropped event is exactly the failure the emitting spelling
+    /// exists to prevent, and a shape that cannot express it needs no check and no test.
+    async fn write_active(
+        &self,
+        organization: &OrganizationId,
+        user: &UserId,
+        active: bool,
+        now_micros: i64,
+        emit: Option<(&Env, &DomainEvent<'_>)>,
+    ) -> Result<(), StoreError> {
         if organization.scope() != self.scope || user.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        sqlx::query(
-            "INSERT INTO scim_membership_activation                  (tenant_id, environment_id, organization_id, user_id, active, updated_at)              VALUES ($1, $2, $3, $4, $5,                      TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)              ON CONFLICT (tenant_id, environment_id, organization_id, user_id)              DO UPDATE SET active = EXCLUDED.active, updated_at = EXCLUDED.updated_at",
+        let changed = sqlx::query(
+            // THE `WHERE` ON THE CONFLICT ARM IS WHAT MAKES A REPEAT WRITE A NO-OP (issue #136).
+            //
+            // Without it, an identity provider re-sending `active: false` for somebody already
+            // deactivated re-dated the row and, with an event attached, announced a second
+            // deprovisioning under a second id. Delivery is at-least-once and a receiver
+            // deduplicates on the event id, so two ids for one change is precisely the shape
+            // dedup CANNOT collapse: the receiver counts two terminations.
+            //
+            // It also stops the redundant write destroying `updated_at`, which is the record of
+            // when this organization's view of the person actually changed.
+            "INSERT INTO scim_membership_activation                  (tenant_id, environment_id, organization_id, user_id, active, updated_at)              VALUES ($1, $2, $3, $4, $5,                      TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval)              ON CONFLICT (tenant_id, environment_id, organization_id, user_id)              DO UPDATE SET active = EXCLUDED.active, updated_at = EXCLUDED.updated_at              WHERE scim_membership_activation.active IS DISTINCT FROM EXCLUDED.active",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -75277,7 +75381,17 @@ impl ScimActivationRepo<'_> {
         .bind(active)
         .bind(now_micros)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        // ONLY WHEN SOMETHING CHANGED. A no-op write announcing a change is the phantom-event
+        // twin of the phantom audit row `revoke_membership_attachments_audited` documents, and
+        // here it is worse: the audit row is read by an operator, the event is ACTED ON by a
+        // downstream system that would terminate somebody twice.
+        if let Some((env, event)) = emit {
+            if changed > 0 {
+                enqueue_domain_event(&mut tx, env, self.scope, Some(event)).await?;
+            }
+        }
         tx.commit().await?;
         Ok(())
     }

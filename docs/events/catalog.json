@@ -3394,6 +3394,29 @@
       "payload_schema": {
         "additionalProperties": false,
         "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.deactivated"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
           "hard_kill": {
             "type": "boolean"
           },
@@ -3410,6 +3433,29 @@
       },
       "payload_schema_version": 1,
       "type": "user.deleted"
+    },
+    {
+      "domain": "user",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "user_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "user.deprovisioned"
     },
     {
       "domain": "user",

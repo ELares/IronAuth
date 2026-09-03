@@ -119,3 +119,4 @@ crates/ironauth-store/src/repository.rs:update_claims:1
 crates/ironauth-store/src/repository.rs:update_with_event:4
 crates/ironauth-store/src/repository.rs:verify_dynamic_client_with_event:1
 crates/ironauth-store/src/repository.rs:withdraw_with_event:1
+crates/ironauth-store/src/repository.rs:write_active:1

@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod bulk;
+mod events;
 mod filter;
 mod groups;
 mod patch;
