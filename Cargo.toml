@@ -34,6 +34,7 @@ members = [
     "crates/ironauth-import",
     "crates/ironauth-importers",
     "crates/ironauth-connector",
+    "crates/ironauth-saml",
     "crates/ironauth-journey",
     "crates/ironauth",
     # The EDGE VERIFY SNIPPET (issue #118). A workspace member rather than a standalone crate
@@ -50,6 +51,18 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ELares/IronAuth"
 
 [workspace.dependencies]
+# The ONE XML library, for `ironauth-saml`, and its only consumer in the tree. Pure Rust, no
+# C, and it does not resolve entities: see that crate's doc for the evaluation and the rejected
+# alternatives. Default features off, so no serialisation or async surface is compiled.
+#
+# 0.41 SPECIFICALLY: it reports an unresolved entity reference in text as its own
+# `Event::GeneralRef`, so `ironauth-saml` can refuse it at PARSE time. 0.37 surfaces the same
+# reference only when a caller unescapes -- also an error there, not a silent truncation -- and
+# this crate never unescapes, so a refusal that fires only on a method call is one that depends
+# on every future caller remembering to make it. See the crate's own note.
+#
+# No other version of this crate was in the tree; nothing else here parses XML.
+quick-xml = { version = "0.41", default-features = false }
 # The IronBus client (issue #104): the OPTIONAL notification backbone for the
 # transactional outbox. Optional in the strict sense the issue requires: Postgres alone
 # is a complete, supported mode, and this crate is behind the `ironbus` feature so a
@@ -59,6 +72,7 @@ ironauth-env = { path = "crates/ironauth-env", version = "0.1.0" }
 ironauth-hash-scheme = { path = "crates/ironauth-hash-scheme", version = "0.2.0" }
 ironauth-config = { path = "crates/ironauth-config", version = "0.1.0" }
 ironauth-connector = { path = "crates/ironauth-connector", version = "0.1.0" }
+ironauth-saml = { path = "crates/ironauth-saml", version = "0.1.0" }
 ironauth-server = { path = "crates/ironauth-server", version = "0.1.0" }
 ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
