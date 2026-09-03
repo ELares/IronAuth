@@ -72,17 +72,27 @@ fn attribute(name: &str, kind: &str, multi: bool, required: bool, mutability: Mu
 ///
 /// # This document describes the TARGET surface, not only what this slice stores
 ///
-/// `displayName`, `emails`, `name` and the three enterprise attributes are published and are
-/// not yet parsed by [`crate::ScimUser`], so a `PUT` carrying them drops them and a no-path
-/// PATCH object ignores them. That is a real gap between the document and the behaviour, and
+/// `displayName`, `emails` and `name` are published and are not yet parsed by
+/// [`crate::ScimUser`], so a `PUT` carrying them drops them and a no-path PATCH object ignores
+/// them. That is a real gap between the document and the behaviour, and
 /// it is recorded here rather than hidden: the alternative, publishing only `userName`,
 /// `externalId` and `active`, would make a provisioning client's schema discovery report a
 /// surface no identity provider would attempt to use, and would have to be reverted attribute
 /// by attribute as each lands.
 ///
+/// THE ENTERPRISE ATTRIBUTES ARE NO LONGER PART OF THAT GAP. This paragraph said "and the
+/// three enterprise attributes", and it stayed there through the change that parsed and stored
+/// all seven -- a review caught it. It is the same artifact class as the
+/// `entra_enterprise_user` fixture that went on asserting `expect_status: 400` after the gap it
+/// named was closed: a sentence recording a gap is exactly as stale-able as a number recording
+/// one, and the sweep that fixed the fixture did not reach the prose.
+///
 /// The test `the_user_schema_covers_every_attribute_the_model_parses` checks the
-/// direction that MUST hold: everything the model parses is published. The reverse direction
-/// is deliberately not asserted, for the reason above.
+/// direction that MUST hold for the CORE schema: everything the model parses is published. The
+/// reverse direction is deliberately not asserted there, for the reason above. For the
+/// EXTENSION both directions are asserted, by
+/// `the_enterprise_schema_and_the_model_name_the_same_attributes` -- there is no target-surface
+/// gap left in it to preserve.
 #[must_use]
 pub fn core_schemas() -> Vec<Value> {
     vec![
@@ -106,9 +116,19 @@ pub fn core_schemas() -> Vec<Value> {
             "id": ENTERPRISE_USER_SCHEMA,
             "name": "EnterpriseUser",
             "description": "Enterprise User",
+            // ALL SEVEN RFC 7643 section 4.3 defines, not the three this document used to
+            // name. The three were what a hand-written list happened to contain, and the model
+            // now stores all seven -- so publishing three would tell a client not to send
+            // `costCenter`, which this server would have stored. The pairing is asserted by
+            // `the_enterprise_schema_and_the_model_name_the_same_attributes`, in both
+            // directions.
             "attributes": [
                 attribute("employeeNumber", "string", false, false, Mutability::ReadWrite),
+                attribute("costCenter", "string", false, false, Mutability::ReadWrite),
+                attribute("organization", "string", false, false, Mutability::ReadWrite),
+                attribute("division", "string", false, false, Mutability::ReadWrite),
                 attribute("department", "string", false, false, Mutability::ReadWrite),
+                attribute("employeeType", "string", false, false, Mutability::ReadWrite),
                 attribute("manager", "complex", false, false, Mutability::ReadWrite),
             ],
         }),
@@ -164,6 +184,9 @@ mod tests {
         // The wire names `ScimUser` deserializes. This list is hand-written -- serde field
         // names are not reflectable at runtime -- so what keeps it honest is the EXHAUSTIVE
         // destructure below, which stops compiling the moment the struct grows a field.
+        // The EXTENSION is checked against its own schema, not this one: its attributes are
+        // published under `ENTERPRISE_USER_SCHEMA` and arrive under that URN, so requiring the
+        // core document to name them would be requiring the wrong document.
         let modelled = ["userName", "externalId", "active"];
         let missing: Vec<&&str> = modelled
             .iter()
@@ -183,15 +206,58 @@ mod tests {
             user_name: _,
             external_id: _,
             active: _,
+            extra: _,
         } = crate::resource::ScimUser {
             user_name: String::new(),
             external_id: None,
             active: true,
+            extra: serde_json::Map::new(),
         };
         assert_eq!(
             modelled.len(),
             3,
-            "the destructure above and this list must describe the same struct"
+            "the destructure above and this list must describe the same CORE struct; \
+             `enterprise` is the fourth field and is covered by the extension check below"
+        );
+    }
+
+    /// And the EXTENSION document publishes every attribute the model accepts.
+    ///
+    /// The same direction as the test above, for the schema the test above deliberately does
+    /// not cover. `ScimUser::enterprise_traits` refuses anything outside
+    /// `ENTERPRISE_ATTRIBUTES`, so that constant is what the model accepts, and a published
+    /// document naming fewer would tell a client not to send an attribute this server stores.
+    ///
+    /// Both directions, because each fails differently: an attribute published and not stored
+    /// is silently dropped, and one stored and not published is never sent.
+    #[test]
+    fn the_enterprise_schema_and_the_model_name_the_same_attributes() {
+        let published: Vec<String> = core_schemas()
+            .iter()
+            .find(|schema| schema["id"] == ENTERPRISE_USER_SCHEMA)
+            .expect("the enterprise schema is published")["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|attribute| {
+                attribute["name"]
+                    .as_str()
+                    .expect("a name")
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let mut accepted: Vec<String> = crate::resource::ENTERPRISE_ATTRIBUTES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        accepted.sort();
+        let mut published = published;
+        published.sort();
+        assert_eq!(
+            published, accepted,
+            "the published Enterprise User attributes and the ones the model stores must be \
+             the same set: one published and not stored is silently dropped, one stored and \
+             not published is never sent"
         );
     }
 }

@@ -80,7 +80,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      session token templates, session jwt mode, audit entry path, agents, \
      agent client binding, agent token vault, agent vault approvals, audit subject, \
      agent vault refresh, native SSO device secrets, SCIM connections, \
-     SCIM external ids, SCIM group push, data plane column scopes.";
+     SCIM external ids, SCIM group push, data plane column scopes, \
+     SCIM enterprise attributes.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -711,7 +712,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        186,
+        187,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -752,7 +753,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
-            177, 178, 179, 180, 181, 182, 183, 184, 185, 186
+            177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8961,6 +8962,25 @@ async fn the_hook_chain_read_is_bounded_and_keeps_the_prefix() {
 /// The uniqueness of an index is invisible to every functional assertion that does not
 /// deliberately write a duplicate, so it is asserted structurally as well: a reviewer replaced
 /// both of 0184's unique indexes with plain ones and the whole suite stayed green.
+/// Whether `table` carries a FOREIGN KEY whose first column is `column`.
+///
+/// Read from `pg_constraint` rather than `information_schema`, so a self-referential or
+/// multi-column key is still found by the column that matters.
+async fn foreign_key_exists(pool: &sqlx::PgPool, table: &str, column: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_constraint c \
+         JOIN pg_class t ON t.oid = c.conrelid \
+         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = c.conkey[1] \
+         WHERE c.contype = 'f' AND t.relname::text = $1 AND a.attname::text = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("foreign key lookup")
+        > 0
+}
+
 async fn unique_index_exists(pool: &sqlx::PgPool, table: &str, index: &str) -> bool {
     sqlx::query(
         "SELECT EXISTS ( \
@@ -8995,6 +9015,15 @@ async fn every_scim_table_carries_its_isolation_structurally() {
             "scim_membership_activation",
             "scim_membership_activation_scope",
         ),
+        // 0187. A review measured the cost of leaving it out: SIX structural mutations on this
+        // table -- the policy widened to `USING (true)`, `FORCE` dropped, the grant widened to
+        // the identity columns, the organization foreign key dropped, and both CHECKs dropped
+        // -- ALL survived the whole store suite, because this list is a hand-written
+        // enumeration and the table has no store suite of its own.
+        (
+            "scim_enterprise_attributes",
+            "scim_enterprise_attributes_scope",
+        ),
     ] {
         assert!(
             rls_enabled_and_forced(pool, table).await,
@@ -9022,6 +9051,51 @@ async fn every_scim_table_carries_its_isolation_structurally() {
         )
         .await,
         "the one-way revocation policy is present"
+    );
+
+    // 0187's structural tier, which is what makes its prose true.
+    //
+    // The unique index is not decoration: it is what makes the write a single upsert rather
+    // than a read-modify-write, so a lost update is impossible rather than unlikely. The
+    // foreign key is on the ISOLATION BOUNDARY -- unlike 0184's `connection_id`, which names a
+    // credential -- so a row naming an organization the database does not have would be a
+    // boundary with nothing behind it. And the object CHECK is what stops a hand-edited row
+    // making a read return an array the renderer would emit as one.
+    assert!(
+        unique_index_exists(
+            pool,
+            "scim_enterprise_attributes",
+            "scim_enterprise_attributes_by_user"
+        )
+        .await,
+        "one document per (organization, user), which is what makes the write one statement"
+    );
+    assert!(
+        foreign_key_exists(pool, "scim_enterprise_attributes", "organization_id").await,
+        "0187's organization_id is its isolation boundary and carries a foreign key"
+    );
+    assert!(
+        check_constraint_exists(
+            pool,
+            "scim_enterprise_attributes",
+            "scim_enterprise_attributes_is_object"
+        )
+        .await,
+        "the stored extension is an object, enforced by the database"
+    );
+
+    // AND THE GRANT IS EXACTLY WHAT THE WRITER NAMES. 0187's header says `organization_id` and
+    // `user_id` are withheld because "a data plane that could repoint either could move one
+    // organization's view of a person onto another's" -- and a review measured that widening
+    // the grant to include them survived everything. A prose withholding nothing checks is a
+    // sentence, which is what the sibling grant test in this file says in as many words.
+    let mut writable = writable_columns(pool, "ironauth_app", "scim_enterprise_attributes").await;
+    writable.sort();
+    assert_eq!(
+        writable,
+        vec!["attributes".to_owned(), "updated_at".to_owned()],
+        "the data plane's UPDATE on scim_enterprise_attributes must be exactly the columns the \
+         upsert's SET list names"
     );
 
     // Both of 0184's indexes are UNIQUE, which is the whole of what they are for: one names a

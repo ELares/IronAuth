@@ -1224,6 +1224,13 @@ impl ScopedKind for ScimExternalIdKind {
     const PREFIX: &'static str = "sxid";
 }
 
+/// Marker for a SCIM Enterprise User attribute document (`sent_`, issue #135).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScimEnterpriseKind;
+impl ScopedKind for ScimEnterpriseKind {
+    const PREFIX: &'static str = "sent";
+}
+
 /// Marker for an inbound SCIM connection (`scim_`, issue #135).
 ///
 /// The non-secret HANDLE of the connection, never its bearer token. Every management
@@ -2086,6 +2093,14 @@ pub type AgentVaultConnectionId = ScopedId<AgentVaultConnectionKind>;
 pub type AgentVaultApprovalId = ScopedId<AgentVaultApprovalKind>;
 /// A SCIM `externalId` mapping row identifier (`sxid_...`), issue #135.
 pub type ScimExternalIdId = ScopedId<ScimExternalIdKind>;
+/// A SCIM Enterprise User attribute document identifier (`sent_...`), issue #135.
+///
+/// One per (organization, user): the extension attributes an organization holds about a person.
+/// Per organization rather than per person because an employee number is the number that person
+/// has AT THAT ORGANIZATION, and two organizations provisioning one human legitimately have
+/// different ones -- and not per CONNECTION, because a token rotation must create a new
+/// connection row and would otherwise strand everything the old one wrote.
+pub type ScimEnterpriseId = ScopedId<ScimEnterpriseKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;

@@ -97,12 +97,12 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimExternalIdId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId,
-    SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId,
-    TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
-    WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimEnterpriseId, ScimExternalIdId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -171,6 +171,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_activation(&self) -> ScimActivationRepo<'a> {
         ScimActivationRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The SCIM Enterprise User attributes for this scope (issue #135, migration 0187).
+    #[must_use]
+    pub fn scim_enterprise(&self) -> ScimEnterpriseRepo<'a> {
+        ScimEnterpriseRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -75013,6 +75022,185 @@ impl ActingScimConnectionRepo<'_> {
 pub struct ScimExternalIdRepo<'a> {
     store: &'a Store,
     scope: Scope,
+}
+
+/// How an Enterprise User write combines with what is already stored.
+///
+/// Three, because SCIM's verbs genuinely mean three different things; see
+/// [`ScimEnterpriseRepo::write`] for what each one is and what was measured going wrong when
+/// they were one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnterpriseWrite {
+    /// `PUT`: the document becomes exactly what was sent.
+    Replace,
+    /// PATCH `replace`: named attributes are set, the rest untouched.
+    Merge,
+    /// PATCH `add`: like [`EnterpriseWrite::Merge`], but a complex attribute gains
+    /// sub-attributes rather than being replaced.
+    Add,
+}
+
+/// The SCIM Enterprise User attributes an ORGANIZATION holds about a person (issue #135,
+/// migration 0187).
+///
+/// Per organization, not per person and not per connection. Not per PERSON because traits are
+/// environment wide and a review measured one organization's token reading and overwriting
+/// another's. Not per CONNECTION because `scim_connections` cannot rotate a token in place, so
+/// a rotation is a new row with a new id and every attribute the old connection wrote would be
+/// stranded -- also measured. An employee number is a fact the ORGANIZATION holds.
+pub struct ScimEnterpriseRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimEnterpriseRepo<'_> {
+    /// The extension document this organization holds for a person, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn document_for(
+        &self,
+        organization: &OrganizationId,
+        user: &UserId,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        if organization.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "SELECT attributes FROM scim_enterprise_attributes \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND user_id = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization.to_string())
+        .bind(user.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| row.get::<serde_json::Value, _>("attributes")))
+    }
+
+    /// Write this organization's document for a person, in ONE statement.
+    ///
+    /// NOT A READ-MODIFY-WRITE. Everything the write needs to know about the stored value is
+    /// expressed in SQL, so two concurrent writers both land: Postgres serializes them on the
+    /// unique index under READ COMMITTED and the second sees the first's row. The trait storage
+    /// this replaces read in one transaction and wrote in another, and a review measured six
+    /// concurrent writes answering 200 with five of them lost. Re-measured after this change:
+    /// every value landed.
+    ///
+    /// `mode` is what SCIM's three verbs mean, and they are genuinely three:
+    ///
+    /// * [`EnterpriseWrite::Replace`] is `PUT` (RFC 7644 section 3.5.1): the document becomes
+    ///   exactly what was sent, so an omitted attribute is GONE. A merge here was measured
+    ///   answering 200 to a `PUT` that carried one attribute and leaving the other two
+    ///   standing, which is a replace that did not replace.
+    /// * [`EnterpriseWrite::Merge`] is `replace` on a PATCH: named attributes are set and the
+    ///   rest are untouched.
+    /// * [`EnterpriseWrite::Add`] is `add` on a PATCH (RFC 7644 section 3.5.2.1), which for a
+    ///   COMPLEX attribute adds sub-attributes to the existing value rather than replacing it.
+    ///   `||` is a shallow merge, so under `Merge` an `add` of `{"manager":{"value":"b"}}` was
+    ///   measured destroying the manager's `displayName` and `$ref`. This mode merges one level
+    ///   deeper, which is exactly as deep as the extension goes.
+    ///
+    /// In every mode a key whose incoming value is JSON `null` is REMOVED. That is what
+    /// `{"op":"remove"}` means here, and it is the only way a `PUT` can clear one named
+    /// attribute while keeping the others.
+    ///
+    /// SUB-ATTRIBUTES TOO, under [`EnterpriseWrite::Add`]. The top-level removal is computed in
+    /// Rust from the incoming map, which cannot see one level down -- and `Add` is the only mode
+    /// that reaches there. A review measured
+    /// `{"op":"add","path":"...:manager","value":{"displayName":null}}` storing and then
+    /// RENDERING `"displayName": null`, which RFC 7643 section 2.5 forbids ("unassigned
+    /// attributes SHALL NOT be present") and which a client round-tripping the resource sends
+    /// back as a null it never wrote. The deep merge drops null sub-attributes in the same
+    /// expression.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn write(
+        &self,
+        env: &Env,
+        organization: &OrganizationId,
+        user: &UserId,
+        incoming: &serde_json::Value,
+        mode: EnterpriseWrite,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if organization.scope() != self.scope || user.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let removed: Vec<String> = incoming
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, value)| value.is_null())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The SET expression, one per mode. Written out rather than assembled from fragments:
+        // three short statements a reader can check against the doc above beat one expression
+        // with two conditionals in it.
+        let combined = match mode {
+            EnterpriseWrite::Replace => "EXCLUDED.attributes",
+            EnterpriseWrite::Merge => {
+                "scim_enterprise_attributes.attributes || EXCLUDED.attributes"
+            }
+            // One level deeper, for the complex attributes RFC 7644 section 3.5.2.1 is about: a
+            // key whose incoming AND stored values are both objects is merged rather than
+            // replaced.
+            EnterpriseWrite::Add => {
+                "(SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb) \
+                  FROM ( \
+                    SELECT key, \
+                           CASE WHEN jsonb_typeof(value) = 'object' \
+                                 AND jsonb_typeof(scim_enterprise_attributes.attributes -> key) \
+                                     = 'object' \
+                                THEN (SELECT COALESCE( \
+                                        jsonb_object_agg(sub_key, sub_value), '{}'::jsonb) \
+                                      FROM jsonb_each( \
+                                        (scim_enterprise_attributes.attributes -> key) || value \
+                                      ) AS merged_sub(sub_key, sub_value) \
+                                      WHERE jsonb_typeof(sub_value) <> 'null') \
+                                ELSE value END AS value \
+                    FROM jsonb_each(scim_enterprise_attributes.attributes || EXCLUDED.attributes) \
+                  ) AS merged)"
+            }
+        };
+        let id = ScimEnterpriseId::generate(env, &self.scope);
+        let statement = format!(
+            "INSERT INTO scim_enterprise_attributes \
+                 (id, tenant_id, environment_id, organization_id, user_id, attributes, \
+                  created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, ($6::jsonb - $7::text[]), \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval) \
+             ON CONFLICT (tenant_id, environment_id, organization_id, user_id) DO UPDATE \
+             SET attributes = ({combined}) - $7::text[], \
+                 updated_at = EXCLUDED.updated_at"
+        );
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(&statement)
+            .bind(id.to_string())
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(organization.to_string())
+            .bind(user.to_string())
+            .bind(incoming)
+            .bind(&removed)
+            .bind(now_micros)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Whether an organization considers a person active (issue #135, migration 0185).

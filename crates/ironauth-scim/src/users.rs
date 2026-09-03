@@ -42,13 +42,15 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ironauth_store::identifier::{IdentifierType, canonicalize_identifier};
 use ironauth_store::{
-    CorrelationId, NewMembership, NewUserIdentifier, OffboardingSchedule, OrgMembershipId,
-    ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId, UserState,
+    CorrelationId, EnterpriseWrite, NewMembership, NewUserIdentifier, OffboardingSchedule,
+    OrgMembershipId, ScimExternalIdId, StoreError, UserAdminRecord, UserId, UserIdentifierId,
+    UserState,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::resource::ScimUser;
+use crate::resource::{ENTERPRISE_ATTRIBUTES, ScimUser, canonical_enterprise_name};
+use crate::schema::ENTERPRISE_USER_SCHEMA;
 use crate::server::{Authenticated, ScimState, scim_error, scim_json};
 
 /// The SCIM core user schema URN (RFC 7643 section 4.1).
@@ -121,9 +123,21 @@ pub(crate) async fn addressed_user(
 /// account's state is environment wide, so rendering it would report a person as inactive here
 /// because a different organization deactivated them -- the read side of the cross-organization
 /// leak the write side was fixed for.
-fn user_resource(record: &UserAdminRecord, external_id: Option<&str>, active: bool) -> Value {
+fn user_resource(
+    record: &UserAdminRecord,
+    external_id: Option<&str>,
+    active: bool,
+    enterprise: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut schemas = vec![Value::from(USER_SCHEMA)];
+    if !enterprise.is_empty() {
+        // DECLARED, not merely carried. RFC 7643 section 3 says a resource's `schemas` names
+        // every schema its attributes come from, and a client that dispatches on that list
+        // would not look for the extension attributes without it.
+        schemas.push(Value::from(ENTERPRISE_USER_SCHEMA));
+    }
     let mut body = json!({
-        "schemas": [USER_SCHEMA],
+        "schemas": schemas,
         "id": record.id.to_string(),
         "userName": record.identifier,
         "active": active,
@@ -138,7 +152,41 @@ fn user_resource(record: &UserAdminRecord, external_id: Option<&str>, active: bo
     if let Some(external_id) = external_id {
         body["externalId"] = json!(external_id);
     }
+    // The extension, under its URN, which is where SCIM carries one.
+    if !enterprise.is_empty() {
+        body[ENTERPRISE_USER_SCHEMA] = Value::Object(enterprise.clone());
+    }
     body
+}
+
+/// The Enterprise User attributes THIS ORGANIZATION holds for a person.
+///
+/// Scoped to `auth.connection.organization_id`, which is what makes the read as private as the
+/// write and what lets a rotated credential still see what its predecessor wrote. No
+/// attribute-name filter is needed or wanted: the table holds only what a SCIM client sent,
+/// and it holds it per organization, so there is nothing of anybody else's in it to filter out.
+/// The trait storage this replaces needed such a filter and a review measured that nothing
+/// killed its removal -- an operator's own declared `department` leaked to every provisioning
+/// client that read the person.
+///
+/// A read failure is an empty map rather than an error, on the same argument [`external_id_of`]
+/// makes: the extension is a rendering detail, and a read that fails must not turn a successful
+/// provisioning call into a 500 the identity provider will retry.
+async fn enterprise_of(
+    state: &ScimState,
+    auth: &Authenticated,
+    user: &UserId,
+) -> serde_json::Map<String, Value> {
+    let Ok(Some(Value::Object(document))) = state
+        .store()
+        .scoped(auth.scope)
+        .scim_enterprise()
+        .document_for(&auth.connection.organization_id, user)
+        .await
+    else {
+        return serde_json::Map::new();
+    };
+    document
 }
 
 /// Read the `externalId` this connection knows a user by, or `None`.
@@ -177,7 +225,13 @@ async fn rendered_user(
         .is_active(&auth.connection.organization_id, user)
         .await
         .map_err(|error| store_failure(&error))?;
-    Ok(user_resource(&record, external_id.as_deref(), active))
+    let enterprise = enterprise_of(state, auth, user).await;
+    Ok(user_resource(
+        &record,
+        external_id.as_deref(),
+        active,
+        &enterprise,
+    ))
 }
 
 /// `GET /scim/v2/Users/{id}`.
@@ -225,6 +279,13 @@ pub(crate) async fn create_user(
             Some("invalidValue"),
             "the request body is not a SCIM user resource",
         );
+    };
+    // THE EXTENSION IS VALIDATED FIRST, before the account exists. An attribute this server
+    // does not store must not be discovered after a person has been created: the create would
+    // have to be undone, and a client that got a 201 would already believe the value round
+    // trips.
+    let Ok(enterprise) = parsed.enterprise_traits() else {
+        return unsupported_enterprise_attribute();
     };
     let canonical = parsed.canonical_identifier();
     // An all-invisible or whitespace-only userName canonicalizes to nothing. The seam refuses
@@ -295,10 +356,165 @@ pub(crate) async fn create_user(
             return response;
         }
     }
+    // A create REPLACES, and only when the body carried an extension.
+    //
+    // The `Replace` is for the RE-ADMIT path: a person this organization once held may have a
+    // document from before, and a create must not leave them inheriting it. The emptiness guard
+    // is because a fresh person has nothing to replace -- and writing an empty row anyway was
+    // not merely wasteful, it made the upsert's INSERT branch UNREACHABLE, so the remove-key
+    // expression in that branch was covered by nothing. A review found the branch untested, and
+    // the test I first wrote for it did not reach it either, for exactly this reason.
+    if !enterprise.is_empty()
+        && let Err(response) = store_enterprise_attributes(
+            &state,
+            &auth,
+            &user_id,
+            &enterprise,
+            EnterpriseWrite::Replace,
+        )
+        .await
+    {
+        return response;
+    }
     match rendered_user(&state, &auth, &user_id).await {
         Ok(body) => created(&user_id, &body),
         Err(response) => response,
     }
+}
+
+/// One `Change` from Entra's URN-qualified PATCH path.
+///
+/// Split out of `plan_operation` only because the two together exceed the crate's
+/// function-length lint.
+#[allow(
+    clippy::result_large_err,
+    reason = "every refusal on this surface is a Response"
+)]
+fn enterprise_path_change(op: &str, path: &str, value: Option<&Value>) -> Result<Change, Response> {
+    let attribute = &path[ENTERPRISE_PATH_PREFIX_LOWER.len()..];
+    if !ENTERPRISE_ATTRIBUTES.contains(&attribute) {
+        return Err(unsupported_enterprise_attribute());
+    }
+    // A `remove` CLEARS the attribute rather than being refused: an operator taking somebody
+    // out of a department is an ordinary provisioning act, and answering "unsupported" to it
+    // would be a false sentence about an attribute this surface does serve.
+    //
+    // AND A VALUELESS `add` OR `replace` IS A CLIENT ERROR, not a remove. This read
+    // `value.cloned().unwrap_or(Value::Null)`, which fed a missing value straight into the
+    // null-means-remove convention: a review measured
+    // `{"op":"replace","path":"urn:...:department"}` with no `value` member answering 200 and
+    // DELETING the attribute. RFC 7644 sections 3.5.2.1 and 3.5.2.3 make both a client error,
+    // and the two sibling arms in this same match already refuse one (`active must carry a
+    // boolean value`).
+    let written = if op == "remove" {
+        Value::Null
+    } else {
+        let Some(value) = value else {
+            return Err(scim_error(
+                StatusCode::BAD_REQUEST,
+                Some("invalidValue"),
+                "an add or replace must carry a value; use remove to clear an attribute",
+            ));
+        };
+        if !crate::resource::enterprise_type_matches(attribute, value) {
+            return Err(unsupported_enterprise_attribute());
+        }
+        value.clone()
+    };
+    // The CANONICAL spelling from the extension's own list, not the caller's, so a client
+    // patching `EMPLOYEENUMBER` writes the same trait a create writes.
+    let mut attributes = serde_json::Map::new();
+    attributes.insert(canonical_enterprise_name(attribute).to_owned(), written);
+    // `add` on a COMPLEX attribute adds sub-attributes to what is stored (RFC 7644 section
+    // 3.5.2.1); `replace` and `remove` set or clear the attribute outright. A review measured
+    // the difference: under a single merge mode, `add` of `{"manager":{"value":"b"}}` destroyed
+    // the stored manager's `displayName` and `$ref`.
+    let mode = if op == "add" {
+        EnterpriseWrite::Add
+    } else {
+        EnterpriseWrite::Merge
+    };
+    Ok(Change::Enterprise(attributes, mode))
+}
+
+/// One `Change` from a whole Enterprise User extension object.
+///
+/// Split out of `plan_operation` only because the two together exceed the crate's
+/// function-length lint.
+#[allow(
+    clippy::result_large_err,
+    reason = "every refusal on this surface is a Response, as \
+     `plan_operation` and its siblings all are; boxing one would make this the odd one out"
+)]
+fn enterprise_change(op: &str, value: &Value) -> Result<Change, Response> {
+    let Value::Object(extension) = value else {
+        return Err(scim_error(
+            StatusCode::BAD_REQUEST,
+            Some("invalidValue"),
+            "the Enterprise User extension must be an object",
+        ));
+    };
+    // AN UNKNOWN EXTENSION ATTRIBUTE IS REFUSED, while an unknown CORE member of the same
+    // no-path object is ignored. A review flagged the asymmetry against the policy stated ten
+    // lines below ("failing would make every ordinary update a 400"), and the two are different
+    // for a reason worth writing down rather than reconciling by making one match the other.
+    //
+    // The CORE schema is a SUPERSET of what this surface stores -- `displayName`, `emails` and
+    // `name` are published and unparsed, deliberately, so a client sending a whole resource
+    // carries members this server has no opinion on. Ignoring them is what lets Okta's no-path
+    // dialect work at all.
+    //
+    // The EXTENSION's vocabulary is CLOSED by RFC 7643 section 4.3 and this server publishes all
+    // seven, so an attribute outside it is not "something we do not implement", it is a name
+    // that is not in the specification. Accepting and dropping it is the defect this whole
+    // change exists to close, and it would close it on the create door while leaving it open on
+    // this one.
+    let mut traits = serde_json::Map::new();
+    for (attribute, extension_value) in extension {
+        let lowered = attribute.to_ascii_lowercase();
+        if !ENTERPRISE_ATTRIBUTES.contains(&lowered.as_str()) {
+            return Err(unsupported_enterprise_attribute());
+        }
+        // A `remove` CLEARS every attribute it names, whatever value the operation carries.
+        // This arm never read `op` at all, and a review measured the result:
+        // `{"op":"remove","value":{URN:{"department":"Tools"}}}` answered 200 and SET
+        // `department` to "Tools" -- a remove that writes.
+        let written = if op == "remove" {
+            Value::Null
+        } else {
+            extension_value.clone()
+        };
+        if !written.is_null() && !crate::resource::enterprise_type_matches(&lowered, &written) {
+            return Err(unsupported_enterprise_attribute());
+        }
+        traits.insert(canonical_enterprise_name(&lowered).to_owned(), written);
+    }
+    let mode = if op == "add" {
+        EnterpriseWrite::Add
+    } else {
+        EnterpriseWrite::Merge
+    };
+    Ok(Change::Enterprise(traits, mode))
+}
+
+/// The lower-cased `urn:...:enterprise:2.0:User:` prefix a URN-qualified PATCH path carries.
+///
+/// Derived from [`ENTERPRISE_USER_SCHEMA`] rather than written out, so the two cannot drift.
+static ENTERPRISE_PATH_PREFIX_LOWER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{ENTERPRISE_USER_SCHEMA}:").to_ascii_lowercase());
+
+/// The refusal for an extension attribute this server does not store.
+///
+/// The attribute name is NOT echoed, on the policy `unsupported_attribute` states: a parser
+/// that reflects a caller's input becomes a reflection gadget. The extension's attribute names
+/// arrive as raw JSON keys, so unlike a parsed path they are bounded by nothing at all.
+fn unsupported_enterprise_attribute() -> Response {
+    scim_error(
+        StatusCode::BAD_REQUEST,
+        Some("invalidValue"),
+        "the Enterprise User extension carries an attribute this server does not store; see \
+         /scim/v2/Schemas for the ones it does",
+    )
 }
 
 /// The 201 a create answers, for both a fresh person and a re-admitted one.
@@ -505,6 +721,51 @@ async fn restore_membership(
         )
         .await
         .map(|_| ())
+        .map_err(|error| store_failure(&error))
+}
+
+/// Store this connection's Enterprise User attributes for a person.
+///
+/// PER ORGANIZATION, in `scim_enterprise_attributes` (migration 0187), not as identity traits. A
+/// review measured the trait storage with two organizations holding one person: Globex's token
+/// read back Acme's `employeeNumber` and then overwrote Acme's `department`. Traits live on the
+/// `users` row and are environment wide; an employee number is the number that person has at
+/// THAT organization.
+///
+/// ONE STATEMENT, so there is no read-modify-write window. The same review measured six
+/// concurrent writes against the trait storage answering 200 with five of them lost.
+///
+/// NO SCHEMA GATE, so there is no late refusal either. The vocabulary is RFC 7643's and
+/// [`ScimUser::enterprise_traits`] has already refused anything outside it, before this runs
+/// and before anything else is written.
+async fn store_enterprise_attributes(
+    state: &ScimState,
+    auth: &Authenticated,
+    user: &UserId,
+    incoming: &serde_json::Map<String, Value>,
+    mode: EnterpriseWrite,
+) -> Result<(), Response> {
+    // AN EMPTY DOCUMENT IS ONLY A NO-OP FOR A MERGE. A `PUT` carrying no extension is a replace
+    // with nothing in it, which RFC 7644 section 3.5.1 makes a request to CLEAR what is stored
+    // -- bailing out here answered 200 and left the document standing, which is a replace that
+    // did not replace.
+    if incoming.is_empty() && mode != EnterpriseWrite::Replace {
+        return Ok(());
+    }
+    let env = state.env().clone();
+    state
+        .store()
+        .scoped(auth.scope)
+        .scim_enterprise()
+        .write(
+            &env,
+            &auth.connection.organization_id,
+            user,
+            &Value::Object(incoming.clone()),
+            mode,
+            epoch_micros(state),
+        )
+        .await
         .map_err(|error| store_failure(&error))
 }
 
@@ -785,11 +1046,25 @@ pub(crate) async fn replace_user(
             "userName cannot be changed through SCIM in this deployment",
         );
     }
+    // VALIDATED BEFORE THE FIRST WRITE, on the same argument the create makes: an attribute
+    // this server does not store must not be discovered after `active` has already moved.
+    let Ok(enterprise) = parsed.enterprise_traits() else {
+        return unsupported_enterprise_attribute();
+    };
     if let Err(response) = set_active(&state, &auth, &user, parsed.active).await {
         return response;
     }
     if let Err(response) =
         rebind_external_id(&state, &auth, &user, parsed.external_id.as_deref()).await
+    {
+        return response;
+    }
+    // PUT is a REPLACE (RFC 7644 section 3.5.1): what the body does not carry is gone. A merge
+    // here was measured answering 200 to a body carrying one attribute and leaving the other two
+    // standing.
+    if let Err(response) =
+        store_enterprise_attributes(&state, &auth, &user, &enterprise, EnterpriseWrite::Replace)
+            .await
     {
         return response;
     }
@@ -949,6 +1224,8 @@ enum Change {
     Active(bool),
     /// Point this connection's `externalId` at a value.
     ExternalId(String),
+    /// Set Enterprise User extension attributes, with the write mode the verb implies.
+    Enterprise(serde_json::Map<String, Value>, EnterpriseWrite),
 }
 
 /// `PATCH` is ATOMIC: everything is validated, then everything is applied.
@@ -978,6 +1255,9 @@ async fn apply_operations(
             Change::Active(active) => set_active(state, auth, user, *active).await?,
             Change::ExternalId(external_id) => {
                 rebind_external_id(state, auth, user, Some(external_id.as_str())).await?;
+            }
+            Change::Enterprise(attributes, mode) => {
+                store_enterprise_attributes(state, auth, user, attributes, *mode).await?;
             }
         }
     }
@@ -1057,6 +1337,14 @@ fn plan_operation(operation: &PatchOperation) -> Result<Vec<Change>, Response> {
             };
             Ok(vec![Change::ExternalId(external_id.clone())])
         }
+        // ENTRA'S DIALECT for an extension attribute: the path is the URN-qualified name,
+        // `urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber`. The
+        // parser already accepts it -- `parse_patch_path` keeps a URN-qualified attribute whole
+        // rather than splitting on its colons -- so what is needed here is to recognise the
+        // prefix and recover the attribute after it.
+        (op, Some(other)) if other.starts_with(ENTERPRISE_PATH_PREFIX_LOWER.as_str()) => {
+            enterprise_path_change(op, other, operation.value.as_ref()).map(|change| vec![change])
+        }
         (_, Some(other)) => Err(unsupported_attribute(other)),
         // The no-path shape: a whole object whose members are the attributes to set.
         (_, None) => {
@@ -1069,6 +1357,13 @@ fn plan_operation(operation: &PatchOperation) -> Result<Vec<Change>, Response> {
             };
             let mut changes = Vec::new();
             for (name, value) in members {
+                // OKTA'S DIALECT for an extension: the whole extension object under its URN,
+                // inside the no-path value. Handled before the lower-cased match below because
+                // the URN is a key, not an attribute name.
+                if name.eq_ignore_ascii_case(ENTERPRISE_USER_SCHEMA) {
+                    changes.push(enterprise_change(&op, value)?);
+                    continue;
+                }
                 match name.to_ascii_lowercase().as_str() {
                     "active" => {
                         let Some(active) = scim_bool(value) else {
@@ -1416,7 +1711,11 @@ async fn scan_members(
             .is_active(&auth.connection.organization_id, &membership.user_id)
             .await
             .map_err(|error| store_failure(&error))?;
-        let resource = user_resource(&record, external_id.as_deref(), active);
+        // The extension is rendered on the LISTING too, not only on a single read. A client
+        // that filters on `employeeNumber` evaluates the filter against this document, so an
+        // omitted extension would make a legitimate filter match nothing.
+        let enterprise = enterprise_of(state, auth, &membership.user_id).await;
+        let resource = user_resource(&record, external_id.as_deref(), active, &enterprise);
         if let Some(filter) = filter
             && !crate::filter_matches(filter, &resource)
         {

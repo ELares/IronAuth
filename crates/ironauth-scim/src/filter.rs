@@ -682,19 +682,66 @@ pub fn matches(filter: &Filter, resource: &serde_json::Value) -> bool {
 /// emails.value ew "@example.com"` may be satisfied by two DIFFERENT addresses, while
 /// `emails[type eq "work" and value ew "@example.com"]` requires one address to be both.
 ///
-/// The schema URN half of a qualified path is IGNORED rather than matched. A resource is
-/// rendered as ONE flat JSON object regardless of which schema declares each attribute, so
-/// there is nothing for a URN to select between: `urn:...:core:2.0:User:userName` and
-/// `userName` name the same member of the same object. (The surface does publish the
-/// enterprise User extension alongside the core schema, so "one schema per resource type"
-/// would be false; what is true is that one RESOURCE is one object here.) Matching the URN
-/// would make a fully qualified filter, which Entra sends for extension attributes, miss the
-/// attribute it correctly named.
+/// The schema URN half of a qualified path is IGNORED rather than matched, and the attribute
+/// is then looked for at the top level FIRST and inside any extension object SECOND.
+///
+/// This used to say a resource "is rendered as ONE flat JSON object regardless of which schema
+/// declares each attribute, so there is nothing for a URN to select between". That was true
+/// when nothing nested, and the Enterprise User extension made it false: RFC 7643 section 3
+/// carries an extension's attributes under its URN as a member object, so
+/// `urn:...:enterprise:2.0:User:employeeNumber` names a key inside that object and a top-level
+/// lookup finds nothing. A review measured the consequence -- a user with `employeeNumber`
+/// rendered on the listing, and both the qualified and the bare filter matching zero -- which
+/// is exactly the "a legitimate filter matches nothing" failure the listing render was added to
+/// avoid, still standing.
+///
+/// The fallback is written against the SHAPE (a member whose key is a schema URN) rather than
+/// against the enterprise URN by name, so a second extension is reachable the day it exists
+/// rather than the day somebody remembers this function. Top level wins, so a core attribute
+/// can never be shadowed by an extension that happens to reuse its name.
+///
+/// Matching the URN instead of ignoring it would make a fully qualified filter, which Entra
+/// sends for extension attributes, miss the attribute it correctly named.
+/// An attribute inside one of the resource's extension objects.
+///
+/// A member whose KEY is a schema URN and whose VALUE is an object is an extension (RFC 7643
+/// section 3). Both halves matter: the key test alone matched the CORE urn as well, which is a
+/// prefix of every SCIM schema URN and names no member of any resource -- harmless today and a
+/// trap the moment a resource carries one.
+///
+/// DETERMINISTIC when two extensions carry one attribute name: the LOWEST URN wins.
+///
+/// `serde_json::Map` is a `BTreeMap` by default -- already sorted -- and an `IndexMap` under
+/// the `preserve_order` feature, which iterates in insertion order. This crate does not enable
+/// it (verified in `Cargo.lock`), so the sort below is redundant TODAY and is the whole rule
+/// the day somebody enables that feature for an unrelated reason. An earlier version of this
+/// paragraph stated the two backwards, which made the accompanying test build one map twice and
+/// prove nothing; the sort is kept and the reason is now the true one.
+///
+/// Case-insensitively on the attribute name, like every other lookup here.
+fn extension_member<'a>(
+    resource: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut candidates: Vec<(&String, &serde_json::Value)> = resource
+        .as_object()?
+        .iter()
+        .filter(|(key, value)| {
+            key.starts_with("urn:ietf:params:scim:schemas:extension:") && value.is_object()
+        })
+        .collect();
+    candidates.sort_by_key(|(key, _)| *key);
+    candidates
+        .into_iter()
+        .find_map(|(_, extension)| member(extension, name))
+}
+
 fn attribute_values<'a>(
     resource: &'a serde_json::Value,
     path: &AttributePath,
 ) -> Vec<&'a serde_json::Value> {
-    let Some(found) = member(resource, &path.name) else {
+    let found = member(resource, &path.name).or_else(|| extension_member(resource, &path.name));
+    let Some(found) = found else {
         return Vec::new();
     };
     match (path.sub.as_deref(), found) {
@@ -783,6 +830,94 @@ fn string_compare(left: &str, op: CompareOp, right: &str) -> bool {
         CompareOp::GreaterOrEqual => left_folded >= right_folded,
         CompareOp::LessThan => left_folded < right_folded,
         CompareOp::LessOrEqual => left_folded <= right_folded,
+    }
+}
+
+#[cfg(test)]
+mod extension_lookup_tests {
+    use super::*;
+
+    /// A core attribute is never shadowed by an extension that reuses its name.
+    ///
+    /// `attribute_values` looks at the top level FIRST and falls back into the extensions. A
+    /// review measured that reversing the two survived the whole crate, so the sentence
+    /// "top level wins" was held by nothing -- and reversed, a resource whose extension carried
+    /// a `userName` would answer filters about the person's login handle with the extension's
+    /// value.
+    #[test]
+    fn a_core_attribute_is_never_shadowed_by_an_extension() {
+        let resource = serde_json::json!({
+            "userName": "core@example.com",
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "userName": "extension-value",
+                "employeeNumber": "701",
+            },
+        });
+        let path = AttributePath {
+            urn: None,
+            name: "userName".to_owned(),
+            sub: None,
+        };
+        assert_eq!(
+            attribute_values(&resource, &path),
+            vec![&serde_json::json!("core@example.com")],
+            "an extension reusing a core attribute name must not shadow it"
+        );
+
+        // The CONTROL: the fallback still reaches an attribute the top level does not carry, so
+        // the assertion above is about precedence and not about a lookup that stopped working.
+        let path = AttributePath {
+            urn: None,
+            name: "employeeNumber".to_owned(),
+            sub: None,
+        };
+        assert_eq!(
+            attribute_values(&resource, &path),
+            vec![&serde_json::json!("701")]
+        );
+    }
+
+    /// The lookup does not treat the CORE urn as an extension, and is deterministic across two.
+    #[test]
+    fn the_extension_lookup_is_narrow_and_deterministic() {
+        // A member keyed by the CORE urn is not an extension. The old prefix test was
+        // `urn:ietf:params:scim:schemas:`, which matches it.
+        let resource = serde_json::json!({
+            "urn:ietf:params:scim:schemas:core:2.0:User": { "employeeNumber": "from-core" },
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+                "employeeNumber": "from-extension",
+            },
+        });
+        let path = AttributePath {
+            urn: None,
+            name: "employeeNumber".to_owned(),
+            sub: None,
+        };
+        assert_eq!(
+            attribute_values(&resource, &path),
+            vec![&serde_json::json!("from-extension")],
+            "a member keyed by the core urn is not an extension"
+        );
+
+        // Two extensions carrying one name resolve to the LOWEST urn, whichever order the
+        // document was built in.
+        let lower = "urn:ietf:params:scim:schemas:extension:aaa:2.0:User";
+        let higher = "urn:ietf:params:scim:schemas:extension:zzz:2.0:User";
+        // ONE map, asserted directly. Building it twice in two insertion orders was the first
+        // shape of this test and it proved nothing: `serde_json::Map` is a `BTreeMap` here, so
+        // both orders produce the identical map and the loop could not observe what it named.
+        let mut object = serde_json::Map::new();
+        for urn in [higher, lower] {
+            object.insert(
+                (*urn).to_owned(),
+                serde_json::json!({ "employeeNumber": urn }),
+            );
+        }
+        assert_eq!(
+            attribute_values(&serde_json::Value::Object(object), &path),
+            vec![&serde_json::json!(lower)],
+            "two extensions carrying one attribute must resolve to the lowest URN"
+        );
     }
 }
 
