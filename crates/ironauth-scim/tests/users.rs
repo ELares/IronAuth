@@ -4723,9 +4723,22 @@ async fn a_delete_ends_offline_consent_even_when_the_account_was_already_disable
 /// # All four refusal variants, and both routes
 ///
 /// `FilterError` has four variants and an earlier version of this drove two: `TooLong` and
-/// `TooDeep` were absent, and `TooLong` is the one most likely to be refused by a DIFFERENT
-/// layer (a multi-kilobyte query string), which is exactly the passing-for-the-wrong-reason
-/// this test exists to rule out. All four are here now.
+/// `TooDeep` were absent. Six of the eight shapes below reach `Unexpected` or `UnexpectedEnd`
+/// between them; the last two are the only ones that reach the bounds.
+///
+/// EACH BOUND SHAPE ASSERTS WHICH REFUSAL IT GOT, from the `detail` text, and that is not
+/// decoration. `MAX_LEN` and `MAX_DEPTH` are private to `filter.rs`, so an integration test
+/// cannot build its inputs from them and these are sized by hand. A review shrank `MAX_LEN`
+/// from 4096 to 64 and measured the consequence: the DEEP shape became `TooLong` too,
+/// `TooDeep` was produced zero times at either route, and the test still passed. Asserting the
+/// detail is what turns that into a failure -- the shape has to reach the refusal it was
+/// written for, not merely some refusal.
+///
+/// `TooLong` also matters because it is the one most likely to be refused by a DIFFERENT layer.
+/// What this rules out is everything between the test and the parser: `Request::builder`, the
+/// axum router, the `Query` extractor and `scim_router`'s `DefaultBodyLimit`. The suites drive
+/// the router through `oneshot`, so hyper never parses a request line and a real server's
+/// request-line and header limits are outside what any test here can say.
 ///
 /// `/Groups` carries a byte-identical arm and was covered by nothing: a review deleted it,
 /// replaced it with `.ok().flatten()`, and the whole crate stayed green while
@@ -4743,56 +4756,50 @@ async fn a_malformed_filter_is_refused_at_the_surface_rather_than_matching_every
 
     // A GROUP TOO, so the `/Groups` control below finds something and the refusals there are
     // distinguishable from an empty environment.
-    make_group_for_filter(&db, &env, &okta.token, "Engineering").await;
+    let group = make_group_for_filter(&db, &env, &okta.token, "Engineering").await;
+    assert!(!group.is_empty());
 
     // OVER THE LENGTH BOUND (4096 bytes) and OVER THE DEPTH BOUND (20), built rather than
     // written out: a literal of either would be unreadable and would silently stop matching the
     // bound if the constant moved.
     let too_long = format!("userName eq \"{}\"", "a".repeat(4200));
     let too_deep = format!("{}userName pr{}", "(".repeat(30), ")".repeat(30));
-    for (what, filter) in [
-        ("trailing input", "userName eq \"a\" garbage".to_owned()),
-        ("an unterminated string", "userName eq \"alice".to_owned()),
-        ("a truncated escape", "userName eq \"alice\\\"".to_owned()),
-        ("an unknown operator", "userName like \"a\"".to_owned()),
-        ("an empty filter", String::new()),
-        ("a bare attribute", "userName".to_owned()),
-        ("a filter over the length bound", too_long),
-        ("a filter over the depth bound", too_deep),
+    for (what, filter, detail) in [
+        (
+            "trailing input",
+            "userName eq \"a\" garbage".to_owned(),
+            None,
+        ),
+        (
+            "an unterminated string",
+            "userName eq \"alice".to_owned(),
+            None,
+        ),
+        (
+            "a truncated escape",
+            "userName eq \"alice\\\"".to_owned(),
+            None,
+        ),
+        (
+            "an unknown operator",
+            "userName like \"a\"".to_owned(),
+            None,
+        ),
+        ("an empty filter", String::new(), None),
+        ("a bare attribute", "userName".to_owned(), None),
+        (
+            "a filter over the length bound",
+            too_long,
+            Some("the filter exceeds"),
+        ),
+        (
+            "a filter over the depth bound",
+            too_deep,
+            Some("the filter nests deeper than"),
+        ),
     ] {
-        for (route, resource) in [
-            ("/scim/v2/Users", "alice@example.test"),
-            ("/scim/v2/Groups", "Engineering"),
-        ] {
-            let (status, body) = call(
-                &db,
-                &env,
-                "GET",
-                &format!("{route}?filter={}", urlencoding(&filter)),
-                Some(&okta.token),
-                None,
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "{what} was not refused at {route}: {body}"
-            );
-            let parsed = serde_json::from_str::<Value>(&body).expect("a SCIM error document");
-            assert_eq!(
-                parsed["scimType"], "invalidFilter",
-                "{what} at {route} must carry the uniform scimType a client branches on: {body}"
-            );
-            assert_eq!(
-                parsed["schemas"][0], "urn:ietf:params:scim:api:messages:2.0:Error",
-                "{what} at {route} must be a SCIM error document, not a bare string: {body}"
-            );
-            // The 400 above already excludes a listing, so this is not a second guard on the
-            // same fact: it names the RESOURCE, so a 400 that somehow carried one would say so.
-            assert!(
-                !body.contains(resource),
-                "{what} at {route} answered 400 and still carried a resource: {body}"
-            );
+        for route in ["/scim/v2/Users", "/scim/v2/Groups"] {
+            assert_filter_refused(&db, &env, &okta.token, route, &filter, what, detail).await;
         }
     }
 
@@ -4825,6 +4832,51 @@ async fn a_malformed_filter_is_refused_at_the_surface_rather_than_matching_every
             body.contains(expected),
             "the control filter at {route} matched nothing, so the refusals above prove \
              nothing: {body}"
+        );
+    }
+}
+
+/// Drive one filter at one route and hold the refusal to the whole contract.
+async fn assert_filter_refused(
+    db: &TestDatabase,
+    env: &Env,
+    token: &str,
+    route: &str,
+    filter: &str,
+    what: &str,
+    detail: Option<&str>,
+) {
+    let (status, body) = call(
+        db,
+        env,
+        "GET",
+        &format!("{route}?filter={}", urlencoding(filter)),
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{what} was not refused at {route}: {body}"
+    );
+    let parsed = serde_json::from_str::<Value>(&body).expect("a SCIM error document");
+    assert_eq!(
+        parsed["scimType"], "invalidFilter",
+        "{what} at {route} must carry the uniform scimType a client branches on: {body}"
+    );
+    assert_eq!(
+        parsed["schemas"][0], "urn:ietf:params:scim:api:messages:2.0:Error",
+        "{what} at {route} must be a SCIM error document, not a bare string: {body}"
+    );
+    // WHICH REFUSAL, for the two shapes that name a bound. `FilterError`'s `Display` is the only
+    // thing that distinguishes `TooLong` from `TooDeep` at the surface, and without this a
+    // shrunken `MAX_LEN` would make the deep shape produce `TooLong` and nothing would notice.
+    if let Some(detail) = detail {
+        let rendered = parsed["detail"].as_str().unwrap_or_default();
+        assert!(
+            rendered.starts_with(detail),
+            "{what} at {route} was refused, but by the wrong bound: {rendered}"
         );
     }
 }
