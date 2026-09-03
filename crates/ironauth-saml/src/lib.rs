@@ -26,13 +26,18 @@
 //!   parser memory-safety issues, a build-time system dependency, and DTD and external-entity
 //!   processing that is on unless correctly switched off. Rejected on memory safety first: a
 //!   parser for attacker-controlled bytes is where a C dependency costs most.
-//! * **`xml-rs`.** Pure Rust, long-lived, and BETTER DEFENDED BY DEFAULT THAN THIS CRATE IS: its
-//!   config block is headed "Limits to defend from billion laughs attack" and ships
-//!   `max_entity_expansion_length`, `max_entity_expansion_depth`, `max_name_length`,
-//!   `max_attributes`, `max_attribute_length` and `max_data_length`, all on by default. An
-//!   earlier draft of this paragraph said entity-expansion bounds "become this crate's problem"
-//!   under it; the opposite is true, and four of those bounds are ones this crate had to add
-//!   for itself.
+//! * **`xml-rs`.** Pure Rust, long-lived, and better defended than an earlier draft of this
+//!   paragraph gave it credit for: its config block is headed "Limits to defend from billion
+//!   laughs attack" and ships `max_entity_expansion_length`, `max_entity_expansion_depth`,
+//!   `max_name_length`, `max_attributes`, `max_attribute_length` and `max_data_length`, all on
+//!   by default. That draft said entity-expansion bounds "become this crate's problem" under it;
+//!   the opposite is true. Two of those six are bounds this crate had to add for itself
+//!   (`max_name_length` and `max_attributes`); it still has no per-value or per-text bound, and
+//!   bounds those only in aggregate through [`Limits::max_bytes`].
+//!
+//!   Neither library dominates the other: `xml-rs` has no document-size, depth or element-count
+//!   bound, which this crate does have. The comparison is a trade, not a ranking, and the
+//!   deciding property is below.
 //! * **`roxmltree`.** Pure Rust, a pleasant tree API, and `ParsingOptions::allow_dtd` defaults
 //!   to FALSE with a `nodes_limit` beside it. An earlier draft said it "handles DTD internal
 //!   subsets and entity expansion", which is what it does when a caller opts in; by default it
@@ -44,18 +49,26 @@
 //!
 //! # So why `quick-xml`, given that two of those are also safe by default
 //!
-//! Because of what the SIGNATURE half needs, which is the half this crate exists for.
+//! RETENTION. With a pull parser this crate decides what is KEPT, which is the only reason
+//! [`Element`] can hold a name and nothing else. A tree library hands back a tree with every
+//! attribute and every text node in it, and "there is no accessor for the value" then becomes a
+//! promise about an API rather than a fact about what exists in memory. That is the property
+//! criterion 6 of #138 is about, and it is the one a later reader will most want to have been
+//! decided structurally.
 //!
-//! XML Signature verifies a canonicalisation of an exact subtree, so the verifier must be able
-//! to say which BYTES of the original document a node occupied. `quick-xml` is a pull parser
-//! over a borrowed buffer and reports the position of every event, so that mapping is available.
-//! A tree library that owns its own decoded nodes gives a tree and not a byte range, and
-//! recovering the range afterwards means re-serialising -- which is the "one component parses,
-//! a second decides signed-ness" split this crate opens by condemning.
+//! AN EARLIER DRAFT GAVE A DIFFERENT REASON AND IT WAS FALSE. It said XML Signature needs byte
+//! ranges for the exact subtree it verifies, which is true, and that a tree library "gives a
+//! tree and not a byte range", which is not: `roxmltree` has `Node::range()`,
+//! `Attribute::range()`, `range_qname()` and `range_value()`, each documented as a byte range in
+//! the original document, behind a `positions` feature that is ON by default. `quick-xml` has no
+//! per-event span at all -- only `Reader::buffer_position()`, a single cursor a caller must keep
+//! its own books against. On that axis the rejected library is BETTER equipped than the chosen
+//! one, and the signature half will have to do that bookkeeping.
 //!
-//! The second reason is retention: with a pull parser this crate decides what is KEPT, which is
-//! how [`Element`] can hold a name and nothing else. A tree library hands back every attribute
-//! and every text node whether or not anybody should be able to read them.
+//! So the honest summary is that `roxmltree` is a credible alternative that was not chosen, on
+//! retention, and that the choice costs this crate the position bookkeeping it would have got
+//! for free. If the signature half finds that bookkeeping is where its bugs live, the decision
+//! is worth reopening, and this paragraph is what a reader would reopen it against.
 //!
 //! `quick-xml` is pure Rust, actively maintained, MIT licensed, and built here with default
 //! features off. What it does NOT do is resolve entities automatically or perform any I/O: an
@@ -101,4 +114,4 @@
 
 mod parse;
 
-pub use parse::{Document, Element, Limits, SamlError, parse};
+pub use parse::{DEPTH_CEILING, Document, Element, Limits, SamlError, parse};

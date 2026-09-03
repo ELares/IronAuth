@@ -329,6 +329,13 @@ fn a_malformed_character_reference_is_not_a_character_reference() {
         ("NUL", "&#0;"),
         ("a forbidden C0 control", "&#x1;"),
         ("a non-character", "&#xFFFE;"),
+        // THE PRODUCTION IS `[0-9]+` AND `x[0-9a-fA-F]+`: no sign, lowercase `x` only. Rust's
+        // `from_str_radix` takes a leading `+`, and an earlier version of this test pinned
+        // `&#X41;` in the CONTROL list as legal -- encoding a non-conforming expectation as
+        // correct, which is worse than the gap it was written to close.
+        ("a signed decimal reference", "&#+65;"),
+        ("a signed hexadecimal reference", "&#x+41;"),
+        ("an uppercase hexadecimal marker", "&#X41;"),
     ] {
         let document = format!("<Response><NameID>a{reference}b</NameID></Response>");
         assert_eq!(
@@ -341,15 +348,7 @@ fn a_malformed_character_reference_is_not_a_character_reference() {
     // THE CONTROLS. Real references, decimal and hexadecimal, and the three C0 controls XML
     // does admit, must all still parse: a rule that refused every `&#` would pass the loop above
     // and reject legal documents.
-    for reference in [
-        "&#65;",
-        "&#x41;",
-        "&#X41;",
-        "&#9;",
-        "&#10;",
-        "&#13;",
-        "&#x1F600;",
-    ] {
+    for reference in ["&#65;", "&#x41;", "&#9;", "&#10;", "&#13;", "&#x1F600;"] {
         let document = format!("<Response><NameID>a{reference}b</NameID></Response>");
         parse(document.as_bytes(), &Limits::default())
             .unwrap_or_else(|_| panic!("{reference} is a legal character reference"));
@@ -460,23 +459,205 @@ fn a_non_utf8_encoding_declaration_is_refused() {
     }
 }
 
-/// A deep tree drops without overflowing the stack.
+/// A caller cannot ask for a depth that would abort the process.
 ///
-/// `parse` is iterative, but the tree's own destructor recurses, and `max_depth` is a public
-/// field with no ceiling whose documentation invites raising it. A review parsed a document at
-/// depth 60000 and watched the process abort on drop with `fatal runtime error: stack overflow`
-/// -- not a refusal anybody can catch. The destructor takes children out iteratively now.
+/// # Two fixes, and why the second was needed
+///
+/// `parse` is iterative, but the TREE is walked recursively -- by its own destructor, and by the
+/// derived `Clone`, `Debug` and `PartialEq`. A review parsed a document at depth 60000 and
+/// watched the process abort on drop with `fatal runtime error: stack overflow`; the destructor
+/// was made iterative, and a later review measured `clone()` and `format!("{:?}")` aborting at
+/// the same depth for the same reason. Writing three more manual impls would have left the next
+/// derive to find.
+///
+/// So the depth a caller asks for is CLAMPED at `DEPTH_CEILING`, which disarms every recursive
+/// walk of the tree at once, including one a consumer of this crate writes itself. Asking for
+/// more is not an error: it gets the ceiling.
 #[test]
-fn a_very_deep_tree_drops_without_overflowing() {
+fn a_caller_cannot_ask_for_a_depth_that_would_abort_the_process() {
     let limits = Limits {
         max_depth: 100_000,
         max_elements: 200_000,
         max_bytes: 4 * 1024 * 1024,
         ..Limits::default()
     };
-    let depth = 60_000;
-    let document = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
-    let parsed = parse(document.as_bytes(), &limits).expect("a deep document within the bounds");
-    // The drop is the test: before the iterative destructor this aborted the process here.
+    let past = ironauth_saml::DEPTH_CEILING + 1;
+    let document = format!("{}{}", "<a>".repeat(past), "</a>".repeat(past));
+    assert_eq!(
+        parse(document.as_bytes(), &limits),
+        Err(SamlError::TooDeep),
+        "a document past the ceiling is refused however high the caller set max_depth"
+    );
+
+    // AT THE CEILING it parses, and every recursive walk of the tree survives it: the drop, the
+    // clone, the debug format and the comparison. The last three aborted the process at depth
+    // 60000 before the ceiling existed.
+    let at = ironauth_saml::DEPTH_CEILING;
+    let document = format!("{}{}", "<a>".repeat(at), "</a>".repeat(at));
+    let parsed = parse(document.as_bytes(), &limits).expect("a document at the ceiling parses");
+    let copy = parsed.clone();
+    assert_eq!(parsed, copy);
+    assert!(!format!("{parsed:?}").is_empty());
+    drop(copy);
     drop(parsed);
+}
+
+/// An attribute NAME is held to the same rule as an element name.
+///
+/// # The duplicate-`ID` guard had a one-byte bypass
+///
+/// The name rule was applied to the element and not to its attributes, which is the half of the
+/// tag where SAML keeps `ID` -- the attribute `XMLDSig`'s `Reference URI="#..."` resolves against.
+/// A review sent `<Assertion ID="_real" ID\0="_forged"/>` and the parser's duplicate check saw
+/// two different names, so the guard whose own comment explains why a NUL in a name is a
+/// wrapping primitive was walked around by putting the NUL in the other name.
+#[test]
+fn an_attribute_name_is_a_name_too() {
+    let mut smuggled = br#"<Assertion ID="_real" ID"#.to_vec();
+    smuggled.push(0);
+    smuggled.extend_from_slice(br#"="_forged"/>"#);
+    assert_eq!(
+        parse(&smuggled, &Limits::default()),
+        Err(SamlError::Malformed),
+        "a NUL in an attribute name smuggled a second ID past the duplicate check"
+    );
+
+    for suffix in ["\u{1}", "\u{a0}", "\u{2000}", "\u{feff}"] {
+        let document = format!(r#"<Assertion ID="_real" ID{suffix}="_forged"/>"#);
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::Malformed),
+            "an attribute name ending in {suffix:?} was accepted"
+        );
+    }
+
+    // AND A NAME MUST START LIKE A NAME. `9Signature` and `.Signature` are names in no XML
+    // processor and were accepted here.
+    for name in ["9Signature", ".Signature", "-Signature"] {
+        let document = format!("<{name}/>");
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::Malformed),
+            "{name} is not a name and was accepted"
+        );
+    }
+
+    // THE CONTROLS: an ordinary prefixed name, an underscore start, and a non-ASCII letter,
+    // which is legal and must not be refused.
+    for name in ["saml:Assertion", "_a", "Ünterschrift"] {
+        let document = format!("<{name}/>");
+        parse(document.as_bytes(), &Limits::default())
+            .unwrap_or_else(|_| panic!("{name} is a legal name"));
+    }
+}
+
+/// A reference outside the document element is content, and is refused like any other content.
+///
+/// The prolog rule was applied to `Text` and `CData` and not to the third thing that carries
+/// characters: `<Response/>&#84;&#82;&#65;` was accepted while the same three characters written
+/// literally were refused.
+#[test]
+fn a_reference_outside_the_document_element_is_refused() {
+    for (what, document) in [
+        ("after the document element", "<Response/>&#84;&#82;&#65;"),
+        ("before the document element", "&#76;&#69;&#65;<Response/>"),
+        ("a built-in after it", "<Response/>&amp;"),
+    ] {
+        assert_eq!(
+            parse(document.as_bytes(), &Limits::default()),
+            Err(SamlError::Malformed),
+            "{what} was accepted"
+        );
+    }
+}
+
+/// A literal control character is refused wherever it appears, exactly as a reference to one is.
+///
+/// `&#0;` was refused and a literal NUL in the same `NameID` was accepted, so one byte reached
+/// opposite verdicts by how it was written -- and the literal is the easier one to send. A NUL
+/// in a `NameID` is the classic truncation primitive against a C consumer.
+#[test]
+fn a_literal_control_character_is_refused_like_a_reference_to_one() {
+    for (what, prefix, suffix) in [
+        (
+            "in element text",
+            "<Response><NameID>admin",
+            "@evil.test</NameID></Response>",
+        ),
+        (
+            "in an attribute value",
+            r#"<Response Destination="https://sp.test/acs"#,
+            r#"@evil.test"/>"#,
+        ),
+        (
+            "in CDATA",
+            "<Response><NameID><![CDATA[admin",
+            "@evil.test]]></NameID></Response>",
+        ),
+    ] {
+        for control in [0_u8, 1, 0x0b, 0x0c, 0x1f] {
+            let mut document = prefix.as_bytes().to_vec();
+            document.push(control);
+            document.extend_from_slice(suffix.as_bytes());
+            assert_eq!(
+                parse(&document, &Limits::default()),
+                Err(SamlError::Malformed),
+                "a literal {control:#04x} {what} was accepted"
+            );
+        }
+    }
+
+    // THE CONTROLS: tab, newline and carriage return ARE legal characters and must not be
+    // refused, or this rule would reject ordinary formatted SAML.
+    for control in ["\t", "\n", "\r"] {
+        let document = format!("<Response><NameID>a{control}b</NameID></Response>");
+        parse(document.as_bytes(), &Limits::default())
+            .unwrap_or_else(|_| panic!("{control:?} is a legal character"));
+    }
+}
+
+/// A raw `<` in an attribute value is refused.
+///
+/// XML's "No `<` in Attribute Values" well-formedness constraint. The scanner already refused a
+/// bare `&` on exactly the reasoning that it is not well-formed, and let the more dangerous
+/// delimiter through.
+#[test]
+fn a_raw_angle_bracket_in_an_attribute_value_is_refused() {
+    assert_eq!(
+        parse(
+            br#"<Response Destination="x<Assertion ID=&quot;_a&quot;/>"/>"#,
+            &Limits::default()
+        ),
+        Err(SamlError::Malformed)
+    );
+
+    // THE CONTROL: the escaped form is ordinary content.
+    parse(
+        br#"<Response Destination="x&lt;Assertion/&gt;"/>"#,
+        &Limits::default(),
+    )
+    .expect("an escaped angle bracket is content");
+}
+
+/// A comment containing `--` is not well-formed and is refused.
+///
+/// #138 names a comment-truncation corpus as its own criterion, so comments are a declared
+/// attack surface for this crate. The one comment well-formedness switch the parser offers was
+/// left at its default of off.
+#[test]
+fn a_malformed_comment_is_refused() {
+    assert_eq!(
+        parse(
+            b"<Response><NameID>a<!-- x--y -->b</NameID></Response>",
+            &Limits::default()
+        ),
+        Err(SamlError::Malformed)
+    );
+
+    // THE CONTROL: an ordinary comment is fine, and this file's own corpus depends on that.
+    parse(
+        b"<Response><!-- an ordinary comment --><NameID>a</NameID></Response>",
+        &Limits::default(),
+    )
+    .expect("an ordinary comment parses");
 }

@@ -22,7 +22,11 @@ pub struct Limits {
     /// a parse cannot be a memory attack. The bound is checked BEFORE parsing begins, so an
     /// oversized document costs one length comparison rather than a parse.
     pub max_bytes: usize,
-    /// The deepest element nesting accepted.
+    /// The deepest element nesting accepted, clamped at [`DEPTH_CEILING`].
+    ///
+    /// CLAMPED RATHER THAN TRUSTED: the tree is walked recursively by three derived impls, so a
+    /// caller who raised this past what a stack can hold would arm a process abort rather than a
+    /// refusal. Asking for more than the ceiling is not an error; it gets the ceiling.
     ///
     /// SAML's own schema nests about ten deep at its worst. This bound is what stops a document
     /// whose only content is nesting: without entity expansion (see the crate doc) that is the
@@ -35,6 +39,11 @@ pub struct Limits {
     /// and still a million allocations.
     pub max_elements: usize,
     /// The most attributes accepted on any one element.
+    ///
+    /// THIS CRATE HAS NO PER-VALUE OR PER-TEXT BOUND, which is worth saying beside the ones it
+    /// does have: a single attribute value or text node is bounded only in aggregate by
+    /// [`Limits::max_bytes`]. That is defensible -- neither is retained, so neither can outlive
+    /// the parse -- and `xml-rs` bounds both by default, which the library evaluation now says.
     ///
     /// A review measured one element carrying five thousand attributes, and a megabyte of them,
     /// passing every other bound: depth and element count say nothing about what hangs off a
@@ -155,18 +164,19 @@ pub struct Element {
     children: Vec<Element>,
 }
 
-/// Drop the tree ITERATIVELY, because the derived one recurses and the depth is a caller's
-/// number.
+/// Drop the tree ITERATIVELY, because the derived one recurses.
 ///
-/// [`parse`] is iterative and cannot overflow, but the tree's own destructor is a recursive
-/// consumer, and [`Limits::max_depth`] is a public field with no ceiling whose documentation
-/// invites raising it. A review measured a document parsed at depth 60000 aborting the process
-/// on drop -- `fatal runtime error: stack overflow` -- which is a misconfiguration cliff with a
-/// hard abort at the end of it and not a refusal anybody can catch.
+/// [`parse`] is iterative and cannot overflow; the tree's own destructor is a recursive
+/// consumer. A review measured a document parsed at depth 60000 aborting the process on drop --
+/// `fatal runtime error: stack overflow` -- which is not a refusal anybody can catch.
 ///
-/// So the destructor takes the children out and drops them from a worklist. Each child is left
-/// with no children of its own by the time it is dropped, so the recursive drop it would
-/// otherwise perform bottoms out immediately.
+/// The destructor takes the children out and drops them from a worklist, so each child is left
+/// with no children of its own before its own drop runs.
+///
+/// IT IS NOT THE ONLY RECURSIVE CONSUMER, which is why [`DEPTH_CEILING`] exists: `Clone`,
+/// `Debug` and `PartialEq` are derived and recurse too, and a later review measured all three
+/// aborting at the same depth. Writing three more manual impls would leave the next derive to
+/// find; capping the depth disarms every one of them at once.
 impl Drop for Element {
     fn drop(&mut self) {
         let mut pending = core::mem::take(&mut self.children);
@@ -210,6 +220,17 @@ impl Document {
     }
 }
 
+/// The deepest nesting [`parse`] will produce, whatever a caller asks for.
+///
+/// [`Limits::max_depth`] is a public field a caller sets, and the tree is walked recursively by
+/// three DERIVED impls (`Clone`, `Debug`, `PartialEq`) as well as by any consumer that writes
+/// its own recursion. A review measured all of them aborting the process at depth 60000. This is
+/// the ceiling that makes those unreachable rather than merely undocumented.
+///
+/// 512 is two orders of magnitude past what SAML's own schema nests, and shallow enough that a
+/// recursive walk of the tree costs a few tens of kilobytes of stack.
+pub const DEPTH_CEILING: usize = 512;
+
 /// Parse `bytes` as a SAML document, refusing anything outside `limits`.
 ///
 /// This is the only way to turn bytes into a [`Document`], and the only way to obtain a
@@ -229,6 +250,8 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
     if bytes.len() > limits.max_bytes {
         return Err(SamlError::TooLarge);
     }
+    // AND THE CALLER'S DEPTH IS CLAMPED, not trusted. See `DEPTH_CEILING`.
+    let max_depth = limits.max_depth.min(DEPTH_CEILING);
     let text = core::str::from_utf8(bytes).map_err(|_| SamlError::Malformed)?;
     let mut reader = Reader::from_str(text);
     // `check_end_names` is the well-formedness rule that makes a start tag and its end tag one
@@ -236,6 +259,11 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
     // `</Response>` and the tree would still build, which is a way to make the shape a
     // signature step reasons about differ from the shape a schema validator would see.
     reader.config_mut().check_end_names = true;
+    // AND COMMENT WELL-FORMEDNESS, which quick-xml leaves off by default. `--` inside a comment
+    // is not well-formed XML, and #138 names a comment-truncation corpus as its own criterion:
+    // comments are a declared attack surface for this crate, so the one switch the library
+    // offers about them is not the one to leave at its default.
+    reader.config_mut().check_comments = true;
     // NO `trim_text`. It was set here with a justification, and a review measured that it had no
     // observable effect: every text event is discarded anyway. It matters now that it is OFF,
     // because whitespace between the prolog and the document element is legal `Misc` and the
@@ -263,13 +291,23 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
             // Refused rather than passed through, because the alternative is a value silently
             // becoming shorter: `<`NameID`>a&whoami;b</`NameID`>` would read as `ab` and a consumer
             // would have no way to know it had been handed a truncation.
-            Ok(Event::GeneralRef(reference)) => check_reference(reference.as_ref())?,
+            Ok(Event::GeneralRef(reference)) => {
+                // A REFERENCE IS CONTENT, so it obeys the same rule as text about WHERE it may
+                // appear. An earlier version checked the reference and not its position, so
+                // `<Response/>&#84;&#82;&#65;` was accepted while the same three characters
+                // written literally were refused: the prolog rule had been applied to `Text` and
+                // `CData` and not to the third thing that carries characters.
+                if stack.is_empty() {
+                    return Err(SamlError::Malformed);
+                }
+                check_reference(reference.as_ref())?;
+            }
             Ok(Event::Start(start)) => {
                 elements += 1;
                 if elements > limits.max_elements {
                     return Err(SamlError::TooManyElements);
                 }
-                if stack.len() >= limits.max_depth {
+                if stack.len() >= max_depth {
                     return Err(SamlError::TooDeep);
                 }
                 stack.push(Element {
@@ -285,7 +323,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
                 // An empty element is a start and an end at once, so it occupies a level while
                 // it exists: a document of nothing but empty elements at the bound must not be
                 // able to exceed it.
-                if stack.len() >= limits.max_depth {
+                if stack.len() >= max_depth {
                     return Err(SamlError::TooDeep);
                 }
                 let leaf = Element {
@@ -327,8 +365,23 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Document, SamlError> {
             // measured `<Response/>TRAILING JUNK` and a leading-text variant being accepted here
             // while every conforming processor rejects them, which is a parser differential
             // against exactly the peer a signature has to agree with.
+            // LITERAL CONTROL CHARACTERS ARE REFUSED WHEREVER THEY APPEAR, which an earlier
+            // version did only for REFERENCES: `&#0;` was refused and a literal NUL in the same
+            // `NameID` was accepted, so one byte reached opposite verdicts by how it was written
+            // -- and the literal is the easier one to send. A NUL in a `NameID` is the classic
+            // truncation primitive against a C consumer.
+            Ok(Event::Text(ref text)) if !stack.is_empty() => {
+                check_literal_characters(text.as_ref())?;
+            }
+            Ok(Event::CData(ref data)) if !stack.is_empty() => {
+                check_literal_characters(data.as_ref())?;
+            }
             Ok(Event::Text(text)) if stack.is_empty() => {
-                if !text.as_ref().iter().all(u8::is_ascii_whitespace) {
+                // XML's `S` production is space, tab, carriage return and newline. Rust's
+                // `is_ascii_whitespace` also admits form feed, which is not even a legal `Char`:
+                // `<Response/>` followed by 0x0C was accepted while `&#12;` was refused, the
+                // same character reaching two verdicts by how it was written.
+                if !text.as_ref().iter().all(|byte| is_xml_space(*byte)) {
                     return Err(SamlError::Malformed);
                 }
             }
@@ -361,17 +414,29 @@ fn check_reference(name: &[u8]) -> Result<(), SamlError> {
     let Some(digits) = name.strip_prefix(b"#") else {
         return Err(SamlError::UnknownEntity);
     };
-    let (digits, radix) = match digits
-        .strip_prefix(b"x")
-        .or_else(|| digits.strip_prefix(b"X"))
-    {
+    // THE PRODUCTION, NOT SOMETHING NEAR IT. XML 1.0 [66] is
+    // `'&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';'`: lowercase `x` only, and no sign. Rust's
+    // `from_str_radix` accepts a leading `+`, and an earlier version of this also took `X`, so
+    // `&#+65;`, `&#x+41;` and `&#X41;` were all accepted here and rejected by every conforming
+    // processor. A test even pinned the last one as legal.
+    let (digits, radix) = match digits.strip_prefix(b"x") {
         Some(hex) => (hex, 16),
         None => (digits, 10),
     };
-    let text = core::str::from_utf8(digits).map_err(|_| SamlError::UnknownEntity)?;
-    if text.is_empty() {
+    if digits.is_empty() {
         return Err(SamlError::UnknownEntity);
     }
+    let legal = |byte: &u8| {
+        if radix == 16 {
+            byte.is_ascii_hexdigit()
+        } else {
+            byte.is_ascii_digit()
+        }
+    };
+    if !digits.iter().all(legal) {
+        return Err(SamlError::UnknownEntity);
+    }
+    let text = core::str::from_utf8(digits).map_err(|_| SamlError::UnknownEntity)?;
     let code = u32::from_str_radix(text, radix).map_err(|_| SamlError::UnknownEntity)?;
     // `char::from_u32` is exactly the specification's `Char` production minus the control
     // characters: it refuses surrogates and anything above the last code point. The remaining
@@ -384,6 +449,23 @@ fn check_reference(name: &[u8]) -> Result<(), SamlError> {
         return Err(SamlError::UnknownEntity);
     }
     Ok(())
+}
+
+/// Refuse any character outside XML 1.0's `Char` production, written literally.
+///
+/// `check_reference` already refuses a REFERENCE to one. This is the same rule for the bytes
+/// themselves, and without it the two disagree: `&#0;` refused, a literal NUL accepted.
+fn check_literal_characters(raw: &[u8]) -> Result<(), SamlError> {
+    let text = core::str::from_utf8(raw).map_err(|_| SamlError::Malformed)?;
+    if text.chars().any(is_forbidden_char) {
+        return Err(SamlError::Malformed);
+    }
+    Ok(())
+}
+
+/// Whether `byte` is XML's `S`: space, tab, carriage return, newline, and nothing else.
+fn is_xml_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 /// Whether `value` is outside XML 1.0's `Char` production.
@@ -420,9 +502,7 @@ fn element_name(
     // parsing, with `name()` not equal to `"Signature"`. A signature-locating step matching on
     // the name would not see that node while a C-based verifier reading the same bytes would,
     // which is a wrapping primitive to close before the signature half exists.
-    if raw.iter().any(|byte| !is_name_byte(*byte)) {
-        return Err(SamlError::Malformed);
-    }
+    check_name(raw)?;
     let mut attributes = 0_usize;
     for attribute in start.attributes() {
         // A malformed or DUPLICATED attribute. The duplicate is the one worth naming: two `ID`
@@ -436,6 +516,13 @@ fn element_name(
         if attribute.key.as_ref().len() > limits.max_name_bytes {
             return Err(SamlError::ElementTooLarge);
         }
+        // THE SAME NAME RULE AS THE ELEMENT, and an earlier version applied it only to the
+        // element. That is the half of the tag where SAML does NOT keep `ID`: a review sent
+        // `<Assertion ID="_real" ID\0="_forged"/>` and the duplicate check saw two different
+        // names, so one NUL walked around the guard whose own comment explains why a NUL in a
+        // name is a wrapping primitive. `ID` is what `XMLDSig`'s `Reference URI="#..."` resolves
+        // against.
+        check_name(attribute.key.as_ref())?;
         check_attribute_value(&attribute.value)?;
     }
     core::str::from_utf8(raw)
@@ -443,15 +530,49 @@ fn element_name(
         .map_err(|_| SamlError::Malformed)
 }
 
-/// Whether `byte` may appear in an element or attribute name.
+/// Hold a name to something close enough to XML's `Name` production to close the differentials.
 ///
-/// Deliberately CONSERVATIVE rather than the full `NameChar` production: everything SAML and
-/// XML Signature name is ASCII letters, digits, `-`, `.`, `_` and the `:` of a prefix, and a
-/// multi-byte UTF-8 sequence is admitted wholesale because refusing it would refuse legal
-/// documents this crate has no reason to refuse. What is closed is the control range, the
-/// space, and the delimiters, which is where the parser differentials live.
-fn is_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b':') || byte >= 0x80
+/// Deliberately CONSERVATIVE rather than the full production, which is pages of Unicode ranges:
+/// everything SAML and XML Signature name is ASCII letters, digits, `-`, `.`, `_` and the `:`
+/// of a prefix. What must be closed is anything that lets one reader see a different name from
+/// another, so this refuses the ASCII control range, the delimiters, and -- decoding the name,
+/// which is cheap and already necessary -- every Unicode whitespace character and the byte-order
+/// mark. An earlier version admitted every byte at or above 0x80 wholesale and claimed to have
+/// closed "the control range, the space, and the delimiters"; a review sent `Sig\u{a0}nature`,
+/// `Sig\u{2000}nature` and `Signature\u{feff}` straight through it.
+///
+/// The FIRST character is checked separately, because `9Signature` and `.Signature` are not
+/// names in any XML processor and were accepted here.
+fn check_name(raw: &[u8]) -> Result<(), SamlError> {
+    let name = core::str::from_utf8(raw).map_err(|_| SamlError::Malformed)?;
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return Err(SamlError::Malformed);
+    };
+    if !is_name_start(first) {
+        return Err(SamlError::Malformed);
+    }
+    if !characters.all(is_name_char) {
+        return Err(SamlError::Malformed);
+    }
+    Ok(())
+}
+
+/// Whether `value` may START a name: a letter, `_` or `:`, or a non-ASCII character that is not
+/// whitespace, a control or the byte-order mark.
+fn is_name_start(value: char) -> bool {
+    if value.is_ascii() {
+        return value.is_ascii_alphabetic() || matches!(value, '_' | ':');
+    }
+    is_name_char(value)
+}
+
+/// Whether `value` may appear anywhere in a name.
+fn is_name_char(value: char) -> bool {
+    if value.is_ascii() {
+        return value.is_ascii_alphanumeric() || matches!(value, '-' | '.' | '_' | ':');
+    }
+    !value.is_whitespace() && !value.is_control() && value != '\u{feff}'
 }
 
 /// Apply the entity rule to a raw attribute value.
@@ -460,6 +581,14 @@ fn is_name_byte(byte: u8) -> bool {
 /// applied to them. A bare `&` is refused too: it is not well-formed XML, and quick-xml does not
 /// refuse it inside an attribute the way it does in text.
 fn check_attribute_value(value: &[u8]) -> Result<(), SamlError> {
+    // NO RAW `<`. XML's "No `<` in Attribute Values" well-formedness constraint, and this
+    // scanner already refuses a bare `&` on exactly the reasoning that it is not well-formed --
+    // and then let the more dangerous delimiter through. A review sent
+    // `Destination="x<Assertion ID=&quot;_a&quot;/>"` and it parsed.
+    if value.contains(&b'<') {
+        return Err(SamlError::Malformed);
+    }
+    check_literal_characters(value)?;
     let mut rest = value;
     while let Some(start) = rest.iter().position(|byte| *byte == b'&') {
         let after = &rest[start + 1..];
