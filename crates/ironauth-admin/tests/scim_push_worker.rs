@@ -289,6 +289,8 @@ struct Harness {
     env: Env,
     scope: Scope,
     connection: ScimPushConnectionId,
+    /// The organization this connection pushes, as the worker compares it against events.
+    org: String,
     downstream: Downstream,
 }
 
@@ -304,6 +306,7 @@ impl Harness {
             env,
             scope,
             connection,
+            org: org.to_string(),
             downstream: Downstream::new(TOKEN),
         }
     }
@@ -373,6 +376,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         limit,
         scope: h.scope,
         now_unix_micros: now_micros(&h.env),
+        organization_id: h.org.clone(),
     };
 
     // Two at a time, then a simulated restart: the second call starts from the recorded position.
@@ -465,6 +469,7 @@ async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
         Collection::User,
         0,
@@ -503,6 +508,7 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
         Collection::User,
         0,
@@ -554,6 +560,7 @@ async fn a_pass_pushes_each_event_then_checkpoints_once() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
     )
     .await
@@ -593,6 +600,7 @@ async fn a_pass_pushes_each_event_then_checkpoints_once() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
     )
     .await
@@ -637,6 +645,7 @@ async fn an_outage_leaves_the_cursor_where_it_was_and_the_replay_does_not_duplic
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
     )
     .await;
@@ -668,6 +677,7 @@ async fn an_outage_leaves_the_cursor_where_it_was_and_the_replay_does_not_duplic
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
     )
     .await
@@ -698,6 +708,7 @@ async fn an_out_of_scope_subject_is_never_pushed_and_one_that_leaves_is_withdraw
         limit: 50,
         scope: h.scope,
         now_unix_micros: now_micros(&h.env),
+        organization_id: h.org.clone(),
     };
 
     // NEVER IN SCOPE: nothing is sent at all.
@@ -815,6 +826,7 @@ async fn a_cursor_the_feed_has_pruned_past_is_reported_rather_than_silently_rest
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
     )
     .await;
@@ -883,6 +895,7 @@ async fn a_paused_connection_reads_nothing_and_moves_nothing() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
+            organization_id: h.org.clone(),
         },
     )
     .await
@@ -914,6 +927,7 @@ async fn a_paused_connection_reads_nothing_and_moves_nothing() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: after_the_pause,
+            organization_id: h.org.clone(),
         },
     )
     .await
@@ -943,6 +957,7 @@ async fn a_paused_connection_reads_nothing_and_moves_nothing() {
             limit: 50,
             scope: h.scope,
             now_unix_micros: deadline - 1,
+            organization_id: h.org.clone(),
         },
     )
     .await

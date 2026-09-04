@@ -90,7 +90,7 @@ async fn no_mapping_may_target_an_attribute_the_protocol_owns() {
     // header calls the one that matters was not pinned by anything.
     //
     // A test whose expected value travels with the code it checks cannot detect a change to both.
-    const MUST_BE_RESERVED: &[&str] = &["id", "meta", "schemas", "externalId"];
+    const MUST_BE_RESERVED: &[&str] = &["id", "meta", "schemas", "externalId", "active"];
     assert_eq!(
         RESERVED_ATTRIBUTES, MUST_BE_RESERVED,
         "the reserved set changed; decide deliberately, because dropping externalId duplicates \
@@ -149,6 +149,25 @@ async fn no_mapping_may_target_an_attribute_the_protocol_owns() {
         "externalId was mappable onto a mutable trait"
     );
 
+    // AND `active` ON ITS OWN, because it was the one missing from this list and its absence had a
+    // consequence the others do not. A mapping pointing `active` at a trait makes that trait
+    // decide departures: the worker builds a deactivation body, the mapping re-stamps `active`
+    // from the trait on the way out, and the downstream is told the person is still enabled. The
+    // deprovision reports success and the account stays live.
+    assert_eq!(
+        resource_for(
+            USER_SCHEMA,
+            "usr_1",
+            false,
+            &json!({ "active": "traits.department" }),
+            &source(),
+        ),
+        Err(MappingError::Reserved {
+            attribute: "active".to_owned()
+        }),
+        "a mapping could overwrite the deactivation flag"
+    );
+
     // CONTROL: a NON-reserved attribute with the same shape maps fine, so the refusals above are
     // the attribute and not the dotted path.
     let mapped = resource_for(
@@ -204,6 +223,39 @@ async fn a_malformed_mapping_is_refused_at_save_time_rather_than_at_write_time()
         .expect("an absent mapping is empty, not invalid");
     assert_eq!(bare["externalId"], json!("usr_1"));
     assert!(bare.get("userName").is_none());
+}
+
+#[tokio::test]
+async fn a_group_body_carries_no_active_attribute() {
+    // RFC 7643 section 4.2 gives Group no `active`, and the first version stamped one on every
+    // resource regardless.
+    //
+    // The consequence is not an ignored extra field. The merged client refuses a Group
+    // deactivation by checking whether the stored representation carries `active`, so a Group
+    // built by this mapper came back carrying one, that refusal was disarmed, and the deprovision
+    // reported success while every member stayed in the group. The mapper and the guard were each
+    // correct alone and wrong together.
+    const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
+    let group = resource_for(
+        GROUP_SCHEMA,
+        "grp_1",
+        true,
+        &json!({ "displayName": "traits.department" }),
+        &source(),
+    )
+    .expect("a group maps");
+    assert!(
+        group.get("active").is_none(),
+        "a Group body carries an attribute its schema does not define: {group}"
+    );
+    assert_eq!(group["externalId"], json!("grp_1"));
+    assert_eq!(group["schemas"], json!([GROUP_SCHEMA]));
+    assert_eq!(group["displayName"], json!("Engineering"));
+
+    // CONTROL: a User body still carries it, so the omission above is about the schema and not
+    // about the attribute having been dropped everywhere.
+    let user = resource_for(USER_SCHEMA, "usr_1", true, &json!({}), &source()).expect("maps");
+    assert_eq!(user["active"], json!(true));
 }
 
 #[tokio::test]

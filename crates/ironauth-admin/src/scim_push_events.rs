@@ -56,6 +56,16 @@ pub enum PushIntent {
         collection: Collection,
         /// IronAuth's own id for the subject.
         subject_id: String,
+        /// The organization the event names, when its schema carries one.
+        ///
+        /// A connection pushes ONE organization's directory. An event that names a DIFFERENT
+        /// organization is not this connection's business, and the worker drops it. Without this
+        /// the feed is environment-wide: one organization's departure would deprovision that
+        /// person from every other organization's downstream in the same environment.
+        ///
+        /// `None` means the event's schema names no organization, which is true of the plain
+        /// `user.*` lifecycle events. Those are decided by the connection's scope filter instead.
+        organization_id: Option<String>,
     },
     /// Remove the subject downstream, per the connection's deletion policy.
     Deprovision {
@@ -63,6 +73,8 @@ pub enum PushIntent {
         collection: Collection,
         /// IronAuth's own id for the subject.
         subject_id: String,
+        /// The organization the event names, when its schema carries one. See [`Self::Converge`].
+        organization_id: Option<String>,
     },
     /// Nothing to push, and the reason is recorded rather than implied.
     Ignore(Ignored),
@@ -108,6 +120,11 @@ const NOT_A_PROVISIONING_SIGNAL: &[&str] = &[
 #[must_use]
 pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
     let subject = |key: &str| payload.get(key).and_then(serde_json::Value::as_str);
+    // Carried through so the worker can drop an event belonging to another organization. The
+    // feed is environment-wide and a connection is organization-scoped, so this is the only
+    // thing standing between one organization's departure and every other organization's
+    // downstream in the same environment.
+    let organization = subject("organization_id");
     match event_type {
         // A USER'S STATE CHANGED, which includes being created. Converge sends the whole mapped
         // representation, so one intent covers create and update: the client decides which by
@@ -120,6 +137,7 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
             Some(id) => PushIntent::Converge {
                 collection: Collection::User,
                 subject_id: id.to_owned(),
+                organization_id: organization.map(str::to_owned),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
         },
@@ -131,10 +149,22 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
             Some(id) => PushIntent::Deprovision {
                 collection: Collection::User,
                 subject_id: id.to_owned(),
+                organization_id: organization.map(str::to_owned),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
         },
-        // GROUP SHAPE OR MEMBERSHIP. A membership change is a converge of the GROUP, not of the
+        // GROUP SHAPE OR MEMBERSHIP.
+        //
+        // THE KEY IS `org_group_id`, NOT `group_id`. The catalog's registered schema for every
+        // `org_group.*` event requires `org_group_id`, and the first version of this module read
+        // `group_id`: a key no envelope carries. Every group create, update, membership change
+        // and deletion therefore fell to `MalformedPayload` and produced no SCIM request at all,
+        // which is the exact silence this module's header says the wildcard was not trusted to
+        // avoid.
+        //
+        // It survived a catalog-denominator test because that test built its own payloads with
+        // the same wrong key. The denominator now reads the catalog's SCHEMA, so a test can no
+        // longer agree with the code against the registry. A membership change is a converge of the GROUP, not of the
         // member: RFC 7643 section 4.2 puts `members` on the group, so the downstream write is a
         // group update either way.
         "org_group.created"
@@ -142,17 +172,37 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
         | "org_group.reparented"
         | "org_group.member_added"
         | "org_group.member_removed"
-        | "org_group.membership_changed" => match subject("group_id") {
+        | "org_group.membership_changed" => match subject("org_group_id") {
             Some(id) => PushIntent::Converge {
                 collection: Collection::Group,
                 subject_id: id.to_owned(),
+                organization_id: organization.map(str::to_owned),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
         },
-        "org_group.deleted" => match subject("group_id") {
+        "org_group.deleted" => match subject("org_group_id") {
             Some(id) => PushIntent::Deprovision {
                 collection: Collection::Group,
                 subject_id: id.to_owned(),
+                organization_id: organization.map(str::to_owned),
+            },
+            None => PushIntent::Ignore(Ignored::MalformedPayload),
+        },
+        // JOINING OR LEAVING THE ORGANIZATION a connection pushes is the most literal reading of
+        // criterion 4: "out-of-scope users are never pushed, and a user leaving scope is
+        // deactivated downstream per policy". Both are a CONVERGE rather than an explicit push or
+        // withdraw, because `scope_decision` already decides which one they are: a member who has
+        // left is out of scope with a link, which is exactly `Withdraw`.
+        //
+        // Classified as `NotASubject` by the first version, so the one event that says a person
+        // left produced no request at all and their downstream account stayed live. The catalog
+        // walk did not catch it: these are `organization.*`, and the walk only asserted a
+        // decision for `user.*` and `org_group.*`.
+        "organization.member_added" | "organization.member_removed" => match subject("user_id") {
+            Some(id) => PushIntent::Converge {
+                collection: Collection::User,
+                subject_id: id.to_owned(),
+                organization_id: organization.map(str::to_owned),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
         },

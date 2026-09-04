@@ -30,10 +30,21 @@ use serde_json::{Map, Value};
 
 /// Attributes the protocol owns, which an `attribute_mapping` may not target.
 ///
-/// `externalId` is here for a different reason from the other three, and the difference is worth
-/// keeping in view: the others are the SERVER's, while `externalId` is the CLIENT's and is what
-/// makes a replay converge instead of duplicating.
-pub const RESERVED_ATTRIBUTES: &[&str] = &["id", "meta", "schemas", "externalId"];
+/// They are reserved for three different reasons, and the differences are worth keeping in view.
+///
+/// `id`, `meta` and `schemas` are the SERVER's (RFC 7643 section 3.1).
+///
+/// `externalId` is the CLIENT's, and is what makes a replay converge instead of duplicating.
+///
+/// `active` is the DEPROVISIONING flag, and it was missing from this list. A connection whose
+/// operator mapped `active` onto a trait would have that trait decide departures: a subject the
+/// worker is deactivating would be re-stamped active by the mapping on the way out, so the
+/// deprovision would write a body saying the person is still enabled and the downstream would
+/// keep them. The module header, the connection view's own field doc, and a test named
+/// `a_deactivated_subject_maps_to_an_inactive_resource` all said `active` comes from the
+/// subject's state rather than from the mapping. The constant did not enforce it, so all three
+/// were claims about a rule nothing applied.
+pub const RESERVED_ATTRIBUTES: &[&str] = &["id", "meta", "schemas", "externalId", "active"];
 
 /// Why a mapping cannot be applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +141,18 @@ fn base_resource(schema_urn: &str, external_id: &str, active: bool) -> Value {
         "externalId".to_owned(),
         Value::String(external_id.to_owned()),
     );
-    resource.insert("active".to_owned(), Value::Bool(active));
+    // `active` ONLY WHERE THE SCHEMA HAS IT. RFC 7643 section 4.2 gives Group no `active`
+    // attribute, and the first version stamped it onto every resource regardless.
+    //
+    // That is not a harmless extra field. The merged client refuses a Group deactivation
+    // precisely by checking whether the stored representation carries `active`, so a Group this
+    // mapper built came back carrying one, the refusal was disarmed, and the deprovision reported
+    // success while every member stayed in the group. The guard and the mapper were each correct
+    // alone and wrong together, which is why the condition belongs beside the schema rather than
+    // at the call site.
+    if schema_urn.ends_with(":User") {
+        resource.insert("active".to_owned(), Value::Bool(active));
+    }
     Value::Object(resource)
 }
 

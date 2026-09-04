@@ -54,6 +54,12 @@ pub struct Progress {
     pub ignored: usize,
     /// Subjects skipped because they are out of this connection's scope and were never pushed.
     pub out_of_scope: usize,
+    /// Subjects the downstream refused PERMANENTLY, recorded against the subject and stepped over.
+    ///
+    /// A permanent refusal is about one person, not about the connection: a duplicate userName, a
+    /// body the downstream will not accept, a policy it enforces. Counting them separately is what
+    /// lets a caller tell "this connection is broken" from "these three people are".
+    pub refused: usize,
     /// Whether the checkpoint moved. False when the page was empty or the pass was refused.
     pub checkpointed: bool,
 }
@@ -156,6 +162,11 @@ pub struct Pass<'a, T: ScimTransport, S: SubjectSource> {
     pub scope: ironauth_store::Scope,
     /// The time this pass is running at, for deciding whether a pause has expired.
     pub now_unix_micros: i64,
+    /// The organization whose directory this connection pushes.
+    ///
+    /// Compared against the organization an event names, so one organization's departure cannot
+    /// reach another's downstream through the environment-wide feed.
+    pub organization_id: String,
 }
 
 /// Runs one tailing pass: read a page of events, apply each, checkpoint once.
@@ -236,7 +247,32 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let payload = envelope.get("payload").unwrap_or(&serde_json::Value::Null);
-        apply_one(store, &pass, event_type, payload, &mut progress).await?;
+        // A PERMANENT REFUSAL IS ABOUT ONE SUBJECT, AND MUST NOT STALL THE PAGE.
+        //
+        // The first version propagated it with `?`, so the pass returned before the checkpoint and
+        // the cursor did not move. The next pass then read the identical page and died on the
+        // identical event, for ever: every user create, update and departure sitting behind that
+        // one event was never delivered. Worse than idle, it was a request LOOP, because every
+        // retry re-pushed the whole page ahead of the poisoned row.
+        //
+        // The default deletion policy guaranteed it. A group deprovision under `deactivate` is a
+        // permanent refusal by construction (RFC 7643 section 4.2 gives Group no `active`), so a
+        // connection created without naming a policy wedged on the first group deletion.
+        //
+        // Recording it against the SUBJECT is what makes stepping over it safe: the failure is
+        // visible on the per-resource health surface (criterion 2), which is the surface that
+        // exists to answer "which people are failing".
+        match apply_one(store, &pass, event_type, payload, &mut progress).await {
+            Ok(()) => {}
+            Err(WorkerError::Permanent(why)) => {
+                record_subject_failure(store, &pass, event_type, payload, &why).await?;
+                progress.refused += 1;
+            }
+            // A RETRYABLE failure still stops the page, and must: the cursor may not advance past
+            // work that has not been done, and a downstream that is down will refuse the next
+            // subject too. This is the outage path, and pausing is what criterion 3 asks for.
+            Err(other) => return Err(other),
+        }
         last_sequence = Some(message.sequence);
     }
 
@@ -267,6 +303,55 @@ const fn is_paused(state: &ScimPushConnection, now_unix_micros: i64) -> bool {
     }
 }
 
+/// Records a permanent refusal against the subject the event names.
+///
+/// # Why this exists at all
+///
+/// `ScimPushLinkRepo::record_failure` had NO caller outside the tests. Criterion 2 asks for
+/// "per-resource errors via the management API", the columns were there, the route publishing
+/// them was there, and nothing ever wrote them: the surface reported `last_error: null` for every
+/// subject no matter how many times its push had been refused. A health surface fed by nothing is
+/// worse than an absent one, because it answers.
+///
+/// A subject with no link is skipped rather than invented: `record_failure` requires the row, and
+/// a refusal for somebody never provisioned has no downstream id to attach to.
+async fn record_subject_failure<T: ScimTransport, S: SubjectSource>(
+    store: &ironauth_store::ScopedStore<'_>,
+    pass: &Pass<'_, T, S>,
+    event_type: &str,
+    payload: &serde_json::Value,
+    why: &str,
+) -> Result<(), WorkerError> {
+    let (collection, subject_id) = match intent_for(event_type, payload) {
+        PushIntent::Converge {
+            collection,
+            subject_id,
+            ..
+        }
+        | PushIntent::Deprovision {
+            collection,
+            subject_id,
+            ..
+        } => (collection, subject_id),
+        PushIntent::Ignore(_) => return Ok(()),
+    };
+    let resource_type = match collection {
+        Collection::User => ScimPushResourceType::User,
+        Collection::Group => ScimPushResourceType::Group,
+    };
+    match store
+        .scim_push_links()
+        .record_failure(pass.connection_id, resource_type, &subject_id, why)
+        .await
+    {
+        Ok(()) => Ok(()),
+        // No link means this connection never provisioned the subject, so there is no per-resource
+        // row to carry the error. Counted in `refused` regardless, so the pass still reports it.
+        Err(StoreError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Applies one event, recording what it did in `progress`.
 async fn apply_one<T: ScimTransport, S: SubjectSource>(
     store: &ironauth_store::ScopedStore<'_>,
@@ -276,15 +361,17 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
     progress: &mut Progress,
 ) -> Result<(), WorkerError> {
     let intent = intent_for(event_type, payload);
-    let (collection, subject_id, departing) = match intent {
+    let (collection, subject_id, organization_id, departing) = match intent {
         PushIntent::Converge {
             collection,
             subject_id,
-        } => (collection, subject_id, false),
+            organization_id,
+        } => (collection, subject_id, organization_id, false),
         PushIntent::Deprovision {
             collection,
             subject_id,
-        } => (collection, subject_id, true),
+            organization_id,
+        } => (collection, subject_id, organization_id, true),
         PushIntent::Ignore(Ignored::MalformedPayload) => {
             // A registered event missing its own required property means a producer and the
             // catalog disagree. Counted, not fatal: one bad row must not stall a page.
@@ -296,6 +383,23 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
             return Ok(());
         }
     };
+
+    // ANOTHER ORGANIZATION'S EVENT IS NOT THIS CONNECTION'S BUSINESS.
+    //
+    // The feed is ENVIRONMENT-wide and a connection is ORGANIZATION-scoped, so without this a
+    // departure in organization B deprovisions that person from organization A's downstream too:
+    // one tenant's offboarding reaching another tenant's directory, through a worker that was
+    // behaving exactly as written.
+    //
+    // Only events whose schema NAMES an organization can be filtered here. The plain `user.*`
+    // lifecycle events carry none, and those are decided by the connection's scope filter below,
+    // which is the mechanism criterion 4 describes.
+    if let Some(named) = &organization_id {
+        if named != &pass.organization_id {
+            progress.out_of_scope += 1;
+            return Ok(());
+        }
+    }
 
     let resource_type = match collection {
         Collection::User => ScimPushResourceType::User,

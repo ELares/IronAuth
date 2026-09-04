@@ -20,13 +20,58 @@ use ironauth_admin::scim_push_events::{
 };
 use serde_json::json;
 
-/// A payload carrying whichever subject id the event's schema requires.
+/// A payload built from the event's OWN registered schema, not from a shape this test invented.
+///
+/// # Why this reads the catalog instead of hard-coding two keys
+///
+/// The first version returned `{"group_id": ...}` for every `org_group.*` event. The catalog
+/// requires `org_group_id`, and the module under test read `group_id` too, so the test and the
+/// code agreed with each other and both disagreed with the registry. Every group event was
+/// silently classified as malformed and the suite was green: the denominator enumerated the
+/// catalog's event NAMES and then measured them against a payload of its own invention.
+///
+/// An expected value that travels with the code it checks cannot detect a change to both. So the
+/// required properties come from `payload_schema`, and a key renamed in the catalog now breaks
+/// this test rather than being quietly mirrored by it.
+fn expected_org(event_type: &str) -> Option<String> {
+    // Derived from the schema, exactly as `payload_for` derives the payload. An earlier version
+    // of this file wrote `Some("seed-organization_id")` onto every expected intent, which is
+    // false for every event whose schema names no organization (`user.deleted` carries
+    // `user_id` and `hard_kill`, and nothing else). Writing the expectation by hand is how the
+    // group-key defect survived; deriving it is the correction applied consistently.
+    let registered = ironauth_store::event_catalog::registered(event_type)?;
+    let schema: serde_json::Value = serde_json::from_str(&registered.payload_schema).ok()?;
+    let required = schema["required"].as_array()?;
+    required
+        .iter()
+        .any(|n| n.as_str() == Some("organization_id"))
+        .then(|| "seed-organization_id".to_owned())
+}
+
 fn payload_for(event_type: &str) -> serde_json::Value {
-    if event_type.starts_with("org_group.") {
-        json!({ "group_id": "grp_1" })
-    } else {
-        json!({ "user_id": "usr_1" })
+    let registered = ironauth_store::event_catalog::registered(event_type)
+        .unwrap_or_else(|| panic!("{event_type} is not registered"));
+    let schema: serde_json::Value =
+        serde_json::from_str(&registered.payload_schema).expect("the schema is JSON");
+    let mut payload = serde_json::Map::new();
+    for name in schema["required"].as_array().into_iter().flatten() {
+        let name = name.as_str().expect("a required property name");
+        let kind = schema["properties"][name]["type"]
+            .as_str()
+            .unwrap_or("string");
+        payload.insert(
+            name.to_owned(),
+            match kind {
+                "boolean" => json!(false),
+                "integer" | "number" => json!(1),
+                "array" => json!([]),
+                "object" => json!({}),
+                // A plausible id for the id-shaped properties, since `intent_for` reads them.
+                _ => json!(format!("seed-{name}")),
+            },
+        );
     }
+    serde_json::Value::Object(payload)
 }
 
 #[tokio::test]
@@ -43,7 +88,13 @@ async fn every_catalogued_subject_event_is_classified() {
     let mut unclassified = Vec::new();
     let mut classified = 0_usize;
     for event_type in &catalogued {
-        if !event_type.starts_with("user.") && !event_type.starts_with("org_group.") {
+        // The membership events are subject events despite their prefix: a person joining or
+        // leaving the organization a connection pushes is precisely criterion 4.
+        const MEMBERSHIP: &[&str] = &["organization.member_added", "organization.member_removed"];
+        if !event_type.starts_with("user.")
+            && !event_type.starts_with("org_group.")
+            && !MEMBERSHIP.contains(&event_type.as_str())
+        {
             // Not about a subject this connection pushes. Asserted below rather than assumed.
             assert_eq!(
                 intent_for(event_type, &json!({})),
@@ -85,10 +136,11 @@ async fn a_departure_is_a_deprovision_and_a_sign_in_is_not_a_write() {
     // prevent.
     for event_type in ["user.deleted", "user.deprovisioned", "user.deactivated"] {
         assert_eq!(
-            intent_for(event_type, &json!({ "user_id": "usr_1" })),
+            intent_for(event_type, &payload_for(event_type)),
             PushIntent::Deprovision {
                 collection: Collection::User,
-                subject_id: "usr_1".to_owned(),
+                subject_id: "seed-user_id".to_owned(),
+                organization_id: expected_org(event_type),
             },
             "{event_type} must deprovision"
         );
@@ -98,19 +150,45 @@ async fn a_departure_is_a_deprovision_and_a_sign_in_is_not_a_write() {
     // translation that pushed on it would send a SCIM request per login, which is a load defect
     // and a rate-limit one.
     assert_eq!(
-        intent_for("user.signed_in", &json!({ "user_id": "usr_1" })),
+        intent_for("user.signed_in", &payload_for("user.signed_in")),
         PushIntent::Ignore(Ignored::NotAProvisioningSignal)
     );
 
     // A membership change converges the GROUP, not the member: RFC 7643 section 4.2 puts
     // `members` on the group, so the downstream write is a group update.
     assert_eq!(
-        intent_for("org_group.member_added", &json!({ "group_id": "grp_1" })),
+        intent_for(
+            "org_group.member_added",
+            &payload_for("org_group.member_added")
+        ),
         PushIntent::Converge {
             collection: Collection::Group,
-            subject_id: "grp_1".to_owned(),
+            subject_id: "seed-org_group_id".to_owned(),
+            organization_id: expected_org("org_group.member_added"),
         }
     );
+
+    // JOINING AND LEAVING THE ORGANIZATION a connection pushes: criterion 4's most literal case.
+    // Both are a CONVERGE, because `scope_decision` turns the "left" one into a withdrawal from
+    // the link's presence. Classified as "not a subject" by the first version, so the one event
+    // that says a person left produced no request and the downstream account stayed live.
+    for event_type in ["organization.member_added", "organization.member_removed"] {
+        assert_eq!(
+            intent_for(event_type, &payload_for(event_type)),
+            PushIntent::Converge {
+                collection: Collection::User,
+                subject_id: "seed-user_id".to_owned(),
+                organization_id: expected_org(event_type),
+            },
+            "{event_type} must re-evaluate the subject"
+        );
+        // AND IT NAMES THE ORGANIZATION, which is what lets the worker drop an event belonging to
+        // a different one. The feed is environment-wide; a connection is not.
+        assert!(
+            expected_org(event_type).is_some(),
+            "{event_type} carries no organization, so the worker cannot confine it"
+        );
+    }
 }
 
 #[tokio::test]
@@ -130,10 +208,11 @@ async fn a_payload_missing_its_subject_id_is_reported_rather_than_ignored() {
     // CONTROL: the same event with its own id is a real intent, so the refusals above are the
     // missing property and not the event type.
     assert_eq!(
-        intent_for("org_group.deleted", &json!({ "group_id": "grp_1" })),
+        intent_for("org_group.deleted", &payload_for("org_group.deleted")),
         PushIntent::Deprovision {
             collection: Collection::Group,
-            subject_id: "grp_1".to_owned(),
+            subject_id: "seed-org_group_id".to_owned(),
+            organization_id: expected_org("org_group.deleted"),
         }
     );
 }
