@@ -75,6 +75,7 @@ mod messages;
 mod scim_connections;
 pub mod scim_push_client;
 mod scim_push_connections;
+pub mod scim_push_directory;
 pub mod scim_push_events;
 pub mod scim_push_mapping;
 pub mod scim_push_transport;

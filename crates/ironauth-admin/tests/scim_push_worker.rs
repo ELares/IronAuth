@@ -416,7 +416,33 @@ async fn enqueue(
     .fetch_one(db.owner_pool())
     .await
     .expect("enqueue");
-    row.get::<i64, _>("sequence")
+    let sequence = row.get::<i64, _>("sequence");
+
+    // WAIT UNTIL THE FEED WILL ACTUALLY SERVE IT, and this is not belt and braces.
+    //
+    // `events_after` withholds any row at or above the cluster's oldest running transaction, and
+    // that watermark is CLUSTER-WIDE: another test in this binary holding a transaction open
+    // stalls the whole feed, so a pass that runs immediately after this insert reads an empty
+    // page and converges nothing. It failed about one run in three, on a different test each
+    // time, and it fails the same way on `main`.
+    //
+    // `newest_sequence` applies the same predicate the reads do, so it answers exactly the
+    // question this needs: is this row on the feed yet. `events_cursor_ordering.rs` waits the
+    // same bounded way and says the same thing about why.
+    let outbox = db.store().scoped(scope);
+    for _ in 0..200 {
+        if outbox
+            .outbox()
+            .newest_sequence()
+            .await
+            .expect("read the feed head")
+            .is_some_and(|head| head >= sequence)
+        {
+            return sequence;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the feed never served sequence {sequence}, so no pass could have read it");
 }
 
 /// Everything a pass needs, wired to a real database and the reference downstream.

@@ -140,7 +140,24 @@ pub trait SubjectSource {
         subject_id: &str,
     ) -> impl Future<Output = Result<bool, String>> + Send;
 
-    /// The next page of IN-SCOPE subject ids, in a stable order, after `after`.
+    /// The next page of subject ids, in a stable order, after `after`, IN SCOPE OR NOT.
+    ///
+    /// # Why this page is not filtered
+    ///
+    /// It said IN-SCOPE, and that contract could not be implemented. An empty page ends the
+    /// collection (see [`run_backfill_pass`]), so a source that honestly filtered a page down to
+    /// nothing would announce the enumeration was finished with the rest of the directory
+    /// unread -- and every person after that page would be skipped, permanently, which is the
+    /// one failure the paragraph below says must not happen. Returning them anyway needs an
+    /// unbounded read per page, because the number of rows between here and the next in-scope
+    /// subject has no ceiling.
+    ///
+    /// It went unnoticed because the only implementor was a test double whose enumeration
+    /// filtered a whole in-memory map and then took a page, so it could always fill one. A
+    /// keyset read over a table cannot.
+    ///
+    /// So scope is decided per subject, by [`Self::in_scope`], in both passes: the tail already
+    /// worked that way, and the backfill now does too.
     ///
     /// # Why the order has to be stable and the caller has to say where it stopped
     ///
@@ -683,6 +700,18 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
     subject_id: &str,
     progress: &mut Progress,
 ) -> Result<(), WorkerError> {
+    // SCOPE IS DECIDED HERE, per subject, exactly as the tail decides it. The enumeration hands
+    // over its page unfiltered because filtering it can empty a page while the directory still
+    // has people in it, and an empty page ends the collection.
+    if !pass
+        .subjects
+        .in_scope(collection, subject_id)
+        .await
+        .map_err(WorkerError::Retryable)?
+    {
+        progress.out_of_scope += 1;
+        return Ok(());
+    }
     let Some(resource) = pass
         .subjects
         .resource(collection, subject_id)

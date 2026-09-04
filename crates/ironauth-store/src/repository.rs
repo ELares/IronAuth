@@ -49476,6 +49476,52 @@ impl OrgMembershipRepo<'_> {
             .collect()
     }
 
+    /// The organization's live member USER IDS, ordered by user id, for an outbound enumeration.
+    ///
+    /// Ordered by `user_id` rather than by `(created_at, id)`, and returning the USER id rather
+    /// than the membership id, because both are what an outbound consumer resumes from: it stores
+    /// the last subject it pushed, and a subject is a person. See
+    /// [`OrgGroupRepo::ids_for_org_after`] for why an id-only cursor is what survives a deletion
+    /// between two passes.
+    ///
+    /// SERVICE ACCOUNTS ARE NOT PEOPLE and are excluded, the same way the management listing
+    /// excludes them: `owner_kind = 'user'`. Provisioning one into a downstream directory would
+    /// create a human-looking account for a machine principal.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn user_ids_for_org_after(
+        &self,
+        org_id: &OrganizationId,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT user_id FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL AND owner_kind = 'user' AND user_id IS NOT NULL \
+             AND ($4::text IS NULL OR user_id > $4::text) \
+             ORDER BY user_id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<String, _>("user_id"))
+            .collect())
+    }
+
     /// One live service-account membership by id.
     ///
     /// The counterpart of [`OrgMembershipRepo::get`] and fenced the mirror way: that one
@@ -50145,6 +50191,51 @@ impl OrgGroupRepo<'_> {
         rows.iter()
             .map(|row| org_group_from_row(row, &self.scope))
             .collect()
+    }
+
+    /// The organization's live group IDS, ordered by id, for an outbound enumeration.
+    ///
+    /// # Why this is not [`Self::list_for_org`]
+    ///
+    /// That one keys its cursor on `(created_at, id)`, which is right for a management listing:
+    /// an operator reads newest-adjacent pages and the extra column breaks ties. An OUTBOUND
+    /// enumeration resumes from a position it wrote to its own state row, and the only thing it
+    /// has to resume from is the subject id it last pushed. Rebuilding a `(created_at, id)` cursor
+    /// from an id means reading the row back, and a row deleted between two passes would leave
+    /// nothing to rebuild from -- so the backfill would restart and re-push the whole directory.
+    ///
+    /// Ordering by id alone is total and stable and survives the row going away, which is what
+    /// makes a resumed enumeration provably skip nobody.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn ids_for_org_after(
+        &self,
+        org_id: &OrganizationId,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id FROM org_groups \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND deleted_at IS NULL \
+             AND ($4::text IS NULL OR id > $4::text) \
+             ORDER BY id LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(|row| row.get::<String, _>("id")).collect())
     }
 
     /// The deterministic EFFECTIVE ROLE SET for one user in one organization

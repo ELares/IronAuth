@@ -850,6 +850,14 @@ name = "scim_push_worker"
 path = "tests/scim_push_worker.rs"
 required-features = ["testing"]
 
+# The PRODUCTION directory, against the real store. Every other push test hands the worker bodies
+# a fixture built; this one is where an operator's attribute mapping is observed on a resource the
+# downstream actually received, which is what criterion 1 of #137 asks for.
+[[test]]
+name = "scim_push_directory"
+path = "tests/scim_push_directory.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "scim_push_mapping"
 path = "tests/scim_push_mapping.rs"
