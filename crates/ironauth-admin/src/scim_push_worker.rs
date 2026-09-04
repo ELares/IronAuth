@@ -92,8 +92,19 @@ pub enum WorkerError {
     ///
     /// The cursor is deliberately NOT advanced, so the events stay ahead of the checkpoint.
     Retryable(String),
-    /// The downstream refused permanently, or the connection is misconfigured.
+    /// The downstream refused permanently. About ONE subject: the page steps over it.
     Permanent(String),
+    /// The connection itself is misconfigured, so every subject would be refused.
+    ///
+    /// # Why this is not `Permanent`
+    ///
+    /// It was, and the per-subject arms then caught it. A mapping that refuses every subject was
+    /// therefore refused per subject, stepped over per subject, and the enumeration advanced past
+    /// everybody: the pass reported `refused: N`, recorded progress past the whole page, and the
+    /// people it skipped were never enumerated again, because a backfill does not come back for a
+    /// position it has passed. The step-over is right for a fault about one person and is the
+    /// worst possible answer for a fault about all of them.
+    Configuration(String),
 }
 
 impl From<StoreError> for WorkerError {
@@ -133,14 +144,30 @@ impl From<PushError> for WorkerError {
 pub enum SourceError {
     /// The source could not answer right now. Trying again may work.
     Retryable(String),
-    /// The source will refuse this subject every time it is asked.
+    /// The source will refuse this subject every time it is asked. Step over it.
     Permanent(String),
+    /// The connection itself is misconfigured, so the source refuses EVERY subject.
+    ///
+    /// # Separate from `Permanent`, because stepping over is the wrong answer
+    ///
+    /// A per-subject refusal is about one person and the page steps over it, records it against
+    /// them, and checkpoints. Applied to a fault that is really about the connection -- an
+    /// attribute mapping that targets a reserved attribute, a scope filter that does not parse --
+    /// that is the worst outcome available: every subject is refused, every one is stepped over,
+    /// the cursor advances past all of them, and the connection reports a clean checkpoint having
+    /// delivered nothing. The events are gone, because the cursor moved.
+    ///
+    /// So this stops the pass without advancing anything, and is recorded against the connection
+    /// where an operator can see one reason rather than one per person.
+    Configuration(String),
 }
 
 impl core::fmt::Display for SourceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Retryable(why) | Self::Permanent(why) => f.write_str(why),
+            Self::Retryable(why) | Self::Permanent(why) | Self::Configuration(why) => {
+                f.write_str(why)
+            }
         }
     }
 }
@@ -150,6 +177,7 @@ impl From<SourceError> for WorkerError {
         match error {
             SourceError::Retryable(why) => Self::Retryable(why),
             SourceError::Permanent(why) => Self::Permanent(why),
+            SourceError::Configuration(why) => Self::Configuration(why),
         }
     }
 }
@@ -708,7 +736,27 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     let mut expected_failures = state.consecutive_failures;
     for subject_id in &subjects {
         let pushed_before = progress.converged;
-        push_one(store, &pass, collection, subject_id, &mut progress).await?;
+        // A PERMANENT REFUSAL IS ABOUT ONE SUBJECT HERE TOO, and the backfill had no arm for it.
+        //
+        // The tail grew one because a permanent refusal that propagates stalls the page for ever.
+        // The backfill's `?` was survivable only while nothing below it could produce a permanent
+        // refusal per subject; giving `SubjectSource` a `Permanent` variant made it produce one,
+        // and this line then aborted the whole pass. Worse than the tail's version of the same
+        // bug: `record_connection_failure` gives a permanent failure NO backoff, deliberately, so
+        // the connection stayed due and every cycle re-enumerated the same page and died on the
+        // same subject with nothing slowing it down.
+        //
+        // Recorded against the subject, counted, stepped over. A fault that is really about the
+        // CONNECTION does not come through here at all: it is `SourceError::Configuration`, and
+        // it stops the pass without moving anything.
+        match push_one(store, &pass, collection, subject_id, &mut progress).await {
+            Ok(()) => {}
+            Err(WorkerError::Permanent(why)) => {
+                record_backfill_refusal(store, &pass, collection, subject_id, &why).await?;
+                progress.refused += 1;
+            }
+            Err(other) => return Err(other),
+        }
         // RECORDED AFTER EACH SUBJECT, so a crash resumes from the last one that actually
         // landed rather than from the start of the page.
         furthest = Some(subject_id.clone());
@@ -728,6 +776,34 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     }
     debug_assert!(furthest.is_some(), "a non-empty page recorded no progress");
     Ok(progress)
+}
+
+/// Records a permanent refusal against one enumerated subject.
+///
+/// The tail's [`record_subject_failure`] derives the subject from the event; a backfill already
+/// holds it, so this is the same write without the intent lookup. A subject with no link is
+/// skipped rather than invented: the failure surface hangs off the link row, and a refusal for
+/// somebody never provisioned has no downstream id to attach to. It is counted in `refused`
+/// either way, so the pass still reports it.
+async fn record_backfill_refusal<T: ScimTransport, S: SubjectSource>(
+    store: &ironauth_store::ScopedStore<'_>,
+    pass: &Pass<'_, T, S>,
+    collection: Collection,
+    subject_id: &str,
+    why: &str,
+) -> Result<(), WorkerError> {
+    let resource_type = match collection {
+        Collection::User => ScimPushResourceType::User,
+        Collection::Group => ScimPushResourceType::Group,
+    };
+    match store
+        .scim_push_links()
+        .record_failure(pass.connection_id, resource_type, subject_id, why)
+        .await
+    {
+        Ok(()) | Err(StoreError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Provisions one subject during a backfill.
@@ -887,10 +963,10 @@ async fn record_connection_failure(
     now_unix_micros: i64,
 ) -> Result<(), StoreError> {
     let (why, pause) = match error {
-        // A PERMANENT failure is not a backoff candidate: retrying reproduces it exactly, and a
-        // pause would only delay the moment an operator sees it. Recorded without one, so the
-        // health surface shows the reason and the connection keeps being picked up.
-        WorkerError::Permanent(why) => (why.clone(), None),
+        // NEITHER IS A BACKOFF CANDIDATE: retrying reproduces each exactly, and a pause would
+        // only delay the moment an operator sees it. Recorded without one, so the health surface
+        // shows the reason and the connection keeps being picked up.
+        WorkerError::Permanent(why) | WorkerError::Configuration(why) => (why.clone(), None),
         WorkerError::Retryable(why) => (why.clone(), Some(())),
         WorkerError::Store(error) => (format!("the store refused the pass: {error:?}"), Some(())),
         // NOT RECORDED AT ALL. Another worker checkpointed this connection's page; nothing failed,

@@ -161,6 +161,36 @@ impl Org {
         id
     }
 
+    /// A group belonging to `organization` rather than to this one.
+    async fn group_of(&self, organization: &OrganizationId, slug: &str) -> OrgGroupId {
+        let id = OrgGroupId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .management()
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .org_groups(self.scope)
+            .create(
+                &self.env,
+                NewOrgGroup {
+                    id: &id,
+                    organization_id: organization,
+                    parent_id: None,
+                    slug,
+                    display_name: "Their group",
+                    metadata: None,
+                },
+                now_micros(&self.env),
+                ORG_GROUP_MAX_DEPTH_CEILING,
+                None,
+            )
+            .await
+            .expect("create the sibling's group");
+        id
+    }
+
     /// An active user bound into `organization` rather than into this one.
     async fn member_of(&self, organization: &OrganizationId, identifier: &str) -> UserId {
         let user = self
@@ -691,6 +721,36 @@ async fn a_person_from_another_organization_is_not_this_connections_subject() {
             .is_none(),
         "another organization's person has a body on this connection: {theirs}"
     );
+
+    // AND THE SAME FOR A GROUP, which has its own fence and its own no-filter shortcut. Naming
+    // the fence on people and not on groups is how a fix gets believed to be everywhere while it
+    // is in one place: `org_group.*` events reach this connection off the same environment-wide
+    // feed that `user.*` events do.
+    let ours_group = org.group("engineering", "Engineering").await;
+    let theirs_group = org.group_of(&neighbour, "their-engineering").await;
+    assert!(
+        directory
+            .in_scope(Collection::Group, &ours_group.to_string())
+            .await
+            .expect("in_scope answers"),
+        "our own group is not in scope, so this connection would provision no groups"
+    );
+    assert!(
+        !directory
+            .in_scope(Collection::Group, &theirs_group.to_string())
+            .await
+            .expect("in_scope answers"),
+        "a group that belongs to another organization is in scope for this connection: \
+         {theirs_group}"
+    );
+    assert!(
+        directory
+            .resource(Collection::Group, &theirs_group.to_string())
+            .await
+            .expect("resource answers")
+            .is_none(),
+        "another organization's group has a body on this connection: {theirs_group}"
+    );
 }
 
 #[tokio::test]
@@ -902,14 +962,177 @@ async fn a_mapping_the_source_will_always_refuse_is_permanent_rather_than_a_wedg
     )
     .await;
 
-    // PERMANENT, not retryable. Retryable is what pauses the connection and re-reads the page.
+    // PERMANENT AND WHOLE-PASS, which is the pair that matters.
+    //
+    // Permanent, because retryable is what pauses the connection and re-reads the page for ever.
+    //
+    // And whole-pass, because this fault is about the CONNECTION: the mapping refuses every
+    // subject, so stepping over it per subject would refuse everybody, step over everybody, and
+    // checkpoint past all of them -- a clean-looking pass that delivered nothing and moved the
+    // cursor past the events that would have said so. `SourceError::Configuration` is what keeps
+    // it whole-pass while a refusal about one subject steps over.
     match outcome {
-        Err(WorkerError::Permanent(why)) => assert!(
+        Err(WorkerError::Configuration(why)) => assert!(
             why.contains("mapping"),
             "the refusal does not say what an operator has to fix: {why}"
         ),
+        // `Permanent` here would be the per-subject class, and the per-subject arms step over it:
+        // the pass would refuse every person in the organization, advance past all of them, and
+        // report a clean page. This assertion is the one that caught exactly that, so it names
+        // the variant rather than accepting any error.
         other => panic!(
-            "a mapping this source will refuse every time was not reported as permanent: {other:?}"
+            "a mapping that refuses every subject was not reported as a connection fault: \
+             {other:?}"
         ),
+    }
+    // NOTHING MOVED. A configuration fault that advanced the enumeration would lose the people it
+    // skipped, because the backfill never comes back for a position it has passed.
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_after_id, None,
+        "a connection-wide refusal advanced the enumeration past the people it could not map"
+    );
+    assert_eq!(
+        state.cursor_sequence, None,
+        "a connection-wide refusal started the connection tailing"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_about_one_subject_is_stepped_over_rather_than_stalling_the_backfill() {
+    // WHY THIS EXISTS. The tail grew a per-subject `Permanent` arm because a refusal that
+    // propagates stalls the page for ever. The backfill had none, and nothing noticed while
+    // nothing below it could produce one per subject. Giving `SubjectSource` a `Permanent`
+    // variant made it produce one, and the backfill's bare `?` then aborted the whole pass --
+    // and `record_connection_failure` gives a permanent failure NO backoff, deliberately, so the
+    // connection stayed due and every cycle re-read the same page and died on the same subject
+    // with nothing slowing it down. The fix that removed a wedge put back a faster one.
+    //
+    // A group with more members than one SCIM body can carry is the refusal that reaches here:
+    // it is permanent, and it is about ONE group.
+    let org = Org::start().await;
+    let (_, membership) = org.member("ada@globex.example", None).await;
+    let group = org.group("engineering", "Engineering").await;
+    org.bind(&group, &membership).await;
+
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = RefusingDirectory {
+        inner: PushDirectory::new(&store, &record).expect("the filters parse"),
+    };
+    let downstream = Downstream::new(TOKEN);
+    let client = ScimPushClient::new(
+        FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        BASE,
+        TOKEN,
+        WriteMode::Patch,
+    );
+    let pass = || Pass {
+        connection_id: &connection,
+        client: &client,
+        subjects: &directory,
+        deletion_policy: DeletionPolicy::Deactivate,
+        limit: 10,
+        scope: org.scope,
+        now_unix_micros: now_micros(&org.env),
+        organization_id: org.id.to_string(),
+    };
+
+    // The user page runs and hands over; the group page hits the refusal.
+    let users_page = run_backfill_pass(&store, pass())
+        .await
+        .expect("the user page runs");
+    assert_eq!(users_page.converged, 1, "{users_page:?}");
+    run_backfill_pass(&store, pass())
+        .await
+        .expect("the empty user page hands over");
+    let groups_page = run_backfill_pass(&store, pass())
+        .await
+        .expect("a refusal about one group must not fail the pass");
+
+    assert_eq!(
+        groups_page.refused, 1,
+        "the refusal was not counted, so nothing reports it: {groups_page:?}"
+    );
+    assert!(
+        downstream.groups().is_empty(),
+        "the refused group was pushed anyway: {:?}",
+        downstream.groups()
+    );
+    // AND THE ENUMERATION MOVED PAST IT, which is the whole point: a pass that stopped here would
+    // re-read the same group for ever and never reach the groups after it.
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_after_id.as_deref(),
+        Some(group.to_string().as_str()),
+        "the enumeration did not step over the refused group: {state:?}"
+    );
+}
+
+/// A directory that refuses one collection permanently, as an oversized group does.
+///
+/// The alternative was seeding a group with more than `MAX_GROUP_MEMBERS` members, which is a
+/// thousand users and a thousand memberships for one assertion. What is under test is the
+/// WORKER's handling of a permanent source refusal, not the directory's reason for making one.
+struct RefusingDirectory<'a> {
+    inner: PushDirectory<'a>,
+}
+
+impl SubjectSource for RefusingDirectory<'_> {
+    fn resource(
+        &self,
+        collection: Collection,
+        subject_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Value>, SourceError>> + Send {
+        let subject_id = subject_id.to_owned();
+        async move {
+            if collection == Collection::Group {
+                return Err(SourceError::Permanent(format!(
+                    "{subject_id} has more members than one SCIM body can carry"
+                )));
+            }
+            self.inner.resource(collection, &subject_id).await
+        }
+    }
+
+    fn in_scope(
+        &self,
+        collection: Collection,
+        subject_id: &str,
+    ) -> impl std::future::Future<Output = Result<bool, SourceError>> + Send {
+        let subject_id = subject_id.to_owned();
+        async move { self.inner.in_scope(collection, &subject_id).await }
+    }
+
+    fn enumerate(
+        &self,
+        collection: Collection,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, SourceError>> + Send {
+        let after = after.map(str::to_owned);
+        async move {
+            self.inner
+                .enumerate(collection, after.as_deref(), limit)
+                .await
+        }
     }
 }

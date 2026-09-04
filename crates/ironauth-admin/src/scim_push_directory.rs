@@ -120,9 +120,17 @@ impl From<DirectoryError> for SourceError {
         let why = error.to_string();
         match error {
             DirectoryError::Store(_) => Self::Retryable(why),
-            DirectoryError::FilterInvalid(_)
-            | DirectoryError::MappingInvalid(_)
-            | DirectoryError::GroupTooLarge { .. } => Self::Permanent(why),
+            // ABOUT THE CONNECTION, not about whoever happened to be read first. A mapping that
+            // targets a reserved attribute and a filter that does not parse refuse EVERY subject,
+            // so reporting them per subject would step over every person in the organization and
+            // checkpoint past all of them: a clean-looking pass that delivered nothing and moved
+            // the cursor past the events that would have said so.
+            DirectoryError::FilterInvalid(_) | DirectoryError::MappingInvalid(_) => {
+                Self::Configuration(why)
+            }
+            // ABOUT ONE GROUP. Every other subject on the page is unaffected, so the page steps
+            // over it and the refusal is recorded where an operator looks for it.
+            DirectoryError::GroupTooLarge { .. } => Self::Permanent(why),
         }
     }
 }
@@ -318,12 +326,14 @@ impl<'a> PushDirectory<'a> {
         // A member with no link is omitted rather than refused: they are out of scope, or the
         // backfill has not reached them yet. Groups are enumerated after users, and a membership
         // event re-converges the group, so the reference appears once the person does.
+        // THE CHEAP DISCRIMINATOR FIRST. Both conditions have to hold, so the order is free to
+        // choose, and the link lookup is ONE statement while `admits_user` is a membership read
+        // plus, when a filter is configured, a whole mapped body. Most members dropped from a
+        // group are dropped by the link check, and asking the expensive question first paid for a
+        // body that was about to be thrown away.
         let mut references = Vec::with_capacity(users.len());
         for (_, user_id) in &users {
             let member_subject = user_id.to_string();
-            if !self.admits_user(&member_subject).await? {
-                continue;
-            }
             let link = self
                 .store
                 .scim_push_links()
@@ -336,6 +346,9 @@ impl<'a> PushDirectory<'a> {
             let Some(link) = link.filter(|l| l.deprovisioned_at_unix_micros.is_none()) else {
                 continue;
             };
+            if !self.admits_user(&member_subject).await? {
+                continue;
+            }
             references.push(Value::Object(Map::from_iter([(
                 "value".to_owned(),
                 Value::String(link.downstream_id.clone()),
@@ -419,13 +432,28 @@ impl<'a> PushDirectory<'a> {
     /// what is true in fact -- a group's members are people, and deciding a person never asks
     /// about a group.
     async fn admits_user(&self, subject_id: &str) -> Result<bool, DirectoryError> {
-        // ALWAYS. `build_user` is the only thing that establishes this person belongs to this
-        // organization, through `for_user_in_org`.
+        // WITH NO FILTER, THE MEMBERSHIP READ IS THE WHOLE ANSWER, and building the body to throw
+        // it away is three reads plus a mapping for a question one read settles. It matters most
+        // where it is asked most: `build_group` asks this about every member, so the cheap path
+        // is the difference between one read per member and four.
+        //
+        // What must NOT come back is the version that skipped the read as well. That was the
+        // cross-organization leak: `admits` answered true for any string when no filter was
+        // configured, and the worker's only fence for an organization-less event is this method.
+        let Some(filter) = self.user_filter.as_ref() else {
+            let Ok(user_id) = self.store.users().parse_id(subject_id) else {
+                return Ok(false);
+            };
+            return Ok(self
+                .store
+                .org_memberships()
+                .for_user_in_org(&self.organization, &user_id)
+                .await?
+                .is_some());
+        };
+        // WITH a filter, the body is what the filter reads, so it has to be built anyway.
         let Some(resource) = self.build_user(subject_id).await? else {
             return Ok(false);
-        };
-        let Some(filter) = self.user_filter.as_ref() else {
-            return Ok(true);
         };
         // EVALUATED AGAINST THE MAPPED RESOURCE, not against the source. An operator writes the
         // filter in SCIM attribute names because that is what the connection is configured in;
@@ -435,11 +463,26 @@ impl<'a> PushDirectory<'a> {
 
     /// [`Self::admits`] for a group.
     async fn admits_group(&self, subject_id: &str) -> Result<bool, DirectoryError> {
+        // THE CHEAP PATH MATTERS MORE HERE. `build_group` fans out over every member, so building
+        // a body only to discard it against an absent filter costs four reads per member of a
+        // group nobody asked to filter.
+        let Some(filter) = self.group_filter.as_ref() else {
+            let Ok(group_id) = self.store.org_groups().parse_id(subject_id) else {
+                return Ok(false);
+            };
+            return match self
+                .store
+                .org_groups()
+                .get_in_org(&self.organization, &group_id)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(StoreError::NotFound) => Ok(false),
+                Err(error) => Err(error.into()),
+            };
+        };
         let Some(resource) = self.build_group(subject_id).await? else {
             return Ok(false);
-        };
-        let Some(filter) = self.group_filter.as_ref() else {
-            return Ok(true);
         };
         Ok(filter_matches(filter, &resource))
     }
