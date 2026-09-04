@@ -1571,6 +1571,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Contract,
             sql: include_str!("../migrations/0193_drop_scim_push_sync_state.sql"),
         },
+        Migration {
+            version: 194,
+            name: "drop_scim_push_control_policy",
+            // CONTRACT: removes a permissive policy whose predicates are identical to the
+            // unqualified one beside it. Permissive policies are OR'd, so it never widened or
+            // narrowed anything, and an old binary sees no change in what it can read or write.
+            phase: Phase::Contract,
+            sql: include_str!("../migrations/0194_drop_scim_push_control_policy.sql"),
+        },
     ]
 }
 
