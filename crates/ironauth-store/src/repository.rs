@@ -75032,13 +75032,13 @@ impl ScimBackfillState {
     ///
     /// Added when the push worker arrived. Before it there were two decode sites for this
     /// vocabulary and both were inline `match` blocks, so the spellings were written three times
-    /// in one file. NotFound rather than a decode error, matching the house choice for a stored
-    /// value that no longer parses.
+    /// in one file. `NotFound` rather than a decode error, matching the house choice for a
+    /// stored value that no longer parses.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for a value outside the vocabulary.
-    pub fn from_str(value: &str) -> Result<Self, StoreError> {
+    pub fn parse_stored(value: &str) -> Result<Self, StoreError> {
         match value {
             "pending" => Ok(Self::Pending),
             "users" => Ok(Self::Users),
@@ -75095,7 +75095,7 @@ fn scim_push_connection_from_row(
         "delete" => ScimDeletionPolicy::Delete,
         _ => return Err(StoreError::NotFound),
     };
-    let backfill_state = ScimBackfillState::from_str(&row.get::<String, _>("backfill_state"))?;
+    let backfill_state = ScimBackfillState::parse_stored(&row.get::<String, _>("backfill_state"))?;
     Ok(ScimPushConnection {
         id: ScimPushConnectionId::parse_in_scope(&row.get::<String, _>("id"), scope)
             .map_err(|_| StoreError::NotFound)?,

@@ -127,8 +127,22 @@ ENABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A table a LATER migration drops is not a live scoped table, and requiring its
+# registration would make every contract migration unlandable. A shipped migration is
+# checksum-frozen, so its FORCE statement cannot be edited out: the removal can only ever
+# be a later DROP, and this is what lets the gate see one.
+#
+# It stays conservative in the direction that matters. A table that is forced and NOT
+# dropped is still required, so the only thing this exempts is a name that no longer
+# names anything, against which no raw SQL can be written.
+DROP_RE = re.compile(
+    r"^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)",
+    re.IGNORECASE,
+)
+
 forced = set()
 enabled = set()
+dropped = set()
 for path in sorted(glob.glob("crates/ironauth-store/migrations/**/*.sql", recursive=True)):
     with open(path, encoding="utf-8") as fh:
         for statement in statements(fh.read()):
@@ -138,6 +152,12 @@ for path in sorted(glob.glob("crates/ironauth-store/migrations/**/*.sql", recurs
             m = ENABLE_RE.match(statement)
             if m:
                 enabled.add(m.group(1).lower())
+            m = DROP_RE.match(statement)
+            if m:
+                dropped.add(m.group(1).lower())
+
+# Applied AFTER the "found nothing at all" guard below, so a DROP_RE that stopped matching
+# cannot quietly empty the forced set and turn this gate into a no-op.
 
 if not forced:
     sys.exit(
@@ -156,6 +176,9 @@ if m is None:
         "scripts/query-audit.sh. If it was renamed, update this check; do not leave\n"
         "the registration unenforced."
     )
+
+forced -= dropped
+enabled -= dropped
 registered = [t for t in m.group(1).split("|") if t]
 if len(registered) != len(set(registered)):
     dupes = sorted({t for t in registered if registered.count(t) > 1})
