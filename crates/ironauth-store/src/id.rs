@@ -1255,6 +1255,18 @@ impl ScopedKind for ScimPushConnectionKind {
     const PREFIX: &'static str = "spc";
 }
 
+/// Marker for an outbound SCIM push LINK (`spl_`, issue #137).
+///
+/// The row that records what ONE downstream calls ONE subject. Not a credential and not a
+/// person: it names an id the downstream issued, which RFC 7643 section 3.1 makes the server's
+/// to choose, so this handle is safe in a log line for the same reason
+/// [`ScimPushConnectionKind`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScimPushLinkKind;
+impl ScopedKind for ScimPushLinkKind {
+    const PREFIX: &'static str = "spl";
+}
+
 /// Marker for a Native SSO device secret (`nsd_`, issue #133, PROTOTYPE).
 ///
 /// The identifier of the ROW, never the secret. The secret itself is high-entropy, returned
@@ -2114,6 +2126,12 @@ pub type ScimExternalIdId = ScopedId<ScimExternalIdKind>;
 /// different ones -- and not per CONNECTION, because a token rotation must create a new
 /// connection row and would otherwise strand everything the old one wrote.
 pub type ScimEnterpriseId = ScopedId<ScimEnterpriseKind>;
+/// An outbound SCIM push LINK identifier (`spl_...`), issue #137.
+///
+/// The row keyed by (connection, resource type, subject) that records the downstream's own id
+/// for that subject. The map exists for what a lookup cannot give: per-resource error state, and
+/// an answer after a downstream is rebuilt and forgets the resource.
+pub type ScimPushLinkId = ScopedId<ScimPushLinkKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;

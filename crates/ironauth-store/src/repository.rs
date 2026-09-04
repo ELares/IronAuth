@@ -98,10 +98,10 @@ use crate::id::{
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
     RiskSignalId, RoutingRuleId, ScimConnectionId, ScimEnterpriseId, ScimExternalIdId,
-    ScimPushConnectionId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId,
-    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
-    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    ScimPushConnectionId, ScimPushLinkId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
     WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
@@ -218,6 +218,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_push_connections(&self) -> ScimPushConnectionRepo<'a> {
         ScimPushConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// What each downstream calls the subjects this scope pushes (issue #137).
+    #[must_use]
+    pub fn scim_push_links(&self) -> ScimPushLinkRepo<'a> {
+        ScimPushLinkRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -75359,6 +75368,333 @@ impl ActingScimPushConnectionRepo<'_> {
             None,
         )
         .await
+    }
+}
+
+/// Which collection an outbound push link names.
+///
+/// A closed vocabulary rather than a string, and `ALL` exists so a test can drive every variant
+/// through the real column against its CHECK: a variant the constraint would reject cannot be
+/// added without a red test, so the Rust spelling and the SQL spelling cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimPushResourceType {
+    /// A user resource (`/Users` downstream).
+    User,
+    /// A group resource (`/Groups` downstream).
+    Group,
+}
+
+impl ScimPushResourceType {
+    /// Every variant, so a test can drive the whole vocabulary against the column.
+    pub const ALL: &'static [Self] = &[Self::User, Self::Group];
+
+    /// The stored spelling, which is also the CHECK constraint's.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Group => "group",
+        }
+    }
+
+    /// Parse a stored spelling.
+    fn from_str(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "user" => Ok(Self::User),
+            "group" => Ok(Self::Group),
+            _ => Err(StoreError::NotFound),
+        }
+    }
+}
+
+/// What a downstream calls one subject an outbound connection pushes (issue #137).
+#[derive(Debug, Clone)]
+pub struct ScimPushLink {
+    /// The link's own handle.
+    pub id: ScimPushLinkId,
+    /// The connection whose namespace this link lives in.
+    pub connection_id: ScimPushConnectionId,
+    /// Which collection the subject belongs to.
+    pub resource_type: ScimPushResourceType,
+    /// IronAuth's own id for the subject.
+    pub subject_id: String,
+    /// The id the DOWNSTREAM issued. Opaque here.
+    pub downstream_id: String,
+    /// The `externalId` this connection sent for the subject.
+    pub external_id: String,
+    /// When the last successful push for this subject completed.
+    pub last_synced_at_unix_micros: Option<i64>,
+    /// When the last failure for this subject was recorded.
+    pub last_error_at_unix_micros: Option<i64>,
+    /// What that failure said.
+    pub last_error: Option<String>,
+}
+
+const SCIM_PUSH_LINK_SELECT_COLUMNS: &str = "id, connection_id, resource_type, subject_id, \
+     downstream_id, external_id, \
+     (EXTRACT(EPOCH FROM last_synced_at) * 1000000)::bigint AS last_synced_at_micros, \
+     (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_at_micros, last_error";
+
+/// Build a [`ScimPushLink`] from a row selected with [`SCIM_PUSH_LINK_SELECT_COLUMNS`].
+fn scim_push_link_from_row(row: &PgRow, scope: &Scope) -> Result<ScimPushLink, StoreError> {
+    Ok(ScimPushLink {
+        id: ScimPushLinkId::parse_in_scope(row.try_get("id")?, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        connection_id: ScimPushConnectionId::parse_in_scope(row.try_get("connection_id")?, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        resource_type: ScimPushResourceType::from_str(row.try_get("resource_type")?)?,
+        subject_id: row.try_get("subject_id")?,
+        downstream_id: row.try_get("downstream_id")?,
+        external_id: row.try_get("external_id")?,
+        last_synced_at_unix_micros: row.try_get("last_synced_at_micros")?,
+        last_error_at_unix_micros: row.try_get("last_error_at_micros")?,
+        last_error: row.try_get("last_error")?,
+    })
+}
+
+/// The outbound push links for one scope (issue #137).
+///
+/// # This is not the idempotency mechanism, and must never become it
+///
+/// What makes a push idempotent is the `externalId` LOOKUP the client issues before every write,
+/// which converges after a lost response because it asks the downstream what is actually there.
+/// A local map cannot do that: it records what this deployment last saw, and a downstream that
+/// was rebuilt, restored from a backup, or edited by hand disagrees with it silently.
+///
+/// What the map is for is the two things the lookup cannot answer: per-resource error state,
+/// which issue #137 asks for by name, and what a subject was called after the downstream has
+/// forgotten it.
+///
+/// # Why the writes here are not audited
+///
+/// A link is written by the push WORKER on the data plane, once per resource per convergence.
+/// The inbound mirror `ScimExternalIdRepo` reads and writes from one type for the same reason
+/// this does: an audit row records an OPERATOR ACTION, and a sync writing a hundred thousand of
+/// them would bury the rows an operator actually reads. What IS audited is the connection
+/// lifecycle, on the control plane, where a person is the actor.
+pub struct ScimPushLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimPushLinkRepo<'_> {
+    /// The link for one subject under one connection, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn find(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        resource_type: ScimPushResourceType,
+        subject_id: &str,
+    ) -> Result<Option<ScimPushLink>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_LINK_SELECT_COLUMNS} FROM scim_push_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND resource_type = $4 AND subject_id = $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| scim_push_link_from_row(&row, &self.scope))
+            .transpose()
+    }
+
+    /// Every link one connection holds, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_connection(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ScimPushLink>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_LINK_SELECT_COLUMNS} FROM scim_push_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| scim_push_link_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The longest error `record_failure` stores, mirroring 0190's `octet_length` bound.
+///
+/// A message longer than the column takes is a 23514 the caller cannot act on, so the value is
+/// truncated here rather than refused. It is a CHARACTER-boundary truncation: slicing bytes would
+/// panic on a multi-byte message, and a downstream's error text is not guaranteed to be ASCII.
+const MAX_ERROR_BYTES: usize = 2048;
+
+/// What a caller supplies to record a successful push.
+pub struct NewScimPushLink<'a> {
+    /// The link's handle, minted by the caller.
+    pub id: &'a ScimPushLinkId,
+    /// The connection whose namespace it lives in.
+    pub connection_id: &'a ScimPushConnectionId,
+    /// Which collection the subject belongs to.
+    pub resource_type: ScimPushResourceType,
+    /// IronAuth's own id for the subject.
+    pub subject_id: &'a str,
+    /// The id the downstream issued.
+    pub downstream_id: &'a str,
+    /// The `externalId` that was sent.
+    pub external_id: &'a str,
+}
+
+impl ScimPushLinkRepo<'_> {
+    /// Record that a subject is provisioned downstream under `downstream_id`.
+    ///
+    /// UPSERT ON THE SUBJECT, because a re-push of a subject already linked is the normal case
+    /// rather than an error: the client looks up before every write, so it reaches here again on
+    /// every convergence. What changes on a re-push is the downstream id (if the resource was
+    /// recreated), the external id (if the mapping changed what is sent) and the sync time.
+    ///
+    /// IT ALSO CLEARS THE ERROR COLUMNS. A subject that has just been pushed successfully is not
+    /// failing, and leaving a stale error would make the per-resource health answer a question
+    /// about the past. Recording a success and clearing the failure are the same event, so they
+    /// are the same statement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id belongs to another scope, [`StoreError::Conflict`]
+    /// if the downstream id is already linked to a DIFFERENT subject under this connection,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn upsert(&self, spec: NewScimPushLink<'_>) -> Result<(), StoreError> {
+        let NewScimPushLink {
+            id,
+            connection_id,
+            resource_type,
+            subject_id,
+            downstream_id,
+            external_id,
+        } = spec;
+        if id.scope() != self.scope || connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_push_links \
+             (id, tenant_id, environment_id, connection_id, resource_type, subject_id, \
+              downstream_id, external_id, last_synced_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) \
+             ON CONFLICT (tenant_id, environment_id, connection_id, resource_type, subject_id) \
+             DO UPDATE SET downstream_id = EXCLUDED.downstream_id, \
+                           external_id = EXCLUDED.external_id, \
+                           last_synced_at = now(), \
+                           last_error_at = NULL, \
+                           last_error = NULL, \
+                           updated_at = now()",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .bind(downstream_id)
+        .bind(external_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            // THE OTHER unique index: one downstream id names one subject. A conflict here is
+            // NOT the upsert's own key, which the ON CONFLICT clause absorbs; it means two
+            // subjects were about to claim one downstream record, which is a bug worth
+            // surfacing rather than a race worth absorbing.
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record that a push for one subject failed, without disturbing its downstream id.
+    ///
+    /// THE LINK MUST ALREADY EXIST. A failure before a subject was ever provisioned has no
+    /// downstream id to attach to, and inventing a row with an empty one would make the
+    /// `downstream_id <> ''` CHECK the thing a caller meets. The worker records those against
+    /// the CONNECTION's health on 0189 instead, which is where a failure with no resource
+    /// belongs.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or no link exists,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn record_failure(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        resource_type: ScimPushResourceType,
+        subject_id: &str,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // BOUNDED HERE, so the column's CHECK is never what a caller meets. A downstream error
+        // body is not this deployment's to bound at the source, and a CHECK violation is
+        // SQLSTATE 23514, which falls through to an opaque failure rather than saying what was
+        // wrong. Truncation on a CHARACTER boundary, because slicing bytes would panic on a
+        // multi-byte error message.
+        let mut bounded = error;
+        if bounded.len() > MAX_ERROR_BYTES {
+            let mut end = MAX_ERROR_BYTES;
+            while end > 0 && !bounded.is_char_boundary(end) {
+                end -= 1;
+            }
+            bounded = &bounded[..end];
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = sqlx::query(
+            "UPDATE scim_push_links \
+             SET last_error_at = now(), last_error = $6, updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND resource_type = $4 AND subject_id = $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .bind(bounded)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
