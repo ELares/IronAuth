@@ -840,6 +840,14 @@ required-features = ["testing"]
 # is where this seam's own behaviour lives.
 # THE EVENT TRANSLATION (issue #137). No database and no downstream: what it measures is that
 # every catalogued subject event has a DECIDED meaning, using the catalog as the denominator.
+# THE ATTRIBUTE MAPPING (issue #137, criterion 1). What matters here is not that a mapping
+# applies but what an operator is ALLOWED to map: `externalId` is the client's lookup key, and
+# mapping it onto a mutable trait duplicates the directory silently.
+[[test]]
+name = "scim_push_mapping"
+path = "tests/scim_push_mapping.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "scim_push_events"
 path = "tests/scim_push_events.rs"
