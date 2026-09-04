@@ -18,17 +18,19 @@
 #![cfg(feature = "testing")]
 
 use std::future::Future;
+use std::sync::Mutex;
 
 use axum::body::Body;
 use axum::http::Request;
 use ironauth_admin::scim_push_client::{DeletionPolicy, ScimPushClient, WriteMode};
 use ironauth_admin::scim_push_directory::PushDirectory;
 use ironauth_admin::scim_push_events::Collection;
+use ironauth_admin::scim_push_scheduler::{ScimPushObserver, tick};
 use ironauth_admin::scim_push_transport::{
     ScimRequest, ScimResponse, ScimTransport, ScimTransportError,
 };
 use ironauth_admin::scim_push_worker::{
-    Pass, SourceError, SubjectSource, WorkerError, run_backfill_pass,
+    Pass, Progress, SourceError, SubjectSource, WorkerError, run_backfill_pass,
 };
 use ironauth_env::Env;
 use ironauth_scim::downstream::Downstream;
@@ -1360,5 +1362,164 @@ async fn a_deleted_person_is_gone_to_the_cheap_fence_as_well_as_to_the_full_buil
             .expect("in_scope answers"),
         "the cheap fence still calls a deleted person a member, so the tail would never withdraw \
          them from the downstream"
+    );
+}
+
+/// Records what the scheduler tells it, so a test can assert on the half of a tick that never
+/// reaches the database.
+#[derive(Default)]
+struct RecordingObserver {
+    finished: Mutex<Vec<(String, bool)>>,
+    unavailable: Mutex<Vec<(String, String)>>,
+}
+
+impl ScimPushObserver for RecordingObserver {
+    fn pass_finished(
+        &self,
+        _scope: Scope,
+        connection: &ScimPushConnectionId,
+        outcome: &Result<Progress, WorkerError>,
+    ) {
+        self.finished
+            .lock()
+            .expect("lock")
+            .push((connection.to_string(), outcome.is_ok()));
+    }
+
+    fn connection_unavailable(&self, _scope: Scope, connection: &ScimPushConnectionId, why: &str) {
+        self.unavailable
+            .lock()
+            .expect("lock")
+            .push((connection.to_string(), why.to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn the_scheduler_opens_the_credential_and_runs_the_due_connection() {
+    // WHY THIS EXISTS. Everything below this was tested and none of it had a caller in a running
+    // server: `run_due_connections` was reached only from tests, so every acceptance criterion of
+    // #137 was satisfied by code a deployment would never execute. This drives the seam a boot
+    // uses, and it is the last unmeasured link in the chain.
+    //
+    // The credential half is the part that only exists here. Every other test hands the client a
+    // token; the scheduler has to find the connection's named secret, open it under the master
+    // key, and turn the bytes into a bearer.
+    let org = Org::start().await;
+    let (ada, _) = org.member("ada@globex.example", None).await;
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    // The backfill has to be finished for the tail, but a due connection mid-backfill is served
+    // too; leaving it enumerating is what makes this a backfill pass.
+    let downstream = Downstream::new(TOKEN);
+    let observer = RecordingObserver::default();
+
+    // THE SECRET THE CONNECTION NAMES, stored the way an operator stores it.
+    org.db
+        .store()
+        .scoped(org.scope)
+        .acting(
+            org.db.test_actor(&org.env),
+            CorrelationId::generate(&org.env),
+        )
+        .environment_secrets()
+        .put(
+            &org.env,
+            &org.db.master_key(),
+            "downstream_token",
+            TOKEN.as_bytes(),
+            None,
+        )
+        .await
+        .expect("store the downstream credential");
+
+    tick(
+        org.db.store(),
+        org.scope,
+        &FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        &org.db.master_key(),
+        &observer,
+    )
+    .await;
+
+    let finished = observer.finished.lock().expect("lock").clone();
+    assert_eq!(
+        finished,
+        vec![(connection.to_string(), true)],
+        "the scheduler did not run the due connection: {finished:?}"
+    );
+    assert!(
+        observer.unavailable.lock().expect("lock").is_empty(),
+        "the connection could not be prepared: {:?}",
+        observer.unavailable.lock().expect("lock")
+    );
+    // AND THE PERSON REACHED THE DOWNSTREAM, through a credential nothing in this test handed to
+    // the client.
+    let users = downstream.users();
+    assert_eq!(users.len(), 1, "nobody was provisioned: {users:?}");
+    assert_eq!(
+        users.values().next().expect("one user")["externalId"].as_str(),
+        Some(ada.to_string().as_str()),
+        "the wrong person was provisioned: {users:?}"
+    );
+    // The state moved, so the next tick resumes rather than repeating.
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_after_id.as_deref(),
+        Some(ada.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_connection_whose_secret_is_missing_is_reported_rather_than_silently_idle() {
+    // WHY THIS EXISTS. `run_due_connections` skips a connection its builder cannot prepare, and
+    // skipping is silent by construction: no pass runs, so nothing writes `last_error`, so the
+    // health surface shows a connection that looks idle rather than one that cannot send. The
+    // observer is the only place that fact exists, and an operator who rotated a secret and
+    // renamed it would otherwise have nothing at all to look at.
+    let org = Org::start().await;
+    org.member("ada@globex.example", None).await;
+    let connection = org.connection(&json!({}), None).await;
+    let downstream = Downstream::new(TOKEN);
+    let observer = RecordingObserver::default();
+
+    // NO SECRET IS STORED. The connection names one; the store does not have it.
+    tick(
+        org.db.store(),
+        org.scope,
+        &FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        &org.db.master_key(),
+        &observer,
+    )
+    .await;
+
+    let unavailable = observer.unavailable.lock().expect("lock").clone();
+    assert_eq!(
+        unavailable.len(),
+        1,
+        "the skip was not reported: {unavailable:?}"
+    );
+    assert_eq!(unavailable[0].0, connection.to_string());
+    assert!(
+        unavailable[0].1.contains("downstream_token"),
+        "the report does not name the secret an operator has to fix: {:?}",
+        unavailable[0].1
+    );
+    assert!(
+        observer.finished.lock().expect("lock").is_empty(),
+        "a pass ran for a connection whose credential could not be opened"
+    );
+    assert!(
+        downstream.users().is_empty(),
+        "somebody was provisioned without a credential: {:?}",
+        downstream.users()
     );
 }

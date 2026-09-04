@@ -170,8 +170,8 @@ impl<'a> PushDirectory<'a> {
         };
         Ok(Self {
             store,
-            connection: connection.id.clone(),
-            organization: connection.organization_id.clone(),
+            connection: connection.id,
+            organization: connection.organization_id,
             attribute_mapping: connection.attribute_mapping.clone(),
             user_filter: parse(connection.user_scope_filter.as_ref())?,
             group_filter: parse(connection.group_scope_filter.as_ref())?,

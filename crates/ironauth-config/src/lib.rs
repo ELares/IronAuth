@@ -119,6 +119,15 @@ pub struct Config {
     /// boot mounts nothing under `/scim/v2` and every such path is a uniform 404.
     pub scim: ScimConfig,
 
+    /// OUTBOUND SCIM provisioning (issue #137): whether THIS process runs the push
+    /// worker, and how often.
+    ///
+    /// Separate from `[scim]`, which is the inbound server. They are opposite directions
+    /// with opposite risks -- inbound accepts writes from a customer's IdP, outbound sends
+    /// this environment's directory to a third party -- and a deployment that consumes SCIM
+    /// should not have to emit it, or the reverse.
+    pub scim_push: ScimPushConfig,
+
     /// Per-tenant and per-environment quota fairness settings (issue #50). The
     /// operator-plane noisy-neighbor guard: nested token buckets that keep one
     /// tenant or environment from starving another. Safe defaults, fully tunable
@@ -850,6 +859,48 @@ pub struct ScimConfig {
     /// Must not exceed the store's own list cap: above that the refusal becomes unreachable
     /// and the truncation happens anyway, which is a measured defect rather than a theory.
     pub max_scan: u32,
+}
+
+/// The outbound SCIM push worker (issue #137).
+///
+/// # Why this is off by default
+///
+/// Every other switch in this file guards a surface this deployment SERVES. This one guards
+/// requests it SENDS, to hosts a customer named. A default-on worker would mean installing
+/// IronAuth is enough to start making outbound calls to third parties as soon as somebody
+/// configures a connection, which is not a thing an operator should discover.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScimPushConfig {
+    /// Whether THIS process runs the outbound worker. Off by default.
+    ///
+    /// A connection can be configured, and its health surface read, with this off. What is off
+    /// is the sending.
+    pub enabled: bool,
+
+    /// How long between ticks, in seconds.
+    ///
+    /// # This is a floor on latency, not a rate limit
+    ///
+    /// A tick asks which connections are DUE and serves those, so the interval decides how
+    /// long a connection waits after becoming due, not how much work it does. The per-pass
+    /// page bound is what limits the work. Shortening it makes provisioning more prompt and
+    /// costs one `due_for_sync` query per scope per tick; lengthening it is what an operator
+    /// reaches for when a downstream is rate limiting, and the per-connection backoff already
+    /// handles that case better.
+    pub interval_secs: u64,
+}
+
+impl Default for ScimPushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Thirty seconds: short enough that a departure reaches a downstream while the
+            // person is still walking out, long enough that an idle environment is not issuing
+            // a query per scope per second.
+            interval_secs: 30,
+        }
+    }
 }
 
 impl Default for ScimConfig {
