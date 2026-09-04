@@ -78,6 +78,7 @@ mod scim_push_connections;
 pub mod scim_push_events;
 pub mod scim_push_mapping;
 pub mod scim_push_transport;
+pub mod scim_push_worker;
 pub mod usage;
 mod whoami;
 

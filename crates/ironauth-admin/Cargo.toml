@@ -843,6 +843,13 @@ required-features = ["testing"]
 # THE ATTRIBUTE MAPPING (issue #137, criterion 1). What matters here is not that a mapping
 # applies but what an operator is ALLOWED to map: `externalId` is the client's lookup key, and
 # mapping it onto a mutable trait duplicates the directory silently.
+# ONE PASS OF THE OUTBOUND SYNC (issue #137, criteria 3 and 4). Real Postgres, real feed, real
+# link and sync-state tables, and the reference downstream; only the subject directory is a seam.
+[[test]]
+name = "scim_push_worker"
+path = "tests/scim_push_worker.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "scim_push_mapping"
 path = "tests/scim_push_mapping.rs"
