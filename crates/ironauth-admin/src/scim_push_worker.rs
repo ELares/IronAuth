@@ -116,6 +116,7 @@ impl From<StoreError> for WorkerError {
 impl From<PushError> for WorkerError {
     fn from(error: PushError) -> Self {
         match error {
+            PushError::Configuration(why) => Self::Configuration(why),
             PushError::Retryable(why) => Self::Retryable(why),
             PushError::Permanent(why) => Self::Permanent(why),
         }
@@ -749,11 +750,13 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
         // Recorded against the subject, counted, stepped over. A fault that is really about the
         // CONNECTION does not come through here at all: it is `SourceError::Configuration`, and
         // it stops the pass without moving anything.
+        let mut refused = None;
         match push_one(store, &pass, collection, subject_id, &mut progress).await {
             Ok(()) => {}
             Err(WorkerError::Permanent(why)) => {
                 record_backfill_refusal(store, &pass, collection, subject_id, &why).await?;
                 progress.refused += 1;
+                refused = Some(why);
             }
             Err(other) => return Err(other),
         }
@@ -772,7 +775,29 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
                 progress.converged > pushed_before,
             )
             .await?;
-        expected_failures = 0;
+        // A REFUSED SUBJECT DOES NOT CLEAR THE CONNECTION'S ERROR STATE, and stepping over one
+        // used to. `record_backfill_progress` sets `consecutive_failures = 0` and NULLs the
+        // error, which is right after a subject that landed and wrong after one that was refused:
+        // a page of refusals wiped the health surface clean on its way past. Re-recording it puts
+        // back what the progress write erased, and leaves `expected_failures` where the next
+        // iteration's guard expects to find it.
+        if let Some(refusal) = &refused {
+            store
+                .scim_push_sync_state()
+                .record_failure(
+                    pass.connection_id,
+                    &format!("{subject_id} was refused and stepped over: {refusal}"),
+                    // NO PAUSE. The subject was stepped over, so the pass is making progress and
+                    // there is nothing to back off from; what this write is for is putting the
+                    // reason back where an operator reads it.
+                    None,
+                )
+                .await?;
+            // `record_failure` incremented the count, so the next checkpoint has to expect it.
+            expected_failures += 1;
+        } else {
+            expected_failures = 0;
+        }
     }
     debug_assert!(furthest.is_some(), "a non-empty page recorded no progress");
     Ok(progress)

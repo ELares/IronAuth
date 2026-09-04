@@ -910,10 +910,14 @@ async fn a_downstream_that_ignores_the_filter_cannot_make_the_client_address_a_s
         .converge("/Users", "u-1", &user("ada", "u-1"))
         .await
         .expect_err("a resource carrying somebody else's externalId is not this subject");
+    // CONFIGURATION, NOT PERMANENT, and the difference decides what the worker does with it.
+    // `Permanent` is the per-subject class and the passes STEP OVER one: a server that ignores
+    // the filter ignores it for everybody, so being stepped over per subject would walk the whole
+    // directory refusing each person in turn and then report a completed backfill.
     assert!(
-        matches!(outcome, PushError::Permanent(_)),
-        "a downstream that does not apply the filter cannot be trusted, so this is permanent: \
-         {outcome:?}"
+        matches!(outcome, PushError::Configuration(_)),
+        "a downstream that does not apply the filter refuses every subject, so this is about the \
+         connection rather than about one person: {outcome:?}"
     );
 
     // AND NO WRITE FOLLOWED. This is the assertion that matters: a verdict alone would still pass

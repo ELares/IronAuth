@@ -1136,3 +1136,229 @@ impl SubjectSource for RefusingDirectory<'_> {
         }
     }
 }
+
+#[tokio::test]
+async fn a_revoked_credential_stops_the_backfill_instead_of_walking_past_everybody() {
+    // WHY THIS EXISTS, and it is the worst thing the reviews found on this branch.
+    //
+    // The per-subject `Permanent` arm was added so a refusal about ONE person does not stall the
+    // page. But the SCIM client classified a 401 as `Permanent` too, and a revoked bearer token
+    // refuses every subject. So the backfill refused person one, stepped over them, advanced the
+    // enumeration, refused person two, stepped over them, and walked the entire directory --
+    // then hit the empty page, handed over to groups, walked those, and CALLED THE BACKFILL
+    // COMPLETE. `record_backfill_progress` clears the error columns on its way past, so the
+    // health surface read zero failures, and a backfill never comes back for a position it has
+    // passed. Nobody was provisioned and nothing said so.
+    //
+    // The credential is what the fixture rejects, because that is the ordinary way a working
+    // connection stops working: a token is rotated at the downstream and not here.
+    let org = Org::start().await;
+    org.member("ada@globex.example", None).await;
+    org.member("grace@globex.example", None).await;
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = PushDirectory::new(&store, &record).expect("the filters parse");
+    let downstream = Downstream::new(TOKEN);
+    // THE WRONG TOKEN, so every request is a 401 from the fixture.
+    let client = ScimPushClient::new(
+        FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        BASE,
+        "a-token-the-downstream-has-rotated-away",
+        WriteMode::Patch,
+    );
+
+    let outcome = run_backfill_pass(
+        &store,
+        Pass {
+            connection_id: &connection,
+            client: &client,
+            subjects: &directory,
+            deletion_policy: DeletionPolicy::Deactivate,
+            limit: 10,
+            scope: org.scope,
+            now_unix_micros: now_micros(&org.env),
+            organization_id: org.id.to_string(),
+        },
+    )
+    .await;
+
+    match outcome {
+        Err(WorkerError::Configuration(_)) => {}
+        other => panic!(
+            "a credential the downstream refuses is about the connection, not about the first \
+             person it happened to be used for: {other:?}"
+        ),
+    }
+    assert!(
+        downstream.users().is_empty(),
+        "somebody was provisioned with a credential the downstream refuses: {:?}",
+        downstream.users()
+    );
+    // AND NOTHING MOVED. This is the half that made the defect destructive rather than noisy.
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_after_id, None,
+        "the enumeration walked past people it never provisioned: {state:?}"
+    );
+    assert!(
+        !state.backfill_state.is_done(),
+        "the backfill reported itself complete having provisioned nobody: {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stepped_over_refusal_leaves_a_reason_on_the_connection() {
+    // WHY THIS EXISTS. `record_backfill_refusal` writes to the LINK row, and during a backfill a
+    // subject refused on its first attempt has no link -- that is what the backfill is for. The
+    // store call answers NotFound, the arm discards it, and the refusal exists only in the
+    // in-memory `Progress` that `run_due_connections` drops on the floor. Then the very next
+    // statement, `record_backfill_progress`, sets `consecutive_failures = 0` and NULLs the error,
+    // so a page of refusals wiped the health surface clean on its way past.
+    //
+    // The doc above the arm said "it is counted in `refused` either way, so the pass still
+    // reports it". Nothing read that count.
+    let org = Org::start().await;
+    let (_, membership) = org.member("ada@globex.example", None).await;
+    let group = org.group("engineering", "Engineering").await;
+    org.bind(&group, &membership).await;
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = RefusingDirectory {
+        inner: PushDirectory::new(&store, &record).expect("the filters parse"),
+    };
+    let downstream = Downstream::new(TOKEN);
+    let client = ScimPushClient::new(
+        FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        BASE,
+        TOKEN,
+        WriteMode::Patch,
+    );
+    let pass = || Pass {
+        connection_id: &connection,
+        client: &client,
+        subjects: &directory,
+        deletion_policy: DeletionPolicy::Deactivate,
+        limit: 10,
+        scope: org.scope,
+        now_unix_micros: now_micros(&org.env),
+        organization_id: org.id.to_string(),
+    };
+
+    for _ in 0..3 {
+        run_backfill_pass(&store, pass())
+            .await
+            .expect("a pass runs");
+        let state = store
+            .scim_push_sync_state()
+            .get(&connection)
+            .await
+            .expect("get")
+            .expect("state");
+        if state.backfill_after_id.as_deref() == Some(group.to_string().as_str()) {
+            break;
+        }
+    }
+
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_after_id.as_deref(),
+        Some(group.to_string().as_str()),
+        "the refused group was not stepped over: {state:?}"
+    );
+    // THE REASON SURVIVED THE PROGRESS WRITE, which is the whole point.
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|why| why.contains(group.to_string().as_str())),
+        "a stepped-over refusal left no reason an operator can read: {:?}",
+        state.last_error
+    );
+    assert!(
+        state.consecutive_failures > 0,
+        "the refusal was counted and then cleared by the progress write: {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_person_is_gone_to_the_cheap_fence_as_well_as_to_the_full_build() {
+    // WHY THIS EXISTS. Deleting a user writes the `users` tombstone and deliberately does NOT
+    // touch `org_memberships`, so a membership row outlives the person. The cheap no-filter fence
+    // answered from the membership alone, so it said "still in scope" for somebody `build_user`
+    // reports as gone -- two halves of one question giving different answers, and the half that
+    // decides departures giving the wrong one.
+    let org = Org::start().await;
+    let (ada, _) = org.member("ada@globex.example", None).await;
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = PushDirectory::new(&store, &record).expect("the filters parse");
+
+    assert!(
+        directory
+            .in_scope(Collection::User, &ada.to_string())
+            .await
+            .expect("in_scope answers"),
+        "a live member is not in scope, so the deletion below proves nothing"
+    );
+
+    org.db
+        .control_store()
+        .scoped(org.scope)
+        .acting(
+            org.db.test_actor(&org.env),
+            CorrelationId::generate(&org.env),
+        )
+        .users()
+        .delete(&org.env, &ada, false, None, None)
+        .await
+        .expect("soft delete the user");
+
+    assert!(
+        directory
+            .resource(Collection::User, &ada.to_string())
+            .await
+            .expect("resource answers")
+            .is_none(),
+        "a deleted person still has a body"
+    );
+    assert!(
+        !directory
+            .in_scope(Collection::User, &ada.to_string())
+            .await
+            .expect("in_scope answers"),
+        "the cheap fence still calls a deleted person a member, so the tail would never withdraw \
+         them from the downstream"
+    );
+}

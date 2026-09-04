@@ -49503,9 +49503,17 @@ impl OrgMembershipRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(&format!(
-            "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
-             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
-             AND user_id = $4 AND deleted_at IS NULL AND owner_kind = 'user'"
+            // THE USER'S OWN TOMBSTONE IS CHECKED TOO, and leaving it out made this disagree
+            // with every other read of the same person. Deleting a user writes the `users`
+            // tombstone and deliberately does NOT touch `org_memberships`, so a membership row
+            // outlives the person: a caller using this as a liveness fence would answer "still a
+            // member" for somebody every other read reports as gone.
+            "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships m \
+             WHERE m.tenant_id = $1 AND m.environment_id = $2 AND m.organization_id = $3 \
+             AND m.user_id = $4 AND m.deleted_at IS NULL AND m.owner_kind = 'user' \
+             AND EXISTS (SELECT 1 FROM users u \
+                         WHERE u.tenant_id = m.tenant_id AND u.environment_id = m.environment_id \
+                         AND u.id = m.user_id AND u.deleted_at IS NULL)"
         ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
