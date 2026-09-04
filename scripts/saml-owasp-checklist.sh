@@ -55,8 +55,8 @@ if not names:
 #
 # Both numbers live beside the thing they count, which is the weakest kind of bound. What they
 # buy is that a change has to be made deliberately, in two files, with the diff visible.
-BLOCKS = 18
-NAMES = 48
+BLOCKS = 20
+NAMES = 53
 blocks = re.findall(r"Coverage::Tests\(&\[(.*?)\]\)", source, re.S)
 if len(blocks) != BLOCKS:
     print(
@@ -76,8 +76,18 @@ print("\n".join(sorted(set(names))))
 PY
 )
 
-# The tests the compiler actually produced.
+# The tests the compiler actually produced. `--list` prints every test, INCLUDING ignored ones,
+# and subtracting the second listing below is what makes the two distinguishable: a name
+# that appears in both is a test the checklist counts and the harness skips.
 existing=$(cargo test -p ironauth-saml --features test-util -- --list 2>/dev/null \
+  | sed -n 's/^\(.*\): test$/\1/p' \
+  | sed 's/.*:://' \
+  | sort -u)
+
+# AND NONE OF THEM IS IGNORED. `--list` cannot tell a running test from a skipped one, so a
+# `#[ignore]` on a checklist-named test left this script printing "clean" while the row claimed
+# coverage that no longer executed. `--ignored --list` prints exactly the skipped ones.
+ignored=$(cargo test -p ironauth-saml --features test-util -- --ignored --list 2>/dev/null \
   | sed -n 's/^\(.*\): test$/\1/p' \
   | sed 's/.*:://' \
   | sort -u)
@@ -96,6 +106,20 @@ done <<< "$named"
 if [ -n "$missing" ]; then
   echo "saml-owasp-checklist: the checklist names tests that do not exist:" >&2
   for name in $missing; do echo "  $name" >&2; done
+  exit 1
+fi
+
+skipped=""
+if [ -n "$ignored" ]; then
+  while read -r name; do
+    [ -z "$name" ] && continue
+    printf '%s\n' "$ignored" | grep -qx "$name" && skipped="$skipped $name"
+  done <<< "$named"
+fi
+if [ -n "$skipped" ]; then
+  echo "saml-owasp-checklist: the checklist names tests that are #[ignore]d, so the rows claim" >&2
+  echo "coverage that does not execute:" >&2
+  for name in $skipped; do echo "  $name" >&2; done
   exit 1
 fi
 

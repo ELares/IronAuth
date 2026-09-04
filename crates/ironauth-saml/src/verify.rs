@@ -489,7 +489,7 @@ fn check_transforms(reference: &Scoped<'_>) -> Result<(), VerifyError> {
 /// Returns the declarations of the ANCESTORS, not of the target itself: the canonicalizer adds
 /// the element's own when it writes it. Walking rather than storing a parent pointer keeps the
 /// tree acyclic and costs one traversal per verification, which is two.
-fn scope_at(root: &RichElement, target: &RichElement) -> Vec<Binding> {
+pub(crate) fn scope_at(root: &RichElement, target: &RichElement) -> Vec<Binding> {
     let mut path = Vec::new();
     if !path_to(root, target, &mut path) {
         return Vec::new();
@@ -586,16 +586,16 @@ fn strip_enveloped_signature(element: &mut RichElement, index: usize) {
 /// So the level is no longer something a call site can get wrong: the only way to look inside
 /// an element is to ask the [`Scoped`] that FOUND it, and it computes the child scope itself.
 #[derive(Clone)]
-struct Scoped<'a> {
-    element: &'a RichElement,
+pub(crate) struct Scoped<'a> {
+    pub(crate) element: &'a RichElement,
     /// What the ancestors declared. NOT this element's own declarations: those belong to its
     /// children's scope, and to the resolution of its own name.
-    inherited: Vec<Binding>,
+    pub(crate) inherited: Vec<Binding>,
 }
 
 impl<'a> Scoped<'a> {
     /// The apex, with whatever its ancestors declared.
-    fn new(element: &'a RichElement, inherited: Vec<Binding>) -> Self {
+    pub(crate) fn new(element: &'a RichElement, inherited: Vec<Binding>) -> Self {
         Self { element, inherited }
     }
 
@@ -603,7 +603,7 @@ impl<'a> Scoped<'a> {
     ///
     /// This is also the scope its own NAME resolves against, because a signer that writes
     /// `xmlns:ds` on the `ds:Signature` element itself is the ordinary case, not an exotic one.
-    fn scope(&self) -> Vec<Binding> {
+    pub(crate) fn scope(&self) -> Vec<Binding> {
         scope_within(self.element, &self.inherited)
     }
 
@@ -612,7 +612,7 @@ impl<'a> Scoped<'a> {
     /// The local name alone is not an element's identity. An earlier version compared only
     /// that, so an application element called `Signature`, and an attacker's element in any
     /// namespace at all, both answered to the name.
-    fn is(&self, namespace: &str, local: &str) -> bool {
+    pub(crate) fn is(&self, namespace: &str, local: &str) -> bool {
         local_name(&self.element.name) == local
             && resolve(&self.element.name, &self.scope()).as_deref() == Some(namespace)
     }
@@ -624,7 +624,11 @@ impl<'a> Scoped<'a> {
     ///
     /// The index is what the enveloped-signature transform removes by, so it must be the index
     /// in `children`, not in the filtered result.
-    fn indexed_children(&self, namespace: &str, local: &str) -> Vec<(usize, Scoped<'a>)> {
+    pub(crate) fn indexed_children(
+        &self,
+        namespace: &str,
+        local: &str,
+    ) -> Vec<(usize, Scoped<'a>)> {
         let inherited = self.scope();
         self.element
             .children
@@ -641,7 +645,7 @@ impl<'a> Scoped<'a> {
     }
 
     /// Every DIRECT child that is `namespace`:`local`.
-    fn children(&self, namespace: &str, local: &str) -> Vec<Scoped<'a>> {
+    pub(crate) fn children(&self, namespace: &str, local: &str) -> Vec<Scoped<'a>> {
         self.indexed_children(namespace, local)
             .into_iter()
             .map(|(_, scoped)| scoped)
@@ -652,7 +656,7 @@ impl<'a> Scoped<'a> {
     ///
     /// Two is not one. A `Signature` with two `SignatureValue` children says two different
     /// things, and picking either is picking which half of a contradiction to believe.
-    fn child(&self, namespace: &str, local: &str) -> Option<Scoped<'a>> {
+    pub(crate) fn child(&self, namespace: &str, local: &str) -> Option<Scoped<'a>> {
         let mut found = self.children(namespace, local);
         match found.len() {
             1 => found.pop(),
@@ -661,12 +665,12 @@ impl<'a> Scoped<'a> {
     }
 
     /// An attribute of this element by qualified name.
-    fn attribute(&self, name: &str) -> Option<&'a str> {
+    pub(crate) fn attribute(&self, name: &str) -> Option<&'a str> {
         attribute(self.element, name)
     }
 
     /// All the text under this element, concatenated.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         text_content(self.element)
     }
 }
@@ -705,7 +709,7 @@ fn resolve(name: &str, scope: &[Binding]) -> Option<String> {
 }
 
 /// Every descendant (and the root itself) whose qualified name matches.
-fn collect<'a>(
+pub(crate) fn collect<'a>(
     root: &'a RichElement,
     inherited: &[Binding],
     namespace: &str,
@@ -799,7 +803,7 @@ fn local_name(name: &str) -> &str {
 }
 
 /// Decode standard base64, ignoring the whitespace XML puts inside a long value.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(text: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut accumulator = 0_u32;
     let mut bits = 0_u32;

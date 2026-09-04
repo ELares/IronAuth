@@ -165,6 +165,12 @@ mod verify;
 pub mod webauthn;
 pub mod webhooks;
 pub mod xmldsig;
+/// XML Encryption data decryption, for SAML encrypted assertions (issue #138, criterion 5).
+///
+/// Here rather than in `ironauth-saml` for the reason `jose-audit.sh` enforces: this crate is the
+/// ONE that may touch a `ring` primitive, so a second crate reaching for AES-GCM would be a
+/// second place the algorithm allowlist lives.
+pub mod xmlenc;
 
 pub mod seams;
 
