@@ -4917,6 +4917,20 @@ async fn a_read_only_credential_can_list_scim_push_connections_and_cannot_change
         "a read-granted key was refused the listing it holds: {body}"
     );
 
+    // AND THE PER-RESOURCE HEALTH LISTING, which is the other Read on this surface (issue #137
+    // criterion 2). Proven here rather than only classified: the classification table says what
+    // permission an operation SHOULD need, and only a credential meeting the surface says what it
+    // DOES need. The two disagree exactly when somebody writes the table from the handler they
+    // meant to write.
+    let (status, _, body) = h
+        .get_as(&format!("{base}/{seeded}/resources"), &secret)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the per-resource listing it holds: {body}"
+    );
+
     // CREATE is refused, and the refusal NAMES write_config rather than any other write.
     let (status, _, body) = h.post_as(&base, &secret, "sp-denied-create", &seed).await;
     assert_eq!(

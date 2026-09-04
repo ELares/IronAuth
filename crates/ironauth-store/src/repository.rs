@@ -75158,6 +75158,49 @@ impl ScimPushConnectionRepo<'_> {
         scim_push_connection_from_row(&row, &self.scope)
     }
 
+    /// One connection, resolved THROUGH the organization that owns it.
+    ///
+    /// # Why this exists beside `get`
+    ///
+    /// `get` scopes by tenant and environment only. Two organizations in one environment are
+    /// therefore both reachable from it, so a handler that took a connection id out of the
+    /// request path and called `get` would let a credential for organization A read organization
+    /// B's connection by naming B's id. The id is unguessable, but unguessable is not an
+    /// authorization check.
+    ///
+    /// The organization goes in the WHERE PREDICATE rather than being compared afterwards, which
+    /// is the shape #1111's review settled on for `set_active` and `delete`: a comparison the
+    /// caller performs is a comparison the caller can forget, and there is no version of this
+    /// query that returns the wrong row and relies on the caller to notice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn find_in_org(
+        &self,
+        organization_id: &OrganizationId,
+        id: &ScimPushConnectionId,
+    ) -> Result<Option<ScimPushConnection>, StoreError> {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_SELECT_COLUMNS} FROM scim_push_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND organization_id = $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| scim_push_connection_from_row(&row, &self.scope))
+            .transpose()
+    }
+
     /// Every connection pushing one organization's directory, oldest first.
     ///
     /// # Errors

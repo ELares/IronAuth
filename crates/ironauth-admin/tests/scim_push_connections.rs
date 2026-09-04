@@ -18,7 +18,19 @@ mod common;
 
 use axum::http::StatusCode;
 use common::Harness;
+use ironauth_env::Env;
+use ironauth_store::{
+    EnvironmentId, NewScimPushLink, ScimPushConnectionId, ScimPushLinkId, ScimPushResourceType,
+    Scope, TenantId,
+};
 use serde_json::Value;
+
+fn scope_of(tenant: &str, environment: &str) -> Scope {
+    Scope::new(
+        TenantId::parse(tenant).expect("tenant id"),
+        EnvironmentId::parse(environment).expect("environment id"),
+    )
+}
 
 /// Create an organization through the management API and return its id.
 async fn create_org(h: &Harness, tenant: &str, environment: &str, key: &str) -> String {
@@ -496,6 +508,137 @@ async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
         listed["feed_head_sequence"].is_i64(),
         "the listing did not report the feed head, so lag cannot be computed: {listed}"
     );
+}
+
+#[tokio::test]
+async fn the_per_resource_listing_reports_which_subjects_are_failing_and_why() {
+    // CRITERION 2's other half. The connection-level health answers "is this downstream
+    // reachable"; this answers "which PEOPLE are failing, and with what". They are different
+    // questions with different audiences: the first tells an operator whether to page somebody,
+    // the second tells them whose access is wrong.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k1").await;
+    let base = push_path(&tenant, &environment, &org);
+    let (status, _, created) = h.post(&base, "k-res", &create_body()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let connection_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // The links are written by the WORKER on the data plane, so they are seeded through the
+    // store rather than through a route: no management surface creates one, and inventing a
+    // route to make this test easier would ship a capability nobody asked for.
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let connection = ScimPushConnectionId::parse_in_scope(&connection_id, &scope).expect("id");
+    for (subject, downstream, error) in [
+        ("usr_ada", "dsid-1", None),
+        (
+            "usr_grace",
+            "dsid-2",
+            Some("the downstream refused: mailbox already claimed"),
+        ),
+    ] {
+        let id = ScimPushLinkId::generate(&env, &scope);
+        h.store()
+            .scoped(scope)
+            .scim_push_links()
+            .upsert(NewScimPushLink {
+                id: &id,
+                connection_id: &connection,
+                resource_type: ScimPushResourceType::User,
+                subject_id: subject,
+                downstream_id: downstream,
+                external_id: subject,
+            })
+            .await
+            .expect("seed the link");
+        if let Some(error) = error {
+            h.store()
+                .scoped(scope)
+                .scim_push_links()
+                .record_failure(&connection, ScimPushResourceType::User, subject, error)
+                .await
+                .expect("record the failure");
+        }
+    }
+
+    let (status, _, listed) = h.get(&format!("{base}/{connection_id}/resources")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed: Value = serde_json::from_str(&listed).expect("json");
+    let items = listed["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "{listed}");
+
+    let failing = items
+        .iter()
+        .find(|item| item["subject_id"] == serde_json::json!("usr_grace"))
+        .expect("the failing subject is listed");
+    assert_eq!(
+        failing["last_error"],
+        serde_json::json!("the downstream refused: mailbox already claimed"),
+        "the per-resource error is not reported: {failing}"
+    );
+    assert!(failing["last_error_at_unix_ms"].is_i64(), "{failing}");
+    // THE DOWNSTREAM ID IS STILL THERE. A failed push does not mean the resource is gone, and
+    // clearing it would make the next run create a duplicate; the surface has to show that the
+    // mapping survived, or an operator reading this cannot tell a failing push from a lost one.
+    assert_eq!(
+        failing["downstream_id"],
+        serde_json::json!("dsid-2"),
+        "{failing}"
+    );
+
+    // THE HEALTHY ONE REPORTS NO ERROR, which is what makes the assertion above about that
+    // subject rather than about the shape of the response.
+    let healthy = items
+        .iter()
+        .find(|item| item["subject_id"] == serde_json::json!("usr_ada"))
+        .expect("the healthy subject is listed");
+    assert!(
+        healthy.get("last_error").is_none(),
+        "a subject with no failure reported one: {healthy}"
+    );
+    assert!(healthy["last_synced_at_unix_ms"].is_i64(), "{healthy}");
+}
+
+#[tokio::test]
+async fn the_per_resource_listing_cannot_be_reached_through_another_organizations_path() {
+    // THE CONFINEMENT THIS ROUTE NEEDED A NEW STORE METHOD FOR. `ScimPushConnectionRepo::get`
+    // scopes by tenant and environment only, so both organizations in one environment are
+    // reachable from it. A handler that parsed the id out of the path and called `get` would let
+    // a credential for organization A read organization B's provisioning state by naming B's
+    // connection id in A's path.
+    //
+    // The id is unguessable, and that is not an authorization check: an id leaks through a log,
+    // a support ticket, or a previous role. The organization goes in the WHERE predicate instead.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org_a = create_org(&h, &tenant, &environment, "k-a").await;
+    let org_b = create_org(&h, &tenant, &environment, "k-b").await;
+
+    let base_b = push_path(&tenant, &environment, &org_b);
+    let (status, _, created) = h.post(&base_b, "k-b-conn", &create_body()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let b_connection = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // B's connection id, A's path.
+    let base_a = push_path(&tenant, &environment, &org_a);
+    let (status, _, body) = h.get(&format!("{base_a}/{b_connection}/resources")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one organization read another's provisioning state: {body}"
+    );
+
+    // CONTROL: the same id under its OWN organization answers, so the refusal is the confinement
+    // and not the route being broken.
+    let (status, _, body) = h.get(&format!("{base_b}/{b_connection}/resources")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

@@ -205,6 +205,65 @@ fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionVi
     }
 }
 
+/// What a connection calls one subject downstream, and how that subject's last push went.
+///
+/// Criterion 2's "per-resource errors". The connection-level health next door answers "is this
+/// downstream reachable"; this answers "which PEOPLE are failing, and with what", which is a
+/// different question and the one an operator asks second.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ScimPushResourceView {
+    /// IronAuth's own id for the subject.
+    pub subject_id: String,
+    /// `user` or `group`.
+    pub resource_type: String,
+    /// What the downstream calls it. Server-issued there, opaque here.
+    pub downstream_id: String,
+    /// The `externalId` this connection sent for the subject.
+    ///
+    /// Recorded rather than recomputed: a connection's attribute mapping can change what is
+    /// sent, and an operator asking "what did we tell them this person was called" wants what
+    /// WAS sent, not what would be sent now.
+    pub external_id: String,
+    /// When this subject was last pushed successfully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced_at_unix_ms: Option<i64>,
+    /// When this subject last failed to push.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at_unix_ms: Option<i64>,
+    /// What that failure said, truncated to the column's bound.
+    ///
+    /// Cleared on the next success, because recording a success and clearing the failure are the
+    /// same event: a stale error here would make this surface answer a question about the past.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// A page of one connection's per-resource state.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ScimPushResourceListView {
+    /// The subjects this connection has provisioned, oldest first.
+    pub items: Vec<ScimPushResourceView>,
+    /// The cursor for the next page, absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn resource_view(link: &ironauth_store::ScimPushLink) -> ScimPushResourceView {
+    ScimPushResourceView {
+        subject_id: link.subject_id.clone(),
+        resource_type: link.resource_type.as_str().to_owned(),
+        downstream_id: link.downstream_id.clone(),
+        external_id: link.external_id.clone(),
+        last_synced_at_unix_ms: link
+            .last_synced_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        last_error_at_unix_ms: link
+            .last_error_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        last_error: link.last_error.clone(),
+    }
+}
+
 /// Refuse a base URL the push worker could never use.
 ///
 /// # Checked here rather than at push time
@@ -527,6 +586,88 @@ pub async fn list_scim_push_connections(
             .newest_sequence()
             .await
             .map_err(|_| ApiError::Internal)?,
+    })
+    .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources`
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources",
+    operation_id = "listScimPushResources",
+    tag = "scim",
+    params(
+        ("tenant_id" = String, Path, description = "Tenant identifier"),
+        ("environment_id" = String, Path, description = "Environment identifier"),
+        ("organization_id" = String, Path, description = "Organization identifier"),
+        ("connection_id" = String, Path, description = "Outbound SCIM connection identifier"),
+        ListQuery
+    ),
+    responses(
+        (status = 200, description = "The subjects this connection has provisioned, with per-resource error state", body = ScimPushResourceListView),
+        (status = 400, description = "A malformed cursor or limit", body = crate::error::ErrorBody),
+        (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorBody),
+        (status = 403, description = "The credential may not read this organization", body = crate::error::ErrorBody),
+        (status = 404, description = "No such live organization or connection", body = crate::error::ErrorBody),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_scim_push_resources(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, connection_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<ListQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102). READ, like the connection listing beside it: this
+    // carries no credential and changes nothing, so it is a strictly smaller capability than
+    // pointing a connection somewhere.
+    principal.require_permission(ManagementPermission::Read)?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
+    let id = ScimPushConnectionId::parse_in_scope(&connection_id, &scope)
+        .map_err(|_| ApiError::NotFound)?;
+
+    // THE CONNECTION IS RESOLVED THROUGH THE ORGANIZATION, not merely parsed. A caller holding a
+    // credential for organization A must not read organization B's provisioning state by naming
+    // B's connection id in A's path: the id is unguessable, but "unguessable" is not an
+    // authorization check, and the whole point of the org confinement surface is that the
+    // organization comes from the credential rather than the request.
+    let connection = state
+        .store()
+        .scoped(scope)
+        .scim_push_connections()
+        .find_in_org(&org_id, &id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
+    let links = state
+        .store()
+        .scoped(scope)
+        .scim_push_links()
+        .list_for_connection(&connection.id, page.fetch_limit(), page.after())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let (links, next_cursor) = page.finish(links, |link| {
+        (link.created_at_unix_micros, link.id.to_string())
+    });
+    let body = serde_json::to_string(&ScimPushResourceListView {
+        items: links.iter().map(resource_view).collect(),
+        next_cursor,
     })
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

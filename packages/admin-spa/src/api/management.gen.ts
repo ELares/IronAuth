@@ -2489,6 +2489,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources` */
+        get: operations["listScimPushResources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
         parameters: {
             query?: never;
@@ -7854,6 +7871,53 @@ export interface components {
             user_scope_filter?: string | null;
             /** @description `patch` or `put`. */
             write_mode: string;
+        };
+        /** @description A page of one connection's per-resource state. */
+        ScimPushResourceListView: {
+            /** @description The subjects this connection has provisioned, oldest first. */
+            items: components["schemas"]["ScimPushResourceView"][];
+            /** @description The cursor for the next page, absent on the last one. */
+            next_cursor?: string | null;
+        };
+        /**
+         * @description What a connection calls one subject downstream, and how that subject's last push went.
+         *
+         *     Criterion 2's "per-resource errors". The connection-level health next door answers "is this
+         *     downstream reachable"; this answers "which PEOPLE are failing, and with what", which is a
+         *     different question and the one an operator asks second.
+         */
+        ScimPushResourceView: {
+            /** @description What the downstream calls it. Server-issued there, opaque here. */
+            downstream_id: string;
+            /**
+             * @description The `externalId` this connection sent for the subject.
+             *
+             *     Recorded rather than recomputed: a connection's attribute mapping can change what is
+             *     sent, and an operator asking "what did we tell them this person was called" wants what
+             *     WAS sent, not what would be sent now.
+             */
+            external_id: string;
+            /**
+             * @description What that failure said, truncated to the column's bound.
+             *
+             *     Cleared on the next success, because recording a success and clearing the failure are the
+             *     same event: a stale error here would make this surface answer a question about the past.
+             */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description When this subject last failed to push.
+             */
+            last_error_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description When this subject was last pushed successfully.
+             */
+            last_synced_at_unix_ms?: number | null;
+            /** @description `user` or `group`. */
+            resource_type: string;
+            /** @description IronAuth's own id for the subject. */
+            subject_id: string;
         };
         /** @description One page of environment secret metadata. */
         SecretList: {
@@ -21812,6 +21876,82 @@ export interface operations {
                 };
             };
             /** @description No such organization or connection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listScimPushResources: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Outbound SCIM connection identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The subjects this connection has provisioned, with per-resource error state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScimPushResourceListView"];
+                };
+            };
+            /** @description A malformed cursor or limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not read this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization or connection */
             404: {
                 headers: {
                     [name: string]: unknown;

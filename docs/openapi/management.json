@@ -18374,6 +18374,130 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources": {
+      "get": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources`",
+        "operationId": "listScimPushResources",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "path",
+            "description": "Outbound SCIM connection identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The subjects this connection has provisioned, with per-resource error state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimPushResourceListView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor or limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not read this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization or connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
       "post": {
         "tags": [
@@ -34777,6 +34901,80 @@
           "write_mode": {
             "type": "string",
             "description": "`patch` or `put`."
+          }
+        }
+      },
+      "ScimPushResourceListView": {
+        "type": "object",
+        "description": "A page of one connection's per-resource state.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScimPushResourceView"
+            },
+            "description": "The subjects this connection has provisioned, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, absent on the last one."
+          }
+        }
+      },
+      "ScimPushResourceView": {
+        "type": "object",
+        "description": "What a connection calls one subject downstream, and how that subject's last push went.\n\nCriterion 2's \"per-resource errors\". The connection-level health next door answers \"is this\ndownstream reachable\"; this answers \"which PEOPLE are failing, and with what\", which is a\ndifferent question and the one an operator asks second.",
+        "required": [
+          "subject_id",
+          "resource_type",
+          "downstream_id",
+          "external_id"
+        ],
+        "properties": {
+          "downstream_id": {
+            "type": "string",
+            "description": "What the downstream calls it. Server-issued there, opaque here."
+          },
+          "external_id": {
+            "type": "string",
+            "description": "The `externalId` this connection sent for the subject.\n\nRecorded rather than recomputed: a connection's attribute mapping can change what is\nsent, and an operator asking \"what did we tell them this person was called\" wants what\nWAS sent, not what would be sent now."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What that failure said, truncated to the column's bound.\n\nCleared on the next success, because recording a success and clearing the failure are the\nsame event: a stale error here would make this surface answer a question about the past."
+          },
+          "last_error_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this subject last failed to push."
+          },
+          "last_synced_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this subject was last pushed successfully."
+          },
+          "resource_type": {
+            "type": "string",
+            "description": "`user` or `group`."
+          },
+          "subject_id": {
+            "type": "string",
+            "description": "IronAuth's own id for the subject."
           }
         }
       },
