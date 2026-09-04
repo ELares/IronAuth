@@ -984,6 +984,19 @@ name = "scim_connections"
 path = "tests/scim_connections.rs"
 required-features = ["testing"]
 
+# THE OUTBOUND IDENTITY MAP (issue #137). Criterion 3's no-duplicates claim rests on this table
+# rather than on the client, so it is measured here.
+[[test]]
+name = "scim_push_links"
+path = "tests/scim_push_links.rs"
+required-features = ["testing"]
+
+# THE WORKER'S CHECKPOINT AND THE HEALTH SURFACE'S SOURCE (issue #137, criterion 2).
+[[test]]
+name = "scim_push_sync_state"
+path = "tests/scim_push_sync_state.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "scim_push_connections"
 path = "tests/scim_push_connections.rs"

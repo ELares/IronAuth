@@ -98,10 +98,10 @@ use crate::id::{
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
     RiskSignalId, RoutingRuleId, ScimConnectionId, ScimEnterpriseId, ScimExternalIdId,
-    ScimPushConnectionId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId,
-    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId,
-    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
-    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    ScimPushConnectionId, ScimPushLinkId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
+    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
+    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
+    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
     WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
@@ -218,6 +218,24 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_push_connections(&self) -> ScimPushConnectionRepo<'a> {
         ScimPushConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// What each downstream calls the subjects this scope pushes (issue #137).
+    #[must_use]
+    pub fn scim_push_links(&self) -> ScimPushLinkRepo<'a> {
+        ScimPushLinkRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Where each outbound connection has read to, and how it is doing (issue #137).
+    #[must_use]
+    pub fn scim_push_sync_state(&self) -> ScimPushSyncStateRepo<'a> {
+        ScimPushSyncStateRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -75360,6 +75378,771 @@ impl ActingScimPushConnectionRepo<'_> {
         )
         .await
     }
+}
+
+/// Which collection an outbound push link names.
+///
+/// A closed vocabulary rather than a string, and `ALL` exists so a test can drive every variant
+/// through the real column against its CHECK: a variant the constraint would reject cannot be
+/// added without a red test, so the Rust spelling and the SQL spelling cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimPushResourceType {
+    /// A user resource (`/Users` downstream).
+    User,
+    /// A group resource (`/Groups` downstream).
+    Group,
+}
+
+impl ScimPushResourceType {
+    /// Every variant, so a test can drive the whole vocabulary against the column.
+    pub const ALL: &'static [Self] = &[Self::User, Self::Group];
+
+    /// The stored spelling, which is also the CHECK constraint's.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Group => "group",
+        }
+    }
+
+    /// Parse a stored spelling.
+    fn from_str(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "user" => Ok(Self::User),
+            "group" => Ok(Self::Group),
+            _ => Err(StoreError::NotFound),
+        }
+    }
+}
+
+/// What a downstream calls one subject an outbound connection pushes (issue #137).
+#[derive(Debug, Clone)]
+pub struct ScimPushLink {
+    /// The link's own handle.
+    pub id: ScimPushLinkId,
+    /// The connection whose namespace this link lives in.
+    pub connection_id: ScimPushConnectionId,
+    /// Which collection the subject belongs to.
+    pub resource_type: ScimPushResourceType,
+    /// IronAuth's own id for the subject.
+    pub subject_id: String,
+    /// The id the DOWNSTREAM issued. Opaque here.
+    pub downstream_id: String,
+    /// The `externalId` this connection sent for the subject.
+    pub external_id: String,
+    /// When the last successful push for this subject completed.
+    pub last_synced_at_unix_micros: Option<i64>,
+    /// When the last failure for this subject was recorded.
+    pub last_error_at_unix_micros: Option<i64>,
+    /// What that failure said.
+    pub last_error: Option<String>,
+    /// When the link was first written.
+    ///
+    /// Present because `list_for_connection` pages on `(created_at, id)` and a caller cannot
+    /// build the [`CursorPosition`] for page two without it. Omitting it made the pagination
+    /// unreachable: the parameter existed, the index carried the sort columns, and no caller
+    /// could ever supply anything but `None`.
+    pub created_at_unix_micros: i64,
+}
+
+const SCIM_PUSH_LINK_SELECT_COLUMNS: &str = "id, connection_id, resource_type, subject_id, \
+     downstream_id, external_id, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros, \
+     (EXTRACT(EPOCH FROM last_synced_at) * 1000000)::bigint AS last_synced_at_micros, \
+     (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_at_micros, last_error";
+
+/// Build a [`ScimPushLink`] from a row selected with [`SCIM_PUSH_LINK_SELECT_COLUMNS`].
+fn scim_push_link_from_row(row: &PgRow, scope: &Scope) -> Result<ScimPushLink, StoreError> {
+    Ok(ScimPushLink {
+        id: ScimPushLinkId::parse_in_scope(row.try_get("id")?, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        connection_id: ScimPushConnectionId::parse_in_scope(row.try_get("connection_id")?, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        resource_type: ScimPushResourceType::from_str(row.try_get("resource_type")?)?,
+        subject_id: row.try_get("subject_id")?,
+        downstream_id: row.try_get("downstream_id")?,
+        external_id: row.try_get("external_id")?,
+        last_synced_at_unix_micros: row.try_get("last_synced_at_micros")?,
+        last_error_at_unix_micros: row.try_get("last_error_at_micros")?,
+        last_error: row.try_get("last_error")?,
+        created_at_unix_micros: row.try_get("created_at_micros")?,
+    })
+}
+
+/// The outbound push links for one scope (issue #137).
+///
+/// # This is not the idempotency mechanism, and must never become it
+///
+/// What makes a push idempotent is the `externalId` LOOKUP the client issues before every write,
+/// which converges after a lost response because it asks the downstream what is actually there.
+/// A local map cannot do that: it records what this deployment last saw, and a downstream that
+/// was rebuilt, restored from a backup, or edited by hand disagrees with it silently.
+///
+/// What the map is for is the two things the lookup cannot answer: per-resource error state,
+/// which issue #137 asks for by name, and what a subject was called after the downstream has
+/// forgotten it.
+///
+/// # Why the writes here are not audited
+///
+/// A link is written by the push WORKER on the data plane, once per resource per convergence.
+/// The inbound mirror `ScimExternalIdRepo` reads and writes from one type for the same reason
+/// this does: an audit row records an OPERATOR ACTION, and a sync writing a hundred thousand of
+/// them would bury the rows an operator actually reads. What IS audited is the connection
+/// lifecycle, on the control plane, where a person is the actor.
+pub struct ScimPushLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimPushLinkRepo<'_> {
+    /// The link for one subject under one connection, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn find(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        resource_type: ScimPushResourceType,
+        subject_id: &str,
+    ) -> Result<Option<ScimPushLink>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_LINK_SELECT_COLUMNS} FROM scim_push_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND resource_type = $4 AND subject_id = $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| scim_push_link_from_row(&row, &self.scope))
+            .transpose()
+    }
+
+    /// Every link one connection holds, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_connection(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ScimPushLink>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_LINK_SELECT_COLUMNS} FROM scim_push_links \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| scim_push_link_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// The longest error `record_failure` stores, mirroring 0190's `octet_length` bound.
+///
+/// A message longer than the column takes is a 23514 the caller cannot act on, so the value is
+/// truncated here rather than refused. It is a CHARACTER-boundary truncation: slicing bytes would
+/// panic on a multi-byte message, and a downstream's error text is not guaranteed to be ASCII.
+const MAX_ERROR_BYTES: usize = 2048;
+
+/// What a caller supplies to record a successful push.
+pub struct NewScimPushLink<'a> {
+    /// The link's handle, minted by the caller.
+    pub id: &'a ScimPushLinkId,
+    /// The connection whose namespace it lives in.
+    pub connection_id: &'a ScimPushConnectionId,
+    /// Which collection the subject belongs to.
+    pub resource_type: ScimPushResourceType,
+    /// IronAuth's own id for the subject.
+    pub subject_id: &'a str,
+    /// The id the downstream issued.
+    pub downstream_id: &'a str,
+    /// The `externalId` that was sent.
+    pub external_id: &'a str,
+}
+
+impl ScimPushLinkRepo<'_> {
+    /// Record that a subject is provisioned downstream under `downstream_id`.
+    ///
+    /// UPSERT ON THE SUBJECT, because a re-push of a subject already linked is the normal case
+    /// rather than an error: the client looks up before every write, so it reaches here again on
+    /// every convergence. What changes on a re-push is the downstream id (if the resource was
+    /// recreated), the external id (if the mapping changed what is sent) and the sync time.
+    ///
+    /// IT ALSO CLEARS THE ERROR COLUMNS. A subject that has just been pushed successfully is not
+    /// failing, and leaving a stale error would make the per-resource health answer a question
+    /// about the past. Recording a success and clearing the failure are the same event, so they
+    /// are the same statement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id belongs to another scope, [`StoreError::Conflict`]
+    /// if the downstream id is already linked to a DIFFERENT subject under this connection,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn upsert(&self, spec: NewScimPushLink<'_>) -> Result<(), StoreError> {
+        let NewScimPushLink {
+            id,
+            connection_id,
+            resource_type,
+            subject_id,
+            downstream_id,
+            external_id,
+        } = spec;
+        if id.scope() != self.scope || connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_push_links \
+             (id, tenant_id, environment_id, connection_id, resource_type, subject_id, \
+              downstream_id, external_id, last_synced_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) \
+             ON CONFLICT (tenant_id, environment_id, connection_id, resource_type, subject_id) \
+             DO UPDATE SET downstream_id = EXCLUDED.downstream_id, \
+                           external_id = EXCLUDED.external_id, \
+                           last_synced_at = now(), \
+                           last_error_at = NULL, \
+                           last_error = NULL, \
+                           updated_at = now()",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .bind(downstream_id)
+        .bind(external_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            // THE OTHER unique index: one downstream id names one subject. A conflict here is
+            // NOT the upsert's own key, which the ON CONFLICT clause absorbs; it means two
+            // subjects were about to claim one downstream record, which is a bug worth
+            // surfacing rather than a race worth absorbing.
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record that a push for one subject failed, without disturbing its downstream id.
+    ///
+    /// THE LINK MUST ALREADY EXIST. A failure before a subject was ever provisioned has no
+    /// downstream id to attach to, and inventing a row with an empty one would make the
+    /// `downstream_id <> ''` CHECK the thing a caller meets. The worker records those against
+    /// the CONNECTION's health on 0189 instead, which is where a failure with no resource
+    /// belongs.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or no link exists,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn record_failure(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        resource_type: ScimPushResourceType,
+        subject_id: &str,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // BOUNDED HERE, so the column's CHECK is never what a caller meets. A downstream error
+        // body is not this deployment's to bound at the source, and a CHECK violation is
+        // SQLSTATE 23514, which falls through to an opaque failure rather than saying what was
+        // wrong. Truncation on a CHARACTER boundary, because slicing bytes would panic on a
+        // multi-byte error message.
+        let mut bounded = error;
+        if bounded.len() > MAX_ERROR_BYTES {
+            let mut end = MAX_ERROR_BYTES;
+            while end > 0 && !bounded.is_char_boundary(end) {
+                end -= 1;
+            }
+            bounded = &bounded[..end];
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = sqlx::query(
+            "UPDATE scim_push_links \
+             SET last_error_at = now(), last_error = $6, updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND resource_type = $4 AND subject_id = $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .bind(bounded)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// The inbound SCIM connections for one scope, read only (issue #135).
+/// How far a connection has got through its initial enumeration (issue #137).
+///
+/// #137 requires the backfill to be RESUMABLE, which is why this is a state and not a boolean:
+/// a worker killed halfway is in `Running` with a `backfill_after` to continue from, and that is
+/// a different situation from one that has never started and one that has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimPushBackfillState {
+    /// Enabled, nothing enumerated yet.
+    Pending,
+    /// Enumerating. `backfill_after` says where to resume.
+    Running,
+    /// Everything in scope is provisioned, so the connection may tail the feed.
+    Complete,
+}
+
+impl ScimPushBackfillState {
+    /// Every state, for a test that wants to prove the Rust vocabulary and the column's CHECK
+    /// still agree.
+    pub const ALL: &'static [Self] = &[Self::Pending, Self::Running, Self::Complete];
+
+    /// The stored spelling, which is also the column's CHECK vocabulary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Complete => "complete",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "complete" => Ok(Self::Complete),
+            // A value outside the vocabulary means the column's CHECK and this enum have
+            // drifted. NotFound rather than a decode error, matching the house choice for a
+            // stored value that no longer parses.
+            _ => Err(StoreError::NotFound),
+        }
+    }
+}
+
+/// One outbound connection's position in the feed and its health (issue #137).
+#[derive(Debug, Clone)]
+pub struct ScimPushSyncState {
+    /// The connection this position belongs to.
+    pub connection_id: ScimPushConnectionId,
+    /// The feed's OPAQUE wire cursor, stored verbatim. `None` means the connection has not
+    /// started tailing, which the column's CHECK ties to an incomplete backfill.
+    pub cursor: Option<String>,
+    /// How far the initial enumeration has got.
+    pub backfill_state: ScimPushBackfillState,
+    /// The subject the backfill reached, so a restart resumes rather than starts over.
+    pub backfill_after: Option<String>,
+    /// When the last event this connection PROCESSED was created, which is the half of "lag"
+    /// that belongs to the connection. The other half is the newest event in the feed, which a
+    /// caller reads separately because it is shared across every connection in the scope.
+    pub last_event_at_unix_micros: Option<i64>,
+    /// When the worker last LOOKED, including the polls that found nothing. Distinct from
+    /// `last_event_at` so an idle feed is distinguishable from a wedged worker.
+    pub last_polled_at_unix_micros: Option<i64>,
+    /// When the worker last wrote something downstream for this connection.
+    pub last_synced_at_unix_micros: Option<i64>,
+    /// Failures since the last success. What a backoff is computed from, and what criterion 2
+    /// calls "error counts".
+    pub consecutive_failures: i32,
+    /// When the most recent failure happened.
+    pub last_error_at_unix_micros: Option<i64>,
+    /// What the most recent failure said, truncated on a character boundary to the column bound.
+    pub last_error: Option<String>,
+    /// While this is in the future the worker skips the connection and leaves the cursor where
+    /// it is: an outage pauses the feed rather than dropping events.
+    pub paused_until_unix_micros: Option<i64>,
+}
+
+const SCIM_PUSH_SYNC_STATE_SELECT_COLUMNS: &str = "connection_id, cursor, backfill_state, \
+     backfill_after, \
+     (EXTRACT(EPOCH FROM last_event_at) * 1000000)::bigint AS last_event_at_micros, \
+     (EXTRACT(EPOCH FROM last_polled_at) * 1000000)::bigint AS last_polled_at_micros, \
+     (EXTRACT(EPOCH FROM last_synced_at) * 1000000)::bigint AS last_synced_at_micros, \
+     consecutive_failures, \
+     (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_at_micros, \
+     last_error, \
+     (EXTRACT(EPOCH FROM paused_until) * 1000000)::bigint AS paused_until_micros";
+
+fn scim_push_sync_state_from_row(
+    row: &PgRow,
+    scope: &Scope,
+) -> Result<ScimPushSyncState, StoreError> {
+    let backfill_state: String = row.try_get("backfill_state")?;
+    Ok(ScimPushSyncState {
+        connection_id: ScimPushConnectionId::parse_in_scope(row.try_get("connection_id")?, scope)
+            .map_err(|_| StoreError::NotFound)?,
+        cursor: row.try_get("cursor")?,
+        backfill_state: ScimPushBackfillState::from_str(&backfill_state)?,
+        backfill_after: row.try_get("backfill_after")?,
+        last_event_at_unix_micros: row.try_get("last_event_at_micros")?,
+        last_polled_at_unix_micros: row.try_get("last_polled_at_micros")?,
+        last_synced_at_unix_micros: row.try_get("last_synced_at_micros")?,
+        consecutive_failures: row.try_get("consecutive_failures")?,
+        last_error_at_unix_micros: row.try_get("last_error_at_micros")?,
+        last_error: row.try_get("last_error")?,
+        paused_until_unix_micros: row.try_get("paused_until_micros")?,
+    })
+}
+
+/// Where each outbound connection has read to, and how it is doing (issue #137).
+///
+/// The DATA plane owns this: every method here is something the sync worker does on a poll. The
+/// management health surface reads the same rows through the control pool's SELECT grant.
+pub struct ScimPushSyncStateRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimPushSyncStateRepo<'_> {
+    /// This connection's state, or `None` if it has never been enabled.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(
+        &self,
+        connection_id: &ScimPushConnectionId,
+    ) -> Result<Option<ScimPushSyncState>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_SYNC_STATE_SELECT_COLUMNS} FROM scim_push_sync_state \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(|row| scim_push_sync_state_from_row(&row, &self.scope))
+            .transpose()
+    }
+
+    /// Begin, or resume, this connection's backfill.
+    ///
+    /// IDEMPOTENT ON PURPOSE. A worker that restarts calls this again, and the second call must
+    /// not rewind a backfill that is already part way through: the INSERT is a no-op when a row
+    /// exists, so `backfill_after` survives. That is what makes the backfill resumable rather
+    /// than merely restartable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope, [`StoreError::Database`]
+    /// otherwise.
+    pub async fn begin_backfill(
+        &self,
+        connection_id: &ScimPushConnectionId,
+    ) -> Result<(), StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO scim_push_sync_state \
+             (connection_id, tenant_id, environment_id, backfill_state) \
+             VALUES ($1, $2, $3, 'running') \
+             ON CONFLICT (connection_id) DO NOTHING",
+        )
+        .bind(connection_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Send a completed connection back to enumerating, and stop it tailing while it does.
+    ///
+    /// # Why a completed backfill is not the end of the state machine
+    ///
+    /// The first version had no way back: `begin_backfill` is `ON CONFLICT DO NOTHING`, so once a
+    /// row reached `complete` nothing could return it to `running`. That is wrong for the case
+    /// this whole feature exists to survive. A downstream that is rebuilt comes back EMPTY, and
+    /// tailing the feed from a stored cursor will never re-create the resources that predate it:
+    /// the connection would sit healthy, cursor advancing, and provision nothing for the people
+    /// who were already there.
+    ///
+    /// Clearing the cursor is what makes it safe rather than merely possible. A connection that
+    /// went back to enumerating must not also be tailing, which is the invariant the column CHECK
+    /// states, so this sets `cursor = NULL` in the same statement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn restart_backfill(
+        &self,
+        connection_id: &ScimPushConnectionId,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET backfill_state = 'running', backfill_after = NULL, cursor = NULL, \
+                 updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+            |query| query,
+        )
+        .await
+    }
+
+    /// Record how far the backfill has enumerated, so a restart resumes from here.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn record_backfill_progress(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        after: &str,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET backfill_after = $4, last_synced_at = now(), consecutive_failures = 0, \
+                 last_error_at = NULL, last_error = NULL, paused_until = NULL, updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND backfill_state = 'running'",
+            |query| query.bind(after.to_owned()),
+        )
+        .await
+    }
+
+    /// The backfill is done: everything in scope is provisioned, so tailing may start HERE.
+    ///
+    /// The cursor is taken at the same moment for a reason. A connection that finished its
+    /// backfill and then read the feed from the beginning would re-apply every event that
+    /// predates the backfill; one that started from the feed's head would lose every event that
+    /// happened DURING it. The caller reads the feed's position BEFORE enumerating and passes it
+    /// here, so the tail resumes from a point the backfill has already covered and the overlap
+    /// is re-applied idempotently rather than lost.
+    ///
+    /// # Only from a RUNNING backfill
+    ///
+    /// The predicate is not decoration. Without it this statement writes `cursor` on any row it
+    /// can see, so a worker that restarted, read the feed head and re-enumerated would overwrite
+    /// a cursor that was already tailing: every event between the old position and the new head
+    /// is then behind the checkpoint and nothing re-reads it. That is silent event loss, and it
+    /// is the exact inverse of the "pause rather than drop" property this table exists for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope, has no state row, or is not
+    /// in the running state; [`StoreError::Database`] otherwise.
+    pub async fn complete_backfill(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        cursor: &str,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET backfill_state = 'complete', backfill_after = NULL, cursor = $4, \
+                 last_synced_at = now(), updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND backfill_state = 'running'",
+            |query| query.bind(cursor.to_owned()),
+        )
+        .await
+    }
+
+    /// Checkpoint after a page of events has been applied.
+    ///
+    /// # Why the caller must say where it thinks the cursor is
+    ///
+    /// This is a COMPARE-AND-SET, and without one a checkpoint is not safe against a second
+    /// writer. Nothing in this crate elects a single worker per connection: two processes, or one
+    /// process restarted before its predecessor noticed, both read a page and both checkpoint. A
+    /// bare `SET cursor = $n` lets the slower one land last and move the cursor BACKWARDS, and
+    /// the events between the two positions are then re-read, or, in the mirror case where the
+    /// slower writer is ahead, never read at all.
+    ///
+    /// `expected_cursor` is what the caller read before it did the work. If the stored value has
+    /// moved since, this touches no rows and answers [`StoreError::NotFound`], which the caller
+    /// must treat as "somebody else owns this connection right now" rather than as an error to
+    /// retry into. `None` means the caller believes the connection has not tailed yet, and
+    /// `IS NOT DISTINCT FROM` is what makes that comparison work against a NULL.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope, has no state row, has not
+    /// finished its backfill, or the stored cursor is not `expected_cursor`;
+    /// [`StoreError::Database`] otherwise.
+    pub async fn advance(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        expected_cursor: Option<&str>,
+        cursor: &str,
+        last_event_at_unix_micros: Option<i64>,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET cursor = $5, \
+                 last_event_at = COALESCE( \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                     last_event_at), \
+                 last_polled_at = now(), last_synced_at = now(), \
+                 consecutive_failures = 0, last_error_at = NULL, last_error = NULL, \
+                 paused_until = NULL, updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND backfill_state = 'complete' \
+               AND cursor IS NOT DISTINCT FROM $4::text",
+            |query| {
+                query
+                    .bind(expected_cursor.map(str::to_owned))
+                    .bind(cursor.to_owned())
+                    .bind(last_event_at_unix_micros.map(|micros| micros.to_string()))
+            },
+        )
+        .await
+    }
+
+    /// A poll that found nothing. Moves `last_polled_at` and NOTHING else.
+    ///
+    /// Separating this from [`Self::advance`] is what lets a health surface tell a connection
+    /// that is idle because the feed is quiet from one that is idle because the worker is
+    /// wedged. A single timestamp conflates them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn record_poll(
+        &self,
+        connection_id: &ScimPushConnectionId,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET last_polled_at = now(), updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+            |query| query,
+        )
+        .await
+    }
+
+    /// Record a connection-level failure and pause the cursor until `paused_until`.
+    ///
+    /// THE CURSOR DOES NOT MOVE. #137 says an outage "pauses the cursor rather than dropping
+    /// events", so this writes health columns only: the events the worker could not deliver are
+    /// still ahead of the stored position and are re-read when the pause expires.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn record_failure(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        error: &str,
+        paused_until_unix_micros: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let bounded = truncate_on_char_boundary(error, MAX_ERROR_BYTES);
+        self.update_one(
+            connection_id,
+            "SET consecutive_failures = consecutive_failures + 1, \
+                 last_error_at = now(), last_error = $4, \
+                 paused_until = COALESCE( \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     paused_until), \
+                 last_polled_at = now(), updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+            |query| {
+                query
+                    .bind(bounded.to_owned())
+                    .bind(paused_until_unix_micros.map(|micros| micros.to_string()))
+            },
+        )
+        .await
+    }
+
+    /// The shared shape of every write above: one scoped UPDATE that must touch exactly one row.
+    ///
+    /// The rows-affected check is the whole point. Without it a connection out of scope, or one
+    /// whose backfill has not finished, silently succeeds and the caller believes a checkpoint
+    /// landed that did not.
+    async fn update_one<F>(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        set_and_where: &str,
+        bind: F,
+    ) -> Result<(), StoreError>
+    where
+        F: for<'q> FnOnce(
+            sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+        ) -> sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+    {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let statement = format!("UPDATE scim_push_sync_state {set_and_where}");
+        let query = sqlx::query(&statement)
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(connection_id.to_string());
+        let result = bind(query).execute(&mut *tx).await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Truncates `value` to at most `max_bytes`, on a CHARACTER boundary.
+///
+/// Slicing bytes would panic on a multi-byte message, and a downstream's error text is not
+/// guaranteed to be ASCII.
+fn truncate_on_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// The inbound SCIM connections for one scope, read only (issue #135).

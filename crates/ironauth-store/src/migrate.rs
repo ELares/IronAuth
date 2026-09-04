@@ -1530,6 +1530,28 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0189_scim_push_connections.sql"),
         },
+        Migration {
+            version: 190,
+            name: "scim_push_links",
+            // EXPAND: one NEW table and nothing else. An old binary does not know it exists, so
+            // it never reads it and never writes it, and nothing is removed or moved.
+            //
+            // The table takes a FOREIGN KEY on `scim_push_connections` with ON DELETE CASCADE,
+            // which touches a table 0189 already shipped. That is still expand-only: a cascade
+            // adds a rule about rows this migration's own table holds, and an old binary that
+            // deletes a connection sees the same delete succeed because there are no links for
+            // it to cascade to until something writes one.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0190_scim_push_links.sql"),
+        },
+        Migration {
+            version: 191,
+            name: "scim_push_sync_state",
+            // EXPAND: one NEW table, and the same cascade argument 0190 records. An old binary
+            // does not know it exists, so a rollback leaves it inert and nothing it reads moves.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0191_scim_push_sync_state.sql"),
+        },
     ]
 }
 
