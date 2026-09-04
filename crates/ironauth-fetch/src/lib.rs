@@ -234,6 +234,22 @@ pub enum FetchPurpose {
     /// SSRF-hardened path: a token URL that resolves to an internal or loopback address
     /// is refused exactly like any other blocked destination.
     FederationToken,
+    /// Pushing one organization's users and groups into a downstream SCIM server (issue #137).
+    ///
+    /// Its OWN purpose rather than borrowing [`FetchPurpose::WebhookDelivery`], for the reason
+    /// every other split on this enum has. Two things differ, and both are things an operator
+    /// reads separately.
+    ///
+    /// WHO CHOSE THE URL. A webhook target is set by a tenant to receive notifications it may
+    /// drop; an outbound SCIM base URL is set by an operator and is where that organization's
+    /// DIRECTORY goes. A rate limit or failure budget that is unremarkable for a dropped
+    /// notification is a directory that has silently stopped converging.
+    ///
+    /// WHAT THE PAYLOAD IS. A webhook carries an event; this carries user and group records.
+    /// Collapsing them into one metric series would hide exactly the question an operator asks
+    /// after a downstream outage: which of my provisioning targets stopped accepting writes,
+    /// and for how long.
+    ScimPush,
 }
 
 impl FetchPurpose {
@@ -241,6 +257,7 @@ impl FetchPurpose {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            FetchPurpose::ScimPush => "scim_push",
             FetchPurpose::JwksUri => "jwks_uri",
             FetchPurpose::ClaimsEnrichment => "claims_enrichment",
             FetchPurpose::SectorIdentifier => "sector_identifier",
