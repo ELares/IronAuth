@@ -838,6 +838,13 @@ required-features = ["testing"]
 # THE PRODUCTION TRANSPORT (issue #137). Separate from the client suite because it constructs the
 # real hardened fetcher: what it measures is every decision made BEFORE a socket is opened, which
 # is where this seam's own behaviour lives.
+# THE EVENT TRANSLATION (issue #137). No database and no downstream: what it measures is that
+# every catalogued subject event has a DECIDED meaning, using the catalog as the denominator.
+[[test]]
+name = "scim_push_events"
+path = "tests/scim_push_events.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "scim_push_transport"
 path = "tests/scim_push_transport.rs"
