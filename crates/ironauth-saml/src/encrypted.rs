@@ -92,8 +92,18 @@ pub enum KeyTransportAlg {
 /// this crate spends the most effort making impossible to distinguish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OaepParameters {
-    /// The OAEP hash. SHA-1 when the document names none, which the specification makes the
-    /// default and which is what `#rsa-oaep-mgf1p` fixes it to.
+    /// The OAEP hash. SHA-1 when the document names none, which is the specification's default.
+    ///
+    /// NOT FIXED BY `#rsa-oaep-mgf1p`, and an earlier version of this very sentence said it was.
+    /// XML Encryption 1.0 section 5.4.2 fixes only the mask generation function under that URI
+    /// and leaves the digest an explicit parameter, so `#rsa-oaep-mgf1p` with a SHA-256
+    /// `DigestMethod` is conforming and this crate accepts it.
+    ///
+    /// AN IMPLEMENTOR WHO BELIEVES THE OLD SENTENCE hard-codes SHA-1 whenever the algorithm is
+    /// `RsaOaepMgf1Sha1` and unwraps under the wrong hash for every such document -- failing
+    /// indistinguishably from a wrong key, which is the exact outcome these parameters exist to
+    /// prevent. This is the only rustdoc a seam implementor sees for this field, so the
+    /// correction lives here and not only beside the code.
     pub digest: OaepDigest,
     /// The mask generation function. MGF1-SHA1 when the document names none.
     pub mgf: OaepMgf,
@@ -104,7 +114,7 @@ pub struct OaepParameters {
 /// An OAEP hash this crate will name to a seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OaepDigest {
-    /// SHA-1, the specification's default and the one `#rsa-oaep-mgf1p` fixes.
+    /// SHA-1, the specification's default when a document names no digest.
     Sha1,
     /// SHA-256.
     Sha256,
@@ -275,6 +285,20 @@ pub fn decrypt_and_verify(
     // hundreds of elements or nested hundreds deep arrives inside a document trivially within
     // every structural bound. `max_elements` and `max_depth` are the bounds an attacker steps
     // around by encrypting, which is why they are applied again here.
+    // THE PLAINTEXT MUST BE AN ASSERTION, NOT MERELY CONTAIN ONE.
+    //
+    // `verify` searches by DESCENDANT, so a ciphertext decrypting to a whole `samlp:Response`
+    // wrapping an assertion was accepted and returned the assertion inside it. The SAML schema
+    // makes an `EncryptedAssertion`'s plaintext an `Assertion`, and OpenSAML refuses anything
+    // else; accepting a wrapper is an accept-more divergence of exactly the kind `check_type`
+    // refuses `#Content` to avoid. Without this, that refusal rests on a containment nothing
+    // checks.
+    let decrypted = crate::tree::build(&plaintext, limits)
+        .map_err(|error| DecryptError::Unverified(VerifyError::Malformed(error)))?;
+    if !crate::verify::Scoped::new(&decrypted, Vec::new()).is(crate::ASSERTION_NS, "Assertion") {
+        return Err(DecryptError::Shape);
+    }
+
     verify(
         &plaintext,
         limits,
@@ -489,7 +513,19 @@ fn oaep_parameters(
         {
             "http://www.w3.org/2000/09/xmldsig#sha1" => OaepDigest::Sha1,
             "http://www.w3.org/2001/04/xmlenc#sha256" => OaepDigest::Sha256,
-            "http://www.w3.org/2001/04/xmldsig-more#sha384" => OaepDigest::Sha384,
+            // BOTH SHA-384 URIs, and the reason is that this is a different context from a
+            // signature's `DigestMethod`. XML Encryption 1.1 section 5.8.3 assigns
+            // `xmlenc#sha384` for use "within RSA-OAEP encryption as a hash function", and the
+            // three entries around this one are all XML Encryption identifiers. RFC 4051 2.1.3
+            // assigns `xmldsig-more#sha384` for the XMLDSIG registry, and implementations emit
+            // it here too because that is where SHA-384 lives for signatures.
+            //
+            // Accepting only the XMLDSIG one refused the identifier the encryption specification
+            // actually assigns. `verify.rs` refuses `xmlenc#sha384` for a SIGNATURE reference on
+            // RFC 4051's authority, and that remains right: same spelling, different registry,
+            // different question.
+            "http://www.w3.org/2001/04/xmldsig-more#sha384"
+            | "http://www.w3.org/2001/04/xmlenc#sha384" => OaepDigest::Sha384,
             "http://www.w3.org/2001/04/xmlenc#sha512" => OaepDigest::Sha512,
             _ => return Err(DecryptError::AlgorithmRefused),
         },

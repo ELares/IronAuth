@@ -31,8 +31,11 @@
 //! careful about error messages, because the oracle is in what the XML parser does with the
 //! decrypted bytes.
 //!
-//! RSA-1.5 KEY TRANSPORT IS REFUSED by the same reasoning one layer up (Bleichenbacher; Keycloak
-//! shipped CVE-2026-2092 for it). The refusal is enforced where the algorithm URI is read, so a
+//! RSA-1.5 KEY TRANSPORT IS REFUSED by the same reasoning one layer up: Bleichenbacher (1998),
+//! which needs no CVE. An earlier version of this note cited Keycloak CVE-2026-2092, which is a
+//! DIFFERENT vulnerability -- encrypted-assertion injection when the enclosing Response is
+//! unsigned, the class the decrypt-then-revalidate ordering closes. A reader checking whether
+//! the RSA-1.5 refusal is justified followed the only citation offered and found something else. The refusal is enforced where the algorithm URI is read, so a
 //! caller's unwrapper is never asked to perform it.
 //!
 //! # The order is decrypt, then RE-VALIDATE
@@ -202,5 +205,128 @@ pub mod test_util {
         out.extend_from_slice(iv);
         out.append(&mut in_out);
         out
+    }
+}
+
+// BEHIND THE FEATURE AS WELL AS `test`, because the encryptor these tests need is. The gate runs
+// `cargo test -p ironauth-jose --lib` with NO features, and a test module that reaches for
+// `test_util` there does not compile -- which is a broken build for every consumer running the
+// plain command, not merely a skipped test.
+#[cfg(all(test, feature = "test-util"))]
+mod tests {
+    use super::test_util::encrypt;
+    use super::{IV_BYTES, XmlEncAlg, XmlEncError, decrypt};
+
+    /// A fixed IV, so a failure is the same failure twice.
+    const IV: [u8; IV_BYTES] = [7; IV_BYTES];
+
+    /// Every algorithm round-trips, including the EMPTY plaintext.
+    ///
+    /// # The boundary this module argues for and nothing measured
+    ///
+    /// `decrypt` requires at least `IV_BYTES + tag_len` and the comment beside it records that an
+    /// earlier draft required one byte MORE, which would have refused a conforming empty
+    /// plaintext. Nothing exercised that: this module had no test at all, and was reached only
+    /// through a second crate's SAML corpus, which never sends an empty assertion.
+    #[test]
+    fn every_algorithm_round_trips_including_the_empty_plaintext() {
+        for (algorithm, key) in [
+            (XmlEncAlg::Aes128Gcm, vec![0x2a; 16]),
+            (XmlEncAlg::Aes256Gcm, vec![0x2a; 32]),
+        ] {
+            for plaintext in [&b""[..], &b"a"[..], &b"the assertion"[..]] {
+                let sealed = encrypt(algorithm, &key, &IV, plaintext);
+                assert_eq!(
+                    decrypt(algorithm, &key, &sealed).as_deref(),
+                    Ok(plaintext),
+                    "{algorithm:?} must round-trip {} bytes",
+                    plaintext.len()
+                );
+            }
+        }
+    }
+
+    /// The length bound is exact at BOTH edges.
+    ///
+    /// # Why one arm is not enough
+    ///
+    /// A mutation sweep showed the bound survives being loosened to `<=` (which refuses the
+    /// conforming empty plaintext) AND being tightened by dropping the tag length (which lets a
+    /// value shorter than a tag reach the AEAD). The one input that separates all three is the
+    /// empty plaintext's sealed form -- exactly `IV_BYTES + tag_len` bytes -- so both edges are
+    /// pinned here.
+    #[test]
+    fn the_length_bound_is_exact_at_both_edges() {
+        for algorithm in [XmlEncAlg::Aes128Gcm, XmlEncAlg::Aes256Gcm] {
+            let key = vec![0x2a; algorithm.key_bytes()];
+            let sealed = encrypt(algorithm, &key, &IV, b"");
+            let smallest = sealed.len();
+            assert_eq!(smallest, IV_BYTES + 16, "an empty plaintext is IV plus tag");
+
+            // EXACTLY the bound: accepted, and it really decrypts.
+            assert_eq!(decrypt(algorithm, &key, &sealed), Ok(Vec::new()));
+            // ONE SHORT: malformed, not a decrypt failure. The distinction matters because a
+            // length is not a secret and a tag mismatch is.
+            assert_eq!(
+                decrypt(algorithm, &key, &sealed[..smallest - 1]),
+                Err(XmlEncError::Malformed)
+            );
+            // AT THE BOUND BUT NOT AUTHENTIC: the length check must not be doing the
+            // authentication's job. Zeroes are the right length and the wrong bytes.
+            assert_eq!(
+                decrypt(algorithm, &key, &vec![0_u8; smallest]),
+                Err(XmlEncError::Decrypt)
+            );
+        }
+    }
+
+    /// A wrong key, a tampered ciphertext and a tampered tag are one answer.
+    #[test]
+    fn a_wrong_key_and_a_tampered_ciphertext_are_indistinguishable() {
+        let algorithm = XmlEncAlg::Aes256Gcm;
+        let key = vec![0x2a; 32];
+        let sealed = encrypt(algorithm, &key, &IV, b"the assertion");
+
+        let mut flipped_body = sealed.clone();
+        flipped_body[IV_BYTES] ^= 0x01;
+        let mut flipped_tag = sealed.clone();
+        let last = flipped_tag.len() - 1;
+        flipped_tag[last] ^= 0x01;
+
+        for (what, key, value) in [
+            ("a wrong key", vec![0x99; 32], sealed.clone()),
+            ("a flipped ciphertext byte", key.clone(), flipped_body),
+            ("a flipped tag byte", key.clone(), flipped_tag),
+        ] {
+            assert_eq!(
+                decrypt(algorithm, &key, &value),
+                Err(XmlEncError::Decrypt),
+                "{what}"
+            );
+        }
+        // CONTROL: the untouched value still opens, so the sameness above is not "everything
+        // fails".
+        assert_eq!(
+            decrypt(algorithm, &key, &sealed).as_deref(),
+            Ok(&b"the assertion"[..])
+        );
+    }
+
+    /// A key of the wrong length is refused before any ciphertext is touched.
+    #[test]
+    fn a_key_of_the_wrong_length_is_refused() {
+        let sealed = encrypt(XmlEncAlg::Aes256Gcm, &[0x2a; 32], &IV, b"x");
+        for length in [0_usize, 15, 16, 31, 33, 64] {
+            assert_eq!(
+                decrypt(XmlEncAlg::Aes256Gcm, &vec![0x2a; length], &sealed),
+                Err(XmlEncError::KeyLength),
+                "{length} bytes is not an AES-256 key"
+            );
+        }
+        // AND THE 128 VARIANT TAKES 16, not 32: the length is per algorithm, not a constant.
+        assert_eq!(
+            decrypt(XmlEncAlg::Aes128Gcm, &[0x2a; 32], &sealed),
+            Err(XmlEncError::KeyLength)
+        );
     }
 }

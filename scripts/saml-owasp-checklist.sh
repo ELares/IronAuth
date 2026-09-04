@@ -77,8 +77,8 @@ PY
 )
 
 # The tests the compiler actually produced. `--list` prints every test, INCLUDING ignored ones,
-# and `--include-ignored` is what makes the two distinguishable: a name that appears only when
-# ignored tests are included is a test that does not run.
+# and subtracting the second listing below is what makes the two distinguishable: a name
+# that appears in both is a test the checklist counts and the harness skips.
 existing=$(cargo test -p ironauth-saml --features test-util -- --list 2>/dev/null \
   | sed -n 's/^\(.*\): test$/\1/p' \
   | sed 's/.*:://' \

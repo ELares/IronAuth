@@ -310,7 +310,10 @@ fn decryption_is_not_verification() {
 /// an implementation cannot defend itself by being careful with error messages. The follow-up
 /// work broke the backwards-compatibility defences too.
 ///
-/// RSA-1.5 key transport is Bleichenbacher, and Keycloak shipped CVE-2026-2092 for it.
+/// RSA-1.5 key transport is Bleichenbacher (1998), which needs no CVE. NOT CVE-2026-2092: this
+/// file cites that one correctly twice above, for a DIFFERENT vulnerability -- encrypted-assertion
+/// injection under an unsigned Response -- and using one identifier for two things 300 lines
+/// apart is how a reader checking a refusal finds the wrong justification.
 ///
 /// THE REFUSAL COMES BEFORE THE SEAM, which the assertion on `seen` is what pins: a caller's
 /// unwrapper must never be asked to perform RSA-1.5, or the unwrapper becomes the oracle no
@@ -1320,4 +1323,234 @@ fn one_key_in_each_placement_is_two_keys() {
         "one key in each placement is two keys"
     );
     assert!(unwrapper.seen.borrow().is_empty());
+}
+
+/// EVERY OAEP digest and mask-generation URI on the allowlist reaches the seam as itself.
+///
+/// # A table, because one named parameter tested one arm
+///
+/// `the_oaep_parameters_reach_the_seam` drives SHA-256 and MGF1-SHA256, so it killed those two
+/// arms and no others: the SHA-1, SHA-384 and SHA-512 digests and the MGF1-SHA384/512 arms could
+/// each be deleted with the suite green. The SHA-384 row matters most, because the crate has
+/// already been wrong about which registry owns that URI once -- `verify.rs` records a research
+/// pass producing `xmlenc#sha384` for a signature digest where RFC 4051 says `xmldsig-more`, and
+/// XML Encryption 1.1 section 5.8.3 assigns the OTHER one for OAEP. Both are accepted here and
+/// both are driven.
+#[test]
+fn every_oaep_parameter_uri_reaches_the_seam_as_itself() {
+    let fixture = Fixture::new();
+    let drive = |children: &str| {
+        let document = fixture.document().replacen(
+            r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/>"#,
+            &format!(
+                concat!(
+                    r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep">"#,
+                    "{}</xenc:EncryptionMethod>"
+                ),
+                children
+            ),
+            1,
+        );
+        let unwrapper = fixture.unwrapper();
+        let outcome = fixture.decrypt(&document, &unwrapper);
+        let seen = unwrapper.seen.borrow().clone();
+        (outcome.is_ok(), seen)
+    };
+
+    for (uri, expected) in [
+        ("http://www.w3.org/2000/09/xmldsig#sha1", OaepDigest::Sha1),
+        (
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            OaepDigest::Sha256,
+        ),
+        // RFC 4051 2.1.3, the XMLDSIG registry.
+        (
+            "http://www.w3.org/2001/04/xmldsig-more#sha384",
+            OaepDigest::Sha384,
+        ),
+        // XML Encryption 1.1 5.8.3, which is the one that specification assigns for OAEP.
+        (
+            "http://www.w3.org/2001/04/xmlenc#sha384",
+            OaepDigest::Sha384,
+        ),
+        (
+            "http://www.w3.org/2001/04/xmlenc#sha512",
+            OaepDigest::Sha512,
+        ),
+    ] {
+        let (ok, seen) = drive(&format!(r#"<ds:DigestMethod Algorithm="{uri}"/>"#));
+        assert!(ok, "{uri} must be accepted");
+        let [(_, parameters)] = seen.as_slice() else {
+            panic!("{uri}: the seam must be asked exactly once");
+        };
+        assert_eq!(parameters.digest, expected, "{uri}");
+    }
+
+    for (uri, expected) in [
+        (
+            "http://www.w3.org/2009/xmlenc11#mgf1sha1",
+            OaepMgf::Mgf1Sha1,
+        ),
+        (
+            "http://www.w3.org/2009/xmlenc11#mgf1sha256",
+            OaepMgf::Mgf1Sha256,
+        ),
+        (
+            "http://www.w3.org/2009/xmlenc11#mgf1sha384",
+            OaepMgf::Mgf1Sha384,
+        ),
+        (
+            "http://www.w3.org/2009/xmlenc11#mgf1sha512",
+            OaepMgf::Mgf1Sha512,
+        ),
+    ] {
+        let (ok, seen) = drive(&format!(
+            concat!(
+                r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" "#,
+                r#"Algorithm="{}"/>"#
+            ),
+            uri
+        ));
+        assert!(ok, "{uri} must be accepted");
+        let [(_, parameters)] = seen.as_slice() else {
+            panic!("{uri}: the seam must be asked exactly once");
+        };
+        assert_eq!(parameters.mgf, expected, "{uri}");
+    }
+
+    // AND ANYTHING ELSE IS REFUSED, so the rows above are not passing because everything is.
+    for children in [
+        r#"<ds:DigestMethod Algorithm="urn:evil"/>"#,
+        r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#ripemd160"/>"#,
+        concat!(
+            r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" "#,
+            r#"Algorithm="urn:evil"/>"#
+        ),
+    ] {
+        let (ok, seen) = drive(children);
+        assert!(!ok, "{children} must be refused");
+        assert!(
+            seen.is_empty(),
+            "{children}: refused before the seam is asked"
+        );
+    }
+}
+
+/// A `RetrievalMethod` URI must be a FRAGMENT, not merely match the key's `Id`.
+///
+/// # The `Id` is attacker-chosen, so matching it proves nothing on its own
+///
+/// The round-2 fix added an `Id`-equality check, and it killed every arm of the test written for
+/// the `#` rule: each of them fed an absolute URI beside a key whose `Id` did not match, so the
+/// equality refused them and the `#` guard was never the thing under test. Replacing the `#`
+/// requirement with `strip_prefix('#').unwrap_or(uri)` left the whole suite green.
+///
+/// The document that separates them pairs an absolute URI with a key whose `Id` IS that string --
+/// which the crate never validates as an `NCName`, so nothing else stops it. Under the mutation it
+/// decrypts.
+#[test]
+fn a_retrieval_method_uri_must_be_a_fragment() {
+    let fixture = Fixture::new();
+    let document = fixture.document();
+    let start = document
+        .find("<xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey");
+    let end = document
+        .find("</xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey")
+        + "</xenc:EncryptedKey>".len();
+
+    let build = |id: &str, uri: &str| {
+        let key = document[start..end].replacen(
+            "<xenc:EncryptedKey>",
+            &format!(
+                concat!(
+                    r#"<xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" "#,
+                    "Id=\"{}\">"
+                ),
+                id
+            ),
+            1,
+        );
+        [&document[..start], &document[end..]]
+            .concat()
+            .replacen(
+                "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"></ds:KeyInfo>",
+                &format!(
+                    concat!(
+                        r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                        "<ds:RetrievalMethod URI=\"{}\"/></ds:KeyInfo>"
+                    ),
+                    uri
+                ),
+                1,
+            )
+            .replacen(
+                "</xenc:EncryptedData>",
+                &format!("</xenc:EncryptedData>{key}"),
+                1,
+            )
+    };
+
+    // CONTROL: a fragment naming the key works.
+    assert!(
+        fixture
+            .decrypt(&build("_ek", "#_ek"), &fixture.unwrapper())
+            .is_ok()
+    );
+
+    for (what, id, uri) in [
+        (
+            "an absolute URI that MATCHES the key's Id",
+            "http://attacker.test/key",
+            "http://attacker.test/key",
+        ),
+        ("a bare relative reference that matches", "_ek", "_ek"),
+    ] {
+        let unwrapper = fixture.unwrapper();
+        assert_eq!(
+            fixture.decrypt(&build(id, uri), &unwrapper),
+            Err(DecryptError::Shape),
+            "{what}"
+        );
+        assert!(unwrapper.seen.borrow().is_empty(), "{what}");
+    }
+}
+
+/// The decrypted plaintext must BE an assertion, not merely contain one.
+///
+/// # What the `#Content` refusal rested on
+///
+/// `verify` searches by descendant, so a ciphertext decrypting to a whole `samlp:Response`
+/// wrapping an assertion was accepted and the assertion inside it returned. The SAML schema makes
+/// an `EncryptedAssertion`'s plaintext an `Assertion` and `OpenSAML` refuses anything else, so this
+/// was an accept-more divergence -- and it undercut `check_type`'s own argument, which refuses
+/// `#Content` on the ground that a fragment must not be read as a document while accepting a
+/// document that was not the element it claimed.
+#[test]
+fn the_plaintext_must_be_an_assertion_rather_than_wrap_one() {
+    let fixture = Fixture::new();
+    let wrapped = format!(
+        concat!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+            r#"ID="_inner">{}</samlp:Response>"#
+        ),
+        fixture.assertion
+    );
+    let document = fixture.wrap(
+        &wrapped,
+        "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+        "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+    );
+    assert_eq!(
+        fixture.decrypt(&document, &fixture.unwrapper()),
+        Err(DecryptError::Shape),
+        "a plaintext that WRAPS an assertion is not an assertion"
+    );
+    // CONTROL: the same assertion, unwrapped, still works.
+    assert!(
+        fixture
+            .decrypt(&fixture.document(), &fixture.unwrapper())
+            .is_ok()
+    );
 }
