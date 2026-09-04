@@ -21,8 +21,8 @@
 
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_saml::{
-    DecryptError, KeyTransport, KeyTransportAlg, Limits, TrustAnchor, VerifyError,
-    decrypt_and_verify,
+    DecryptError, KeyTransport, KeyTransportAlg, Limits, OaepDigest, OaepMgf, OaepParameters,
+    TrustAnchor, VerifyError, decrypt_and_verify,
 };
 
 /// A key-transport seam that just hands back the key it was given.
@@ -36,13 +36,19 @@ use ironauth_saml::{
 /// would be testing RSA-OAEP.
 struct Unwrapper {
     key: Vec<u8>,
-    /// What the seam was ASKED for, so a test can assert the allowlist reached it correctly.
-    seen: std::cell::RefCell<Vec<KeyTransportAlg>>,
+    /// What the seam was ASKED for, so a test can assert the allowlist reached it correctly and
+    /// that the OAEP parameters the document named actually arrived.
+    seen: std::cell::RefCell<Vec<(KeyTransportAlg, OaepParameters)>>,
 }
 
 impl KeyTransport for Unwrapper {
-    fn unwrap_key(&self, algorithm: KeyTransportAlg, _wrapped: &[u8]) -> Option<Vec<u8>> {
-        self.seen.borrow_mut().push(algorithm);
+    fn unwrap_key(
+        &self,
+        algorithm: KeyTransportAlg,
+        parameters: &OaepParameters,
+        _wrapped: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.seen.borrow_mut().push((algorithm, parameters.clone()));
         Some(self.key.clone())
     }
 }
@@ -51,7 +57,12 @@ impl KeyTransport for Unwrapper {
 struct Refuses;
 
 impl KeyTransport for Refuses {
-    fn unwrap_key(&self, _algorithm: KeyTransportAlg, _wrapped: &[u8]) -> Option<Vec<u8>> {
+    fn unwrap_key(
+        &self,
+        _algorithm: KeyTransportAlg,
+        _parameters: &OaepParameters,
+        _wrapped: &[u8],
+    ) -> Option<Vec<u8>> {
         None
     }
 }
@@ -108,8 +119,21 @@ impl Fixture {
     /// one: a builder that hard-coded them would need a hand-edited string per case, and a
     /// hand-edited string is where a test stops differing in exactly one dimension.
     fn wrap(&self, plaintext: &str, data_alg: &str, key_alg: &str) -> String {
+        self.wrap_with(plaintext, data_alg, key_alg, 32)
+    }
+
+    /// The same, with the data-encryption key length chosen explicitly.
+    ///
+    /// AES-128-GCM takes a 16 byte key, and the whole 128 path was reachable and unexercised
+    /// until a reviewer pointed out that `wrap` hard-coded the 256 variant: the allowlist arm,
+    /// the enum variant and its key length were all killed by no test.
+    fn wrap_with(&self, plaintext: &str, data_alg: &str, key_alg: &str, bits: usize) -> String {
         let cipher = ironauth_jose::xmlenc::test_util::encrypt(
-            ironauth_jose::xmlenc::XmlEncAlg::Aes256Gcm,
+            if bits == 16 {
+                ironauth_jose::xmlenc::XmlEncAlg::Aes128Gcm
+            } else {
+                ironauth_jose::xmlenc::XmlEncAlg::Aes256Gcm
+            },
             &self.key,
             &IV,
             plaintext.as_bytes(),
@@ -185,8 +209,13 @@ fn an_encrypted_assertion_decrypts_and_verifies() {
     // wrong algorithm to a caller's unwrapper and nothing would notice, because this seam ignores
     // the argument.
     assert_eq!(
-        unwrapper.seen.borrow().as_slice(),
-        &[KeyTransportAlg::RsaOaep]
+        unwrapper
+            .seen
+            .borrow()
+            .iter()
+            .map(|(algorithm, _)| *algorithm)
+            .collect::<Vec<_>>(),
+        vec![KeyTransportAlg::RsaOaep]
     );
 }
 
@@ -217,7 +246,17 @@ fn decryption_is_not_verification() {
     for (what, plaintext) in [
         (
             "signed by a key nobody pinned",
-            stranger_document[start..end].to_owned(),
+            // WITH THE DECLARATION, and this arm is why the fixture's comment about it matters.
+            // Lifted without it, the `saml:` prefix is unbound, `verify` finds ZERO candidates,
+            // and the document is refused as `ReferenceRefused` for having no assertion at all --
+            // the stranger's key is never reached. A reviewer showed that pinning the stranger
+            // did not change the outcome, so the arm demonstrated nothing about trust anchors,
+            // while the checklist row rested its whole rationale on it.
+            stranger_document[start..end].replacen(
+                "<saml:Assertion ",
+                r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" "#,
+                1,
+            ),
         ),
         (
             "not signed at all",
@@ -236,15 +275,29 @@ fn decryption_is_not_verification() {
             "http://www.w3.org/2009/xmlenc11#rsa-oaep",
         );
         let unwrapper = fixture.unwrapper();
+        // THE SPECIFIC REFUSAL, not `Unverified(_)`. The wildcard accepted a refusal for the
+        // wrong reason, which is how the first arm passed while proving nothing: a document
+        // refused for having no readable assertion looks the same through it as one refused for
+        // being signed by a stranger.
         let outcome = fixture.decrypt(&document, &unwrapper);
-        assert!(
-            matches!(outcome, Err(DecryptError::Unverified(_))),
-            "{what} must be refused by the verifier, got {outcome:?}"
+        let expected = match what {
+            "not signed at all" => VerifyError::SignatureMissing,
+            _ => VerifyError::SignatureInvalid,
+        };
+        assert_eq!(
+            outcome,
+            Err(DecryptError::Unverified(expected)),
+            "{what} must be refused by the verifier"
         );
-        // AND IT REALLY DECRYPTED. Without this the refusal could be a decryption failure wearing
-        // a verification error, and the test would pass against an implementation that could not
-        // decrypt at all.
-        assert_eq!(unwrapper.seen.borrow().len(), 1, "{what} must have decrypted");
+        // AND IT REALLY DECRYPTED. Asking the seam is not evidence of that -- the seam is asked
+        // before the ciphertext is opened -- so what is checked is that the refusal came from the
+        // VERIFIER, which only runs on a plaintext. The `assert_eq!` above carries that: a
+        // decryption failure answers `DecryptFailed`, not `Unverified`.
+        assert_eq!(
+            unwrapper.seen.borrow().len(),
+            1,
+            "{what}: the seam must be asked exactly once"
+        );
     }
 }
 
@@ -504,16 +557,24 @@ fn an_encrypted_content_ciphertext_is_refused() {
 #[test]
 fn the_limits_apply_to_the_decrypted_document() {
     let fixture = Fixture::new();
+    // The element bound is generous enough that the DEPTH arm crosses only the depth bound: a
+    // payload that trips both is pinned by whichever is checked first, which is how the wildcard
+    // hid the fact that the depth half was unmeasured.
     let limits = Limits {
-        max_elements: 24,
+        max_elements: 64,
         max_depth: 12,
         ..Limits::default()
     };
 
-    for (what, payload) in [
+    // THE SPECIFIC VARIANT, not `Malformed(_)`. The depth payload is also 34 elements, so under
+    // the wildcard the depth arm was satisfied by the ELEMENT bound: raising the depth guard left
+    // it green on `TooManyElements` while its doc claimed to pin depth. The element bound is now
+    // generous enough that only the depth arm crosses it.
+    for (what, payload, expected) in [
         (
             "more elements than the bound",
-            "<saml:Advice>".to_owned() + &"<saml:X/>".repeat(64) + "</saml:Advice>",
+            "<saml:Advice>".to_owned() + &"<saml:X/>".repeat(128) + "</saml:Advice>",
+            ironauth_saml::SamlError::TooManyElements,
         ),
         (
             "deeper than the bound",
@@ -521,6 +582,7 @@ fn the_limits_apply_to_the_decrypted_document() {
                 + &"<saml:X>".repeat(32)
                 + &"</saml:X>".repeat(32)
                 + "</saml:Advice>",
+            ironauth_saml::SamlError::TooDeep,
         ),
     ] {
         let padded = fixture.assertion.replace(
@@ -543,17 +605,16 @@ fn the_limits_apply_to_the_decrypted_document() {
             ironauth_saml::parse(padded.as_bytes(), &limits).is_err(),
             "{what}: the DECRYPTED document must not parse, or there is nothing to refuse"
         );
-        assert!(
-            matches!(
-                decrypt_and_verify(
-                    document.as_bytes(),
-                    &limits,
-                    &fixture.anchors,
-                    &fixture.unwrapper(),
-                ),
-                Err(DecryptError::Unverified(VerifyError::Malformed(_)))
+        assert_eq!(
+            decrypt_and_verify(
+                document.as_bytes(),
+                &limits,
+                &fixture.anchors,
+                &fixture.unwrapper(),
             ),
-            "{what}: a ciphertext inside the bounds that decrypts past them must be refused"
+            Err(DecryptError::Unverified(VerifyError::Malformed(expected))),
+            "{what}: a ciphertext inside the bounds that decrypts past them must be refused, \
+             and for the named reason"
         );
     }
 
@@ -641,4 +702,343 @@ fn the_ciphertext_must_be_inside_the_encrypted_assertion() {
     );
     assert_eq!(restored, document, "the surgery must be reversible");
     assert!(fixture.decrypt(&restored, &fixture.unwrapper()).is_ok());
+}
+
+/// The accept-arms the documentation argues hardest for are DRIVEN, not merely written.
+///
+/// # Two allowlist entries that no test named
+///
+/// `#rsa-oaep-mgf1p` and `#aes128-gcm` were both reachable and both unexercised: deleting either
+/// match arm turned it into `AlgorithmRefused` with the whole suite still green. The first is the
+/// one the module doc argues at length must be accepted despite its SHA-1, on the ground that
+/// refusing it would refuse most deployed identity providers -- so it was the arm with the
+/// longest justification and no test at all.
+///
+/// The OAEP PARAMETERS are asserted too, because reaching the seam is not the same as reaching
+/// it correctly: an unwrapper told SHA-1 when the document said SHA-256 decrypts under the wrong
+/// parameters and fails indistinguishably from a wrong key.
+#[test]
+fn every_accepted_algorithm_is_driven_end_to_end() {
+    for (what, data_alg, key_alg, expected) in [
+        (
+            "AES-256-GCM with RSA-OAEP",
+            "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+            "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+            KeyTransportAlg::RsaOaep,
+        ),
+        (
+            "AES-128-GCM with RSA-OAEP",
+            "http://www.w3.org/2009/xmlenc11#aes128-gcm",
+            "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+            KeyTransportAlg::RsaOaep,
+        ),
+        (
+            "AES-256-GCM with RSA-OAEP-MGF1P",
+            "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+            "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+            KeyTransportAlg::RsaOaepMgf1Sha1,
+        ),
+    ] {
+        let bits = if data_alg.ends_with("aes128-gcm") {
+            16
+        } else {
+            32
+        };
+        let fixture = Fixture {
+            key: vec![0x2a; bits],
+            ..Fixture::new()
+        };
+        let document = fixture.wrap_with(&fixture.assertion, data_alg, key_alg, bits);
+        let unwrapper = fixture.unwrapper();
+        let assertion = fixture
+            .decrypt(&document, &unwrapper)
+            .unwrap_or_else(|error| panic!("{what} must decrypt and verify: {error:?}"));
+        assert_eq!(
+            assertion
+                .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+                .as_deref(),
+            Some("victim@example.test"),
+            "{what}"
+        );
+        // AND THE SEAM WAS TOLD THE RIGHT THING. Without this the crate could pass any algorithm
+        // it liked to a caller's unwrapper, because this one ignores the argument.
+        let seen = unwrapper.seen.borrow();
+        let [(algorithm, parameters)] = seen.as_slice() else {
+            panic!("{what}: the seam must be asked exactly once");
+        };
+        assert_eq!(*algorithm, expected, "{what}");
+        // The defaults, since none of these documents names OAEP parameters.
+        assert_eq!(parameters.digest, OaepDigest::Sha1, "{what}");
+        assert_eq!(parameters.mgf, OaepMgf::Mgf1Sha1, "{what}");
+        assert_eq!(parameters.label, None, "{what}");
+    }
+}
+
+/// The OAEP parameters a document names REACH the seam, and a contradiction is refused.
+///
+/// # An unwrapper cannot guess
+///
+/// XML Encryption 1.1 section 5.5.2 parameterises RSA-OAEP with `ds:DigestMethod`, `xenc11:MGF`
+/// and `xenc:OAEPparams`, and the specification's own worked example uses SHA-256 with
+/// MGF1-SHA256. An earlier version read only the `Algorithm` attribute and discarded all three,
+/// so a conforming SHA-256 document and one using the SHA-1 defaults arrived at the caller
+/// looking identical -- and a caller that guessed wrong would fail indistinguishably from a wrong
+/// key.
+#[test]
+fn the_oaep_parameters_reach_the_seam() {
+    let fixture = Fixture::new();
+    let parameterised = fixture.document().replacen(
+        r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/>"#,
+        concat!(
+            r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep">"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" "#,
+            r#"Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha256"/>"#,
+            r#"<xenc:OAEPparams>QUJD</xenc:OAEPparams>"#,
+            "</xenc:EncryptionMethod>"
+        ),
+        1,
+    );
+    assert_ne!(parameterised, fixture.document(), "the edit must apply");
+    let unwrapper = fixture.unwrapper();
+    fixture
+        .decrypt(&parameterised, &unwrapper)
+        .expect("a parameterised OAEP document decrypts and verifies");
+    let seen = unwrapper.seen.borrow();
+    let [(_, parameters)] = seen.as_slice() else {
+        panic!("the seam must be asked exactly once");
+    };
+    assert_eq!(parameters.digest, OaepDigest::Sha256);
+    assert_eq!(parameters.mgf, OaepMgf::Mgf1Sha256);
+    assert_eq!(parameters.label.as_deref(), Some(&b"ABC"[..]));
+
+    // AND `#rsa-oaep-mgf1p` FIXES THEM. That URI means MGF1-SHA1; a document naming it and then
+    // carrying a SHA-256 DigestMethod is asking for two different things, and resolving that to
+    // one of them is choosing which half of a contradiction to believe.
+    let contradictory = fixture
+        .wrap_with(
+            &fixture.assertion,
+            "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+            "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+            32,
+        )
+        .replacen(
+            r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/>"#,
+            concat!(
+                r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p">"#,
+                r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+                "</xenc:EncryptionMethod>"
+            ),
+            1,
+        );
+    let unwrapper = fixture.unwrapper();
+    assert_eq!(
+        fixture.decrypt(&contradictory, &unwrapper),
+        Err(DecryptError::AlgorithmRefused)
+    );
+    assert!(
+        unwrapper.seen.borrow().is_empty(),
+        "a contradictory document must be refused before the seam is asked"
+    );
+}
+
+/// The `EncryptedKey` may be a SIBLING of the `EncryptedData`, which is what `OpenSAML` emits.
+///
+/// # The schema says so, and refusing it refused a large share of the field
+///
+/// `saml-schema-assertion-2.0.xsd` defines `EncryptedElementType` as an `EncryptedData` followed
+/// by zero or more `EncryptedKey` SIBLINGS. `OpenSAML` and Shibboleth emit that shape, pointing at
+/// the key with a `ds:RetrievalMethod` whose URI is a same-document fragment.
+///
+/// A first version accepted only the nested placement and refused any `RetrievalMethod` outright,
+/// justified as "honouring one would let an unauthenticated document drive an outbound request".
+/// That is true of an absolute URI and FALSE of `#_ek`, which resolves inside the tree already
+/// parsed. So the refusal was refusing conforming documents on a reason that did not apply to
+/// them, and every such identity provider failed with `Shape` -- indistinguishable from malformed.
+#[test]
+fn the_key_may_sit_beside_the_ciphertext() {
+    let fixture = Fixture::new();
+    let document = fixture.document();
+    let start = document
+        .find("<xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey");
+    let end = document
+        .find("</xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey")
+        + "</xenc:EncryptedKey>".len();
+    // THE DECLARATION COMES WITH IT. `xmlns:xenc` is on the `EncryptedData` element itself, so a
+    // sibling is outside the scope that declared it -- the same class of mistake as lifting an
+    // assertion out of the Response that declared `xmlns:saml`. A real identity provider declares
+    // the prefix higher up; this test carries it on the element it moves.
+    let key = document[start..end].replacen(
+        "<xenc:EncryptedKey>",
+        concat!(
+            r#"<xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" "#,
+            r#"Id="_ek">"#
+        ),
+        1,
+    );
+    // Lift it out of the KeyInfo and put it beside the EncryptedData, with the fragment reference
+    // the schema shape uses.
+    let moved = [&document[..start], &document[end..]]
+        .concat()
+        .replacen(
+            "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"></ds:KeyInfo>",
+            concat!(
+                r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                "<ds:RetrievalMethod URI=\"#_ek\" ",
+                "Type=\"http://www.w3.org/2001/04/xmlenc#EncryptedKey\"/>",
+                "</ds:KeyInfo>"
+            ),
+            1,
+        )
+        .replacen(
+            "</xenc:EncryptedData>",
+            &format!("</xenc:EncryptedData>{key}"),
+            1,
+        );
+    assert_ne!(moved, document, "the surgery must move something");
+
+    let unwrapper = fixture.unwrapper();
+    let assertion = fixture
+        .decrypt(&moved, &unwrapper)
+        .expect("the schema's own EncryptedKey placement must work");
+    assert_eq!(
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
+        Some("victim@example.test")
+    );
+
+    // AND AN ABSOLUTE URI IS STILL REFUSED, because that one really would be a request. This is
+    // the arm that keeps the loosening honest: the refusal moved from "any RetrievalMethod" to
+    // "one that names somewhere else", and without this the fix would just be a removal.
+    let outbound = moved.replacen("URI=\"#_ek\"", "URI=\"http://attacker.test/key\"", 1);
+    let unwrapper = fixture.unwrapper();
+    assert_eq!(
+        fixture.decrypt(&outbound, &unwrapper),
+        Err(DecryptError::Shape)
+    );
+    assert!(
+        unwrapper.seen.borrow().is_empty(),
+        "a document naming somewhere else must be refused before the seam is asked"
+    );
+}
+
+/// A cleartext assertion beside an encrypted one is refused.
+///
+/// # Two entry points, one document, two identities
+///
+/// Encryption uses the service provider's PUBLIC key, out of its own published metadata, so
+/// anyone can mint an `EncryptedAssertion`. A `Response` carrying the identity provider's
+/// genuinely signed CLEARTEXT assertion plus an attacker's encrypted one was accepted, and
+/// `decrypt_and_verify` returned the encrypted subject while `verify` on the identical bytes
+/// returned the cleartext one. Which identity the caller gets then depends on which function it
+/// happened to call, which is the disagreement this crate exists to make impossible.
+#[test]
+fn a_cleartext_assertion_beside_an_encrypted_one_is_refused() {
+    let fixture = Fixture::new();
+    let cleartext = fixture.assertion.clone();
+    let both = fixture.document().replacen(
+        "</samlp:Response>",
+        &format!("{cleartext}</samlp:Response>"),
+        1,
+    );
+    assert_ne!(both, fixture.document(), "the edit must apply");
+    let unwrapper = fixture.unwrapper();
+    assert_eq!(
+        fixture.decrypt(&both, &unwrapper),
+        Err(DecryptError::Shape),
+        "a document carrying both forms must be refused rather than resolved to one"
+    );
+    assert!(
+        unwrapper.seen.borrow().is_empty(),
+        "it must be refused before the seam is asked"
+    );
+}
+
+/// The error does not reveal whether the key transport succeeded.
+///
+/// # Bleichenbacher's bit, handed over by an argument evaluation order
+///
+/// An earlier version evaluated `cipher_value(&data)` as an ARGUMENT to the decrypt call, so it
+/// ran AFTER the caller's unwrapper. A document with a deliberately malformed `CipherData` then
+/// answered `Shape` when the unwrap succeeded and `DecryptFailed` when it did not -- and an
+/// unauthenticated party varying only the `EncryptedKey`, holding the broken `CipherData` fixed,
+/// read one bit per request: did the private-key unwrap work. That is the whole of an adaptive
+/// chosen-ciphertext attack's oracle, handed over by the error taxonomy built to withhold it.
+///
+/// The two documents below differ ONLY in whether the seam answers, and they must be
+/// indistinguishable.
+#[test]
+fn the_error_does_not_reveal_whether_the_unwrap_succeeded() {
+    let fixture = Fixture::new();
+    let broken = fixture.document().replacen(
+        "</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
+        "!!!not base64!!!</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
+        1,
+    );
+    assert_ne!(broken, fixture.document(), "the edit must apply");
+
+    let succeeds = fixture.decrypt(&broken, &fixture.unwrapper());
+    let refuses = fixture.decrypt(&broken, &Refuses);
+    assert_eq!(
+        succeeds, refuses,
+        "the answer must not depend on whether the seam unwrapped the key"
+    );
+
+    // AND THE SAME FOR A WRONG-LENGTH KEY, which is the other way a seam can "succeed" and still
+    // be wrong. All three are one answer.
+    let wrong_length = fixture.decrypt(
+        &broken,
+        &Unwrapper {
+            key: vec![0x2a; 7],
+            seen: std::cell::RefCell::new(Vec::new()),
+        },
+    );
+    assert_eq!(succeeds, wrong_length);
+
+    // CONTROL: the unbroken document still tells the two apart in the only place it may -- by
+    // succeeding for one and failing for the other. Without this the sameness above would be
+    // satisfied by a crate that always returns the same error.
+    assert!(
+        fixture
+            .decrypt(&fixture.document(), &fixture.unwrapper())
+            .is_ok()
+    );
+    assert_eq!(
+        fixture.decrypt(&fixture.document(), &Refuses),
+        Err(DecryptError::DecryptFailed)
+    );
+}
+
+/// A refusal written for one element refuses two of it.
+///
+/// # "Is it present" and "is there exactly one" are different questions
+///
+/// Both guards were `Scoped::child(..).is_some()`, and `child` answers `None` for zero matches
+/// AND for two or more. So a document carrying the element TWICE walked straight past a refusal
+/// written to reject it once -- inverting this crate's own doctrine that two is a contradiction,
+/// for exactly the two elements whose whole purpose is to be refused.
+#[test]
+fn writing_a_refused_element_twice_does_not_evade_the_refusal() {
+    let fixture = Fixture::new();
+    let reference = r#"<xenc:CipherReference URI="http://attacker.test/data"/>"#;
+    for (what, count) in [("once", 1), ("twice", 2), ("three times", 3)] {
+        let document = fixture.document().replacen(
+            "<xenc:CipherData><xenc:CipherValue>",
+            &format!(
+                "<xenc:CipherData>{}<xenc:CipherValue>",
+                reference.repeat(count)
+            ),
+            1,
+        );
+        assert_ne!(document, fixture.document(), "{what}: the edit must apply");
+        let unwrapper = fixture.unwrapper();
+        assert_eq!(
+            fixture.decrypt(&document, &unwrapper),
+            Err(DecryptError::Shape),
+            "{what}"
+        );
+    }
 }

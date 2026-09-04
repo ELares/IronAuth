@@ -183,8 +183,14 @@
 //!
 //! # What this crate does NOT do yet
 //!
-//! Metadata parsing, anchor rotation, and the SP protocol flow are #139. Everything #138 asks
-//! for is here.
+//! Metadata parsing, anchor rotation, and the SP protocol flow are #139.
+//!
+//! EVERY ACCEPTANCE CRITERION OF #138 IS MET, which is not the same as "everything #138 asks
+//! for". Its What section also names strict schema validation before signature processing, and
+//! this crate performs none: it checks well-formedness, bounds and signature structure. The SAML
+//! schema constrains a protocol this crate does not implement, so `tests/owasp_checklist.rs`
+//! records it as #139's, and this sentence says so rather than letting a reader infer more from
+//! a criteria count.
 //!
 //! ENCRYPTED ASSERTIONS ARE HERE, with the key transport as a CALLER'S SEAM rather than a key
 //! this crate holds. That is better architecture -- a production service provider keeps its
@@ -219,7 +225,10 @@ pub const ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 
 /// The SAML 2.0 protocol namespace, which `Response` and `AuthnRequest` are in.
 pub const PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
-pub use encrypted::{DecryptError, KeyTransport, KeyTransportAlg, decrypt_and_verify};
+pub use encrypted::{
+    DecryptError, KeyTransport, KeyTransportAlg, OaepDigest, OaepMgf, OaepParameters,
+    decrypt_and_verify,
+};
 pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.

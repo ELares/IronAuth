@@ -76,8 +76,18 @@ print("\n".join(sorted(set(names))))
 PY
 )
 
-# The tests the compiler actually produced.
+# The tests the compiler actually produced. `--list` prints every test, INCLUDING ignored ones,
+# and `--include-ignored` is what makes the two distinguishable: a name that appears only when
+# ignored tests are included is a test that does not run.
 existing=$(cargo test -p ironauth-saml --features test-util -- --list 2>/dev/null \
+  | sed -n 's/^\(.*\): test$/\1/p' \
+  | sed 's/.*:://' \
+  | sort -u)
+
+# AND NONE OF THEM IS IGNORED. `--list` cannot tell a running test from a skipped one, so a
+# `#[ignore]` on a checklist-named test left this script printing "clean" while the row claimed
+# coverage that no longer executed. `--ignored --list` prints exactly the skipped ones.
+ignored=$(cargo test -p ironauth-saml --features test-util -- --ignored --list 2>/dev/null \
   | sed -n 's/^\(.*\): test$/\1/p' \
   | sed 's/.*:://' \
   | sort -u)
@@ -96,6 +106,20 @@ done <<< "$named"
 if [ -n "$missing" ]; then
   echo "saml-owasp-checklist: the checklist names tests that do not exist:" >&2
   for name in $missing; do echo "  $name" >&2; done
+  exit 1
+fi
+
+skipped=""
+if [ -n "$ignored" ]; then
+  while read -r name; do
+    [ -z "$name" ] && continue
+    printf '%s\n' "$ignored" | grep -qx "$name" && skipped="$skipped $name"
+  done <<< "$named"
+fi
+if [ -n "$skipped" ]; then
+  echo "saml-owasp-checklist: the checklist names tests that are #[ignore]d, so the rows claim" >&2
+  echo "coverage that does not execute:" >&2
+  for name in $skipped; do echo "  $name" >&2; done
   exit 1
 fi
 

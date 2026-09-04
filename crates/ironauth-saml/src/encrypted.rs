@@ -46,8 +46,14 @@
 use crate::parse::{Limits, SamlError};
 use crate::verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
-/// The XML Encryption namespaces. Two, because the GCM modes live in the 1.1 revision.
+/// The XML Encryption namespace.
 const XENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
+
+/// The XML Encryption 1.1 namespace, which is where `MGF` lives.
+const XENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
+
+/// The XMLDSIG namespace, which is where `KeyInfo` and `RetrievalMethod` live.
+const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// How the data key was wrapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,20 +70,85 @@ pub enum KeyTransportAlg {
     RsaOaep,
 }
 
+/// The OAEP hash and mask generation the `EncryptedKey` names.
+///
+/// # Why the seam is told, rather than left to guess
+///
+/// XML Encryption 1.1 section 5.5.2 parameterises RSA-OAEP with three CHILD elements of
+/// `EncryptionMethod`: `ds:DigestMethod` (the OAEP hash), `xenc11:MGF` (the mask generation
+/// function), and `xenc:OAEPparams` (the RFC 3447 label). The specification's own worked example
+/// carries SHA-256 and MGF1-SHA256.
+///
+/// A first version read only the `Algorithm` attribute and discarded all three, so a conforming
+/// SHA-256 document and one using the SHA-1 defaults arrived at the caller's unwrapper looking
+/// identical. An unwrapper cannot decrypt without knowing which, so it would have had to guess,
+/// and a guess that is wrong is indistinguishable from a wrong key -- which is the failure mode
+/// this crate spends the most effort making impossible to distinguish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OaepParameters {
+    /// The OAEP hash. SHA-1 when the document names none, which the specification makes the
+    /// default and which is what `#rsa-oaep-mgf1p` fixes it to.
+    pub digest: OaepDigest,
+    /// The mask generation function. MGF1-SHA1 when the document names none.
+    pub mgf: OaepMgf,
+    /// The `OAEPparams` label, if the document carries one. Decoded, never the base64.
+    pub label: Option<Vec<u8>>,
+}
+
+/// An OAEP hash this crate will name to a seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OaepDigest {
+    /// SHA-1, the specification's default and the one `#rsa-oaep-mgf1p` fixes.
+    Sha1,
+    /// SHA-256.
+    Sha256,
+    /// SHA-384.
+    Sha384,
+    /// SHA-512.
+    Sha512,
+}
+
+/// A mask generation function this crate will name to a seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OaepMgf {
+    /// MGF1 with SHA-1, the default.
+    Mgf1Sha1,
+    /// MGF1 with SHA-256.
+    Mgf1Sha256,
+    /// MGF1 with SHA-384.
+    Mgf1Sha384,
+    /// MGF1 with SHA-512.
+    Mgf1Sha512,
+}
+
 /// The seam a caller fills to unwrap a data key.
 ///
 /// # Why this is a trait and not a key
 ///
-/// See the module documentation: the private key belongs where the deployment keeps it. An
-/// implementation is expected to be a call into an HSM, a KMS, or whatever holds the service
-/// provider's decryption key.
+/// The private key belongs where the deployment keeps it, which in production is an HSM or a KMS.
+/// This crate parses the `EncryptedKey`, enforces the allowlist and hands over the wrapped bytes.
+///
+/// It is also the only correct answer available: `ring` has no RSA decryption, and the `rsa`
+/// crate's advisory exemption in `deny.toml` rests on the written claim that it "NEVER DECRYPTS",
+/// which calling its decrypt here would have made false in the exact operation the Marvin
+/// advisory is about.
 ///
 /// AN IMPLEMENTATION MUST NOT REPORT WHY IT FAILED. Returning distinguishable errors for "bad
 /// padding" and "wrong key" rebuilds the Bleichenbacher oracle inside the caller, which is why
 /// this returns an `Option` rather than a `Result`.
 pub trait KeyTransport {
     /// Unwrap `wrapped` under this deployment's private key, or answer `None`.
-    fn unwrap_key(&self, algorithm: KeyTransportAlg, wrapped: &[u8]) -> Option<Vec<u8>>;
+    ///
+    /// `parameters` carries the OAEP hash, mask generation function and label the document named,
+    /// with the specification's defaults filled in. An implementation that ignores them decrypts
+    /// under the wrong parameters for every identity provider that does not use the SHA-1
+    /// defaults.
+    fn unwrap_key(
+        &self,
+        algorithm: KeyTransportAlg,
+        parameters: &OaepParameters,
+        wrapped: &[u8],
+    ) -> Option<Vec<u8>>;
 }
 
 /// Why an encrypted assertion was refused.
@@ -133,30 +204,58 @@ pub fn decrypt_and_verify(
 ) -> Result<VerifiedAssertion, DecryptError> {
     let root = crate::tree::build(bytes, limits).map_err(DecryptError::Malformed)?;
 
-    // EXACTLY ONE EncryptedAssertion, and the EncryptedData is ITS OWN DIRECT CHILD.
+    // EXACTLY ONE EncryptedAssertion, AND NO CLEARTEXT ONE BESIDE IT.
     //
-    // The containment is the half a first draft of this got wrong: it searched the whole document
-    // for an `EncryptedData` and only counted the `EncryptedAssertion`, with a comment claiming
-    // the containment it did not check. A document with one of each, where the ciphertext is a
-    // SIBLING of the assertion rather than inside it, would then have been decrypted -- the same
-    // "the element I found is not the element that matters" shape as XML Signature Wrapping,
-    // arriving one layer down.
+    // The second half was missing and it is a wrapping shape. Encryption uses the service
+    // provider's PUBLIC key, published in its own metadata, so anyone can mint an
+    // EncryptedAssertion. A Response carrying the identity provider's genuinely signed cleartext
+    // assertion PLUS an attacker's encrypted one was accepted here, and `decrypt_and_verify`
+    // returned the encrypted subject while `verify` on the same bytes returned the cleartext one.
+    // Two entry points, one document, two different identities: the exact disagreement this crate
+    // exists to make impossible.
     let encrypted = crate::verify::collect(&root, &[], crate::ASSERTION_NS, "EncryptedAssertion");
     let [encrypted] = encrypted.as_slice() else {
         return Err(DecryptError::Shape);
     };
+    if !crate::verify::collect(&root, &[], crate::ASSERTION_NS, "Assertion").is_empty() {
+        return Err(DecryptError::Shape);
+    }
     let encrypted =
         crate::verify::Scoped::new(encrypted, crate::verify::scope_at(&root, encrypted));
-    let mut children = encrypted.children(XENC_NS, "EncryptedData");
-    let (Some(data), 1) = (children.pop(), children.len() + 1) else {
-        return Err(DecryptError::Shape);
-    };
 
+    // The EncryptedData is the EncryptedAssertion's OWN direct child. A first draft searched the
+    // whole document while counting only the assertion, with a comment claiming a containment it
+    // did not check, so a ciphertext SIBLING of the assertion was decrypted.
+    let data = exactly_one(encrypted.children(XENC_NS, "EncryptedData"))?;
+
+    // EVERYTHING THE DOCUMENT DECIDES IS DECIDED BEFORE THE SEAM IS ASKED. That ordering is the
+    // whole of the oracle defence and an earlier version got it wrong: `cipher_value(&data)` was
+    // evaluated as an argument to the decrypt call, i.e. AFTER the unwrapper had run. So a
+    // document with a deliberately malformed CipherData answered `Shape` when the unwrap
+    // succeeded and `DecryptFailed` when it did not, and an unauthenticated party varying only
+    // the EncryptedKey read one bit per request: did the private-key unwrap work. That is
+    // Bleichenbacher's bit, handed over by the error taxonomy that exists to withhold it.
     check_type(&data)?;
     let algorithm = data_algorithm(&data)?;
-    let key = unwrap_data_key(&data, algorithm, transport)?;
+    let wrapped = wrapped_key(&encrypted, &data)?;
+    let ciphertext = cipher_value(&data)?;
 
-    let plaintext = ironauth_jose::xmlenc::decrypt(algorithm, &key, &cipher_value(&data)?)
+    // ONLY NOW. Everything from here answers `DecryptFailed` whatever went wrong.
+    let key = transport
+        .unwrap_key(wrapped.algorithm, &wrapped.parameters, &wrapped.bytes)
+        .ok_or(DecryptError::DecryptFailed)?;
+    // DEFENCE IN DEPTH, not the check. `xmlenc::decrypt` refuses a wrong-length key and so does
+    // `ring` beneath it, so a mutation sweep removes this with the suite still green.
+    //
+    // It earns its place by making the refusal not depend on what the backend happens to do, and
+    // by keeping the error one word. An earlier version of this comment also claimed it stopped
+    // a caller's unwrapper being PROBED for the length of what it returned -- it does not: the
+    // seam has already run by the time this line is reached, and what actually withholds that bit
+    // is that every path from here answers `DecryptFailed`.
+    if key.len() != algorithm.key_bytes() {
+        return Err(DecryptError::DecryptFailed);
+    }
+    let plaintext = ironauth_jose::xmlenc::decrypt(algorithm, &key, &ciphertext)
         .map_err(|_| DecryptError::DecryptFailed)?;
 
     // AND NOW IT IS JUST A DOCUMENT. The same parser, the same verifier, the same anchors, and
@@ -218,82 +317,178 @@ fn data_algorithm(
     {
         "http://www.w3.org/2009/xmlenc11#aes128-gcm" => Ok(XmlEncAlg::Aes128Gcm),
         "http://www.w3.org/2009/xmlenc11#aes256-gcm" => Ok(XmlEncAlg::Aes256Gcm),
+        // EVERYTHING ELSE, and the CBC URIs are the ones that matter:
+        // `xmlenc#aes128-cbc`, `#aes192-cbc`, `#aes256-cbc` and `#tripledes-cbc`. They are not
+        // named in a match arm because there is nothing to say to them that the default does not,
+        // and an earlier version of this doc claimed they were listed here when they were not.
+        // `ring` offers no CBC at all, so the refusal is structural rather than a rule to keep.
+        //
+        // AES-192-GCM is also refused, and that IS a narrowing of a conforming algorithm: `ring`
+        // has no 192-bit AES. Refusing is the honest answer; pretending would be worse.
         _ => Err(DecryptError::AlgorithmRefused),
     }
 }
 
-/// Unwrap the data key carried inside this `EncryptedData`.
+/// Exactly one, or a shape refusal.
 ///
-/// # The key must be HERE, not somewhere this crate would have to go and get
+/// # Why this is a helper rather than `Scoped::child`
 ///
-/// A `RetrievalMethod` is a URI, and honouring one would make an unauthenticated document able to
-/// choose an outbound request. This crate performs no I/O, so a document that carries a reference
-/// instead of a key is refused rather than followed.
-///
-/// # The unwrapped length is checked against the ALGORITHM
-///
-/// A caller's unwrapper answers with bytes. If those bytes are the wrong length for the named
-/// algorithm the answer is a refusal, not a truncation or a pad: silently adjusting a key length
-/// is how an implementation ends up decrypting under something neither party chose.
-fn unwrap_data_key(
-    data: &crate::verify::Scoped<'_>,
-    algorithm: ironauth_jose::xmlenc::XmlEncAlg,
-    transport: &dyn KeyTransport,
-) -> Result<Vec<u8>, DecryptError> {
-    let key_info = data
-        .child("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")
-        .ok_or(DecryptError::Shape)?;
-    if key_info
-        .child("http://www.w3.org/2000/09/xmldsig#", "RetrievalMethod")
-        .is_some()
-    {
-        return Err(DecryptError::Shape);
+/// `Scoped::child` answers `None` for zero matches AND for two or more, and two of the guards
+/// here were written as `child(..).is_some()`. That reads as "is it present" and means "is there
+/// exactly one", so a document carrying the element TWICE slipped past a refusal written to
+/// reject it once -- inverting this crate's own doctrine that two is a contradiction.
+fn exactly_one(
+    mut found: Vec<crate::verify::Scoped<'_>>,
+) -> Result<crate::verify::Scoped<'_>, DecryptError> {
+    match found.len() {
+        1 => found.pop().ok_or(DecryptError::Shape),
+        _ => Err(DecryptError::Shape),
     }
-    let encrypted_key = key_info
-        .child(XENC_NS, "EncryptedKey")
-        .ok_or(DecryptError::Shape)?;
-    let method = encrypted_key
-        .child(XENC_NS, "EncryptionMethod")
-        .ok_or(DecryptError::Shape)?;
-    let transport_algorithm = match method
+}
+
+/// Refuse if `element` carries ANY child that is `namespace`:`local`.
+///
+/// Counting rather than asking for exactly one: the guards below are refusals, so "there are two"
+/// must refuse as loudly as "there is one".
+fn refuse_any(
+    element: &crate::verify::Scoped<'_>,
+    namespace: &str,
+    local: &str,
+) -> Result<(), DecryptError> {
+    if element.children(namespace, local).is_empty() {
+        Ok(())
+    } else {
+        Err(DecryptError::Shape)
+    }
+}
+
+/// The wrapped data key, with the parameters the document named.
+struct WrappedKey {
+    algorithm: KeyTransportAlg,
+    parameters: OaepParameters,
+    bytes: Vec<u8>,
+}
+
+/// Find the `EncryptedKey` and read everything the seam will need from it.
+///
+/// # BOTH placements the SAML schema allows
+///
+/// `saml-schema-assertion-2.0.xsd` defines `EncryptedElementType` as an `EncryptedData` followed
+/// by zero or more `EncryptedKey` SIBLINGS. So the key is legally either inside the
+/// `EncryptedData`'s `ds:KeyInfo`, or a sibling of the `EncryptedData` inside the
+/// `EncryptedAssertion` -- and the second is what `OpenSAML` and Shibboleth emit, pointed at by a
+/// `ds:RetrievalMethod` whose URI is a same-document fragment.
+///
+/// A first version accepted only the first placement and refused a `RetrievalMethod` outright,
+/// on the stated ground that "a `RetrievalMethod` is a URI, and honouring one would make an
+/// unauthenticated document able to choose an outbound request". That is true of an ABSOLUTE URI
+/// and false of `#_ek`, which resolves inside the tree already parsed and drives no request. The
+/// refusal is now on what it was always about: a reference this crate would have to FETCH.
+fn wrapped_key(
+    encrypted: &crate::verify::Scoped<'_>,
+    data: &crate::verify::Scoped<'_>,
+) -> Result<WrappedKey, DecryptError> {
+    let inside = data
+        .child(DSIG_NS, "KeyInfo")
+        .map(|info| info.children(XENC_NS, "EncryptedKey"))
+        .unwrap_or_default();
+    let beside = encrypted.children(XENC_NS, "EncryptedKey");
+
+    // ONE KEY, wherever it sits. Two is the contradiction, and one in each place is two.
+    let mut found = inside;
+    found.extend(beside);
+    let key = exactly_one(found)?;
+
+    // A RETRIEVAL METHOD MAY NOT NAME SOMEWHERE ELSE. A same-document fragment is fine and is
+    // what the sibling placement uses; anything else is a request this crate will not make.
+    if let Some(info) = data.child(DSIG_NS, "KeyInfo") {
+        for method in info.children(DSIG_NS, "RetrievalMethod") {
+            let uri = method.attribute("URI").ok_or(DecryptError::Shape)?;
+            if !uri.starts_with('#') {
+                return Err(DecryptError::Shape);
+            }
+        }
+    }
+
+    let method = exactly_one(key.children(XENC_NS, "EncryptionMethod"))?;
+    let algorithm = match method
         .attribute("Algorithm")
         .ok_or(DecryptError::AlgorithmRefused)?
     {
         "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p" => KeyTransportAlg::RsaOaepMgf1Sha1,
         "http://www.w3.org/2009/xmlenc11#rsa-oaep" => KeyTransportAlg::RsaOaep,
-        // `#rsa-1_5` lands here, and that is the Bleichenbacher refusal. It is refused BEFORE the
+        // `#rsa-1_5` lands here, and that is the Bleichenbacher refusal. It happens BEFORE the
         // caller's unwrapper is asked, so the unwrapper cannot become the oracle.
         _ => return Err(DecryptError::AlgorithmRefused),
     };
-    let wrapped = cipher_value(&encrypted_key)?;
-    let key = transport
-        .unwrap_key(transport_algorithm, &wrapped)
-        .ok_or(DecryptError::DecryptFailed)?;
-    // DEFENCE IN DEPTH, not the check. `xmlenc::decrypt` refuses a wrong-length key and so does
-    // `ring` beneath it, so a mutation sweep removes this with the suite still green. It earns
-    // its place by refusing BEFORE the ciphertext is touched at all, which keeps a caller's
-    // unwrapper from being probed for the length of what it returned.
-    //
-    // What `a_data_key_of_the_wrong_length_is_refused` pins is the OUTCOME -- a key of the wrong
-    // length never decrypts -- rather than this line. Saying which is which is the difference
-    // between a comment and a claim.
-    if key.len() != algorithm.key_bytes() {
-        return Err(DecryptError::DecryptFailed);
+
+    Ok(WrappedKey {
+        algorithm,
+        parameters: oaep_parameters(&method, algorithm)?,
+        bytes: cipher_value(&key)?,
+    })
+}
+
+/// The OAEP hash, mask generation and label the `EncryptionMethod` names.
+///
+/// Absent means the specification's default, which is SHA-1 for both, and `#rsa-oaep-mgf1p` FIXES
+/// them there: a document naming that URI and then carrying a SHA-256 `DigestMethod` is asking
+/// for two different things, so it is refused rather than resolved to one of them.
+fn oaep_parameters(
+    method: &crate::verify::Scoped<'_>,
+    algorithm: KeyTransportAlg,
+) -> Result<OaepParameters, DecryptError> {
+    let digest = match method.child(DSIG_NS, "DigestMethod") {
+        None => OaepDigest::Sha1,
+        Some(named) => match named
+            .attribute("Algorithm")
+            .ok_or(DecryptError::AlgorithmRefused)?
+        {
+            "http://www.w3.org/2000/09/xmldsig#sha1" => OaepDigest::Sha1,
+            "http://www.w3.org/2001/04/xmlenc#sha256" => OaepDigest::Sha256,
+            "http://www.w3.org/2001/04/xmldsig-more#sha384" => OaepDigest::Sha384,
+            "http://www.w3.org/2001/04/xmlenc#sha512" => OaepDigest::Sha512,
+            _ => return Err(DecryptError::AlgorithmRefused),
+        },
+    };
+    let mgf = match method.child(XENC11_NS, "MGF") {
+        None => OaepMgf::Mgf1Sha1,
+        Some(named) => match named
+            .attribute("Algorithm")
+            .ok_or(DecryptError::AlgorithmRefused)?
+        {
+            "http://www.w3.org/2009/xmlenc11#mgf1sha1" => OaepMgf::Mgf1Sha1,
+            "http://www.w3.org/2009/xmlenc11#mgf1sha256" => OaepMgf::Mgf1Sha256,
+            "http://www.w3.org/2009/xmlenc11#mgf1sha384" => OaepMgf::Mgf1Sha384,
+            "http://www.w3.org/2009/xmlenc11#mgf1sha512" => OaepMgf::Mgf1Sha512,
+            _ => return Err(DecryptError::AlgorithmRefused),
+        },
+    };
+    if algorithm == KeyTransportAlg::RsaOaepMgf1Sha1
+        && (digest != OaepDigest::Sha1 || mgf != OaepMgf::Mgf1Sha1)
+    {
+        return Err(DecryptError::AlgorithmRefused);
     }
-    Ok(key)
+    let label = match method.child(XENC_NS, "OAEPparams") {
+        None => None,
+        Some(params) => {
+            Some(crate::verify::decode_base64(&params.text()).ok_or(DecryptError::Shape)?)
+        }
+    };
+    Ok(OaepParameters { digest, mgf, label })
 }
 
 /// The decoded `CipherValue` of an `EncryptedData` or an `EncryptedKey`.
 fn cipher_value(element: &crate::verify::Scoped<'_>) -> Result<Vec<u8>, DecryptError> {
-    let data = element
-        .child(XENC_NS, "CipherData")
-        .ok_or(DecryptError::Shape)?;
-    // NOT CipherReference, which is the same outbound-request refusal as RetrievalMethod.
-    if data.child(XENC_NS, "CipherReference").is_some() {
-        return Err(DecryptError::Shape);
-    }
-    let value = data
-        .child(XENC_NS, "CipherValue")
-        .ok_or(DecryptError::Shape)?;
+    let data = exactly_one(element.children(XENC_NS, "CipherData"))?;
+    // NOT A CipherReference, which unlike a RetrievalMethod is always somewhere ELSE: XML
+    // Encryption defines it as a reference to cipher data OUTSIDE the document, so honouring one
+    // is a request this crate will not make.
+    //
+    // COUNTED, not `child(..).is_some()`. That reads as "is it present" and means "is there
+    // exactly one", so a document carrying the element TWICE walked straight past a refusal
+    // written to reject it once.
+    refuse_any(&data, XENC_NS, "CipherReference")?;
+    let value = exactly_one(data.children(XENC_NS, "CipherValue"))?;
     crate::verify::decode_base64(&value.text()).ok_or(DecryptError::Shape)
 }
