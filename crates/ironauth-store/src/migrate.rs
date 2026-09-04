@@ -1544,6 +1544,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0190_scim_push_links.sql"),
         },
+        Migration {
+            version: 191,
+            name: "scim_push_sync_state",
+            // EXPAND: one NEW table, and the same cascade argument 0190 records. An old binary
+            // does not know it exists, so a rollback leaves it inert and nothing it reads moves.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0191_scim_push_sync_state.sql"),
+        },
     ]
 }
 

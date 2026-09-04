@@ -991,6 +991,12 @@ name = "scim_push_links"
 path = "tests/scim_push_links.rs"
 required-features = ["testing"]
 
+# THE WORKER'S CHECKPOINT AND THE HEALTH SURFACE'S SOURCE (issue #137, criterion 2).
+[[test]]
+name = "scim_push_sync_state"
+path = "tests/scim_push_sync_state.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "scim_push_connections"
 path = "tests/scim_push_connections.rs"
