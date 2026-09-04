@@ -18,17 +18,19 @@
 #![cfg(feature = "testing")]
 
 use std::future::Future;
+use std::sync::Mutex;
 
 use axum::body::Body;
 use axum::http::Request;
 use ironauth_admin::scim_push_client::{DeletionPolicy, ScimPushClient, WriteMode};
 use ironauth_admin::scim_push_directory::PushDirectory;
 use ironauth_admin::scim_push_events::Collection;
+use ironauth_admin::scim_push_scheduler::{ScimPushObserver, tick};
 use ironauth_admin::scim_push_transport::{
     ScimRequest, ScimResponse, ScimTransport, ScimTransportError,
 };
 use ironauth_admin::scim_push_worker::{
-    Pass, SourceError, SubjectSource, WorkerError, run_backfill_pass,
+    Pass, Progress, SourceError, SubjectSource, WorkerError, run_backfill_pass,
 };
 use ironauth_env::Env;
 use ironauth_scim::downstream::Downstream;
@@ -36,8 +38,9 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, NewAdminUser, NewMembership, NewOrgGroup, NewOrgGroupMember,
     NewScimPushConnection, NewUserTraits, ORG_GROUP_MAX_DEPTH_CEILING, OrgGroupId,
-    OrgGroupMemberId, OrgMembershipId, OrganizationId, ScimDeletionPolicy, ScimPushConnection,
-    ScimPushConnectionId, ScimWriteMode, Scope, TraitWriteVisibility, UserId, UserState,
+    OrgGroupMemberId, OrgMembershipId, OrganizationId, ScimBackfillState, ScimDeletionPolicy,
+    ScimPushConnection, ScimPushConnectionId, ScimWriteMode, Scope, TraitWriteVisibility, UserId,
+    UserState,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -411,6 +414,53 @@ impl Org {
             .begin_backfill(&id, Some(0))
             .await
             .expect("begin the backfill");
+        id
+    }
+
+    /// A push connection EXACTLY as the management create leaves it: `backfill_state = 'pending'`.
+    ///
+    /// # Why this is a separate helper from [`Self::connection`]
+    ///
+    /// That one starts the backfill by hand, because the directory tests are about what a pass
+    /// does once it is enumerating. Doing it by hand is also how the scheduler's first version
+    /// looked correct while provisioning nobody: `begin_backfill` had no production caller, so
+    /// every real connection stayed pending and `run_backfill_pass` refused it, and the test
+    /// could not notice because it had supplied the missing step itself.
+    ///
+    /// A test about the SCHEDULER has to start where an operator's POST leaves off.
+    async fn connection_as_created(
+        &self,
+        attribute_mapping: &Value,
+        user_scope_filter: Option<&str>,
+    ) -> ScimPushConnectionId {
+        let id = ScimPushConnectionId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .scim_push_connections()
+            .create(
+                &self.env,
+                NewScimPushConnection {
+                    id: &id,
+                    organization_id: &self.id,
+                    display_name: "Okta production",
+                    base_url: BASE,
+                    credential_secret_name: "scim_push_downstream_token",
+                    attribute_mapping,
+                    user_scope_filter,
+                    group_scope_filter: None,
+                    write_mode: ScimWriteMode::Patch,
+                    deletion_policy: ScimDeletionPolicy::Deactivate,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create the push connection");
         id
     }
 }
@@ -1360,5 +1410,358 @@ async fn a_deleted_person_is_gone_to_the_cheap_fence_as_well_as_to_the_full_buil
             .expect("in_scope answers"),
         "the cheap fence still calls a deleted person a member, so the tail would never withdraw \
          them from the downstream"
+    );
+}
+
+/// Records what the scheduler tells it, so a test can assert on the half of a tick that never
+/// reaches the database.
+#[derive(Default)]
+struct RecordingObserver {
+    finished: Mutex<Vec<(String, bool)>>,
+    unavailable: Mutex<Vec<(String, String)>>,
+}
+
+impl ScimPushObserver for RecordingObserver {
+    fn pass_finished(
+        &self,
+        _scope: Scope,
+        connection: &ScimPushConnectionId,
+        outcome: &Result<Progress, WorkerError>,
+    ) {
+        self.finished
+            .lock()
+            .expect("lock")
+            .push((connection.to_string(), outcome.is_ok()));
+    }
+
+    fn connection_unavailable(&self, _scope: Scope, connection: &ScimPushConnectionId, why: &str) {
+        self.unavailable
+            .lock()
+            .expect("lock")
+            .push((connection.to_string(), why.to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn the_scheduler_opens_the_credential_and_runs_the_due_connection() {
+    // WHY THIS EXISTS. Everything below this was tested and none of it had a caller in a running
+    // server: `run_due_connections` was reached only from tests, so every acceptance criterion of
+    // #137 was satisfied by code a deployment would never execute. This drives the seam a boot
+    // uses, and it is the last unmeasured link in the chain.
+    //
+    // The credential half is the part that only exists here. Every other test hands the client a
+    // token; the scheduler has to find the connection's named secret, open it under the master
+    // key, and turn the bytes into a bearer.
+    let org = Org::start().await;
+    let (ada, _) = org.member("ada@globex.example", None).await;
+    let connection = org.connection_as_created(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    // NOTHING STARTS THE BACKFILL HERE, and that is the point. `Org::connection` leaves the row
+    // exactly as the management create does: `backfill_state = 'pending'`. `begin_backfill` had
+    // no caller outside tests, and `run_backfill_pass` refuses a connection that is not
+    // enumerating, so a scheduler that did not start one would have provisioned nobody in every
+    // environment while reporting a clean pass for each connection. The earlier version of this
+    // test called `begin_backfill` itself and could not have noticed.
+    let downstream = Downstream::new(TOKEN);
+    let observer = RecordingObserver::default();
+
+    // THE SECRET THE CONNECTION NAMES, stored the way an operator stores it.
+    org.db
+        .store()
+        .scoped(org.scope)
+        .acting(
+            org.db.test_actor(&org.env),
+            CorrelationId::generate(&org.env),
+        )
+        .environment_secrets()
+        .put(
+            &org.env,
+            &org.db.master_key(),
+            "scim_push_downstream_token",
+            TOKEN.as_bytes(),
+            None,
+        )
+        .await
+        .expect("store the downstream credential");
+
+    tick(
+        org.db.store(),
+        org.scope,
+        &FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        &org.db.master_key(),
+        &observer,
+    )
+    .await;
+
+    let finished = observer.finished.lock().expect("lock").clone();
+    assert_eq!(
+        finished,
+        vec![(connection.to_string(), true)],
+        "the scheduler did not run the due connection: {finished:?}"
+    );
+    assert!(
+        observer.unavailable.lock().expect("lock").is_empty(),
+        "the connection could not be prepared: {:?}",
+        observer.unavailable.lock().expect("lock")
+    );
+    // AND THE PERSON REACHED THE DOWNSTREAM, through a credential nothing in this test handed to
+    // the client.
+    let users = downstream.users();
+    assert_eq!(users.len(), 1, "nobody was provisioned: {users:?}");
+    assert_eq!(
+        users.values().next().expect("one user")["externalId"].as_str(),
+        Some(ada.to_string().as_str()),
+        "the wrong person was provisioned: {users:?}"
+    );
+    // The state moved, so the next tick resumes rather than repeating.
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_after_id.as_deref(),
+        Some(ada.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_connection_whose_secret_is_missing_is_reported_rather_than_silently_idle() {
+    // WHY THIS EXISTS. `run_due_connections` skips a connection its builder cannot prepare, and
+    // skipping is silent by construction: no pass runs, so nothing writes `last_error`, so the
+    // health surface shows a connection that looks idle rather than one that cannot send. The
+    // observer is the only place that fact exists, and an operator who rotated a secret and
+    // renamed it would otherwise have nothing at all to look at.
+    let org = Org::start().await;
+    org.member("ada@globex.example", None).await;
+    let connection = org.connection_as_created(&json!({}), None).await;
+    let downstream = Downstream::new(TOKEN);
+    let observer = RecordingObserver::default();
+
+    // NO SECRET IS STORED. The connection names one; the store does not have it.
+    tick(
+        org.db.store(),
+        org.scope,
+        &FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        &org.db.master_key(),
+        &observer,
+    )
+    .await;
+
+    let unavailable = observer.unavailable.lock().expect("lock").clone();
+    assert_eq!(
+        unavailable.len(),
+        1,
+        "the skip was not reported: {unavailable:?}"
+    );
+    assert_eq!(unavailable[0].0, connection.to_string());
+    assert!(
+        unavailable[0].1.contains("scim_push_downstream_token"),
+        "the report does not name the secret an operator has to fix: {:?}",
+        unavailable[0].1
+    );
+    assert!(
+        observer.finished.lock().expect("lock").is_empty(),
+        "a pass ran for a connection whose credential could not be opened"
+    );
+    assert!(
+        downstream.users().is_empty(),
+        "somebody was provisioned without a credential: {:?}",
+        downstream.users()
+    );
+    // AND THE BACKFILL WAS NOT STARTED. The head captured at `begin_backfill` is where the tail
+    // resumes and is captured exactly once, so stamping it on a tick that then skips the
+    // connection freezes the position at a moment nothing was sent: every event between then and
+    // the day an operator fixes the secret would be seen by the backfill as current state rather
+    // than replayed by the tail.
+    let store = org.db.store().scoped(org.scope);
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        state.backfill_state,
+        ScimBackfillState::Pending,
+        "the backfill was started for a connection this tick could not serve, so its feed \
+         position is frozen at a moment nothing was sent: {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_feed_starts_a_backfill_that_can_afterwards_tail() {
+    // WHY THIS EXISTS. `newest_sequence` answers `None` when the scope's visible feed is empty,
+    // which is the ORDINARY state of a new environment and also what a reaped or
+    // watermark-stalled feed answers. That `None` was passed straight into `begin_backfill` as
+    // the head; `complete_backfill` copies it into `cursor_sequence`; and `run_tail_pass` refuses
+    // a connection whose cursor is NULL with "this connection has not finished its backfill".
+    //
+    // So a connection created before the first event in its environment would enumerate its
+    // directory once and then never tail, permanently, with the health surface reporting the
+    // backfill DONE beside a connection failing on every tick -- and nothing could reset it,
+    // because `begin_backfill` only fires on a pending connection and `restart_backfill` has no
+    // production caller.
+    let org = Org::start().await;
+    org.member("ada@globex.example", None).await;
+    let connection = org.connection_as_created(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+
+    // THE FEED IS EMPTY, which is the precondition and is asserted rather than assumed: a fixture
+    // that had somehow put an event on the feed would make this test prove nothing.
+    assert_eq!(
+        store.outbox().newest_sequence().await.expect("head"),
+        None,
+        "the feed is not empty, so this test does not exercise the case it names"
+    );
+
+    org.db
+        .store()
+        .scoped(org.scope)
+        .acting(
+            org.db.test_actor(&org.env),
+            CorrelationId::generate(&org.env),
+        )
+        .environment_secrets()
+        .put(
+            &org.env,
+            &org.db.master_key(),
+            "scim_push_downstream_token",
+            TOKEN.as_bytes(),
+            None,
+        )
+        .await
+        .expect("store the downstream credential");
+
+    let downstream = Downstream::new(TOKEN);
+    let observer = RecordingObserver::default();
+    // Enough ticks to finish: users, the empty user page, the empty group page.
+    for _ in 0..4 {
+        tick(
+            org.db.store(),
+            org.scope,
+            &FixtureTransport {
+                downstream: downstream.clone(),
+            },
+            &org.db.master_key(),
+            &observer,
+        )
+        .await;
+        let state = store
+            .scim_push_sync_state()
+            .get(&connection)
+            .await
+            .expect("get")
+            .expect("state");
+        if state.backfill_state.is_done() {
+            break;
+        }
+    }
+
+    let state = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert!(
+        state.backfill_state.is_done(),
+        "the backfill did not finish: {state:?}"
+    );
+    // THE ASSERTION THAT MATTERS. A NULL cursor here is a connection that is `done` and can never
+    // tail, which is the wedge.
+    assert_eq!(
+        state.cursor_sequence,
+        Some(0),
+        "an empty feed left the connection with no cursor, so it is done and can never tail: \
+         {state:?}"
+    );
+    assert_eq!(
+        downstream.users().len(),
+        1,
+        "the person was not provisioned"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_naming_a_secret_outside_its_namespace_is_refused_at_the_read() {
+    // WHY THIS EXISTS. The environment-secret store is WRITE-ONLY: no endpoint returns a value.
+    // A connection names a secret and the worker sends its plaintext to a base URL the same
+    // principal chose, so an unconfined name turns that store into a read oracle for anybody who
+    // can configure a connection.
+    //
+    // `check_secret_name` refuses it at create, and that is the only door the API offers -- but
+    // not the only way a row arrives: a config import, a snapshot restore, or a row written
+    // before the rule existed all reach the table without it. A bound enforced only at one write
+    // door is a bound on that door. This drives the READ, which is what the store needs
+    // protecting from.
+    let org = Org::start().await;
+    org.member("ada@globex.example", None).await;
+    let connection = org.connection_as_created(&json!({}), None).await;
+
+    // A row that did not come through the surface, naming a secret nobody meant it to read.
+    sqlx::query(
+        "UPDATE scim_push_connections SET credential_secret_name = 'database_password' \
+         WHERE id = $1",
+    )
+    .bind(connection.to_string())
+    .execute(org.db.owner_pool())
+    .await
+    .expect("write a name the surface would refuse");
+    org.db
+        .store()
+        .scoped(org.scope)
+        .acting(
+            org.db.test_actor(&org.env),
+            CorrelationId::generate(&org.env),
+        )
+        .environment_secrets()
+        .put(
+            &org.env,
+            &org.db.master_key(),
+            "database_password",
+            b"the-password-nobody-should-send-anywhere",
+            None,
+        )
+        .await
+        .expect("store the unrelated secret");
+
+    let downstream = Downstream::new(TOKEN);
+    let observer = RecordingObserver::default();
+    tick(
+        org.db.store(),
+        org.scope,
+        &FixtureTransport {
+            downstream: downstream.clone(),
+        },
+        &org.db.master_key(),
+        &observer,
+    )
+    .await;
+
+    let unavailable = observer.unavailable.lock().expect("lock").clone();
+    assert_eq!(
+        unavailable.len(),
+        1,
+        "the refusal was not reported: {unavailable:?}"
+    );
+    assert!(
+        unavailable[0].1.contains("namespace"),
+        "the report does not say what is wrong: {:?}",
+        unavailable[0].1
+    );
+    assert!(
+        observer.finished.lock().expect("lock").is_empty(),
+        "a pass ran with a credential outside the connection namespace"
+    );
+    assert!(
+        downstream.requests().is_empty(),
+        "the secret reached a downstream: {:?}",
+        downstream.requests()
     );
 }

@@ -119,6 +119,15 @@ pub struct Config {
     /// boot mounts nothing under `/scim/v2` and every such path is a uniform 404.
     pub scim: ScimConfig,
 
+    /// OUTBOUND SCIM provisioning (issue #137): whether THIS process runs the push
+    /// worker, and how often.
+    ///
+    /// Separate from `[scim]`, which is the inbound server. They are opposite directions
+    /// with opposite risks -- inbound accepts writes from a customer's IdP, outbound sends
+    /// this environment's directory to a third party -- and a deployment that consumes SCIM
+    /// should not have to emit it, or the reverse.
+    pub scim_push: ScimPushConfig,
+
     /// Per-tenant and per-environment quota fairness settings (issue #50). The
     /// operator-plane noisy-neighbor guard: nested token buckets that keep one
     /// tenant or environment from starving another. Safe defaults, fully tunable
@@ -850,6 +859,48 @@ pub struct ScimConfig {
     /// Must not exceed the store's own list cap: above that the refusal becomes unreachable
     /// and the truncation happens anyway, which is a measured defect rather than a theory.
     pub max_scan: u32,
+}
+
+/// The outbound SCIM push worker (issue #137).
+///
+/// # Why this is off by default
+///
+/// Every other switch in this file guards a surface this deployment SERVES. This one guards
+/// requests it SENDS, to hosts a customer named. A default-on worker would mean installing
+/// IronAuth is enough to start making outbound calls to third parties as soon as somebody
+/// configures a connection, which is not a thing an operator should discover.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScimPushConfig {
+    /// Whether THIS process runs the outbound worker. Off by default.
+    ///
+    /// A connection can be configured, and its health surface read, with this off. What is off
+    /// is the sending.
+    pub enabled: bool,
+
+    /// How long between ticks, in seconds.
+    ///
+    /// # This is a floor on latency, not a rate limit
+    ///
+    /// A tick asks which connections are DUE and serves those, so the interval decides how
+    /// long a connection waits after becoming due, not how much work it does. The per-pass
+    /// page bound is what limits the work. Shortening it makes provisioning more prompt and
+    /// costs one `due_for_sync` query per scope per tick; lengthening it is what an operator
+    /// reaches for when a downstream is rate limiting, and the per-connection backoff already
+    /// handles that case better.
+    pub interval_secs: u64,
+}
+
+impl Default for ScimPushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Thirty seconds: short enough that a departure reaches a downstream while the
+            // person is still walking out, long enough that an idle environment is not issuing
+            // a query per scope per second.
+            interval_secs: 30,
+        }
+    }
 }
 
 impl Default for ScimConfig {
@@ -5463,6 +5514,7 @@ impl Config {
         check_byok_unconsumed(&self.byok)?;
         validate_admin(&self.admin)?;
         validate_scim(&self.scim)?;
+        validate_scim_push(&self.scim_push)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
             self.oidc.authorization_code_ttl_secs,
@@ -5645,6 +5697,20 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
 ///
 /// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
 /// merely large, which is the distinction that decides what belongs in this function.
+/// Refuse a scim_push section that would run the worker without pausing.
+fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
+    if scim_push.enabled && scim_push.interval_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "scim_push.interval_secs must be at least 1: the tick loop sleeps for this \
+                      long between passes, so zero is a busy loop that issues a due-connection \
+                      query per scope as fast as the database will answer"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a scim section whose page bounds cannot be satisfied.
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
         return Err(ConfigError::Invalid {

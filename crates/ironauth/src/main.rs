@@ -16,6 +16,9 @@ use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTarge
 use ironauth_admin::message_composer::DefaultComposer;
 use ironauth_admin::message_http_provider::HttpMessageProvider;
 use ironauth_admin::offboarding_worker::OffboardingConsumer;
+use ironauth_admin::scim_push_scheduler::{
+    ScimPushObserver, ScimPushScheduler, ScimPushSchedulerInputs,
+};
 use ironauth_admin::trait_migration_worker::TraitMigrationConsumer;
 use ironauth_admin::webhook_delivery::{
     FetchWebhookSender, WebhookDeliveryConsumer, WebhookReplayConsumer,
@@ -348,6 +351,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // grows fastest. The only switch is `outbox.reap_enabled`, which defaults ON.
         let retention_inputs = retention_sweeper_inputs(&config, &env);
         let audit_retention_inputs = audit_retention_inputs(&config, &env);
+        let scim_push_inputs = scim_push_inputs(&config);
         let log_shipper_inputs = log_shipper_inputs(&config, &env);
         let metrics_sampler_inputs_captured = metrics_sampler_inputs(&config, &env);
         let webhook_inputs = webhook_delivery_inputs(&config, &env);
@@ -514,6 +518,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_audit_retention_sweeper(inputs).await,
             None => None,
         };
+        // THE OUTBOUND SCIM WORKER (issue #137). Started here rather than beside the SCIM
+        // surface, because the two are opposite directions with independent switches: a
+        // deployment that consumes SCIM should not have to emit it.
+        let scim_push_scheduler = match scim_push_inputs {
+            Some(inputs) => start_scim_push_scheduler(inputs).await,
+            None => None,
+        };
         let retention_sweeper = if let Some(inputs) = retention_inputs {
             start_retention_sweeper(inputs).await
         } else {
@@ -565,6 +576,11 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         }
         if let Some(sweeper) = audit_retention_sweeper {
             sweeper.shutdown().await;
+        }
+        // Stopped with the sweepers. Nothing is lost by stopping mid-tick: every pass
+        // checkpoints, and a connection this tick did not reach is still due on the next boot.
+        if let Some(scheduler) = scim_push_scheduler {
+            scheduler.shutdown().await;
         }
         if let Some(shipper) = log_shipper {
             shipper.shutdown().await;
@@ -4211,7 +4227,173 @@ struct AuditRetentionInputs {
     env: Env,
 }
 
-/// Capture the audit retention sweeper's inputs, or `None` when it is switched off.
+/// What the outbound SCIM push scheduler (issue #137) needs, captured before `config`
+/// moves into the server.
+struct ScimPushInputs {
+    /// The data-plane connection the passes read and write through.
+    data_dsn: String,
+    /// The control-plane connection the scope enumeration reads through.
+    control_dsn: String,
+    /// How long between ticks.
+    interval: std::time::Duration,
+    /// The platform master key, which opens each connection's sealed credential.
+    master: Option<Arc<MasterKey>>,
+}
+
+/// Capture the scheduler's inputs, or [`None`] when it is switched off.
+fn scim_push_inputs(config: &Config) -> Option<ScimPushInputs> {
+    if !config.scim_push.enabled {
+        return None;
+    }
+    // THE CONTROL PLANE IS REQUIRED, not optional. Without it there is no scope enumeration,
+    // so the scheduler would tick over an empty list for ever and look like it was running.
+    let Some(control_dsn) = select_control_dsn(config) else {
+        tracing::error!(
+            "outbound SCIM NOT running: no control-plane connection is configured, so no \
+             scope can be enumerated"
+        );
+        return None;
+    };
+    Some(ScimPushInputs {
+        data_dsn: config.database.url.expose().to_owned(),
+        control_dsn,
+        interval: std::time::Duration::from_secs(config.scim_push.interval_secs),
+        master: resolve_master_key(config),
+    })
+}
+
+/// Start the outbound SCIM push scheduler, or [`None`] when it cannot run.
+///
+/// # Two connections, for the reason every other worker here needs two
+///
+/// Enumerating scopes reads `environments`, which only the control-plane role may read; the
+/// passes read and write data-plane tables under row-level security. Neither role can do both.
+async fn start_scim_push_scheduler(inputs: ScimPushInputs) -> Option<ScimPushScheduler> {
+    let ScimPushInputs {
+        data_dsn,
+        control_dsn,
+        interval,
+        master,
+    } = inputs;
+    // WITHOUT THE KEY NOTHING CAN BE SENT, because every connection's credential is sealed
+    // under it. Refusing to start says so once, at boot; starting would say it once per
+    // connection per tick, for ever, and would look like a downstream problem.
+    let Some(master) = master else {
+        tracing::error!(
+            "outbound SCIM NOT running: no platform master key is configured, so no \
+             connection's credential can be opened"
+        );
+        return None;
+    };
+    // THE KEY GOES ON THE STORE, not only into the scheduler. Every sealed-PII read the passes
+    // make -- `users().traits()` above all -- goes through the repository layer, which reads the
+    // key off the handle and fails closed without it. A store built without one provisions
+    // nobody, and does it quietly: the failure surfaces as a store error per subject.
+    let data_store = match Store::connect(&data_dsn).await {
+        Ok(store) => Arc::new(store.with_master_key(Arc::clone(&master))),
+        Err(error) => {
+            tracing::error!(%error, "outbound SCIM NOT running: data-plane connect failed");
+            return None;
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "outbound SCIM NOT running: control-plane connect failed");
+            return None;
+        }
+    };
+    // THE SAME SSRF-HARDENED FETCHER every other outbound path uses. A downstream base URL is
+    // customer-supplied and untrusted, which is the whole reason issue #10 exists.
+    let fetcher = match ironauth_fetch::Fetcher::new(ironauth_fetch::FetchLimits::default()) {
+        Ok(fetcher) => Arc::new(fetcher),
+        Err(error) => {
+            tracing::error!(%error, "outbound SCIM NOT running: fetcher setup failed");
+            return None;
+        }
+    };
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let scheduler = ScimPushScheduler::spawn(ScimPushSchedulerInputs {
+        store: data_store,
+        scopes,
+        fetcher,
+        master,
+        interval,
+        observer: Arc::new(TracingScimPushObserver),
+    });
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "outbound SCIM provisioning started"
+    );
+    Some(scheduler)
+}
+
+/// Reports the scheduler's passes through `tracing`.
+struct TracingScimPushObserver;
+
+impl ScimPushObserver for TracingScimPushObserver {
+    fn pass_finished(
+        &self,
+        scope: ironauth_store::Scope,
+        connection: &ironauth_store::ScimPushConnectionId,
+        outcome: &Result<
+            ironauth_admin::scim_push_worker::Progress,
+            ironauth_admin::scim_push_worker::WorkerError,
+        >,
+    ) {
+        match outcome {
+            Ok(progress) => tracing::debug!(
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                %connection,
+                read = progress.read,
+                converged = progress.converged,
+                deprovisioned = progress.deprovisioned,
+                refused = progress.refused,
+                "outbound SCIM pass finished"
+            ),
+            Err(error) => tracing::warn!(
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                %connection,
+                ?error,
+                "outbound SCIM pass failed"
+            ),
+        }
+    }
+
+    fn connection_unavailable(
+        &self,
+        scope: ironauth_store::Scope,
+        connection: &ironauth_store::ScimPushConnectionId,
+        why: &str,
+    ) {
+        // WARN RATHER THAN DEBUG, and this is the only place the fact exists: no pass ran, so
+        // nothing wrote `last_error`, so the health surface shows a connection that looks idle.
+        tracing::warn!(
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            %connection,
+            why,
+            "outbound SCIM connection could not be prepared, so no pass ran for it"
+        );
+    }
+
+    fn tick_failed(&self, scope: ironauth_store::Scope, error: &ironauth_store::StoreError) {
+        tracing::warn!(
+            tenant = %scope.tenant(),
+            environment = %scope.environment(),
+            ?error,
+            "outbound SCIM tick failed"
+        );
+    }
+
+    fn enumeration_failed(&self, error: &ironauth_store::StoreError) {
+        tracing::warn!(?error, "outbound SCIM scope enumeration failed");
+    }
+}
+
+/// Capture what the audit retention sweeper (issue #109) needs, or [`None`] when it is off.
 fn audit_retention_inputs(config: &Config, env: &Env) -> Option<AuditRetentionInputs> {
     if !config.audit_retention.enabled {
         return None;

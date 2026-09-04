@@ -2502,6 +2502,25 @@
       },
       "type": "object"
     },
+    "ScimPushConfig": {
+      "additionalProperties": false,
+      "description": "The outbound SCIM push worker (issue #137).\n\n# Why this is off by default\n\nEvery other switch in this file guards a surface this deployment SERVES. This one guards\nrequests it SENDS, to hosts a customer named. A default-on worker would mean installing\nIronAuth is enough to start making outbound calls to third parties as soon as somebody\nconfigures a connection, which is not a thing an operator should discover.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether THIS process runs the outbound worker. Off by default.\n\nA connection can be configured, and its health surface read, with this off. What is off\nis the sending.",
+          "type": "boolean"
+        },
+        "interval_secs": {
+          "default": 30,
+          "description": "How long between ticks, in seconds.\n\n# This is a floor on latency, not a rate limit\n\nA tick asks which connections are DUE and serves those, so the interval decides how\nlong a connection waits after becoming due, not how much work it does. The per-pass\npage bound is what limits the work. Shortening it makes provisioning more prompt and\ncosts one `due_for_sync` query per scope per tick; lengthening it is what an operator\nreaches for when a downstream is rate limiting, and the per-connection backoff already\nhandles that case better.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ScopeQuotaConfig": {
       "additionalProperties": false,
       "description": "The limits for one quota tier (issue #50), over the three enforced\ndimensions. Each dimension is a token bucket with a sustained refill rate\n(`*_per_second`) and a burst capacity (`*_burst`); the dimensions enforce\nindependently, so exhausting one does not affect another. A `*_burst` of 0\ndisables that dimension (unlimited), which is how a single-tenant self-hoster\nexpresses no quota.",
@@ -3281,6 +3300,14 @@
         "max_scan": 1000
       },
       "description": "Inbound SCIM 2.0 provisioning (issue #135). OFF by default, so the default\nboot mounts nothing under `/scim/v2` and every such path is a uniform 404."
+    },
+    "scim_push": {
+      "$ref": "#/$defs/ScimPushConfig",
+      "default": {
+        "enabled": false,
+        "interval_secs": 30
+      },
+      "description": "OUTBOUND SCIM provisioning (issue #137): whether THIS process runs the push\nworker, and how often.\n\nSeparate from `[scim]`, which is the inbound server. They are opposite directions\nwith opposite risks -- inbound accepts writes from a customer's IdP, outbound sends\nthis environment's directory to a third party -- and a deployment that consumes SCIM\nshould not have to emit it, or the reverse."
     },
     "server": {
       "$ref": "#/$defs/ServerConfig",
