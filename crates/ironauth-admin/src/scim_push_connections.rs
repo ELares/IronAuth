@@ -181,47 +181,63 @@ fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionVi
 /// difference between a validation error and a connection that silently never works.
 fn check_base_url(value: &str) -> Result<String, ApiError> {
     let value = require_non_empty(value, "base_url")?;
-    let refuse = |why: &str| {
-        Err(ApiError::BadRequest(format!(
-            "invalid_base_url: base_url must be an https URL with a host, because the push \
-             worker refuses plaintext HTTP and a stored one would fail on every pass ({why})"
-        )))
-    };
-    let Some(rest) = value.strip_prefix("https://") else {
-        return refuse("no https scheme");
-    };
-    // THE AUTHORITY, up to whichever delimiter ends it first. The first version of this check
-    // was `starts_with("https://")` and nothing else, so the literal string `https://` -- no
-    // host at all -- was accepted and stored, which is precisely the deferral this function's
-    // own doc says it exists to prevent.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // THE HOST, which is the authority with any port removed. Checking the authority alone was
-    // not enough: `https://:8080/scim` has a NON-EMPTY authority (`:8080`) and no host at all,
-    // so the first version of this check accepted it. The bare `https://` case it was written
-    // for is the same defect with the port left off.
-    //
-    // AN IPv6 LITERAL IS BRACKETED (RFC 3986 section 3.2.2) and its address is full of colons,
-    // so splitting on the first one would call the host `[`. That still ACCEPTS, which is the
-    // right answer for `https://[::1]/scim`, but by accident: the value would be garbage under
-    // a name that says otherwise, and the next person to use it for anything would be wrong.
-    let host = match authority.strip_prefix('[') {
-        Some(rest) => rest.split_once(']').map_or("", |(inside, _)| inside),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    if host.is_empty() {
-        return refuse("no host");
-    }
-    if authority.contains('@') {
-        // Userinfo in a stored base URL is a credential smuggled into a field that is not the
-        // credential field, and it is the classic way to make a URL read as one host and
-        // resolve as another.
-        return refuse("userinfo is not allowed");
-    }
-    if value.chars().any(char::is_whitespace) {
-        return refuse("whitespace");
-    }
+    // A TEXT-COLUMN BOUND, not a URL rule, so it stays here: 0189's `octet_length` CHECK would
+    // otherwise reach the caller as SQLSTATE 23514 and a 500 nobody predicted.
     if value.len() > MAX_BASE_URL_BYTES {
-        return refuse("too long");
+        return Err(ApiError::BadRequest(format!(
+            "invalid_base_url: base_url must be at most {MAX_BASE_URL_BYTES} bytes"
+        )));
+    }
+    // NOT A HAND-WRITTEN GRAMMAR. The first version restated the fetcher's URL rules by hand
+    // (scheme prefix, authority split, host emptiness, userinfo, IPv6 brackets) and drifted from
+    // them in both directions: it REFUSED `HTTPS://host/scim`, which the fetcher accepts because
+    // RFC 3986 makes the scheme case insensitive, and it ACCEPTED `https://host:0/scim` and
+    // `https://host:99999/scim`, which the fetcher refuses as malformed. A base URL accepted here
+    // and refused there is stored and then fails on every push for ever, which is the exact
+    // failure this function's own message says it exists to prevent.
+    //
+    // `external_issuers.rs` shipped that identical defect against `jwks_uri` and was corrected to
+    // call `parse_target`; its comment names the same two divergences. This is the same
+    // correction in the outbound SCIM half, not a claim about that one.
+    //
+    // `parse_target` is also the function the FETCHER itself runs, so agreement is by
+    // construction rather than by two copies being kept in step.
+    let target = ironauth_fetch::parse_target(&value).map_err(|error| {
+        ApiError::BadRequest(format!(
+            "invalid_base_url: base_url is not a URL the hardened fetcher can resolve \
+             ({error:?}), so the push worker could never reach it"
+        ))
+    })?;
+    if target.scheme != ironauth_fetch::Scheme::Https {
+        return Err(ApiError::BadRequest(
+            "invalid_base_url: base_url must be an https URL, because the push worker sends a \
+             bearer token with authority over somebody else's directory and refuses to send it \
+             in clear"
+                .to_owned(),
+        ));
+    }
+    // NOT REFUSING A LITERAL ADDRESS HERE, deliberately. `external_issuers.rs` additionally runs
+    // `classify` on `target.literal_ip` and refuses a loopback or metadata address at
+    // configuration time, and the same argument would apply to a push connection: one pointed at
+    // an address the fetcher blocks can never sync.
+    //
+    // It is left out because it is a BEHAVIOUR CHANGE rather than part of undoing the
+    // duplication, and mixing the two makes both harder to review and to revert. An existing
+    // test stores `https://[2001:db8::1]/scim/v2`, which `classify` refuses as documentation
+    // range, so adding the guard silently changes what this surface accepts. That deserves its
+    // own change with its own reasoning about which classes are worth refusing early, given the
+    // fetcher refuses them at push time anyway.
+    // WHAT `parse_target` DOES NOT EXPRESS, because it is about this caller's own path building
+    // rather than about URLs: a base carrying a query or a fragment folds the SCIM path into it,
+    // so `/Users` becomes part of a parameter value and every request addresses the base path.
+    // `scim_push_transport::join` refuses it too and calls itself the last place that sees both
+    // halves; refusing here as well means an operator learns at save time.
+    if value.contains('?') || value.contains('#') {
+        return Err(ApiError::BadRequest(
+            "invalid_base_url: base_url must not carry a query or a fragment, because the SCIM \
+             path is appended to it and would be folded into one"
+                .to_owned(),
+        ));
     }
     Ok(value)
 }

@@ -405,6 +405,35 @@ async fn a_handle_from_another_organization_is_not_found() {
 /// `jsonb_typeof(...) = 'object'` CHECK: without the surface check a caller meets that
 /// constraint as a database error rendered 500, and a malformed body deserves a 400.
 #[tokio::test]
+async fn a_scheme_the_fetcher_accepts_is_not_refused_by_the_surface_in_front_of_it() {
+    // RFC 3986 makes the scheme case insensitive, and the hardened fetcher accepts `HTTPS://`.
+    // The first version of `check_base_url` tested `starts_with("https://")` by hand and refused
+    // it, rejecting a configuration that would have worked.
+    //
+    // A validator stricter than the thing it guards is not "safer". It turns a working setup into
+    // a support ticket, and the divergence is invisible until somebody types it. `external_issuers`
+    // shipped exactly this against `jwks_uri` and was corrected by calling `parse_target`; this
+    // surface now composes the same function, so the two cannot drift again.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k1").await;
+    let path = push_path(&tenant, &environment, &org);
+
+    let body = serde_json::json!({
+        "display_name": "Downstream SaaS",
+        "base_url": "HTTPS://downstream.example/scim/v2",
+        "credential_secret_name": "scim_push_downstream",
+    })
+    .to_string();
+    let (status, _, response) = h.post(&path, "k-upper-scheme", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "an uppercase scheme the fetcher accepts was refused: {response}"
+    );
+}
+
+#[tokio::test]
 async fn a_malformed_base_url_is_refused_before_the_write() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
@@ -424,6 +453,27 @@ async fn a_malformed_base_url_is_refused_before_the_write() {
             "https://user:pw@downstream.example/scim/v2",
         ),
         ("a space", "https://downstream.example/scim v2"),
+        // THE TWO THE HAND-WRITTEN GRAMMAR ACCEPTED. `check_base_url` used to split the
+        // authority itself and never looked at the port, so both of these were stored and then
+        // failed on every push for ever, which is the deferral the check exists to prevent.
+        // `parse_target` refuses them, and it is the function the fetcher itself runs.
+        ("a zero port", "https://downstream.example:0/scim/v2"),
+        (
+            "a port above the range",
+            "https://downstream.example:99999/scim/v2",
+        ),
+        (
+            "a non-numeric port",
+            "https://downstream.example:https/scim/v2",
+        ),
+        // A QUERY folds the SCIM path into it, so `/Users` becomes part of a parameter value and
+        // every request addresses the base path instead. A downstream that ignores unknown
+        // parameters answers 200 and the client reads a create that never happened as a success.
+        (
+            "a query string",
+            "https://downstream.example/scim/v2?tenant=acme",
+        ),
+        ("a fragment", "https://downstream.example/scim/v2#frag"),
     ] {
         let body = serde_json::json!({
             "display_name": "Downstream SaaS",
