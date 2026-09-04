@@ -28,6 +28,9 @@
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_saml::{Limits, TrustAnchor, VerifyError, verify};
 
+/// The XMLDSIG namespace, for the rows that name a signature element.
+const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
 /// The key, the anchor, and a document that really verifies.
 struct Fixture {
     anchors: Vec<TrustAnchor>,
@@ -1387,4 +1390,213 @@ fn bytes_after_the_base64_padding_are_refused() {
         fixture.verify(&wrapped).is_ok(),
         "whitespace after the padding is the ordinary wrapped form"
     );
+}
+
+/// AN UNSIGNED ASSERTION IS REFUSED. This is the most basic control there is, and until now
+/// nothing in this crate drove it.
+///
+/// # How a suite of 81 tests missed it
+///
+/// Every `verify` call site in the test tree starts from `Fixture::new()`, `signed_response`,
+/// `resign` or `reseal` -- documents that ARE signed. So no test ever fed `verify` a document
+/// with no signature at all, and a reviewer showed the consequence by mutating the refusal into
+/// `Ok(..)`: every one of the 81 tests stayed green while an entirely unsigned response read its
+/// `NameID` back as though verified. Authenticate as anyone, with no key at all.
+///
+/// The three arms are the three shapes of "not signed HERE", because the interesting failures
+/// are the ones where a signature exists somewhere and a verifier is tempted to count it:
+/// none at all, one on the enclosing `Response` instead, and one buried deeper in the assertion
+/// rather than as its child.
+#[test]
+fn an_assertion_with_no_signature_of_its_own_is_refused() {
+    let fixture = Fixture::new();
+    let bare = concat!(
+        r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+        r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_response">"#,
+        r#"<saml:Assertion ID="_assertion"><saml:Issuer>urn:idp</saml:Issuer>"#,
+        "<saml:Subject><saml:NameID>attacker@evil.test</saml:NameID></saml:Subject>",
+        "</saml:Assertion></samlp:Response>"
+    );
+    assert_eq!(
+        fixture.verify(bare),
+        Err(VerifyError::SignatureMissing),
+        "an assertion with no signature must not verify"
+    );
+
+    // The identity provider's real signature, moved OUT of the assertion and onto the response.
+    // It no longer covers the assertion, and a verifier that searches the document for "a
+    // signature" rather than for THIS element's signature would count it.
+    let start = fixture
+        .document
+        .find("<ds:Signature")
+        .expect("the fixture is signed");
+    let end = fixture
+        .document
+        .find("</ds:Signature>")
+        .expect("the fixture is signed")
+        + "</ds:Signature>".len();
+    let signature = &fixture.document[start..end];
+    let moved = [&fixture.document[..start], &fixture.document[end..]]
+        .concat()
+        .replacen(
+            "</samlp:Response>",
+            &format!("{signature}</samlp:Response>"),
+            1,
+        );
+    assert_eq!(
+        fixture.verify(&moved),
+        Err(VerifyError::SignatureMissing),
+        "a signature on the response is not a signature on the assertion"
+    );
+
+    // And one nested a level deeper than a child, which is where XSW puts a signature it wants a
+    // verifier to find and a reader to ignore.
+    let buried = [&fixture.document[..start], &fixture.document[end..]]
+        .concat()
+        .replacen("<saml:Subject>", &format!("<saml:Subject>{signature}"), 1);
+    assert_eq!(
+        fixture.verify(&buried),
+        Err(VerifyError::SignatureMissing),
+        "a signature nested below the assertion is not the assertion's signature"
+    );
+}
+
+/// A verified assertion carries NO `ds:Signature` child, because the enveloped transform removed
+/// exactly the one it had.
+///
+/// # The historical bug as an invariant
+///
+/// The authenticate-as-anyone defect this crate shipped and fixed digested a stripped copy and
+/// returned the ORIGINAL subtree, which still had its `Signature` child with the attacker's
+/// forged content hidden inside. Stating the invariant directly is what lets the fuzz target
+/// check it on every input it reaches the accept path with.
+///
+/// DIRECT children, not descendants, and that distinction is load-bearing: a signature deeper in
+/// the tree can be perfectly legitimate. A `saml:Advice` carrying a signed assertion has one, and
+/// so does every assertion inside a Response that was itself signed. An earlier fuzz assertion
+/// used a descendant search and died on the ordinary Okta document that signs both.
+#[test]
+fn a_verified_assertion_carries_no_signature_child() {
+    let fixture = Fixture::new();
+    let assertion = fixture
+        .verify(&fixture.document)
+        .expect("the fixture verifies");
+    assert_eq!(
+        assertion.child_count("http://www.w3.org/2000/09/xmldsig#", "Signature"),
+        0
+    );
+    // AND THE COUNT IS NOT ZERO BECAUSE IT COUNTS NOTHING. The control names an element the
+    // signed assertion really does have, so a `child_count` that always answered zero would fail
+    // here.
+    assert_eq!(
+        assertion.child_count(ironauth_saml::ASSERTION_NS, "Subject"),
+        1
+    );
+    assert_eq!(
+        assertion.child_count(ironauth_saml::ASSERTION_NS, "Issuer"),
+        1
+    );
+
+    // AND IT COUNTS DIRECT CHILDREN, NOT DESCENDANTS. `NameID` is inside `Subject`, so a
+    // descendant walk answers 1 and this answers 0.
+    //
+    // This probe is the only one that separates the two implementations, and without it swapping
+    // `Scoped::children` for the descendant `collect` passed every test in the crate -- while
+    // bringing back the crash the whole round-2 fix was for, because the ordinary Okta document
+    // that signs the Response AND the assertion has a `ds:Signature` at depth two inside the
+    // verified Response.
+    assert_eq!(
+        assertion.child_count(ironauth_saml::ASSERTION_NS, "NameID"),
+        0,
+        "child_count must count DIRECT children; NameID is a grandchild"
+    );
+
+    // The mirror, so the row above cannot pass by counting nothing at that depth either.
+    let subject_reachable = assertion
+        .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+        .is_some();
+    assert!(
+        subject_reachable,
+        "the grandchild must be reachable by a DESCENDANT accessor, or the previous assertion \
+         proves only that the element is absent"
+    );
+}
+
+/// THE ORDINARY OKTA AND ADFS DOCUMENT: the Response and the assertion inside it are both
+/// signed, and both verify.
+///
+/// # The document three doc comments argued about and nothing built
+///
+/// It is the reason `child_count` counts DIRECT children. Verifying the Response returns a
+/// subtree that still contains the assertion's whole signature -- legitimately, because the
+/// Response signature covered it -- so a DESCENDANT count answers one there, and a verifier that
+/// used one would refuse the commonest document in the field. A fuzz assertion did exactly that
+/// and crashed on it.
+///
+/// Until now nothing in this crate could build one, so the property was asserted in prose and
+/// measured by nothing. Both directions are checked here: each level verifies on its own terms,
+/// and each returns a subtree with no signature CHILD while the Response still contains the
+/// assertion's signature further down.
+#[test]
+fn a_response_and_its_assertion_can_both_be_signed() {
+    let key = XmlTestKey::generate();
+    let anchors = vec![TrustAnchor::EcdsaP256(key.public_point())];
+    let inner = ironauth_saml::test_util::signed_response(&key, "_assertion");
+    let both = ironauth_saml::test_util::sign_response(&key, &inner);
+    let check = |namespace: &str, local: &str| {
+        verify(
+            both.as_bytes(),
+            &Limits::default(),
+            &anchors,
+            namespace,
+            local,
+        )
+    };
+
+    let assertion = check(ironauth_saml::ASSERTION_NS, "Assertion")
+        .expect("the assertion verifies under its own signature");
+    assert_eq!(
+        assertion
+            .text_of(ironauth_saml::ASSERTION_NS, "NameID")
+            .as_deref(),
+        Some("victim@example.test")
+    );
+    assert_eq!(assertion.child_count(DSIG_NS, "Signature"), 0);
+
+    let response = check(ironauth_saml::PROTOCOL_NS, "Response")
+        .expect("the response verifies under the response signature");
+    assert_eq!(response.name(), "samlp:Response");
+    // ITS OWN signature is gone, and the assertion's is still there. That pair is the whole
+    // point: the first is what the enveloped transform removes, the second is content the
+    // response signature covered.
+    assert_eq!(response.child_count(DSIG_NS, "Signature"), 0);
+    assert_eq!(
+        response.child_count(ironauth_saml::ASSERTION_NS, "Assertion"),
+        1
+    );
+    assert!(
+        response.text_of(DSIG_NS, "SignatureValue").is_some(),
+        "the assertion's signature must still be inside the verified response"
+    );
+
+    // AND THE CONTROL: a stranger's key verifies neither level, so the two accepts above are
+    // about the signature rather than about the document being well formed.
+    let stranger = XmlTestKey::generate();
+    let stranger_anchors = vec![TrustAnchor::EcdsaP256(stranger.public_point())];
+    for (namespace, local) in [
+        (ironauth_saml::ASSERTION_NS, "Assertion"),
+        (ironauth_saml::PROTOCOL_NS, "Response"),
+    ] {
+        assert_eq!(
+            verify(
+                both.as_bytes(),
+                &Limits::default(),
+                &stranger_anchors,
+                namespace,
+                local
+            ),
+            Err(VerifyError::SignatureInvalid),
+            "{local} must not verify under a key that signed nothing"
+        );
+    }
 }

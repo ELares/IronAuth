@@ -1,0 +1,1 @@
+<samlp:Response xmlns:samlp="urn:p" xmlns:ds="urn:ds"><ds:SignedInfo><ds:Reference/></ds:SignedInfo></samlp:Response>

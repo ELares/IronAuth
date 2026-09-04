@@ -196,6 +196,41 @@ pub mod test_util {
             self.pair.public_key().as_ref().to_vec()
         }
 
+        /// Load a key from a fixed PKCS#8 document, so a caller can have the SAME key twice.
+        ///
+        /// # Why a fuzz target cannot use [`XmlTestKey::generate`]
+        ///
+        /// A fuzzer needs the accept path to EXIST: with no key that can authorise anything,
+        /// `verify` is `Err` by construction and every assertion downstream of it is
+        /// unfalsifiable. It also needs determinism, because a corpus entry that verifies in one
+        /// process and not the next is a corpus entry that means nothing.
+        ///
+        /// `generate` gives neither. This takes the bytes, so the caller can embed one.
+        ///
+        /// # Errors
+        ///
+        /// If the document is not a P-256 PKCS#8 private key.
+        pub fn from_pkcs8(document: &[u8]) -> Result<Self, &'static str> {
+            let rng = secure_random();
+            let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, document, &rng)
+                .map_err(|_| "not a P-256 PKCS#8 key")?;
+            Ok(Self { pair, rng })
+        }
+
+        /// A PKCS#8 document for a freshly generated key, so a caller can embed one.
+        ///
+        /// # Panics
+        ///
+        /// If the platform has no usable entropy.
+        #[must_use]
+        pub fn generate_pkcs8() -> Vec<u8> {
+            let rng = secure_random();
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .expect("generate a P-256 key")
+                .as_ref()
+                .to_vec()
+        }
+
         /// Sign `message`, producing the fixed-width `r || s` an XML signature carries.
         ///
         /// # Panics
@@ -208,6 +243,48 @@ pub mod test_util {
                 .expect("sign")
                 .as_ref()
                 .to_vec()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::XmlTestKey;
+
+        /// A generated PKCS#8 document loads back, and the loaded key signs.
+        ///
+        /// # Why a generator needs a caller
+        ///
+        /// `generate_pkcs8` exists so a fuzz target can EMBED a fixed key: a fuzzer needs the
+        /// accept path to be reachable and deterministic, and `generate` gives neither. That
+        /// makes it a producer whose only consumer is a human running it once, so nothing would
+        /// notice if it stopped producing a loadable document -- if, for instance, the curve
+        /// constant it hardcodes diverged from the one `from_pkcs8` parses with.
+        ///
+        /// A review found it with no callers at all, which is the layer-without-a-caller shape.
+        /// This is the caller, and it pins the two together.
+        #[test]
+        fn a_generated_key_document_loads_and_signs() {
+            let document = XmlTestKey::generate_pkcs8();
+            let key = XmlTestKey::from_pkcs8(&document).expect("a generated document loads");
+            let signature = key.sign(b"a message");
+            // A P-256 fixed-width signature is r||s over a 32 byte field.
+            assert_eq!(signature.len(), 64);
+            // AND THE POINT IS A POINT. Uncompressed, so 0x04 and two 32 byte coordinates.
+            let point = key.public_point();
+            assert_eq!(point.len(), 65);
+            assert_eq!(point[0], 0x04);
+        }
+
+        /// Bytes that are not a PKCS#8 key are refused rather than panicking.
+        #[test]
+        fn a_document_that_is_not_a_key_is_refused() {
+            assert!(XmlTestKey::from_pkcs8(b"").is_err());
+            assert!(XmlTestKey::from_pkcs8(b"not a key at all").is_err());
+            // A VALID DER PREFIX with the wrong contents, so the refusal is not merely "too
+            // short": this is the shape a truncated or corrupted key actually has.
+            let mut truncated = XmlTestKey::generate_pkcs8();
+            truncated.truncate(20);
+            assert!(XmlTestKey::from_pkcs8(&truncated).is_err());
         }
     }
 }

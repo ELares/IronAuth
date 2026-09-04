@@ -163,6 +163,26 @@ impl VerifiedAssertion {
             .map(|attribute| attribute.value.as_str())
     }
 
+    /// How many DIRECT CHILDREN of the signed element are `namespace`:`local`.
+    ///
+    /// # Why a count, and why direct children
+    ///
+    /// [`Self::text_of`] answers `None` for zero matches AND for two or more, so it cannot be
+    /// used to ask whether something is absent. A fuzz target tried, asserting that a verified
+    /// assertion carries no `ds:SignatureValue`, and was silent on the document that carries TWO
+    /// -- which is the smuggling shape it was written for.
+    ///
+    /// DIRECT children, because that is the question worth asking about a signature: the
+    /// enveloped transform removed exactly the one `Signature` that was a child of this element,
+    /// so a verified assertion has none. A `Signature` deeper inside may be perfectly
+    /// legitimate: a `saml:Advice` carrying a signed assertion has one, and so does every
+    /// assertion inside a Response that was itself signed.
+    #[must_use]
+    pub fn child_count(&self, namespace: &str, local: &str) -> usize {
+        let scoped = Scoped::new(&self.signed, self.inherited.clone());
+        scoped.children(namespace, local).len()
+    }
+
     /// The text of the descendant in `namespace` with local name `local`, if there is EXACTLY
     /// ONE.
     ///

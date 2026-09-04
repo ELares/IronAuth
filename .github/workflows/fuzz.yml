@@ -58,7 +58,10 @@ jobs:
   build:
     name: build every fuzz target
     runs-on: ubuntu-latest
-    # Measured at 394s over eight crates on an M-series laptop, and a hosted runner is
+    # Measured at 394s over eight crates on an M-series laptop; the tree now holds NINE,
+    # and the ninth is the heaviest (crates/ironauth-saml/fuzz depends on ironauth-jose, so
+    # it compiles ring, p256 and rsa from source in a detached crate that shares no target
+    # directory). Treat the number as a floor that has not been re-measured. A hosted runner is
     # slower, has fewer cores, shares no target directory between the detached crates, and
     # builds cargo-fuzz from source first.
     timeout-minutes: 60
@@ -93,12 +96,17 @@ jobs:
           done < <(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
                           -not -path '*/target/*' | sort)
           # The floor is the count the freshness gate reports, not a token 2: a floor of 2
-          # tolerates the walk silently dropping six of the eight crates, which is most of the
+          # tolerates the walk silently dropping seven of the nine crates, which is most of the
           # way back to finding nothing.
+          #
+          # AND IT HAS TO MOVE WITH THE TREE. `found` and `expected` come from the same `find`,
+          # so they can never disagree: the literal below is the job's only real backstop, and
+          # it went slack the moment ironauth-saml/fuzz was added and it still said 8. Adding a
+          # fuzz crate means raising this line in the same commit.
           expected="$(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
                             -not -path '*/target/*' | wc -l | tr -d ' ')"
-          if [ "$found" -ne "$expected" ] || [ "$found" -lt 8 ]; then
-            echo "walked $found fuzz crates, expected at least 8 (found $expected)" >&2
+          if [ "$found" -ne "$expected" ] || [ "$found" -lt 9 ]; then
+            echo "walked $found fuzz crates, expected at least 9 (found $expected)" >&2
             exit 1
           fi
           if [ -n "$broken" ]; then
@@ -109,12 +117,12 @@ jobs:
 
   fuzz:
     name: fuzz ${{ matrix.target }}
-    # NOT on pull requests: eighteen targets at five minutes each is a nightly lane, not a
+    # NOT on pull requests: twenty-one targets at five minutes each is a nightly lane, not a
     # merge gate. `build` above is the part that gates.
     #
     # `!cancelled()` rather than a bare event check, because `needs: build` otherwise carries
-    # an implicit `success()`: one crate failing to build would skip ALL EIGHTEEN legs, so a
-    # single dead target would stop seventeen healthy parsers being fuzzed that night. That is
+    # an implicit `success()`: one crate failing to build would skip ALL TWENTY-ONE legs, so a
+    # single dead target would stop twenty healthy parsers being fuzzed that night. That is
     # a strictly worse version of the failure this PR exists to fix, and `fail-fast: false`
     # below says the opposite is intended. The ordering is kept for the log; the suppression
     # is not.
@@ -184,6 +192,15 @@ jobs:
             target: claim_mapping
           - dir: crates/ironauth-connector
             target: connector_def
+          # The SAML harness (issue #138, criterion 6). One target per path the issue
+          # names: the XML parse, exclusive canonicalization, and signature verification.
+          # All three read bytes an unauthenticated party posts to an assertion consumer.
+          - dir: crates/ironauth-saml
+            target: saml_parse
+          - dir: crates/ironauth-saml
+            target: saml_canonicalize
+          - dir: crates/ironauth-saml
+            target: saml_verify
     steps:
       - uses: actions/checkout@v7
       # cargo-fuzz needs a nightly toolchain for the sanitizer build. The

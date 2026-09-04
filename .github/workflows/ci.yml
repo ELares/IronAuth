@@ -999,6 +999,13 @@ jobs:
         run: scripts/http-audit.sh
       - name: jose audit (no second JOSE verification path outside ironauth-jose)
         run: scripts/jose-audit.sh
+      # Issue #138 criterion 6: the OWASP SAML checklist maps every item to a test or a written
+      # N/A, and the rows that name tests must name ones that EXIST. This lives in a script
+      # rather than in the checklist file because a Rust test cannot see the test registry: two
+      # earlier versions scanned the source for `fn <name>(` and both could report a row as
+      # covered by a function nothing runs. `cargo test -- --list` cannot be wrong about that.
+      - name: saml owasp checklist (every named test exists)
+        run: scripts/saml-owasp-checklist.sh
       - name: no M2M metering (no metering/billing/quota hook on the client-credentials path)
         run: scripts/no-m2m-metering.sh
       - name: dash scan
