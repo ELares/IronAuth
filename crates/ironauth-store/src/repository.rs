@@ -49476,6 +49476,49 @@ impl OrgMembershipRepo<'_> {
             .collect()
     }
 
+    /// One live membership, named by BOTH its organization and its user.
+    ///
+    /// # Why this is not `list_for_user` plus a filter in Rust
+    ///
+    /// [`Self::list_for_user`] takes no organization and no caller limit: it binds
+    /// [`MANAGEMENT_LIST_HARD_CAP`] directly and returns no cursor, so it cannot even read one
+    /// past the ceiling to notice it truncated. Selecting the organization from that page in Rust
+    /// therefore answers "not a member" for anyone whose membership sorts past the cap, and
+    /// nothing distinguishes that from the truth. A caller using it as a MEMBERSHIP FENCE gets a
+    /// fence that silently opens, which is the worst way for one to fail.
+    ///
+    /// The predicate belongs in the statement, where it cannot be truncated past.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. A user who is not a live member of this
+    /// organization is `Ok(None)`, not an error.
+    pub async fn for_user_in_org(
+        &self,
+        org_id: &OrganizationId,
+        user_id: &UserId,
+    ) -> Result<Option<OrgMembershipRecord>, StoreError> {
+        if org_id.scope() != self.scope || user_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_MEMBERSHIP_SELECT_COLUMNS} FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND user_id = $4 AND deleted_at IS NULL AND owner_kind = 'user'"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| org_membership_from_row(row, &self.scope))
+            .transpose()
+    }
+
     /// The organization's live member USER IDS, ordered by user id, for an outbound enumeration.
     ///
     /// Ordered by `user_id` rather than by `(created_at, id)`, and returning the USER id rather

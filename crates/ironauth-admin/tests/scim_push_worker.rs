@@ -29,8 +29,8 @@ use ironauth_admin::scim_push_transport::{
     ScimRequest, ScimResponse, ScimTransport, ScimTransportError,
 };
 use ironauth_admin::scim_push_worker::{
-    Pass, Progress, SubjectSource, WorkerError, run_backfill_pass, run_due_connections,
-    run_tail_pass,
+    Pass, Progress, SourceError, SubjectSource, WorkerError, run_backfill_pass,
+    run_due_connections, run_tail_pass,
 };
 use ironauth_env::Env;
 use ironauth_scim::downstream::{Downstream, Health};
@@ -236,7 +236,7 @@ impl SubjectSource for Directory {
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<Option<Value>, String>> + Send {
+    ) -> impl Future<Output = Result<Option<Value>, SourceError>> + Send {
         // COLLECTION-AWARE, because the worker addresses two different downstream endpoints and a
         // source that answered the same body for both would let a group be pushed as a user with
         // nothing noticing.
@@ -252,7 +252,7 @@ impl SubjectSource for Directory {
         &self,
         _collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<bool, String>> + Send {
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
         let out = self
             .out_of_scope
             .lock()
@@ -267,20 +267,18 @@ impl SubjectSource for Directory {
         collection: Collection,
         after: Option<&str>,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
+    ) -> impl Future<Output = Result<Vec<String>, SourceError>> + Send {
         // COLLECTION-AWARE, and the two maps are separate on purpose. A source that returned its
         // people again for the group pass would re-push every one of them under the wrong
         // resource type, and every assertion below would still hold. Most tests here add no
         // groups at all, so their group enumeration is empty and the users-to-groups handover
         // stays observable exactly as before.
         if collection == Collection::Group {
-            let out_of_scope = self.out_of_scope.lock().expect("lock").clone();
             let page: Vec<String> = self
                 .groups
                 .lock()
                 .expect("lock")
                 .keys()
-                .filter(|id| !out_of_scope.iter().any(|s| s == *id))
                 .filter(|id| after.is_none_or(|a| id.as_str() > a))
                 .take(limit)
                 .cloned()
@@ -290,14 +288,19 @@ impl SubjectSource for Directory {
         // A BTreeMap, so the order is total and stable across passes. That is what makes `after`
         // mean anything: an enumeration whose order changed between passes would let a resumed
         // backfill skip people, and nothing would ever come back for them.
-        let out_of_scope = self.out_of_scope.lock().expect("lock").clone();
+        //
+        // AND IT DOES NOT FILTER. It used to, and that made every scope test in this file pass
+        // for a reason production cannot reproduce: this double holds the whole directory in a
+        // map, so it can filter it and STILL fill a page, while a keyset read over a table that
+        // filters a page down to nothing has nothing to return and ends the enumeration. The
+        // contract now says "in scope or not" and `push_one` asks `in_scope` per subject; a
+        // double that keeps filtering is one that cannot observe that.
         let page: Vec<String> = self
             .people
             .lock()
             .expect("lock")
             .keys()
             .filter(|id| after.is_none_or(|a| id.as_str() > a))
-            .filter(|id| !out_of_scope.iter().any(|o| o == *id))
             .take(limit)
             .cloned()
             .collect();

@@ -117,28 +117,66 @@ impl From<PushError> for WorkerError {
 /// connection: whether a subject is in scope depends on the connection's filter, and the SCIM
 /// body depends on its attribute mapping. Keeping it a seam is also what lets this module's tests
 /// drive a real downstream and a real database without a full directory behind them.
+/// Why a [`SubjectSource`] could not answer.
+///
+/// # A source has to be able to say PERMANENT
+///
+/// The trait returned `String`, and both call sites wrapped it in [`WorkerError::Retryable`].
+/// That is right for a database that is down and wrong for everything a source refuses on its
+/// own terms: a group with more members than one SCIM body can carry, an attribute mapping that
+/// targets a reserved attribute, a scope filter that does not parse. None of those get better by
+/// being tried again, and a pass that returns `Retryable` never checkpoints -- so the connection
+/// re-read the same page, hit the same subject, and paused with a doubling backoff for ever,
+/// with every event behind it undelivered. It is the same wedge the per-subject refusal arm was
+/// added to close, reintroduced one layer down where that arm could not see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceError {
+    /// The source could not answer right now. Trying again may work.
+    Retryable(String),
+    /// The source will refuse this subject every time it is asked.
+    Permanent(String),
+}
+
+impl core::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Retryable(why) | Self::Permanent(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<SourceError> for WorkerError {
+    fn from(error: SourceError) -> Self {
+        match error {
+            SourceError::Retryable(why) => Self::Retryable(why),
+            SourceError::Permanent(why) => Self::Permanent(why),
+        }
+    }
+}
+
+/// Where a connection's subjects come from: who exists, who is in scope, and how to walk them.
 pub trait SubjectSource {
     /// The SCIM body for a subject, or `None` if it no longer exists.
     ///
     /// # Errors
     ///
-    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    /// [`SourceError`]. `Permanent` steps over the subject; `Retryable` stops the pass.
     fn resource(
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<Option<serde_json::Value>, String>> + Send;
+    ) -> impl Future<Output = Result<Option<serde_json::Value>, SourceError>> + Send;
 
     /// Whether the subject is inside this connection's scoping filter.
     ///
     /// # Errors
     ///
-    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    /// [`SourceError`]. `Permanent` steps over the subject; `Retryable` stops the pass.
     fn in_scope(
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<bool, String>> + Send;
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send;
 
     /// The next page of subject ids, in a stable order, after `after`, IN SCOPE OR NOT.
     ///
@@ -170,13 +208,13 @@ pub trait SubjectSource {
     ///
     /// # Errors
     ///
-    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    /// [`SourceError`]. `Permanent` steps over the subject; `Retryable` stops the pass.
     fn enumerate(
         &self,
         collection: Collection,
         after: Option<&str>,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<String>, String>> + Send;
+    ) -> impl Future<Output = Result<Vec<String>, SourceError>> + Send;
 }
 
 use std::future::Future;
@@ -486,7 +524,7 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
         .subjects
         .in_scope(collection, &subject_id)
         .await
-        .map_err(WorkerError::Retryable)?;
+        .map_err(WorkerError::from)?;
     // A LINK THAT HAS BEEN WITHDRAWN IS NOT A PROVISIONED SUBJECT. `scope_decision` reads the
     // link as "this connection provisioned them", and 0190 keeps the row after a withdrawal so a
     // rehire can resolve through it. Reading mere PRESENCE therefore made every later event for a
@@ -530,7 +568,7 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
         .subjects
         .resource(collection, &subject_id)
         .await
-        .map_err(WorkerError::Retryable)?
+        .map_err(WorkerError::from)?
     else {
         // The subject vanished between the event and this read. The next pass will carry its
         // deletion event, so nothing is done here rather than guessing.
@@ -631,7 +669,7 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
         .subjects
         .enumerate(collection, state.backfill_after_id.as_deref(), limit)
         .await
-        .map_err(WorkerError::Retryable)?;
+        .map_err(WorkerError::from)?;
 
     // AN EMPTY PAGE MEANS THE ENUMERATION IS DONE, and only then does the connection start
     // tailing, from the position that was read before any of this began.
@@ -707,7 +745,7 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
         .subjects
         .in_scope(collection, subject_id)
         .await
-        .map_err(WorkerError::Retryable)?
+        .map_err(WorkerError::from)?
     {
         progress.out_of_scope += 1;
         return Ok(());
@@ -716,7 +754,7 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
         .subjects
         .resource(collection, subject_id)
         .await
-        .map_err(WorkerError::Retryable)?
+        .map_err(WorkerError::from)?
     else {
         // Enumerated and then deleted. The tail will carry its deletion event.
         progress.ignored += 1;

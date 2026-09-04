@@ -24,12 +24,15 @@
 //! this module be about one question: what does IronAuth know about this subject.
 
 use ironauth_scim::{Filter, filter_matches};
-use ironauth_store::{OrganizationId, ScimPushConnection, ScopedStore, StoreError, UserState};
+use ironauth_store::{
+    MANAGEMENT_LIST_HARD_CAP, OrganizationId, ScimPushConnection, ScimPushConnectionId,
+    ScimPushResourceType, ScopedStore, StoreError, UserState,
+};
 use serde_json::{Map, Value};
 
 use crate::scim_push_events::Collection;
 use crate::scim_push_mapping::resource_for;
-use crate::scim_push_worker::SubjectSource;
+use crate::scim_push_worker::{SourceError, SubjectSource};
 
 /// The SCIM 2.0 core User schema URN (RFC 7643 section 4.1).
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
@@ -45,6 +48,21 @@ const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 /// because a group that syncs with some of its members is worse than one that refuses to sync:
 /// the downstream would enforce access for a membership IronAuth does not have.
 const MAX_GROUP_MEMBERS: i64 = 1000;
+
+/// The ceiling is only detectable if the store will actually SERVE one row past it.
+///
+/// The oversize probe asks for `MAX_GROUP_MEMBERS + 1` and calls the group too large when that
+/// many come back. Every paged read in the store clamps its limit to
+/// `MANAGEMENT_LIST_HARD_CAP + 1`, so a ceiling at or above that cap makes the probe ask for
+/// more than the store will ever return: `len()` could never exceed the ceiling and every group,
+/// however large, would be silently truncated to a partial `members` array instead.
+///
+/// A bound that is only correct because of a constant declared in another crate is a bound
+/// nobody will keep in step by reading it. This makes raising either one a compile error.
+const _: () = assert!(
+    MAX_GROUP_MEMBERS < MANAGEMENT_LIST_HARD_CAP + 1,
+    "MAX_GROUP_MEMBERS must leave room for the store's clamp to serve one row past it"
+);
 
 /// Why a subject could not be read or mapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,9 +108,29 @@ impl From<StoreError> for DirectoryError {
     }
 }
 
+impl From<DirectoryError> for SourceError {
+    /// # Which of these get better by being tried again
+    ///
+    /// Only the store one. A mapping that targets a reserved attribute, a filter that does not
+    /// parse and a group too large for one body are refusals this source will repeat every time
+    /// it is asked, and reporting them as retryable made the pass return without checkpointing:
+    /// the connection re-read the same page, hit the same subject, and paused with a doubling
+    /// backoff for ever while everything behind it went undelivered.
+    fn from(error: DirectoryError) -> Self {
+        let why = error.to_string();
+        match error {
+            DirectoryError::Store(_) => Self::Retryable(why),
+            DirectoryError::FilterInvalid(_)
+            | DirectoryError::MappingInvalid(_)
+            | DirectoryError::GroupTooLarge { .. } => Self::Permanent(why),
+        }
+    }
+}
+
 /// One organization's people and groups, as one outbound connection sees them.
 pub struct PushDirectory<'a> {
     store: &'a ScopedStore<'a>,
+    connection: ScimPushConnectionId,
     organization: OrganizationId,
     attribute_mapping: Value,
     /// PARSED ONCE, at construction. A filter that cannot be parsed is a configuration fault, and
@@ -124,6 +162,7 @@ impl<'a> PushDirectory<'a> {
         };
         Ok(Self {
             store,
+            connection: connection.id.clone(),
             organization: connection.organization_id.clone(),
             attribute_mapping: connection.attribute_mapping.clone(),
             user_filter: parse(connection.user_scope_filter.as_ref())?,
@@ -147,20 +186,28 @@ impl<'a> PushDirectory<'a> {
         let Ok(user_id) = self.store.users().parse_id(subject_id) else {
             return Ok(None);
         };
-        let Ok(user) = self.store.users().get(&user_id).await else {
-            return Ok(None);
+        // A STORE FAULT IS NOT AN ABSENCE, and conflating them deprovisions live people.
+        //
+        // This was `let Ok(user) = ... else { return Ok(None) }`, which put a connection reset, a
+        // statement timeout, a failover and a missing master key in the same arm as a deleted
+        // user. `None` is what the tail reads as "this person is gone": `scope_decision` turns it
+        // into a Withdraw and the connection deactivates them downstream. One database hiccup
+        // during a pass would have deprovisioned everybody in the page.
+        let user = match self.store.users().get(&user_id).await {
+            Ok(user) => user,
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
-        // MEMBERSHIP IS WHAT MAKES THEM THIS CONNECTION'S SUBJECT. A user who exists but is not a
-        // live member of this organization is not somebody this connection provisions, and
-        // answering `None` is what makes the worker step over them rather than push a stranger.
-        let membership = self
+        // MEMBERSHIP IS WHAT MAKES THEM THIS CONNECTION'S SUBJECT, and the predicate is in the
+        // statement. A user who is not a live member of this organization is not somebody this
+        // connection provisions, and answering `None` is what makes the worker step over them
+        // rather than push a stranger.
+        let Some(membership) = self
             .store
             .org_memberships()
-            .list_for_user(&user_id)
+            .for_user_in_org(&self.organization, &user_id)
             .await?
-            .into_iter()
-            .find(|record| record.organization_id == self.organization);
-        let Some(membership) = membership else {
+        else {
             return Ok(None);
         };
 
@@ -220,13 +267,17 @@ impl<'a> PushDirectory<'a> {
         let Ok(group_id) = self.store.org_groups().parse_id(subject_id) else {
             return Ok(None);
         };
-        let Ok(group) = self
+        // A STORE FAULT IS NOT AN ABSENCE. See `build_user`: `None` reads as "this group is gone"
+        // and the tail deprovisions it.
+        let group = match self
             .store
             .org_groups()
             .get_in_org(&self.organization, &group_id)
             .await
-        else {
-            return Ok(None);
+        {
+            Ok(group) => group,
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
 
         // ONE READ PAST THE CEILING, so a group at exactly the limit is served and one above it is
@@ -247,18 +298,49 @@ impl<'a> PushDirectory<'a> {
             .org_memberships()
             .users_for(&membership_ids)
             .await?;
-        // THE MEMBER VALUE IS THE SUBJECT ID THE WORKER PUSHES, which is the user id and not the
-        // membership id. A downstream resolves `members[].value` against what it was told the
-        // person's `externalId` is, and that is what `build_user` stamps.
-        let members: Vec<Value> = users
-            .iter()
-            .map(|(_, user_id)| {
-                Value::Object(Map::from_iter([(
-                    "value".to_owned(),
-                    Value::String(user_id.to_string()),
-                )]))
-            })
-            .collect();
+
+        // # A MEMBER REFERENCE IS THE DOWNSTREAM'S ID, AND ONLY FOR MEMBERS THIS CONNECTION SENT
+        //
+        // Two things were wrong with putting every member's IronAuth id in here.
+        //
+        // RFC 7643 section 4.2 says `members[].value` identifies the member AT THIS SERVER, so a
+        // downstream resolves it against ids IT issued. IronAuth's own subject id is not one, and
+        // the reference server refuses a membership it cannot resolve. The link table is where
+        // the id it did issue lives, recorded when the subject was provisioned.
+        //
+        // And the members were not filtered. A connection with a `user_scope_filter` is one an
+        // operator configured to send SOME of the organization, and the group body handed the
+        // downstream the identifier of every member including the ones the filter excludes. The
+        // filter reached `admits` for a User pushed on its own and never reached a User named
+        // inside a Group, so the confinement the operator configured had a hole in exactly the
+        // shape of their groups.
+        //
+        // A member with no link is omitted rather than refused: they are out of scope, or the
+        // backfill has not reached them yet. Groups are enumerated after users, and a membership
+        // event re-converges the group, so the reference appears once the person does.
+        let mut references = Vec::with_capacity(users.len());
+        for (_, user_id) in &users {
+            let member_subject = user_id.to_string();
+            if !self.admits_user(&member_subject).await? {
+                continue;
+            }
+            let link = self
+                .store
+                .scim_push_links()
+                .find(
+                    &self.connection,
+                    ScimPushResourceType::User,
+                    &member_subject,
+                )
+                .await?;
+            let Some(link) = link.filter(|l| l.deprovisioned_at_unix_micros.is_none()) else {
+                continue;
+            };
+            references.push(Value::Object(Map::from_iter([(
+                "value".to_owned(),
+                Value::String(link.downstream_id.clone()),
+            )])));
+        }
 
         let source = Value::Object(Map::from_iter([
             ("id".to_owned(), Value::String(subject_id.to_owned())),
@@ -271,7 +353,7 @@ impl<'a> PushDirectory<'a> {
                 "displayName".to_owned(),
                 Value::String(group.display_name.clone()),
             ),
-            ("members".to_owned(), Value::Array(members)),
+            ("members".to_owned(), Value::Array(references)),
             (
                 "parentId".to_owned(),
                 group
@@ -296,26 +378,68 @@ impl<'a> PushDirectory<'a> {
         .map_err(|error| DirectoryError::MappingInvalid(format!("{error:?}")))
     }
 
-    /// Whether this connection's filter admits `subject_id`.
+    /// Whether `subject_id` is this connection's to push: in its organization, and admitted by
+    /// its filter if it has one.
+    ///
+    /// # The organization check is not optional, and skipping it was a cross-organization leak
+    ///
+    /// An earlier version returned `true` without reading anything when no filter was configured,
+    /// on the grounds that the connection is attached to one organization and every read here is
+    /// confined to it. That sentence is true of `build`. It was not true of this method, which on
+    /// that path never called `build` at all and answered `true` for any string.
+    ///
+    /// The worker relies on this for confinement and says so: the event feed is ENVIRONMENT-wide,
+    /// and the fence in `apply_one` can only filter events whose schema names an organization.
+    /// `user.deleted` and `user.deprovisioned` name none, so they are decided here. With no
+    /// filter -- the default the management surface allows -- a deletion in organization B
+    /// reached organization A's connection as an in-scope departure, and A's client sent
+    /// `GET /Users?filter=externalId eq "<B's user id>"` to A's downstream. On a downstream both
+    /// organizations point at, the match lands and the subject is deactivated on a connection
+    /// that was never authorized for them.
+    ///
+    /// So the membership read happens whatever the filter says, and the filter narrows what is
+    /// left. It costs a read the old path skipped; a fence that fails open on the default
+    /// configuration is not a fence.
     async fn admits(
         &self,
         collection: Collection,
         subject_id: &str,
     ) -> Result<bool, DirectoryError> {
-        let filter = match collection {
-            Collection::User => self.user_filter.as_ref(),
-            Collection::Group => self.group_filter.as_ref(),
+        match collection {
+            Collection::User => self.admits_user(subject_id).await,
+            Collection::Group => self.admits_group(subject_id).await,
+        }
+    }
+
+    /// [`Self::admits`] for a person.
+    ///
+    /// SPELLED OUT PER COLLECTION rather than dispatched inside one body, because `build_group`
+    /// asks this about each member: routing that through the general form makes `build` call
+    /// itself, which an `async fn` cannot do without boxing. Splitting it says in the type system
+    /// what is true in fact -- a group's members are people, and deciding a person never asks
+    /// about a group.
+    async fn admits_user(&self, subject_id: &str) -> Result<bool, DirectoryError> {
+        // ALWAYS. `build_user` is the only thing that establishes this person belongs to this
+        // organization, through `for_user_in_org`.
+        let Some(resource) = self.build_user(subject_id).await? else {
+            return Ok(false);
         };
-        let Some(filter) = filter else {
-            // NO FILTER MEANS EVERYONE IN THE ORGANIZATION, which is the whole scope already: the
-            // connection is attached to one organization and every read here is confined to it.
+        let Some(filter) = self.user_filter.as_ref() else {
             return Ok(true);
         };
         // EVALUATED AGAINST THE MAPPED RESOURCE, not against the source. An operator writes the
         // filter in SCIM attribute names because that is what the connection is configured in;
         // evaluating it against IronAuth's own field names would silently match nothing.
-        let Some(resource) = self.build(collection, subject_id).await? else {
+        Ok(filter_matches(filter, &resource))
+    }
+
+    /// [`Self::admits`] for a group.
+    async fn admits_group(&self, subject_id: &str) -> Result<bool, DirectoryError> {
+        let Some(resource) = self.build_group(subject_id).await? else {
             return Ok(false);
+        };
+        let Some(filter) = self.group_filter.as_ref() else {
+            return Ok(true);
         };
         Ok(filter_matches(filter, &resource))
     }
@@ -326,12 +450,12 @@ impl SubjectSource for PushDirectory<'_> {
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<Option<Value>, String>> + Send {
+    ) -> impl Future<Output = Result<Option<Value>, SourceError>> + Send {
         let subject_id = subject_id.to_owned();
         async move {
             self.build(collection, &subject_id)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(Into::into)
         }
     }
 
@@ -339,12 +463,12 @@ impl SubjectSource for PushDirectory<'_> {
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<bool, String>> + Send {
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send {
         let subject_id = subject_id.to_owned();
         async move {
             self.admits(collection, &subject_id)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(Into::into)
         }
     }
 
@@ -353,7 +477,7 @@ impl SubjectSource for PushDirectory<'_> {
         collection: Collection,
         after: Option<&str>,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
+    ) -> impl Future<Output = Result<Vec<String>, SourceError>> + Send {
         let after = after.map(str::to_owned);
         async move {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -371,7 +495,7 @@ impl SubjectSource for PushDirectory<'_> {
                         .await
                 }
             }
-            .map_err(|error| DirectoryError::from(error).to_string())?;
+            .map_err(|error| SourceError::from(DirectoryError::from(error)))?;
             // UNFILTERED, and that is the contract. Filtering here can empty a page while the
             // organization still has people in it, and an empty page tells the worker the
             // collection is finished: everybody after that page would be skipped for good. The

@@ -23,18 +23,21 @@ use axum::body::Body;
 use axum::http::Request;
 use ironauth_admin::scim_push_client::{DeletionPolicy, ScimPushClient, WriteMode};
 use ironauth_admin::scim_push_directory::PushDirectory;
+use ironauth_admin::scim_push_events::Collection;
 use ironauth_admin::scim_push_transport::{
     ScimRequest, ScimResponse, ScimTransport, ScimTransportError,
 };
-use ironauth_admin::scim_push_worker::{Pass, run_backfill_pass};
+use ironauth_admin::scim_push_worker::{
+    Pass, SourceError, SubjectSource, WorkerError, run_backfill_pass,
+};
 use ironauth_env::Env;
 use ironauth_scim::downstream::Downstream;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     CorrelationId, NewAdminUser, NewMembership, NewOrgGroup, NewOrgGroupMember,
     NewScimPushConnection, NewUserTraits, ORG_GROUP_MAX_DEPTH_CEILING, OrgGroupId,
-    OrgGroupMemberId, OrgMembershipId, OrganizationId, ScimDeletionPolicy, ScimPushConnectionId,
-    ScimWriteMode, Scope, TraitWriteVisibility, UserId, UserState,
+    OrgGroupMemberId, OrgMembershipId, OrganizationId, ScimDeletionPolicy, ScimPushConnection,
+    ScimPushConnectionId, ScimWriteMode, Scope, TraitWriteVisibility, UserId, UserState,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -136,6 +139,80 @@ impl Org {
             .await
             .expect("create organization");
         Self { db, env, scope, id }
+    }
+
+    /// A SECOND organization in the same environment, for the confinement tests.
+    ///
+    /// The same environment on purpose: the event feed is environment-wide, so the interesting
+    /// neighbour is one whose events this connection will actually read.
+    async fn sibling(&self, display_name: &str) -> OrganizationId {
+        let id = OrganizationId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .management()
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .organizations(self.scope)
+            .create(&self.env, &id, now_micros(&self.env), display_name, None)
+            .await
+            .expect("create the sibling organization");
+        id
+    }
+
+    /// An active user bound into `organization` rather than into this one.
+    async fn member_of(&self, organization: &OrganizationId, identifier: &str) -> UserId {
+        let user = self
+            .db
+            .control_store()
+            .scoped(self.scope)
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .users()
+            .admin_create(
+                &self.env,
+                NewAdminUser {
+                    id: None,
+                    identifier,
+                    password_hash: Some(PASSWORD_HASH),
+                    claims_json: None,
+                    external_id: None,
+                    state: UserState::Active,
+                    foreign_password_hash: None,
+                    foreign_password_algo: None,
+                    traits: None,
+                },
+                now_micros(&self.env),
+                None,
+            )
+            .await
+            .expect("create active user");
+        let membership_id = OrgMembershipId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .management()
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .org_memberships(self.scope)
+            .create(
+                &self.env,
+                NewMembership {
+                    id: &membership_id,
+                    organization_id: organization,
+                    user_id: &user,
+                    metadata: None,
+                },
+                now_micros(&self.env),
+                None,
+            )
+            .await
+            .expect("bind user into the sibling organization");
+        user
     }
 
     /// An active user, bound into the organization, with `traits`.
@@ -451,10 +528,33 @@ async fn a_group_carries_its_name_and_its_members_with_no_mapping_configured() {
         2,
         "the group arrived short of members: {provisioned}"
     );
+    // A MEMBER REFERENCE IS THE DOWNSTREAM'S OWN ID FOR THAT PERSON, not IronAuth's. RFC 7643
+    // section 4.2 says `members[].value` identifies the member AT THIS SERVER, so a reference
+    // carrying a foreign id is one no downstream can resolve: the group stores and the
+    // membership means nothing.
+    //
+    // The expected values are DERIVED from what the downstream stored for each person, so a
+    // change to how either side mints ids cannot make this assertion quietly wrong.
+    let downstream_users = downstream.users();
+    let id_of = |subject: &UserId| -> String {
+        downstream_users
+            .values()
+            .find(|u| u["externalId"].as_str() == Some(subject.to_string().as_str()))
+            .and_then(|u| u["id"].as_str())
+            .unwrap_or_else(|| {
+                panic!("{subject} was never provisioned, so it has no downstream id")
+            })
+            .to_owned()
+    };
+    let (ada_id, grace_id) = (id_of(&ada), id_of(&grace));
     assert!(
-        members.contains(&ada.to_string().as_str())
-            && members.contains(&grace.to_string().as_str()),
-        "the members are not the people the group holds: {provisioned}"
+        members.contains(&ada_id.as_str()) && members.contains(&grace_id.as_str()),
+        "the members are not the downstream ids of the people the group holds: {provisioned}"
+    );
+    assert!(
+        !members.contains(&ada.to_string().as_str()),
+        "a member reference carries IronAuth's own id, which no downstream can resolve: \
+         {provisioned}"
     );
     // AND NO `active`, which RFC 7643 section 4.2 gives Group no room for and which the client's
     // deactivate refusal reads.
@@ -534,4 +634,282 @@ async fn a_page_of_people_the_filter_excludes_does_not_end_the_enumeration() {
         "the enumeration stopped at the first excluded page, so the one in-scope person, who \
          sorts last, was never provisioned: {users:?}"
     );
+}
+
+#[tokio::test]
+async fn a_person_from_another_organization_is_not_this_connections_subject() {
+    // WHY THIS EXISTS, and it was a CROSS-ORGANIZATION LEAK.
+    //
+    // `admits` returned true without reading anything when the connection had no scope filter --
+    // the default the management surface allows -- on the grounds that the connection is attached
+    // to one organization and every read is confined to it. That sentence was true of `build`.
+    // It was not true of `admits`, which on that path never called `build` and answered true for
+    // any string at all.
+    //
+    // The worker relies on this for confinement and says so: the event feed is ENVIRONMENT-wide,
+    // and the fence in `apply_one` can only filter events whose schema NAMES an organization.
+    // `user.deleted` names none. So a deletion in organization B reached organization A's
+    // connection as an in-scope departure, and A's client sent
+    // `GET /Users?filter=externalId eq "<B's user id>"` to A's downstream -- disclosing B's
+    // subject id, and on a downstream both organizations point at, deactivating them there.
+    let org = Org::start().await;
+    let (ours, _) = org.member("ada@globex.example", None).await;
+    let neighbour = org.sibling("Initech").await;
+    let theirs = org.member_of(&neighbour, "bob@initech.example").await;
+
+    // NO FILTER, which is the configuration the defect needed and the one an operator gets by
+    // default.
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = PushDirectory::new(&store, &record).expect("the filters parse");
+
+    assert!(
+        directory
+            .in_scope(Collection::User, &ours.to_string())
+            .await
+            .expect("in_scope answers"),
+        "our own member is not in scope, so this connection would provision nobody"
+    );
+    assert!(
+        !directory
+            .in_scope(Collection::User, &theirs.to_string())
+            .await
+            .expect("in_scope answers"),
+        "a person who belongs to another organization is in scope for this connection: {theirs}"
+    );
+    assert!(
+        directory
+            .resource(Collection::User, &theirs.to_string())
+            .await
+            .expect("resource answers")
+            .is_none(),
+        "another organization's person has a body on this connection: {theirs}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_member_the_scope_filter_excludes_is_not_named_in_the_group() {
+    // WHY THIS EXISTS. The connection's `user_scope_filter` reached `admits` for a person pushed
+    // on their own and never reached a person NAMED INSIDE A GROUP, so the group body handed the
+    // downstream the identifier of every member including the ones the operator's filter excludes.
+    // The confinement they configured had a hole in exactly the shape of their groups.
+    //
+    // THE FILTER HAS TO NARROW AFTER THE PERSON IS PROVISIONED, and the first version of this
+    // test missed that. A member reference is resolved through the link table, so somebody the
+    // filter excluded from the start has no link and is dropped for that reason instead: removing
+    // the scope check entirely left the test green. Narrowing an EXISTING connection is the shape
+    // where the link is live and the filter is the only thing that can exclude them -- and it is
+    // the ordinary operational case, an operator tightening a filter on a running connection.
+    let org = Org::start().await;
+    let (kept, kept_membership) = org
+        .member("kept@globex.example", Some(&json!({ "dept": "eng" })))
+        .await;
+    let (excluded, excluded_membership) = org
+        .member("excluded@globex.example", Some(&json!({ "dept": "sales" })))
+        .await;
+    let group = org.group("engineering", "Engineering").await;
+    org.bind(&group, &kept_membership).await;
+    org.bind(&group, &excluded_membership).await;
+
+    // FIRST, with no filter: both people are provisioned and both hold live links.
+    let mapping = json!({ "userName": "identifier", "title": "traits.dept" });
+    let connection = org.connection(&mapping, None).await;
+    let downstream = backfill(&org, &connection, 10).await;
+    let users = downstream.users();
+    assert_eq!(users.len(), 2, "both were not provisioned: {users:?}");
+    let downstream_id = |subject: &UserId| -> String {
+        users
+            .values()
+            .find(|u| u["externalId"].as_str() == Some(subject.to_string().as_str()))
+            .and_then(|u| u["id"].as_str())
+            .expect("provisioned, so it has a downstream id")
+            .to_owned()
+    };
+    let (kept_id, excluded_id) = (downstream_id(&kept), downstream_id(&excluded));
+
+    let store = org.db.store().scoped(org.scope);
+    let before = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let wide = PushDirectory::new(&store, &before).expect("the filters parse");
+    let group_body = wide
+        .resource(Collection::Group, &group.to_string())
+        .await
+        .expect("the group builds")
+        .expect("the group exists");
+    let wide_members = member_values(&group_body);
+    assert!(
+        wide_members.contains(&kept_id) && wide_members.contains(&excluded_id),
+        "the unfiltered connection did not name both members, so narrowing proves nothing: \
+         {group_body}"
+    );
+
+    // NOW THE OPERATOR NARROWS IT. Both links are still live; only the filter changes.
+    let narrowed = ScimPushConnection {
+        user_scope_filter: Some("title eq \"eng\"".to_owned()),
+        ..before
+    };
+    let directory = PushDirectory::new(&store, &narrowed).expect("the filters parse");
+    let group_body = directory
+        .resource(Collection::Group, &group.to_string())
+        .await
+        .expect("the group builds")
+        .expect("the group exists");
+    let members = member_values(&group_body);
+    assert_eq!(
+        members,
+        vec![kept_id],
+        "the group names a member this connection's filter excludes, whose link is still live: \
+         {group_body}"
+    );
+}
+
+/// The `members[].value` references of a SCIM Group body.
+fn member_values(group: &Value) -> Vec<String> {
+    group["members"]
+        .as_array()
+        .expect("members is an array")
+        .iter()
+        .filter_map(|m| m["value"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_store_fault_reading_a_person_is_reported_rather_than_read_as_a_departure() {
+    // WHY THIS EXISTS. `build_user` opened with `let Ok(user) = ... else { return Ok(None) }`,
+    // which put a connection reset, a statement timeout, a failover and a missing master key in
+    // the same arm as a deleted user. `None` is what the tail reads as "this person is gone":
+    // `scope_decision` turns it into a Withdraw and the connection deactivates them downstream.
+    // One database hiccup during a pass would have deprovisioned the whole page.
+    //
+    // THE FAULT IS INJECTED, not simulated. Revoking the app role's SELECT makes the read fail
+    // with SQLSTATE 42501, which is a `StoreError::Database` and not a `NotFound` -- the exact
+    // distinction the arm has to make. A test that only deleted the row would exercise the arm
+    // that already worked.
+    let org = Org::start().await;
+    let (ada, _) = org.member("ada@globex.example", None).await;
+    let connection = org.connection(&json!({}), None).await;
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = PushDirectory::new(&store, &record).expect("the filters parse");
+
+    // The control: the same call answers a body while the read works.
+    assert!(
+        directory
+            .resource(Collection::User, &ada.to_string())
+            .await
+            .expect("resource answers")
+            .is_some(),
+        "the fixture cannot read this person at all, so the fault case proves nothing"
+    );
+
+    sqlx::query("REVOKE SELECT ON users FROM ironauth_app")
+        .execute(org.db.owner_pool())
+        .await
+        .expect("revoke the read");
+
+    let faulted = directory.resource(Collection::User, &ada.to_string()).await;
+
+    sqlx::query("GRANT SELECT ON users TO ironauth_app")
+        .execute(org.db.owner_pool())
+        .await
+        .expect("restore the read");
+
+    match faulted {
+        Err(SourceError::Retryable(_)) => {}
+        Ok(None) => panic!(
+            "a store fault was reported as an absence, which the tail turns into a deprovision"
+        ),
+        other => panic!("a store fault must be retryable, not {other:?}"),
+    }
+
+    // AND THE CONTROL AGAIN, so a permanently broken fixture cannot pass the assertion above.
+    assert!(
+        directory
+            .resource(Collection::User, &ada.to_string())
+            .await
+            .expect("resource answers once the read is restored")
+            .is_some(),
+        "the grant was not restored, so the assertion above proved nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_mapping_the_source_will_always_refuse_is_permanent_rather_than_a_wedge() {
+    // WHY THIS EXISTS. `SubjectSource` returned `String` and both call sites wrapped it in
+    // `WorkerError::Retryable`. A source refusal that can never succeed -- a mapping targeting a
+    // reserved attribute, a group too large for one body -- therefore stopped the pass without
+    // checkpointing: the connection re-read the same page, hit the same subject, and paused with
+    // a doubling backoff for ever, with everything behind it undelivered. It is the same wedge
+    // the per-subject refusal arm exists to close, one layer down where that arm could not see it.
+    //
+    // The mapping is written STRAIGHT TO THE COLUMN because the management surface refuses this
+    // one at write time. That is the right place for it to be refused and it is not the only way
+    // such a mapping can arrive: a mapping stored before a rule existed, or a reserved attribute
+    // added later, reaches the worker the same way.
+    let org = Org::start().await;
+    org.member("ada@globex.example", None).await;
+    let connection = org.connection(&json!({}), None).await;
+    sqlx::query("UPDATE scim_push_connections SET attribute_mapping = $1::jsonb WHERE id = $2")
+        .bind(r#"{"active":"traits.enabled"}"#)
+        .bind(connection.to_string())
+        .execute(org.db.owner_pool())
+        .await
+        .expect("store a mapping the surface would refuse");
+
+    let store = org.db.store().scoped(org.scope);
+    let record = store
+        .scim_push_connections()
+        .find_in_org(&org.id, &connection)
+        .await
+        .expect("read the connection")
+        .expect("the connection exists");
+    let directory = PushDirectory::new(&store, &record).expect("the filters parse");
+    let client = ScimPushClient::new(
+        FixtureTransport {
+            downstream: Downstream::new(TOKEN),
+        },
+        BASE,
+        TOKEN,
+        WriteMode::Patch,
+    );
+    let outcome = run_backfill_pass(
+        &store,
+        Pass {
+            connection_id: &connection,
+            client: &client,
+            subjects: &directory,
+            deletion_policy: DeletionPolicy::Deactivate,
+            limit: 10,
+            scope: org.scope,
+            now_unix_micros: now_micros(&org.env),
+            organization_id: org.id.to_string(),
+        },
+    )
+    .await;
+
+    // PERMANENT, not retryable. Retryable is what pauses the connection and re-reads the page.
+    match outcome {
+        Err(WorkerError::Permanent(why)) => assert!(
+            why.contains("mapping"),
+            "the refusal does not say what an operator has to fix: {why}"
+        ),
+        other => panic!(
+            "a mapping this source will refuse every time was not reported as permanent: {other:?}"
+        ),
+    }
 }
