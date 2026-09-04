@@ -74,9 +74,13 @@ CREATE TABLE scim_push_links (
         CHECK (downstream_id <> '' AND octet_length(downstream_id) <= 512),
     CONSTRAINT scim_push_links_external_id_shaped
         CHECK (external_id <> '' AND octet_length(external_id) <= 512),
-    -- OCTET_LENGTH, not `char_length`, because the surface that refuses these first counts
-    -- BYTES. Two bounds on one value must agree on the unit or one of them is unreachable and
-    -- the other produces a 500 nobody predicted; 0189 records being caught by exactly that.
+    -- OCTET_LENGTH, not `char_length`, and the reason is about a surface that does not exist
+    -- YET. Nothing refuses an over-long `downstream_id` before this column does: the value comes
+    -- from the downstream, not from a request, so there is no handler to check it. When one
+    -- arrives it will count BYTES like every other bound in this schema, and two bounds on one
+    -- value that disagree on the unit leave one unreachable and turn the other into a 500 nobody
+    -- predicted. 0189 records being caught by exactly that, which is why the unit is settled now
+    -- rather than when the second bound is written.
     CONSTRAINT scim_push_links_last_error_bounded
         CHECK (last_error IS NULL OR octet_length(last_error) <= 2048),
 
@@ -94,7 +98,7 @@ CREATE TABLE scim_push_links (
     -- subject in ONE downstream, and with the connection gone there is no downstream to address
     -- and no credential to address it with. Keeping the rows would preserve ids nothing can use.
     --
-    -- `scim_push_connections_delete_cascades_its_links` drives it.
+    -- `deleting_the_connection_takes_its_links_with_it` in tests/scim_push_links.rs drives it.
     FOREIGN KEY (connection_id) REFERENCES scim_push_connections (id) ON DELETE CASCADE
 );
 
@@ -135,10 +139,20 @@ CREATE POLICY scim_push_links_scope ON scim_push_links
 --
 -- SELECT, INSERT and a COLUMN-SCOPED UPDATE, which is exactly what the repository methods in
 -- this change perform: `upsert` writes a link and refreshes what a re-push changes, and
--- `record_failure` writes the error columns. The identity columns are NOT updatable: a link
--- whose `subject_id` or `downstream_id` could be re-pointed in place would let one bug silently
--- redirect a person's provisioning at another person's downstream record, and re-pointing is
--- what a DELETE and an INSERT are for -- two rows in the log rather than one that says "edited".
+-- `record_failure` writes the error columns.
+--
+-- WHAT THE COLUMN LIST ACTUALLY WITHHOLDS is `subject_id`, and only `subject_id`. A link whose
+-- subject could be re-pointed in place would let one bug silently redirect a person's
+-- provisioning at another person's downstream record, and the scope columns are withheld for the
+-- same reason: a row that could move between tenants is a cross-tenant write waiting to happen.
+--
+-- `downstream_id` IS updatable, deliberately, and an earlier draft of this comment claimed the
+-- opposite while the GRANT below said otherwise. It has to be: RFC 7643 section 3.1 makes the id
+-- the DOWNSTREAM's to issue, so a downstream that is rebuilt reissues it for the same person, and
+-- a link that could not follow would address a resource that no longer exists for ever. The
+-- protection against a re-point being a silent redirect is not the grant, it is the second unique
+-- index above: one downstream id names one subject, so a re-point that collided with another
+-- subject's resource is a 23505 rather than an overwrite.
 --
 -- No DELETE grant. Nothing in this change deletes a link: a deprovision leaves the link so a
 -- rehire resolves through it, exactly as 0184 argues for the inbound direction, and a connection

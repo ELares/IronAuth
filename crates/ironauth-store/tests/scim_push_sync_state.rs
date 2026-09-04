@@ -149,7 +149,12 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
     // arriving through the one door the externalId lookup does not cover.
     let early = store
         .scim_push_sync_state()
-        .advance(&connection, "cursor-1", Some(now_micros(&env)))
+        .advance(
+            &connection,
+            Some("cursor-0"),
+            "cursor-1",
+            Some(now_micros(&env)),
+        )
         .await;
     assert!(
         matches!(early, Err(StoreError::NotFound)),
@@ -165,7 +170,12 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, "cursor-1", Some(now_micros(&env)))
+        .advance(
+            &connection,
+            Some("cursor-0"),
+            "cursor-1",
+            Some(now_micros(&env)),
+        )
         .await
         .expect("tailing starts once the backfill is done");
 
@@ -226,6 +236,201 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
 }
 
 #[tokio::test]
+async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_tailing() {
+    // WHY THIS EXISTS. `complete_backfill` writes `cursor`, and the value it writes was measured
+    // by nothing: every call in this file was followed immediately by an `advance` that supplied
+    // its own cursor, so deleting `cursor = $4` from the statement left all six tests green. The
+    // five-line doc comment arguing for that exact value was decoration.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection)
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection, "feed-head-at-enumeration")
+        .await
+        .expect("complete");
+
+    // READ IT BACK BEFORE ANYTHING ELSE WRITES. The tail must resume from the position the
+    // caller read BEFORE enumerating, so the overlap is re-applied idempotently rather than lost.
+    let after = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(
+        after.cursor.as_deref(),
+        Some("feed-head-at-enumeration"),
+        "the backfill did not store the position it was given"
+    );
+
+    // AND IT CANNOT RUN AGAIN OVER A LIVE CURSOR.
+    //
+    // This is the critical half. Without a `backfill_state = 'running'` predicate the statement
+    // writes `cursor` on any row it can see, so a worker that restarted, read the CURRENT feed
+    // head and re-enumerated would overwrite a cursor that was already tailing. Every event
+    // between the old position and the new head is then behind the checkpoint and nothing
+    // re-reads it: silent loss, which is the inverse of "pause rather than drop".
+    store
+        .scim_push_sync_state()
+        .advance(
+            &connection,
+            Some("feed-head-at-enumeration"),
+            "seq-9000",
+            None,
+        )
+        .await
+        .expect("tail");
+    let clobber = store
+        .scim_push_sync_state()
+        .complete_backfill(&connection, "seq-9500")
+        .await;
+    assert!(
+        matches!(clobber, Err(StoreError::NotFound)),
+        "a second complete_backfill moved a live cursor: {clobber:?}"
+    );
+    let unmoved = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(
+        unmoved.cursor.as_deref(),
+        Some("seq-9000"),
+        "the cursor moved anyway"
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused() {
+    // NOTHING ELECTS A SINGLE WORKER PER CONNECTION. Two processes, or one restarted before its
+    // predecessor noticed, both read a page and both checkpoint. A bare `SET cursor = $n` lets
+    // the slower one land last and move the cursor BACKWARDS, so events are re-read; in the
+    // mirror case it lands ahead and events are never read at all.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection)
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection, "seq-100")
+        .await
+        .expect("complete");
+
+    // Worker A reads seq-100, does its work, and checkpoints. It wins.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some("seq-100"), "seq-200", None)
+        .await
+        .expect("the first writer checkpoints");
+
+    // Worker B read seq-100 too, and is slower. Its checkpoint would rewind the cursor by a
+    // hundred events, every one of which has already been pushed downstream.
+    let stale = store
+        .scim_push_sync_state()
+        .advance(&connection, Some("seq-100"), "seq-150", None)
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::NotFound)),
+        "a stale writer moved the cursor: {stale:?}"
+    );
+    let held = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(held.cursor.as_deref(), Some("seq-200"));
+
+    // CONTROL: the winner can carry on, so the refusal above is the stale expectation and not
+    // the connection being wedged.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some("seq-200"), "seq-300", None)
+        .await
+        .expect("the current holder continues");
+}
+
+#[tokio::test]
+async fn a_rebuilt_downstream_can_be_enumerated_again() {
+    // A completed backfill used to be a dead end: `begin_backfill` is ON CONFLICT DO NOTHING, so
+    // nothing could return a row to `running`. That is wrong for the case this feature exists to
+    // survive. A downstream that is rebuilt comes back EMPTY, and tailing from a stored cursor
+    // never re-creates the resources that predate it: the connection sits healthy, cursor
+    // advancing, provisioning nobody who was already there.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection)
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection, "seq-100")
+        .await
+        .expect("complete");
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some("seq-100"), "seq-500", None)
+        .await
+        .expect("tail");
+
+    store
+        .scim_push_sync_state()
+        .restart_backfill(&connection)
+        .await
+        .expect("re-enumerate");
+
+    let restarted = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(restarted.backfill_state, ScimPushBackfillState::Running);
+    // THE CURSOR IS CLEARED, which is what makes this safe rather than merely possible: a
+    // connection that went back to enumerating must not also be tailing, and that is the
+    // invariant the column CHECK states.
+    assert_eq!(
+        restarted.cursor, None,
+        "a re-enumerating connection was left tailing: {restarted:?}"
+    );
+    assert_eq!(restarted.backfill_after, None);
+
+    // AND TAILING IS REFUSED AGAIN until the new enumeration finishes.
+    let early = store
+        .scim_push_sync_state()
+        .advance(&connection, None, "seq-600", None)
+        .await;
+    assert!(
+        matches!(early, Err(StoreError::NotFound)),
+        "a re-enumerating connection could tail: {early:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -246,7 +451,12 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, "cursor-7", Some(now_micros(&env)))
+        .advance(
+            &connection,
+            Some("cursor-0"),
+            "cursor-7",
+            Some(now_micros(&env)),
+        )
         .await
         .expect("advance");
 
@@ -296,7 +506,12 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
     // outage would need an operator to clear it, and nothing would tell them to.
     store
         .scim_push_sync_state()
-        .advance(&connection, "cursor-8", Some(now_micros(&env)))
+        .advance(
+            &connection,
+            Some("cursor-7"),
+            "cursor-8",
+            Some(now_micros(&env)),
+        )
         .await
         .expect("advance after recovery");
     let recovered = store
@@ -308,6 +523,148 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
     assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.last_error, None);
     assert_eq!(recovered.paused_until_unix_micros, None);
+}
+
+#[tokio::test]
+async fn a_failure_without_a_new_deadline_leaves_the_pause_that_is_already_running() {
+    // WHY THIS EXISTS. `record_failure` took `paused_until: Option<i64>` and wrote it straight
+    // in, so `None` CLEARED a pause that was already running. A connection in a backoff would be
+    // un-paused by the next failure that happened not to compute a new deadline, which is the
+    // opposite of what a failure should do: it would resume hammering a downstream that is
+    // already failing, and the backoff would never lengthen.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection)
+        .await
+        .expect("begin");
+
+    let deadline = now_micros(&env) + 300_000_000;
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "downstream answered 503", Some(deadline))
+        .await
+        .expect("the first failure sets a pause");
+    let paused = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    let held = paused
+        .paused_until_unix_micros
+        .expect("the first failure paused the connection");
+
+    // A SECOND FAILURE WITH NO DEADLINE. The count still rises, the message is still recorded,
+    // and the pause is LEFT ALONE.
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "downstream answered 503 again", None)
+        .await
+        .expect("the second failure records");
+    let still = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(
+        still.paused_until_unix_micros,
+        Some(held),
+        "a failure with no deadline cleared the pause that was running"
+    );
+    assert_eq!(still.consecutive_failures, 2);
+
+    // CONTROL: a failure that DOES carry a deadline still moves it, so the behaviour above is
+    // "leave it alone", not "never write it".
+    let later = held + 600_000_000;
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "still failing", Some(later))
+        .await
+        .expect("the third failure extends the pause");
+    let extended = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(extended.paused_until_unix_micros, Some(later));
+}
+
+#[tokio::test]
+async fn the_due_index_can_serve_a_pause_that_has_expired() {
+    // WHY AN INDEX HAS A TEST.
+    //
+    // The first version was `WHERE paused_until IS NULL`, and a pause here is a self-clearing
+    // DEADLINE: the worker's due query is `paused_until IS NULL OR paused_until <= now()`. A
+    // partial index holding only the NULL rows can never serve the second half, so a connection
+    // whose outage had ENDED was excluded from the index for ever. That is the exact opposite of
+    // the recovery property the deadline was chosen for, and no behavioural test can see it: the
+    // rows are still correct, they are just unreachable by the plan the worker will use.
+    //
+    // So this asserts the index DEFINITION, which is the only place the property lives.
+    let db = TestDatabase::start().await;
+    let definition: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'scim_push_sync_state_due'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the due index exists");
+
+    assert!(
+        !definition.to_ascii_uppercase().contains(" WHERE "),
+        "the due index is partial, so an expired pause is unreachable through it: {definition}"
+    );
+    assert!(
+        definition.contains("paused_until"),
+        "the due index cannot range-scan expired pauses: {definition}"
+    );
+    assert!(
+        definition.contains("last_polled_at"),
+        "the due index cannot order the work: {definition}"
+    );
+
+    // AND THE QUERY THE WORKER WILL ACTUALLY RUN returns a connection whose pause has passed.
+    // The index assertions above are about the plan; this is about the answer.
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection)
+        .await
+        .expect("begin");
+    // A pause that expired a minute ago.
+    store
+        .scim_push_sync_state()
+        .record_failure(
+            &connection,
+            "past outage",
+            Some(now_micros(&env) - 60_000_000),
+        )
+        .await
+        .expect("record");
+
+    let due: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM scim_push_sync_state          WHERE tenant_id = $1 AND environment_id = $2            AND (paused_until IS NULL OR paused_until <= now())",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the due query runs");
+    assert_eq!(
+        due, 1,
+        "a connection whose pause has expired is not due, so it would never run again"
+    );
 }
 
 #[tokio::test]
@@ -332,7 +689,7 @@ async fn an_empty_poll_is_distinguishable_from_a_wedged_worker() {
     let applied_at = now_micros(&env);
     store
         .scim_push_sync_state()
-        .advance(&connection, "cursor-3", Some(applied_at))
+        .advance(&connection, Some("cursor-0"), "cursor-3", Some(applied_at))
         .await
         .expect("advance");
 

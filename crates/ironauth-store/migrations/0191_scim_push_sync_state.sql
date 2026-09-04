@@ -109,11 +109,19 @@ CREATE TABLE scim_push_sync_state (
     FOREIGN KEY (connection_id) REFERENCES scim_push_connections (id) ON DELETE CASCADE
 );
 
--- THE WORKER'S OWN QUERY: which connections in this scope are due to run. Partial on the pause
--- so a long outage does not make the index scan the rows it is going to skip.
+-- THE WORKER'S OWN QUERY: which connections in this scope are due to run.
+--
+-- NOT PARTIAL, and the first draft's `WHERE paused_until IS NULL` was a real defect rather than a
+-- tuning choice. A pause here is a self-clearing DEADLINE, so the due query is
+-- `paused_until IS NULL OR paused_until <= now()`; an index that only holds the rows where the
+-- column is NULL can never serve the second half of that. A connection whose outage had ENDED was
+-- therefore excluded from the index for ever, which is the exact opposite of the recovery
+-- property the column was chosen for.
+--
+-- `paused_until` leads so the planner can range-scan the expired ones, with `last_polled_at`
+-- after it to order the work.
 CREATE INDEX scim_push_sync_state_due
-    ON scim_push_sync_state (tenant_id, environment_id, last_polled_at)
-    WHERE paused_until IS NULL;
+    ON scim_push_sync_state (tenant_id, environment_id, paused_until, last_polled_at);
 
 ALTER TABLE scim_push_sync_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE scim_push_sync_state FORCE ROW LEVEL SECURITY;
@@ -129,7 +137,9 @@ CREATE POLICY scim_push_sync_state_scope ON scim_push_sync_state
     );
 
 -- The DATA plane owns this outright, which is the inverse of 0189 and the reason this is its own
--- table. Every column is written by the worker on a poll.
+-- table: every column the worker maintains is written by the worker, not by an operator.
+-- ("Every column" would be false, and the GRANT below says so: the scope columns and
+-- `connection_id` are set once at INSERT and are deliberately absent from the UPDATE list.)
 --
 -- The UPDATE is column-scoped anyway, and the columns left out are the ones that would let a bug
 -- move a row between scopes or between connections: `connection_id`, `tenant_id` and
@@ -151,8 +161,9 @@ COMMENT ON TABLE scim_push_sync_state IS
     'and health, written by the sync worker and read by the management health surface.';
 COMMENT ON COLUMN scim_push_sync_state.cursor IS
     'Issue #137: the event feed''s OPAQUE wire cursor, stored verbatim and never interpreted. '
-    'NULL means the connection has not started tailing, which the backfill CHECK ties to a '
-    'completed backfill.';
+    'NULL means the connection has not started tailing. The CHECK ties the other direction: a '
+    'NON-NULL cursor requires a completed backfill, so a connection cannot tail while it is '
+    'still enumerating.';
 COMMENT ON COLUMN scim_push_sync_state.paused_until IS
     'Issue #137: a downstream outage pauses the cursor rather than dropping events. A deadline '
     'rather than a flag, so an outage that ends unattended recovers without an intervention.';

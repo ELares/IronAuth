@@ -75437,10 +75437,18 @@ pub struct ScimPushLink {
     pub last_error_at_unix_micros: Option<i64>,
     /// What that failure said.
     pub last_error: Option<String>,
+    /// When the link was first written.
+    ///
+    /// Present because `list_for_connection` pages on `(created_at, id)` and a caller cannot
+    /// build the [`CursorPosition`] for page two without it. Omitting it made the pagination
+    /// unreachable: the parameter existed, the index carried the sort columns, and no caller
+    /// could ever supply anything but `None`.
+    pub created_at_unix_micros: i64,
 }
 
 const SCIM_PUSH_LINK_SELECT_COLUMNS: &str = "id, connection_id, resource_type, subject_id, \
      downstream_id, external_id, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros, \
      (EXTRACT(EPOCH FROM last_synced_at) * 1000000)::bigint AS last_synced_at_micros, \
      (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_at_micros, last_error";
 
@@ -75458,6 +75466,7 @@ fn scim_push_link_from_row(row: &PgRow, scope: &Scope) -> Result<ScimPushLink, S
         last_synced_at_unix_micros: row.try_get("last_synced_at_micros")?,
         last_error_at_unix_micros: row.try_get("last_error_at_micros")?,
         last_error: row.try_get("last_error")?,
+        created_at_unix_micros: row.try_get("created_at_micros")?,
     })
 }
 
@@ -75886,6 +75895,39 @@ impl ScimPushSyncStateRepo<'_> {
         Ok(())
     }
 
+    /// Send a completed connection back to enumerating, and stop it tailing while it does.
+    ///
+    /// # Why a completed backfill is not the end of the state machine
+    ///
+    /// The first version had no way back: `begin_backfill` is `ON CONFLICT DO NOTHING`, so once a
+    /// row reached `complete` nothing could return it to `running`. That is wrong for the case
+    /// this whole feature exists to survive. A downstream that is rebuilt comes back EMPTY, and
+    /// tailing the feed from a stored cursor will never re-create the resources that predate it:
+    /// the connection would sit healthy, cursor advancing, and provision nothing for the people
+    /// who were already there.
+    ///
+    /// Clearing the cursor is what makes it safe rather than merely possible. A connection that
+    /// went back to enumerating must not also be tailing, which is the invariant the column CHECK
+    /// states, so this sets `cursor = NULL` in the same statement.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn restart_backfill(
+        &self,
+        connection_id: &ScimPushConnectionId,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET backfill_state = 'running', backfill_after = NULL, cursor = NULL, \
+                 updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+            |query| query,
+        )
+        .await
+    }
+
     /// Record how far the backfill has enumerated, so a restart resumes from here.
     ///
     /// # Errors
@@ -75917,10 +75959,18 @@ impl ScimPushSyncStateRepo<'_> {
     /// here, so the tail resumes from a point the backfill has already covered and the overlap
     /// is re-applied idempotently rather than lost.
     ///
+    /// # Only from a RUNNING backfill
+    ///
+    /// The predicate is not decoration. Without it this statement writes `cursor` on any row it
+    /// can see, so a worker that restarted, read the feed head and re-enumerated would overwrite
+    /// a cursor that was already tailing: every event between the old position and the new head
+    /// is then behind the checkpoint and nothing re-reads it. That is silent event loss, and it
+    /// is the exact inverse of the "pause rather than drop" property this table exists for.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
-    /// [`StoreError::Database`] otherwise.
+    /// [`StoreError::NotFound`] if the connection is out of scope, has no state row, or is not
+    /// in the running state; [`StoreError::Database`] otherwise.
     pub async fn complete_backfill(
         &self,
         connection_id: &ScimPushConnectionId,
@@ -75930,7 +75980,8 @@ impl ScimPushSyncStateRepo<'_> {
             connection_id,
             "SET backfill_state = 'complete', backfill_after = NULL, cursor = $4, \
                  last_synced_at = now(), updated_at = now() \
-             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND backfill_state = 'running'",
             |query| query.bind(cursor.to_owned()),
         )
         .await
@@ -75938,29 +75989,48 @@ impl ScimPushSyncStateRepo<'_> {
 
     /// Checkpoint after a page of events has been applied.
     ///
+    /// # Why the caller must say where it thinks the cursor is
+    ///
+    /// This is a COMPARE-AND-SET, and without one a checkpoint is not safe against a second
+    /// writer. Nothing in this crate elects a single worker per connection: two processes, or one
+    /// process restarted before its predecessor noticed, both read a page and both checkpoint. A
+    /// bare `SET cursor = $n` lets the slower one land last and move the cursor BACKWARDS, and
+    /// the events between the two positions are then re-read, or, in the mirror case where the
+    /// slower writer is ahead, never read at all.
+    ///
+    /// `expected_cursor` is what the caller read before it did the work. If the stored value has
+    /// moved since, this touches no rows and answers [`StoreError::NotFound`], which the caller
+    /// must treat as "somebody else owns this connection right now" rather than as an error to
+    /// retry into. `None` means the caller believes the connection has not tailed yet, and
+    /// `IS NOT DISTINCT FROM` is what makes that comparison work against a NULL.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the connection is out of scope, has no state row, or has not
-    /// finished its backfill; [`StoreError::Database`] otherwise.
+    /// [`StoreError::NotFound`] if the connection is out of scope, has no state row, has not
+    /// finished its backfill, or the stored cursor is not `expected_cursor`;
+    /// [`StoreError::Database`] otherwise.
     pub async fn advance(
         &self,
         connection_id: &ScimPushConnectionId,
+        expected_cursor: Option<&str>,
         cursor: &str,
         last_event_at_unix_micros: Option<i64>,
     ) -> Result<(), StoreError> {
         self.update_one(
             connection_id,
-            "SET cursor = $4, \
+            "SET cursor = $5, \
                  last_event_at = COALESCE( \
-                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
                      last_event_at), \
                  last_polled_at = now(), last_synced_at = now(), \
                  consecutive_failures = 0, last_error_at = NULL, last_error = NULL, \
                  paused_until = NULL, updated_at = now() \
              WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
-               AND backfill_state = 'complete'",
+               AND backfill_state = 'complete' \
+               AND cursor IS NOT DISTINCT FROM $4::text",
             |query| {
                 query
+                    .bind(expected_cursor.map(str::to_owned))
                     .bind(cursor.to_owned())
                     .bind(last_event_at_unix_micros.map(|micros| micros.to_string()))
             },
@@ -76012,7 +76082,9 @@ impl ScimPushSyncStateRepo<'_> {
             connection_id,
             "SET consecutive_failures = consecutive_failures + 1, \
                  last_error_at = now(), last_error = $4, \
-                 paused_until = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                 paused_until = COALESCE( \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     paused_until), \
                  last_polled_at = now(), updated_at = now() \
              WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
             |query| {
