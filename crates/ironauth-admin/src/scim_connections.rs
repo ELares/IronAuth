@@ -110,7 +110,12 @@ pub struct ScimConnectionCreated {
     pub token_already_issued: bool,
 }
 
-fn micros_to_millis(micros: i64) -> i64 {
+/// Microseconds to milliseconds, the unit every admin view publishes.
+///
+/// `pub(crate)` because the outbound SCIM module publishes the same timestamps and had a
+/// byte-identical copy. One conversion, so a change to the published unit cannot reach one
+/// surface and miss the other.
+pub(crate) fn micros_to_millis(micros: i64) -> i64 {
     micros / 1_000
 }
 

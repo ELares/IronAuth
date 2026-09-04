@@ -75733,14 +75733,7 @@ impl ScimPushLinkRepo<'_> {
         // SQLSTATE 23514, which falls through to an opaque failure rather than saying what was
         // wrong. Truncation on a CHARACTER boundary, because slicing bytes would panic on a
         // multi-byte error message.
-        let mut bounded = error;
-        if bounded.len() > MAX_ERROR_BYTES {
-            let mut end = MAX_ERROR_BYTES;
-            while end > 0 && !bounded.is_char_boundary(end) {
-                end -= 1;
-            }
-            bounded = &bounded[..end];
-        }
+        let bounded = truncate_on_char_boundary(error, MAX_ERROR_BYTES);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let result = sqlx::query(
             "UPDATE scim_push_links \

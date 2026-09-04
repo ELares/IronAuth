@@ -566,21 +566,11 @@ fn patch_document(resource: &Value, current: Option<&Value>) -> Value {
 /// address a different collection, one containing `?` turn the rest of the path into a query, and
 /// one containing `#` truncate the request. A hostile or merely careless downstream therefore
 /// chose which resource the next DELETE hit.
+///
+/// The encoder lives in the transport module and is shared with the filter encoder: two copies of
+/// one unreserved set drift, and the hole that opens when they do is in URL construction.
 fn encode_path_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            // RFC 3986 section 2.3 unreserved, plus the sub-delims that are safe in a segment.
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(char::from(byte));
-            }
-            _ => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "%{byte:02X}");
-            }
-        }
-    }
-    out
+    crate::scim_push_transport::percent_encode(segment)
 }
 
 /// Escape a literal for a SCIM filter comparison.

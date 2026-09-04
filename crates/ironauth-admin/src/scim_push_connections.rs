@@ -149,10 +149,6 @@ pub struct SetScimPushActiveRequest {
     pub active: bool,
 }
 
-fn micros_to_millis(micros: i64) -> i64 {
-    micros / 1_000
-}
-
 fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionView {
     ScimPushConnectionView {
         id: connection.id.to_string(),
@@ -168,7 +164,9 @@ fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionVi
         backfill_state: connection.backfill_state.as_str().to_owned(),
         consecutive_failures: connection.consecutive_failures,
         last_error: connection.last_error.clone(),
-        last_success_at_unix_ms: connection.last_success_at_unix_micros.map(micros_to_millis),
+        last_success_at_unix_ms: connection
+            .last_success_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
     }
 }
 

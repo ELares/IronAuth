@@ -244,18 +244,25 @@ fn join(base_url: &str, path: &str) -> Result<String, ScimTransportError> {
     Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
 }
 
-/// Percent-encode a filter for a query string.
+/// Percent-encodes one value into a URL, keeping only RFC 3986 section 2.3 unreserved bytes.
 ///
-/// A SCIM filter carries spaces and quotes (`externalId eq "u-1"`), neither of which is legal
-/// raw in a query. Encoded HERE, at the one place a filter becomes a URL, rather than at each
-/// call site: a caller that forgot would send a request the downstream rejects as malformed and
-/// the client would read that as "no match" and create a duplicate.
-fn encode_filter(filter: &str) -> String {
-    let mut out = String::with_capacity(filter.len() * 3);
-    for byte in filter.as_bytes() {
+/// # One encoder, two callers
+///
+/// The outbound client encodes a downstream-issued `id` into a path segment and this module
+/// encodes a filter into a query value, and both were written as their own loop over the same
+/// unreserved set. Two copies of an encoder is a specific hazard rather than untidiness: the two
+/// sets drift, one gains a character the other does not, and the resulting hole is in URL
+/// construction, which is where a traversal or a query-splitting bug lives.
+///
+/// Deliberately conservative. Encoding a byte that did not need it is a correct URL; leaving one
+/// that did is not, so the unreserved set is the whole allowance and everything else is escaped,
+/// including `/`, `?`, `#` and `:`.
+pub(crate) fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char);
+                out.push(char::from(byte));
             }
             _ => {
                 use std::fmt::Write as _;
@@ -277,7 +284,7 @@ impl ScimTransport for FetchScimTransport {
         let joined = join(base_url, &request.path).map(|mut url| {
             if let Some(filter) = &request.filter {
                 url.push_str("?filter=");
-                url.push_str(&encode_filter(filter));
+                url.push_str(&percent_encode(filter));
             }
             url
         });
@@ -343,7 +350,7 @@ impl ScimTransport for FetchScimTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScimTransportError, encode_filter, join};
+    use super::{ScimTransportError, join, percent_encode};
 
     #[test]
     fn a_base_url_and_a_path_join_with_exactly_one_slash() {
@@ -395,12 +402,12 @@ mod tests {
         // space and a quote: raw, it is not a legal query, and a downstream that rejects it
         // answers something the client would otherwise read as "no match" and create a duplicate.
         assert_eq!(
-            encode_filter("externalId eq \"u-1\""),
+            percent_encode("externalId eq \"u-1\""),
             "externalId%20eq%20%22u-1%22"
         );
         // Unreserved characters are NOT encoded, so the common case stays readable in a log.
-        assert_eq!(encode_filter("abc-123_x.y~z"), "abc-123_x.y~z");
+        assert_eq!(percent_encode("abc-123_x.y~z"), "abc-123_x.y~z");
         // A multi-byte character encodes per BYTE, which is what percent-encoding is defined on.
-        assert_eq!(encode_filter("\u{e9}"), "%C3%A9");
+        assert_eq!(percent_encode("\u{e9}"), "%C3%A9");
     }
 }
