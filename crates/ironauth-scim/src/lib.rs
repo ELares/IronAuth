@@ -34,6 +34,15 @@ pub use bulk::{
 pub use patch::{PatchPath, PatchPathError, parse_patch_path};
 pub use path::{PathError, ResourceRef, ResourceType, parse_resource_path};
 pub use resource::ScimUser;
+
+/// A reference DOWNSTREAM SCIM server, for testing IronAuth as a SCIM client (issue #137).
+///
+/// Behind a feature because it is test scaffolding: shipping a server that accepts a bearer
+/// token chosen by its constructor into a production build would be a liability, and a
+/// feature gate makes "this never reaches a release binary" a fact about the build rather
+/// than a convention.
+#[cfg(feature = "downstream-fixture")]
+pub mod downstream;
 pub use server::{ScimState, scim_router};
 pub use service_provider_config::{
     AuthenticationScheme, BulkConfig, FilterConfig, ScimLimits, ServiceProviderConfig, Supported,

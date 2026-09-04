@@ -10,6 +10,11 @@ description = "SCIM 2.0 inbound server surface for IronAuth (issue #135): the RF
 [lints]
 workspace = true
 
+[features]
+# The reference downstream SCIM server used to test the OUTBOUND client (issue #137).
+# Test scaffolding only; never enabled by a release build.
+downstream-fixture = []
+
 [dependencies]
 ironauth-store = { path = "../ironauth-store" }
 ironauth-env = { path = "../ironauth-env" }
@@ -49,3 +54,10 @@ path = "tests/users.rs"
 [[test]]
 name = "groups"
 path = "tests/groups.rs"
+
+# THE REFERENCE DOWNSTREAM (issue #137): the fixture the outbound client is measured against,
+# tested itself so that a client suite driving it cannot pass for the wrong reason. No database.
+[[test]]
+name = "downstream_fixture"
+path = "tests/downstream_fixture.rs"
+required-features = ["downstream-fixture"]
