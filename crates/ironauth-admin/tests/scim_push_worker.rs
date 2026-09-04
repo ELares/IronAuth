@@ -204,6 +204,11 @@ impl Directory {
         );
     }
 
+    /// Take a group out of the directory, as a deletion upstream does.
+    fn remove_group(&self, subject: &str) {
+        self.groups.lock().expect("lock").remove(subject);
+    }
+
     fn put_out_of_scope(&self, subject: &str) {
         self.out_of_scope
             .lock()
@@ -263,9 +268,11 @@ impl SubjectSource for Directory {
         after: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
-        // This directory holds people. A GROUP enumeration is empty, and saying so honestly is
-        // what lets the users-to-groups handover be observed: a source that returned its users
-        // again for the group pass would re-push every one of them under the wrong resource type.
+        // COLLECTION-AWARE, and the two maps are separate on purpose. A source that returned its
+        // people again for the group pass would re-push every one of them under the wrong
+        // resource type, and every assertion below would still hold. Most tests here add no
+        // groups at all, so their group enumeration is empty and the users-to-groups handover
+        // stays observable exactly as before.
         if collection == Collection::Group {
             let out_of_scope = self.out_of_scope.lock().expect("lock").clone();
             let page: Vec<String> = self
@@ -797,6 +804,117 @@ async fn a_group_reaches_the_downstream_through_the_tail_and_the_backfill() {
         after.len(),
         1,
         "the tail created a second group instead of converging the one that exists: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_departure_is_refused_under_deactivate_and_deletes_under_delete() {
+    // WHY THIS EXISTS. Criterion 1's third verb is delete/deactivate, and for GROUPS it was the
+    // one composition nothing drove. It is also the one this module's own header calls out as
+    // having wedged a page: RFC 7643 section 4.2 gives Group no `active`, so a group departure
+    // under the DEFAULT policy is a permanent refusal by construction, and the first version
+    // propagated that refusal with `?` -- the cursor never moved, the next pass read the same
+    // page, and every user create and departure queued behind it was never delivered.
+    //
+    // No test reached that arm. `record_subject_failure` had no test caller at all, and reverting
+    // the catch to `?` was green across this whole file. Both policies are driven here, because
+    // the refusing one is where the wedge lives and the deleting one is where the criterion is
+    // actually satisfied.
+    let h = Harness::start().await;
+    let directory = Directory::default();
+    directory.add_group("grp_eng", "engineering", &["usr_ada"]);
+    h.start_tailing_from(0).await;
+    let store = h.db.store().scoped(h.scope);
+    let client = h.client();
+
+    let pass_with = |policy: DeletionPolicy| Pass {
+        connection_id: &h.connection,
+        client: &client,
+        subjects: &directory,
+        deletion_policy: policy,
+        limit: 10,
+        scope: h.scope,
+        now_unix_micros: now_micros(&h.env),
+        organization_id: h.org.clone(),
+    };
+
+    // Provision it first, so there is a downstream resource and a link for a departure to address.
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group_created",
+        "org_group.created",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    run_tail_pass(&store, pass_with(DeletionPolicy::Deactivate))
+        .await
+        .expect("the group is provisioned");
+    assert_eq!(h.downstream.groups().len(), 1);
+
+    // THE DEPARTURE UNDER `deactivate`. A permanent refusal, and the page must step over it.
+    directory.remove_group("grp_eng");
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group_deleted",
+        "org_group.deleted",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    let refused = run_tail_pass(&store, pass_with(DeletionPolicy::Deactivate))
+        .await
+        .expect("a permanent refusal about one subject must not fail the pass");
+    assert_eq!(
+        refused.refused, 1,
+        "the refusal was not counted, so the health surface cannot report it: {refused:?}"
+    );
+    assert!(
+        refused.checkpointed,
+        "the pass did not checkpoint, so the next one reads this same event again for ever"
+    );
+    assert_eq!(
+        h.downstream.groups().len(),
+        1,
+        "the group was removed under a policy that cannot express its departure"
+    );
+    // AND THE REFUSAL IS ON THE SUBJECT, which is the surface that answers "which of these is
+    // failing" rather than "is this connection broken".
+    let link = store
+        .scim_push_links()
+        .find(&h.connection, ScimPushResourceType::Group, "grp_eng")
+        .await
+        .expect("link read")
+        .expect("the group was provisioned, so it has a link");
+    assert!(
+        link.last_error
+            .as_deref()
+            .is_some_and(|why| why.contains("active")),
+        "the per-resource surface does not say why this group cannot be deactivated: {:?}",
+        link.last_error
+    );
+
+    // THE SAME DEPARTURE UNDER `delete` SUCCEEDS. Without this the test would only prove that a
+    // group departure fails, which is half a criterion and the wrong half.
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group_deleted_again",
+        "org_group.deleted",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    let deleted = run_tail_pass(&store, pass_with(DeletionPolicy::Delete))
+        .await
+        .expect("a delete-policy connection removes the group");
+    assert_eq!(
+        deleted.deprovisioned, 1,
+        "the departure was not carried out: {deleted:?}"
+    );
+    assert!(
+        h.downstream.groups().is_empty(),
+        "the group is still on the downstream after a delete-policy departure: {:?}",
+        h.downstream.groups()
     );
 }
 
