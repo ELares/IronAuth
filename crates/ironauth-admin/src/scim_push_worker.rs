@@ -189,18 +189,17 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
     // TAILING REQUIRES A FINISHED BACKFILL. Reading the feed for a connection that has not
     // enumerated its scope means the first event for an unprovisioned subject creates a resource
     // that the backfill then creates again.
-    let Some(cursor_wire) = state.cursor.clone() else {
+    let Some(cursor_sequence) = state.cursor_sequence else {
         return Err(WorkerError::Permanent(
             "this connection has not finished its backfill, so it must not tail the feed"
                 .to_owned(),
         ));
     };
-    let cursor = EventCursor::from_wire(&cursor_wire).ok_or_else(|| {
-        // A stored cursor the feed cannot parse is not something a retry fixes.
-        WorkerError::Permanent(format!(
-            "the stored cursor {cursor_wire:?} is not a position this feed understands"
-        ))
-    })?;
+    // THE SEQUENCE RE-ENTERS THE FEED ONLY THROUGH `EventCursor`, never as a number this module
+    // does arithmetic on. #107 made the wire cursor opaque so a consumer could not compute
+    // `cursor + 1`; storing the sequence gives that up at the column, and keeping the conversion
+    // in exactly one place is what recovers it at the boundary.
+    let cursor = EventCursor::after_sequence(cursor_sequence);
 
     let page = match store.outbox().events_page_after(cursor, pass.limit).await? {
         EventPage::Page(events) => events,
@@ -230,7 +229,6 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
     }
 
     let mut last_sequence = None;
-    let mut last_event_at = None;
     for message in &page {
         let envelope = &message.payload;
         let event_type = envelope
@@ -240,19 +238,15 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
         let payload = envelope.get("payload").unwrap_or(&serde_json::Value::Null);
         apply_one(store, &pass, event_type, payload, &mut progress).await?;
         last_sequence = Some(message.sequence);
-        last_event_at = envelope
-            .get("occurred_at_unix_micros")
-            .and_then(serde_json::Value::as_i64)
-            .or(last_event_at);
     }
 
     // CHECKPOINT LAST, AND ONLY ONCE. `expected_cursor` is the value read at the top of this
     // function, so a second worker that checkpointed in between makes this fail rather than
     // overwrite its position.
-    let next = EventCursor::after_sequence(last_sequence.expect("the page is not empty")).to_wire();
+    let next = last_sequence.expect("the page is not empty");
     store
         .scim_push_sync_state()
-        .advance(pass.connection_id, Some(&cursor_wire), &next, last_event_at)
+        .advance(pass.connection_id, Some(cursor_sequence), next)
         .await?;
     progress.checkpointed = true;
     Ok(progress)
@@ -408,7 +402,7 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     store: &ironauth_store::ScopedStore<'_>,
     pass: Pass<'_, T, S>,
     collection: Collection,
-    feed_position_at_start: &str,
+    feed_position_at_start: i64,
 ) -> Result<Progress, WorkerError> {
     let state = store
         .scim_push_sync_state()
@@ -418,7 +412,7 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     if is_paused(&state, pass.now_unix_micros) {
         return Ok(Progress::default());
     }
-    if state.backfill_state != ironauth_store::ScimPushBackfillState::Running {
+    if !state.backfill_state.is_enumerating() {
         return Err(WorkerError::Permanent(
             "this connection is not enumerating, so a backfill pass has nothing to resume"
                 .to_owned(),

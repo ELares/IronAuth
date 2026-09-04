@@ -35,8 +35,8 @@ use ironauth_env::Env;
 use ironauth_scim::downstream::{Downstream, Health};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, EventCursor, NewScimPushConnection, OrganizationId, ScimDeletionPolicy,
-    ScimPushConnectionId, ScimPushResourceType, ScimWriteMode, Scope,
+    CorrelationId, NewScimPushConnection, OrganizationId, ScimDeletionPolicy, ScimPushConnectionId,
+    ScimPushResourceType, ScimWriteMode, Scope,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -318,10 +318,7 @@ impl Harness {
             .expect("begin");
         store
             .scim_push_sync_state()
-            .complete_backfill(
-                &self.connection,
-                &EventCursor::after_sequence(sequence).to_wire(),
-            )
+            .complete_backfill(&self.connection, sequence)
             .await
             .expect("complete");
     }
@@ -364,7 +361,9 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     // THE FEED POSITION IS READ BEFORE ANY ENUMERATION, and the same value is carried through
     // every page. A backfill that finished and THEN read the head would lose every event that
     // happened while it ran.
-    let feed_head = EventCursor::beginning().to_wire();
+    // Sequence 0: the position before the first event, which is where a connection with no
+    // history starts.
+    let feed_head = 0_i64;
     let client = h.client();
     let page = |limit: i64| Pass {
         connection_id: &h.connection,
@@ -377,7 +376,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     };
 
     // Two at a time, then a simulated restart: the second call starts from the recorded position.
-    let first = run_backfill_pass(&store, page(2), Collection::Users, &feed_head)
+    let first = run_backfill_pass(&store, page(2), Collection::Users, feed_head)
         .await
         .expect("first page");
     assert_eq!(first.converged, 2, "{first:?}");
@@ -392,9 +391,12 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         Some("usr_b"),
         "the backfill did not record where it stopped"
     );
-    assert_eq!(mid.cursor, None, "a running backfill must not be tailing");
+    assert_eq!(
+        mid.cursor_sequence, None,
+        "a running backfill must not be tailing"
+    );
 
-    let second = run_backfill_pass(&store, page(2), Collection::Users, &feed_head)
+    let second = run_backfill_pass(&store, page(2), Collection::Users, feed_head)
         .await
         .expect("second page");
     assert_eq!(second.converged, 2, "{second:?}");
@@ -408,7 +410,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     );
 
     // THE EMPTY PAGE IS WHAT COMPLETES IT, and only then does the cursor appear.
-    let done = run_backfill_pass(&store, page(2), Collection::Users, &feed_head)
+    let done = run_backfill_pass(&store, page(2), Collection::Users, feed_head)
         .await
         .expect("the empty page completes the backfill");
     assert!(done.checkpointed);
@@ -418,7 +420,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         .await
         .expect("get")
         .expect("state");
-    assert_eq!(complete.cursor.as_deref(), Some(feed_head.as_str()));
+    assert_eq!(complete.cursor_sequence, Some(feed_head));
     assert_eq!(complete.backfill_after, None);
 
     // AND A LINK EXISTS FOR EVERY PERSON, so the tail can address them by downstream id.
@@ -465,7 +467,7 @@ async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
             now_unix_micros: now_micros(&h.env),
         },
         Collection::Users,
-        &EventCursor::beginning().to_wire(),
+        0,
     )
     .await
     .expect("backfill");
@@ -503,7 +505,7 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
             now_unix_micros: now_micros(&h.env),
         },
         Collection::Users,
-        &EventCursor::beginning().to_wire(),
+        0,
     )
     .await;
     assert!(
@@ -580,10 +582,7 @@ async fn a_pass_pushes_each_event_then_checkpoints_once() {
         .await
         .expect("get")
         .expect("state");
-    assert_eq!(
-        state.cursor.as_deref(),
-        Some(EventCursor::after_sequence(last).to_wire().as_str())
-    );
+    assert_eq!(state.cursor_sequence, Some(last));
     let second = run_tail_pass(
         &store,
         Pass {
@@ -625,7 +624,7 @@ async fn an_outage_leaves_the_cursor_where_it_was_and_the_replay_does_not_duplic
         .await
         .expect("get")
         .expect("state")
-        .cursor;
+        .cursor_sequence;
 
     h.downstream.set_health(Health::Down);
     let outcome = run_tail_pass(
@@ -654,7 +653,7 @@ async fn an_outage_leaves_the_cursor_where_it_was_and_the_replay_does_not_duplic
         .await
         .expect("get")
         .expect("state")
-        .cursor;
+        .cursor_sequence;
     assert_eq!(during, before, "the outage advanced the cursor");
 
     // RESTORED, AND REPLAYED.
@@ -837,8 +836,8 @@ async fn a_cursor_the_feed_has_pruned_past_is_reported_rather_than_silently_rest
         .expect("get")
         .expect("state");
     assert_eq!(
-        after.cursor.as_deref(),
-        Some(EventCursor::after_sequence(first).to_wire().as_str()),
+        after.cursor_sequence,
+        Some(first),
         "the pruned pass moved the cursor"
     );
     assert!(

@@ -1552,6 +1552,25 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0191_scim_push_sync_state.sql"),
         },
+        Migration {
+            version: 192,
+            name: "scim_push_worker_grants",
+            // EXPAND: two new columns, one new index, one new CHECK, and the column-scoped
+            // UPDATE grant 0189 deferred until the worker existed. An old binary neither reads
+            // nor writes any of it. The CHECK is satisfied by every existing row, because
+            // `cursor_sequence` is NULL until a worker sets it and no worker has run.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0192_scim_push_worker_grants.sql"),
+        },
+        Migration {
+            version: 193,
+            name: "drop_scim_push_sync_state",
+            // CONTRACT: removes the duplicate table 0191 should not have added. Its only
+            // consumer moves to `scim_push_connections` in the same change, and no deployment
+            // has run a worker against either shape, so the table is empty wherever it exists.
+            phase: Phase::Contract,
+            sql: include_str!("../migrations/0193_drop_scim_push_sync_state.sql"),
+        },
     ]
 }
 

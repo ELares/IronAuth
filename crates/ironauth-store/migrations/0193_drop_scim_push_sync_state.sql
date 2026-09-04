@@ -1,0 +1,23 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- 0193: remove the duplicate sync-state table (issue #137).
+--
+-- 0191 added `scim_push_sync_state` holding a cursor, a backfill state, an error message and a
+-- failure count. `scim_push_connections` (0189) already had all four, and had already said that
+-- the worker's access to them was a GRANT that "belongs in the migration that adds it". 0192 is
+-- that grant. This drops what should never have been a second table.
+--
+-- CONTRACT, and safe to run now rather than later. Nothing outside `ScimPushSyncStateRepo`
+-- reads or writes this table: it shipped in the same release train as its only consumer, and
+-- that consumer moves to 0189's columns in this change. Deferring the removal would mean two
+-- sources of truth for one connection's position, and the cost of that is not a tidy-up job
+-- later: it is a management surface that has to choose which one to believe while a worker
+-- writes the other.
+--
+-- WHAT IS NOT LOST. Everything 0191 held has a home on `scim_push_connections`, and the two
+-- columns it introduced that 0189 genuinely lacked (`last_polled_at`, `paused_until`) were added
+-- by 0192 rather than dropped with the table. Its `no_tailing_before_backfill` CHECK travelled
+-- too. No production deployment has run a worker against either shape, so there is no data to
+-- migrate: the table is empty everywhere it exists.
+
+DROP TABLE IF EXISTS scim_push_sync_state;
