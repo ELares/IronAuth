@@ -4227,7 +4227,6 @@ struct AuditRetentionInputs {
     env: Env,
 }
 
-/// Capture the audit retention sweeper's inputs, or `None` when it is switched off.
 /// What the outbound SCIM push scheduler (issue #137) needs, captured before `config`
 /// moves into the server.
 struct ScimPushInputs {

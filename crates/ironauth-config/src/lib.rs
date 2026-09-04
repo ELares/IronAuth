@@ -5710,6 +5710,7 @@ fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Refuse a scim section whose page bounds cannot be satisfied.
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
         return Err(ConfigError::Invalid {

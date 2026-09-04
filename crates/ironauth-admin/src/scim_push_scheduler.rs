@@ -249,34 +249,34 @@ pub async fn tick<T: ScimTransport + Clone>(
     // and capturing nothing would make it skip everything that happened in between. The first
     // tick that can actually serve the connection is the only moment where "now" is the right
     // answer.
-    for connection in &due {
-        if connection.backfill_state != ScimBackfillState::Pending {
-            continue;
-        }
-        let head = match scoped.outbox().newest_sequence().await {
-            Ok(head) => head,
-            Err(error) => {
-                observer.tick_failed(scope, &error);
-                return;
-            }
-        };
-        if let Err(error) = scoped
-            .scim_push_sync_state()
-            .begin_backfill(&connection.id, head)
-            .await
-        {
-            observer.connection_unavailable(
-                scope,
-                &connection.id,
-                &format!("this connection's backfill could not be started: {error:?}"),
-            );
-        }
-    }
-
     // The credential for each due connection, by id, and which ids this tick tried at all.
     let attempted: Vec<ScimPushConnectionId> = due.iter().map(|c| c.id).collect();
     let mut credentials: Vec<(ScimPushConnectionId, String)> = Vec::with_capacity(due.len());
     for connection in &due {
+        // THE CONFINEMENT IS ENFORCED AT THE READ, not only at the write.
+        //
+        // `check_secret_name` refuses a name outside the connection namespace when a connection
+        // is created, and that door is the only one the API offers. It is not the only way a row
+        // arrives: a config import, a snapshot restore, or a row written before the rule existed
+        // all reach this table without passing it. A bound that only holds for rows that came
+        // through one door is a bound on that door, and what it is protecting -- the write-only
+        // secret store -- is read HERE.
+        if !connection
+            .credential_secret_name
+            .starts_with(crate::scim_push_connections::CREDENTIAL_SECRET_PREFIX)
+        {
+            observer.connection_unavailable(
+                scope,
+                &connection.id,
+                &format!(
+                    "this connection names the secret {:?}, which is outside the {:?} namespace \
+                     a connection may read",
+                    connection.credential_secret_name,
+                    crate::scim_push_connections::CREDENTIAL_SECRET_PREFIX
+                ),
+            );
+            continue;
+        }
         match scoped
             .environment_secrets()
             .open_value(master, &connection.credential_secret_name)
@@ -298,6 +298,63 @@ pub async fn tick<T: ScimTransport + Clone>(
                     connection.credential_secret_name
                 ),
             ),
+        }
+    }
+
+    // STARTED ONLY FOR A CONNECTION THIS TICK CAN ACTUALLY SERVE, which is why this runs after
+    // the credentials and not before them.
+    //
+    // The head captured here is where the tail resumes, and `begin_backfill` is guarded on
+    // `pending` so it is captured exactly once and never again. Stamping it on a tick that then
+    // skips the connection -- because its secret is missing, or is not text -- means the position
+    // is frozen at a moment nothing was sent, and every event between then and the day an
+    // operator fixes the secret is enumerated by the backfill as current state rather than
+    // replayed. The comment that used to sit here said "the first tick that can actually serve
+    // the connection" while the loop ran before anything that decides whether it can.
+    let pending: Vec<&ScimPushConnection> = due
+        .iter()
+        .filter(|c| c.backfill_state == ScimBackfillState::Pending)
+        .filter(|c| credentials.iter().any(|(id, _)| id == &c.id))
+        .collect();
+    if !pending.is_empty() {
+        // READ ONCE PER TICK, not once per connection. The head is a property of the SCOPE's
+        // feed, so asking per connection issues the same scope-wide query N times and, worse,
+        // gives two connections started in the same tick two different starting positions for no
+        // reason. Read only when there is something to start, so an environment with no pending
+        // connection pays nothing.
+        let head = match scoped.outbox().newest_sequence().await {
+            Ok(head) => head,
+            Err(error) => {
+                observer.tick_failed(scope, &error);
+                return;
+            }
+        };
+        // AN EMPTY FEED IS POSITION ZERO, NOT "NO POSITION", and passing the `None` through
+        // wedged the connection for ever.
+        //
+        // `newest_sequence` answers `None` when the scope's feed is empty, which is the ordinary
+        // state of a new environment. `begin_backfill` stores it as `backfill_from_sequence`,
+        // `complete_backfill` copies that into `cursor_sequence`, and `run_tail_pass` refuses a
+        // connection whose cursor is NULL with "this connection has not finished its backfill".
+        // So a connection created before the first event in its environment would enumerate its
+        // directory once and then never tail, permanently, and no retry would fix it because the
+        // backfill would already be `done`.
+        //
+        // Zero is the position before the first event, which is exactly what an empty feed means
+        // and what every test that starts a connection has always passed.
+        let head = Some(head.unwrap_or(0));
+        for connection in pending {
+            if let Err(error) = scoped
+                .scim_push_sync_state()
+                .begin_backfill(&connection.id, head)
+                .await
+            {
+                observer.connection_unavailable(
+                    scope,
+                    &connection.id,
+                    &format!("this connection's backfill could not be started: {error:?}"),
+                );
+            }
         }
     }
 

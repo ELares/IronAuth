@@ -453,6 +453,8 @@ fn check_label(value: &str, field: &str, max: usize) -> Result<String, ApiError>
 /// or an upstream client secret is out of reach whatever the connection says.
 pub const CREDENTIAL_SECRET_PREFIX: &str = "scim_push_";
 
+/// Validate a connection's `credential_secret_name`: a legal secret name, in the connection
+/// namespace.
 fn check_secret_name(value: &str) -> Result<String, ApiError> {
     let value = require_non_empty(value, "credential_secret_name")?;
     if !ironauth_store::esv::name_is_valid(&value) {
