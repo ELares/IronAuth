@@ -163,6 +163,13 @@ impl ScimTransport for RacingTransport {
 #[derive(Clone, Default)]
 struct Directory {
     people: Arc<Mutex<BTreeMap<String, Value>>>,
+    /// The GROUPS this directory holds, kept apart from its people.
+    ///
+    /// One map for both would make `resource` answer a user body for a group id, and every
+    /// collection-aware assertion below would pass against a source that cannot tell them apart.
+    /// Empty by default, so a test that says nothing about groups still observes an empty group
+    /// enumeration and the users-to-groups handover it is there to prove.
+    groups: Arc<Mutex<BTreeMap<String, Value>>>,
     out_of_scope: Arc<Mutex<Vec<String>>>,
 }
 
@@ -179,6 +186,27 @@ impl Directory {
             }),
         );
         d
+    }
+
+    /// Put one group in the directory, with the members SCIM carries on a Group.
+    fn add_group(&self, subject: &str, display_name: &str, members: &[&str]) {
+        self.groups.lock().expect("lock").insert(
+            subject.to_owned(),
+            json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                "displayName": display_name,
+                "externalId": subject,
+                "members": members
+                    .iter()
+                    .map(|m| json!({ "value": m }))
+                    .collect::<Vec<Value>>(),
+            }),
+        );
+    }
+
+    /// Take a group out of the directory, as a deletion upstream does.
+    fn remove_group(&self, subject: &str) {
+        self.groups.lock().expect("lock").remove(subject);
     }
 
     fn put_out_of_scope(&self, subject: &str) {
@@ -206,10 +234,17 @@ impl Directory {
 impl SubjectSource for Directory {
     fn resource(
         &self,
-        _collection: Collection,
+        collection: Collection,
         subject_id: &str,
     ) -> impl Future<Output = Result<Option<Value>, String>> + Send {
-        let found = self.people.lock().expect("lock").get(subject_id).cloned();
+        // COLLECTION-AWARE, because the worker addresses two different downstream endpoints and a
+        // source that answered the same body for both would let a group be pushed as a user with
+        // nothing noticing.
+        let held = match collection {
+            Collection::User => &self.people,
+            Collection::Group => &self.groups,
+        };
+        let found = held.lock().expect("lock").get(subject_id).cloned();
         async move { Ok(found) }
     }
 
@@ -233,11 +268,24 @@ impl SubjectSource for Directory {
         after: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
-        // This directory holds people. A GROUP enumeration is empty, and saying so honestly is
-        // what lets the users-to-groups handover be observed: a source that returned its users
-        // again for the group pass would re-push every one of them under the wrong resource type.
+        // COLLECTION-AWARE, and the two maps are separate on purpose. A source that returned its
+        // people again for the group pass would re-push every one of them under the wrong
+        // resource type, and every assertion below would still hold. Most tests here add no
+        // groups at all, so their group enumeration is empty and the users-to-groups handover
+        // stays observable exactly as before.
         if collection == Collection::Group {
-            return std::future::ready(Ok(Vec::new()));
+            let out_of_scope = self.out_of_scope.lock().expect("lock").clone();
+            let page: Vec<String> = self
+                .groups
+                .lock()
+                .expect("lock")
+                .keys()
+                .filter(|id| !out_of_scope.iter().any(|s| s == *id))
+                .filter(|id| after.is_none_or(|a| id.as_str() > a))
+                .take(limit)
+                .cloned()
+                .collect();
+            return std::future::ready(Ok(page));
         }
         // A BTreeMap, so the order is total and stable across passes. That is what makes `after`
         // mean anything: an enumeration whose order changed between passes would let a resumed
@@ -642,6 +690,231 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
         h.downstream.users().is_empty(),
         "it pushed anyway: {:?}",
         h.downstream.users()
+    );
+}
+
+#[tokio::test]
+async fn a_group_reaches_the_downstream_through_the_tail_and_the_backfill() {
+    // WHY THIS EXISTS. Criterion 1 asks that the fixture receive writes for in-scope users AND
+    // GROUPS, and three separate layers proved their group half: the client converges `/Groups`,
+    // the mapper builds a Group body with no `active`, and the translator maps every `org_group.*`
+    // type to a Converge. What no test drove was the COMPOSITION. The worker suite's directory
+    // returned an empty group enumeration unconditionally and its `resource` ignored the
+    // collection entirely, so no group had ever reached the downstream through the worker, and a
+    // worker that pushed groups to `/Users` would have passed every test in this file.
+    //
+    // Both paths are exercised, because they address the downstream differently: the backfill
+    // enumerates and pushes, the tail translates one event and pushes.
+    let h = Harness::start().await;
+    let directory = Directory::default();
+    directory.add("usr_ada", "ada");
+    directory.add_group("grp_eng", "engineering", &["usr_ada"]);
+
+    // THE BACKFILL. Users first, then groups, then done.
+    let client = h.client();
+    let page = |limit: i64| Pass {
+        connection_id: &h.connection,
+        client: &client,
+        subjects: &directory,
+        deletion_policy: DeletionPolicy::Deactivate,
+        limit,
+        scope: h.scope,
+        now_unix_micros: now_micros(&h.env),
+        organization_id: h.org.clone(),
+    };
+    let store = h.db.store().scoped(h.scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&h.connection, Some(0))
+        .await
+        .expect("begin");
+    // Driven to completion rather than a fixed count: users, then the empty user page that hands
+    // over, then groups, then the empty group page that completes. A fixed number would either
+    // stop short or run a pass against a finished backfill, and both look like a group defect.
+    for _ in 0..8 {
+        run_backfill_pass(&store, page(10))
+            .await
+            .expect("a backfill pass");
+        let state = store
+            .scim_push_sync_state()
+            .get(&h.connection)
+            .await
+            .expect("get")
+            .expect("state");
+        if state.backfill_state.is_done() {
+            break;
+        }
+    }
+
+    let groups = h.downstream.groups();
+    assert_eq!(
+        groups.len(),
+        1,
+        "the backfill never provisioned a group: {groups:?}"
+    );
+    let provisioned = groups.values().next().expect("one group");
+    assert_eq!(
+        provisioned["displayName"].as_str(),
+        Some("engineering"),
+        "the group arrived without the attribute that names it: {provisioned}"
+    );
+    // AND IT WENT TO THE GROUPS ENDPOINT, not to Users under a group id. The fixture keeps the
+    // two collections apart, so a worker that addressed the wrong one leaves this empty.
+    assert_eq!(
+        h.downstream.users().len(),
+        1,
+        "a group was written into the user collection: {:?}",
+        h.downstream.users()
+    );
+    assert!(
+        store
+            .scim_push_links()
+            .find(&h.connection, ScimPushResourceType::Group, "grp_eng")
+            .await
+            .expect("link read")
+            .is_some(),
+        "no link was recorded for the group, so the tail cannot address it by downstream id"
+    );
+
+    // THE TAIL. A membership change on the same group converges it again through the event path.
+    directory.add_group("grp_eng", "engineering", &["usr_ada", "usr_grace"]);
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group",
+        "org_group.member_added",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    let progress = run_tail_pass(&store, page(10))
+        .await
+        .expect("the tail pass runs");
+    assert_eq!(
+        progress.converged, 1,
+        "a group event did not converge a group: {progress:?}"
+    );
+    let after = h.downstream.groups();
+    let updated = after.values().next().expect("one group");
+    assert_eq!(
+        updated["members"].as_array().map(Vec::len),
+        Some(2),
+        "the membership change never reached the downstream: {updated}"
+    );
+    assert_eq!(
+        after.len(),
+        1,
+        "the tail created a second group instead of converging the one that exists: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_departure_is_refused_under_deactivate_and_deletes_under_delete() {
+    // WHY THIS EXISTS. Criterion 1's third verb is delete/deactivate, and for GROUPS it was the
+    // one composition nothing drove. It is also the one this module's own header calls out as
+    // having wedged a page: RFC 7643 section 4.2 gives Group no `active`, so a group departure
+    // under the DEFAULT policy is a permanent refusal by construction, and the first version
+    // propagated that refusal with `?` -- the cursor never moved, the next pass read the same
+    // page, and every user create and departure queued behind it was never delivered.
+    //
+    // No test reached that arm. `record_subject_failure` had no test caller at all, and reverting
+    // the catch to `?` was green across this whole file. Both policies are driven here, because
+    // the refusing one is where the wedge lives and the deleting one is where the criterion is
+    // actually satisfied.
+    let h = Harness::start().await;
+    let directory = Directory::default();
+    directory.add_group("grp_eng", "engineering", &["usr_ada"]);
+    h.start_tailing_from(0).await;
+    let store = h.db.store().scoped(h.scope);
+    let client = h.client();
+
+    let pass_with = |policy: DeletionPolicy| Pass {
+        connection_id: &h.connection,
+        client: &client,
+        subjects: &directory,
+        deletion_policy: policy,
+        limit: 10,
+        scope: h.scope,
+        now_unix_micros: now_micros(&h.env),
+        organization_id: h.org.clone(),
+    };
+
+    // Provision it first, so there is a downstream resource and a link for a departure to address.
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group_created",
+        "org_group.created",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    run_tail_pass(&store, pass_with(DeletionPolicy::Deactivate))
+        .await
+        .expect("the group is provisioned");
+    assert_eq!(h.downstream.groups().len(), 1);
+
+    // THE DEPARTURE UNDER `deactivate`. A permanent refusal, and the page must step over it.
+    directory.remove_group("grp_eng");
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group_deleted",
+        "org_group.deleted",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    let refused = run_tail_pass(&store, pass_with(DeletionPolicy::Deactivate))
+        .await
+        .expect("a permanent refusal about one subject must not fail the pass");
+    assert_eq!(
+        refused.refused, 1,
+        "the refusal was not counted, so the health surface cannot report it: {refused:?}"
+    );
+    assert!(
+        refused.checkpointed,
+        "the pass did not checkpoint, so the next one reads this same event again for ever"
+    );
+    assert_eq!(
+        h.downstream.groups().len(),
+        1,
+        "the group was removed under a policy that cannot express its departure"
+    );
+    // AND THE REFUSAL IS ON THE SUBJECT, which is the surface that answers "which of these is
+    // failing" rather than "is this connection broken".
+    let link = store
+        .scim_push_links()
+        .find(&h.connection, ScimPushResourceType::Group, "grp_eng")
+        .await
+        .expect("link read")
+        .expect("the group was provisioned, so it has a link");
+    assert!(
+        link.last_error
+            .as_deref()
+            .is_some_and(|why| why.contains("active")),
+        "the per-resource surface does not say why this group cannot be deactivated: {:?}",
+        link.last_error
+    );
+
+    // THE SAME DEPARTURE UNDER `delete` SUCCEEDS. Without this the test would only prove that a
+    // group departure fails, which is half a criterion and the wrong half.
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_group_deleted_again",
+        "org_group.deleted",
+        json!({ "org_group_id": "grp_eng", "organization_id": h.org.clone() }),
+    )
+    .await;
+    let deleted = run_tail_pass(&store, pass_with(DeletionPolicy::Delete))
+        .await
+        .expect("a delete-policy connection removes the group");
+    assert_eq!(
+        deleted.deprovisioned, 1,
+        "the departure was not carried out: {deleted:?}"
+    );
+    assert!(
+        h.downstream.groups().is_empty(),
+        "the group is still on the downstream after a delete-policy departure: {:?}",
+        h.downstream.groups()
     );
 }
 
