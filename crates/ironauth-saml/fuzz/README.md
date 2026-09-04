@@ -81,27 +81,25 @@ Continuous fuzzing should persist and grow these.
 
 ## What has actually been run
 
-Ninety seconds per target on an M-series laptop, from the seeds above:
+Nothing here. An earlier version of this section carried a table of execution
+counts, and the table outlived two rewrites of the things it described: the
+numbers were measured when `saml_verify` still pinned anchors that had signed
+nothing and the corpus held no signed document, so its two million executions
+were evidence about the parser and about nothing in `verify` -- while sitting
+under a heading that says what has actually been run.
 
-| target | executions | new units |
-| --- | --- | --- |
-| `saml_parse` | 11,727,964 | 19,483 |
-| `saml_canonicalize` | 6,541,595 | 15,990 |
-| `saml_verify` | 2,256,060 | 9,055 |
+A hand-copied number that no check re-derives is a claim with a decaying
+half-life, and this one decayed inside a single pull request. Run the targets
+yourself if you want a number; the command is above.
 
-No crashes, and `artifacts/` was empty afterwards.
-
-TWO CAVEATS, because a number in a README is worth exactly what its provenance
-is. These were measured by hand on a developer machine before the targets were
-rewritten in response to review, so they say the harness RAN, not that the
-current targets have. And nothing in this repository verifies them: they are a
-note, not a check. `scripts/fuzz-matrix-freshness.sh` is a different thing
-entirely -- a static three-way check that the registered `[[bin]]` entries, the
-target files and the workflow matrix rows all agree -- and it deliberately never
-invokes cargo, so it cannot tell whether the lane has ever executed. Nothing
-can, from inside the repository.
-
-Ninety seconds is a smoke test. The scheduled lane is what makes it continuous.
+What IS checked, on every build rather than by a note: `tests/fuzz_seeds.rs`
+asserts the seeds are tracked, that every canonicalization seed parses, that the
+parse corpus carries both accepted and DOCTYPE-refused documents, and that at
+least one verify seed genuinely VERIFIES under the embedded key.
+`scripts/fuzz-matrix-freshness.sh` asserts that the registered `[[bin]]` entries,
+the target files and the workflow matrix rows all agree -- it is deliberately
+static and never invokes cargo, so it says nothing about whether the lane has
+executed. Nothing in this repository can say that.
 
 ## Triage
 
@@ -113,8 +111,27 @@ for one is:
 2. **Classify by what an unauthenticated party gets.** A panic in `parse` or
    `canonicalize` is a denial of service on the assertion consumer endpoint and is
    the highest severity this crate can produce, because it needs no key and no
-   valid document. An `Ok` from `saml_verify` is an authentication bypass and is
-   higher still.
+   valid document.
+
+   AN `Ok` FROM `saml_verify` IS THE NORMAL CASE, not a finding. An earlier
+   version of this rule said the opposite, and it was written for an earlier
+   version of the target that asserted `verify` never returns `Ok` at all. The
+   target now embeds a real key so the accept path is reachable, and every
+   iteration reaches it. A triager following the old rule would read a legal SAML
+   response as a working exploit.
+
+   What a `saml_verify` artifact means is that one of two invariants broke: the
+   element returned was not the one asked for, or a verified assertion still
+   carried the `ds:Signature` child the enveloped transform removes. The second is
+   the authentication bypass -- it is the historical defect where the verifier
+   digested a stripped copy and returned the original -- and it is the highest
+   severity here. The first is a wrapping bug of some other shape.
+
+   Read the panic message before assuming which. Both assertions have been wrong
+   before: a version of this target aborted on the ordinary Okta document that
+   signs the Response and the assertion inside it, and on any document with a
+   `URI="#..."` anywhere before the Reference. If an artifact reproduces on a
+   document a real identity provider would send, the TARGET is the defect.
 3. **Write the failing test BEFORE the fix**, in `tests/hostile.rs` for a parse
    crash, `tests/canonical.rs` for a canonicalization one, `tests/wrapping.rs` for
    anything reaching `verify`. The corpus entry alone is not the regression: the

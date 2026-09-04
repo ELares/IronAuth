@@ -1,43 +1,50 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Fuzz signature verification (issue #138, criterion 6).
 //!
-//! # The key is REAL, and that is the whole difference
+//! # The key is REAL, and the assertions are ones a CONFORMING document cannot break
 //!
-//! An earlier version of this target pinned anchors that had signed nothing -- an empty slice,
-//! and a syntactically well-formed point that is not on the curve -- and asserted that `verify`
-//! never returns `Ok`. The doc claimed that covered "every bypass class in one assertion".
-//! It covered none of them. `verify`'s only `Ok` exit sits immediately after
-//! `if !anchors.iter().any(|a| verify_xml_signature(..))`, so with either of those anchors the
-//! `Err` is taken by construction, whatever happened upstream. A reviewer deleted the digest
-//! comparison, the exactly-one-candidate refusal and the duplicate-identifier guard in turn and
-//! the target stayed green on every input, forever. It asserted that `any()` over an empty
-//! iterator is false.
+//! Two earlier versions of this target were wrong in opposite directions, and both are worth
+//! recording because they are the two ways a fuzz assertion goes bad.
 //!
-//! So this target carries a FIXED private key and a document that genuinely verifies under it.
-//! The accept path exists, the fuzzer's mutations of that document can reach it, and the
-//! assertions below are about what comes back when they do.
+//! THE FIRST ASSERTED NOTHING. It pinned anchors that had signed nothing and asserted `verify`
+//! never returns `Ok`. `verify`'s only `Ok` exit sits immediately after
+//! `if !anchors.iter().any(|a| verify_xml_signature(..))`, so with an empty slice the `Err` is
+//! taken by construction, whatever happened upstream. A reviewer deleted the digest comparison,
+//! the exactly-one-candidate refusal and the duplicate-identifier guard in turn and the target
+//! stayed green on every input. It asserted that `any()` over an empty iterator is false.
 //!
-//! Fixed rather than generated, for two reasons: `verify` must be able to answer `Ok` at all,
-//! and a corpus entry that verifies in one process and not the next means nothing. The key is a
-//! throwaway P-256 pair with no counterpart anywhere; it authorises nothing but this target.
+//! THE SECOND ASSERTED TOO MUCH, which is worse, because a fuzz target that fires on a valid
+//! document reports an authentication bypass that does not exist. It checked that a verified
+//! subtree carries no `ds:SignatureValue` -- false for the ordinary Okta and ADFS document that
+//! signs the Response AND the assertion inside it, where verifying the Response legitimately
+//! returns a subtree containing the assertion's signature. And it compared the returned `ID`
+//! against the first `URI="#` found by scanning the RAW INPUT, which is not the reference the
+//! verifier used: a Response-level signature, or any inserted text, sits outside the digested
+//! subtree, so a document that verifies correctly aborted the target. A reviewer produced both
+//! crashes with `cargo fuzz run`, and the README's triage rules would have had a maintainer
+//! reading a legal SAML response as a working exploit.
 //!
-//! # What is asserted when the accept path IS reached
+//! # So what is asserted is what a correct verifier CANNOT violate
 //!
-//! 1. THE RETURNED SUBTREE CARRIES NO SIGNATURE. The enveloped-signature transform removes the
-//!    `Signature` before the digest, so a `VerifiedAssertion` that still contains one is holding
-//!    content the digest did not cover. That is exactly the authenticate-as-anyone defect this
-//!    crate shipped and fixed: the verifier digested a stripped copy and returned the original,
-//!    and the forged `NameID` rode inside the `Signature` element.
+//! 1. THE ELEMENT RETURNED IS THE ELEMENT ASKED FOR. `verify` selects candidates by resolved
+//!    namespace and local name, so the subtree it hands back must satisfy the same predicate.
+//!    A wrapping bug that returned a neighbouring element breaks it.
 //!
-//! 2. THE RETURNED ELEMENT IS THE ONE THE REFERENCE NAMED. Its `ID` must equal the fragment in
-//!    the `Reference` URI. "Verify the node you consume" is only true if those agree.
+//! 2. THE ENVELOPED SIGNATURE IS GONE. `verify` requires exactly one `ds:Signature` that is a
+//!    DIRECT CHILD of the candidate, and the enveloped transform removes exactly that one before
+//!    the digest, so a verified assertion has zero. This is the historical
+//!    authenticate-as-anyone defect stated as an invariant: that version digested a stripped
+//!    copy and returned the ORIGINAL, which still had its signature child and the forged content
+//!    hidden inside it. It is DIRECT children only, which is what makes it survive the
+//!    double-signed Response the previous version died on: the assertion's signature is a child
+//!    of the assertion, not of the Response.
 //!
 //! # And what a fuzzer still cannot do
 //!
 //! It cannot FORGE. Every `Ok` it reaches comes from a mutation that left the signature and the
 //! digest intact, so this explores the accept path's edges rather than its perimeter. The
 //! perimeter is `tests/wrapping.rs`, where each document is built deliberately. Neither
-//! substitutes for the other, and an earlier draft of this note claimed one did.
+//! substitutes for the other.
 //!
 //! Run locally: `cargo +nightly fuzz run saml_verify` from `crates/ironauth-saml/fuzz`.
 #![no_main]
@@ -45,7 +52,15 @@
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 
+/// The XMLDSIG namespace, for the one assertion that names an element.
+const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
 /// A throwaway P-256 key, fixed so the accept path is reachable AND deterministic.
+///
+/// Fixed rather than generated for two reasons: `verify` must be able to answer `Ok` at all, and
+/// a corpus entry that verifies in one process and not the next means nothing. It authorises
+/// nothing but this target, and `crates/ironauth-saml/tests/fuzz_seeds.rs` reads this literal out
+/// of this file so the signed seed and the target cannot drift apart.
 const FUZZ_KEY_PKCS8: &[u8] = &[
     0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
     0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02,
@@ -72,12 +87,9 @@ fn pinned() -> &'static (Vec<u8>, Vec<ironauth_saml::TrustAnchor>) {
     })
 }
 
-/// The fragment named by the first `Reference` URI in the document, if there is one.
-fn referenced_id(bytes: &[u8]) -> Option<String> {
-    let text = core::str::from_utf8(bytes).ok()?;
-    let start = text.find("URI=\"#")? + "URI=\"#".len();
-    let end = start + text[start..].find('"')?;
-    Some(text[start..end].to_owned())
+/// The local part of a qualified name.
+fn local_of(name: &str) -> &str {
+    name.split_once(':').map_or(name, |(_, rest)| rest)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -106,33 +118,16 @@ fuzz_target!(|data: &[u8]| {
         let Ok(assertion) = ironauth_saml::verify(data, &limits, anchors, namespace, local) else {
             continue;
         };
-        // 1. No signature survives into what the caller reads.
-        assert!(
-            assertion
-                .text_of("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")
-                .is_none(),
-            "a verified {local} still carries a SignatureValue, so the digest did not cover it"
+        assert_eq!(
+            local_of(assertion.name()),
+            local,
+            "verify returned an element that is not the one it was asked for"
         );
-        // 2. The element returned is the element the reference named.
-        if let Some(id) = referenced_id(data) {
-            assert_eq!(
-                assertion.attribute("ID"),
-                Some(id.as_str()),
-                "a verified {local} is not the element the Reference URI named"
-            );
-        }
-    }
-
-    // AND WITH NO KEY, NOTHING VERIFIES. Weaker than the above and kept for one reason: it is
-    // the only assertion that holds for EVERY input rather than only for the ones that reach the
-    // accept path, so it is what covers the inputs the mutations never make verifiable.
-    for (namespace, local) in [
-        (ironauth_saml::ASSERTION_NS, "Assertion"),
-        (ironauth_saml::PROTOCOL_NS, "Response"),
-    ] {
-        assert!(
-            ironauth_saml::verify(data, &limits, &[], namespace, local).is_err(),
-            "verified {local} against no pinned key at all"
+        assert_eq!(
+            assertion.child_count(DSIG_NS, "Signature"),
+            0,
+            "a verified {local} still carries the signature the enveloped transform removes, so \
+             the caller can read content the digest did not cover"
         );
     }
 });

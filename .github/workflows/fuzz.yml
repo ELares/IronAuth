@@ -58,7 +58,10 @@ jobs:
   build:
     name: build every fuzz target
     runs-on: ubuntu-latest
-    # Measured at 394s over eight crates on an M-series laptop, and a hosted runner is
+    # Measured at 394s over eight crates on an M-series laptop; the tree now holds NINE,
+    # and the ninth is the heaviest (crates/ironauth-saml/fuzz depends on ironauth-jose, so
+    # it compiles ring, p256 and rsa from source in a detached crate that shares no target
+    # directory). Treat the number as a floor that has not been re-measured. A hosted runner is
     # slower, has fewer cores, shares no target directory between the detached crates, and
     # builds cargo-fuzz from source first.
     timeout-minutes: 60
@@ -93,7 +96,7 @@ jobs:
           done < <(find . -path '*/fuzz/Cargo.toml' -not -path './target/*' \
                           -not -path '*/target/*' | sort)
           # The floor is the count the freshness gate reports, not a token 2: a floor of 2
-          # tolerates the walk silently dropping six of the eight crates, which is most of the
+          # tolerates the walk silently dropping seven of the nine crates, which is most of the
           # way back to finding nothing.
           #
           # AND IT HAS TO MOVE WITH THE TREE. `found` and `expected` come from the same `find`,
@@ -114,11 +117,11 @@ jobs:
 
   fuzz:
     name: fuzz ${{ matrix.target }}
-    # NOT on pull requests: eighteen targets at five minutes each is a nightly lane, not a
+    # NOT on pull requests: twenty-one targets at five minutes each is a nightly lane, not a
     # merge gate. `build` above is the part that gates.
     #
     # `!cancelled()` rather than a bare event check, because `needs: build` otherwise carries
-    # an implicit `success()`: one crate failing to build would skip ALL EIGHTEEN legs, so a
+    # an implicit `success()`: one crate failing to build would skip ALL TWENTY-ONE legs, so a
     # single dead target would stop seventeen healthy parsers being fuzzed that night. That is
     # a strictly worse version of the failure this PR exists to fix, and `fail-fast: false`
     # below says the opposite is intended. The ordering is kept for the log; the suppression

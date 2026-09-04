@@ -245,4 +245,46 @@ pub mod test_util {
                 .to_vec()
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::XmlTestKey;
+
+        /// A generated PKCS#8 document loads back, and the loaded key signs.
+        ///
+        /// # Why a generator needs a caller
+        ///
+        /// `generate_pkcs8` exists so a fuzz target can EMBED a fixed key: a fuzzer needs the
+        /// accept path to be reachable and deterministic, and `generate` gives neither. That
+        /// makes it a producer whose only consumer is a human running it once, so nothing would
+        /// notice if it stopped producing a loadable document -- if, for instance, the curve
+        /// constant it hardcodes diverged from the one `from_pkcs8` parses with.
+        ///
+        /// A review found it with no callers at all, which is the layer-without-a-caller shape.
+        /// This is the caller, and it pins the two together.
+        #[test]
+        fn a_generated_key_document_loads_and_signs() {
+            let document = XmlTestKey::generate_pkcs8();
+            let key = XmlTestKey::from_pkcs8(&document).expect("a generated document loads");
+            let signature = key.sign(b"a message");
+            // A P-256 fixed-width signature is r||s over a 32 byte field.
+            assert_eq!(signature.len(), 64);
+            // AND THE POINT IS A POINT. Uncompressed, so 0x04 and two 32 byte coordinates.
+            let point = key.public_point();
+            assert_eq!(point.len(), 65);
+            assert_eq!(point[0], 0x04);
+        }
+
+        /// Bytes that are not a PKCS#8 key are refused rather than panicking.
+        #[test]
+        fn a_document_that_is_not_a_key_is_refused() {
+            assert!(XmlTestKey::from_pkcs8(b"").is_err());
+            assert!(XmlTestKey::from_pkcs8(b"not a key at all").is_err());
+            // A VALID DER PREFIX with the wrong contents, so the refusal is not merely "too
+            // short": this is the shape a truncated or corrupted key actually has.
+            let mut truncated = XmlTestKey::generate_pkcs8();
+            truncated.truncate(20);
+            assert!(XmlTestKey::from_pkcs8(&truncated).is_err());
+        }
+    }
 }

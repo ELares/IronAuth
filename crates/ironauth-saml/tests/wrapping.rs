@@ -1388,3 +1388,109 @@ fn bytes_after_the_base64_padding_are_refused() {
         "whitespace after the padding is the ordinary wrapped form"
     );
 }
+
+/// AN UNSIGNED ASSERTION IS REFUSED. This is the most basic control there is, and until now
+/// nothing in this crate drove it.
+///
+/// # How a suite of 81 tests missed it
+///
+/// Every `verify` call site in the test tree starts from `Fixture::new()`, `signed_response`,
+/// `resign` or `reseal` -- documents that ARE signed. So no test ever fed `verify` a document
+/// with no signature at all, and a reviewer showed the consequence by mutating the refusal into
+/// `Ok(..)`: every one of the 81 tests stayed green while an entirely unsigned response read its
+/// `NameID` back as though verified. Authenticate as anyone, with no key at all.
+///
+/// The three arms are the three shapes of "not signed HERE", because the interesting failures
+/// are the ones where a signature exists somewhere and a verifier is tempted to count it:
+/// none at all, one on the enclosing `Response` instead, and one buried deeper in the assertion
+/// rather than as its child.
+#[test]
+fn an_assertion_with_no_signature_of_its_own_is_refused() {
+    let fixture = Fixture::new();
+    let bare = concat!(
+        r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
+        r#"xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_response">"#,
+        r#"<saml:Assertion ID="_assertion"><saml:Issuer>urn:idp</saml:Issuer>"#,
+        "<saml:Subject><saml:NameID>attacker@evil.test</saml:NameID></saml:Subject>",
+        "</saml:Assertion></samlp:Response>"
+    );
+    assert_eq!(
+        fixture.verify(bare),
+        Err(VerifyError::SignatureMissing),
+        "an assertion with no signature must not verify"
+    );
+
+    // The identity provider's real signature, moved OUT of the assertion and onto the response.
+    // It no longer covers the assertion, and a verifier that searches the document for "a
+    // signature" rather than for THIS element's signature would count it.
+    let start = fixture
+        .document
+        .find("<ds:Signature")
+        .expect("the fixture is signed");
+    let end = fixture
+        .document
+        .find("</ds:Signature>")
+        .expect("the fixture is signed")
+        + "</ds:Signature>".len();
+    let signature = &fixture.document[start..end];
+    let moved = [&fixture.document[..start], &fixture.document[end..]]
+        .concat()
+        .replacen(
+            "</samlp:Response>",
+            &format!("{signature}</samlp:Response>"),
+            1,
+        );
+    assert_eq!(
+        fixture.verify(&moved),
+        Err(VerifyError::SignatureMissing),
+        "a signature on the response is not a signature on the assertion"
+    );
+
+    // And one nested a level deeper than a child, which is where XSW puts a signature it wants a
+    // verifier to find and a reader to ignore.
+    let buried = [&fixture.document[..start], &fixture.document[end..]]
+        .concat()
+        .replacen("<saml:Subject>", &format!("<saml:Subject>{signature}"), 1);
+    assert_eq!(
+        fixture.verify(&buried),
+        Err(VerifyError::SignatureMissing),
+        "a signature nested below the assertion is not the assertion's signature"
+    );
+}
+
+/// A verified assertion carries NO `ds:Signature` child, because the enveloped transform removed
+/// exactly the one it had.
+///
+/// # The historical bug as an invariant
+///
+/// The authenticate-as-anyone defect this crate shipped and fixed digested a stripped copy and
+/// returned the ORIGINAL subtree, which still had its `Signature` child with the attacker's
+/// forged content hidden inside. Stating the invariant directly is what lets the fuzz target
+/// check it on every input it reaches the accept path with.
+///
+/// DIRECT children, not descendants, and that distinction is load-bearing: a signature deeper in
+/// the tree can be perfectly legitimate. A `saml:Advice` carrying a signed assertion has one, and
+/// so does every assertion inside a Response that was itself signed. An earlier fuzz assertion
+/// used a descendant search and died on the ordinary Okta document that signs both.
+#[test]
+fn a_verified_assertion_carries_no_signature_child() {
+    let fixture = Fixture::new();
+    let assertion = fixture
+        .verify(&fixture.document)
+        .expect("the fixture verifies");
+    assert_eq!(
+        assertion.child_count("http://www.w3.org/2000/09/xmldsig#", "Signature"),
+        0
+    );
+    // AND THE COUNT IS NOT ZERO BECAUSE IT COUNTS NOTHING. The control names an element the
+    // signed assertion really does have, so a `child_count` that always answered zero would fail
+    // here.
+    assert_eq!(
+        assertion.child_count(ironauth_saml::ASSERTION_NS, "Subject"),
+        1
+    );
+    assert_eq!(
+        assertion.child_count(ironauth_saml::ASSERTION_NS, "Issuer"),
+        1
+    );
+}

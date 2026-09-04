@@ -13,33 +13,43 @@
 //! this file FAILS if a named function is not an actual test in this crate. Renaming a test
 //! without updating its row is a red build.
 //!
-//! # Three defects the first version of this file had, because they are the ones to watch for
+//! # THE NAME CHECK IS NOT HERE, AND THAT IS THE THIRD ATTEMPT
 //!
-//! IT SCANNED A HAND-WRITTEN LIST OF FOUR FILENAMES, and the row it was written for named a test
-//! in a fifth. The build was red on the commit that introduced it, and the commit message
-//! claimed the whole thing had been mutation-verified -- which cannot have happened, because a
-//! mutation check needs a green baseline. The scan now WALKS the directories; a list covers what
-//! somebody thought of.
+//! Two versions of this file tried to verify that a named test EXISTS by scanning the source for
+//! `fn <name>(`, and a source scan cannot decide what the compiler decided. `libtest` exposes no
+//! list of the tests linked into a binary, so there was nothing sound to ask.
 //!
-//! IT WAS A PLAIN SUBSTRING MATCH, so `// fn foo(` in a comment, or a helper function that is
-//! not a test at all, satisfied a row. It now requires a `#[test]` or `#[tokio::test]` attribute
-//! within a few lines above, and refuses a commented-out line.
+//! The first scanned a hand-written list of four filenames, and the row it was written for named
+//! a test in a fifth file the same commit added: the build was red on arrival. The second walked
+//! the directories and required a `#[test]` attribute within four lines above the function --
+//! which attributes a HELPER declared just after a test, misses a one-line
+//! `#[test] fn foo() {}` entirely, and descends into `tests/compile-fail/`, whose files are
+//! `trybuild` fixtures that are never compiled into any test binary. Both versions could report
+//! a row as covered by a function nothing runs.
 //!
-//! ONE ROW NAMED A TEST THAT MEASURED NOTHING IT CLAIMED. "Bound document size, depth and
-//! breadth" pointed at a test that only ever set an attribute-count and a name-length limit; all
-//! three bound guards could be deleted from the parser with that row still green. Rows now name
-//! EVERY test that carries the control, which is why [`Coverage::Tests`] takes a slice.
+//! `scripts/saml-owasp-checklist.sh` owns that check now. It reads
+//! `cargo test -- --list`, which prints exactly the tests the compiler produced, and it runs in
+//! the merge-blocking invariants job. What is left here is what a table CAN check about itself:
+//! every row has a rationale, no two rows claim the same control, an N/A names an owner, and a
+//! gap names the criterion it belongs to.
+//!
+//! # One defect that was about the ROWS rather than the mechanism
+//!
+//! A row named ONE test for a control about three separate bounds, and that test measured none
+//! of them: all three parser guards could be deleted with the row still green. Rows now name
+//! EVERY test that carries the control, which is why [`Coverage::Tests`] takes a slice, and a
+//! second test refuses a row whose control enumerates several properties while naming one test.
 //!
 //! # What this still cannot check, said out loud
 //!
-//! It checks that the named tests EXIST, not that they prove what the row claims. That gap is
-//! real, and the rationale on every row is what a reader needs to judge it. The thing that
-//! actually covers the gap is the mutation sweep over the crate, not this file: a row whose test
-//! exists but proves nothing is caught by removing the guard and watching the suite stay green.
+//! That a named test proves what its row claims. The rationale on every row is what a reader
+//! needs to judge it, and the thing that actually covers the gap is the mutation sweep over the
+//! crate: a row whose test exists but proves nothing is caught by removing the guard and
+//! watching the suite stay green.
 //!
-//! It also cannot tell that a ROW WAS DELETED. A count floor is a ratchet and nothing more: it
-//! catches a row going missing by accident, not a row removed on purpose, because the expected
-//! value would live in the same file as the thing it bounds.
+//! It also cannot tell that a ROW WAS DELETED. A count floor is a ratchet and nothing more, and
+//! this file has already demonstrated the limit: the commit that added two dozen missing items
+//! also DELETED the audience row, and no floor noticed because the total went up.
 //!
 //! # The source, and what "complete" means
 //!
@@ -93,8 +103,12 @@ const CHEAT_SHEET: &[Item] = &[
     Item {
         control: "Use strong encryption and signature algorithms throughout the chain",
         coverage: Coverage::Tests(&["a_refused_algorithm_is_refused_before_anything_is_verified"]),
-        rationale: "The signature allowlist is exactly RSA and ECDSA over SHA-256/384/512, and \
-                    the digest allowlist exactly SHA-256/384/512. Nothing else is accepted.",
+        rationale: "The signature allowlist is exactly rsa-sha256/384/512 and ecdsa-sha256/384; \
+                    the digest allowlist exactly SHA-256/384/512. NOT ecdsa-sha512, which an \
+                    earlier version of this row claimed: `ring` offers the fixed-width \
+                    verification XMLDSIG needs only for the matched hash and curve pairs, and \
+                    the crate documentation is where that narrowing is recorded. A row that \
+                    overstates the allowlist hides the one place it was written down.",
     },
     Item {
         control: "Deprecate support for insecure XMLEnc algorithms",
@@ -158,6 +172,58 @@ const CHEAT_SHEET: &[Item] = &[
              no-op check.",
         ),
         rationale: "The item is only meaningfully owned where the signed subtree is known.",
+    },
+    Item {
+        control: "Validate the assertion's audience (Recipient and AudienceRestriction)",
+        coverage: Coverage::NotApplicable(
+            "There is no configured audience here to compare against: this crate returns a \
+             verified subtree and holds no service provider identity. Issue #139 owns it, and it \
+             is the control against an assertion minted for one service provider being replayed \
+             at another.",
+        ),
+        rationale: "RESTORED. This row existed, and the commit that added two dozen missing \
+                    items DELETED it while claiming the checklist was now complete. No count \
+                    floor noticed, because the total went up. That is the limit of a ratchet \
+                    stated as a fact rather than as a caveat.",
+    },
+    Item {
+        control: "Never select security-relevant elements by tag name; use absolute paths",
+        coverage: Coverage::Tests(&[
+            "a_second_assertion_under_another_prefix_is_still_a_second_assertion",
+            "a_foreign_signature_as_a_direct_child_is_not_a_signature",
+            "a_prefix_rebound_under_signed_info_is_not_the_signature_namespace",
+            "an_assertion_with_no_signature_of_its_own_is_refused",
+        ]),
+        rationale: "The cheat sheet's target is `getElementsByTagName`, and this crate's \
+                    equivalent is `collect`. It is not a tag-name search: identity is (namespace \
+                    URI, local name), resolved against the declarations in scope, which the \
+                    first test exists because an earlier version got wrong. Everything under the \
+                    signature is found by DIRECT CHILD rather than by descendant search, which \
+                    is the property an absolute path buys, and the last test is the one that \
+                    pins it -- a signature nested below the assertion is not the assertion's.",
+    },
+    Item {
+        control: "Prefer OneTimeUse and short lifetimes on the Response",
+        coverage: Coverage::NotApplicable(
+            "Both are conditions on a Response this crate does not interpret, and honouring \
+             OneTimeUse needs the durable state a replay cache is. Issue #139 owns them together \
+             with the replay table.",
+        ),
+        rationale: "Named rather than folded into the time-bounds row, because OneTimeUse is a \
+                    different mechanism from an expiry and an implementation can ship one \
+                    without the other.",
+    },
+    Item {
+        control: "Refuse unsolicited responses (IdP-initiated SSO) unless deliberately enabled",
+        coverage: Coverage::NotApplicable(
+            "Unsolicited means there was no AuthnRequest to correlate against, and this crate \
+             never made one. Issue #139 owns it, and its plan records the shape: refused by \
+             default, per-connection opt-in, and with the opt-in on, a replayed assertion ID \
+             rejected for the full validity window.",
+        ),
+        rationale: "This is login CSRF rather than a signature problem, which is why it belongs \
+                    with the flow: an attacker who can post a VALID assertion for their own \
+                    account signs the victim's browser into it.",
     },
     Item {
         control: "Validate NotBefore / NotOnOrAfter and bound clock skew",
@@ -421,87 +487,9 @@ const CHEAT_SHEET: &[Item] = &[
     },
 ];
 
-/// Every `#[test]` function in this crate, found by WALKING the source rather than by reading a
-/// list of filenames.
-///
-/// # The list was the bug
-///
-/// The first version of this file hand-listed four paths, and the row it was written for named a
-/// test in a fifth that this same commit added. The build was red the moment it landed. A walk
-/// covers what is there; a list covers what somebody remembered.
-///
-/// Inline `#[cfg(test)]` modules under `src/` are walked too, because a test does not stop being
-/// a test for living beside the code.
-fn every_test_in_this_crate() -> std::collections::BTreeSet<String> {
-    fn walk(directory: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, into);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                into.push(path);
-            }
-        }
-    }
-
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    walk(&root.join("tests"), &mut files);
-    walk(&root.join("src"), &mut files);
-    assert!(
-        files.len() >= 8,
-        "the walk found only {} source files, so it is not walking what it thinks it is",
-        files.len()
-    );
-
-    let mut names = std::collections::BTreeSet::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("a source file is readable");
-        let lines: Vec<&str> = text.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            // A COMMENTED-OUT LINE IS NOT A TEST. An earlier version matched `fn name(`
-            // anywhere, so `// fn foo(` in a doc comment satisfied a row.
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            let Some(rest) = trimmed
-                .strip_prefix("fn ")
-                .or_else(|| trimmed.strip_prefix("async fn "))
-            else {
-                continue;
-            };
-            let Some(name) = rest.split('(').next() else {
-                continue;
-            };
-            // AND IT MUST CARRY A TEST ATTRIBUTE. A helper function is not a test, and naming
-            // one in a row would claim coverage from a function nothing ever runs.
-            let attributed = lines[index.saturating_sub(4)..index].iter().any(|above| {
-                let above = above.trim_start();
-                above.starts_with("#[test]")
-                    || above.starts_with("#[tokio::test")
-                    || above.starts_with("#[test_case")
-            });
-            if attributed {
-                names.insert(name.trim().to_owned());
-            }
-        }
-    }
-    names
-}
-
 /// Every row names tests that exist, or carries a reason with an owner.
 #[test]
 fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
-    let tests = every_test_in_this_crate();
-    assert!(
-        tests.contains("every_checklist_item_names_a_test_that_exists_or_a_reason"),
-        "the walk cannot find this very test, so it finds nothing"
-    );
-
     let mut named = 0_usize;
     let mut excused = 0_usize;
     let mut gaps = 0_usize;
@@ -525,20 +513,38 @@ fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
                     item.control
                 );
                 named += 1;
+                // THAT THE NAMES EXIST IS scripts/saml-owasp-checklist.sh's job, because it
+                // can read `cargo test -- --list` and this cannot. What is checkable here is
+                // that a name is shaped like one, so a typo that produces an empty or obviously
+                // wrong string fails immediately rather than at gate time.
                 for name in covering {
                     assert!(
-                        tests.contains(*name),
-                        "{}: names `{name}`, which is not a #[test] in this crate",
+                        !name.is_empty()
+                            && name.chars().all(|character| character.is_ascii_lowercase()
+                                || character.is_ascii_digit()
+                                || character == '_'),
+                        "{}: `{name}` is not a test function name",
                         item.control
                     );
                 }
             }
             Coverage::NotApplicable(reason) => {
                 excused += 1;
+                // BOTH ALTERNATIVES THE MESSAGE OFFERS ARE IMPLEMENTED. An earlier version
+                // checked only the first while promising the second, and the one row that
+                // depends on the second -- IP filtering, which no code in this repository can
+                // assert -- passed by accident on a trailing clause. A check that is narrower
+                // than its own error message trains a reader to distrust the message.
+                // Case-insensitive, because half the rows open a sentence with "Issue #139".
+                // An earlier version matched only the lowercase form and passed those rows on a
+                // bare `#139` disjunct instead, which made the whole condition near-tautological.
+                let lowered = reason.to_ascii_lowercase();
+                let names_an_owner = lowered.contains("issue #") || lowered.contains("(#");
+                let names_nobody = reason.contains("Nothing in this repository can assert it");
                 assert!(
-                    reason.contains("issue #") || reason.contains("(#") || reason.contains("#139"),
-                    "{}: an N/A must name the issue that DOES own the item, or say plainly that \
-                     nothing in this repository can assert it",
+                    names_an_owner || names_nobody,
+                    "{}: an N/A must name the issue that DOES own the item, or say in those \
+                     words that `Nothing in this repository can assert it`",
                     item.control
                 );
             }
@@ -553,18 +559,21 @@ fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
         }
     }
 
-    // FLOORS, and they are a ratchet rather than a proof. They catch a row or a name going
-    // missing by accident; they cannot catch one removed on purpose, because the expected value
-    // would live in the same file as the thing it bounds. That limit is in the module doc.
-    assert!(named >= 14, "only {named} rows are covered by tests");
-    assert!(
-        excused >= 12,
-        "only {excused} rows are excused as out of scope"
+    // FLOORS, and they are set at the CURRENT counts rather than comfortably below them.
+    // Slack is what the previous version had and it bought nothing: with floors two rows below
+    // the totals, two published items could vanish in silence, which is the failure a checklist
+    // exists to prevent -- and one did, when the commit that added two dozen items also deleted
+    // the audience row and no floor noticed because the total went UP.
+    //
+    // At exact counts a deletion is a red build that a reader has to lower deliberately, in the
+    // same commit, with the removed row visible in the diff. That is the most a same-file bound
+    // can do: it cannot stop a removal, only make one loud.
+    assert_eq!(named, 17, "a row that names tests was added or removed");
+    assert_eq!(
+        excused, 17,
+        "a row marked out of scope was added or removed"
     );
-    assert!(
-        gaps >= 1,
-        "no row is recorded as a gap; the encrypted-assertion work is one"
-    );
+    assert_eq!(gaps, 2, "a row marked as a gap was added or removed");
 }
 
 /// The rows that name tests name ENOUGH of them.
