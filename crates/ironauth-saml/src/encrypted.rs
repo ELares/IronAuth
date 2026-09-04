@@ -36,9 +36,15 @@
 //!   conforming XML Encryption implementation using the XML parser's own behaviour on the
 //!   decrypted bytes as an oracle, and the backwards-compatibility defences fell to the
 //!   follow-up work. `ring` offers no CBC, so this refusal is structural.
-//! * A `RetrievalMethod` pointing anywhere. The key must be carried INSIDE the `EncryptedData`
-//!   being decrypted; a reference is a request that this crate fetch something, and it fetches
-//!   nothing.
+//! * A `RetrievalMethod` naming somewhere ELSE. The SAML schema allows the `EncryptedKey` to be
+//!   a SIBLING of the `EncryptedData`, referenced by a same-document fragment, and that is what
+//!   `OpenSAML` and Shibboleth emit -- so a fragment is accepted and must name the key actually
+//!   used. Anything that is not a fragment is a request this crate will not make.
+//!
+//!   An earlier version refused every `RetrievalMethod` on the ground that "a reference is a
+//!   request that this crate fetch something". True of an absolute URI, false of `#_ek`, and the
+//!   refusal was therefore turning away conforming documents from the commonest implementation
+//!   in the field.
 //! * More than one `EncryptedData`, or more than one `EncryptedKey` within it, for the reason
 //!   every other "exactly one" in this crate exists: two is a contradiction, and choosing is
 //!   choosing which half to believe.
@@ -346,6 +352,25 @@ fn exactly_one(
     }
 }
 
+/// At most one, refusing two. `None` means the document carried none.
+///
+/// # Why `Scoped::child` is wrong wherever ABSENT has a meaning
+///
+/// `child` answers `None` for zero matches AND for two or more. Where `None` means "use the
+/// specification's default" that is not a shrug, it is a DOWNGRADE: writing an OAEP
+/// `DigestMethod` twice made the crate tell the caller SHA-1 for a document that named SHA-512,
+/// and slipped past the contradiction guard beside it. Duplication selected a weaker parameter
+/// set, which is worse than the refusal-evasion this crate had already fixed once.
+fn at_most_one(
+    mut found: Vec<crate::verify::Scoped<'_>>,
+) -> Result<Option<crate::verify::Scoped<'_>>, DecryptError> {
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => Err(DecryptError::Shape),
+    }
+}
+
 /// Refuse if `element` carries ANY child that is `namespace`:`local`.
 ///
 /// Counting rather than asking for exactly one: the guards below are refusals, so "there are two"
@@ -388,8 +413,16 @@ fn wrapped_key(
     encrypted: &crate::verify::Scoped<'_>,
     data: &crate::verify::Scoped<'_>,
 ) -> Result<WrappedKey, DecryptError> {
-    let inside = data
-        .child(DSIG_NS, "KeyInfo")
+    // AT MOST ONE KeyInfo, and two is a refusal rather than a shrug. Before the round-1 fix this
+    // was `child(..).ok_or(Shape)?`, which refused two; the fix relaxed it to
+    // `.map(..).unwrap_or_default()` so a missing KeyInfo would fall through to the sibling
+    // placement -- and `child` still answers `None` for TWO. So two KeyInfo children produced an
+    // EMPTY nested list instead of a refusal: a document holding three EncryptedKey elements was
+    // accepted, and because the same `child` call gates the loop below, the absolute-URI refusal
+    // was skipped entirely. That refusal is the arm that keeps the sibling placement honest.
+    let key_info = at_most_one(data.children(DSIG_NS, "KeyInfo"))?;
+    let inside = key_info
+        .as_ref()
         .map(|info| info.children(XENC_NS, "EncryptedKey"))
         .unwrap_or_default();
     let beside = encrypted.children(XENC_NS, "EncryptedKey");
@@ -401,10 +434,17 @@ fn wrapped_key(
 
     // A RETRIEVAL METHOD MAY NOT NAME SOMEWHERE ELSE. A same-document fragment is fine and is
     // what the sibling placement uses; anything else is a request this crate will not make.
-    if let Some(info) = data.child(DSIG_NS, "KeyInfo") {
+    if let Some(info) = key_info.as_ref() {
         for method in info.children(DSIG_NS, "RetrievalMethod") {
             let uri = method.attribute("URI").ok_or(DecryptError::Shape)?;
-            if !uri.starts_with('#') {
+            let Some(fragment) = uri.strip_prefix('#') else {
+                return Err(DecryptError::Shape);
+            };
+            // AND IT MUST NAME THE KEY THAT IS USED. Checking only the leading `#` made the
+            // reference decorative: a document could point at `#somewhere_else` and be decrypted
+            // under whichever key happened to be found. A reference that names nothing is a
+            // reference to nothing.
+            if key.attribute("Id") != Some(fragment) {
                 return Err(DecryptError::Shape);
             }
         }
@@ -431,14 +471,17 @@ fn wrapped_key(
 
 /// The OAEP hash, mask generation and label the `EncryptionMethod` names.
 ///
-/// Absent means the specification's default, which is SHA-1 for both, and `#rsa-oaep-mgf1p` FIXES
-/// them there: a document naming that URI and then carrying a SHA-256 `DigestMethod` is asking
-/// for two different things, so it is refused rather than resolved to one of them.
+/// Absent means the specification's default, which is SHA-1 for both.
+///
+/// `#rsa-oaep-mgf1p` fixes the MASK GENERATION FUNCTION only (XML Encryption 1.0 section 5.4.2:
+/// it "is always MGF1 with SHA1"), and leaves the digest an explicit parameter. So that URI with
+/// a SHA-256 `DigestMethod` is conforming and common; what it may NOT carry is an explicit
+/// `xenc11:MGF`, because the URI already decided that.
 fn oaep_parameters(
     method: &crate::verify::Scoped<'_>,
     algorithm: KeyTransportAlg,
 ) -> Result<OaepParameters, DecryptError> {
-    let digest = match method.child(DSIG_NS, "DigestMethod") {
+    let digest = match at_most_one(method.children(DSIG_NS, "DigestMethod"))? {
         None => OaepDigest::Sha1,
         Some(named) => match named
             .attribute("Algorithm")
@@ -451,7 +494,8 @@ fn oaep_parameters(
             _ => return Err(DecryptError::AlgorithmRefused),
         },
     };
-    let mgf = match method.child(XENC11_NS, "MGF") {
+    let mgf_named = at_most_one(method.children(XENC11_NS, "MGF"))?;
+    let mgf = match &mgf_named {
         None => OaepMgf::Mgf1Sha1,
         Some(named) => match named
             .attribute("Algorithm")
@@ -464,12 +508,24 @@ fn oaep_parameters(
             _ => return Err(DecryptError::AlgorithmRefused),
         },
     };
-    if algorithm == KeyTransportAlg::RsaOaepMgf1Sha1
-        && (digest != OaepDigest::Sha1 || mgf != OaepMgf::Mgf1Sha1)
-    {
+    // `#rsa-oaep-mgf1p` FIXES THE MASK GENERATION AND NOTHING ELSE, and an earlier version had
+    // this backwards on both halves.
+    //
+    // XML Encryption 1.0 section 5.4.2, which DEFINES the URI, says the mask generation function
+    // "is always MGF1 with SHA1" and makes the digest an explicit parameter: "a mandatory message
+    // digest function ... indicated by the Algorithm attribute of a child ds:DigestMethod
+    // element". So mgf1p with a SHA-256 digest is ONE algorithm, not a contradiction, and it is
+    // what `xmlsec` and OpenSAML emit when configured with a SHA-256 OAEP digest on the 1.0 URI.
+    // A reviewer found it in crewjam/saml's own corpus.
+    //
+    // The previous rule refused exactly that -- a correct-sounding reason applied to documents it
+    // did not describe, which is the same defect as round 1's headline finding, reintroduced one
+    // element down by the fix for it. What IS wrong under this URI is a PRESENT `xenc11:MGF`,
+    // because the URI already fixed it, and that is what is refused now.
+    if algorithm == KeyTransportAlg::RsaOaepMgf1Sha1 && mgf_named.is_some() {
         return Err(DecryptError::AlgorithmRefused);
     }
-    let label = match method.child(XENC_NS, "OAEPparams") {
+    let label = match at_most_one(method.children(XENC_NS, "OAEPparams"))? {
         None => None,
         Some(params) => {
             Some(crate::verify::decode_base64(&params.text()).ok_or(DecryptError::Shape)?)

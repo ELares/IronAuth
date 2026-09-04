@@ -812,10 +812,13 @@ fn the_oaep_parameters_reach_the_seam() {
     assert_eq!(parameters.mgf, OaepMgf::Mgf1Sha256);
     assert_eq!(parameters.label.as_deref(), Some(&b"ABC"[..]));
 
-    // AND `#rsa-oaep-mgf1p` FIXES THEM. That URI means MGF1-SHA1; a document naming it and then
-    // carrying a SHA-256 DigestMethod is asking for two different things, and resolving that to
-    // one of them is choosing which half of a contradiction to believe.
-    let contradictory = fixture
+    // AND `#rsa-oaep-mgf1p` FIXES THE MASK GENERATION FUNCTION ONLY.
+    //
+    // XML Encryption 1.0 section 5.4.2, which defines that URI, says the MGF "is always MGF1 with
+    // SHA1" and makes the DIGEST an explicit parameter. So mgf1p with a SHA-256 DigestMethod is
+    // conforming and is what xmlsec and OpenSAML emit; an earlier version of this crate refused
+    // it, and a reviewer found the shape in another SAML library's own test corpus.
+    let with_digest = fixture
         .wrap_with(
             &fixture.assertion,
             "http://www.w3.org/2009/xmlenc11#aes256-gcm",
@@ -832,8 +835,43 @@ fn the_oaep_parameters_reach_the_seam() {
             1,
         );
     let unwrapper = fixture.unwrapper();
+    fixture
+        .decrypt(&with_digest, &unwrapper)
+        .expect("mgf1p with an explicit digest is conforming");
+    {
+        let seen = unwrapper.seen.borrow();
+        let [(algorithm, parameters)] = seen.as_slice() else {
+            panic!("the seam must be asked exactly once");
+        };
+        assert_eq!(*algorithm, KeyTransportAlg::RsaOaepMgf1Sha1);
+        assert_eq!(parameters.digest, OaepDigest::Sha256);
+        // The URI decided this one, so it is the fixed value whatever the digest says.
+        assert_eq!(parameters.mgf, OaepMgf::Mgf1Sha1);
+    }
+
+    // WHAT IT MAY NOT CARRY is an explicit MGF, because the URI already decided that. Refusing
+    // the digest and accepting the MGF was the previous rule, which had the specification exactly
+    // backwards on both halves.
+    let with_mgf = fixture
+        .wrap_with(
+            &fixture.assertion,
+            "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+            "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+            32,
+        )
+        .replacen(
+            r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/>"#,
+            concat!(
+                r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p">"#,
+                r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" "#,
+                r#"Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha1"/>"#,
+                "</xenc:EncryptionMethod>"
+            ),
+            1,
+        );
+    let unwrapper = fixture.unwrapper();
     assert_eq!(
-        fixture.decrypt(&contradictory, &unwrapper),
+        fixture.decrypt(&with_mgf, &unwrapper),
         Err(DecryptError::AlgorithmRefused)
     );
     assert!(
@@ -1041,4 +1079,245 @@ fn writing_a_refused_element_twice_does_not_evade_the_refusal() {
             "{what}"
         );
     }
+}
+
+/// A duplicated OAEP parameter is REFUSED, not silently downgraded to the default.
+///
+/// # Duplication selecting a weaker parameter set is worse than duplication evading a refusal
+///
+/// `Scoped::child` answers `None` for zero matches AND for two or more, and in `oaep_parameters`
+/// `None` means "use the specification's default". So writing a `DigestMethod` twice did not
+/// evade a refusal, it CHOSE SHA-1: the crate told a caller's HSM SHA-1 for a document that named
+/// SHA-512, which is precisely the "decrypts under the wrong parameters and fails
+/// indistinguishably from a wrong key" failure the parameters exist to prevent. Two
+/// `OAEPparams` silently dropped the label.
+///
+/// This is the same class the previous round fixed for `CipherReference`, reappearing in the code
+/// that fixed it.
+#[test]
+fn a_duplicated_oaep_parameter_is_refused() {
+    let fixture = Fixture::new();
+    for (what, doubled) in [
+        (
+            "two DigestMethod",
+            concat!(
+                r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha512"/>"#,
+                r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha512"/>"#
+            ),
+        ),
+        (
+            "two MGF",
+            concat!(
+                r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" "#,
+                r#"Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha512"/>"#,
+                r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" "#,
+                r#"Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha512"/>"#
+            ),
+        ),
+        (
+            "two OAEPparams",
+            "<xenc:OAEPparams>QUJD</xenc:OAEPparams><xenc:OAEPparams>QUJD</xenc:OAEPparams>",
+        ),
+    ] {
+        let document = fixture.document().replacen(
+            r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/>"#,
+            &format!(
+                concat!(
+                    r#"<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep">"#,
+                    "{}</xenc:EncryptionMethod>"
+                ),
+                doubled
+            ),
+            1,
+        );
+        assert_ne!(document, fixture.document(), "{what}: the edit must apply");
+        let unwrapper = fixture.unwrapper();
+        assert_eq!(
+            fixture.decrypt(&document, &unwrapper),
+            Err(DecryptError::Shape),
+            "{what}"
+        );
+        assert!(
+            unwrapper.seen.borrow().is_empty(),
+            "{what}: refused before the seam is asked"
+        );
+    }
+}
+
+/// A second `ds:KeyInfo` is refused, and does not make a key invisible or skip the URI check.
+///
+/// # What the round-1 fix relaxed by accident
+///
+/// The lookup used to be `child(..).ok_or(Shape)?`, which refused two `KeyInfo` children. The fix
+/// relaxed it to `.map(..).unwrap_or_default()` so an absent `KeyInfo` could fall through to the
+/// sibling placement -- and `child` still answers `None` for TWO. So two `KeyInfo` children
+/// produced an EMPTY nested list rather than a refusal: a document holding three `EncryptedKey`
+/// elements was accepted, and because the same call gated the `RetrievalMethod` loop, the
+/// absolute-URI refusal was skipped entirely. That refusal is the arm that keeps the sibling
+/// placement honest, so relaxing it removed the only thing standing between a document and an
+/// outbound request.
+#[test]
+fn a_second_key_info_is_refused() {
+    let fixture = Fixture::new();
+    let empty_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"/>"#;
+    let document = fixture.document();
+    let start = document
+        .find("<xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey");
+    let end = document
+        .find("</xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey")
+        + "</xenc:EncryptedKey>".len();
+    let key = document[start..end].replacen(
+        "<xenc:EncryptedKey>",
+        r#"<xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">"#,
+        1,
+    );
+
+    // THE SHAPE THAT MATTERS: two KeyInfo children AND a sibling key. With `child` answering
+    // `None` for two, the nested list came back EMPTY and the sibling was used, so a document
+    // carrying two EncryptedKey elements decrypted. A test that only doubles the KeyInfo without
+    // a sibling refuses either way and proves nothing -- which is how the first version of this
+    // test passed against the mutation.
+    let doubled = document
+        .replacen("<ds:KeyInfo", &format!("{empty_info}<ds:KeyInfo"), 1)
+        .replacen(
+            "</xenc:EncryptedData>",
+            &format!("</xenc:EncryptedData>{key}"),
+            1,
+        );
+    assert_ne!(doubled, document, "the edit must apply");
+    let unwrapper = fixture.unwrapper();
+    assert_eq!(
+        fixture.decrypt(&doubled, &unwrapper),
+        Err(DecryptError::Shape),
+        "two KeyInfo children must be refused, not resolved to neither"
+    );
+    assert!(unwrapper.seen.borrow().is_empty());
+
+    // AND THE SAME DOCUMENT WITH ONE KeyInfo IS THE CONTROL: it is refused too, but for the
+    // reason the crate means -- two keys -- so the arm above is not passing on a coincidence.
+    let single = document.replacen(
+        "</xenc:EncryptedData>",
+        &format!("</xenc:EncryptedData>{key}"),
+        1,
+    );
+    assert_eq!(
+        fixture.decrypt(&single, &fixture.unwrapper()),
+        Err(DecryptError::Shape)
+    );
+}
+
+/// A `RetrievalMethod` must name the key that is actually used.
+///
+/// # A reference that names nothing is a reference to nothing
+///
+/// Checking only the leading `#` made the reference decorative: a document could point at
+/// `#somewhere_else` and still be decrypted under whichever key happened to be found. The
+/// fragment now has to match the `Id` of the key the crate uses, which is what makes the sibling
+/// placement a REFERENCE rather than a coincidence.
+#[test]
+fn a_retrieval_method_must_name_the_key_it_uses() {
+    let fixture = Fixture::new();
+    let document = fixture.document();
+    let start = document
+        .find("<xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey");
+    let end = document
+        .find("</xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey")
+        + "</xenc:EncryptedKey>".len();
+    let key = document[start..end].replacen(
+        "<xenc:EncryptedKey>",
+        concat!(
+            r#"<xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" "#,
+            r#"Id="_ek">"#
+        ),
+        1,
+    );
+    let with_reference = |uri: &str| {
+        [&document[..start], &document[end..]]
+            .concat()
+            .replacen(
+                "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"></ds:KeyInfo>",
+                &format!(
+                    concat!(
+                        r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                        "<ds:RetrievalMethod URI=\"{}\"/></ds:KeyInfo>"
+                    ),
+                    uri
+                ),
+                1,
+            )
+            .replacen(
+                "</xenc:EncryptedData>",
+                &format!("</xenc:EncryptedData>{key}"),
+                1,
+            )
+    };
+
+    // CONTROL: naming the key that is there works.
+    assert!(
+        fixture
+            .decrypt(&with_reference("#_ek"), &fixture.unwrapper())
+            .is_ok(),
+        "a reference naming the key must work"
+    );
+
+    for (what, uri) in [
+        ("a fragment naming something else", "#somewhere_else"),
+        ("an absolute URI", "http://attacker.test/key"),
+        ("an empty fragment", "#"),
+    ] {
+        let unwrapper = fixture.unwrapper();
+        assert_eq!(
+            fixture.decrypt(&with_reference(uri), &unwrapper),
+            Err(DecryptError::Shape),
+            "{what}"
+        );
+        assert!(
+            unwrapper.seen.borrow().is_empty(),
+            "{what}: refused before the seam is asked"
+        );
+    }
+}
+
+/// One key in EACH placement is two keys.
+///
+/// # The rule the code states and no test drove
+///
+/// `wrapped_key` merges the nested and sibling lists and demands exactly one, with a comment
+/// saying "ONE KEY, wherever it sits. Two is the contradiction, and one in each place is two."
+/// No test put one in each place, so replacing the merge with "prefer the nested one and ignore
+/// the sibling" left the whole suite green.
+#[test]
+fn one_key_in_each_placement_is_two_keys() {
+    let fixture = Fixture::new();
+    let document = fixture.document();
+    let start = document
+        .find("<xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey");
+    let end = document
+        .find("</xenc:EncryptedKey>")
+        .expect("the fixture has an EncryptedKey")
+        + "</xenc:EncryptedKey>".len();
+    let key = document[start..end].replacen(
+        "<xenc:EncryptedKey>",
+        r#"<xenc:EncryptedKey xmlns:xenc="http://www.w3.org/2001/04/xmlenc#">"#,
+        1,
+    );
+    // The nested key stays where it is; a copy goes beside the EncryptedData.
+    let both = document.replacen(
+        "</xenc:EncryptedData>",
+        &format!("</xenc:EncryptedData>{key}"),
+        1,
+    );
+    assert_ne!(both, document, "the edit must apply");
+    let unwrapper = fixture.unwrapper();
+    assert_eq!(
+        fixture.decrypt(&both, &unwrapper),
+        Err(DecryptError::Shape),
+        "one key in each placement is two keys"
+    );
+    assert!(unwrapper.seen.borrow().is_empty());
 }
