@@ -26,25 +26,24 @@
 
 /// The SCIM collection a subject belongs to.
 ///
-/// Two, because RFC 7644 gives the protocol two resource types and #137 pushes both. Not a
-/// string: the collection selects the path, the required attribute and the scope filter, and a
-/// typo in any of those is a request to the wrong endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Collection {
-    /// `/Users`.
-    Users,
-    /// `/Groups`.
-    Groups,
-}
+/// A re-export of [`ironauth_scim::ResourceType`] rather than a second enum. An earlier version
+/// of this module declared its own `Collection { Users, Groups }`, which gave the same two-element
+/// set three vocabularies in one repository: this one, `ResourceType` in the inbound half, and
+/// `ScimPushResourceType` in the store. Two of them now agree by being the same type; the store's
+/// stays separate because it is the spelling a database CHECK constrains, and a Rust enum that
+/// travels into SQL is a different obligation from one that names a URL path.
+pub use ironauth_scim::ResourceType as Collection;
 
-impl Collection {
-    /// The path segment, as the client builds it.
-    #[must_use]
-    pub const fn path(self) -> &'static str {
-        match self {
-            Self::Users => "/Users",
-            Self::Groups => "/Groups",
-        }
+/// The path a SCIM client addresses this collection at, with the leading slash the client builds.
+///
+/// [`Collection::as_str`] gives the bare SCIM spelling (`Users`), which is what a `ResourceRef`
+/// and a schema URN use. The client's request paths carry the slash, and putting the join here
+/// keeps that difference in one place rather than at every call site.
+#[must_use]
+pub fn collection_path(collection: Collection) -> &'static str {
+    match collection {
+        Collection::User => "/Users",
+        Collection::Group => "/Groups",
     }
 }
 
@@ -119,7 +118,7 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
         | "user.identifier_added"
         | "user.identifier_removed" => match subject("user_id") {
             Some(id) => PushIntent::Converge {
-                collection: Collection::Users,
+                collection: Collection::User,
                 subject_id: id.to_owned(),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
@@ -130,7 +129,7 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
         // account that stays active downstream is the failure #137 exists to prevent.
         "user.deleted" | "user.deprovisioned" | "user.deactivated" => match subject("user_id") {
             Some(id) => PushIntent::Deprovision {
-                collection: Collection::Users,
+                collection: Collection::User,
                 subject_id: id.to_owned(),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
@@ -145,14 +144,14 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
         | "org_group.member_removed"
         | "org_group.membership_changed" => match subject("group_id") {
             Some(id) => PushIntent::Converge {
-                collection: Collection::Groups,
+                collection: Collection::Group,
                 subject_id: id.to_owned(),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),
         },
         "org_group.deleted" => match subject("group_id") {
             Some(id) => PushIntent::Deprovision {
-                collection: Collection::Groups,
+                collection: Collection::Group,
                 subject_id: id.to_owned(),
             },
             None => PushIntent::Ignore(Ignored::MalformedPayload),

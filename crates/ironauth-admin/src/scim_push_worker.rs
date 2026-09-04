@@ -37,7 +37,7 @@ use ironauth_store::{
 
 use crate::scim_push_client::{Converged, DeletionPolicy, PushError, ScimPushClient};
 use crate::scim_push_events::{
-    Collection, Ignored, PushIntent, ScopeDecision, intent_for, scope_decision,
+    Collection, Ignored, PushIntent, ScopeDecision, collection_path, intent_for, scope_decision,
 };
 use crate::scim_push_transport::ScimTransport;
 
@@ -298,8 +298,8 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
     };
 
     let resource_type = match collection {
-        Collection::Users => ScimPushResourceType::User,
-        Collection::Groups => ScimPushResourceType::Group,
+        Collection::User => ScimPushResourceType::User,
+        Collection::Group => ScimPushResourceType::Group,
     };
     let link = store
         .scim_push_links()
@@ -324,7 +324,7 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
         let known = link.as_ref().map(|l| l.downstream_id.clone());
         pass.client
             .deprovision(
-                collection.path(),
+                collection_path(collection),
                 &subject_id,
                 pass.deletion_policy,
                 known.as_deref(),
@@ -348,7 +348,7 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
 
     let converged = pass
         .client
-        .converge(collection.path(), &subject_id, &resource)
+        .converge(collection_path(collection), &subject_id, &resource)
         .await?;
     let downstream_id = match &converged {
         Converged::Created(id) | Converged::Updated(id) => id.clone(),
@@ -478,7 +478,7 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
     };
     let converged = pass
         .client
-        .converge(collection.path(), subject_id, &resource)
+        .converge(collection_path(collection), subject_id, &resource)
         .await?;
     let downstream_id = match &converged {
         Converged::Created(id) | Converged::Updated(id) => id.clone(),
@@ -488,8 +488,8 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
         }
     };
     let resource_type = match collection {
-        Collection::Users => ScimPushResourceType::User,
-        Collection::Groups => ScimPushResourceType::Group,
+        Collection::User => ScimPushResourceType::User,
+        Collection::Group => ScimPushResourceType::Group,
     };
     let external_id = resource
         .get("externalId")

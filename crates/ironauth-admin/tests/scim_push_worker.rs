@@ -376,7 +376,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     };
 
     // Two at a time, then a simulated restart: the second call starts from the recorded position.
-    let first = run_backfill_pass(&store, page(2), Collection::Users, feed_head)
+    let first = run_backfill_pass(&store, page(2), Collection::User, feed_head)
         .await
         .expect("first page");
     assert_eq!(first.converged, 2, "{first:?}");
@@ -396,7 +396,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         "a running backfill must not be tailing"
     );
 
-    let second = run_backfill_pass(&store, page(2), Collection::Users, feed_head)
+    let second = run_backfill_pass(&store, page(2), Collection::User, feed_head)
         .await
         .expect("second page");
     assert_eq!(second.converged, 2, "{second:?}");
@@ -410,7 +410,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     );
 
     // THE EMPTY PAGE IS WHAT COMPLETES IT, and only then does the cursor appear.
-    let done = run_backfill_pass(&store, page(2), Collection::Users, feed_head)
+    let done = run_backfill_pass(&store, page(2), Collection::User, feed_head)
         .await
         .expect("the empty page completes the backfill");
     assert!(done.checkpointed);
@@ -466,7 +466,7 @@ async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
         },
-        Collection::Users,
+        Collection::User,
         0,
     )
     .await
@@ -504,7 +504,7 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
             scope: h.scope,
             now_unix_micros: now_micros(&h.env),
         },
-        Collection::Users,
+        Collection::User,
         0,
     )
     .await;

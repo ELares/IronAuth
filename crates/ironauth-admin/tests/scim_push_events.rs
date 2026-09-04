@@ -87,7 +87,7 @@ async fn a_departure_is_a_deprovision_and_a_sign_in_is_not_a_write() {
         assert_eq!(
             intent_for(event_type, &json!({ "user_id": "usr_1" })),
             PushIntent::Deprovision {
-                collection: Collection::Users,
+                collection: Collection::User,
                 subject_id: "usr_1".to_owned(),
             },
             "{event_type} must deprovision"
@@ -107,7 +107,7 @@ async fn a_departure_is_a_deprovision_and_a_sign_in_is_not_a_write() {
     assert_eq!(
         intent_for("org_group.member_added", &json!({ "group_id": "grp_1" })),
         PushIntent::Converge {
-            collection: Collection::Groups,
+            collection: Collection::Group,
             subject_id: "grp_1".to_owned(),
         }
     );
@@ -132,7 +132,7 @@ async fn a_payload_missing_its_subject_id_is_reported_rather_than_ignored() {
     assert_eq!(
         intent_for("org_group.deleted", &json!({ "group_id": "grp_1" })),
         PushIntent::Deprovision {
-            collection: Collection::Groups,
+            collection: Collection::Group,
             subject_id: "grp_1".to_owned(),
         }
     );
