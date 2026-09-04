@@ -46,6 +46,39 @@ use serde_json::{Map, Value};
 /// were claims about a rule nothing applied.
 pub const RESERVED_ATTRIBUTES: &[&str] = &["id", "meta", "schemas", "externalId", "active"];
 
+/// Attributes taken from the SUBJECT when the mapping does not set them.
+///
+/// # Defaulted, not reserved, and the difference is the whole design
+///
+/// A RESERVED attribute is one the operator may not touch, because letting them decide it breaks
+/// something: `active` decides departures, `externalId` decides whether a replay converges.
+/// A DEFAULTED one is an attribute the subject already answers and the schema needs, where an
+/// operator may still know better.
+///
+/// Every one of these is REQUIRED of its resource by RFC 7643. `userName` is required of a User
+/// (section 4.1) and `displayName` of a Group (section 4.2), and `members` is what makes a group
+/// a group rather than an empty shell the downstream would enforce access against.
+///
+/// Leaving them to the mapping meant the OUT-OF-THE-BOX connection -- created with no mapping,
+/// which is the default the management surface allows -- built a body the downstream refuses on
+/// the required attribute. It was invisible because every test that exercised the mapper passed
+/// it a mapping, and the one place a default connection reaches a real downstream did not exist
+/// until the production directory did.
+///
+/// Reserving them instead would be wrong in the other direction: `userName` is the attribute
+/// operators most often want to point somewhere else (a work email rather than a login handle),
+/// and refusing that mapping would make the connection unusable for them.
+#[must_use]
+fn defaulted_attributes(schema_urn: &str) -> &'static [&'static str] {
+    if schema_urn.ends_with(":Group") {
+        return &["displayName", "members"];
+    }
+    if schema_urn.ends_with(":User") {
+        return &["userName"];
+    }
+    &[]
+}
+
 /// Why a mapping cannot be applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MappingError {
@@ -101,12 +134,12 @@ pub fn resource_for(
         // below. Explicit null is the house convention for absent (0189 records being caught
         // asserting otherwise), so it is accepted rather than refused.
         if mapping.is_null() {
-            return Ok(base_resource(schema_urn, external_id, active));
+            return Ok(base_resource(schema_urn, external_id, active, source));
         }
         return Err(MappingError::NotAnObject);
     };
 
-    let mut resource = base_resource(schema_urn, external_id, active);
+    let mut resource = base_resource(schema_urn, external_id, active, source);
     for (attribute, source_path) in entries {
         let head = attribute.split('.').next().unwrap_or_default();
         if RESERVED_ATTRIBUTES.contains(&head) {
@@ -131,7 +164,7 @@ pub fn resource_for(
 }
 
 /// The attributes every outbound resource carries, whatever the mapping says.
-fn base_resource(schema_urn: &str, external_id: &str, active: bool) -> Value {
+fn base_resource(schema_urn: &str, external_id: &str, active: bool, source: &Source) -> Value {
     let mut resource = Map::new();
     resource.insert(
         "schemas".to_owned(),
@@ -152,6 +185,15 @@ fn base_resource(schema_urn: &str, external_id: &str, active: bool) -> Value {
     // at the call site.
     if schema_urn.ends_with(":User") {
         resource.insert("active".to_owned(), Value::Bool(active));
+    }
+    // THE SCHEMA'S REQUIRED ATTRIBUTES, from the subject, BEFORE the mapping runs so an operator
+    // who names one still wins. See `defaulted_attributes`.
+    for attribute in defaulted_attributes(schema_urn) {
+        // ABSENT RATHER THAN NULL when the subject does not carry one. RFC 7644 section 3.5.1
+        // makes a PUT a full replace, so sending `null` asks the downstream to clear it.
+        if let Some(value) = source.get(*attribute) {
+            resource.insert((*attribute).to_owned(), value.clone());
+        }
     }
     Value::Object(resource)
 }

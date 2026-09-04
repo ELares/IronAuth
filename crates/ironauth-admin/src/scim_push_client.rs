@@ -68,9 +68,25 @@ pub enum PushError {
     /// The downstream is unreachable or answered 5xx. THE CURSOR PAUSES: the event is not
     /// consumed, and the same event is replayed when the downstream returns.
     Retryable(String),
-    /// The downstream refused the request itself, and a replay reproduces it. An operator has to
-    /// act, and the connection records the error rather than spinning.
+    /// The downstream refused the request itself, and a replay reproduces it. About ONE SUBJECT:
+    /// a duplicate `userName`, a body this server will not accept, a policy it enforces. The
+    /// caller steps over it and records it against that subject.
     Permanent(String),
+    /// The downstream refused something about the CONNECTION, so it will refuse every subject.
+    ///
+    /// # Why this is not `Permanent`
+    ///
+    /// The caller's per-subject arm steps over a `Permanent` and moves on. Applied to a fault
+    /// that refuses everybody -- a revoked bearer token, a base URL that is not a SCIM server, a
+    /// downstream that does not honour the filter this client identifies subjects by -- that is
+    /// the worst answer available: every subject is refused, every one is stepped over, the
+    /// enumeration advances past the whole directory, and the backfill COMPLETES having
+    /// provisioned nobody, with a health surface reading zero failures because no pass ever
+    /// returned an error.
+    ///
+    /// A backfill does not come back for a position it has passed, so those people are simply
+    /// gone until an operator notices and restarts it.
+    Configuration(String),
 }
 
 impl PushError {
@@ -99,7 +115,7 @@ impl From<ScimTransportError> for PushError {
             // failure on every attempt: retrying is a busy loop, and reporting it as a transport
             // failure makes a connection with a typo look exactly like a downstream outage. The
             // operator has to edit the connection, so the error has to say that.
-            ScimTransportError::Configuration => Self::Permanent(
+            ScimTransportError::Configuration => Self::Configuration(
                 "this connection cannot produce a request: check its base URL and the credential \
                  the secret holds"
                     .to_owned(),
@@ -186,7 +202,12 @@ impl<T: ScimTransport> ScimPushClient<T> {
             )));
         }
         if !response.status.is_success() {
-            return Err(PushError::Permanent(format!(
+            // A REFUSED LOOKUP IS ABOUT THE CONNECTION, not about the person being looked up.
+            // Nothing in the request identifies them beyond a filter this server has just said
+            // it will not answer: a 401 means the credential, a 403 means the grant, a 400
+            // `invalidFilter` means it does not support the filter this client identifies
+            // subjects by. Each refuses every subject on the page.
+            return Err(PushError::Configuration(format!(
                 "the downstream answered {} to a lookup{}",
                 response.status,
                 response
@@ -196,7 +217,8 @@ impl<T: ScimTransport> ScimPushClient<T> {
             )));
         }
         let Some(body) = response.body else {
-            return Err(PushError::Permanent(
+            // Not a SCIM server, or not at this path. Nothing subject-specific about it.
+            return Err(PushError::Configuration(
                 "the downstream answered a lookup with no body".to_owned(),
             ));
         };
@@ -220,14 +242,16 @@ impl<T: ScimTransport> ScimPushClient<T> {
         // reading the answer, so the answer is read.
         let carried = found.get("externalId").and_then(Value::as_str);
         if carried != Some(external_id) {
-            return Err(PushError::Permanent(format!(
+            // ABOUT THE CONNECTION. A server that does not apply the filter does not apply it
+            // for anybody, and every later write on this connection would address a stranger.
+            return Err(PushError::Configuration(format!(
                 "the downstream answered a lookup for externalId {external_id:?} with a resource \
                  carrying {carried:?}, so it is not applying the filter and its answers cannot be \
                  trusted to identify a subject"
             )));
         }
         let Some(id) = found.get("id").and_then(Value::as_str) else {
-            return Err(PushError::Permanent(
+            return Err(PushError::Configuration(
                 "the downstream answered a lookup with a resource that has no id".to_owned(),
             ));
         };
@@ -489,6 +513,18 @@ fn classify_write(response: &ScimResponse, what: &str) -> Result<(), PushError> 
         return Err(PushError::Retryable(format!(
             "the downstream answered 404 to {what}, so the resource was removed between the \
              lookup and the write and the next pass must create it again"
+        )));
+    }
+    // A CREDENTIAL OR GRANT REFUSAL IS ABOUT THE CONNECTION. 401 and 403 do not depend on which
+    // subject the body carries, so stepping over them per subject walks the whole directory.
+    if matches!(
+        response.status,
+        http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
+    ) {
+        return Err(PushError::Configuration(format!(
+            "the downstream answered {} to {what}, which is about this connection rather than \
+             about one subject",
+            response.status
         )));
     }
     Err(PushError::Permanent(format!(

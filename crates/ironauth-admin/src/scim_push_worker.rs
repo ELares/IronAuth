@@ -92,8 +92,19 @@ pub enum WorkerError {
     ///
     /// The cursor is deliberately NOT advanced, so the events stay ahead of the checkpoint.
     Retryable(String),
-    /// The downstream refused permanently, or the connection is misconfigured.
+    /// The downstream refused permanently. About ONE subject: the page steps over it.
     Permanent(String),
+    /// The connection itself is misconfigured, so every subject would be refused.
+    ///
+    /// # Why this is not `Permanent`
+    ///
+    /// It was, and the per-subject arms then caught it. A mapping that refuses every subject was
+    /// therefore refused per subject, stepped over per subject, and the enumeration advanced past
+    /// everybody: the pass reported `refused: N`, recorded progress past the whole page, and the
+    /// people it skipped were never enumerated again, because a backfill does not come back for a
+    /// position it has passed. The step-over is right for a fault about one person and is the
+    /// worst possible answer for a fault about all of them.
+    Configuration(String),
 }
 
 impl From<StoreError> for WorkerError {
@@ -105,6 +116,7 @@ impl From<StoreError> for WorkerError {
 impl From<PushError> for WorkerError {
     fn from(error: PushError) -> Self {
         match error {
+            PushError::Configuration(why) => Self::Configuration(why),
             PushError::Retryable(why) => Self::Retryable(why),
             PushError::Permanent(why) => Self::Permanent(why),
         }
@@ -117,30 +129,102 @@ impl From<PushError> for WorkerError {
 /// connection: whether a subject is in scope depends on the connection's filter, and the SCIM
 /// body depends on its attribute mapping. Keeping it a seam is also what lets this module's tests
 /// drive a real downstream and a real database without a full directory behind them.
+/// Why a [`SubjectSource`] could not answer.
+///
+/// # A source has to be able to say PERMANENT
+///
+/// The trait returned `String`, and both call sites wrapped it in [`WorkerError::Retryable`].
+/// That is right for a database that is down and wrong for everything a source refuses on its
+/// own terms: a group with more members than one SCIM body can carry, an attribute mapping that
+/// targets a reserved attribute, a scope filter that does not parse. None of those get better by
+/// being tried again, and a pass that returns `Retryable` never checkpoints -- so the connection
+/// re-read the same page, hit the same subject, and paused with a doubling backoff for ever,
+/// with every event behind it undelivered. It is the same wedge the per-subject refusal arm was
+/// added to close, reintroduced one layer down where that arm could not see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceError {
+    /// The source could not answer right now. Trying again may work.
+    Retryable(String),
+    /// The source will refuse this subject every time it is asked. Step over it.
+    Permanent(String),
+    /// The connection itself is misconfigured, so the source refuses EVERY subject.
+    ///
+    /// # Separate from `Permanent`, because stepping over is the wrong answer
+    ///
+    /// A per-subject refusal is about one person and the page steps over it, records it against
+    /// them, and checkpoints. Applied to a fault that is really about the connection -- an
+    /// attribute mapping that targets a reserved attribute, a scope filter that does not parse --
+    /// that is the worst outcome available: every subject is refused, every one is stepped over,
+    /// the cursor advances past all of them, and the connection reports a clean checkpoint having
+    /// delivered nothing. The events are gone, because the cursor moved.
+    ///
+    /// So this stops the pass without advancing anything, and is recorded against the connection
+    /// where an operator can see one reason rather than one per person.
+    Configuration(String),
+}
+
+impl core::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Retryable(why) | Self::Permanent(why) | Self::Configuration(why) => {
+                f.write_str(why)
+            }
+        }
+    }
+}
+
+impl From<SourceError> for WorkerError {
+    fn from(error: SourceError) -> Self {
+        match error {
+            SourceError::Retryable(why) => Self::Retryable(why),
+            SourceError::Permanent(why) => Self::Permanent(why),
+            SourceError::Configuration(why) => Self::Configuration(why),
+        }
+    }
+}
+
+/// Where a connection's subjects come from: who exists, who is in scope, and how to walk them.
 pub trait SubjectSource {
     /// The SCIM body for a subject, or `None` if it no longer exists.
     ///
     /// # Errors
     ///
-    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    /// [`SourceError`]. `Permanent` steps over the subject; `Retryable` stops the pass.
     fn resource(
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<Option<serde_json::Value>, String>> + Send;
+    ) -> impl Future<Output = Result<Option<serde_json::Value>, SourceError>> + Send;
 
     /// Whether the subject is inside this connection's scoping filter.
     ///
     /// # Errors
     ///
-    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    /// [`SourceError`]. `Permanent` steps over the subject; `Retryable` stops the pass.
     fn in_scope(
         &self,
         collection: Collection,
         subject_id: &str,
-    ) -> impl Future<Output = Result<bool, String>> + Send;
+    ) -> impl Future<Output = Result<bool, SourceError>> + Send;
 
-    /// The next page of IN-SCOPE subject ids, in a stable order, after `after`.
+    /// The next page of subject ids, in a stable order, after `after`, IN SCOPE OR NOT.
+    ///
+    /// # Why this page is not filtered
+    ///
+    /// It said IN-SCOPE, and that contract could not be implemented. An empty page ends the
+    /// collection (see [`run_backfill_pass`]), so a source that honestly filtered a page down to
+    /// nothing would announce the enumeration was finished with the rest of the directory
+    /// unread -- and every person after that page would be skipped, permanently, which is the
+    /// one failure the paragraph below says must not happen. Returning them anyway needs an
+    /// unbounded read per page, because the number of rows between here and the next in-scope
+    /// subject has no ceiling.
+    ///
+    /// It went unnoticed because the only implementor was a test double whose enumeration
+    /// filtered a whole in-memory map and then took a page, so it could always fill one. A
+    /// keyset read over a table cannot.
+    ///
+    /// So scope is decided per subject, by [`Self::in_scope`], in both passes: the tail already
+    /// worked that way, and the backfill now does too.
     ///
     /// # Why the order has to be stable and the caller has to say where it stopped
     ///
@@ -153,13 +237,13 @@ pub trait SubjectSource {
     ///
     /// # Errors
     ///
-    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    /// [`SourceError`]. `Permanent` steps over the subject; `Retryable` stops the pass.
     fn enumerate(
         &self,
         collection: Collection,
         after: Option<&str>,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<String>, String>> + Send;
+    ) -> impl Future<Output = Result<Vec<String>, SourceError>> + Send;
 }
 
 use std::future::Future;
@@ -469,7 +553,7 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
         .subjects
         .in_scope(collection, &subject_id)
         .await
-        .map_err(WorkerError::Retryable)?;
+        .map_err(WorkerError::from)?;
     // A LINK THAT HAS BEEN WITHDRAWN IS NOT A PROVISIONED SUBJECT. `scope_decision` reads the
     // link as "this connection provisioned them", and 0190 keeps the row after a withdrawal so a
     // rehire can resolve through it. Reading mere PRESENCE therefore made every later event for a
@@ -513,7 +597,7 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
         .subjects
         .resource(collection, &subject_id)
         .await
-        .map_err(WorkerError::Retryable)?
+        .map_err(WorkerError::from)?
     else {
         // The subject vanished between the event and this read. The next pass will carry its
         // deletion event, so nothing is done here rather than guessing.
@@ -614,7 +698,7 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
         .subjects
         .enumerate(collection, state.backfill_after_id.as_deref(), limit)
         .await
-        .map_err(WorkerError::Retryable)?;
+        .map_err(WorkerError::from)?;
 
     // AN EMPTY PAGE MEANS THE ENUMERATION IS DONE, and only then does the connection start
     // tailing, from the position that was read before any of this began.
@@ -653,7 +737,29 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     let mut expected_failures = state.consecutive_failures;
     for subject_id in &subjects {
         let pushed_before = progress.converged;
-        push_one(store, &pass, collection, subject_id, &mut progress).await?;
+        // A PERMANENT REFUSAL IS ABOUT ONE SUBJECT HERE TOO, and the backfill had no arm for it.
+        //
+        // The tail grew one because a permanent refusal that propagates stalls the page for ever.
+        // The backfill's `?` was survivable only while nothing below it could produce a permanent
+        // refusal per subject; giving `SubjectSource` a `Permanent` variant made it produce one,
+        // and this line then aborted the whole pass. Worse than the tail's version of the same
+        // bug: `record_connection_failure` gives a permanent failure NO backoff, deliberately, so
+        // the connection stayed due and every cycle re-enumerated the same page and died on the
+        // same subject with nothing slowing it down.
+        //
+        // Recorded against the subject, counted, stepped over. A fault that is really about the
+        // CONNECTION does not come through here at all: it is `SourceError::Configuration`, and
+        // it stops the pass without moving anything.
+        let mut refused = None;
+        match push_one(store, &pass, collection, subject_id, &mut progress).await {
+            Ok(()) => {}
+            Err(WorkerError::Permanent(why)) => {
+                record_backfill_refusal(store, &pass, collection, subject_id, &why).await?;
+                progress.refused += 1;
+                refused = Some(why);
+            }
+            Err(other) => return Err(other),
+        }
         // RECORDED AFTER EACH SUBJECT, so a crash resumes from the last one that actually
         // landed rather than from the start of the page.
         furthest = Some(subject_id.clone());
@@ -669,10 +775,60 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
                 progress.converged > pushed_before,
             )
             .await?;
-        expected_failures = 0;
+        // A REFUSED SUBJECT DOES NOT CLEAR THE CONNECTION'S ERROR STATE, and stepping over one
+        // used to. `record_backfill_progress` sets `consecutive_failures = 0` and NULLs the
+        // error, which is right after a subject that landed and wrong after one that was refused:
+        // a page of refusals wiped the health surface clean on its way past. Re-recording it puts
+        // back what the progress write erased, and leaves `expected_failures` where the next
+        // iteration's guard expects to find it.
+        if let Some(refusal) = &refused {
+            store
+                .scim_push_sync_state()
+                .record_failure(
+                    pass.connection_id,
+                    &format!("{subject_id} was refused and stepped over: {refusal}"),
+                    // NO PAUSE. The subject was stepped over, so the pass is making progress and
+                    // there is nothing to back off from; what this write is for is putting the
+                    // reason back where an operator reads it.
+                    None,
+                )
+                .await?;
+            // `record_failure` incremented the count, so the next checkpoint has to expect it.
+            expected_failures += 1;
+        } else {
+            expected_failures = 0;
+        }
     }
     debug_assert!(furthest.is_some(), "a non-empty page recorded no progress");
     Ok(progress)
+}
+
+/// Records a permanent refusal against one enumerated subject.
+///
+/// The tail's [`record_subject_failure`] derives the subject from the event; a backfill already
+/// holds it, so this is the same write without the intent lookup. A subject with no link is
+/// skipped rather than invented: the failure surface hangs off the link row, and a refusal for
+/// somebody never provisioned has no downstream id to attach to. It is counted in `refused`
+/// either way, so the pass still reports it.
+async fn record_backfill_refusal<T: ScimTransport, S: SubjectSource>(
+    store: &ironauth_store::ScopedStore<'_>,
+    pass: &Pass<'_, T, S>,
+    collection: Collection,
+    subject_id: &str,
+    why: &str,
+) -> Result<(), WorkerError> {
+    let resource_type = match collection {
+        Collection::User => ScimPushResourceType::User,
+        Collection::Group => ScimPushResourceType::Group,
+    };
+    match store
+        .scim_push_links()
+        .record_failure(pass.connection_id, resource_type, subject_id, why)
+        .await
+    {
+        Ok(()) | Err(StoreError::NotFound) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Provisions one subject during a backfill.
@@ -683,11 +839,23 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
     subject_id: &str,
     progress: &mut Progress,
 ) -> Result<(), WorkerError> {
+    // SCOPE IS DECIDED HERE, per subject, exactly as the tail decides it. The enumeration hands
+    // over its page unfiltered because filtering it can empty a page while the directory still
+    // has people in it, and an empty page ends the collection.
+    if !pass
+        .subjects
+        .in_scope(collection, subject_id)
+        .await
+        .map_err(WorkerError::from)?
+    {
+        progress.out_of_scope += 1;
+        return Ok(());
+    }
     let Some(resource) = pass
         .subjects
         .resource(collection, subject_id)
         .await
-        .map_err(WorkerError::Retryable)?
+        .map_err(WorkerError::from)?
     else {
         // Enumerated and then deleted. The tail will carry its deletion event.
         progress.ignored += 1;
@@ -820,10 +988,10 @@ async fn record_connection_failure(
     now_unix_micros: i64,
 ) -> Result<(), StoreError> {
     let (why, pause) = match error {
-        // A PERMANENT failure is not a backoff candidate: retrying reproduces it exactly, and a
-        // pause would only delay the moment an operator sees it. Recorded without one, so the
-        // health surface shows the reason and the connection keeps being picked up.
-        WorkerError::Permanent(why) => (why.clone(), None),
+        // NEITHER IS A BACKOFF CANDIDATE: retrying reproduces each exactly, and a pause would
+        // only delay the moment an operator sees it. Recorded without one, so the health surface
+        // shows the reason and the connection keeps being picked up.
+        WorkerError::Permanent(why) | WorkerError::Configuration(why) => (why.clone(), None),
         WorkerError::Retryable(why) => (why.clone(), Some(())),
         WorkerError::Store(error) => (format!("the store refused the pass: {error:?}"), Some(())),
         // NOT RECORDED AT ALL. Another worker checkpointed this connection's page; nothing failed,
