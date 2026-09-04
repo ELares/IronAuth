@@ -31,8 +31,8 @@
 //! makes at-least-once safe is that every downstream write is a converge.
 
 use ironauth_store::{
-    EventCursor, EventPage, NewScimPushLink, ScimPushConnection, ScimPushConnectionId,
-    ScimPushLinkId, ScimPushResourceType, StoreError,
+    EventCursor, EventPage, NewScimPushLink, ScimBackfillState, ScimPushConnection,
+    ScimPushConnectionId, ScimPushLinkId, ScimPushResourceType, StoreError,
 };
 
 use crate::scim_push_client::{Converged, DeletionPolicy, PushError, ScimPushClient};
@@ -196,6 +196,13 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
     if is_paused(&state, pass.now_unix_micros) {
         return Ok(Progress::default());
     }
+    // A DISABLED CONNECTION DOES NOTHING. `active` is the operator's switch, and neither pass
+    // consulted it: a connection an operator had turned off kept pushing to the downstream and
+    // kept advancing its cursor, so "disabled" meant only that the management surface said so.
+    // Checked after the row is read and before anything is sent, in both passes.
+    if !connection_is_active(&state) {
+        return Ok(Progress::default());
+    }
 
     // TAILING REQUIRES A FINISHED BACKFILL. Reading the feed for a connection that has not
     // enumerated its scope means the first event for an unprovisioned subject creates a resource
@@ -286,6 +293,11 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
         .await?;
     progress.checkpointed = true;
     Ok(progress)
+}
+
+/// Whether an operator has left this connection switched on.
+const fn connection_is_active(state: &ScimPushConnection) -> bool {
+    state.active
 }
 
 /// Whether the connection's pause is still running at `now_unix_micros`.
@@ -505,8 +517,6 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
 pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     store: &ironauth_store::ScopedStore<'_>,
     pass: Pass<'_, T, S>,
-    collection: Collection,
-    feed_position_at_start: i64,
 ) -> Result<Progress, WorkerError> {
     let state = store
         .scim_push_sync_state()
@@ -516,13 +526,30 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     if is_paused(&state, pass.now_unix_micros) {
         return Ok(Progress::default());
     }
-    if !state.backfill_state.is_enumerating() {
-        return Err(WorkerError::Permanent(
-            "this connection is not enumerating, so a backfill pass has nothing to resume"
-                .to_owned(),
-        ));
+    // A DISABLED CONNECTION DOES NOTHING. `active` is the operator's switch, and neither pass
+    // consulted it: a connection an operator had turned off kept pushing to the downstream and
+    // kept advancing its cursor, so "disabled" meant only that the management surface said so.
+    // Checked after the row is read and before anything is sent, in both passes.
+    if !connection_is_active(&state) {
+        return Ok(Progress::default());
     }
-
+    // THE STATE CHOOSES THE COLLECTION, not the caller.
+    //
+    // The first version took `collection` as an argument and completed the whole backfill on the
+    // first empty page whatever it had been handed. So a caller that ran Users saw the backfill
+    // finish with no group ever provisioned, and one that ran Groups saw it finish with no user:
+    // the state machine 0189 designed to distinguish the two halves was decided by a parameter
+    // instead, and either order silently truncated the other collection.
+    let collection = match state.backfill_state {
+        ScimBackfillState::Users => Collection::User,
+        ScimBackfillState::Groups => Collection::Group,
+        ScimBackfillState::Pending | ScimBackfillState::Done => {
+            return Err(WorkerError::Permanent(
+                "this connection is not enumerating, so a backfill pass has nothing to resume"
+                    .to_owned(),
+            ));
+        }
+    };
     let limit = usize::try_from(pass.limit).unwrap_or(usize::MAX);
     let subjects = pass
         .subjects
@@ -532,15 +559,28 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
 
     // AN EMPTY PAGE MEANS THE ENUMERATION IS DONE, and only then does the connection start
     // tailing, from the position that was read before any of this began.
+    // AN EMPTY PAGE ENDS THIS COLLECTION, not the backfill. Users hand over to groups; only
+    // groups finish, and only then does a cursor appear.
     if subjects.is_empty() {
-        store
-            .scim_push_sync_state()
-            .complete_backfill(pass.connection_id, feed_position_at_start)
-            .await?;
-        return Ok(Progress {
-            checkpointed: true,
-            ..Progress::default()
-        });
+        match collection {
+            Collection::User => {
+                store
+                    .scim_push_sync_state()
+                    .begin_group_backfill(pass.connection_id)
+                    .await?;
+                return Ok(Progress::default());
+            }
+            Collection::Group => {
+                store
+                    .scim_push_sync_state()
+                    .complete_backfill(pass.connection_id)
+                    .await?;
+                return Ok(Progress {
+                    checkpointed: true,
+                    ..Progress::default()
+                });
+            }
+        }
     }
 
     let mut progress = Progress {

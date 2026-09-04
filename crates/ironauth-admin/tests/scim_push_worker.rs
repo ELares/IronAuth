@@ -35,8 +35,8 @@ use ironauth_env::Env;
 use ironauth_scim::downstream::{Downstream, Health};
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewScimPushConnection, OrganizationId, ScimDeletionPolicy, ScimPushConnectionId,
-    ScimPushResourceType, ScimWriteMode, Scope,
+    CorrelationId, NewScimPushConnection, OrganizationId, ScimBackfillState, ScimDeletionPolicy,
+    ScimPushConnectionId, ScimPushResourceType, ScimWriteMode, Scope,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -176,10 +176,16 @@ impl SubjectSource for Directory {
 
     fn enumerate(
         &self,
-        _collection: Collection,
+        collection: Collection,
         after: Option<&str>,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
+        // This directory holds people. A GROUP enumeration is empty, and saying so honestly is
+        // what lets the users-to-groups handover be observed: a source that returned its users
+        // again for the group pass would re-push every one of them under the wrong resource type.
+        if collection == Collection::Group {
+            return std::future::ready(Ok(Vec::new()));
+        }
         // A BTreeMap, so the order is total and stable across passes. That is what makes `after`
         // mean anything: an enumeration whose order changed between passes would let a resumed
         // backfill skip people, and nothing would ever come back for them.
@@ -194,7 +200,7 @@ impl SubjectSource for Directory {
             .take(limit)
             .cloned()
             .collect();
-        async move { Ok(page) }
+        std::future::ready(Ok(page))
     }
 }
 
@@ -316,12 +322,21 @@ impl Harness {
         let store = self.db.store().scoped(self.scope);
         store
             .scim_push_sync_state()
-            .begin_backfill(&self.connection)
+            .begin_backfill(&self.connection, Some(sequence))
             .await
             .expect("begin");
+        // THE WHOLE STATE MACHINE, because reaching `done` now requires passing through both
+        // collections. A helper that jumped straight from `users` to `done` would let every test
+        // above it start tailing without groups ever having been enumerated, which is precisely
+        // the defect the transition was added to close.
         store
             .scim_push_sync_state()
-            .complete_backfill(&self.connection, sequence)
+            .begin_group_backfill(&self.connection)
+            .await
+            .expect("users done, on to groups");
+        store
+            .scim_push_sync_state()
+            .complete_backfill(&self.connection)
             .await
             .expect("complete");
     }
@@ -357,7 +372,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     let store = h.db.store().scoped(h.scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&h.connection)
+        .begin_backfill(&h.connection, Some(0))
         .await
         .expect("begin");
 
@@ -380,7 +395,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
     };
 
     // Two at a time, then a simulated restart: the second call starts from the recorded position.
-    let first = run_backfill_pass(&store, page(2), Collection::User, feed_head)
+    let first = run_backfill_pass(&store, page(2))
         .await
         .expect("first page");
     assert_eq!(first.converged, 2, "{first:?}");
@@ -400,7 +415,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         "a running backfill must not be tailing"
     );
 
-    let second = run_backfill_pass(&store, page(2), Collection::User, feed_head)
+    let second = run_backfill_pass(&store, page(2))
         .await
         .expect("second page");
     assert_eq!(second.converged, 2, "{second:?}");
@@ -413,10 +428,32 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         h.downstream.users()
     );
 
-    // THE EMPTY PAGE IS WHAT COMPLETES IT, and only then does the cursor appear.
-    let done = run_backfill_pass(&store, page(2), Collection::User, feed_head)
+    // AN EMPTY USER PAGE HANDS OVER TO GROUPS rather than finishing. A backfill that completed
+    // here would leave every group unprovisioned while reporting itself done, which is what the
+    // first version did whatever collection it had been handed.
+    let handover = run_backfill_pass(&store, page(2))
         .await
-        .expect("the empty page completes the backfill");
+        .expect("the empty user page hands over");
+    assert!(
+        !handover.checkpointed,
+        "the backfill completed before groups were enumerated: {handover:?}"
+    );
+    let mid = store
+        .scim_push_sync_state()
+        .get(&h.connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(mid.backfill_state, ScimBackfillState::Groups);
+    assert_eq!(
+        mid.cursor_sequence, None,
+        "a connection still enumerating groups must not be tailing"
+    );
+
+    // AND THE EMPTY GROUP PAGE COMPLETES IT, and only then does the cursor appear.
+    let done = run_backfill_pass(&store, page(2))
+        .await
+        .expect("the empty group page completes the backfill");
     assert!(done.checkpointed);
     let complete = store
         .scim_push_sync_state()
@@ -455,7 +492,7 @@ async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
     let store = h.db.store().scoped(h.scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&h.connection)
+        .begin_backfill(&h.connection, Some(0))
         .await
         .expect("begin");
     let client = h.client();
@@ -471,8 +508,6 @@ async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
             now_unix_micros: now_micros(&h.env),
             organization_id: h.org.clone(),
         },
-        Collection::User,
-        0,
     )
     .await
     .expect("backfill");
@@ -510,8 +545,6 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
             now_unix_micros: now_micros(&h.env),
             organization_id: h.org.clone(),
         },
-        Collection::User,
-        0,
     )
     .await;
     assert!(

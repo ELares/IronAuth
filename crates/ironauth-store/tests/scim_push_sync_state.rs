@@ -91,7 +91,7 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
 
     state
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     state
@@ -106,7 +106,7 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
     // a large org means re-pushing tens of thousands of users.
     state
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin again after a restart");
 
@@ -139,7 +139,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
 
@@ -160,7 +160,12 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
     // is the backfill state doing the refusing and not the call being broken.
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 0)
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
@@ -240,12 +245,17 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(42))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 42)
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
 
@@ -275,9 +285,13 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
         .advance(&connection, Some(42), 9000)
         .await
         .expect("tail");
+    // NO TRANSITION HERE, deliberately. This connection is TAILING, and the point of the
+    // assertion below is that `complete_backfill` refuses it. The refusal is now structural
+    // rather than incidental: completing requires the `groups` state, and a tailing connection is
+    // `done`, so a second completion cannot reach the cursor at all.
     let clobber = store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 9500)
+        .complete_backfill(&connection)
         .await;
     assert!(
         matches!(clobber, Err(StoreError::NotFound)),
@@ -310,12 +324,17 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(100))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 100)
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
 
@@ -368,12 +387,17 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(100))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 100)
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
@@ -426,12 +450,17 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 0)
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
@@ -515,7 +544,7 @@ async fn a_failure_without_a_new_deadline_leaves_the_pause_that_is_already_runni
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
 
@@ -624,7 +653,7 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     // A pause that expired a minute ago.
@@ -665,12 +694,17 @@ async fn an_empty_poll_is_distinguishable_from_a_wedged_worker() {
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, 0)
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
@@ -728,7 +762,7 @@ async fn deleting_the_connection_takes_its_sync_state_with_it() {
     db.store()
         .scoped(scope)
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
 

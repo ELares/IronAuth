@@ -75894,19 +75894,23 @@ impl ScimPushSyncStateRepo<'_> {
     pub async fn begin_backfill(
         &self,
         connection_id: &ScimPushConnectionId,
+        feed_head_sequence: Option<i64>,
     ) -> Result<(), StoreError> {
         if connection_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         sqlx::query(
-            "UPDATE scim_push_connections SET backfill_state = 'users', updated_at = now() \
+            "UPDATE scim_push_connections \
+             SET backfill_state = 'users', backfill_from_sequence = $4::bigint, \
+                 updated_at = now() \
              WHERE tenant_id = $2 AND environment_id = $3 AND id = $1 \
                AND backfill_state = 'pending'",
         )
         .bind(connection_id.to_string())
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .bind(feed_head_sequence)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -75969,6 +75973,39 @@ impl ScimPushSyncStateRepo<'_> {
         .await
     }
 
+    /// Users are enumerated; move on to groups.
+    ///
+    /// # Why this exists
+    ///
+    /// Nothing wrote `backfill_state = 'groups'`. `begin_backfill` wrote `'users'`,
+    /// `restart_backfill` wrote `'users'`, and `complete_backfill` jumped straight to `'done'` on
+    /// the first empty page whatever collection it had been enumerating. So a connection finished
+    /// its USERS and immediately started tailing, and its groups were never provisioned at all:
+    /// the vocabulary 0189 chose specifically to distinguish the two halves had a state no code
+    /// could reach.
+    ///
+    /// The resume point is cleared with the transition, because it is a single column shared by
+    /// both halves and a user id is not a position in the group ordering.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope, has no row, or is not
+    /// enumerating users; [`StoreError::Database`] otherwise.
+    pub async fn begin_group_backfill(
+        &self,
+        connection_id: &ScimPushConnectionId,
+    ) -> Result<(), StoreError> {
+        self.update_one(
+            connection_id,
+            "SET backfill_state = 'groups', backfill_after_id = NULL, \
+                 backfill_after_created_at = NULL, updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND backfill_state = 'users'",
+            |query| query,
+        )
+        .await
+    }
+
     /// The backfill is done: everything in scope is provisioned, so tailing may start HERE.
     ///
     /// The cursor is taken at the same moment for a reason. A connection that finished its
@@ -75993,15 +76030,27 @@ impl ScimPushSyncStateRepo<'_> {
     pub async fn complete_backfill(
         &self,
         connection_id: &ScimPushConnectionId,
-        cursor_sequence: i64,
     ) -> Result<(), StoreError> {
         self.update_one(
             connection_id,
-            "SET backfill_state = 'done', backfill_after_id = NULL, backfill_after_created_at = NULL, cursor_sequence = $4::bigint, \
+            // THE CURSOR COMES FROM `backfill_from_sequence`, not from an argument.
+            //
+            // 0189 added that column for exactly this and documented why: it is "the newest
+            // sequence visible BEFORE the backfill began. Captured first and applied last, so an
+            // event that lands mid-backfill is replayed rather than skipped." It was granted and
+            // selected and written by nothing, while the caller passed the position separately.
+            //
+            // Taking it from the row closes two gaps at once. A worker RESTARTED mid-backfill no
+            // longer loses the position, because it is durable rather than held in the caller's
+            // memory. And the value cannot be a bound satisfied by zero: a test could pass the
+            // literal 0 for the argument and nothing noticed, where now the number has to have
+            // been captured by `begin_backfill`.
+            "SET backfill_state = 'done', backfill_after_id = NULL, \
+                 backfill_after_created_at = NULL, cursor_sequence = backfill_from_sequence, \
                  last_success_at = now(), updated_at = now() \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
-               AND backfill_state IN ('users', 'groups')",
-            |query| query.bind(cursor_sequence),
+               AND backfill_state = 'groups'",
+            |query| query,
         )
         .await
     }
