@@ -5514,6 +5514,7 @@ impl Config {
         check_byok_unconsumed(&self.byok)?;
         validate_admin(&self.admin)?;
         validate_scim(&self.scim)?;
+        validate_scim_push(&self.scim_push)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
             self.oidc.authorization_code_ttl_secs,
@@ -5696,6 +5697,19 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
 ///
 /// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
 /// merely large, which is the distinction that decides what belongs in this function.
+/// Refuse a scim_push section that would run the worker without pausing.
+fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
+    if scim_push.enabled && scim_push.interval_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "scim_push.interval_secs must be at least 1: the tick loop sleeps for this \
+                      long between passes, so zero is a busy loop that issues a due-connection \
+                      query per scope as fast as the database will answer"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
         return Err(ConfigError::Invalid {

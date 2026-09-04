@@ -29,7 +29,8 @@ use std::time::Duration;
 
 use ironauth_store::outbox::ScopeSource;
 use ironauth_store::{
-    ScimPushConnection, ScimPushConnectionId, ScimWriteMode, Scope, Store, StoreError,
+    ScimBackfillState, ScimPushConnection, ScimPushConnectionId, ScimWriteMode, Scope, Store,
+    StoreError,
 };
 
 use crate::scim_push_client::{ScimPushClient, WriteMode};
@@ -234,7 +235,46 @@ pub async fn tick<T: ScimTransport + Clone>(
         return;
     }
 
-    // The credential for each due connection, by id.
+    // A CONNECTION HAS TO BE STARTED BEFORE IT CAN RUN, and nothing started one.
+    //
+    // 0189 creates every connection `backfill_state = 'pending'`, and `run_backfill_pass` refuses
+    // a connection that is not enumerating: "this connection is not enumerating, so a backfill
+    // pass has nothing to resume". `begin_backfill` had no caller outside tests, so a connection
+    // an operator created stayed pending for ever and this scheduler would have provisioned
+    // nobody, in every environment, while reporting a clean pass for each one.
+    //
+    // Started HERE rather than at create time, deliberately. The feed position it captures is the
+    // point the tail resumes from, and an operator may create a connection days before enabling
+    // the worker: capturing it at create time would make the connection replay every event since,
+    // and capturing nothing would make it skip everything that happened in between. The first
+    // tick that can actually serve the connection is the only moment where "now" is the right
+    // answer.
+    for connection in &due {
+        if connection.backfill_state != ScimBackfillState::Pending {
+            continue;
+        }
+        let head = match scoped.outbox().newest_sequence().await {
+            Ok(head) => head,
+            Err(error) => {
+                observer.tick_failed(scope, &error);
+                return;
+            }
+        };
+        if let Err(error) = scoped
+            .scim_push_sync_state()
+            .begin_backfill(&connection.id, head)
+            .await
+        {
+            observer.connection_unavailable(
+                scope,
+                &connection.id,
+                &format!("this connection's backfill could not be started: {error:?}"),
+            );
+        }
+    }
+
+    // The credential for each due connection, by id, and which ids this tick tried at all.
+    let attempted: Vec<ScimPushConnectionId> = due.iter().map(|c| c.id).collect();
     let mut credentials: Vec<(ScimPushConnectionId, String)> = Vec::with_capacity(due.len());
     for connection in &due {
         match scoped
@@ -262,10 +302,28 @@ pub async fn tick<T: ScimTransport + Clone>(
     }
 
     let outcomes = run_due_connections(&scoped, scope, now, DEFAULT_PAGE, |connection| {
-        let token = credentials
+        let Some(token) = credentials
             .iter()
             .find(|(id, _)| id == &connection.id)
-            .map(|(_, token)| token.clone())?;
+            .map(|(_, token)| token.clone())
+        else {
+            // TWO DIFFERENT REASONS REACH THIS ARM, and reporting the wrong one is worse than
+            // reporting nothing: an operator chasing "became due later" for a connection whose
+            // secret is simply missing looks at the scheduler instead of at the secret.
+            //
+            // A connection this tick already TRIED to resolve was reported by the loop above,
+            // with the reason. Only a connection that was not in the first listing at all became
+            // due in between.
+            if !attempted.iter().any(|id| id == &connection.id) {
+                observer.connection_unavailable(
+                    scope,
+                    &connection.id,
+                    "this connection became due after its tick had resolved credentials, so it \
+                     is served on the next one",
+                );
+            }
+            return None;
+        };
         // A CONNECTION WHOSE FILTER DOES NOT PARSE IS NOT SILENTLY IDLE. The management surface
         // refuses those at write time, so reaching this means one was stored before that check
         // existed; either way an operator has to be told, because no pass will run and nothing

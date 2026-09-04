@@ -415,6 +415,53 @@ impl Org {
             .expect("begin the backfill");
         id
     }
+
+    /// A push connection EXACTLY as the management create leaves it: `backfill_state = 'pending'`.
+    ///
+    /// # Why this is a separate helper from [`Self::connection`]
+    ///
+    /// That one starts the backfill by hand, because the directory tests are about what a pass
+    /// does once it is enumerating. Doing it by hand is also how the scheduler's first version
+    /// looked correct while provisioning nobody: `begin_backfill` had no production caller, so
+    /// every real connection stayed pending and `run_backfill_pass` refused it, and the test
+    /// could not notice because it had supplied the missing step itself.
+    ///
+    /// A test about the SCHEDULER has to start where an operator's POST leaves off.
+    async fn connection_as_created(
+        &self,
+        attribute_mapping: &Value,
+        user_scope_filter: Option<&str>,
+    ) -> ScimPushConnectionId {
+        let id = ScimPushConnectionId::generate(&self.env, &self.scope);
+        self.db
+            .control_store()
+            .scoped(self.scope)
+            .acting(
+                self.db.test_actor(&self.env),
+                CorrelationId::generate(&self.env),
+            )
+            .scim_push_connections()
+            .create(
+                &self.env,
+                NewScimPushConnection {
+                    id: &id,
+                    organization_id: &self.id,
+                    display_name: "Okta production",
+                    base_url: BASE,
+                    credential_secret_name: "scim_push_downstream_token",
+                    attribute_mapping,
+                    user_scope_filter,
+                    group_scope_filter: None,
+                    write_mode: ScimWriteMode::Patch,
+                    deletion_policy: ScimDeletionPolicy::Deactivate,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create the push connection");
+        id
+    }
 }
 
 /// Run the backfill to completion against a real directory, returning what the downstream got.
@@ -1406,10 +1453,14 @@ async fn the_scheduler_opens_the_credential_and_runs_the_due_connection() {
     // key, and turn the bytes into a bearer.
     let org = Org::start().await;
     let (ada, _) = org.member("ada@globex.example", None).await;
-    let connection = org.connection(&json!({}), None).await;
+    let connection = org.connection_as_created(&json!({}), None).await;
     let store = org.db.store().scoped(org.scope);
-    // The backfill has to be finished for the tail, but a due connection mid-backfill is served
-    // too; leaving it enumerating is what makes this a backfill pass.
+    // NOTHING STARTS THE BACKFILL HERE, and that is the point. `Org::connection` leaves the row
+    // exactly as the management create does: `backfill_state = 'pending'`. `begin_backfill` had
+    // no caller outside tests, and `run_backfill_pass` refuses a connection that is not
+    // enumerating, so a scheduler that did not start one would have provisioned nobody in every
+    // environment while reporting a clean pass for each connection. The earlier version of this
+    // test called `begin_backfill` itself and could not have noticed.
     let downstream = Downstream::new(TOKEN);
     let observer = RecordingObserver::default();
 
@@ -1425,7 +1476,7 @@ async fn the_scheduler_opens_the_credential_and_runs_the_due_connection() {
         .put(
             &org.env,
             &org.db.master_key(),
-            "downstream_token",
+            "scim_push_downstream_token",
             TOKEN.as_bytes(),
             None,
         )
@@ -1485,7 +1536,7 @@ async fn a_connection_whose_secret_is_missing_is_reported_rather_than_silently_i
     // renamed it would otherwise have nothing at all to look at.
     let org = Org::start().await;
     org.member("ada@globex.example", None).await;
-    let connection = org.connection(&json!({}), None).await;
+    let connection = org.connection_as_created(&json!({}), None).await;
     let downstream = Downstream::new(TOKEN);
     let observer = RecordingObserver::default();
 
@@ -1509,7 +1560,7 @@ async fn a_connection_whose_secret_is_missing_is_reported_rather_than_silently_i
     );
     assert_eq!(unavailable[0].0, connection.to_string());
     assert!(
-        unavailable[0].1.contains("downstream_token"),
+        unavailable[0].1.contains("scim_push_downstream_token"),
         "the report does not name the secret an operator has to fix: {:?}",
         unavailable[0].1
     );

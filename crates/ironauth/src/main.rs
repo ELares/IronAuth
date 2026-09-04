@@ -4286,8 +4286,12 @@ async fn start_scim_push_scheduler(inputs: ScimPushInputs) -> Option<ScimPushSch
         );
         return None;
     };
+    // THE KEY GOES ON THE STORE, not only into the scheduler. Every sealed-PII read the passes
+    // make -- `users().traits()` above all -- goes through the repository layer, which reads the
+    // key off the handle and fails closed without it. A store built without one provisions
+    // nobody, and does it quietly: the failure surfaces as a store error per subject.
     let data_store = match Store::connect(&data_dsn).await {
-        Ok(store) => Arc::new(store),
+        Ok(store) => Arc::new(store.with_master_key(Arc::clone(&master))),
         Err(error) => {
             tracing::error!(%error, "outbound SCIM NOT running: data-plane connect failed");
             return None;
@@ -4390,6 +4394,7 @@ impl ScimPushObserver for TracingScimPushObserver {
     }
 }
 
+/// Capture what the audit retention sweeper (issue #109) needs, or [`None`] when it is off.
 fn audit_retention_inputs(config: &Config, env: &Env) -> Option<AuditRetentionInputs> {
     if !config.audit_retention.enabled {
         return None;

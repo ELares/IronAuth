@@ -434,6 +434,25 @@ fn check_label(value: &str, field: &str, max: usize) -> Result<String, ApiError>
 ///
 /// Calling the store's own predicate rather than restating it: a rule copied here would be a
 /// second place for the alphabet to live, and the two would drift on the first change.
+/// The prefix a connection's credential secret must carry.
+///
+/// # This is a confinement, not a naming convention
+///
+/// The environment-secret store is WRITE-ONLY by design: `setSecret` stores a value and no
+/// endpoint returns one, so a principal with `management.write` cannot read a secret it did not
+/// supply. A push connection names a secret and sends its plaintext to a base URL the same
+/// principal chose, which turns that store into a read oracle: point a connection at any secret
+/// name, at a server you control, and the worker delivers it as a bearer token.
+///
+/// It was latent while nothing ran the worker. The scheduler is what makes it reachable, so the
+/// bound goes in with it.
+///
+/// A prefix rather than an allowlist because the set is not knowable here: an operator names
+/// their own secrets. What the prefix buys is that a connection can only ever name a secret
+/// somebody deliberately put in the connection namespace, so a database password, a signing key
+/// or an upstream client secret is out of reach whatever the connection says.
+pub const CREDENTIAL_SECRET_PREFIX: &str = "scim_push_";
+
 fn check_secret_name(value: &str) -> Result<String, ApiError> {
     let value = require_non_empty(value, "credential_secret_name")?;
     if !ironauth_store::esv::name_is_valid(&value) {
@@ -442,6 +461,14 @@ fn check_secret_name(value: &str) -> Result<String, ApiError> {
              letters, digits, underscore, dot or hyphen, which is what an environment secret \
              name may be",
             ironauth_store::esv::MAX_NAME_LEN
+        )));
+    }
+    if !value.starts_with(CREDENTIAL_SECRET_PREFIX) {
+        return Err(ApiError::BadRequest(format!(
+            "invalid_credential_secret_name: credential_secret_name must begin with \
+             {CREDENTIAL_SECRET_PREFIX:?}. A connection sends the named secret to its base URL as \
+             a bearer token, so a connection that could name any secret would make the \
+             write-only secret store readable by anyone who can configure one"
         )));
     }
     Ok(value)
