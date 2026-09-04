@@ -7887,6 +7887,16 @@ export interface components {
          *     different question and the one an operator asks second.
          */
         ScimPushResourceView: {
+            /**
+             * Format: int64
+             * @description When this subject was withdrawn downstream, absent while it is provisioned.
+             *
+             *     Present because the link row SURVIVES a withdrawal so a rehire resolves through it. Without
+             *     it this listing reported a departed person with a `last_synced_at` and no error, which is
+             *     indistinguishable from a healthy one: an operator auditing who still has access would have
+             *     read the removed people as present.
+             */
+            deprovisioned_at_unix_ms?: number | null;
             /** @description What the downstream calls it. Server-issued there, opaque here. */
             downstream_id: string;
             /**

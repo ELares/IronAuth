@@ -230,6 +230,14 @@ pub struct ScimPushResourceView {
     /// When this subject last failed to push.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error_at_unix_ms: Option<i64>,
+    /// When this subject was withdrawn downstream, absent while it is provisioned.
+    ///
+    /// Present because the link row SURVIVES a withdrawal so a rehire resolves through it. Without
+    /// it this listing reported a departed person with a `last_synced_at` and no error, which is
+    /// indistinguishable from a healthy one: an operator auditing who still has access would have
+    /// read the removed people as present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprovisioned_at_unix_ms: Option<i64>,
     /// What that failure said, truncated to the column's bound.
     ///
     /// Cleared on the next success, because recording a success and clearing the failure are the
@@ -259,6 +267,9 @@ fn resource_view(link: &ironauth_store::ScimPushLink) -> ScimPushResourceView {
             .map(crate::scim_connections::micros_to_millis),
         last_error_at_unix_ms: link
             .last_error_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        deprovisioned_at_unix_ms: link
+            .deprovisioned_at_unix_micros
             .map(crate::scim_connections::micros_to_millis),
         last_error: link.last_error.clone(),
     }

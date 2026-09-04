@@ -429,7 +429,14 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
         .in_scope(collection, &subject_id)
         .await
         .map_err(WorkerError::Retryable)?;
-    let decision = scope_decision(in_scope, link.is_some());
+    // A LINK THAT HAS BEEN WITHDRAWN IS NOT A PROVISIONED SUBJECT. `scope_decision` reads the
+    // link as "this connection provisioned them", and 0190 keeps the row after a withdrawal so a
+    // rehire can resolve through it. Reading mere PRESENCE therefore made every later event for a
+    // departed subject send another deprovision, for ever.
+    let provisioned = link
+        .as_ref()
+        .is_some_and(|l| l.deprovisioned_at_unix_micros.is_none());
+    let decision = scope_decision(in_scope, provisioned);
     let withdraw = departing || decision == ScopeDecision::Withdraw;
     if decision == ScopeDecision::Skip {
         progress.out_of_scope += 1;
@@ -446,6 +453,17 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
                 known.as_deref(),
             )
             .await?;
+        // RECORDED, so the next event for this subject does not withdraw them again and the
+        // per-resource health surface stops reporting a departed person as a healthy success.
+        // A subject with no link has nothing to record against, which is the NotFound arm.
+        match store
+            .scim_push_links()
+            .record_deprovision(pass.connection_id, resource_type, &subject_id)
+            .await
+        {
+            Ok(()) | Err(StoreError::NotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
         progress.deprovisioned += 1;
         return Ok(());
     }

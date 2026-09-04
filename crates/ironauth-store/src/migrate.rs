@@ -1580,6 +1580,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Contract,
             sql: include_str!("../migrations/0194_drop_scim_push_control_policy.sql"),
         },
+        Migration {
+            version: 195,
+            name: "scim_push_link_deprovisioned",
+            // EXPAND: one nullable column, one partial index and one column-scoped grant. Every
+            // existing row reads as provisioned, which is what it was, and an old binary neither
+            // selects nor writes it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0195_scim_push_link_deprovisioned.sql"),
+        },
     ]
 }
 

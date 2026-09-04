@@ -75602,6 +75602,11 @@ pub struct ScimPushLink {
     pub last_error_at_unix_micros: Option<i64>,
     /// What that failure said.
     pub last_error: Option<String>,
+    /// When this subject was withdrawn downstream, or `None` while it is provisioned.
+    ///
+    /// The row SURVIVES a withdrawal so a rehire resolves through it (0190), which is why the
+    /// state needs a column rather than the row's absence.
+    pub deprovisioned_at_unix_micros: Option<i64>,
     /// When the link was first written.
     ///
     /// Present because `list_for_connection` pages on `(created_at, id)` and a caller cannot
@@ -75613,6 +75618,7 @@ pub struct ScimPushLink {
 
 const SCIM_PUSH_LINK_SELECT_COLUMNS: &str = "id, connection_id, resource_type, subject_id, \
      downstream_id, external_id, \
+     (EXTRACT(EPOCH FROM deprovisioned_at) * 1000000)::bigint AS deprovisioned_at_micros, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_micros, \
      (EXTRACT(EPOCH FROM last_synced_at) * 1000000)::bigint AS last_synced_at_micros, \
      (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_at_micros, last_error";
@@ -75631,6 +75637,7 @@ fn scim_push_link_from_row(row: &PgRow, scope: &Scope) -> Result<ScimPushLink, S
         last_synced_at_unix_micros: row.try_get("last_synced_at_micros")?,
         last_error_at_unix_micros: row.try_get("last_error_at_micros")?,
         last_error: row.try_get("last_error")?,
+        deprovisioned_at_unix_micros: row.try_get("deprovisioned_at_micros")?,
         created_at_unix_micros: row.try_get("created_at_micros")?,
     })
 }
@@ -75793,6 +75800,7 @@ impl ScimPushLinkRepo<'_> {
              ON CONFLICT (tenant_id, environment_id, connection_id, resource_type, subject_id) \
              DO UPDATE SET downstream_id = EXCLUDED.downstream_id, \
                            external_id = EXCLUDED.external_id, \
+                           deprovisioned_at = NULL, \
                            last_synced_at = now(), \
                            last_error_at = NULL, \
                            last_error = NULL, \
@@ -75819,6 +75827,54 @@ impl ScimPushLinkRepo<'_> {
                 error.into()
             }
         })?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record that a subject has been withdrawn downstream.
+    ///
+    /// # Why the row is kept
+    ///
+    /// 0190 argues that a deprovision should LEAVE the link, so a rehire resolves through it
+    /// rather than allocating a second downstream resource for the same person. That is right,
+    /// and it is why the withdrawal needs a column: with the row present and no state on it,
+    /// `scope_decision` reads "this connection provisioned them" for ever, so every later event
+    /// for a departed subject sends another deprovision, and criterion 2's per-resource listing
+    /// reports them as a healthy success.
+    ///
+    /// The downstream id is untouched, for the reason `record_failure` gives: the resource may
+    /// still exist, and a rehire has to be able to find it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is out of scope or no link exists,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn record_deprovision(
+        &self,
+        connection_id: &ScimPushConnectionId,
+        resource_type: ScimPushResourceType,
+        subject_id: &str,
+    ) -> Result<(), StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let result = sqlx::query(
+            "UPDATE scim_push_links \
+             SET deprovisioned_at = now(), updated_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND resource_type = $4 AND subject_id = $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(resource_type.as_str())
+        .bind(subject_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
         tx.commit().await?;
         Ok(())
     }
