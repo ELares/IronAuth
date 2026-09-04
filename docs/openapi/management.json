@@ -34644,6 +34644,14 @@
           "items"
         ],
         "properties": {
+          "feed_head_sequence": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The newest sequence in this environment's event feed, absent when the feed is empty.\n\nThe OTHER half of criterion 2's lag, reported once for the page rather than per row\nbecause it is the same number for every connection in the scope. A connection's lag is\nthis minus its own `cursor_sequence`."
+          },
           "items": {
             "type": "array",
             "items": {
@@ -34701,6 +34709,14 @@
             "type": "string",
             "description": "The NAME of the environment secret holding the bearer token."
           },
+          "cursor_sequence": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The feed sequence this connection has read through, absent until it starts tailing.\n\nCriterion 2's \"cursor position\". Compare with `feed_head_sequence` on the listing to get\nLAG. The two are reported separately rather than as one subtracted number, because a\ncaller shown only \"600 behind\" cannot tell a connection that has stalled from one whose\nfeed has simply grown, and those need different responses."
+          },
           "deletion_policy": {
             "type": "string",
             "description": "`deactivate` or `delete`."
@@ -34727,6 +34743,14 @@
             ],
             "description": "The last failure in operator-safe words, absent when there has been none.\n\nNEVER a downstream response body. An error page can carry anything, including the\ncredential it was sent."
           },
+          "last_polled_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the worker last LOOKED, including polls that found nothing.\n\nWhat separates \"idle because the feed is quiet\" from \"idle because the worker is wedged\".\n`last_success_at_unix_ms` moves only when something was written downstream, so on its own\nit cannot tell those apart, and they need opposite responses."
+          },
           "last_success_at_unix_ms": {
             "type": [
               "integer",
@@ -34734,6 +34758,14 @@
             ],
             "format": "int64",
             "description": "The last success, in milliseconds since the epoch."
+          },
+          "paused_until_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "While this is in the future the worker is skipping this connection after a failure.\n\nPresent so an operator seeing a stalled cursor can tell a deliberate backoff from a\nstopped worker without reading logs."
           },
           "user_scope_filter": {
             "type": [

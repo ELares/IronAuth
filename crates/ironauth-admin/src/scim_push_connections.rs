@@ -87,6 +87,27 @@ pub struct ScimPushConnectionView {
     /// The last success, in milliseconds since the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_success_at_unix_ms: Option<i64>,
+    /// The feed sequence this connection has read through, absent until it starts tailing.
+    ///
+    /// Criterion 2's "cursor position". Compare with `feed_head_sequence` on the listing to get
+    /// LAG. The two are reported separately rather than as one subtracted number, because a
+    /// caller shown only "600 behind" cannot tell a connection that has stalled from one whose
+    /// feed has simply grown, and those need different responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_sequence: Option<i64>,
+    /// When the worker last LOOKED, including polls that found nothing.
+    ///
+    /// What separates "idle because the feed is quiet" from "idle because the worker is wedged".
+    /// `last_success_at_unix_ms` moves only when something was written downstream, so on its own
+    /// it cannot tell those apart, and they need opposite responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_polled_at_unix_ms: Option<i64>,
+    /// While this is in the future the worker is skipping this connection after a failure.
+    ///
+    /// Present so an operator seeing a stalled cursor can tell a deliberate backoff from a
+    /// stopped worker without reading logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_until_unix_ms: Option<i64>,
 }
 
 /// A page of outbound connections.
@@ -102,6 +123,13 @@ pub struct ScimPushConnectionListView {
     /// a parameter no client can use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// The newest sequence in this environment's event feed, absent when the feed is empty.
+    ///
+    /// The OTHER half of criterion 2's lag, reported once for the page rather than per row
+    /// because it is the same number for every connection in the scope. A connection's lag is
+    /// this minus its own `cursor_sequence`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feed_head_sequence: Option<i64>,
 }
 
 /// What a create names.
@@ -166,6 +194,13 @@ fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionVi
         last_error: connection.last_error.clone(),
         last_success_at_unix_ms: connection
             .last_success_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        cursor_sequence: connection.cursor_sequence,
+        last_polled_at_unix_ms: connection
+            .last_polled_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        paused_until_unix_ms: connection
+            .paused_until_unix_micros
             .map(crate::scim_connections::micros_to_millis),
     }
 }
@@ -483,6 +518,15 @@ pub async fn list_scim_push_connections(
     let body = serde_json::to_string(&ScimPushConnectionListView {
         items: connections.iter().map(view).collect(),
         next_cursor,
+        // READ ONCE FOR THE PAGE. It is the same number for every connection in the scope, so a
+        // per-row query would be one round trip per connection to learn one fact.
+        feed_head_sequence: state
+            .store()
+            .scoped(scope)
+            .outbox()
+            .newest_sequence()
+            .await
+            .map_err(|_| ApiError::Internal)?,
     })
     .map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body))

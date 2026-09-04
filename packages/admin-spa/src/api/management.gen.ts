@@ -7760,6 +7760,15 @@ export interface components {
         };
         /** @description A page of outbound connections. */
         ScimPushConnectionListView: {
+            /**
+             * Format: int64
+             * @description The newest sequence in this environment's event feed, absent when the feed is empty.
+             *
+             *     The OTHER half of criterion 2's lag, reported once for the page rather than per row
+             *     because it is the same number for every connection in the scope. A connection's lag is
+             *     this minus its own `cursor_sequence`.
+             */
+            feed_head_sequence?: number | null;
             /** @description This organization's outbound connections. */
             items: components["schemas"]["ScimPushConnectionView"][];
             /**
@@ -7794,6 +7803,16 @@ export interface components {
             consecutive_failures: number;
             /** @description The NAME of the environment secret holding the bearer token. */
             credential_secret_name: string;
+            /**
+             * Format: int64
+             * @description The feed sequence this connection has read through, absent until it starts tailing.
+             *
+             *     Criterion 2's "cursor position". Compare with `feed_head_sequence` on the listing to get
+             *     LAG. The two are reported separately rather than as one subtracted number, because a
+             *     caller shown only "600 behind" cannot tell a connection that has stalled from one whose
+             *     feed has simply grown, and those need different responses.
+             */
+            cursor_sequence?: number | null;
             /** @description `deactivate` or `delete`. */
             deletion_policy: string;
             /** @description The operator-facing label. */
@@ -7811,9 +7830,26 @@ export interface components {
             last_error?: string | null;
             /**
              * Format: int64
+             * @description When the worker last LOOKED, including polls that found nothing.
+             *
+             *     What separates "idle because the feed is quiet" from "idle because the worker is wedged".
+             *     `last_success_at_unix_ms` moves only when something was written downstream, so on its own
+             *     it cannot tell those apart, and they need opposite responses.
+             */
+            last_polled_at_unix_ms?: number | null;
+            /**
+             * Format: int64
              * @description The last success, in milliseconds since the epoch.
              */
             last_success_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description While this is in the future the worker is skipping this connection after a failure.
+             *
+             *     Present so an operator seeing a stalled cursor can tell a deliberate backoff from a
+             *     stopped worker without reading logs.
+             */
+            paused_until_unix_ms?: number | null;
             /** @description The RFC 7644 filter deciding which users are pushed, absent when all of them are. */
             user_scope_filter?: string | null;
             /** @description `patch` or `put`. */

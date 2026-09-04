@@ -434,6 +434,71 @@ async fn a_scheme_the_fetcher_accepts_is_not_refused_by_the_surface_in_front_of_
 }
 
 #[tokio::test]
+async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
+    // CRITERION 2: "per-app sync status reports cursor position, lag, and per-resource errors via
+    // the management API". This covers the first two; the per-resource half is the links listing.
+    //
+    // WHY LAG IS TWO NUMBERS AND NOT ONE. A single "600 behind" cannot distinguish a connection
+    // that has stalled from one whose feed has simply grown while it kept pace, and those need
+    // opposite responses from an operator. The connection's own position and the feed head are
+    // both reported, so the subtraction happens where the context is.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k1").await;
+    let path = push_path(&tenant, &environment, &org);
+
+    let body = serde_json::json!({
+        "display_name": "Downstream SaaS",
+        "base_url": "https://downstream.example/scim/v2",
+        "credential_secret_name": "scim_push_downstream",
+    })
+    .to_string();
+    let (status, _, _) = h.post(&path, "k-health", &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _, listed) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("json");
+    let connection = &listed["items"][0];
+
+    // A CONNECTION THAT HAS NEVER RUN says so by OMITTING the fields rather than reporting zero.
+    // A cursor of 0 is a real position (the start of the feed), so a surface that defaulted to it
+    // would report a connection that has never tailed as one sitting at the beginning, which is a
+    // different thing and would make its lag look like the whole feed.
+    assert!(
+        connection.get("cursor_sequence").is_none(),
+        "a connection that has not tailed reported a position: {connection}"
+    );
+    assert!(
+        connection.get("last_polled_at_unix_ms").is_none(),
+        "a connection the worker has never looked at reported a poll time: {connection}"
+    );
+    assert!(
+        connection.get("paused_until_unix_ms").is_none(),
+        "an unpaused connection reported a pause: {connection}"
+    );
+
+    // WHAT IT DOES REPORT, because these have meaningful values from the moment it is created.
+    assert_eq!(connection["backfill_state"], serde_json::json!("pending"));
+    assert_eq!(connection["consecutive_failures"], serde_json::json!(0));
+    assert_eq!(connection["active"], serde_json::json!(true));
+
+    // AND THE FEED HEAD IS ON THE LISTING, once, not once per connection.
+    assert!(
+        listed["items"].as_array().expect("items").len() == 1,
+        "{listed}"
+    );
+    // The tenant creation above wrote audit events, so the feed is not empty and the head is a
+    // real number. Asserting it is PRESENT rather than a particular value: the point is that a
+    // caller has both halves of the subtraction, not what this environment's sequence happens to
+    // be.
+    assert!(
+        listed["feed_head_sequence"].is_i64(),
+        "the listing did not report the feed head, so lag cannot be computed: {listed}"
+    );
+}
+
+#[tokio::test]
 async fn a_malformed_base_url_is_refused_before_the_write() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;

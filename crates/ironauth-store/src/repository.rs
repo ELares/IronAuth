@@ -24740,6 +24740,39 @@ impl OutboxRepo<'_> {
         ))
     }
 
+    /// The newest sequence in this scope's feed, or `None` when the feed is empty.
+    ///
+    /// # What it is for, and what it is not
+    ///
+    /// Criterion 2 of issue #137 asks a health surface to report LAG. Lag is a comparison, and a
+    /// connection's own row holds only one side of it: where that connection has read to. This is
+    /// the other side, and it is shared by every connection in the scope, so a listing reads it
+    /// ONCE rather than per row.
+    ///
+    /// Deliberately a SEQUENCE and not a duration. "Four minutes behind" needs the timestamp of
+    /// the event at the consumer's position, which is a row that may have been pruned; "six
+    /// hundred events behind" is answerable from two integers that always exist. A caller wanting
+    /// elapsed time has `last_polled_at` and `last_success_at` on the connection, which say when
+    /// the worker last looked and last wrote, and those two answer the question an operator
+    /// actually asks first: is it running.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn newest_sequence(&self) -> Result<Option<i64>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let newest: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(sequence) FROM outbox_messages \
+             WHERE tenant_id = $1 AND environment_id = $2",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(newest)
+    }
+
     /// Read the ordered event feed after `after_sequence`, for a cursor consumer
     /// (issue #107).
     ///
