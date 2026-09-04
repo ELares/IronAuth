@@ -28,7 +28,9 @@ use ironauth_admin::scim_push_events::Collection;
 use ironauth_admin::scim_push_transport::{
     ScimRequest, ScimResponse, ScimTransport, ScimTransportError,
 };
-use ironauth_admin::scim_push_worker::{Pass, Progress, SubjectSource, WorkerError, run_tail_pass};
+use ironauth_admin::scim_push_worker::{
+    Pass, Progress, SubjectSource, WorkerError, run_backfill_pass, run_tail_pass,
+};
 use ironauth_env::Env;
 use ironauth_scim::downstream::{Downstream, Health};
 use ironauth_store::test_support::TestDatabase;
@@ -134,6 +136,20 @@ impl Directory {
     }
 }
 
+impl Directory {
+    fn add(&self, subject: &str, user_name: &str) {
+        self.people.lock().expect("lock").insert(
+            subject.to_owned(),
+            json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": user_name,
+                "externalId": subject,
+                "active": true,
+            }),
+        );
+    }
+}
+
 impl SubjectSource for Directory {
     fn resource(
         &self,
@@ -156,6 +172,29 @@ impl SubjectSource for Directory {
             .iter()
             .any(|s| s == subject_id);
         async move { Ok(!out) }
+    }
+
+    fn enumerate(
+        &self,
+        _collection: Collection,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<String>, String>> + Send {
+        // A BTreeMap, so the order is total and stable across passes. That is what makes `after`
+        // mean anything: an enumeration whose order changed between passes would let a resumed
+        // backfill skip people, and nothing would ever come back for them.
+        let out_of_scope = self.out_of_scope.lock().expect("lock").clone();
+        let page: Vec<String> = self
+            .people
+            .lock()
+            .expect("lock")
+            .keys()
+            .filter(|id| after.is_none_or(|a| id.as_str() > a))
+            .filter(|id| !out_of_scope.iter().any(|o| o == *id))
+            .take(limit)
+            .cloned()
+            .collect();
+        async move { Ok(page) }
     }
 }
 
@@ -297,6 +336,185 @@ impl Harness {
             WriteMode::Patch,
         )
     }
+}
+
+#[tokio::test]
+async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing() {
+    // #137 requires the backfill to be RESUMABLE. The test kills it between pages and asserts
+    // that the second run continues rather than restarting: for a large org, restarting means
+    // re-pushing tens of thousands of people, and the interesting failure is the other one, where
+    // a resumed enumeration SKIPS somebody and nothing ever comes back for them.
+    let h = Harness::start().await;
+    let directory = Directory::default();
+    for (subject, name) in [
+        ("usr_a", "ada"),
+        ("usr_b", "bea"),
+        ("usr_c", "cyd"),
+        ("usr_d", "dee"),
+    ] {
+        directory.add(subject, name);
+    }
+    let store = h.db.store().scoped(h.scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&h.connection)
+        .await
+        .expect("begin");
+
+    // THE FEED POSITION IS READ BEFORE ANY ENUMERATION, and the same value is carried through
+    // every page. A backfill that finished and THEN read the head would lose every event that
+    // happened while it ran.
+    let feed_head = EventCursor::beginning().to_wire();
+    let client = h.client();
+    let page = |limit: i64| Pass {
+        connection_id: &h.connection,
+        client: &client,
+        subjects: &directory,
+        deletion_policy: DeletionPolicy::Deactivate,
+        limit,
+        scope: h.scope,
+        now_unix_micros: now_micros(&h.env),
+    };
+
+    // Two at a time, then a simulated restart: the second call starts from the recorded position.
+    let first = run_backfill_pass(&store, page(2), Collection::Users, &feed_head)
+        .await
+        .expect("first page");
+    assert_eq!(first.converged, 2, "{first:?}");
+    let mid = store
+        .scim_push_sync_state()
+        .get(&h.connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        mid.backfill_after.as_deref(),
+        Some("usr_b"),
+        "the backfill did not record where it stopped"
+    );
+    assert_eq!(mid.cursor, None, "a running backfill must not be tailing");
+
+    let second = run_backfill_pass(&store, page(2), Collection::Users, &feed_head)
+        .await
+        .expect("second page");
+    assert_eq!(second.converged, 2, "{second:?}");
+    // FOUR PEOPLE, ONCE EACH. A restart that rewound would push a and b again, and one that
+    // skipped would leave c or d unprovisioned for ever.
+    assert_eq!(
+        h.downstream.users().len(),
+        4,
+        "the resumed backfill did not provision each person exactly once: {:?}",
+        h.downstream.users()
+    );
+
+    // THE EMPTY PAGE IS WHAT COMPLETES IT, and only then does the cursor appear.
+    let done = run_backfill_pass(&store, page(2), Collection::Users, &feed_head)
+        .await
+        .expect("the empty page completes the backfill");
+    assert!(done.checkpointed);
+    let complete = store
+        .scim_push_sync_state()
+        .get(&h.connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(complete.cursor.as_deref(), Some(feed_head.as_str()));
+    assert_eq!(complete.backfill_after, None);
+
+    // AND A LINK EXISTS FOR EVERY PERSON, so the tail can address them by downstream id.
+    for subject in ["usr_a", "usr_b", "usr_c", "usr_d"] {
+        assert!(
+            store
+                .scim_push_links()
+                .find(&h.connection, ScimPushResourceType::User, subject)
+                .await
+                .expect("find")
+                .is_some(),
+            "{subject} was provisioned without a link"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_backfill_never_pushes_a_subject_outside_the_connections_scope() {
+    // Criterion 4's first half, on the enumeration path rather than the event path. An
+    // out-of-scope person must not be provisioned by the initial sweep either, and this is the
+    // sweep that touches everybody.
+    let h = Harness::start().await;
+    let directory = Directory::default();
+    directory.add("usr_in", "ada");
+    directory.add("usr_out", "eve");
+    directory.put_out_of_scope("usr_out");
+
+    let store = h.db.store().scoped(h.scope);
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&h.connection)
+        .await
+        .expect("begin");
+    let client = h.client();
+    run_backfill_pass(
+        &store,
+        Pass {
+            connection_id: &h.connection,
+            client: &client,
+            subjects: &directory,
+            deletion_policy: DeletionPolicy::Deactivate,
+            limit: 50,
+            scope: h.scope,
+            now_unix_micros: now_micros(&h.env),
+        },
+        Collection::Users,
+        &EventCursor::beginning().to_wire(),
+    )
+    .await
+    .expect("backfill");
+
+    let stored = h.downstream.users();
+    assert_eq!(
+        stored.len(),
+        1,
+        "an out-of-scope person was provisioned: {stored:?}"
+    );
+    let only = stored.values().next().expect("one");
+    assert_eq!(only["externalId"], json!("usr_in"));
+}
+
+#[tokio::test]
+async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
+    // The mirror of the tail pass's guard. Running an enumeration against a connection that is
+    // already tailing would re-push everybody and, worse, the completing pass would then move a
+    // live cursor.
+    let h = Harness::start().await;
+    let directory = Directory::with("usr_ada", "ada");
+    h.start_tailing_from(0).await;
+
+    let store = h.db.store().scoped(h.scope);
+    let client = h.client();
+    let outcome = run_backfill_pass(
+        &store,
+        Pass {
+            connection_id: &h.connection,
+            client: &client,
+            subjects: &directory,
+            deletion_policy: DeletionPolicy::Deactivate,
+            limit: 50,
+            scope: h.scope,
+            now_unix_micros: now_micros(&h.env),
+        },
+        Collection::Users,
+        &EventCursor::beginning().to_wire(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(WorkerError::Permanent(_))),
+        "a tailing connection ran a backfill pass: {outcome:?}"
+    );
+    assert!(
+        h.downstream.users().is_empty(),
+        "it pushed anyway: {:?}",
+        h.downstream.users()
+    );
 }
 
 #[tokio::test]

@@ -115,6 +115,27 @@ pub trait SubjectSource {
         collection: Collection,
         subject_id: &str,
     ) -> impl Future<Output = Result<bool, String>> + Send;
+
+    /// The next page of IN-SCOPE subject ids, in a stable order, after `after`.
+    ///
+    /// # Why the order has to be stable and the caller has to say where it stopped
+    ///
+    /// #137 requires the backfill to be RESUMABLE, and a resumable enumeration is exactly one
+    /// that can be restarted from a recorded position. That needs a total order the source will
+    /// not change between passes: an implementation that returned subjects in whatever order the
+    /// database found them would make `after` meaningless, and a worker killed halfway would
+    /// either repeat people or skip them. Repeating is survivable because a push is a converge;
+    /// SKIPPING is not, because nothing would ever come back for them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the implementation needs to report; the worker treats it as retryable.
+    fn enumerate(
+        &self,
+        collection: Collection,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<String>, String>> + Send;
 }
 
 use std::future::Future;
@@ -359,6 +380,136 @@ async fn apply_one<T: ScimTransport, S: SubjectSource>(
             connection_id: pass.connection_id,
             resource_type,
             subject_id: &subject_id,
+            downstream_id: &downstream_id,
+            external_id: &external_id,
+        })
+        .await?;
+    progress.converged += 1;
+    Ok(())
+}
+
+/// Runs one backfill pass: provision the next page of in-scope subjects, and record where it got.
+///
+/// # Why the feed position is taken BEFORE the enumeration, not after
+///
+/// A backfill that finished and then read the feed head would lose every event that happened
+/// while it was running: those events are behind the new head, and the enumeration may not have
+/// seen the change either. Taking the position FIRST means the tail resumes from a point the
+/// backfill has already covered, so the overlap is re-applied. Re-applying is free, because every
+/// push is a converge; losing is not.
+///
+/// The caller supplies `feed_position_at_start` for that reason: it is read once, before the
+/// first page, and passed to every pass until the last one completes.
+///
+/// # Errors
+///
+/// [`WorkerError`] as described on its variants.
+pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
+    store: &ironauth_store::ScopedStore<'_>,
+    pass: Pass<'_, T, S>,
+    collection: Collection,
+    feed_position_at_start: &str,
+) -> Result<Progress, WorkerError> {
+    let state = store
+        .scim_push_sync_state()
+        .get(pass.connection_id)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    if is_paused(&state, pass.now_unix_micros) {
+        return Ok(Progress::default());
+    }
+    if state.backfill_state != ironauth_store::ScimPushBackfillState::Running {
+        return Err(WorkerError::Permanent(
+            "this connection is not enumerating, so a backfill pass has nothing to resume"
+                .to_owned(),
+        ));
+    }
+
+    let limit = usize::try_from(pass.limit).unwrap_or(usize::MAX);
+    let subjects = pass
+        .subjects
+        .enumerate(collection, state.backfill_after.as_deref(), limit)
+        .await
+        .map_err(WorkerError::Retryable)?;
+
+    // AN EMPTY PAGE MEANS THE ENUMERATION IS DONE, and only then does the connection start
+    // tailing, from the position that was read before any of this began.
+    if subjects.is_empty() {
+        store
+            .scim_push_sync_state()
+            .complete_backfill(pass.connection_id, feed_position_at_start)
+            .await?;
+        return Ok(Progress {
+            checkpointed: true,
+            ..Progress::default()
+        });
+    }
+
+    let mut progress = Progress {
+        read: subjects.len(),
+        ..Progress::default()
+    };
+    let mut furthest = None;
+    for subject_id in &subjects {
+        push_one(store, &pass, collection, subject_id, &mut progress).await?;
+        // RECORDED AFTER EACH SUBJECT, so a crash resumes from the last one that actually
+        // landed rather than from the start of the page.
+        furthest = Some(subject_id.clone());
+        store
+            .scim_push_sync_state()
+            .record_backfill_progress(pass.connection_id, subject_id)
+            .await?;
+    }
+    debug_assert!(furthest.is_some(), "a non-empty page recorded no progress");
+    Ok(progress)
+}
+
+/// Provisions one subject during a backfill.
+async fn push_one<T: ScimTransport, S: SubjectSource>(
+    store: &ironauth_store::ScopedStore<'_>,
+    pass: &Pass<'_, T, S>,
+    collection: Collection,
+    subject_id: &str,
+    progress: &mut Progress,
+) -> Result<(), WorkerError> {
+    let Some(resource) = pass
+        .subjects
+        .resource(collection, subject_id)
+        .await
+        .map_err(WorkerError::Retryable)?
+    else {
+        // Enumerated and then deleted. The tail will carry its deletion event.
+        progress.ignored += 1;
+        return Ok(());
+    };
+    let converged = pass
+        .client
+        .converge(collection.path(), subject_id, &resource)
+        .await?;
+    let downstream_id = match &converged {
+        Converged::Created(id) | Converged::Updated(id) => id.clone(),
+        Converged::AlreadyGone => {
+            progress.ignored += 1;
+            return Ok(());
+        }
+    };
+    let resource_type = match collection {
+        Collection::Users => ScimPushResourceType::User,
+        Collection::Groups => ScimPushResourceType::Group,
+    };
+    let external_id = resource
+        .get("externalId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(subject_id)
+        .to_owned();
+    let id = ScimPushLinkId::generate(&ironauth_env::Env::system(), &pass.scope);
+    store
+        .scim_push_links()
+        .upsert(NewScimPushLink {
+            id: &id,
+            connection_id: pass.connection_id,
+            resource_type,
+            subject_id,
             downstream_id: &downstream_id,
             external_id: &external_id,
         })
