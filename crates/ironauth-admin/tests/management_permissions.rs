@@ -444,6 +444,25 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "revokeScimConnection",
         ManagementPermission::WriteCredentials,
     ),
+    // The OUTBOUND provisioning surface (issue #137), and it is `WriteConfig` rather than the
+    // `WriteCredentials` its inbound neighbour above carries. The difference is what the row
+    // holds: an inbound connection IS a credential, minted and revoked here, while an outbound
+    // one only NAMES an `environment_secrets` row that somebody with the credential permission
+    // already created. Pointing a connection at an existing secret is configuration; it mints
+    // nothing and reveals nothing, which is the same line `setSecret` and `deleteSecret` sit on.
+    ("listScimPushConnections", ManagementPermission::Read),
+    (
+        "createScimPushConnection",
+        ManagementPermission::WriteConfig,
+    ),
+    (
+        "setScimPushConnectionActive",
+        ManagementPermission::WriteConfig,
+    ),
+    (
+        "deleteScimPushConnection",
+        ManagementPermission::WriteConfig,
+    ),
     (
         "revokeOrganizationApiKey",
         ManagementPermission::WriteCredentials,
@@ -850,6 +869,15 @@ const PERMISSION_PROVEN: &[&str] = &[
     "createScimConnection",
     "listScimConnections",
     "revokeScimConnection",
+    // Proven in `a_read_only_credential_can_list_scim_push_connections_and_cannot_change_one`,
+    // which drives create, pause and delete with a read-only credential and asserts each
+    // refusal NAMES write_config, then drives the LISTING with a `write_config` credential so
+    // the read is checked in both directions too. It also asserts the seeded connection is
+    // still there AND still active, so a refusal that half-applied would fail it.
+    "listScimPushConnections",
+    "createScimPushConnection",
+    "setScimPushConnectionActive",
+    "deleteScimPushConnection",
     // Proven in `a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key`. The
     // listing is here too, and only here: that test checks it in BOTH directions, so a
     // downgrade of the read to "any permission" is refused as well as an upgrade of it.
@@ -957,7 +985,7 @@ const PERMISSION_PROVEN: &[&str] = &[
 /// without somebody editing this assertion and noticing what they are doing.
 ///
 /// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 221 minus 77 is always 144. (It read "166 minus 22", then "171 minus 27", then
+/// its own: 225 minus 81 is always 144. (It read "166 minus 22", then "171 minus 27", then
 /// "210 minus 66", then "218 minus 74" -- each of them stale, and the last of them stale in a doc paragraph that
 /// says in the same breath that this is the hazard, while
 /// the pins above it moved twice without it, which is the hazard of writing an arithmetic
@@ -977,12 +1005,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        221,
+        225,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        77,
+        81,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -998,6 +1026,14 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     // Listed the moment the module existed: a file NOT enumerated here is one this gate never
     // reads, so its classification comments and its gate calls could disagree silently.
     ("agents.rs", include_str!("../src/agents.rs")),
+    // The outbound provisioning module (issue #137). Listed the moment it existed: a file NOT
+    // enumerated here is one this gate never reads, so a mutation deleting a
+    // `require_permission` call inside it SURVIVES, and the classification above would look
+    // like enforcement while enforcing nothing.
+    (
+        "scim_push_connections.rs",
+        include_str!("../src/scim_push_connections.rs"),
+    ),
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
     (
         "claims_mappings.rs",

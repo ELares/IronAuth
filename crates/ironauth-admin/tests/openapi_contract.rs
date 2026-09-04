@@ -121,6 +121,7 @@ fn operation_ids_are_the_stable_set() {
             "createProjectGrant",
             "createRoutingRule",
             "createScimConnection",
+            "createScimPushConnection",
             "createServiceAccountApiKey",
             "createServiceAccountMembership",
             "createSubjectMapping",
@@ -150,6 +151,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteOrganization",
             "deleteOutboundVerification",
             "deletePermission",
+            "deleteScimPushConnection",
             "deleteSecret",
             "deleteSessionJwtMode",
             "deleteSessionTokenTemplate",
@@ -262,6 +264,7 @@ fn operation_ids_are_the_stable_set() {
             "listResourceTypes",
             "listRoutingRules",
             "listScimConnections",
+            "listScimPushConnections",
             "listSecrets",
             "listServiceAccountApiKeys",
             "listSessionTokenTemplates",
@@ -339,6 +342,7 @@ fn operation_ids_are_the_stable_set() {
             "setOrgDefaultRole",
             "setOrgGroupParent",
             "setOutboundVerification",
+            "setScimPushConnectionActive",
             "setSecret",
             "setSessionJwtMode",
             "setSessionTokenTemplate",
@@ -409,6 +413,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listOrgMembershipRoles",
         "listOrgRolePermissions",
         "listScimConnections",
+        "listScimPushConnections",
         "listPermissions",
         "listResourceServers",
     ] {
@@ -459,6 +464,7 @@ fn every_post_documents_the_idempotency_key_header() {
         "extendSignupQuarantine",
         "approveRecoveryApproval",
         "rejectRecoveryApproval",
+        "createScimPushConnection",
         "createOrgRole",
         "createOrgGroup",
         "addOrgGroupMember",
@@ -569,6 +575,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}",
@@ -658,6 +665,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/queues",
@@ -753,6 +761,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
@@ -812,6 +821,7 @@ fn documented_paths_are_the_expected_set() {
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents/{agent_id}/vault-connections",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/parent",
+            "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-jwt-mode",
             "PUT /v1/tenants/{tenant_id}/environments/{environment_id}/session-token-templates",
@@ -911,7 +921,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        282,
+        286,
         "the documented route count is pinned"
     );
 

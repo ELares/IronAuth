@@ -81,7 +81,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      agent client binding, agent token vault, agent vault approvals, audit subject, \
      agent vault refresh, native SSO device secrets, SCIM connections, \
      SCIM external ids, SCIM group push, data plane column scopes, \
-     SCIM enterprise attributes, group binding provenance.";
+     SCIM enterprise attributes, group binding provenance, outbound SCIM push connections.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -712,7 +712,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        188,
+        189,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -753,7 +753,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
-            177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188
+            177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189
         ]
     );
     let phase_of = |version: i64| async move {
@@ -9024,6 +9024,13 @@ async fn every_scim_table_carries_its_isolation_structurally() {
             "scim_enterprise_attributes",
             "scim_enterprise_attributes_scope",
         ),
+        // 0189, the OUTBOUND table. Added with the migration rather than after a review
+        // measured the gap, which is how 0187 got here. The list is a hand-written enumeration,
+        // so a table absent from it has none of the three assertions below run against it, and
+        // the table's own store suite cannot substitute: it reaches everything through the
+        // repository, whose queries all carry the scope predicates explicitly, so it cannot
+        // tell the policy from its absence.
+        ("scim_push_connections", "scim_push_connections_scope"),
     ] {
         assert!(
             rls_enabled_and_forced(pool, table).await,
@@ -9108,6 +9115,100 @@ async fn every_scim_table_carries_its_isolation_structurally() {
             unique_index_exists(pool, "scim_external_ids", index).await,
             "{index} must be UNIQUE; a plain index of the same name serves reads identically \
              and enforces nothing"
+        );
+    }
+}
+
+/// 0189's UPDATE grant is COLUMN SCOPED, and the scoping is measured rather than read.
+///
+/// # Why a test and not just the migration
+///
+/// A column-scoped grant and a table-wide one look identical in every functional test: the only
+/// statement this slice issues sets `active` and `updated_at`, which both grants permit. Widen
+/// the grant to the whole table and nothing goes red. So the property has to be asserted where
+/// it can be, against `information_schema`, or it is a line in a migration nobody checks.
+///
+/// # What it does and does not buy, stated because the migration's comment once overclaimed
+///
+/// It stops an existing connection being silently RE-POINTED: `organization_id` and
+/// `credential_secret_name` cannot change under a handle that keeps its identity, so a
+/// connection an operator audited stays the connection they audited. It is NOT a fence against
+/// the control role reaching another organization at all -- that role also holds INSERT and
+/// DELETE -- but doing it that way mints a new id and writes two audit rows with two actions,
+/// which is visible where an in-place UPDATE would not be.
+#[tokio::test]
+async fn the_outbound_connection_update_grant_is_scoped_to_the_columns_a_statement_writes() {
+    let db = TestDatabase::start().await;
+    let pool = db.owner_pool();
+
+    // GRANTED: the two columns `set_active` writes, and only those.
+    for column in ["active", "updated_at"] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "scim_push_connections",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "ironauth_control must hold column-scoped UPDATE on \
+             scim_push_connections.{column}, which `set_active` writes"
+        );
+    }
+
+    // WITHHELD: EVERYTHING ELSE, and the set is DERIVED from the table rather than written out.
+    //
+    // A hand-written list said "everything else" and named twelve of the twenty-four columns,
+    // so the ten it omitted -- `cursor_sequence`, the three `backfill_*`, the health columns and
+    // `created_at` -- could have been granted without the assertion noticing. The sentence was
+    // true of the comment and false of the loop, which is the defect this file keeps finding
+    // elsewhere. Asking the catalogue makes the claim and the check the same thing.
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns \
+         WHERE table_name = 'scim_push_connections' ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the table's columns");
+    assert!(
+        columns.len() > 20,
+        "the column list came back implausibly short, so the loop below would assert nothing: \
+         {columns:?}"
+    );
+    for column in &columns {
+        if column == "active" || column == "updated_at" {
+            continue;
+        }
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_control",
+                "scim_push_connections",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "ironauth_control must NOT hold UPDATE on scim_push_connections.{column}: no \
+             statement writes it, and a grant for a write nothing performs is a permission \
+             nobody can account for"
+        );
+    }
+
+    // AND THE DATA PLANE READS ONLY. The worker that will advance the cursor does not exist
+    // yet, so it holds no UPDATE anywhere on this table.
+    for column in ["active", "cursor_sequence", "backfill_state", "last_error"] {
+        assert!(
+            !role_has_column_privilege(
+                pool,
+                "ironauth_app",
+                "scim_push_connections",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "ironauth_app must NOT hold UPDATE on scim_push_connections.{column} until the \
+             worker that performs it arrives"
         );
     }
 }

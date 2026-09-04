@@ -4850,3 +4850,145 @@ async fn the_agent_vault_surface_splits_deciding_from_reading_the_queue() {
         "write_organizations did not cover the decision: {response}"
     );
 }
+
+/// A read-only credential may LIST outbound SCIM connections and may not create, pause or
+/// delete one (issue #137).
+///
+/// # Why this file rather than the classification pin
+///
+/// `management_permissions.rs` records that these four operations demand
+/// `Read`/`WriteConfig`/`WriteConfig`/`WriteConfig` and separately asserts each handler calls
+/// `require_permission`, and NOTHING COMPARES THE TWO: its own comment says it "cannot tell
+/// WHICH permission a handler demands, only that it demands one". A mutation downgrading any of
+/// the three writes to `Read` passes every pin in that file. The refusal-body assertions here
+/// are what make this verify the specific permission.
+///
+/// # Why `write_config` and not `write_credentials`
+///
+/// The inbound neighbour's proof asserts `management.write_credentials`, because an inbound
+/// connection IS a credential minted at that route. An outbound connection only NAMES an
+/// `environment_secrets` row somebody else created, so pointing one at an existing secret mints
+/// nothing. Asserting the string here is what stops that reasoning from being only a comment: if
+/// a later edit "aligned" these handlers with the inbound ones, this test names the difference.
+#[tokio::test]
+async fn a_read_only_credential_can_list_scim_push_connections_and_cannot_change_one() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "sp-mint").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "sp-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let base = format!("{orgs}/{org}/scim-push-connections");
+
+    // Seeded while the credential is still unrestricted: the restriction below is what the test
+    // is about, and the fixture has to exist before it applies.
+    let seed = serde_json::json!({
+        "display_name": "seed",
+        "base_url": "https://downstream.example.com/scim/v2",
+        "credential_secret_name": "scim_push_downstream",
+    })
+    .to_string();
+    let (status, _, body) = h.post(&base, "sp-seed", &seed).await;
+    assert_eq!(status, StatusCode::CREATED, "seed connection: {body}");
+    let seeded = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    // The READ it holds still works, which is what makes the three refusals below a narrowing
+    // rather than a credential locked out of the surface entirely.
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the listing it holds: {body}"
+    );
+
+    // CREATE is refused, and the refusal NAMES write_config rather than any other write.
+    let (status, _, body) = h.post_as(&base, &secret, "sp-denied-create", &seed).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential pointed a connection at a downstream directory: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config, so the handler may demand a different \
+         permission than the classification records: {body}"
+    );
+
+    // PAUSE is refused, and names the same permission. Driven separately from delete because
+    // they are separate handlers: a fence on one door is a fence with a door beside it.
+    let (status, _, body) = h
+        .put_as(
+            &format!("{base}/{seeded}/active"),
+            &secret,
+            &serde_json::json!({ "active": false }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential PAUSED a connection: {body}"
+    );
+    assert!(body.contains("management.write_config"), "pause: {body}");
+
+    // DELETE is refused, and names the same permission.
+    let (status, _, body) = h.delete_as(&format!("{base}/{seeded}"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential DELETED a connection: {body}"
+    );
+    assert!(body.contains("management.write_config"), "delete: {body}");
+
+    // And NOTHING LANDED: still exactly one connection, and still active. Presence alone would
+    // pass while the refused pause had gone through.
+    let (_, _, listed) = h.get(&base).await;
+    let parsed = serde_json::from_str::<serde_json::Value>(&listed).expect("json");
+    assert_eq!(
+        parsed["items"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    assert_eq!(
+        parsed["items"][0]["active"],
+        serde_json::json!(true),
+        "the refused pause landed anyway: {listed}"
+    );
+
+    // And the LISTING demands `management.read` rather than merely being reachable. The half
+    // above cannot see a deleted check on the list handler: a credential HOLDING read lists
+    // successfully either way. A credential holding a DIFFERENT permission is what separates
+    // them, and it is `write_config` rather than an empty grant set because an empty set could
+    // be refused by some earlier check and would prove nothing about which permission this
+    // route wants.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential LISTED outbound connections, so the listing demands no \
+         permission of its own: {body}"
+    );
+}

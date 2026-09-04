@@ -58,7 +58,24 @@ PROVIDER_DIR="terraform-provider-ironauth/internal/provider"
 # provisioning TOKEN exactly once and never again, so a provider resource for it has to decide
 # where that secret lives in state before it is written, and that decision belongs with the
 # provider work rather than being made in passing inside the API's own change.
-UNCOVERED_CEILING=25
+# RAISED 25 -> 26 for `createScimPushConnection` (issue #137). The denominator grew again: the
+# OUTBOUND SCIM surface is new, and it is promotable on the same terms as its inbound mirror (a
+# collection POST with a sibling item DELETE).
+#
+# THE REASON FOR DEFERRING IS DIFFERENT THIS TIME, and worth stating rather than reusing the one
+# above. The inbound resource was deferred because its create returns a token once and a provider
+# has to decide where that secret lives in state. This one returns NO secret at all -- the
+# connection names an environment secret, and the value never crosses the API -- so that
+# particular problem does not arise, and a Terraform resource for it is genuinely
+# straightforward.
+#
+# It is deferred because the resource is not finished. This slice ships configuration storage and
+# its management surface; the fields a provider would manage (`cursor_sequence`, the backfill
+# state, the health columns) are written by a push worker that does not exist yet, and the
+# `write_mode` fallback that later slices add can change the value the API reports. A provider
+# resource written against today's shape would have to be rewritten against the finished one, and
+# a `terraform plan` that flaps because the server rewrote a field is worse than no resource.
+UNCOVERED_CEILING=26
 
 python3 - "$SPEC" "$PROVIDER_DIR" "$UNCOVERED_CEILING" <<'PY'
 import collections, json, pathlib, re, sys

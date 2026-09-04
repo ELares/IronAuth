@@ -100,12 +100,14 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrganizationApiKey",
     "createProjectGrant",
     "createScimConnection",
+    "createScimPushConnection",
     "createServiceAccountMembership",
     "decideAgentVaultApproval",
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
     "deleteOrganization",
+    "deleteScimPushConnection",
     "disableOrganization",
     "enableOrganization",
     "registerAgent",
@@ -114,6 +116,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "revokeScimConnection",
     "rotateOrganizationApiKey",
     "setAgentState",
+    "setScimPushConnectionActive",
     "setOrgDefaultRole",
     "setOrgGroupParent",
     "storeAgentVaultConnection",
@@ -158,6 +161,22 @@ const UNATTRIBUTED_CEILING: usize = 0;
 /// function and reads that function plus the same-file functions it calls, which is the
 /// granularity `org_confinement_surface.rs` already uses for the confinement fence.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    // The outbound provisioning writes (issue #137). All three attribute through
+    // `.in_organization(org_id)`; they did not, and `audit_log.organization_id` was NULL for
+    // every one of them, so a per-organization log stream saw none of an operator re-pointing
+    // that organization's directory.
+    (
+        "createScimPushConnection",
+        include_str!("../src/scim_push_connections.rs"),
+    ),
+    (
+        "setScimPushConnectionActive",
+        include_str!("../src/scim_push_connections.rs"),
+    ),
+    (
+        "deleteScimPushConnection",
+        include_str!("../src/scim_push_connections.rs"),
+    ),
     (
         "storeAgentVaultConnection",
         include_str!("../src/agents.rs"),

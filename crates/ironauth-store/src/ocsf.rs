@@ -262,6 +262,19 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "environment_secret",
     "environment_variable",
     "flow_target",
+    // An OUTBOUND SCIM connection (issue #137) is CONFIGURATION, not a credential, and that is
+    // why it is here while `scim_connection` is on the access-management list one screen up.
+    //
+    // The inbound row IS the credential: it holds the token digest, and creating one grants
+    // provisioning rights over an organization. The outbound row holds no credential at all --
+    // only the NAME of an environment secret -- so what an operator changes when they touch it
+    // is where this environment's directory gets pushed. Creating one does not hand anybody a
+    // new right; it points an existing one somewhere.
+    //
+    // `scim_push_connection`, NOT `scim_push`, for the reason the inbound note gives: this
+    // classifier keys on the text before the first dot, and the worker actions later slices add
+    // (`scim_push.user_pushed`) are a different shape. Wire strings freeze into the audit trail.
+    "scim_push_connection",
     "flow_version",
     "locale",
     "mds3",

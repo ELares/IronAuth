@@ -2844,6 +2844,62 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The OUTBOUND connection (issue #137). The id and the ORGANIZATION for the reason the
+        // inbound entry above gives, plus the BASE URL: the question a consumer asks about an
+        // outbound connection is "where is this organization's directory now going", and the
+        // id alone does not answer it.
+        //
+        // NO `credential_secret_name`. It is not a secret, but naming an environment secret on
+        // the wire tells a consumer which secret to attack and buys a consumer nothing: no
+        // receiver of this event can resolve it, and the one component that can already reads
+        // the row.
+        "scim_push_connection.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scim_push_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "base_url": {"type": "string", "minLength": 1}
+            },
+            "required": ["scim_push_connection_id", "organization_id", "base_url"]
+        }"#,
+    ),
+    (
+        // Pausing and resuming are ONE event with a boolean rather than two types, because a
+        // consumer's question is "is this organization's directory still being pushed", and two
+        // types would make answering it a join of two streams.
+        "scim_push_connection.active_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scim_push_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "active": {"type": "boolean"}
+            },
+            "required": ["scim_push_connection_id", "organization_id", "active"]
+        }"#,
+    ),
+    (
+        // Emitted only when a row was actually removed. A delete naming an absent handle is a
+        // `NotFound` that commits nothing, so it announces nothing: the inbound revoke beside
+        // it records what collapsing those two costs.
+        "scim_push_connection.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scim_push_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["scim_push_connection_id", "organization_id"]
+        }"#,
+    ),
+    (
         // The id and the OWNER, because an api key is the same credential kind under three
         // different owners (user, service account, organization) and a consumer routing on
         // "who gained a credential" cannot get that from the id alone.

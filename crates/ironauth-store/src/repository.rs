@@ -98,11 +98,11 @@ use crate::id::{
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
     RiskSignalId, RoutingRuleId, ScimConnectionId, ScimEnterpriseId, ScimExternalIdId,
-    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
-    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    ScimPushConnectionId, ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId,
+    SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId,
+    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
+    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -205,6 +205,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ScimConnectionRepo<'a> {
         ScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The OUTBOUND SCIM connections for this scope (issue #137).
+    ///
+    /// READ side. Creating and deleting one points a credential at somebody else's directory, so
+    /// both go through [`ScopedStore::acting`] and the CONTROL plane. The DATA plane reads this,
+    /// because the push worker runs there.
+    #[must_use]
+    pub fn scim_push_connections(&self) -> ScimPushConnectionRepo<'a> {
+        ScimPushConnectionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1635,6 +1648,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ActingScimConnectionRepo<'a> {
         ActingScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of the outbound SCIM connections (issue #137).
+    #[must_use]
+    pub fn scim_push_connections(&self) -> ActingScimPushConnectionRepo<'a> {
+        ActingScimPushConnectionRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -74773,6 +74796,570 @@ pub struct NewScimConnection<'a> {
     pub token_digest: &'a str,
     /// When it stops authenticating, from the APPLICATION clock.
     pub expires_at_unix_micros: Option<i64>,
+}
+
+/// An outbound SCIM connection: where an environment PUSHES an organization's directory.
+///
+/// # The mirror of [`ScimConnection`], and the inversion is the point
+///
+/// Inbound, an identity provider holds a token and writes into IronAuth. Outbound, IronAuth holds
+/// a credential and writes into somebody else's application. Three things follow from that and
+/// none of them is cosmetic:
+///
+/// * `externalId` swaps sides. Inbound, `id` is the IronAuth id and `externalId` is the identity
+///   provider's key; outbound, `externalId` carries the IronAuth id and `id` is whatever the
+///   downstream assigns. An implementation that reuses the inbound renderer gets this backwards
+///   and every resource is created twice.
+/// * There is a CURSOR. An inbound connection is driven by whoever calls it; an outbound one has
+///   to remember how far it has got, and it advances only on success, so a downstream outage
+///   pauses it rather than dropping events.
+/// * THE CREDENTIAL IS NOT HERE. Only the NAME of an `environment_secrets` row is, which is what
+///   `log_streams` does. Resolving it at push time reuses the sealing path that already exists
+///   rather than minting a second one, and it gives rotation for free: the operator rotates the
+///   secret and every connection naming it follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScimPushConnection {
+    /// The non-secret handle (`spc_`).
+    pub id: ScimPushConnectionId,
+    /// THE boundary: the one organization whose directory this connection pushes.
+    ///
+    /// Parsed IN SCOPE on the way out, so a row that somehow held a foreign organization fails
+    /// the read rather than handing a worker a boundary it would trust.
+    pub organization_id: OrganizationId,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// The downstream SCIM base URL. https, checked at the surface.
+    pub base_url: String,
+    /// The NAME of the environment secret holding the bearer token. Never the token.
+    pub credential_secret_name: String,
+    /// How IronAuth attributes map onto the downstream schema.
+    pub attribute_mapping: serde_json::Value,
+    /// The RFC 7644 filter deciding which users are in scope, if any.
+    ///
+    /// Held as text and re-parsed on read rather than stored parsed, because the parsed form is
+    /// not a wire type: a `Filter` that round-tripped through a column would be a second
+    /// grammar to keep in step with the first.
+    pub user_scope_filter: Option<String>,
+    /// The same for groups.
+    pub group_scope_filter: Option<String>,
+    /// PATCH or PUT. See [`ScimWriteMode`].
+    pub write_mode: ScimWriteMode,
+    /// What a departure means downstream. See [`ScimDeletionPolicy`].
+    pub deletion_policy: ScimDeletionPolicy,
+    /// Whether the worker should serve it.
+    pub active: bool,
+    /// How far the worker has got, or `None` before the first pass.
+    pub cursor_sequence: Option<i64>,
+    /// Where the initial backfill has reached.
+    pub backfill_state: ScimBackfillState,
+    /// Operator-facing health, in the shape `log_streams` uses.
+    pub last_success_at_unix_micros: Option<i64>,
+    /// When it last failed.
+    pub last_error_at_unix_micros: Option<i64>,
+    /// The last failure, in operator-safe words. NEVER a response body: a downstream error page
+    /// can carry anything, including the credential it was sent.
+    pub last_error: Option<String>,
+    /// Consecutive failures, which is what the health status is computed from.
+    pub consecutive_failures: i32,
+    /// Creation time, which is the listing's sort key and therefore its cursor position.
+    pub created_at_unix_micros: i64,
+}
+
+/// Whether a downstream is written with PATCH or PUT.
+///
+/// # Why this is stored rather than probed
+///
+/// RFC 7644 makes PATCH optional and a great many implementations answer 501. Probing on every
+/// write costs a round trip per resource; probing once and remembering is what this column is.
+/// `patch` is the default because it is what the specification prefers and what a conforming
+/// downstream supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimWriteMode {
+    /// RFC 7644 section 3.5.2 PATCH, falling back to PUT once on a refusal.
+    Patch,
+    /// PUT only, for a downstream known not to implement PATCH.
+    Put,
+}
+
+impl ScimWriteMode {
+    /// Every value, so a test can drive the Rust vocabulary against the column's CHECK.
+    ///
+    /// THE TWO CAN DRIFT. A Rust variant added without touching the constraint compiles, and
+    /// fails at INSERT in production rather than in CI. `ALL` is what lets a test iterate them.
+    pub const ALL: &'static [Self] = &[Self::Patch, Self::Put];
+
+    /// The stored spelling, which is the CHECK constraint's vocabulary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Put => "put",
+        }
+    }
+}
+
+/// What a departure from scope means downstream.
+///
+/// # `Deactivate` is the default, and it is not a timid one
+///
+/// A DELETE against a customer's directory is not reversible, and the most common cause of a
+/// user leaving scope is a mapping rule someone just edited. Deactivating is recoverable;
+/// deleting is a support ticket that starts with "we lost the accounts".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimDeletionPolicy {
+    /// `PATCH active=false`, the recoverable answer.
+    Deactivate,
+    /// `DELETE`, for a downstream whose licence count depends on it.
+    Delete,
+}
+
+impl ScimDeletionPolicy {
+    /// Every value. See [`ScimWriteMode::ALL`] for why this exists.
+    pub const ALL: &'static [Self] = &[Self::Deactivate, Self::Delete];
+
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deactivate => "deactivate",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Where the initial backfill has reached.
+///
+/// # Why a backfill needs its own state rather than a boolean
+///
+/// It is resumable, and resuming needs to know WHICH half was interrupted: a connection that got
+/// through the users and died in the groups must not start the users again, both because it is
+/// wasted work against somebody else's rate limit and because a re-push is a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScimBackfillState {
+    /// Nothing enumerated yet.
+    Pending,
+    /// Part way through the users.
+    Users,
+    /// Users done, part way through the groups.
+    Groups,
+    /// Done; the worker is tailing the cursor.
+    Done,
+}
+
+impl ScimBackfillState {
+    /// Every value. See [`ScimWriteMode::ALL`].
+    pub const ALL: &'static [Self] = &[Self::Pending, Self::Users, Self::Groups, Self::Done];
+
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Users => "users",
+            Self::Groups => "groups",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// The columns every outbound-connection read selects, so one shape feeds one parser.
+const SCIM_PUSH_SELECT_COLUMNS: &str = "id, organization_id, display_name, base_url, \
+     credential_secret_name, attribute_mapping, user_scope_filter, group_scope_filter, \
+     write_mode, deletion_policy, active, cursor_sequence, backfill_state, \
+     (EXTRACT(EPOCH FROM last_success_at) * 1000000)::bigint AS last_success_us, \
+     (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_us, \
+     last_error, consecutive_failures, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
+/// Build a [`ScimPushConnection`] from a row selected with [`SCIM_PUSH_SELECT_COLUMNS`].
+///
+/// EVERY ID IS PARSED IN SCOPE. A row that somehow held a foreign organization fails the READ
+/// rather than handing a worker a boundary it would then trust, which is the same rule the
+/// inbound side follows and for the same reason: referential integrity does not see row-level
+/// security, so the scope check has to be in the code.
+fn scim_push_connection_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: &Scope,
+) -> Result<ScimPushConnection, StoreError> {
+    let write_mode = match row.get::<String, _>("write_mode").as_str() {
+        "patch" => ScimWriteMode::Patch,
+        "put" => ScimWriteMode::Put,
+        // NOT a default. The column has a CHECK constraint, so an unknown value means the
+        // database and this enum have drifted, and guessing which the operator meant is how a
+        // connection silently starts writing the other way.
+        _ => return Err(StoreError::NotFound),
+    };
+    let deletion_policy = match row.get::<String, _>("deletion_policy").as_str() {
+        "deactivate" => ScimDeletionPolicy::Deactivate,
+        "delete" => ScimDeletionPolicy::Delete,
+        _ => return Err(StoreError::NotFound),
+    };
+    let backfill_state = match row.get::<String, _>("backfill_state").as_str() {
+        "pending" => ScimBackfillState::Pending,
+        "users" => ScimBackfillState::Users,
+        "groups" => ScimBackfillState::Groups,
+        "done" => ScimBackfillState::Done,
+        _ => return Err(StoreError::NotFound),
+    };
+    Ok(ScimPushConnection {
+        id: ScimPushConnectionId::parse_in_scope(&row.get::<String, _>("id"), scope)
+            .map_err(|_| StoreError::NotFound)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            scope,
+        )
+        .map_err(|_| StoreError::NotFound)?,
+        display_name: row.get("display_name"),
+        base_url: row.get("base_url"),
+        credential_secret_name: row.get("credential_secret_name"),
+        attribute_mapping: row.get("attribute_mapping"),
+        user_scope_filter: row.get("user_scope_filter"),
+        group_scope_filter: row.get("group_scope_filter"),
+        write_mode,
+        deletion_policy,
+        active: row.get("active"),
+        cursor_sequence: row.get("cursor_sequence"),
+        backfill_state,
+        last_success_at_unix_micros: row.get("last_success_us"),
+        last_error_at_unix_micros: row.get("last_error_us"),
+        last_error: row.get("last_error"),
+        consecutive_failures: row.get("consecutive_failures"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// The OUTBOUND SCIM connections for one scope, read only (issue #137).
+pub struct ScimPushConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ScimPushConnectionRepo<'_> {
+    /// One connection by id.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such connection is visible in this scope.
+    pub async fn get(&self, id: &ScimPushConnectionId) -> Result<ScimPushConnection, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_SELECT_COLUMNS} FROM scim_push_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let row = row.ok_or(StoreError::NotFound)?;
+        scim_push_connection_from_row(&row, &self.scope)
+    }
+
+    /// Every connection pushing one organization's directory, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_org(
+        &self,
+        org_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<ScimPushConnection>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_SELECT_COLUMNS} FROM scim_push_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| scim_push_connection_from_row(row, &self.scope))
+            .collect()
+    }
+}
+
+/// What a caller supplies to create an outbound connection.
+pub struct NewScimPushConnection<'a> {
+    /// The handle the caller minted.
+    pub id: &'a ScimPushConnectionId,
+    /// The organization whose directory this connection pushes, and the only one it ever can.
+    ///
+    /// A TYPED, scoped id rather than a string, for the reason [`NewScimConnection`] records:
+    /// the `organizations` foreign key is id-only and Postgres referential integrity BYPASSES
+    /// row-level security, so an untyped string resolves any globally existing organization,
+    /// including one in another tenant.
+    pub organization_id: &'a OrganizationId,
+    /// The operator-facing label.
+    pub display_name: &'a str,
+    /// The downstream SCIM base URL. https, checked at the surface.
+    pub base_url: &'a str,
+    /// The NAME of the environment secret holding the bearer token. Never the token.
+    pub credential_secret_name: &'a str,
+    /// How IronAuth attributes map onto the downstream schema.
+    pub attribute_mapping: &'a serde_json::Value,
+    /// The RFC 7644 filter deciding which users are in scope, if any.
+    pub user_scope_filter: Option<&'a str>,
+    /// The same for groups.
+    pub group_scope_filter: Option<&'a str>,
+    /// PATCH or PUT.
+    pub write_mode: ScimWriteMode,
+    /// What a departure means downstream.
+    pub deletion_policy: ScimDeletionPolicy,
+}
+
+/// The WRITE side of the outbound SCIM connections (issue #137).
+///
+/// Creating one points a credential at somebody else's directory, which is an operator action for
+/// the same reason creating an inbound one is.
+pub struct ActingScimPushConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingScimPushConnectionRepo<'_> {
+    /// Create a connection.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id belongs to another scope, [`StoreError::Conflict`]
+    /// if the handle is taken, [`StoreError::Database`] otherwise.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewScimPushConnection<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let NewScimPushConnection {
+            id,
+            organization_id,
+            display_name,
+            base_url,
+            credential_secret_name,
+            attribute_mapping,
+            user_scope_filter,
+            group_scope_filter,
+            write_mode,
+            deletion_policy,
+        } = spec;
+        // BOTH ids, not just the connection's. The organization guard is the one this check
+        // exists for: without it a control-plane caller points a credential at another tenant's
+        // organization and the foreign key waves it through, because RI does not see RLS.
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let organization_id = organization_id.to_string();
+        let display_name = display_name.to_owned();
+        let base_url = base_url.to_owned();
+        let credential_secret_name = credential_secret_name.to_owned();
+        let attribute_mapping = attribute_mapping.clone();
+        let user_scope_filter = user_scope_filter.map(str::to_owned);
+        let group_scope_filter = group_scope_filter.map(str::to_owned);
+        let organization_detail = organization_id.clone();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScimPushConnectionCreated,
+                target: &id,
+            },
+            async |tx| {
+                sqlx::query(
+                    "INSERT INTO scim_push_connections \
+                     (id, tenant_id, environment_id, organization_id, display_name, base_url, \
+                      credential_secret_name, attribute_mapping, user_scope_filter, \
+                      group_scope_filter, write_mode, deletion_policy) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&display_name)
+                .bind(&base_url)
+                .bind(&credential_secret_name)
+                .bind(&attribute_mapping)
+                .bind(&user_scope_filter)
+                .bind(&group_scope_filter)
+                .bind(write_mode.as_str())
+                .bind(deletion_policy.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
+                // IN THE SAME TRANSACTION as the row. A record written afterwards would leave
+                // a window in which the connection exists and the retry that created it can
+                // still create a second one pointed at the same downstream.
+                insert_idempotency(tx, idempotency).await?;
+                // IN THE SAME TRANSACTION as the row, so a receiver is never told an outbound
+                // connection changed before it did, and never told at all if the write rolls
+                // back.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            // The organization, which is what makes the row answerable on its own.
+            Some(&organization_detail),
+        )
+        .await
+    }
+
+    /// Turn a connection on or off without deleting it.
+    ///
+    /// # Why `active` is a column rather than a deletion
+    ///
+    /// Pausing a push is the operator action that happens under pressure -- a downstream is
+    /// misbehaving, or a mapping rule was wrong -- and it has to be reversible without losing
+    /// the cursor. Deleting and recreating would restart the backfill against somebody else's
+    /// rate limit.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such connection is visible here.
+    pub async fn set_active(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &ScimPushConnectionId,
+        active: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let organization_id = organization_id.to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScimPushConnectionUpdated,
+                target: &id,
+            },
+            async |tx| {
+                // THE ORGANIZATION IS PART OF THE PREDICATE, not merely resolved by the caller.
+                // The handler resolves the organization from the path and could compare it
+                // itself, and the first version did not -- it bound the result to `_org_id` and
+                // deleted by connection id alone, so a handle from organization B was reachable
+                // through organization A's path and answered 204. That is the IDOR the inbound
+                // slice exists to prevent, reintroduced in its mirror.
+                //
+                // Fenced HERE so no handler can forget: a caller that has the wrong organization
+                // gets a not-found, and there is no call shape that omits it.
+                let result = sqlx::query(
+                    "UPDATE scim_push_connections SET active = $5, updated_at = now() \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND organization_id = $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(&organization_id)
+                .bind(active)
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // IN THE SAME TRANSACTION as the row, so a receiver is never told an outbound
+                // connection changed before it did, and never told at all if the write rolls
+                // back.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(if active { "activated" } else { "paused" }),
+        )
+        .await
+    }
+
+    /// Delete a connection.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such connection is visible here.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &ScimPushConnectionId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let organization_id = organization_id.to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::ScimPushConnectionDeleted,
+                target: &id,
+            },
+            async |tx| {
+                // THE ORGANIZATION IS PART OF THE PREDICATE. See `set_active` for the IDOR this
+                // closes and why it is fenced here rather than in the handler.
+                let result = sqlx::query(
+                    "DELETE FROM scim_push_connections \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND organization_id = $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(&organization_id)
+                .execute(&mut **tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                // IN THE SAME TRANSACTION as the row, so a receiver is never told an outbound
+                // connection changed before it did, and never told at all if the write rolls
+                // back.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await
+    }
 }
 
 /// The inbound SCIM connections for one scope, read only (issue #135).

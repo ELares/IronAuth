@@ -2437,6 +2437,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections` */
+        get: operations["listScimPushConnections"];
+        put?: never;
+        /** `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections` */
+        post: operations["createScimPushConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** `DELETE .../scim-push-connections/{connection_id}` */
+        delete: operations["deleteScimPushConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** `PUT .../scim-push-connections/{connection_id}/active` */
+        put: operations["setScimPushConnectionActive"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
         parameters: {
             query?: never;
@@ -5000,6 +5052,25 @@ export interface components {
              *     `400 invalid_provider`, before the write.
              */
             provider: string;
+        };
+        /** @description What a create names. */
+        CreateScimPushConnectionRequest: {
+            /** @description How IronAuth attributes map onto the downstream schema. Empty means the core mapping. */
+            attribute_mapping?: Record<string, never> | null;
+            /** @description The downstream SCIM base URL. Must be https. */
+            base_url: string;
+            /** @description The NAME of an environment secret holding the bearer token. Never the token. */
+            credential_secret_name: string;
+            /** @description `deactivate` or `delete`. Defaults to `deactivate`. */
+            deletion_policy?: string | null;
+            /** @description The operator-facing label, for telling two downstream applications apart. */
+            display_name: string;
+            /** @description The same for groups. */
+            group_scope_filter?: string | null;
+            /** @description An RFC 7644 filter deciding which users are pushed. Absent means all of them. */
+            user_scope_filter?: string | null;
+            /** @description `patch` or `put`. Defaults to `patch`. */
+            write_mode?: string | null;
         };
         /** @description The body to bind a machine identity into an organization (issue #126). */
         CreateServiceAccountMembershipRequest: {
@@ -7676,6 +7747,78 @@ export interface components {
              */
             revoked_at_unix_ms?: number | null;
         };
+        /**
+         * @description The 201 of a create.
+         *
+         *     NOTHING SECRET IS IN IT, and there is nothing that could be.
+         */
+        ScimPushConnectionCreated: {
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description The non-secret handle. */
+            id: string;
+        };
+        /** @description A page of outbound connections. */
+        ScimPushConnectionListView: {
+            /** @description This organization's outbound connections. */
+            items: components["schemas"]["ScimPushConnectionView"][];
+            /**
+             * @description The cursor for the next page, absent on the last one.
+             *
+             *     PRESENT because the operation publishes a `cursor` parameter. It did not, and the
+             *     contract advertised `limit` and `cursor` on a listing that had neither a cursor to
+             *     return nor a handler that read one: a documented parameter with no field to feed it is
+             *     a parameter no client can use.
+             */
+            next_cursor?: string | null;
+        };
+        /**
+         * @description One outbound connection, as the management surface renders it.
+         *
+         *     THE SECRET NAME IS HERE AND THE SECRET IS NOT, which is the whole point of naming one: this
+         *     view has nothing to redact, because the row it renders holds nothing to redact.
+         */
+        ScimPushConnectionView: {
+            /** @description Whether the worker serves this connection. */
+            active: boolean;
+            /** @description How IronAuth attributes map onto the downstream schema. */
+            attribute_mapping: Record<string, never>;
+            /** @description Where the initial backfill has reached. */
+            backfill_state: string;
+            /** @description The downstream SCIM base URL. */
+            base_url: string;
+            /**
+             * Format: int32
+             * @description Consecutive failures, which is what a health status is computed from.
+             */
+            consecutive_failures: number;
+            /** @description The NAME of the environment secret holding the bearer token. */
+            credential_secret_name: string;
+            /** @description `deactivate` or `delete`. */
+            deletion_policy: string;
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description The same for groups. */
+            group_scope_filter?: string | null;
+            /** @description The non-secret `spc_` handle. Every other operation names the connection by this. */
+            id: string;
+            /**
+             * @description The last failure in operator-safe words, absent when there has been none.
+             *
+             *     NEVER a downstream response body. An error page can carry anything, including the
+             *     credential it was sent.
+             */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description The last success, in milliseconds since the epoch.
+             */
+            last_success_at_unix_ms?: number | null;
+            /** @description The RFC 7644 filter deciding which users are pushed, absent when all of them are. */
+            user_scope_filter?: string | null;
+            /** @description `patch` or `put`. */
+            write_mode: string;
+        };
         /** @description One page of environment secret metadata. */
         SecretList: {
             /** @description The secrets in this page, as metadata only. */
@@ -8180,6 +8323,11 @@ export interface components {
              *     key and is never readable back through any endpoint.
              */
             token: string;
+        };
+        /** @description What a pause or resume names. */
+        SetScimPushActiveRequest: {
+            /** @description Whether the worker should serve this connection. */
+            active: boolean;
         };
         /** @description Set (create or replace) a secret. */
         SetSecretRequest: {
@@ -21345,6 +21493,289 @@ export interface operations {
                 };
             };
             /** @description No such connection in this organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listScimPushConnections: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The organization's outbound SCIM connections */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScimPushConnectionListView"];
+                };
+            };
+            /** @description A malformed cursor or limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not read this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createScimPushConnection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. A retry under the same key returns the original response without creating a second connection */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateScimPushConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description The connection was created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScimPushConnectionCreated"];
+                };
+            };
+            /** @description A malformed body, base URL, filter or vocabulary word */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not write this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A concurrent request carried the same Idempotency-Key */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The Idempotency-Key was reused with a different request */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteScimPushConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Outbound connection identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The connection was deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not write this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such organization or connection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setScimPushConnectionActive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Outbound connection identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetScimPushActiveRequest"];
+            };
+        };
+        responses: {
+            /** @description The connection was paused or resumed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A malformed body */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not write this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such organization or connection */
             404: {
                 headers: {
                     [name: string]: unknown;

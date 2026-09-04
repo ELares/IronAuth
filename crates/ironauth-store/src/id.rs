@@ -1242,6 +1242,19 @@ impl ScopedKind for ScimConnectionKind {
     const PREFIX: &'static str = "scim";
 }
 
+/// Marker for an OUTBOUND SCIM connection (`spc_`, issue #137).
+///
+/// The mirror of [`ScimConnectionKind`], and the direction is the whole difference: inbound, an
+/// identity provider holds a token and writes into IronAuth; outbound, IronAuth holds a
+/// credential and writes into somebody else's application. The row names an
+/// `environment_secrets` entry rather than holding the credential, so this id is safe in a log
+/// line in a way an inbound token never is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScimPushConnectionKind;
+impl ScopedKind for ScimPushConnectionKind {
+    const PREFIX: &'static str = "spc";
+}
+
 /// Marker for a Native SSO device secret (`nsd_`, issue #133, PROTOTYPE).
 ///
 /// The identifier of the ROW, never the secret. The secret itself is high-entropy, returned
@@ -2104,6 +2117,8 @@ pub type ScimEnterpriseId = ScopedId<ScimEnterpriseKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
+/// An OUTBOUND SCIM connection identifier (`spc_...`), issue #137.
+pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
 /// A Native SSO device secret row identifier (`nsd_...`), issue #133. The row, never the
 /// secret: the secret is stored only as a digest.
 pub type NativeSsoDeviceSecretId = ScopedId<NativeSsoDeviceSecretKind>;

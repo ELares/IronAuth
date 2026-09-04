@@ -1530,6 +1530,36 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/organizations/{org}/scim-connections/scim_absent"),
             body: None,
         },
+        // The OUTBOUND surface (issue #137), WRITES ONLY: this sweep rejects a GET case with
+        // "addresses 0 documented operations rather than exactly one", and the listing is
+        // driven by `live_surface.rs` instead. The same caveat as the two cases above applies
+        // to all three: the segments name rows that do not exist, so what is pinned here is
+        // that the absent ENVIRONMENT is refused, not the Write-versus-Read variant.
+        Case {
+            label: "scim_push_connections.createScimPushConnection",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/scim-push-connections"),
+            body: Some(
+                serde_json::json!({
+                    "display_name": "absent",
+                    "base_url": "https://downstream.example.com/scim/v2",
+                    "credential_secret_name": "scim_push_downstream",
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "scim_push_connections.setScimPushConnectionActive",
+            method: "PUT",
+            path: format!("{base}/organizations/{org}/scim-push-connections/spc_absent/active"),
+            body: Some(serde_json::json!({ "active": false }).to_string()),
+        },
+        Case {
+            label: "scim_push_connections.deleteScimPushConnection",
+            method: "DELETE",
+            path: format!("{base}/organizations/{org}/scim-push-connections/spc_absent"),
+            body: None,
+        },
         // The service-account surface is NOT nested under an organization, so its cases
         // address the environment directly. The principal id is a literal that names nothing;
         // the point of the sweep is that the absent ENVIRONMENT is refused before the path
