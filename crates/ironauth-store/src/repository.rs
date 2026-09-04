@@ -24751,10 +24751,32 @@ impl OutboxRepo<'_> {
     ///
     /// Deliberately a SEQUENCE and not a duration. "Four minutes behind" needs the timestamp of
     /// the event at the consumer's position, which is a row that may have been pruned; "six
-    /// hundred events behind" is answerable from two integers that always exist. A caller wanting
+    /// hundred behind" is answerable from two integers that always exist. A caller wanting
     /// elapsed time has `last_polled_at` and `last_success_at` on the connection, which say when
     /// the worker last looked and last wrote, and those two answer the question an operator
     /// actually asks first: is it running.
+    ///
+    /// # It counts FEED POSITIONS, not people waiting to be provisioned
+    ///
+    /// The distance is measured in rows of this scope's feed, and the feed carries every kind of
+    /// event the environment emits. A SCIM push worker reads all of them and translates almost
+    /// none: a sign-in, a token issuance and a consent are each one position of "lag" that will
+    /// never produce a request to any downstream. So a large number here means the worker is a
+    /// long way back in the feed, NOT that a large number of users are unprovisioned, and a
+    /// surface built on it should say the first thing rather than imply the second.
+    ///
+    /// # It applies the same visibility watermark the feed does
+    ///
+    /// `events_after` withholds any row whose `xmin` is at or above the cluster's oldest running
+    /// transaction, because a cursor consumer that advanced past such a row would never be
+    /// offered it again. A plain `MAX(sequence)` does not: it is computed from the reader's own
+    /// snapshot, which includes committed rows the feed is deliberately still holding back.
+    ///
+    /// Without the watermark the two sides of the comparison come from different feeds. A
+    /// connection that has consumed everything the feed will serve still reports a non-zero
+    /// distance, permanently under continuous writes, and an operator watching for "caught up"
+    /// never sees it. Anything that edits the predicate in `events_after` must edit this one
+    /// too, the same way `events_cursor_ordering.rs` is kept in step with it.
     ///
     /// # Errors
     ///
@@ -24763,7 +24785,8 @@ impl OutboxRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let newest: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(sequence) FROM outbox_messages \
-             WHERE tenant_id = $1 AND environment_id = $2",
+             WHERE tenant_id = $1 AND environment_id = $2 \
+             AND xmin::text::bigint < pg_snapshot_xmin(pg_current_snapshot())::text::bigint",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -76163,6 +76186,36 @@ impl ScimPushSyncStateRepo<'_> {
     /// the events between the two positions are then re-read, or, in the mirror case where the
     /// slower writer is ahead, never read at all.
     ///
+    /// # `last_success_at` moves only when something was actually written downstream
+    ///
+    /// `delivered` says whether this page produced at least one request the downstream accepted.
+    /// It is not the same question as whether the pass succeeded, and conflating them made the
+    /// column useless: the feed carries every event the environment emits, and a SCIM connection
+    /// translates almost none of them, so the ORDINARY page is one where nothing was pushed. A
+    /// checkpoint that stamped `last_success_at` unconditionally therefore moved it on nearly
+    /// every pass, which made it an alias for `last_polled_at` and left an operator asking "is
+    /// this connection still delivering anything" with no column that answers.
+    ///
+    /// The same applies to a page whose every subject was refused permanently. Those refusals
+    /// are recorded against their subjects and stepped over deliberately, so the cursor moves and
+    /// the poll clock moves; what did not happen is a delivery.
+    ///
+    /// `record_backfill_progress` writes the column unconditionally and that is not the same
+    /// defect: it is called immediately after a downstream write this caller just watched
+    /// succeed, so the success it records is one it observed rather than one it assumed.
+    ///
+    /// # The guard covers what the statement writes, not only the cursor
+    ///
+    /// This clears seven columns: the failure count, the error and its time, and the pause, as
+    /// well as moving the cursor and the two clocks. An earlier version compared only the cursor,
+    /// so anything that touched the health columns without touching the cursor was invisible to
+    /// it, and `record_failure` is exactly that. A pass that began before an outage, ran slowly,
+    /// and then succeeded against a stale view would clear a pause set while it was in flight,
+    /// and the connection resumed straight into a downstream that was still down.
+    ///
+    /// `expected_failures` is compared for that reason. Between them the two values cover every
+    /// column the statement clears: a checkpoint may only erase a failure state its caller saw.
+    ///
     /// `expected_sequence` is what the caller read before it did the work. If the stored value has
     /// moved since, this touches no rows and answers [`StoreError::NotFound`], which the caller
     /// must treat as "somebody else owns this connection right now" rather than as an error to
@@ -76178,18 +76231,27 @@ impl ScimPushSyncStateRepo<'_> {
         &self,
         connection_id: &ScimPushConnectionId,
         expected_sequence: Option<i64>,
+        expected_failures: i32,
         cursor_sequence: i64,
+        delivered: bool,
     ) -> Result<(), StoreError> {
         self.update_one(
             connection_id,
-            "SET cursor_sequence = $5::bigint, \
-                 last_polled_at = now(), last_success_at = now(), \
+            "SET cursor_sequence = $5::bigint, last_polled_at = now(), \
+                 last_success_at = CASE WHEN $7::bool THEN now() ELSE last_success_at END, \
                  consecutive_failures = 0, last_error_at = NULL, last_error = NULL, \
                  paused_until = NULL, updated_at = now() \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
                AND backfill_state = 'done' \
-               AND cursor_sequence IS NOT DISTINCT FROM $4::bigint",
-            |query| query.bind(expected_sequence).bind(cursor_sequence),
+               AND cursor_sequence IS NOT DISTINCT FROM $4::bigint \
+               AND consecutive_failures = $6::int",
+            |query| {
+                query
+                    .bind(expected_sequence)
+                    .bind(cursor_sequence)
+                    .bind(expected_failures)
+                    .bind(delivered)
+            },
         )
         .await
     }

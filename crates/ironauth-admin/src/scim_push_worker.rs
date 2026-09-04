@@ -283,13 +283,28 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
         last_sequence = Some(message.sequence);
     }
 
-    // CHECKPOINT LAST, AND ONLY ONCE. `expected_cursor` is the value read at the top of this
-    // function, so a second worker that checkpointed in between makes this fail rather than
-    // overwrite its position.
+    // CHECKPOINT LAST, AND ONLY ONCE. Both compared values are read at the top of this function,
+    // so a second worker that checkpointed in between makes this fail rather than overwrite its
+    // position.
+    //
+    // The failure count is compared as well as the cursor because the checkpoint CLEARS it, along
+    // with the error, its time, and the pause. `record_failure` moves those columns without
+    // moving the cursor, so a cursor-only guard could not see it: a pass that began before an
+    // outage, ran slowly, and then succeeded against a stale view would erase a pause set while
+    // it was in flight and resume into a downstream that was still down.
     let next = last_sequence.expect("the page is not empty");
     store
         .scim_push_sync_state()
-        .advance(pass.connection_id, Some(cursor_sequence), next)
+        .advance(
+            pass.connection_id,
+            Some(cursor_sequence),
+            state.consecutive_failures,
+            next,
+            // WHETHER ANYTHING WAS ACTUALLY DELIVERED, which is not the same as whether the pass
+            // succeeded. Most pages carry no provisioning signal at all, and a page whose every
+            // subject was refused delivered nothing either.
+            progress.converged + progress.deprovisioned > 0,
+        )
         .await?;
     progress.checkpointed = true;
     Ok(progress)

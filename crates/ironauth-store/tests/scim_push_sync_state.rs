@@ -149,7 +149,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
     // arriving through the one door the externalId lookup does not cover.
     let early = store
         .scim_push_sync_state()
-        .advance(&connection, Some(0), 1)
+        .advance(&connection, Some(0), 0, 1, true)
         .await;
     assert!(
         matches!(early, Err(StoreError::NotFound)),
@@ -170,7 +170,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(0), 1)
+        .advance(&connection, Some(0), 0, 1, true)
         .await
         .expect("tailing starts once the backfill is done");
 
@@ -282,7 +282,7 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
     // re-reads it: silent loss, which is the inverse of "pause rather than drop".
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(42), 9000)
+        .advance(&connection, Some(42), 0, 9000, true)
         .await
         .expect("tail");
     // NO TRANSITION HERE, deliberately. This connection is TAILING, and the point of the
@@ -341,7 +341,7 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
     // Worker A reads seq-100, does its work, and checkpoints. It wins.
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(100), 200)
+        .advance(&connection, Some(100), 0, 200, true)
         .await
         .expect("the first writer checkpoints");
 
@@ -349,7 +349,7 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
     // hundred events, every one of which has already been pushed downstream.
     let stale = store
         .scim_push_sync_state()
-        .advance(&connection, Some(100), 150)
+        .advance(&connection, Some(100), 0, 150, true)
         .await;
     assert!(
         matches!(stale, Err(StoreError::NotFound)),
@@ -367,7 +367,7 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
     // the connection being wedged.
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(200), 300)
+        .advance(&connection, Some(200), 0, 300, true)
         .await
         .expect("the current holder continues");
 }
@@ -402,7 +402,7 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(100), 500)
+        .advance(&connection, Some(100), 0, 500, true)
         .await
         .expect("tail");
 
@@ -431,7 +431,7 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
     // AND TAILING IS REFUSED AGAIN until the new enumeration finishes.
     let early = store
         .scim_push_sync_state()
-        .advance(&connection, None, 600)
+        .advance(&connection, None, 0, 600, true)
         .await;
     assert!(
         matches!(early, Err(StoreError::NotFound)),
@@ -465,7 +465,7 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(0), 7)
+        .advance(&connection, Some(0), 0, 7, true)
         .await
         .expect("advance");
 
@@ -515,7 +515,7 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
     // outage would need an operator to clear it, and nothing would tell them to.
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(7), 8)
+        .advance(&connection, Some(7), 2, 8, true)
         .await
         .expect("advance after recovery");
     let recovered = store
@@ -526,6 +526,112 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
         .expect("a state row");
     assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.last_error, None);
+    assert_eq!(recovered.paused_until_unix_micros, None);
+}
+
+#[tokio::test]
+async fn a_checkpoint_cannot_erase_a_pause_that_began_after_the_pass_started() {
+    // WHY THIS EXISTS. The checkpoint compares the cursor but CLEARS seven columns: the failure
+    // count, the error and its time, and the pause, as well as moving the cursor and the clocks.
+    // `record_failure` writes those health columns without touching the cursor, so a guard that
+    // compared only the cursor could not see one at all.
+    //
+    // The sequence that breaks it is ordinary. A pass reads the state, pushes a page slowly, and
+    // while it is in flight the downstream fails a DIFFERENT pass, which pauses the connection.
+    // The slow pass then checkpoints against the cursor it still holds, which is unchanged, and
+    // the pause it never saw is erased. #137 asks for an outage to pause the cursor; a pause any
+    // in-flight pass can clear on its way past is not one.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+
+    // The slow pass reads here. Both of the values it will compare are what it holds from now on.
+    let read = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(read.cursor_sequence, Some(0));
+    assert_eq!(read.consecutive_failures, 0);
+
+    // The outage happens while it is in flight. Note the cursor does NOT move.
+    let resume_at = now_micros(&env) + 60_000_000;
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "downstream answered 503", Some(resume_at))
+        .await
+        .expect("record the failure");
+
+    let refused = store
+        .scim_push_sync_state()
+        .advance(
+            &connection,
+            read.cursor_sequence,
+            read.consecutive_failures,
+            9,
+            true,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::NotFound)),
+        "a checkpoint erased a failure state its caller never saw: {refused:?}"
+    );
+
+    // AND THE PAUSE IS STILL THERE, which is the half that matters operationally: refusing the
+    // write is only useful if the outage state survives it.
+    let after = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(after.consecutive_failures, 1, "the failure count was reset");
+    assert_eq!(
+        after.last_error.as_deref(),
+        Some("downstream answered 503"),
+        "the error was cleared"
+    );
+    assert!(
+        after.paused_until_unix_micros.is_some(),
+        "the pause was cleared"
+    );
+    assert_eq!(after.cursor_sequence, Some(0), "the cursor moved anyway");
+
+    // A PASS THAT DID SEE THE FAILURE STILL CHECKPOINTS. The guard has to refuse a stale caller
+    // without refusing recovery, or an outage would be permanent.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(0), 1, 9, true)
+        .await
+        .expect("a caller holding the current failure count checkpoints");
+    let recovered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(recovered.cursor_sequence, Some(9));
+    assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.paused_until_unix_micros, None);
 }
 
@@ -684,6 +790,92 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
 }
 
 #[tokio::test]
+async fn a_page_that_delivered_nothing_moves_the_cursor_without_claiming_a_success() {
+    // WHY THIS EXISTS. The checkpoint stamped `last_success_at = now()` on any non-empty page,
+    // and the management view says of that column that it "moves only when something was written
+    // downstream". The two disagreed, and the view was the one telling the truth about what an
+    // operator needs.
+    //
+    // It is not a corner case. The feed carries every event the environment emits and a SCIM
+    // connection translates almost none of them, so a page with nothing to push is the ORDINARY
+    // page. Stamping success on it made the column an alias for `last_polled_at`, and the
+    // question it exists to answer -- has this connection delivered anything lately -- had no
+    // column left that could answer it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+
+    // A page that DID deliver, so there is a success timestamp to be wrongly overwritten later.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(0), 0, 10, true)
+        .await
+        .expect("a delivering page checkpoints");
+    let delivered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    let success_at = delivered
+        .last_success_at_unix_micros
+        .expect("a delivering page records a success");
+
+    // Now a page that read events, moved the cursor, and pushed nothing at all.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(10), 0, 20, false)
+        .await
+        .expect("a page carrying no provisioning signal still checkpoints");
+    let quiet = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+
+    assert_eq!(
+        quiet.cursor_sequence,
+        Some(20),
+        "the cursor must move: those events are read and will not be offered again"
+    );
+    assert_eq!(
+        quiet.last_success_at_unix_micros,
+        Some(success_at),
+        "a page that pushed nothing claimed a delivery"
+    );
+    // AND THE POLL CLOCK STILL MOVES, which is the pair that makes the surface readable: the
+    // worker is running (it polled) and it is not delivering (no success since).
+    assert!(
+        quiet.last_polled_at_unix_micros >= delivered.last_polled_at_unix_micros,
+        "the poll clock stalled, so a running worker looks wedged"
+    );
+    assert!(
+        quiet.last_polled_at_unix_micros.is_some(),
+        "a checkpoint that does not record the poll leaves nothing saying the worker ran"
+    );
+}
+
+#[tokio::test]
 async fn an_empty_poll_is_distinguishable_from_a_wedged_worker() {
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -709,7 +901,7 @@ async fn an_empty_poll_is_distinguishable_from_a_wedged_worker() {
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, Some(0), 3)
+        .advance(&connection, Some(0), 0, 3, true)
         .await
         .expect("advance");
 

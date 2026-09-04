@@ -271,6 +271,80 @@ async fn the_repo_feed_holds_back_an_event_an_older_writer_could_still_precede()
 }
 
 #[tokio::test]
+async fn the_head_a_lag_is_measured_against_is_the_head_the_feed_will_serve() {
+    // WHY THIS EXISTS. #137's health surface reports lag as a distance between two sequences:
+    // where a connection has read to, and the head of the feed. The read side comes from
+    // `events_after`, which WITHHOLDS any row an older in-flight writer could still precede. The
+    // head side came from a plain `MAX(sequence)`, computed from the reader's own snapshot, which
+    // includes exactly those withheld rows.
+    //
+    // Two sides from two different feeds do not subtract. A connection that has consumed
+    // everything the feed will serve still reported a non-zero distance, and under continuous
+    // writes there is always something in flight, so it never reported zero at all. An operator
+    // watching for "caught up" would never have seen it, and the alert built on it would fire
+    // for ever.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let pool = db.owner_pool();
+    let (tenant, environment) = (scope.tenant().to_string(), scope.environment().to_string());
+
+    let mut early = pool.begin().await.expect("begin early");
+    let early_seq =
+        insert_returning_sequence(&mut early, &tenant, &environment, "evt_head_early").await;
+
+    let mut late = pool.begin().await.expect("begin late");
+    let late_seq =
+        insert_returning_sequence(&mut late, &tenant, &environment, "evt_head_late").await;
+    late.commit().await.expect("commit late");
+
+    let outbox = db.store().scoped(scope).outbox();
+
+    // `late` is committed and visible to this reader, and the feed is still holding it back.
+    let served = outbox.events_after(0, 1_000).await.expect("read");
+    let highest_served = served.iter().map(|m| m.sequence).max();
+    assert!(
+        !served.iter().any(|m| m.sequence == late_seq),
+        "the feed served a row an older writer could still precede"
+    );
+
+    let head = outbox.newest_sequence().await.expect("head");
+    assert_ne!(
+        head,
+        Some(late_seq),
+        "the head counted a row the feed refuses to serve, so the lag can never reach zero"
+    );
+    // THE PROPERTY, stated as the equality it has to be rather than as one excluded value: a
+    // consumer that has read everything on offer is exactly at the head.
+    assert_eq!(
+        head, highest_served,
+        "the head and the feed disagree about where the feed ends"
+    );
+
+    early.commit().await.expect("commit early");
+
+    // Same bounded wait as the tests above, and for the same reason: the watermark is
+    // cluster-wide, so it moves when the cluster's oldest transaction does, not on our commit.
+    let mut settled = None;
+    for _ in 0..100 {
+        settled = outbox.newest_sequence().await.expect("head");
+        if settled == Some(late_seq) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        settled,
+        Some(late_seq),
+        "the head must catch up once the writers settle, or it is a ceiling and not a head"
+    );
+    assert!(
+        early_seq < late_seq,
+        "the fixture did not produce the interleaving it needs"
+    );
+}
+
+#[tokio::test]
 async fn an_unrelated_open_transaction_stalls_the_whole_feed() {
     // The cost of the watermark, stated as a test rather than left for an operator to
     // discover under load.

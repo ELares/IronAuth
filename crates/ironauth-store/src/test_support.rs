@@ -973,3 +973,83 @@ mod reclaim_threshold_tests {
         );
     }
 }
+
+/// A payload the event registry accepts for `event_type`, with `overrides` written over it.
+///
+/// # Why this is not written by hand in each test
+///
+/// A test that hand-writes an event payload is writing a SECOND declaration of a shape the
+/// registry already declares, and the two drift silently: the payload only has to satisfy the
+/// code under test, never the schema. The SCIM push worker suite ran that way and every test
+/// passed while its `user.updated` carried `user_id` alone. The registry requires `fields` as
+/// well, so the worker had never once been driven by an event IronAuth actually emits, and the
+/// question the suite exists to answer was not being asked.
+///
+/// So the skeleton is built from the schema: every required property, filled from what the
+/// schema says about it, honouring `enum`, `minItems` and the item type rather than only the
+/// top-level `type`. A caller then names ONLY the properties its test is about, and those are
+/// written on top -- including values the schema would not have chosen, which is what lets a
+/// test drive a case the code should refuse.
+///
+/// The result is still worth validating at the point of use: this builds what the schema
+/// describes, and `event_catalog::validate_event` is what decides whether it succeeded.
+///
+/// # Panics
+///
+/// If `event_type` is unregistered, if its schema is not JSON, or if `overrides` is not an
+/// object. Each is a mistake in the test rather than a condition to handle.
+#[must_use]
+pub fn registry_payload(event_type: &str, overrides: &serde_json::Value) -> serde_json::Value {
+    let registered = crate::event_catalog::registered(event_type)
+        .unwrap_or_else(|| panic!("{event_type} is not a registered event type"));
+    let schema: serde_json::Value =
+        serde_json::from_str(&registered.payload_schema).expect("the payload schema is JSON");
+    let mut payload = serde_json::Map::new();
+    for name in schema["required"].as_array().into_iter().flatten() {
+        let name = name.as_str().expect("a required property name");
+        payload.insert(
+            name.to_owned(),
+            schema_value(&schema["properties"][name], name),
+        );
+    }
+    for (key, value) in overrides
+        .as_object()
+        .expect("the overrides are a JSON object")
+    {
+        payload.insert(key.clone(), value.clone());
+    }
+    serde_json::Value::Object(payload)
+}
+
+/// One value that satisfies `schema`, named `name` so a string is recognisable in a failure.
+fn schema_value(schema: &serde_json::Value, name: &str) -> serde_json::Value {
+    // An `enum` is the tightest thing a schema can say, so it wins over `type`: a string
+    // property with an enum has exactly as many acceptable values as the list, and "seed-x" is
+    // not one of them.
+    if let Some(first) = schema["enum"].as_array().and_then(|values| values.first()) {
+        return first.clone();
+    }
+    match schema["type"].as_str().unwrap_or("string") {
+        "boolean" => serde_json::Value::Bool(false),
+        "integer" | "number" => serde_json::json!(1),
+        "array" => {
+            // `minItems` is why this exists. An empty array satisfies the TYPE and fails the
+            // schema, which is the same near-miss the whole helper is here to stop.
+            let least = schema["minItems"].as_u64().unwrap_or(0);
+            let item = schema_value(&schema["items"], name);
+            serde_json::Value::Array(vec![item; usize::try_from(least).unwrap_or(0)])
+        }
+        "object" => {
+            let mut nested = serde_json::Map::new();
+            for inner in schema["required"].as_array().into_iter().flatten() {
+                let inner = inner.as_str().expect("a required property name");
+                nested.insert(
+                    inner.to_owned(),
+                    schema_value(&schema["properties"][inner], inner),
+                );
+            }
+            serde_json::Value::Object(nested)
+        }
+        _ => serde_json::Value::String(format!("seed-{name}")),
+    }
+}

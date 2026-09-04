@@ -49,29 +49,11 @@ fn expected_org(event_type: &str) -> Option<String> {
 }
 
 fn payload_for(event_type: &str) -> serde_json::Value {
-    let registered = ironauth_store::event_catalog::registered(event_type)
-        .unwrap_or_else(|| panic!("{event_type} is not registered"));
-    let schema: serde_json::Value =
-        serde_json::from_str(&registered.payload_schema).expect("the schema is JSON");
-    let mut payload = serde_json::Map::new();
-    for name in schema["required"].as_array().into_iter().flatten() {
-        let name = name.as_str().expect("a required property name");
-        let kind = schema["properties"][name]["type"]
-            .as_str()
-            .unwrap_or("string");
-        payload.insert(
-            name.to_owned(),
-            match kind {
-                "boolean" => json!(false),
-                "integer" | "number" => json!(1),
-                "array" => json!([]),
-                "object" => json!({}),
-                // A plausible id for the id-shaped properties, since `intent_for` reads them.
-                _ => json!(format!("seed-{name}")),
-            },
-        );
-    }
-    serde_json::Value::Object(payload)
+    // ONE BUILDER, shared with the worker suite. Two test files deriving a payload from the same
+    // registry by two copies of the same loop is two chances to get the derivation wrong, and the
+    // worker suite's copy WAS wrong: it filled an array property with `[]` against a schema that
+    // requires an item. Neither file noticed, because neither validated what it built.
+    ironauth_store::test_support::registry_payload(event_type, &json!({}))
 }
 
 #[tokio::test]

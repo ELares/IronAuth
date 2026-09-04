@@ -262,6 +262,21 @@ async fn seed_connection(
 }
 
 /// Puts one catalogued event on the feed and returns its sequence.
+///
+/// # The envelope is BUILT BY THE REGISTRY, not written here
+///
+/// The first version of this helper hand-wrote `{"type": ..., "payload": ...}` and inserted it.
+/// That is two words of the envelope a producer actually emits: the real one also carries `id`,
+/// `payload_schema_version`, `occurred_at_unix_ms`, `tenant_id` and `environment_id`, and the
+/// catalog's own envelope schema makes all five REQUIRED.
+///
+/// So the whole worker suite was measuring the worker against envelopes this file invented and
+/// nothing in the system produces. Every test passed on a shape that would not have survived
+/// `validate_event`, and the question the suite exists to answer -- does the worker read the
+/// events IronAuth emits -- was never asked. `event_catalog::envelope` is the same constructor
+/// `enqueue_domain_event` feeds, so building through it makes the fixture and production one
+/// source; `validate_event` then holds the fixture to the registry, which is what turns a
+/// registry change that the worker cannot read into a failing test rather than a silent one.
 async fn enqueue(
     db: &TestDatabase,
     scope: Scope,
@@ -269,9 +284,23 @@ async fn enqueue(
     event_type: &str,
     payload: Value,
 ) -> i64 {
-    let envelope = json!({
-        "type": event_type,
-        "payload": payload,
+    let payload = ironauth_store::test_support::registry_payload(event_type, &payload);
+    let envelope = ironauth_store::event_catalog::envelope(
+        id,
+        event_type,
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        1_700_000_000_000,
+        &payload,
+    )
+    .unwrap_or_else(|| {
+        panic!("{event_type} is not an environment-scoped registered type, so no producer emits it")
+    });
+    ironauth_store::event_catalog::validate_event(&envelope).unwrap_or_else(|error| {
+        panic!(
+            "the fixture built an envelope the registry refuses, so the worker would never see \
+             it in production: {error:?}\n\n{envelope}"
+        )
     });
     let row = sqlx::query(
         "INSERT INTO outbox_messages \
