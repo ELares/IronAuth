@@ -17933,6 +17933,447 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections": {
+      "get": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`",
+        "operationId": "listScimPushConnections",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "The desired page size, a positive integer. Clamped to\n`[1, max_page_size]`; defaults to the configured default when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The opaque cursor from a previous page's `next_cursor`. Absent for the\nfirst page (keyset pagination; there is no offset).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The organization's outbound SCIM connections",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimPushConnectionListView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor or limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not read this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`",
+        "operationId": "createScimPushConnection",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. A retry under the same key returns the original response without creating a second connection",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScimPushConnectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The connection was created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimPushConnectionCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed body, base URL, filter or vocabulary word",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not write this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request carried the same Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The Idempotency-Key was reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}": {
+      "delete": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`DELETE .../scim-push-connections/{connection_id}`",
+        "operationId": "deleteScimPushConnection",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "path",
+            "description": "Outbound connection identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The connection was deleted"
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not write this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such organization or connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active": {
+      "put": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`PUT .../scim-push-connections/{connection_id}/active`",
+        "operationId": "setScimPushConnectionActive",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "path",
+            "description": "Outbound connection identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetScimPushActiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The connection was paused or resumed"
+          },
+          "400": {
+            "description": "A malformed body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not write this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such organization or connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
       "post": {
         "tags": [
@@ -29755,6 +30196,64 @@
           }
         }
       },
+      "CreateScimPushConnectionRequest": {
+        "type": "object",
+        "description": "What a create names.",
+        "required": [
+          "display_name",
+          "base_url",
+          "credential_secret_name"
+        ],
+        "properties": {
+          "attribute_mapping": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "How IronAuth attributes map onto the downstream schema. Empty means the core mapping."
+          },
+          "base_url": {
+            "type": "string",
+            "description": "The downstream SCIM base URL. Must be https."
+          },
+          "credential_secret_name": {
+            "type": "string",
+            "description": "The NAME of an environment secret holding the bearer token. Never the token."
+          },
+          "deletion_policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`deactivate` or `delete`. Defaults to `deactivate`."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label, for telling two downstream applications apart."
+          },
+          "group_scope_filter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The same for groups."
+          },
+          "user_scope_filter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An RFC 7644 filter deciding which users are pushed. Absent means all of them."
+          },
+          "write_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`patch` or `put`. Defaults to `patch`."
+          }
+        }
+      },
       "CreateServiceAccountMembershipRequest": {
         "type": "object",
         "description": "The body to bind a machine identity into an organization (issue #126).",
@@ -34120,6 +34619,135 @@
           }
         }
       },
+      "ScimPushConnectionCreated": {
+        "type": "object",
+        "description": "The 201 of a create.\n\nNOTHING SECRET IS IN IT, and there is nothing that could be.",
+        "required": [
+          "id",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret handle."
+          }
+        }
+      },
+      "ScimPushConnectionListView": {
+        "type": "object",
+        "description": "A page of outbound connections.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScimPushConnectionView"
+            },
+            "description": "This organization's outbound connections."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, absent on the last one.\n\nPRESENT because the operation publishes a `cursor` parameter. It did not, and the\ncontract advertised `limit` and `cursor` on a listing that had neither a cursor to\nreturn nor a handler that read one: a documented parameter with no field to feed it is\na parameter no client can use."
+          }
+        }
+      },
+      "ScimPushConnectionView": {
+        "type": "object",
+        "description": "One outbound connection, as the management surface renders it.\n\nTHE SECRET NAME IS HERE AND THE SECRET IS NOT, which is the whole point of naming one: this\nview has nothing to redact, because the row it renders holds nothing to redact.",
+        "required": [
+          "id",
+          "display_name",
+          "base_url",
+          "credential_secret_name",
+          "attribute_mapping",
+          "write_mode",
+          "deletion_policy",
+          "active",
+          "backfill_state",
+          "consecutive_failures"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the worker serves this connection."
+          },
+          "attribute_mapping": {
+            "type": "object",
+            "description": "How IronAuth attributes map onto the downstream schema."
+          },
+          "backfill_state": {
+            "type": "string",
+            "description": "Where the initial backfill has reached."
+          },
+          "base_url": {
+            "type": "string",
+            "description": "The downstream SCIM base URL."
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failures, which is what a health status is computed from."
+          },
+          "credential_secret_name": {
+            "type": "string",
+            "description": "The NAME of the environment secret holding the bearer token."
+          },
+          "deletion_policy": {
+            "type": "string",
+            "description": "`deactivate` or `delete`."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "group_scope_filter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The same for groups."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret `spc_` handle. Every other operation names the connection by this."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last failure in operator-safe words, absent when there has been none.\n\nNEVER a downstream response body. An error page can carry anything, including the\ncredential it was sent."
+          },
+          "last_success_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last success, in milliseconds since the epoch."
+          },
+          "user_scope_filter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The RFC 7644 filter deciding which users are pushed, absent when all of them are."
+          },
+          "write_mode": {
+            "type": "string",
+            "description": "`patch` or `put`."
+          }
+        }
+      },
       "SecretList": {
         "type": "object",
         "description": "One page of environment secret metadata.",
@@ -34759,6 +35387,19 @@
           "token": {
             "type": "string",
             "description": "The shared bearer a successor system will present to this environment's\ncredential-verification endpoint. Writing it enables the endpoint for this\nenvironment; writing it again rotates it, and the previous value stops working\nthe moment the write commits. It is sealed under this environment's envelope\nkey and is never readable back through any endpoint."
+          }
+        }
+      },
+      "SetScimPushActiveRequest": {
+        "type": "object",
+        "description": "What a pause or resume names.",
+        "required": [
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the worker should serve this connection."
           }
         }
       },

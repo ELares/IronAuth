@@ -983,3 +983,8 @@ required-features = ["testing"]
 name = "scim_connections"
 path = "tests/scim_connections.rs"
 required-features = ["testing"]
+
+[[test]]
+name = "scim_push_connections"
+path = "tests/scim_push_connections.rs"
+required-features = ["testing"]

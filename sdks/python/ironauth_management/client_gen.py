@@ -195,6 +195,10 @@ class Client:
         """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, body)
 
+    def create_scim_push_connection(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections", query, body)
+
     def create_service_account_api_key(self, tenant_id: str, environment_id: str, service_account_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """createServiceAccountApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys", query, body)
@@ -310,6 +314,10 @@ class Client:
     def delete_permission(self, tenant_id: str, environment_id: str, permission_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a permission (soft delete; idempotent in effect). DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/permissions/{urllib.parse.quote(permission_id)}", query, None)
+
+    def delete_scim_push_connection(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`DELETE .../scim-push-connections/{connection_id}`. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections/{urllib.parse.quote(connection_id)}", query, None)
 
     def delete_secret(self, tenant_id: str, environment_id: str, name: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a secret by name. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}."""
@@ -759,6 +767,10 @@ class Client:
         """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections", query, None)
 
+    def list_scim_push_connections(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections", query, None)
+
     def list_secrets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the secrets of an environment (metadata only, cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/secrets", query, None)
@@ -1066,6 +1078,10 @@ class Client:
     def set_outbound_verification(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Enable, or rotate, one environment's outbound-verification token. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification."""
         return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/migration/outbound-verification", query, body)
+
+    def set_scim_push_connection_active(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`PUT .../scim-push-connections/{connection_id}/active`. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections/{urllib.parse.quote(connection_id)}/active", query, body)
 
     def set_secret(self, tenant_id: str, environment_id: str, name: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or replace) a secret by name. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}."""

@@ -1520,6 +1520,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0188_group_binding_provenance.sql"),
         },
+        Migration {
+            version: 189,
+            name: "scim_push_connections",
+            // EXPAND: one NEW table and nothing else. An old binary does not know the table
+            // exists, so it never reads it and never writes it; nothing is removed and no data
+            // is moved. The outbound push worker is the only thing that will read it, and that
+            // worker does not exist yet.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0189_scim_push_connections.sql"),
+        },
     ]
 }
 

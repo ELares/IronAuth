@@ -73,6 +73,7 @@ mod keys;
 mod locales;
 mod messages;
 mod scim_connections;
+mod scim_push_connections;
 pub mod usage;
 mod whoami;
 
@@ -592,6 +593,23 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
             delete(scim_connections::revoke_scim_connection),
+        )
+        // AND THE OUTBOUND MIRROR (issue #137). Where the routes above mint a credential that
+        // lets somebody write INTO an organization, these point IronAuth at somebody else's SCIM
+        // server. Nothing here returns a secret: the connection NAMES an environment secret, so
+        // the create response has nothing to leak.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
+            axum::routing::get(scim_push_connections::list_scim_push_connections)
+                .post(scim_push_connections::create_scim_push_connection),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}",
+            delete(scim_push_connections::delete_scim_push_connection),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active",
+            axum::routing::put(scim_push_connections::set_scim_push_connection_active),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",

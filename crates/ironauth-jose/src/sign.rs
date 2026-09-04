@@ -54,6 +54,12 @@ pub(crate) fn secure_random() -> SystemRandom {
 /// would otherwise have to name the backend's RNG type in its own struct, which is a second
 /// `entropy-via-env` exception with no argument behind it. This alias is how it borrows the one
 /// argument that already exists here.
+// BEHIND THE FEATURE THAT USES IT. `xmldsig::test_util` is the only consumer, and it is
+// `#[cfg(feature = "test-util")]`, so in a build without that feature this alias is dead code.
+// The workspace gate never showed it because it runs `--all-features`; a crate that depends on
+// this one WITHOUT test-util -- which is every one of them -- turns it into a `-D warnings`
+// failure. Found while building `ironauth-store` alone.
+#[cfg(feature = "test-util")]
 pub(crate) type SecureRandom = SystemRandom;
 
 /// Sign `signing_input` with `key` under the key's declared algorithm.

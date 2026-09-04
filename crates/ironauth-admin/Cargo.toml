@@ -189,6 +189,11 @@ path = "tests/scim_connections.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "scim_push_connections"
+path = "tests/scim_push_connections.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "api_keys"
 path = "tests/api_keys.rs"
 required-features = ["testing"]

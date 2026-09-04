@@ -1346,6 +1346,17 @@ pub enum Action {
     /// documents: a revoke of an already-revoked connection that emitted this anyway would
     /// claim a teardown that removed nothing.
     ScimConnectionBindingsRevoked,
+    /// An OUTBOUND SCIM connection was created (issue #137).
+    ///
+    /// The mirror of [`Action::ScimConnectionCreated`], and the direction is why it is a separate
+    /// action rather than a flag on that one: an inbound connection lets somebody write INTO this
+    /// environment, an outbound one points a credential at somebody else's directory. An operator
+    /// reading the log needs to see which happened without decoding a detail field.
+    ScimPushConnectionCreated,
+    /// An outbound SCIM connection's configuration changed (issue #137).
+    ScimPushConnectionUpdated,
+    /// An outbound SCIM connection was deleted (issue #137).
+    ScimPushConnectionDeleted,
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
     /// authorization after checking the permission and the justification. The row targets the
     /// `imp_` authorization.
@@ -1856,6 +1867,9 @@ impl Action {
             Action::ScimConnectionCreated => "scim_connection.created",
             Action::ScimConnectionRevoked => "scim_connection.revoked",
             Action::ScimConnectionBindingsRevoked => "scim_connection.bindings.revoke",
+            Action::ScimPushConnectionCreated => "scim_push_connection.created",
+            Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
+            Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",
             Action::ApiKeyRevoked => "api_key.revoked",
             Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",

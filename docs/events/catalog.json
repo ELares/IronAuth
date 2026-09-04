@@ -2612,6 +2612,84 @@
       "type": "scim_connection.revoked"
     },
     {
+      "domain": "scim_push_connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scim_push_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scim_push_connection_id",
+          "organization_id",
+          "active"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "scim_push_connection.active_changed"
+    },
+    {
+      "domain": "scim_push_connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "base_url": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scim_push_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scim_push_connection_id",
+          "organization_id",
+          "base_url"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "scim_push_connection.created"
+    },
+    {
+      "domain": "scim_push_connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scim_push_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scim_push_connection_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "scim_push_connection.deleted"
+    },
+    {
       "domain": "session",
       "payload_schema": {
         "additionalProperties": false,

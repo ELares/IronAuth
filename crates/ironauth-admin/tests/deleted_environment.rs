@@ -339,6 +339,7 @@ struct Fixture {
     /// unmeasurable on this route -- which is the exact vacuity `Intent::Read` carries a
     /// payload to prevent.
     scim_connection: String,
+    scim_push_connection: String,
 }
 
 impl Fixture {
@@ -456,6 +457,8 @@ impl Fixture {
         )
         .await;
 
+        let scim_push_connection = Self::seed_scim_push_connection(h, &base, key).await;
+
         let fixture = Self {
             base,
             org,
@@ -475,6 +478,7 @@ impl Fixture {
             approval,
             service_account,
             scim_connection,
+            scim_push_connection,
         };
         fixture.seed_relations(h, key).await;
         fixture
@@ -492,6 +496,29 @@ impl Fixture {
     /// organization does not already hold a grant on, or it would answer 409 and pin a
     /// conflict instead of a create.
     ///
+    /// The OUTBOUND connection (issue #137), seeded so the pause and delete cases can name a
+    /// REAL handle: an absent one answers the uniform not-found at a LIVE environment too, so
+    /// driving it at a soft-deleted one would measure nothing about the fence.
+    ///
+    /// Split out from [`Fixture::seed`] for the reason its siblings are: appending it inline
+    /// pushed that function to 107 lines against the crate's 100-line ceiling, which a targeted
+    /// `cargo test` does not see and only clippy does, which means the gate.
+    async fn seed_scim_push_connection(h: &Harness, base: &str, key: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/scim-push-connections"),
+            &format!("{key}-spc"),
+            &serde_json::json!({
+                "display_name": "Seeded downstream",
+                "base_url": "https://downstream.example.com/scim/v2",
+                "credential_secret_name": "scim_push_downstream",
+            })
+            .to_string(),
+            "scim push connection",
+        )
+        .await
+    }
+
     /// Split out from [`Fixture::seed`] only because the two together exceed the crate's
     /// function-length lint.
     async fn seed_project_grant(
@@ -707,6 +734,11 @@ impl Fixture {
                 .into_iter()
                 .filter(|case| case.method != "GET"),
         );
+        cases.extend(
+            self.scim_push_connection_cases()
+                .into_iter()
+                .filter(|case| case.method != "GET"),
+        );
         cases.extend(self.destructive_write_cases());
         cases
     }
@@ -724,6 +756,11 @@ impl Fixture {
         let mut cases = self.organization_read_cases();
         cases.extend(
             self.scim_connection_cases()
+                .into_iter()
+                .filter(|case| case.method == "GET"),
+        );
+        cases.extend(
+            self.scim_push_connection_cases()
                 .into_iter()
                 .filter(|case| case.method == "GET"),
         );
@@ -805,6 +842,63 @@ impl Fixture {
                 // what `EnvironmentAccess::Read` buys. It names the connection the create
                 // above landed, so an empty page cannot pass for an audit.
                 intent: Intent::Read(vec!["Seeded Okta".to_owned()]),
+                live: StatusCode::OK,
+            },
+        ]
+    }
+
+    /// The OUTBOUND connection surface at a soft-deleted environment (issue #137).
+    ///
+    /// Its own function rather than four more cases appended to a neighbour: those functions
+    /// are already near `clippy::too_many_lines`, and a targeted `cargo test` does not catch
+    /// that ceiling. Only clippy does, which means the gate.
+    fn scim_push_connection_cases(&self) -> Vec<Case> {
+        let Self {
+            base,
+            scim_push_connection,
+            ..
+        } = self;
+        vec![
+            Case {
+                label: "scim_push_connections.createScimPushConnection",
+                method: "POST",
+                path: format!("{base}/scim-push-connections"),
+                body: Some(
+                    serde_json::json!({
+                        "display_name": "sweep push connection",
+                        "base_url": "https://downstream.example.com/scim/v2",
+                        "credential_secret_name": "scim_push_downstream",
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
+                label: "scim_push_connections.setScimPushConnectionActive",
+                method: "PUT",
+                // The SEEDED handle, not an absent one, for the reason the revoke above states.
+                path: format!("{base}/scim-push-connections/{scim_push_connection}/active"),
+                body: Some(serde_json::json!({ "active": false }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "scim_push_connections.deleteScimPushConnection",
+                method: "DELETE",
+                path: format!("{base}/scim-push-connections/{scim_push_connection}"),
+                body: None,
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "scim_push_connections.listScimPushConnections",
+                method: "GET",
+                path: format!("{base}/scim-push-connections"),
+                body: None,
+                // AUDITABLE at a decommissioned environment, naming the row the seed landed so
+                // an empty page cannot pass for an audit.
+                intent: Intent::Read(vec!["Seeded downstream".to_owned()]),
                 live: StatusCode::OK,
             },
         ]
@@ -1422,6 +1516,7 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         approval: "ava_x".to_owned(),
         service_account: "sva_x".to_owned(),
         scim_connection: "scim_x".to_owned(),
+        scim_push_connection: "spc_x".to_owned(),
     };
     let cases = fixture.cases();
     let documented = documented_organization_operations();
@@ -1954,6 +2049,21 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             format!("{base}/scim-connections"),
             serde_json::json!({ "display_name": "Replay Okta", "provider": "okta" }).to_string(),
         ),
+        // The OUTBOUND create (issue #137), keyed for the same reason and driven for the same
+        // reason: it needs nothing beyond the organization at `base`. The doc block below
+        // records `createScimConnection` having hidden in the undriven remainder behind
+        // somebody else's justification; this is that lesson applied on the way in rather than
+        // after a review found it.
+        (
+            "scim_push_connections.createScimPushConnection",
+            format!("{base}/scim-push-connections"),
+            serde_json::json!({
+                "display_name": "Replay downstream",
+                "base_url": "https://downstream.example/scim/v2",
+                "credential_secret_name": "scim_push_downstream",
+            })
+            .to_string(),
+        ),
         // Added with the agent cases, because this change is what brings `registerAgent` into
         // the sweep: a keyed write reaching the surface without reaching the replay fence is
         // the gap the derived assertion below exists to make visible.
@@ -2095,6 +2205,7 @@ fn replay_fixture() -> Fixture {
         approval: "ava_x".to_owned(),
         service_account: "sva_x".to_owned(),
         scim_connection: "scim_x".to_owned(),
+        scim_push_connection: "spc_x".to_owned(),
     }
 }
 
@@ -2337,8 +2448,8 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 34;
-    const READS: usize = 16;
+    const WRITES: usize = 37;
+    const READS: usize = 17;
 
     let cases = replay_fixture_cases();
     let writes = cases

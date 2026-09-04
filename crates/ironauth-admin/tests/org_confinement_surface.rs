@@ -42,6 +42,13 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     // whole module. All four already resolve through `resolve_live_org`; the omission
     // was the scan's, not theirs.
     ("agents.rs", include_str!("../src/agents.rs")),
+    // The outbound provisioning module (issue #137): four organization-addressed operations,
+    // all four of which resolve through `resolve_live_org`. Added with them rather than after a
+    // review measured the gap, which is how `api_keys.rs` got here.
+    (
+        "scim_push_connections.rs",
+        include_str!("../src/scim_push_connections.rs"),
+    ),
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),
     (
@@ -85,7 +92,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 50;
+const ORG_ADDRESSED_OPERATIONS: usize = 54;
 
 /// The path segment that makes an operation organization-addressed.
 fn org_addressed(attr: &str) -> bool {

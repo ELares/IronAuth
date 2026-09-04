@@ -323,6 +323,13 @@ func (c *Client) CreateScimConnection(tenant_id string, environment_id string, o
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, body)
 }
 
+// CreateScimPushConnection performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections.
+//
+// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`.
+func (c *Client) CreateScimPushConnection(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-push-connections", query, body)
+}
+
 // CreateServiceAccountApiKey performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys.
 //
 // createServiceAccountApiKey.
@@ -524,6 +531,13 @@ func (c *Client) DeleteOutboundVerification(tenant_id string, environment_id str
 // Delete a permission (soft delete; idempotent in effect).
 func (c *Client) DeletePermission(tenant_id string, environment_id string, permission_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/permissions/" + escape(permission_id), query, nil)
+}
+
+// DeleteScimPushConnection performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}.
+//
+// `DELETE .../scim-push-connections/{connection_id}`.
+func (c *Client) DeleteScimPushConnection(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-push-connections/" + escape(connection_id), query, nil)
 }
 
 // DeleteSecret performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}.
@@ -1310,6 +1324,13 @@ func (c *Client) ListScimConnections(tenant_id string, environment_id string, or
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections", query, nil)
 }
 
+// ListScimPushConnections performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections.
+//
+// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`.
+func (c *Client) ListScimPushConnections(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-push-connections", query, nil)
+}
+
 // ListSecrets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets.
 //
 // List the secrets of an environment (metadata only, cursor paginated).
@@ -1847,6 +1868,13 @@ func (c *Client) SetOrgGroupParent(tenant_id string, environment_id string, orga
 // Enable, or rotate, one environment's outbound-verification token.
 func (c *Client) SetOutboundVerification(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/migration/outbound-verification", query, body)
+}
+
+// SetScimPushConnectionActive performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active.
+//
+// `PUT .../scim-push-connections/{connection_id}/active`.
+func (c *Client) SetScimPushConnectionActive(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-push-connections/" + escape(connection_id) + "/active", query, body)
 }
 
 // SetSecret performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/secrets/{name}.

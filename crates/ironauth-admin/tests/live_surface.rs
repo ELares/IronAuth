@@ -327,6 +327,7 @@ struct Fixture {
     /// A LIVE SCIM connection, so the revoke case measures the environment fence rather than
     /// a handle that never resolved (issue #135).
     scim_connection: String,
+    scim_push_connection: String,
     /// A real `sva_` principal, so the service-account key cases address a live owner rather
     /// than an id that never resolved (issue #99).
     service_account: String,
@@ -848,6 +849,27 @@ impl Fixture {
             "create scim connection: {body}"
         );
         let scim_connection = field(&body, "/id", "seed scim connection");
+        // And one OUTBOUND connection (issue #137), REAL for the same reason: a handle that
+        // does not exist answers the uniform not-found at a live environment too, which would
+        // make the deleted-environment half indistinguishable from the live half.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/scim-push-connections"),
+                "seed-scim-push-connection",
+                &serde_json::json!({
+                    "display_name": "sweep push connection",
+                    "base_url": "https://downstream.example.com/scim/v2",
+                    "credential_secret_name": "scim_push_downstream",
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create scim push connection: {body}"
+        );
+        let scim_push_connection = field(&body, "/id", "seed scim push connection");
         let session = h.seed_session(scope, &user).await;
         let family = h
             .seed_refresh_family(scope, &user, &client, &session, false)
@@ -1346,6 +1368,7 @@ impl Fixture {
             project_grant,
             api_key,
             scim_connection,
+            scim_push_connection,
             service_account,
             agent,
             approval,
@@ -1410,6 +1433,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         project_grant,
         api_key,
         scim_connection,
+        scim_push_connection,
         service_account,
         agent,
         approval,
@@ -2663,6 +2687,35 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{org_base}/scim-connections/{scim_connection}"),
         ),
+        // The OUTBOUND connection surface (issue #137), on all four of its shapes. Driven
+        // against a connection this sweep creates itself: the create case runs first, and the
+        // pause and delete cases name a handle seeded beside `scim_connection` above.
+        Case::json(
+            "scim_push_connections.createScimPushConnection",
+            "POST",
+            format!("{org_base}/scim-push-connections"),
+            &serde_json::json!({
+                "display_name": "sweep push connection",
+                "base_url": "https://downstream.example.com/scim/v2",
+                "credential_secret_name": "scim_push_downstream",
+            }),
+        ),
+        Case::empty(
+            "scim_push_connections.listScimPushConnections",
+            "GET",
+            format!("{org_base}/scim-push-connections"),
+        ),
+        Case::json(
+            "scim_push_connections.setScimPushConnectionActive",
+            "PUT",
+            format!("{org_base}/scim-push-connections/{scim_push_connection}/active"),
+            &serde_json::json!({ "active": false }),
+        ),
+        Case::empty(
+            "scim_push_connections.deleteScimPushConnection",
+            "DELETE",
+            format!("{org_base}/scim-push-connections/{scim_push_connection}"),
+        ),
         // The service-account surface, same four shapes. Not nested under an organization:
         // `service_accounts` has no organization column, so the path addresses the
         // environment directly.
@@ -3194,6 +3247,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         project_grant: "pgt_0".to_owned(),
         api_key: "akey_0".to_owned(),
         scim_connection: "scimconn_0".to_owned(),
+        scim_push_connection: "spc_0".to_owned(),
         connector: "con_0".to_owned(),
         log_stream: "lgs_0".to_owned(),
         flow_target: "ftg_0".to_owned(),
