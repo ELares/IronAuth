@@ -31,8 +31,8 @@
 //! makes at-least-once safe is that every downstream write is a converge.
 
 use ironauth_store::{
-    EventCursor, EventPage, NewScimPushLink, ScimPushConnectionId, ScimPushLinkId,
-    ScimPushResourceType, ScimPushSyncState, StoreError,
+    EventCursor, EventPage, NewScimPushLink, ScimPushConnection, ScimPushConnectionId,
+    ScimPushLinkId, ScimPushResourceType, StoreError,
 };
 
 use crate::scim_push_client::{Converged, DeletionPolicy, PushError, ScimPushClient};
@@ -260,7 +260,7 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
 /// test cannot address: "resumes when the deadline passes" would need a sleep, and "does not
 /// resume a microsecond early" would be untestable at all. The caller already knows the time it
 /// is running at, so it says so.
-const fn is_paused(state: &ScimPushSyncState, now_unix_micros: i64) -> bool {
+const fn is_paused(state: &ScimPushConnection, now_unix_micros: i64) -> bool {
     match state.paused_until_unix_micros {
         Some(until) => until > now_unix_micros,
         None => false,
@@ -422,7 +422,7 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
     let limit = usize::try_from(pass.limit).unwrap_or(usize::MAX);
     let subjects = pass
         .subjects
-        .enumerate(collection, state.backfill_after.as_deref(), limit)
+        .enumerate(collection, state.backfill_after_id.as_deref(), limit)
         .await
         .map_err(WorkerError::Retryable)?;
 

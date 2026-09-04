@@ -117,7 +117,7 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
         .expect("get")
         .expect("a state row");
     assert_eq!(
-        resumed.backfill_after.as_deref(),
+        resumed.backfill_after_id.as_deref(),
         Some("usr_500"),
         "the restart rewound the backfill"
     );
@@ -178,7 +178,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
     assert_eq!(tailing.cursor_sequence, Some(1));
     assert_eq!(tailing.backfill_state, ScimBackfillState::Done);
     assert_eq!(
-        tailing.backfill_after, None,
+        tailing.backfill_after_id, None,
         "a completed backfill left its resume point behind"
     );
 
@@ -402,7 +402,7 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
         restarted.cursor_sequence, None,
         "a re-enumerating connection was left tailing: {restarted:?}"
     );
-    assert_eq!(restarted.backfill_after, None);
+    assert_eq!(restarted.backfill_after_id, None);
 
     // AND TAILING IS REFUSED AGAIN until the new enumeration finishes.
     let early = store

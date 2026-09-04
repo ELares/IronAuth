@@ -387,7 +387,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         .expect("get")
         .expect("state");
     assert_eq!(
-        mid.backfill_after.as_deref(),
+        mid.backfill_after_id.as_deref(),
         Some("usr_b"),
         "the backfill did not record where it stopped"
     );
@@ -421,7 +421,7 @@ async fn a_backfill_resumes_from_where_it_stopped_and_only_then_starts_tailing()
         .expect("get")
         .expect("state");
     assert_eq!(complete.cursor_sequence, Some(feed_head));
-    assert_eq!(complete.backfill_after, None);
+    assert_eq!(complete.backfill_after_id, None);
 
     // AND A LINK EXISTS FOR EVERY PERSON, so the tail can address them by downstream id.
     for subject in ["usr_a", "usr_b", "usr_c", "usr_d"] {

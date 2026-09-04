@@ -74877,6 +74877,21 @@ pub struct ScimPushConnection {
     /// The last failure, in operator-safe words. NEVER a response body: a downstream error page
     /// can carry anything, including the credential it was sent.
     pub last_error: Option<String>,
+    /// The subject the backfill reached, so a restart resumes rather than starting over.
+    pub backfill_after_id: Option<String>,
+    /// The newest feed sequence visible BEFORE the backfill began.
+    ///
+    /// Captured first and applied last, so an event that lands mid-backfill is replayed rather
+    /// than skipped.
+    pub backfill_from_sequence: Option<i64>,
+    /// When the worker last LOOKED, including the polls that found nothing.
+    ///
+    /// Distinct from `last_success_at` so a connection idle because the feed is quiet is
+    /// distinguishable from one idle because the worker is wedged.
+    pub last_polled_at_unix_micros: Option<i64>,
+    /// While this is in the future the worker skips the connection and leaves the cursor where
+    /// it is: an outage pauses the feed rather than dropping events.
+    pub paused_until_unix_micros: Option<i64>,
     /// Consecutive failures, which is what the health status is computed from.
     pub consecutive_failures: i32,
     /// Creation time, which is the listing's sort key and therefore its cursor position.
@@ -75019,7 +75034,9 @@ const SCIM_PUSH_SELECT_COLUMNS: &str = "id, organization_id, display_name, base_
      write_mode, deletion_policy, active, cursor_sequence, backfill_state, \
      (EXTRACT(EPOCH FROM last_success_at) * 1000000)::bigint AS last_success_us, \
      (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_us, \
-     last_error, consecutive_failures, \
+     last_error, consecutive_failures, backfill_after_id, backfill_from_sequence, \
+     (EXTRACT(EPOCH FROM last_polled_at) * 1000000)::bigint AS last_polled_us, \
+     (EXTRACT(EPOCH FROM paused_until) * 1000000)::bigint AS paused_until_us, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
 
 /// Build a [`ScimPushConnection`] from a row selected with [`SCIM_PUSH_SELECT_COLUMNS`].
@@ -75069,6 +75086,10 @@ fn scim_push_connection_from_row(
         last_error_at_unix_micros: row.get("last_error_us"),
         last_error: row.get("last_error"),
         consecutive_failures: row.get("consecutive_failures"),
+        backfill_after_id: row.get("backfill_after_id"),
+        backfill_from_sequence: row.get("backfill_from_sequence"),
+        last_polled_at_unix_micros: row.get("last_polled_us"),
+        paused_until_unix_micros: row.get("paused_until_us"),
         created_at_unix_micros: row.get("created_us"),
     })
 }
@@ -75743,83 +75764,20 @@ impl ScimPushLinkRepo<'_> {
     }
 }
 
-/// One outbound connection's position in the feed and its health (issue #137).
-#[derive(Debug, Clone)]
-pub struct ScimPushSyncState {
-    /// The connection this position belongs to.
-    pub connection_id: ScimPushConnectionId,
-    /// The feed sequence this connection has read through. `None` means it has not started
-    /// tailing, which the column's CHECK ties to an unfinished backfill.
-    ///
-    /// A SEQUENCE rather than the feed's opaque wire cursor, which is the one place 0189's shape
-    /// is weaker than the table this replaced. The wire form exists so a consumer cannot do
-    /// arithmetic on its checkpoint (#107), and storing the number gives that up. It is stored
-    /// here anyway because the alternative was a second table duplicating five other columns, and
-    /// the encapsulation is recovered at the boundary: `EventCursor::after_sequence` is the only
-    /// way this value re-enters the feed, and nothing outside this module reads it as a number.
-    pub cursor_sequence: Option<i64>,
-    /// How far the initial enumeration has got.
-    pub backfill_state: ScimBackfillState,
-    /// The subject the backfill reached, so a restart resumes rather than starts over.
-    pub backfill_after: Option<String>,
-    /// The newest feed sequence visible BEFORE this connection's backfill began.
-    ///
-    /// Captured first and applied last, so an event that lands mid-backfill is replayed rather
-    /// than skipped. 0189 designed this column and documented that property; the worker's
-    /// backfill pass re-derived it independently before finding it already here.
-    pub backfill_from_sequence: Option<i64>,
-    /// When the worker last LOOKED, including the polls that found nothing. Distinct from
-    /// `last_event_at` so an idle feed is distinguishable from a wedged worker.
-    pub last_polled_at_unix_micros: Option<i64>,
-    /// When the worker last wrote something downstream for this connection.
-    /// When the worker last wrote something downstream for this connection.
-    pub last_success_at_unix_micros: Option<i64>,
-    /// Failures since the last success. What a backoff is computed from, and what criterion 2
-    /// calls "error counts".
-    pub consecutive_failures: i32,
-    /// When the most recent failure happened.
-    pub last_error_at_unix_micros: Option<i64>,
-    /// What the most recent failure said, truncated on a character boundary to the column bound.
-    pub last_error: Option<String>,
-    /// While this is in the future the worker skips the connection and leaves the cursor where
-    /// it is: an outage pauses the feed rather than dropping events.
-    pub paused_until_unix_micros: Option<i64>,
-}
-
-const SCIM_PUSH_SYNC_STATE_SELECT_COLUMNS: &str = "id AS connection_id, cursor_sequence, \
-     backfill_state, backfill_after_id, backfill_from_sequence, \
-     (EXTRACT(EPOCH FROM last_polled_at) * 1000000)::bigint AS last_polled_at_micros, \
-     (EXTRACT(EPOCH FROM last_success_at) * 1000000)::bigint AS last_success_at_micros, \
-     consecutive_failures, \
-     (EXTRACT(EPOCH FROM last_error_at) * 1000000)::bigint AS last_error_at_micros, \
-     last_error, \
-     (EXTRACT(EPOCH FROM paused_until) * 1000000)::bigint AS paused_until_micros";
-
-fn scim_push_sync_state_from_row(
-    row: &PgRow,
-    scope: &Scope,
-) -> Result<ScimPushSyncState, StoreError> {
-    let backfill_state: String = row.try_get("backfill_state")?;
-    Ok(ScimPushSyncState {
-        connection_id: ScimPushConnectionId::parse_in_scope(row.try_get("connection_id")?, scope)
-            .map_err(|_| StoreError::NotFound)?,
-        cursor_sequence: row.try_get("cursor_sequence")?,
-        backfill_state: ScimBackfillState::from_str(&backfill_state)?,
-        backfill_after: row.try_get("backfill_after_id")?,
-        backfill_from_sequence: row.try_get("backfill_from_sequence")?,
-        last_polled_at_unix_micros: row.try_get("last_polled_at_micros")?,
-        last_success_at_unix_micros: row.try_get("last_success_at_micros")?,
-        consecutive_failures: row.try_get("consecutive_failures")?,
-        last_error_at_unix_micros: row.try_get("last_error_at_micros")?,
-        last_error: row.try_get("last_error")?,
-        paused_until_unix_micros: row.try_get("paused_until_micros")?,
-    })
-}
-
 /// Where each outbound connection has read to, and how it is doing (issue #137).
 ///
-/// The DATA plane owns this: every method here is something the sync worker does on a poll. The
-/// management health surface reads the same rows through the control pool's SELECT grant.
+/// # Two repositories over one table, and why that is not the duplication it resembles
+///
+/// [`ScimPushConnectionRepo`] is the CONTROL plane's view: an operator creates a connection,
+/// enables and disables it, deletes it. This is the DATA plane's, and every method here is
+/// something the sync worker does on a poll. 0192 grants the app role exactly the columns these
+/// methods write and no others, so the two differ in the thing that matters: what each is
+/// ALLOWED to write.
+///
+/// What they must NOT differ in is how they READ the row, and an earlier version of this module
+/// had a second struct, a second select list and a second row parser over the same columns. Those
+/// are gone. Both return [`ScimPushConnection`], so a column added to the table appears in one
+/// projection or in neither.
 pub struct ScimPushSyncStateRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -75834,13 +75792,13 @@ impl ScimPushSyncStateRepo<'_> {
     pub async fn get(
         &self,
         connection_id: &ScimPushConnectionId,
-    ) -> Result<Option<ScimPushSyncState>, StoreError> {
+    ) -> Result<Option<ScimPushConnection>, StoreError> {
         if connection_id.scope() != self.scope {
             return Ok(None);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(&format!(
-            "SELECT {SCIM_PUSH_SYNC_STATE_SELECT_COLUMNS} FROM scim_push_connections \
+            "SELECT {SCIM_PUSH_SELECT_COLUMNS} FROM scim_push_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
         ))
         .bind(self.scope.tenant().to_string())
@@ -75849,7 +75807,7 @@ impl ScimPushSyncStateRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        row.map(|row| scim_push_sync_state_from_row(&row, &self.scope))
+        row.map(|row| scim_push_connection_from_row(&row, &self.scope))
             .transpose()
     }
 
