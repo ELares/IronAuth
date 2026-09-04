@@ -9,9 +9,10 @@
 //! test was renamed, and the failure mode of a stale checklist is the worst one available, which
 //! is a reader believing a control exists because a document says so.
 //!
-//! So the table lives here, every [`Coverage::Tests`] row names real `#[test]` functions, and
-//! this file FAILS if a named function is not an actual test in this crate. Renaming a test
-//! without updating its row is a red build.
+//! So the table lives here and every [`Coverage::Tests`] row names real `#[test]` functions.
+//! THAT THEY EXIST IS CHECKED BY `scripts/saml-owasp-checklist.sh`, NOT BY THIS FILE, for the
+//! reason the next section gives. Renaming a test without updating its row turns that script
+//! red in CI's invariants job and in `scripts/gate.sh`.
 //!
 //! # THE NAME CHECK IS NOT HERE, AND THAT IS THE THIRD ATTEMPT
 //!
@@ -29,7 +30,14 @@
 //!
 //! `scripts/saml-owasp-checklist.sh` owns that check now. It reads
 //! `cargo test -- --list`, which prints exactly the tests the compiler produced, and it runs in
-//! the merge-blocking invariants job. What is left here is what a table CAN check about itself:
+//! CI's invariants job and in `scripts/gate.sh`.
+//!
+//! NOT "merge-blocking", which an earlier draft called it. Branch protection on `main` requires
+//! one approving review and ZERO status checks, so a red invariants job does not stop a merge,
+//! and the standing admin-squash authorisation makes that the normal path. A sentence telling a
+//! reader the build cannot land in that state is worse than none: it is why they stop looking.
+//!
+//! What is left here is what a table CAN check about itself:
 //! every row has a rationale, no two rows claim the same control, an N/A names an owner, and a
 //! gap names the criterion it belongs to.
 //!
@@ -265,7 +273,8 @@ const CHEAT_SHEET: &[Item] = &[
         control: "Prefer IP filtering where the deployment allows it",
         coverage: Coverage::NotApplicable(
             "A network control, made by whatever fronts the deployment. Nothing in this \
-             repository can assert it, and issue #139 does not either.",
+             repository can assert it: there is no issue that owns it, because there is no \
+             code it could live in.",
         ),
         rationale: "An item a library cannot implement is worth an explicit N/A rather than \
                     silence, so a reader does not go looking for it.",
@@ -274,6 +283,7 @@ const CHEAT_SHEET: &[Item] = &[
     Item {
         control: "Ensure each Assertion, or the entire Response, is signed",
         coverage: Coverage::Tests(&[
+            "an_assertion_with_no_signature_of_its_own_is_refused",
             "no_pinned_key_means_no_signature_verifies",
             "two_genuinely_signed_assertions_are_refused_rather_than_resolved",
         ]),
@@ -418,6 +428,67 @@ const CHEAT_SHEET: &[Item] = &[
                     two different documents produced identical canonical octets. And a \
                     declaration is not an attribute: an unused one is never digested, so it \
                     must not be readable through an accessor or through `Debug`.",
+    },
+    Item {
+        control: "Validate that the assertion was signed by an AUTHORIZED identity provider",
+        coverage: Coverage::NotApplicable(
+            "Distinct from never taking the anchor from the document, which this crate does \
+             enforce: that is about KeyInfo, this is about WHICH pinned identity provider a \
+             given connection may be served by. `verify` takes a list of anchors and asks only \
+             whether one of them signed; deciding that THIS connection may be served by THAT \
+             identity provider needs the connection, which is issue #139.",
+        ),
+        rationale: "Named separately because the two are easy to conflate and a deployment with \
+                    several identity providers is exactly where conflating them lets one tenant's \
+                    identity provider mint an assertion another tenant's connection accepts.",
+    },
+    Item {
+        control: "Validate strong authentication options at the identity provider",
+        coverage: Coverage::NotApplicable(
+            "An identity provider concern, and IronAuth is the service provider here. The SAML \
+             half of it -- reading and acting on AuthnContext -- is issue #139.",
+        ),
+        rationale: "A service provider can require an authentication context; it cannot make the \
+                    identity provider honour one. The item is real and it is not this crate's.",
+    },
+    Item {
+        control: "Synchronize to a common Internet time source",
+        coverage: Coverage::NotApplicable(
+            "A deployment concern with no code in this repository to hold it: there is no clock \
+             in this crate at all, deliberately. Nothing in this repository can assert it.",
+        ),
+        rationale: "The consequence lands on the time-bounds check that issue #139 owns, so an \
+                    operator reading that row finds this one beside it.",
+    },
+    Item {
+        control: "Define levels of assurance for identity verification",
+        coverage: Coverage::NotApplicable(
+            "A policy decision expressed through AuthnContext class references, which issue #139 \
+             maps. This crate returns a verified subtree and reads no semantics from it.",
+        ),
+        rationale: "Recorded so the mapping work inherits an entry rather than rediscovering the \
+                    item.",
+    },
+    Item {
+        control: "Prefer asymmetric identifiers over personally identifiable ones in assertions",
+        coverage: Coverage::NotApplicable(
+            "About what a NameID CONTAINS, which is an identity provider's choice and a JIT \
+             mapping concern. Issue #139 owns the mapping; nothing here inspects the value.",
+        ),
+        rationale: "The one thing this crate does for it is make sure whatever the value is was \
+                    signed, which the signature rows carry.",
+    },
+    Item {
+        control: "Input validation on every value taken out of an assertion",
+        coverage: Coverage::Tests(&[
+            "a_malformed_qualified_name_is_refused",
+            "an_undefined_entity_reference_is_refused_rather_than_emptied",
+            "non_utf8_is_refused",
+        ]),
+        rationale: "The cheat sheet's one-line section, and the part of it this crate owns is \
+                    that a value reaching a caller has already survived a hostile parser: no \
+                    DOCTYPE, no unresolved entity, valid UTF-8, well formed names. What a caller \
+                    then does with a NameID is issue #139's.",
     },
     // -- X.509 Certificate Considerations ---------------------------------------------------
     Item {
@@ -568,31 +639,43 @@ fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
     // At exact counts a deletion is a red build that a reader has to lower deliberately, in the
     // same commit, with the removed row visible in the diff. That is the most a same-file bound
     // can do: it cannot stop a removal, only make one loud.
-    assert_eq!(named, 17, "a row that names tests was added or removed");
+    assert_eq!(named, 18, "a row that names tests was added or removed");
     assert_eq!(
-        excused, 17,
+        excused, 22,
         "a row marked out of scope was added or removed"
     );
     assert_eq!(gaps, 2, "a row marked as a gap was added or removed");
 }
 
-/// The rows that name tests name ENOUGH of them.
+/// A row whose control TEXT enumerates several properties names several tests.
 ///
-/// # Why a separate assertion
+/// # A narrow guard, and the narrowness is measured rather than hoped
 ///
 /// The row that failed review named exactly one test, and that test measured none of the three
-/// things the control was about. One name is where that failure lives: a control carried by
-/// several guards, pinned to one test, lets every other guard be deleted with the row green.
-/// This is not a proof that the names are the right ones -- nothing in this file can be -- but a
-/// row whose control enumerates several properties and names one test is visible here.
+/// things the control was about. This catches the shape where the control SAYS it covers several
+/// things: "Bound document size, depth and breadth" is two conjunctions, so it needs two names.
+///
+/// IT REACHES FEW ROWS, AND THAT IS THE HONEST DESCRIPTION. Punctuation is a proxy for "how many
+/// properties", and a control can carry four tests while reading as one phrase: "Reject XML
+/// Signature Wrapping in all its published forms" scores zero, so cutting its four names to one
+/// passes here. A reviewer demonstrated exactly that.
+///
+/// What catches THAT is `scripts/saml-owasp-checklist.sh`, which asserts the exact number of
+/// names across all rows, in a different file from the table. This guard is kept for the case it
+/// does catch and is described for the cases it does not, rather than left looking like more.
 #[test]
 fn a_row_naming_several_properties_names_several_tests() {
     for item in CHEAT_SHEET {
         let Coverage::Tests(covering) = item.coverage else {
             continue;
         };
-        let conjunctions =
-            item.control.matches(',').count() + item.control.matches(" and ").count();
+        // SEMICOLONS COUNT. Two of the four-name rows separate their clauses with one and so
+        // scored zero, which left this guard reaching three rows of seventeen: the row carrying
+        // the whole published wrapping corpus could have been cut to a single test with
+        // everything still green.
+        let conjunctions = item.control.matches(',').count()
+            + item.control.matches(';').count()
+            + item.control.matches(" and ").count();
         if conjunctions >= 2 {
             assert!(
                 covering.len() >= 2,

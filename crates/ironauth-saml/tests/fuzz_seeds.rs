@@ -51,7 +51,7 @@ fn every_fuzz_target_has_a_tracked_seed_corpus() {
     for (target, floor) in [
         ("saml_parse", 5),
         ("saml_canonicalize", 4),
-        ("saml_verify", 3),
+        ("saml_verify", 4),
     ] {
         let found = seeds(target);
         assert!(
@@ -94,6 +94,52 @@ fn every_canonicalization_seed_reaches_the_canonicalizer() {
         ironauth_saml::test_util::canonicalize(text, document.root().name())
             .unwrap_or_else(|error| panic!("saml_canonicalize/{name} must canonicalise: {error}"));
     }
+
+    // AND THE CORPUS REACHES INHERITED SCOPE, which is the path it exists for. Not every seed:
+    // `seed_pi_and_comment` has no element child at all and is not meant to, since its subject is
+    // what happens to a processing instruction and a comment.
+    //
+    // The property is measured rather than assumed from a filename. A seed reaches inherited
+    // scope when canonicalising a DESCENDANT emits a namespace declaration the descendant's own
+    // start tag does not carry -- which is exactly a prefix resolved from an ancestor OUTSIDE the
+    // subtree, and exactly where this crate's worst canonicalization defect lived. A reviewer
+    // showed the previous root-only check would have let `<a/><!--pad-->` replace the one seed
+    // that does it.
+    let reaching = seeds("saml_canonicalize")
+        .into_iter()
+        .filter(|(_, bytes)| {
+            let Ok(document) = ironauth_saml::parse(bytes, &limits) else {
+                return false;
+            };
+            let Ok(text) = core::str::from_utf8(bytes) else {
+                return false;
+            };
+            let Some(child) = document.root().children().first() else {
+                return false;
+            };
+            let Ok(canonical) = ironauth_saml::test_util::canonicalize(text, child.name()) else {
+                return false;
+            };
+            // The descendant's own start tag, as written in the seed.
+            let opened = format!("<{}", child.name());
+            let Some(start) = text.find(&opened) else {
+                return false;
+            };
+            let Some(end) = text[start..].find('>').map(|offset| start + offset) else {
+                return false;
+            };
+            canonical.contains("xmlns") && !text[start..end].contains("xmlns")
+        })
+        .count();
+    // EXACT, not a floor. Three of the four seeds reach inherited scope, so `>= 1` let two of
+    // them be replaced by documents that do not -- which is the mutation a reviewer used, and it
+    // passed. A floor with slack protects the PROPERTY while the corpus quietly shrinks toward
+    // the last seed that carries it.
+    assert_eq!(
+        reaching, 3,
+        "a canonicalization seed stopped reaching the inherited-scope path, or a new one started; \
+         either is a deliberate change to what this corpus explores"
+    );
 }
 
 /// The parse corpus covers BOTH answers, and the verify corpus reaches the signature path.
@@ -167,6 +213,30 @@ fn the_corpus_covers_both_answers_and_reaches_the_verifier() {
             .is_ok()
         })
         .count();
+    // AND ONE VERIFIES AT THE RESPONSE LEVEL. The fuzz target loops over both
+    // (ASSERTION_NS, "Assertion") and (PROTOCOL_NS, "Response"), and a fuzzer cannot forge a
+    // Response-level signature -- so without a seed that already carries one, the second half of
+    // that loop takes its `continue` on every iteration, forever. The double-signed document is
+    // also the exact shape the direct-child rule exists for, so a corpus without it exercises
+    // none of the reasoning the target is built on.
+    let at_response = seeds("saml_verify")
+        .into_iter()
+        .filter(|(_, bytes)| {
+            ironauth_saml::verify(
+                bytes,
+                &limits,
+                &anchors,
+                ironauth_saml::PROTOCOL_NS,
+                "Response",
+            )
+            .is_ok()
+        })
+        .count();
+    assert!(
+        at_response >= 1,
+        "no verify seed verifies at the Response level, so the target's Response branch is \
+         unreachable and the double-signed case it is designed around is never explored"
+    );
     assert!(
         verified >= 1,
         "no verify seed VERIFIES under the key the fuzz target embeds, so the target's accept \

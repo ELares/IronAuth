@@ -303,6 +303,49 @@ pub mod test_util {
         [&document[..start], &value, &document[end..]].concat()
     }
 
+    /// Add a RESPONSE-level enveloped signature to a document whose assertion is already signed.
+    ///
+    /// # The document this builds is the ordinary one, not an exotic one
+    ///
+    /// Okta and ADFS sign the Response AND the assertion inside it. That shape is why
+    /// `VerifiedAssertion::child_count` counts DIRECT children: verifying the Response returns a
+    /// subtree that still contains the assertion's signature, legitimately, because the Response
+    /// signature covered it. A descendant count answers one there and a verifier that used one
+    /// would refuse the commonest document in the field.
+    ///
+    /// Nothing in this crate could BUILD that document before, so the property was argued for in
+    /// three doc comments and exercised by nothing.
+    ///
+    /// # Panics
+    ///
+    /// If the document does not parse or has no `samlp:Response` element.
+    #[must_use]
+    pub fn sign_response(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        document: &str,
+    ) -> String {
+        // The digest is over the Response AS IT STANDS: the enveloped transform removes only the
+        // signature carrying the transform, which is the one being added, and it is not there
+        // yet. The assertion's own signature IS covered, which is the point of signing both.
+        let digest = digest_of(document, "samlp:Response");
+        let signed_info = signed_info_for("_response", &digest);
+        let open_end = document.find('>').expect("the Response start tag closes") + 1;
+        let stage = |value: &str| {
+            [
+                &document[..open_end],
+                &signature_element(&signed_info, value),
+                &document[open_end..],
+            ]
+            .concat()
+        };
+        // The Response's `SignedInfo` is FIRST in document order because the signature is spliced
+        // in as the first child, so canonicalising by qualified name reaches it and not the
+        // assertion's.
+        let message =
+            canonicalize(&stage(""), "ds:SignedInfo").expect("the staged SignedInfo parses");
+        stage(&base64(&key.sign(message.as_bytes())))
+    }
+
     /// The `SignedInfo` for one reference and digest.
     fn signed_info_for(id: &str, digest: &str) -> String {
         [

@@ -43,10 +43,34 @@ for block in re.findall(r"Coverage::Tests\(&\[(.*?)\]\)", source, re.S):
 if not names:
     print("saml-owasp-checklist: no Coverage::Tests rows found, which cannot be right", file=sys.stderr)
     raise SystemExit(1)
-# A FLOOR ON WHAT WAS PARSED. If the regex stops matching -- the enum is renamed, the rows are
-# reformatted -- an empty result would make this script pass while checking nothing.
-if len(names) < 20:
-    print(f"saml-owasp-checklist: parsed only {len(names)} names; the parser has drifted", file=sys.stderr)
+# EXACT COUNTS, IN THE OTHER FILE FROM THE TABLE. A floor with slack is what the previous
+# version had -- `len(names) < 20` against 44 actual -- so a row could be cut from four names to
+# one, or written in a shape the regex does not match (a hoisted `const` instead of an inline
+# `&[..]`, an array closing `] )`), and this script would print "clean" having checked fewer
+# names than it did yesterday. `re.findall` does not report what it skipped.
+#
+# The Rust side asserts the ROW counts and this side asserts the NAME and BLOCK counts, so the
+# two halves are no longer blind in opposite directions: a row that stops parsing here changes
+# BLOCKS without changing the row count there, and a row losing names changes NAMES.
+#
+# Both numbers live beside the thing they count, which is the weakest kind of bound. What they
+# buy is that a change has to be made deliberately, in two files, with the diff visible.
+BLOCKS = 18
+NAMES = 48
+blocks = re.findall(r"Coverage::Tests\(&\[(.*?)\]\)", source, re.S)
+if len(blocks) != BLOCKS:
+    print(
+        f"saml-owasp-checklist: parsed {len(blocks)} Coverage::Tests blocks, expected {BLOCKS}. "
+        "A row was added, removed, or written in a shape the parser does not match.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if len(names) != NAMES:
+    print(
+        f"saml-owasp-checklist: parsed {len(names)} test names, expected {NAMES}. "
+        "A row gained or lost a name.",
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 print("\n".join(sorted(set(names))))
 PY

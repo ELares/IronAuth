@@ -558,6 +558,7 @@ run "events-vs-webhooks guidance" python3 scripts/events-vs-webhooks.py --check
 run "metering stays off the hot path" scripts/metering-off-hot-path.sh
 
 run "fuzz matrix freshness (every registered fuzz target has a CI matrix row)" scripts/fuzz-matrix-freshness.sh
+run "saml owasp checklist (every named test exists)" scripts/saml-owasp-checklist.sh
 
 if command -v cargo-deny >/dev/null 2>&1; then
   run "cargo deny" cargo deny check

@@ -122,7 +122,7 @@ jobs:
     #
     # `!cancelled()` rather than a bare event check, because `needs: build` otherwise carries
     # an implicit `success()`: one crate failing to build would skip ALL TWENTY-ONE legs, so a
-    # single dead target would stop seventeen healthy parsers being fuzzed that night. That is
+    # single dead target would stop twenty healthy parsers being fuzzed that night. That is
     # a strictly worse version of the failure this PR exists to fix, and `fail-fast: false`
     # below says the opposite is intended. The ordering is kept for the log; the suppression
     # is not.

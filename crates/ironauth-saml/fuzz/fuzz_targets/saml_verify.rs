@@ -26,25 +26,37 @@
 //!
 //! # So what is asserted is what a correct verifier CANNOT violate
 //!
-//! 1. THE ELEMENT RETURNED IS THE ELEMENT ASKED FOR. `verify` selects candidates by resolved
-//!    namespace and local name, so the subtree it hands back must satisfy the same predicate.
-//!    A wrapping bug that returned a neighbouring element breaks it.
+//! 1. THE ELEMENT RETURNED IS THE ELEMENT ASKED FOR.
+//! 2. THE ENVELOPED SIGNATURE IS GONE: a verified assertion has no `ds:Signature` DIRECT CHILD,
+//!    because `verify` requires exactly one and the transform removes exactly that one. Direct
+//!    children only, which is what makes it survive the double-signed Response the previous
+//!    version died on: the assertion's signature is a child of the assertion, not of the
+//!    Response.
+//! 3. AND NO OTHER KEY WOULD HAVE DONE. Whatever verified under the pinned anchor must NOT
+//!    verify under a different real key. This is the only one of the three that depends on the
+//!    cryptography at all.
 //!
-//! 2. THE ENVELOPED SIGNATURE IS GONE. `verify` requires exactly one `ds:Signature` that is a
-//!    DIRECT CHILD of the candidate, and the enveloped transform removes exactly that one before
-//!    the digest, so a verified assertion has zero. This is the historical
-//!    authenticate-as-anyone defect stated as an invariant: that version digested a stripped
-//!    copy and returned the ORIGINAL, which still had its signature child and the forged content
-//!    hidden inside it. It is DIRECT children only, which is what makes it survive the
-//!    double-signed Response the previous version died on: the assertion's signature is a child
-//!    of the assertion, not of the Response.
+//! # WHICH MUTATIONS THIS KILLS, AND WHICH IT DOES NOT
 //!
-//! # And what a fuzzer still cannot do
+//! Stated because a reviewer measured it, and because the first two versions of this target both
+//! claimed coverage they did not have. Assertions 1 and 2 are decided BEFORE the digest is
+//! computed -- 1 restates the selection predicate, and 2 is settled the moment
+//! `strip_enveloped_signature` runs -- so neither can notice anything the signature check does.
 //!
-//! It cannot FORGE. Every `Ok` it reaches comes from a mutation that left the signature and the
-//! digest intact, so this explores the accept path's edges rather than its perimeter. The
-//! perimeter is `tests/wrapping.rs`, where each document is built deliberately. Neither
-//! substitutes for the other.
+//! KILLED: returning the un-stripped original subtree (the historical authenticate-as-anyone
+//! defect, caught by 2); relaxing the exactly-one-signature rule to "take the first", which
+//! leaves a second `Signature` child unstripped (2); ignoring the pinned anchors (3).
+//!
+//! NOT KILLED, and each is covered by a test in `tests/wrapping.rs` instead: deleting the digest
+//! comparison (`changing_a_signed_value_breaks_the_digest`), the exactly-one-candidate refusal
+//! (`a_forged_assertion_before_the_signed_one_is_refused`), and the duplicate-identifier guard
+//! (`an_enclosing_element_claiming_the_same_identifier_is_refused`). A fuzzer cannot forge, so
+//! it cannot build the document that separates a correct digest check from an absent one: that
+//! needs a signature over content the attacker chose, which is exactly what it does not have.
+//!
+//! The value here is therefore: no panics on any input, the accept path is exercised with a real
+//! key, and three invariants that no conforming document can violate. That is less than "every
+//! bypass class in one assertion", which is what the first version claimed.
 //!
 //! Run locally: `cargo +nightly fuzz run saml_verify` from `crates/ironauth-saml/fuzz`.
 #![no_main]
@@ -74,17 +86,52 @@ const FUZZ_KEY_PKCS8: &[u8] = &[
 ];
 
 /// The signed fixture and the anchor that verifies it, built once.
-fn pinned() -> &'static (Vec<u8>, Vec<ironauth_saml::TrustAnchor>) {
-    static PINNED: OnceLock<(Vec<u8>, Vec<ironauth_saml::TrustAnchor>)> = OnceLock::new();
+fn pinned() -> &'static Pinned {
+    static PINNED: OnceLock<Pinned> = OnceLock::new();
     PINNED.get_or_init(|| {
         let key = ironauth_jose::xmldsig::test_util::XmlTestKey::from_pkcs8(FUZZ_KEY_PKCS8)
             .expect("the embedded key loads");
         let document = ironauth_saml::test_util::signed_response(&key, "_assertion");
-        (
-            document.into_bytes(),
-            vec![ironauth_saml::TrustAnchor::EcdsaP256(key.public_point())],
-        )
+        let anchors = vec![ironauth_saml::TrustAnchor::EcdsaP256(key.public_point())];
+        // A SECOND REAL KEY, which signed nothing. Assertion 3 needs a key that could have
+        // verified something and did not: a syntactically valid point that is not on the curve
+        // would be refused by the primitive rather than by the signature, which is a different
+        // fact.
+        let stranger = ironauth_jose::xmldsig::test_util::XmlTestKey::generate();
+        let stranger_anchors =
+            vec![ironauth_saml::TrustAnchor::EcdsaP256(stranger.public_point())];
+
+        // THE CONTROL RUNS ONCE, HERE. It used to run on every iteration, and a reviewer
+        // measured what that cost: 50.8 microseconds of parse, canonicalization, SHA-256 and
+        // ECDSA against a CONSTANT document, which is 99.7% of an iteration that rejects its
+        // input. The fixture and the anchors are both behind this `OnceLock` and cannot change,
+        // so checking once gives the identical guarantee -- if the fixture ever stops verifying,
+        // the target asserts nothing, and this is where it says so.
+        assert!(
+            ironauth_saml::verify(
+                document.as_bytes(),
+                &ironauth_saml::Limits::default(),
+                &anchors,
+                ironauth_saml::ASSERTION_NS,
+                "Assertion",
+            )
+            .is_ok(),
+            "the embedded fixture must verify, or this target asserts nothing"
+        );
+
+        Pinned {
+            document: document.into_bytes(),
+            anchors,
+            stranger_anchors,
+        }
     })
+}
+
+/// The fixture, the anchor that verifies it, and a second real key that signed nothing.
+struct Pinned {
+    document: Vec<u8>,
+    anchors: Vec<ironauth_saml::TrustAnchor>,
+    stranger_anchors: Vec<ironauth_saml::TrustAnchor>,
 }
 
 /// The local part of a qualified name.
@@ -94,28 +141,17 @@ fn local_of(name: &str) -> &str {
 
 fuzz_target!(|data: &[u8]| {
     let limits = ironauth_saml::Limits::default();
-    let (fixture, anchors) = pinned();
-
-    // THE CONTROL, EVERY RUN. If the fixture ever stops verifying, every assertion below becomes
-    // vacuous in silence: the accept path would be unreachable again and the target would keep
-    // reporting success. So it is checked here rather than assumed.
-    assert!(
-        ironauth_saml::verify(
-            fixture,
-            &limits,
-            anchors,
-            ironauth_saml::ASSERTION_NS,
-            "Assertion",
-        )
-        .is_ok(),
-        "the embedded fixture must verify, or this target asserts nothing"
-    );
+    let pinned = pinned();
+    // The control lives in `pinned()` and runs once; see the note there.
+    let _ = &pinned.document;
 
     for (namespace, local) in [
         (ironauth_saml::ASSERTION_NS, "Assertion"),
         (ironauth_saml::PROTOCOL_NS, "Response"),
     ] {
-        let Ok(assertion) = ironauth_saml::verify(data, &limits, anchors, namespace, local) else {
+        let Ok(assertion) =
+            ironauth_saml::verify(data, &limits, &pinned.anchors, namespace, local)
+        else {
             continue;
         };
         assert_eq!(
@@ -128,6 +164,15 @@ fuzz_target!(|data: &[u8]| {
             0,
             "a verified {local} still carries the signature the enveloped transform removes, so \
              the caller can read content the digest did not cover"
+        );
+        // AND NO OTHER KEY WOULD HAVE DONE. The stranger is a real P-256 key that signed
+        // nothing, so a verifier that ignores its anchors, or that accepts any well-formed one,
+        // answers Ok here and a correct one cannot.
+        assert!(
+            ironauth_saml::verify(data, &limits, &pinned.stranger_anchors, namespace, local)
+                .is_err(),
+            "a document that verified under the pinned key also verified under a key that \
+             signed nothing"
         );
     }
 });
