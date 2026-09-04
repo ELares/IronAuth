@@ -177,7 +177,10 @@ fn encode_filter(filter: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(*byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out

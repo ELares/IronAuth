@@ -121,6 +121,7 @@ struct Inner {
     bearer: String,
     patch: PatchSupport,
     health: Health,
+    stale_reads: bool,
     users: BTreeMap<String, Value>,
     groups: BTreeMap<String, Value>,
     next_id: u64,
@@ -142,6 +143,7 @@ impl Downstream {
                 bearer: bearer.to_owned(),
                 patch: PatchSupport::Supported,
                 health: Health::Up,
+                stale_reads: false,
                 users: BTreeMap::new(),
                 groups: BTreeMap::new(),
                 next_id: 1,
@@ -164,6 +166,34 @@ impl Downstream {
             .expect("downstream state is not poisoned")
             .patch = PatchSupport::Unsupported;
         this
+    }
+
+    /// Answer every FILTERED QUERY as if it matched nothing, while writes keep working.
+    ///
+    /// # Why a downstream would do this, and why the client must survive it
+    ///
+    /// A downstream serving reads from a replica has read-after-write lag: a resource that was
+    /// just created is not yet visible to a query. A provisioning client that looks up before
+    /// creating then misses, POSTs, and meets the uniqueness constraint on a resource it created
+    /// itself moments ago.
+    ///
+    /// That 409 is not a failure and it is the WHOLE REASON the recovery path exists, so it has
+    /// to be reachable in a test. Without this switch a client could delete its 409 handling
+    /// entirely and every test would still pass, because a fixture with a perfect read view
+    /// never issues one.
+    ///
+    /// Reads only. A version that also failed writes would be an outage, which `Health` already
+    /// models and which is a different thing.
+    ///
+    /// # Panics
+    ///
+    /// If a previous holder of the state lock panicked. A poisoned fixture cannot answer
+    /// meaningfully, and a test that reached one has already failed for a better reason.
+    pub fn set_stale_reads(&self, stale: bool) {
+        self.inner
+            .lock()
+            .expect("downstream state is not poisoned")
+            .stale_reads = stale;
     }
 
     /// Take the downstream down, or bring it back up.
@@ -626,6 +656,11 @@ fn list_in(state: &Downstream, collection: &str, filter: Option<&str>) -> Respon
     let Some(filter) = filter else {
         return list_response(&store.values().cloned().collect::<Vec<_>>());
     };
+    if inner.stale_reads {
+        // The replica has not caught up. A valid, well-formed empty result, which is exactly
+        // what makes it dangerous: it is indistinguishable from a genuine miss.
+        return list_response(&[]);
+    }
     let Some((attr, literal)) = parse_eq_filter(filter) else {
         return scim_error(
             StatusCode::BAD_REQUEST,

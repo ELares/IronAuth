@@ -73,6 +73,7 @@ mod keys;
 mod locales;
 mod messages;
 mod scim_connections;
+pub mod scim_push_client;
 mod scim_push_connections;
 pub mod scim_push_transport;
 pub mod usage;

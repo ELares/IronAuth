@@ -118,6 +118,11 @@ wasm-hooks = ["ironauth-oidc/wasm-hooks"]
 # every real deploy and a suite that stays green.
 ironauth-hooks = { workspace = true, features = ["testing"] }
 
+# The reference downstream SCIM server (issue #137), test builds only. The outbound client is
+# measured against a server written from RFC 7644 BEFORE the client existed, rather than against
+# a mock that answers whatever the client sends.
+ironauth-scim = { workspace = true, features = ["downstream-fixture"] }
+
 # The hermetic fetcher seam (issue #674). Test builds only, so no production
 # binary can construct a fetcher that skips the OS trust store.
 ironauth-fetch = { workspace = true, features = ["test-harness"] }
@@ -821,4 +826,11 @@ required-features = ["testing"]
 [[test]]
 name = "authzen_agent_profile"
 path = "tests/authzen_agent_profile.rs"
+required-features = ["testing"]
+
+# THE OUTBOUND SCIM CLIENT (issue #137) against the reference downstream. No database: the
+# client's whole surface is HTTP, and the fixture answers in process.
+[[test]]
+name = "scim_push_client"
+path = "tests/scim_push_client.rs"
 required-features = ["testing"]
