@@ -19,8 +19,8 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewScimPushConnection, OrganizationId, ScimDeletionPolicy,
-    ScimPushBackfillState, ScimPushConnectionId, ScimWriteMode, Scope, StoreError,
+    CorrelationId, NewScimPushConnection, OrganizationId, ScimBackfillState, ScimDeletionPolicy,
+    ScimPushConnectionId, ScimWriteMode, Scope, StoreError,
 };
 
 fn now_micros(env: &Env) -> i64 {
@@ -121,7 +121,7 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
         Some("usr_500"),
         "the restart rewound the backfill"
     );
-    assert_eq!(resumed.backfill_state, ScimPushBackfillState::Users);
+    assert_eq!(resumed.backfill_state, ScimBackfillState::Users);
     assert_eq!(
         resumed.cursor_sequence, None,
         "a running backfill must not be tailing"
@@ -176,7 +176,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
         .expect("get")
         .expect("a state row");
     assert_eq!(tailing.cursor_sequence, Some(1));
-    assert_eq!(tailing.backfill_state, ScimPushBackfillState::Done);
+    assert_eq!(tailing.backfill_state, ScimBackfillState::Done);
     assert_eq!(
         tailing.backfill_after, None,
         "a completed backfill left its resume point behind"
@@ -394,7 +394,7 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
         .await
         .expect("get")
         .expect("a state row");
-    assert_eq!(restarted.backfill_state, ScimPushBackfillState::Users);
+    assert_eq!(restarted.backfill_state, ScimBackfillState::Users);
     // THE CURSOR IS CLEARED, which is what makes this safe rather than merely possible: a
     // connection that went back to enumerating must not also be tailing, and that is the
     // invariant the column CHECK states.
@@ -768,7 +768,7 @@ async fn every_backfill_state_round_trips_and_an_unknown_one_does_not() {
     let org = seed_org(&db, &env, scope, "Globex").await;
     let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
 
-    for state in ScimPushBackfillState::ALL.iter().copied() {
+    for state in ScimBackfillState::ALL.iter().copied() {
         let mut tx = db.app_pool().begin().await.expect("begin");
         for (name, value) in [
             ("ironauth.tenant_id", scope.tenant().to_string()),

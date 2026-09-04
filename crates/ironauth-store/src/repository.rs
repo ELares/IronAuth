@@ -74978,6 +74978,39 @@ impl ScimBackfillState {
             Self::Done => "done",
         }
     }
+
+    /// The stored value, or [`StoreError::NotFound`] if the column's CHECK and this enum have
+    /// drifted apart.
+    ///
+    /// Added when the push worker arrived. Before it there were two decode sites for this
+    /// vocabulary and both were inline `match` blocks, so the spellings were written three times
+    /// in one file. NotFound rather than a decode error, matching the house choice for a stored
+    /// value that no longer parses.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a value outside the vocabulary.
+    pub fn from_str(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "users" => Ok(Self::Users),
+            "groups" => Ok(Self::Groups),
+            "done" => Ok(Self::Done),
+            _ => Err(StoreError::NotFound),
+        }
+    }
+
+    /// Whether the connection may tail the feed.
+    #[must_use]
+    pub const fn is_done(self) -> bool {
+        matches!(self, Self::Done)
+    }
+
+    /// Whether the connection is part way through an enumeration.
+    #[must_use]
+    pub const fn is_enumerating(self) -> bool {
+        matches!(self, Self::Users | Self::Groups)
+    }
 }
 
 /// The columns every outbound-connection read selects, so one shape feeds one parser.
@@ -75012,13 +75045,7 @@ fn scim_push_connection_from_row(
         "delete" => ScimDeletionPolicy::Delete,
         _ => return Err(StoreError::NotFound),
     };
-    let backfill_state = match row.get::<String, _>("backfill_state").as_str() {
-        "pending" => ScimBackfillState::Pending,
-        "users" => ScimBackfillState::Users,
-        "groups" => ScimBackfillState::Groups,
-        "done" => ScimBackfillState::Done,
-        _ => return Err(StoreError::NotFound),
-    };
+    let backfill_state = ScimBackfillState::from_str(&row.get::<String, _>("backfill_state"))?;
     Ok(ScimPushConnection {
         id: ScimPushConnectionId::parse_in_scope(&row.get::<String, _>("id"), scope)
             .map_err(|_| StoreError::NotFound)?,
@@ -75716,69 +75743,6 @@ impl ScimPushLinkRepo<'_> {
     }
 }
 
-/// How far a connection has got through its initial enumeration (issue #137).
-///
-/// #137 requires the backfill to be RESUMABLE, which is why this is a state and not a boolean: a
-/// worker killed halfway is mid-enumeration with a resume point to continue from, and that is a
-/// different situation from one that has never started and one that has finished.
-///
-/// The vocabulary is 0189's, and it names WHICH collection is being enumerated. An earlier
-/// version of this type used ('pending', 'running', 'complete'), which cannot answer "has it
-/// finished the people but not the groups" -- a question an operator asks during a long backfill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScimPushBackfillState {
-    /// Enabled, nothing enumerated yet.
-    Pending,
-    /// Enumerating USERS. The backfill resume point says where to continue.
-    Users,
-    /// Users are done, enumerating GROUPS.
-    Groups,
-    /// Everything in scope is provisioned, so the connection may tail the feed.
-    Done,
-}
-
-impl ScimPushBackfillState {
-    /// Every state, for a test that wants to prove the Rust vocabulary and the column's CHECK
-    /// still agree.
-    pub const ALL: &'static [Self] = &[Self::Pending, Self::Users, Self::Groups, Self::Done];
-
-    /// The stored spelling, which is also the column's CHECK vocabulary.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Users => "users",
-            Self::Groups => "groups",
-            Self::Done => "done",
-        }
-    }
-
-    /// Whether the connection may tail the feed.
-    #[must_use]
-    pub const fn is_done(self) -> bool {
-        matches!(self, Self::Done)
-    }
-
-    /// Whether the connection is part way through an enumeration.
-    #[must_use]
-    pub const fn is_enumerating(self) -> bool {
-        matches!(self, Self::Users | Self::Groups)
-    }
-
-    fn from_str(value: &str) -> Result<Self, StoreError> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "users" => Ok(Self::Users),
-            "groups" => Ok(Self::Groups),
-            "done" => Ok(Self::Done),
-            // A value outside the vocabulary means the column's CHECK and this enum have
-            // drifted. NotFound rather than a decode error, matching the house choice for a
-            // stored value that no longer parses.
-            _ => Err(StoreError::NotFound),
-        }
-    }
-}
-
 /// One outbound connection's position in the feed and its health (issue #137).
 #[derive(Debug, Clone)]
 pub struct ScimPushSyncState {
@@ -75795,7 +75759,7 @@ pub struct ScimPushSyncState {
     /// way this value re-enters the feed, and nothing outside this module reads it as a number.
     pub cursor_sequence: Option<i64>,
     /// How far the initial enumeration has got.
-    pub backfill_state: ScimPushBackfillState,
+    pub backfill_state: ScimBackfillState,
     /// The subject the backfill reached, so a restart resumes rather than starts over.
     pub backfill_after: Option<String>,
     /// The newest feed sequence visible BEFORE this connection's backfill began.
@@ -75840,7 +75804,7 @@ fn scim_push_sync_state_from_row(
         connection_id: ScimPushConnectionId::parse_in_scope(row.try_get("connection_id")?, scope)
             .map_err(|_| StoreError::NotFound)?,
         cursor_sequence: row.try_get("cursor_sequence")?,
-        backfill_state: ScimPushBackfillState::from_str(&backfill_state)?,
+        backfill_state: ScimBackfillState::from_str(&backfill_state)?,
         backfill_after: row.try_get("backfill_after_id")?,
         backfill_from_sequence: row.try_get("backfill_from_sequence")?,
         last_polled_at_unix_micros: row.try_get("last_polled_at_micros")?,
