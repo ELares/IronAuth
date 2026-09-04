@@ -834,3 +834,11 @@ required-features = ["testing"]
 name = "scim_push_client"
 path = "tests/scim_push_client.rs"
 required-features = ["testing"]
+
+# THE PRODUCTION TRANSPORT (issue #137). Separate from the client suite because it constructs the
+# real hardened fetcher: what it measures is every decision made BEFORE a socket is opened, which
+# is where this seam's own behaviour lives.
+[[test]]
+name = "scim_push_transport"
+path = "tests/scim_push_transport.rs"
+required-features = ["testing"]

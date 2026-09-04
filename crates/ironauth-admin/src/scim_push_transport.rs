@@ -36,7 +36,7 @@ use serde_json::Value;
 /// above this seam can construct an absolute URL and reach a host the connection does not name.
 /// A client that built its own URLs would be a second outbound path, which is a second chance to
 /// send a directory somewhere nobody configured.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScimRequest {
     /// The HTTP method.
     pub method: http::Method,
@@ -71,6 +71,21 @@ impl ScimRequest {
         }
     }
 
+    /// A plain `GET` of one resource by its downstream id.
+    ///
+    /// Distinct from [`Self::query`] in the way that matters to convergence: a query is answered
+    /// by whatever view the downstream serves reads from and can lag, while this addresses one
+    /// resource by the id the server itself issued.
+    #[must_use]
+    pub fn get(path: impl Into<String>) -> Self {
+        Self {
+            method: http::Method::GET,
+            path: path.into(),
+            filter: None,
+            body: None,
+        }
+    }
+
     /// A `DELETE` (RFC 7644 section 3.6).
     #[must_use]
     pub fn delete(path: impl Into<String>) -> Self {
@@ -83,13 +98,45 @@ impl ScimRequest {
     }
 }
 
+/// Shape without contents.
+///
+/// The derived `Debug` printed the whole body, and a SCIM body is a person's directory record:
+/// name, e-mail addresses, employee number, manager, group membership. One `tracing` call, or one
+/// `.expect()` on a `Result` carrying a request, put that in a log that outlives the request and
+/// travels wherever logs are shipped. What an operator debugging a sync needs is which request
+/// went where, which is what this prints.
+impl std::fmt::Debug for ScimRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScimRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("has_filter", &self.filter.is_some())
+            .field("has_body", &self.body.is_some())
+            .finish()
+    }
+}
+
+/// Shape without contents, for the reason [`ScimRequest`]'s own `Debug` gives.
+///
+/// `scimType` is kept: it is a protocol constant rather than customer data, and it is the one
+/// field that tells a duplicate from a bad filter from a refusal.
+impl std::fmt::Debug for ScimResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScimResponse")
+            .field("status", &self.status)
+            .field("scim_type", &self.scim_type())
+            .field("has_body", &self.body.is_some())
+            .finish()
+    }
+}
+
 /// What a downstream said.
 ///
 /// The STATUS IS CARRIED, not reduced to a boolean, because the whole convergence protocol is
 /// written in status codes: 409 means a race the client recovers from, 501 means fall back to
 /// PUT, 404 means the mapping is stale, and 5xx means pause the cursor rather than skip the
 /// event. A boolean outcome would make all four the same answer.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScimResponse {
     /// The HTTP status.
     pub status: http::StatusCode,
@@ -101,8 +148,14 @@ impl ScimResponse {
     /// The `scimType` a SCIM error document carries (RFC 7644 section 3.12), if any.
     ///
     /// Read rather than inferred from the status: 409 is `uniqueness` when a resource already
-    /// exists, and a server may use it for other conflicts, so the client that treats a 409 as
-    /// "already provisioned" has to check which one it got.
+    /// exists, and a server may use it for other conflicts.
+    ///
+    /// What the client does with it today is REPORT it, not branch on it. `converge` answers a
+    /// 409 by re-querying, and a re-query that finds the resource converges whatever the conflict
+    /// was named, while one that finds nothing is a permanent refusal that quotes this value so
+    /// an operator can see which conflict the downstream meant. An earlier version of this
+    /// sentence said the handler "has to check which one it got", which described a branch that
+    /// does not exist.
     #[must_use]
     pub fn scim_type(&self) -> Option<&str> {
         self.body.as_ref()?.get("scimType")?.as_str()
@@ -125,6 +178,14 @@ pub enum ScimTransportError {
     Timeout,
     /// Anything else: connect failure, TLS failure, a truncated body.
     Transport,
+    /// The CONNECTION's own configuration cannot produce a request.
+    ///
+    /// A base URL carrying a query or a fragment, or a credential that is not a legal header
+    /// value. Distinct from [`Self::Transport`] because no retry can change the outcome: the same
+    /// stored configuration produces the same failure forever, and reporting it as a transport
+    /// failure makes a connection with a typo in its URL look like a downstream outage. The
+    /// operator has to edit the connection, and the health surface has to say so.
+    Configuration,
 }
 
 /// The one outbound path an outbound SCIM push has.
@@ -155,13 +216,32 @@ impl FetchScimTransport {
     }
 }
 
-/// Join a connection's base URL to a relative path, keeping exactly one slash between them.
+/// Join a connection's base URL to a caller-built path, keeping exactly one slash between them.
 ///
 /// A base URL an operator typed may or may not end in a slash, and a path always begins with one.
 /// Naive concatenation yields `.../scim/v2//Users`, which some servers 404 and others normalize:
 /// a difference that shows up as one downstream working and another not.
-fn join(base_url: &str, path: &str) -> String {
-    format!("{}{}", base_url.trim_end_matches('/'), path)
+/// Joins a connection's base URL to a SCIM path, or says why it cannot.
+///
+/// # Why this can fail
+///
+/// The base URL is OPERATOR SUPPLIED and points at somebody else's server, so it is untrusted
+/// input in the same sense a redirect URI is. Concatenating blindly has two holes:
+///
+///   * a base carrying a QUERY (`https://host/scim/v2?tenant=acme`) folds the whole SCIM path
+///     into that query, so `/Users` becomes part of a parameter value and every request is sent
+///     to the base path instead. A downstream that ignores unknown parameters answers 200 to a
+///     request that addressed nothing, and the client reads a create as a success.
+///   * a base carrying a FRAGMENT truncates the request at the `#`, with the same result.
+///
+/// Both are refused here rather than at the surface alone, because this is the last place that
+/// sees the two halves together, and a base URL stored before the surface learned to check it
+/// would otherwise still be used.
+fn join(base_url: &str, path: &str) -> Result<String, ScimTransportError> {
+    if base_url.contains('?') || base_url.contains('#') {
+        return Err(ScimTransportError::Configuration);
+    }
+    Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
 }
 
 /// Percent-encode a filter for a query string.
@@ -194,25 +274,30 @@ impl ScimTransport for FetchScimTransport {
         request: ScimRequest,
     ) -> impl Future<Output = Result<ScimResponse, ScimTransportError>> + Send {
         let fetcher = Arc::clone(&self.fetcher);
-        let mut url = join(base_url, &request.path);
-        if let Some(filter) = &request.filter {
-            url.push_str("?filter=");
-            url.push_str(&encode_filter(filter));
-        }
+        let joined = join(base_url, &request.path).map(|mut url| {
+            if let Some(filter) = &request.filter {
+                url.push_str("?filter=");
+                url.push_str(&encode_filter(filter));
+            }
+            url
+        });
         let authorization = format!("Bearer {bearer}");
         async move {
+            let url = joined?;
             let mut fetch = ironauth_fetch::FetchRequest::new(
                 ironauth_fetch::FetchPurpose::ScimPush,
                 request.method,
                 url,
             );
             let Ok(auth) = http::HeaderValue::from_str(&authorization) else {
-                // A credential that cannot be a header value never leaves the process, and it is
-                // NOT a transport failure to retry: the secret is malformed and every retry
-                // reproduces it. Reported as `Transport` because this seam does not classify
-                // configuration problems; the caller pauses and an operator sees the connection
-                // stop, which is the correct outcome for a credential that cannot be presented.
-                return Err(ScimTransportError::Transport);
+                // A credential that cannot be a header value never leaves the process, and no
+                // retry can change that: the same stored secret produces the same failure every
+                // time. `Configuration` rather than `Transport` because the two want different
+                // things from an operator -- one means edit the connection, the other means wait
+                // for the downstream -- and reporting this as a transport failure made a
+                // connection holding a malformed secret look exactly like a downstream outage,
+                // which is the one thing an operator would NOT investigate.
+                return Err(ScimTransportError::Configuration);
             };
             fetch = fetch.header(http::header::AUTHORIZATION, auth);
             fetch = fetch.header(
@@ -237,6 +322,19 @@ impl ScimTransport for FetchScimTransport {
                 }
                 Err(ironauth_fetch::FetchError::Blocked) => Err(ScimTransportError::Blocked),
                 Err(ironauth_fetch::FetchError::Timeout) => Err(ScimTransportError::Timeout),
+                // A PLAINTEXT BASE URL IS A TYPO, not an outage.
+                //
+                // The fetcher refuses `http` without an explicit opt-in, and it is right to: a
+                // bearer with authority over somebody else's directory would otherwise cross the
+                // network in clear. But the old catch-all called that `Transport`, so a
+                // connection whose URL was pasted with the wrong scheme retried for ever and its
+                // health read "the downstream could not be reached" -- pointing an operator at
+                // somebody else's server when the fix is one character of their own
+                // configuration. Found by this crate's own transport suite, which could not
+                // reach the address policy at all until the scheme stopped swallowing it.
+                Err(ironauth_fetch::FetchError::SchemeNotAllowed) => {
+                    Err(ScimTransportError::Configuration)
+                }
                 Err(_) => Err(ScimTransportError::Transport),
             }
         }
@@ -245,7 +343,7 @@ impl ScimTransport for FetchScimTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_filter, join};
+    use super::{ScimTransportError, encode_filter, join};
 
     #[test]
     fn a_base_url_and_a_path_join_with_exactly_one_slash() {
@@ -253,17 +351,41 @@ mod tests {
         // between them is a double slash some downstreams 404 and others normalize.
         assert_eq!(
             join("https://d.example/scim/v2", "/Users"),
-            "https://d.example/scim/v2/Users"
+            Ok("https://d.example/scim/v2/Users".to_owned())
         );
         assert_eq!(
             join("https://d.example/scim/v2/", "/Users"),
-            "https://d.example/scim/v2/Users"
+            Ok("https://d.example/scim/v2/Users".to_owned())
         );
         // And a base that is nothing but a host, which is what a server with SCIM at the root
         // gets configured as.
         assert_eq!(
             join("https://d.example", "/Users"),
-            "https://d.example/Users"
+            Ok("https://d.example/Users".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_base_url_carrying_a_query_or_a_fragment_is_refused() {
+        // Concatenating onto a base with a query folds the SCIM path INTO that query, so
+        // `/Users` becomes part of a parameter value and the request addresses the base path.
+        // A downstream that ignores unknown parameters answers 200, and the client reads a
+        // create that never happened as a success.
+        for base in [
+            "https://d.example/scim/v2?tenant=acme",
+            "https://d.example/scim/v2#frag",
+        ] {
+            assert_eq!(
+                join(base, "/Users"),
+                Err(ScimTransportError::Configuration),
+                "{base} was accepted"
+            );
+        }
+        // CONTROL: the same shape without the query joins, so the refusal is the query and not
+        // the path.
+        assert_eq!(
+            join("https://d.example/scim/v2", "/Users"),
+            Ok("https://d.example/scim/v2/Users".to_owned())
         );
     }
 
