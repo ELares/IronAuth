@@ -76073,22 +76073,48 @@ impl ScimPushSyncStateRepo<'_> {
 
     /// Record how far the backfill has enumerated, so a restart resumes from here.
     ///
+    /// # It carries the same two arguments as [`Self::advance`], and for the same two reasons
+    ///
+    /// This clears the identical failure state -- the count, the error and its time, the pause --
+    /// and an earlier version cleared it against no comparison at all. Its only predicate was the
+    /// backfill state, so a pass whose page was still in flight when another pass hit an outage
+    /// erased that pause on its way past. Naming the guard on one of two sibling writers and not
+    /// the other is the shape of a fix believed to be everywhere and applied in one place, so
+    /// `expected_failures` is compared here too.
+    ///
+    /// `delivered` is the same distinction. The caller runs this after EVERY enumerated subject,
+    /// and two of `push_one`'s arms return without sending anything: the subject was deleted
+    /// between the enumeration and the read, or the downstream already has no copy of it. A page
+    /// of fifty subjects that all vanished sent zero requests, and stamping `last_success_at`
+    /// fifty times told an operator the connection was delivering.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the connection is out of scope or has no state row,
-    /// [`StoreError::Database`] otherwise.
+    /// [`StoreError::NotFound`] if the connection is out of scope, has no state row, is not
+    /// enumerating, or its failure count is not `expected_failures`; [`StoreError::Database`]
+    /// otherwise.
     pub async fn record_backfill_progress(
         &self,
         connection_id: &ScimPushConnectionId,
         after: &str,
+        expected_failures: i32,
+        delivered: bool,
     ) -> Result<(), StoreError> {
         self.update_one(
             connection_id,
-            "SET backfill_after_id = $4, last_success_at = now(), consecutive_failures = 0, \
+            "SET backfill_after_id = $4, \
+                 last_success_at = CASE WHEN $6::bool THEN now() ELSE last_success_at END, \
+                 consecutive_failures = 0, \
                  last_error_at = NULL, last_error = NULL, paused_until = NULL, updated_at = now() \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
-               AND backfill_state IN ('users', 'groups')",
-            |query| query.bind(after.to_owned()),
+               AND backfill_state IN ('users', 'groups') \
+               AND consecutive_failures = $5::int",
+            |query| {
+                query
+                    .bind(after.to_owned())
+                    .bind(expected_failures)
+                    .bind(delivered)
+            },
         )
         .await
     }
@@ -76165,9 +76191,15 @@ impl ScimPushSyncStateRepo<'_> {
             // memory. And the value cannot be a bound satisfied by zero: a test could pass the
             // literal 0 for the argument and nothing noticed, where now the number has to have
             // been captured by `begin_backfill`.
+            // NO `last_success_at` HERE, and its absence is the point. The only caller runs
+            // this on the EMPTY groups page: the pass that completes a backfill is by
+            // construction the pass that found nothing left to enumerate, so it pushed nothing.
+            // Stamping a success there meant a connection whose scope matched nobody at all
+            // reported a fresh delivery having never sent one request. Every page that DID push
+            // stamped the column through `record_backfill_progress` on its way here.
             "SET backfill_state = 'done', backfill_after_id = NULL, \
                  backfill_after_created_at = NULL, cursor_sequence = backfill_from_sequence, \
-                 last_success_at = now(), updated_at = now() \
+                 updated_at = now() \
              WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
                AND backfill_state = 'groups'",
             |query| query,
@@ -76200,9 +76232,12 @@ impl ScimPushSyncStateRepo<'_> {
     /// are recorded against their subjects and stepped over deliberately, so the cursor moves and
     /// the poll clock moves; what did not happen is a delivery.
     ///
-    /// `record_backfill_progress` writes the column unconditionally and that is not the same
-    /// defect: it is called immediately after a downstream write this caller just watched
-    /// succeed, so the success it records is one it observed rather than one it assumed.
+    /// [`Self::record_backfill_progress`] is the same statement on the backfill path and carries
+    /// the same two arguments. An earlier draft of this paragraph exempted it, on the grounds
+    /// that it runs straight after a write its caller watched succeed. That was a claim in this
+    /// file about another one, and reading the caller refuted it: `run_backfill_pass` records
+    /// progress after every enumerated subject, including the two `push_one` arms that send
+    /// nothing at all.
     ///
     /// # The guard covers what the statement writes, not only the cursor
     ///

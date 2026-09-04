@@ -96,7 +96,7 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
         .expect("begin");
     state
         .scim_push_sync_state()
-        .record_backfill_progress(&connection, "usr_500")
+        .record_backfill_progress(&connection, "usr_500", 0, true)
         .await
         .expect("progress");
 
@@ -786,6 +786,165 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
     assert_eq!(
         due, 1,
         "a connection whose pause has expired is not due, so it would never run again"
+    );
+}
+
+#[tokio::test]
+async fn recording_backfill_progress_carries_the_same_two_guards_as_the_checkpoint() {
+    // WHY THIS EXISTS. `record_backfill_progress` clears the identical failure state the
+    // checkpoint clears -- the count, the error and its time, and the pause -- and it did so
+    // against no comparison at all, and stamped `last_success_at` whatever the subject did.
+    //
+    // Both are the defects that were fixed on the tail path, still live on the backfill path.
+    // Naming a guard on one of two sibling writers and calling the defect closed is how a fix
+    // gets believed to be everywhere while it is in one place.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+
+    // A subject that DID reach the downstream, so there is a success to be wrongly overwritten.
+    store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_100", 0, true)
+        .await
+        .expect("a delivered subject records progress");
+    let delivered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    let success_at = delivered
+        .last_success_at_unix_micros
+        .expect("a delivered subject records a success");
+
+    // A subject that was enumerated and then vanished: progress moves, the success does not.
+    store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_101", 0, false)
+        .await
+        .expect("a vanished subject still records progress");
+    let skipped = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(
+        skipped.backfill_after_id.as_deref(),
+        Some("usr_101"),
+        "progress must move: this subject will not be enumerated again"
+    );
+    assert_eq!(
+        skipped.last_success_at_unix_micros,
+        Some(success_at),
+        "a subject that reached no downstream claimed a delivery"
+    );
+
+    // AND THE OUTAGE STATE IS GUARDED. A pass that began before a failure cannot clear it.
+    let resume_at = now_micros(&env) + 60_000_000;
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "downstream answered 503", Some(resume_at))
+        .await
+        .expect("record the failure");
+    let stale = store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_102", 0, true)
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::NotFound)),
+        "a backfill record erased a failure state its caller never saw: {stale:?}"
+    );
+    let after = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(after.consecutive_failures, 1, "the failure count was reset");
+    assert!(
+        after.paused_until_unix_micros.is_some(),
+        "the pause was cleared"
+    );
+    assert_eq!(
+        after.backfill_after_id.as_deref(),
+        Some("usr_101"),
+        "the refused record moved progress anyway"
+    );
+
+    // A caller that DID see the failure still records, or an outage would freeze the backfill.
+    store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_102", 1, true)
+        .await
+        .expect("a caller holding the current failure count records progress");
+    let recovered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(recovered.consecutive_failures, 0);
+    assert_eq!(recovered.paused_until_unix_micros, None);
+}
+
+#[tokio::test]
+async fn completing_a_backfill_does_not_claim_a_success_it_never_made() {
+    // WHY THIS EXISTS. `complete_backfill` runs on the EMPTY groups page -- the pass that finds
+    // nothing left to enumerate -- and it stamped `last_success_at`. A connection whose scope
+    // filter matches nobody therefore reported a fresh delivery having never sent one request,
+    // which is the one case where an operator most needs the surface to say so.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+
+    let done = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert!(
+        done.backfill_state.is_done(),
+        "the backfill did not complete"
+    );
+    assert_eq!(
+        done.last_success_at_unix_micros, None,
+        "an empty scope claimed a delivery it never made"
+    );
+    assert_eq!(
+        done.cursor_sequence,
+        Some(0),
+        "completing must still hand the tail its starting position"
     );
 }
 

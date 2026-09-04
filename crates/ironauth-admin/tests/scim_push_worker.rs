@@ -107,6 +107,58 @@ impl ScimTransport for FixtureTransport {
     }
 }
 
+/// A transport that lets a SECOND writer move the connection's health state mid-pass.
+///
+/// The interleaving a checkpoint guard exists to refuse cannot be produced any other way from a
+/// test: the pass reads its state, does its work, and checkpoints, all inside one call. This runs
+/// `during` on the first request the pass sends, which is exactly the window between the read and
+/// the checkpoint.
+#[derive(Clone)]
+struct RacingTransport {
+    inner: FixtureTransport,
+    pool: sqlx::PgPool,
+    connection: String,
+    fired: Arc<Mutex<bool>>,
+}
+
+impl ScimTransport for RacingTransport {
+    fn send(
+        &self,
+        base_url: &str,
+        bearer: &str,
+        request: ScimRequest,
+    ) -> impl Future<Output = Result<ScimResponse, ScimTransportError>> + Send {
+        let first = {
+            let mut fired = self.fired.lock().expect("the flag is not poisoned");
+            let first = !*fired;
+            *fired = true;
+            first
+        };
+        let pool = self.pool.clone();
+        let connection = self.connection.clone();
+        let delegated = self.inner.send(base_url, bearer, request);
+        async move {
+            if first {
+                // ANOTHER WORKER'S PASS FAILS AGAINST THE SAME CONNECTION. Written straight to the
+                // table rather than through the repository, because what is being reproduced is a
+                // concurrent writer, not a call this pass makes.
+                sqlx::query(
+                    "UPDATE scim_push_connections \
+                     SET consecutive_failures = consecutive_failures + 1, \
+                         last_error = 'downstream answered 503', last_error_at = now(), \
+                         paused_until = now() + interval '60 seconds' \
+                     WHERE id = $1",
+                )
+                .bind(&connection)
+                .execute(&pool)
+                .await
+                .expect("the racing writer lands");
+            }
+            delegated.await
+        }
+    }
+}
+
 /// A directory the test controls: who exists, and who is in scope.
 #[derive(Clone, Default)]
 struct Directory {
@@ -590,6 +642,80 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
         h.downstream.users().is_empty(),
         "it pushed anyway: {:?}",
         h.downstream.users()
+    );
+}
+
+#[tokio::test]
+async fn losing_the_checkpoint_race_is_not_recorded_as_a_connection_failure() {
+    // WHY THIS EXISTS. Losing the compare-and-set answers `StoreError::NotFound`, and the driver
+    // recorded EVERY error as a connection failure: the loser wrote a failure count, an error
+    // string naming an internal condition, and a doubling pause. Nothing had failed. Two healthy
+    // workers on a healthy connection produced a paused connection whose downstream had returned
+    // nothing but success, and the three comments saying a lost race "is not a fault" were
+    // enforced nowhere.
+    //
+    // It compounds, which is why it is worth a test rather than a comment. The checkpoint now
+    // compares the failure count, so a spurious failure record invalidates the checkpoint of
+    // every other pass still in flight against that connection, and each of those records another.
+    let h = Harness::start().await;
+    let directory = Directory::with("usr_ada", "ada");
+    h.start_tailing_from(0).await;
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_1",
+        "user.created",
+        json!({ "user_id": "usr_ada", "state": "active" }),
+    )
+    .await;
+
+    let store = h.db.store().scoped(h.scope);
+    let racer = RacingTransport {
+        inner: FixtureTransport {
+            downstream: h.downstream.clone(),
+        },
+        pool: h.db.owner_pool().clone(),
+        connection: h.connection.to_string(),
+        fired: Arc::new(Mutex::new(false)),
+    };
+
+    let outcomes = run_due_connections(&store, h.scope, now_micros(&h.env), 50, |connection| {
+        Some((
+            ScimPushClient::new(racer.clone(), BASE, TOKEN, WriteMode::Patch),
+            directory.clone(),
+            connection.organization_id.to_string(),
+        ))
+    })
+    .await
+    .expect("the due listing reads");
+
+    // The pass DID its work: the downstream has the user. Only the checkpoint lost.
+    assert_eq!(
+        h.downstream.users().len(),
+        1,
+        "the pass never reached the downstream, so this proves nothing about the checkpoint"
+    );
+    assert!(
+        matches!(outcomes[0].1, Err(WorkerError::Contended)),
+        "a lost checkpoint race must be reported as contention: {:?}",
+        outcomes[0].1
+    );
+
+    let after = store
+        .scim_push_sync_state()
+        .get(&h.connection)
+        .await
+        .expect("get")
+        .expect("state");
+    // EXACTLY ONE failure, the racer's. A second means the driver recorded the lost race.
+    assert_eq!(
+        after.consecutive_failures, 1,
+        "losing the checkpoint race was counted as a connection failure: {after:?}"
+    );
+    assert_eq!(
+        after.last_error.as_deref(),
+        Some("downstream answered 503"),
+        "the lost race overwrote the real reason with an internal one"
     );
 }
 

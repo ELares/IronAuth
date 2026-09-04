@@ -135,9 +135,10 @@ pub struct ScimPushConnectionListView {
     /// never produce a request to any downstream. So it says how far back in the feed the worker
     /// is, and a surface built on it should say that rather than imply a queue of unsynced users.
     ///
-    /// It is measured against the head the feed will actually SERVE, which is not `MAX(sequence)`:
-    /// `newest_sequence` applies the same visibility watermark the reads do, or a connection that
-    /// had consumed everything on offer would report a distance that never reached zero.
+    /// It is the head the feed will actually SERVE, which is not simply the highest sequence in
+    /// the table: the feed withholds an event an older in-flight writer could still precede, and
+    /// this number withholds it too. Both sides of the subtraction therefore come from the same
+    /// feed, which is what lets a connection that has consumed everything on offer report zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feed_head_sequence: Option<i64>,
 }

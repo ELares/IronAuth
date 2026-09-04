@@ -49,10 +49,16 @@ fn expected_org(event_type: &str) -> Option<String> {
 }
 
 fn payload_for(event_type: &str) -> serde_json::Value {
-    // ONE BUILDER, shared with the worker suite. Two test files deriving a payload from the same
-    // registry by two copies of the same loop is two chances to get the derivation wrong, and the
-    // worker suite's copy WAS wrong: it filled an array property with `[]` against a schema that
-    // requires an item. Neither file noticed, because neither validated what it built.
+    // ONE BUILDER, shared with the worker suite, and THIS file is where the loop used to live.
+    // The worker suite hand-wrote its envelopes instead, so pointing it at a derivation meant
+    // giving it this one -- and the moment its output was validated, the loop's own defect
+    // surfaced: it filled an array property with `[]` against a schema requiring an item. It had
+    // sat here unnoticed because nothing in this file validates what it builds either; the
+    // classification tests only ever read the properties they name.
+    //
+    // So the builder now honours `enum`, `minItems` and the item type rather than the top-level
+    // `type` alone, and it lives in one place. What actually holds it to the registry is the
+    // worker suite calling `validate_event` on the envelope it produces.
     ironauth_store::test_support::registry_payload(event_type, &json!({}))
 }
 

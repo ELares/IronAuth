@@ -34774,7 +34774,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The newest sequence in this environment's event feed, absent when the feed is empty.\n\nThe OTHER half of criterion 2's lag, reported once for the page rather than per row\nbecause it is the same number for every connection in the scope. A connection's lag is\nthis minus its own `cursor_sequence`."
+            "description": "The newest sequence in this environment's event feed, absent when the feed is empty.\n\nThe OTHER half of criterion 2's lag, reported once for the page rather than per row\nbecause it is the same number for every connection in the scope. A connection's lag is\nthis minus its own `cursor_sequence`.\n\nThe difference counts FEED POSITIONS, not people waiting to be provisioned. The feed\ncarries every event the environment emits and a SCIM connection translates almost none of\nthem: a sign-in, a token issuance and a consent are each one of \"600 behind\" that will\nnever produce a request to any downstream. So it says how far back in the feed the worker\nis, and a surface built on it should say that rather than imply a queue of unsynced users.\n\nIt is the head the feed will actually SERVE, which is not simply the highest sequence in\nthe table: the feed withholds an event an older in-flight writer could still precede, and\nthis number withholds it too. Both sides of the subtraction therefore come from the same\nfeed, which is what lets a connection that has consumed everything on offer report zero."
           },
           "items": {
             "type": "array",

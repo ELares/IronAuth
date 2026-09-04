@@ -67,9 +67,27 @@ pub struct Progress {
 /// Why a pass stopped early.
 #[derive(Debug)]
 pub enum WorkerError {
-    /// The store refused something. Includes the compare-and-set losing to another worker, which
-    /// is not a fault: it means this connection is somebody else's right now.
+    /// The store refused something. A genuine fault: a database error, a missing state row, a
+    /// connection that is out of scope.
+    ///
+    /// NOT the compare-and-set losing. That has its own variant, because this one is recorded as
+    /// a connection failure and pauses the connection.
     Store(StoreError),
+    /// This pass lost the checkpoint race to another worker, so its page was already applied.
+    ///
+    /// SEPARATE FROM `Store` BECAUSE IT IS NOT A FAULT, and treating it as one was a defect that
+    /// fed itself. Losing the race answers `StoreError::NotFound`, which reached
+    /// `record_connection_failure` like any other store error: the loser wrote
+    /// `consecutive_failures + 1`, an error string naming an internal condition, and a doubling
+    /// pause -- so two healthy workers on one healthy connection produced a paused connection
+    /// whose downstream had never returned anything but success.
+    ///
+    /// The checkpoint guard makes it compound. It compares `consecutive_failures`, so the failure
+    /// the loser records invalidates the checkpoint of every OTHER pass still in flight against
+    /// that connection, and each of those records a failure of its own.
+    ///
+    /// The correct response is to do nothing at all: the work was done, by whoever won.
+    Contended,
     /// The downstream could not be converged and the failure is worth retrying.
     ///
     /// The cursor is deliberately NOT advanced, so the events stay ahead of the checkpoint.
@@ -293,7 +311,10 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
     // outage, ran slowly, and then succeeded against a stale view would erase a pause set while
     // it was in flight and resume into a downstream that was still down.
     let next = last_sequence.expect("the page is not empty");
-    store
+    // MAPPED HERE, at the ONE call whose `NotFound` means contention rather than a fault. Doing it
+    // in `From<StoreError>` would have swallowed every other `NotFound` in the pass -- a missing
+    // state row, a connection out of scope -- and called those contention too.
+    match store
         .scim_push_sync_state()
         .advance(
             pass.connection_id,
@@ -305,7 +326,12 @@ pub async fn run_tail_pass<T: ScimTransport, S: SubjectSource>(
             // subject was refused delivered nothing either.
             progress.converged + progress.deprovisioned > 0,
         )
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        Err(StoreError::NotFound) => return Err(WorkerError::Contended),
+        Err(other) => return Err(WorkerError::Store(other)),
+    }
     progress.checkpointed = true;
     Ok(progress)
 }
@@ -621,15 +647,29 @@ pub async fn run_backfill_pass<T: ScimTransport, S: SubjectSource>(
         ..Progress::default()
     };
     let mut furthest = None;
+    // THE FAILURE COUNT THIS PASS HOLDS, which the first successful record clears to zero. The
+    // checkpoint compares it, so carrying the value read at the top of the pass through the whole
+    // loop would make every record after the first one lose its own guard.
+    let mut expected_failures = state.consecutive_failures;
     for subject_id in &subjects {
+        let pushed_before = progress.converged;
         push_one(store, &pass, collection, subject_id, &mut progress).await?;
         // RECORDED AFTER EACH SUBJECT, so a crash resumes from the last one that actually
         // landed rather than from the start of the page.
         furthest = Some(subject_id.clone());
         store
             .scim_push_sync_state()
-            .record_backfill_progress(pass.connection_id, subject_id)
+            .record_backfill_progress(
+                pass.connection_id,
+                subject_id,
+                expected_failures,
+                // WHETHER THIS SUBJECT REACHED THE DOWNSTREAM. `push_one` returns Ok without
+                // sending anything when the subject was deleted between the enumeration and the
+                // read, or when the downstream already has no copy of it.
+                progress.converged > pushed_before,
+            )
             .await?;
+        expected_failures = 0;
     }
     debug_assert!(furthest.is_some(), "a non-empty page recorded no progress");
     Ok(progress)
@@ -786,6 +826,9 @@ async fn record_connection_failure(
         WorkerError::Permanent(why) => (why.clone(), None),
         WorkerError::Retryable(why) => (why.clone(), Some(())),
         WorkerError::Store(error) => (format!("the store refused the pass: {error:?}"), Some(())),
+        // NOT RECORDED AT ALL. Another worker checkpointed this connection's page; nothing failed,
+        // and the health surface must not say something did.
+        WorkerError::Contended => return Ok(()),
     };
     let deadline = pause.map(|()| {
         // Doubling from a second, capped. `consecutive_failures` is the count BEFORE this failure,
