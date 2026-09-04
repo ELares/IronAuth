@@ -2705,6 +2705,11 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{org_base}/scim-push-connections"),
         ),
+        Case::empty(
+            "scim_push_connections.listScimPushResources",
+            "GET",
+            format!("{org_base}/scim-push-connections/{scim_push_connection}/resources"),
+        ),
         Case::json(
             "scim_push_connections.setScimPushConnectionActive",
             "PUT",

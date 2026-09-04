@@ -265,6 +265,7 @@ fn operation_ids_are_the_stable_set() {
             "listRoutingRules",
             "listScimConnections",
             "listScimPushConnections",
+            "listScimPushResources",
             "listSecrets",
             "listServiceAccountApiKeys",
             "listSessionTokenTemplates",
@@ -414,6 +415,7 @@ fn every_list_endpoint_documents_cursor_pagination() {
         "listOrgRolePermissions",
         "listScimConnections",
         "listScimPushConnections",
+        "listScimPushResources",
         "listPermissions",
         "listResourceServers",
     ] {
@@ -666,6 +668,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/permissions/{permission_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/queues",
@@ -921,7 +924,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        286,
+        287,
         "the documented route count is pinned"
     );
 

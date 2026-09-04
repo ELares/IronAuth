@@ -1552,6 +1552,43 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0191_scim_push_sync_state.sql"),
         },
+        Migration {
+            version: 192,
+            name: "scim_push_worker_grants",
+            // EXPAND: two new columns, one new index, one new CHECK, and the column-scoped
+            // UPDATE grant 0189 deferred until the worker existed. An old binary neither reads
+            // nor writes any of it. The CHECK is satisfied by every existing row, because
+            // `cursor_sequence` is NULL until a worker sets it and no worker has run.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0192_scim_push_worker_grants.sql"),
+        },
+        Migration {
+            version: 193,
+            name: "drop_scim_push_sync_state",
+            // CONTRACT: removes the duplicate table 0191 should not have added. Its only
+            // consumer moves to `scim_push_connections` in the same change, and no deployment
+            // has run a worker against either shape, so the table is empty wherever it exists.
+            phase: Phase::Contract,
+            sql: include_str!("../migrations/0193_drop_scim_push_sync_state.sql"),
+        },
+        Migration {
+            version: 194,
+            name: "drop_scim_push_control_policy",
+            // CONTRACT: removes a permissive policy whose predicates are identical to the
+            // unqualified one beside it. Permissive policies are OR'd, so it never widened or
+            // narrowed anything, and an old binary sees no change in what it can read or write.
+            phase: Phase::Contract,
+            sql: include_str!("../migrations/0194_drop_scim_push_control_policy.sql"),
+        },
+        Migration {
+            version: 195,
+            name: "scim_push_link_deprovisioned",
+            // EXPAND: one nullable column, one partial index and one column-scoped grant. Every
+            // existing row reads as provisioned, which is what it was, and an old binary neither
+            // selects nor writes it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0195_scim_push_link_deprovisioned.sql"),
+        },
     ]
 }
 

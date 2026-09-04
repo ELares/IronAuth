@@ -87,6 +87,27 @@ pub struct ScimPushConnectionView {
     /// The last success, in milliseconds since the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_success_at_unix_ms: Option<i64>,
+    /// The feed sequence this connection has read through, absent until it starts tailing.
+    ///
+    /// Criterion 2's "cursor position". Compare with `feed_head_sequence` on the listing to get
+    /// LAG. The two are reported separately rather than as one subtracted number, because a
+    /// caller shown only "600 behind" cannot tell a connection that has stalled from one whose
+    /// feed has simply grown, and those need different responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_sequence: Option<i64>,
+    /// When the worker last LOOKED, including polls that found nothing.
+    ///
+    /// What separates "idle because the feed is quiet" from "idle because the worker is wedged".
+    /// `last_success_at_unix_ms` moves only when something was written downstream, so on its own
+    /// it cannot tell those apart, and they need opposite responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_polled_at_unix_ms: Option<i64>,
+    /// While this is in the future the worker is skipping this connection after a failure.
+    ///
+    /// Present so an operator seeing a stalled cursor can tell a deliberate backoff from a
+    /// stopped worker without reading logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_until_unix_ms: Option<i64>,
 }
 
 /// A page of outbound connections.
@@ -102,6 +123,24 @@ pub struct ScimPushConnectionListView {
     /// a parameter no client can use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// The newest sequence in this environment's event feed, absent when the feed is empty.
+    ///
+    /// The OTHER half of criterion 2's lag, reported once for the page rather than per row
+    /// because it is the same number for every connection in the scope. A connection's lag is
+    /// this minus its own `cursor_sequence`.
+    ///
+    /// The difference counts FEED POSITIONS, not people waiting to be provisioned. The feed
+    /// carries every event the environment emits and a SCIM connection translates almost none of
+    /// them: a sign-in, a token issuance and a consent are each one of "600 behind" that will
+    /// never produce a request to any downstream. So it says how far back in the feed the worker
+    /// is, and a surface built on it should say that rather than imply a queue of unsynced users.
+    ///
+    /// It is the head the feed will actually SERVE, which is not simply the highest sequence in
+    /// the table: the feed withholds an event an older in-flight writer could still precede, and
+    /// this number withholds it too. Both sides of the subtraction therefore come from the same
+    /// feed, which is what lets a connection that has consumed everything on offer report zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feed_head_sequence: Option<i64>,
 }
 
 /// What a create names.
@@ -149,10 +188,6 @@ pub struct SetScimPushActiveRequest {
     pub active: bool,
 }
 
-fn micros_to_millis(micros: i64) -> i64 {
-    micros / 1_000
-}
-
 fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionView {
     ScimPushConnectionView {
         id: connection.id.to_string(),
@@ -168,7 +203,86 @@ fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionVi
         backfill_state: connection.backfill_state.as_str().to_owned(),
         consecutive_failures: connection.consecutive_failures,
         last_error: connection.last_error.clone(),
-        last_success_at_unix_ms: connection.last_success_at_unix_micros.map(micros_to_millis),
+        last_success_at_unix_ms: connection
+            .last_success_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        cursor_sequence: connection.cursor_sequence,
+        last_polled_at_unix_ms: connection
+            .last_polled_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        paused_until_unix_ms: connection
+            .paused_until_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+    }
+}
+
+/// What a connection calls one subject downstream, and how that subject's last push went.
+///
+/// Criterion 2's "per-resource errors". The connection-level health next door answers "is this
+/// downstream reachable"; this answers "which PEOPLE are failing, and with what", which is a
+/// different question and the one an operator asks second.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ScimPushResourceView {
+    /// IronAuth's own id for the subject.
+    pub subject_id: String,
+    /// `user` or `group`.
+    pub resource_type: String,
+    /// What the downstream calls it. Server-issued there, opaque here.
+    pub downstream_id: String,
+    /// The `externalId` this connection sent for the subject.
+    ///
+    /// Recorded rather than recomputed: a connection's attribute mapping can change what is
+    /// sent, and an operator asking "what did we tell them this person was called" wants what
+    /// WAS sent, not what would be sent now.
+    pub external_id: String,
+    /// When this subject was last pushed successfully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced_at_unix_ms: Option<i64>,
+    /// When this subject last failed to push.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at_unix_ms: Option<i64>,
+    /// When this subject was withdrawn downstream, absent while it is provisioned.
+    ///
+    /// Present because the link row SURVIVES a withdrawal so a rehire resolves through it. Without
+    /// it this listing reported a departed person with a `last_synced_at` and no error, which is
+    /// indistinguishable from a healthy one: an operator auditing who still has access would have
+    /// read the removed people as present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprovisioned_at_unix_ms: Option<i64>,
+    /// What that failure said, truncated to the column's bound.
+    ///
+    /// Cleared on the next success, because recording a success and clearing the failure are the
+    /// same event: a stale error here would make this surface answer a question about the past.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// A page of one connection's per-resource state.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ScimPushResourceListView {
+    /// The subjects this connection has provisioned, oldest first.
+    pub items: Vec<ScimPushResourceView>,
+    /// The cursor for the next page, absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn resource_view(link: &ironauth_store::ScimPushLink) -> ScimPushResourceView {
+    ScimPushResourceView {
+        subject_id: link.subject_id.clone(),
+        resource_type: link.resource_type.as_str().to_owned(),
+        downstream_id: link.downstream_id.clone(),
+        external_id: link.external_id.clone(),
+        last_synced_at_unix_ms: link
+            .last_synced_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        last_error_at_unix_ms: link
+            .last_error_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        deprovisioned_at_unix_ms: link
+            .deprovisioned_at_unix_micros
+            .map(crate::scim_connections::micros_to_millis),
+        last_error: link.last_error.clone(),
     }
 }
 
@@ -181,47 +295,63 @@ fn view(connection: &ironauth_store::ScimPushConnection) -> ScimPushConnectionVi
 /// difference between a validation error and a connection that silently never works.
 fn check_base_url(value: &str) -> Result<String, ApiError> {
     let value = require_non_empty(value, "base_url")?;
-    let refuse = |why: &str| {
-        Err(ApiError::BadRequest(format!(
-            "invalid_base_url: base_url must be an https URL with a host, because the push \
-             worker refuses plaintext HTTP and a stored one would fail on every pass ({why})"
-        )))
-    };
-    let Some(rest) = value.strip_prefix("https://") else {
-        return refuse("no https scheme");
-    };
-    // THE AUTHORITY, up to whichever delimiter ends it first. The first version of this check
-    // was `starts_with("https://")` and nothing else, so the literal string `https://` -- no
-    // host at all -- was accepted and stored, which is precisely the deferral this function's
-    // own doc says it exists to prevent.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // THE HOST, which is the authority with any port removed. Checking the authority alone was
-    // not enough: `https://:8080/scim` has a NON-EMPTY authority (`:8080`) and no host at all,
-    // so the first version of this check accepted it. The bare `https://` case it was written
-    // for is the same defect with the port left off.
-    //
-    // AN IPv6 LITERAL IS BRACKETED (RFC 3986 section 3.2.2) and its address is full of colons,
-    // so splitting on the first one would call the host `[`. That still ACCEPTS, which is the
-    // right answer for `https://[::1]/scim`, but by accident: the value would be garbage under
-    // a name that says otherwise, and the next person to use it for anything would be wrong.
-    let host = match authority.strip_prefix('[') {
-        Some(rest) => rest.split_once(']').map_or("", |(inside, _)| inside),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    if host.is_empty() {
-        return refuse("no host");
-    }
-    if authority.contains('@') {
-        // Userinfo in a stored base URL is a credential smuggled into a field that is not the
-        // credential field, and it is the classic way to make a URL read as one host and
-        // resolve as another.
-        return refuse("userinfo is not allowed");
-    }
-    if value.chars().any(char::is_whitespace) {
-        return refuse("whitespace");
-    }
+    // A TEXT-COLUMN BOUND, not a URL rule, so it stays here: 0189's `octet_length` CHECK would
+    // otherwise reach the caller as SQLSTATE 23514 and a 500 nobody predicted.
     if value.len() > MAX_BASE_URL_BYTES {
-        return refuse("too long");
+        return Err(ApiError::BadRequest(format!(
+            "invalid_base_url: base_url must be at most {MAX_BASE_URL_BYTES} bytes"
+        )));
+    }
+    // NOT A HAND-WRITTEN GRAMMAR. The first version restated the fetcher's URL rules by hand
+    // (scheme prefix, authority split, host emptiness, userinfo, IPv6 brackets) and drifted from
+    // them in both directions: it REFUSED `HTTPS://host/scim`, which the fetcher accepts because
+    // RFC 3986 makes the scheme case insensitive, and it ACCEPTED `https://host:0/scim` and
+    // `https://host:99999/scim`, which the fetcher refuses as malformed. A base URL accepted here
+    // and refused there is stored and then fails on every push for ever, which is the exact
+    // failure this function's own message says it exists to prevent.
+    //
+    // `external_issuers.rs` shipped that identical defect against `jwks_uri` and was corrected to
+    // call `parse_target`; its comment names the same two divergences. This is the same
+    // correction in the outbound SCIM half, not a claim about that one.
+    //
+    // `parse_target` is also the function the FETCHER itself runs, so agreement is by
+    // construction rather than by two copies being kept in step.
+    let target = ironauth_fetch::parse_target(&value).map_err(|error| {
+        ApiError::BadRequest(format!(
+            "invalid_base_url: base_url is not a URL the hardened fetcher can resolve \
+             ({error:?}), so the push worker could never reach it"
+        ))
+    })?;
+    if target.scheme != ironauth_fetch::Scheme::Https {
+        return Err(ApiError::BadRequest(
+            "invalid_base_url: base_url must be an https URL, because the push worker sends a \
+             bearer token with authority over somebody else's directory and refuses to send it \
+             in clear"
+                .to_owned(),
+        ));
+    }
+    // NOT REFUSING A LITERAL ADDRESS HERE, deliberately. `external_issuers.rs` additionally runs
+    // `classify` on `target.literal_ip` and refuses a loopback or metadata address at
+    // configuration time, and the same argument would apply to a push connection: one pointed at
+    // an address the fetcher blocks can never sync.
+    //
+    // It is left out because it is a BEHAVIOUR CHANGE rather than part of undoing the
+    // duplication, and mixing the two makes both harder to review and to revert. An existing
+    // test stores `https://[2001:db8::1]/scim/v2`, which `classify` refuses as documentation
+    // range, so adding the guard silently changes what this surface accepts. That deserves its
+    // own change with its own reasoning about which classes are worth refusing early, given the
+    // fetcher refuses them at push time anyway.
+    // WHAT `parse_target` DOES NOT EXPRESS, because it is about this caller's own path building
+    // rather than about URLs: a base carrying a query or a fragment folds the SCIM path into it,
+    // so `/Users` becomes part of a parameter value and every request addresses the base path.
+    // `scim_push_transport::join` refuses it too and calls itself the last place that sees both
+    // halves; refusing here as well means an operator learns at save time.
+    if value.contains('?') || value.contains('#') {
+        return Err(ApiError::BadRequest(
+            "invalid_base_url: base_url must not carry a query or a fragment, because the SCIM \
+             path is appended to it and would be folded into one"
+                .to_owned(),
+        ));
     }
     Ok(value)
 }
@@ -468,6 +598,97 @@ pub async fn list_scim_push_connections(
     });
     let body = serde_json::to_string(&ScimPushConnectionListView {
         items: connections.iter().map(view).collect(),
+        next_cursor,
+        // READ ONCE FOR THE PAGE. It is the same number for every connection in the scope, so a
+        // per-row query would be one round trip per connection to learn one fact.
+        feed_head_sequence: state
+            .store()
+            .scoped(scope)
+            .outbox()
+            .newest_sequence()
+            .await
+            .map_err(|_| ApiError::Internal)?,
+    })
+    .map_err(|_| ApiError::Internal)?;
+    Ok(json(StatusCode::OK, body))
+}
+
+/// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources`
+#[utoipa::path(
+    get,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources",
+    operation_id = "listScimPushResources",
+    tag = "scim",
+    params(
+        ("tenant_id" = String, Path, description = "Tenant identifier"),
+        ("environment_id" = String, Path, description = "Environment identifier"),
+        ("organization_id" = String, Path, description = "Organization identifier"),
+        ("connection_id" = String, Path, description = "Outbound SCIM connection identifier"),
+        ListQuery
+    ),
+    responses(
+        (status = 200, description = "The subjects this connection has provisioned, with per-resource error state", body = ScimPushResourceListView),
+        (status = 400, description = "A malformed cursor or limit", body = crate::error::ErrorBody),
+        (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorBody),
+        (status = 403, description = "The credential may not read this organization", body = crate::error::ErrorBody),
+        (status = 404, description = "No such live organization or connection", body = crate::error::ErrorBody),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_scim_push_resources(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, connection_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<ListQuery>,
+) -> Result<Response, ApiError> {
+    let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102). READ, like the connection listing beside it: this
+    // carries no credential and changes nothing, so it is a strictly smaller capability than
+    // pointing a connection somewhere.
+    principal.require_permission(ManagementPermission::Read)?;
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Read,
+    )
+    .await?;
+    let id = ScimPushConnectionId::parse_in_scope(&connection_id, &scope)
+        .map_err(|_| ApiError::NotFound)?;
+
+    // THE CONNECTION IS RESOLVED THROUGH THE ORGANIZATION, not merely parsed. A caller holding a
+    // credential for organization A must not read organization B's provisioning state by naming
+    // B's connection id in A's path: the id is unguessable, but "unguessable" is not an
+    // authorization check, and the whole point of the org confinement surface is that the
+    // organization comes from the credential rather than the request.
+    let connection = state
+        .store()
+        .scoped(scope)
+        .scim_push_connections()
+        .find_in_org(&org_id, &id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    let page = Pagination::resolve(&query, state.default_page_size(), state.max_page_size())?;
+    let links = state
+        .store()
+        .scoped(scope)
+        .scim_push_links()
+        .list_for_connection(&connection.id, page.fetch_limit(), page.after())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    let (links, next_cursor) = page.finish(links, |link| {
+        (link.created_at_unix_micros, link.id.to_string())
+    });
+    let body = serde_json::to_string(&ScimPushResourceListView {
+        items: links.iter().map(resource_view).collect(),
         next_cursor,
     })
     .map_err(|_| ApiError::Internal)?;

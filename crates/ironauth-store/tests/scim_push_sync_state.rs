@@ -19,8 +19,8 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewScimPushConnection, OrganizationId, ScimDeletionPolicy,
-    ScimPushBackfillState, ScimPushConnectionId, ScimWriteMode, Scope, StoreError,
+    CorrelationId, NewScimPushConnection, OrganizationId, ScimBackfillState, ScimDeletionPolicy,
+    ScimPushConnectionId, ScimWriteMode, Scope, StoreError,
 };
 
 fn now_micros(env: &Env) -> i64 {
@@ -91,12 +91,12 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
 
     state
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     state
         .scim_push_sync_state()
-        .record_backfill_progress(&connection, "usr_500")
+        .record_backfill_progress(&connection, "usr_500", 0, true)
         .await
         .expect("progress");
 
@@ -106,7 +106,7 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
     // a large org means re-pushing tens of thousands of users.
     state
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin again after a restart");
 
@@ -117,13 +117,13 @@ async fn a_backfill_resumes_where_it_stopped_rather_than_starting_over() {
         .expect("get")
         .expect("a state row");
     assert_eq!(
-        resumed.backfill_after.as_deref(),
+        resumed.backfill_after_id.as_deref(),
         Some("usr_500"),
         "the restart rewound the backfill"
     );
-    assert_eq!(resumed.backfill_state, ScimPushBackfillState::Running);
+    assert_eq!(resumed.backfill_state, ScimBackfillState::Users);
     assert_eq!(
-        resumed.cursor, None,
+        resumed.cursor_sequence, None,
         "a running backfill must not be tailing"
     );
 }
@@ -139,7 +139,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
 
@@ -149,12 +149,7 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
     // arriving through the one door the externalId lookup does not cover.
     let early = store
         .scim_push_sync_state()
-        .advance(
-            &connection,
-            Some("cursor-0"),
-            "cursor-1",
-            Some(now_micros(&env)),
-        )
+        .advance(&connection, Some(0), 0, 1, true)
         .await;
     assert!(
         matches!(early, Err(StoreError::NotFound)),
@@ -165,17 +160,17 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
     // is the backfill state doing the refusing and not the call being broken.
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "cursor-0")
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(
-            &connection,
-            Some("cursor-0"),
-            "cursor-1",
-            Some(now_micros(&env)),
-        )
+        .advance(&connection, Some(0), 0, 1, true)
         .await
         .expect("tailing starts once the backfill is done");
 
@@ -185,10 +180,10 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
         .await
         .expect("get")
         .expect("a state row");
-    assert_eq!(tailing.cursor.as_deref(), Some("cursor-1"));
-    assert_eq!(tailing.backfill_state, ScimPushBackfillState::Complete);
+    assert_eq!(tailing.cursor_sequence, Some(1));
+    assert_eq!(tailing.backfill_state, ScimBackfillState::Done);
     assert_eq!(
-        tailing.backfill_after, None,
+        tailing.backfill_after_id, None,
         "a completed backfill left its resume point behind"
     );
 
@@ -212,8 +207,8 @@ async fn tailing_cannot_start_before_the_backfill_is_complete() {
             .expect("set the scope");
     }
     let rogue = sqlx::query(
-        "UPDATE scim_push_sync_state SET backfill_state = 'running', cursor = 'cursor-9' \
-         WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+        "UPDATE scim_push_connections SET backfill_state = 'users', cursor_sequence = 9 \
+         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
@@ -250,12 +245,17 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(42))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "feed-head-at-enumeration")
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
 
@@ -268,8 +268,8 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
         .expect("get")
         .expect("a state row");
     assert_eq!(
-        after.cursor.as_deref(),
-        Some("feed-head-at-enumeration"),
+        after.cursor_sequence,
+        Some(42),
         "the backfill did not store the position it was given"
     );
 
@@ -282,17 +282,16 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
     // re-reads it: silent loss, which is the inverse of "pause rather than drop".
     store
         .scim_push_sync_state()
-        .advance(
-            &connection,
-            Some("feed-head-at-enumeration"),
-            "seq-9000",
-            None,
-        )
+        .advance(&connection, Some(42), 0, 9000, true)
         .await
         .expect("tail");
+    // NO TRANSITION HERE, deliberately. This connection is TAILING, and the point of the
+    // assertion below is that `complete_backfill` refuses it. The refusal is now structural
+    // rather than incidental: completing requires the `groups` state, and a tailing connection is
+    // `done`, so a second completion cannot reach the cursor at all.
     let clobber = store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "seq-9500")
+        .complete_backfill(&connection)
         .await;
     assert!(
         matches!(clobber, Err(StoreError::NotFound)),
@@ -305,8 +304,8 @@ async fn completing_a_backfill_writes_the_cursor_and_cannot_clobber_one_that_is_
         .expect("get")
         .expect("a state row");
     assert_eq!(
-        unmoved.cursor.as_deref(),
-        Some("seq-9000"),
+        unmoved.cursor_sequence,
+        Some(9000),
         "the cursor moved anyway"
     );
 }
@@ -325,19 +324,24 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(100))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "seq-100")
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
 
     // Worker A reads seq-100, does its work, and checkpoints. It wins.
     store
         .scim_push_sync_state()
-        .advance(&connection, Some("seq-100"), "seq-200", None)
+        .advance(&connection, Some(100), 0, 200, true)
         .await
         .expect("the first writer checkpoints");
 
@@ -345,7 +349,7 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
     // hundred events, every one of which has already been pushed downstream.
     let stale = store
         .scim_push_sync_state()
-        .advance(&connection, Some("seq-100"), "seq-150", None)
+        .advance(&connection, Some(100), 0, 150, true)
         .await;
     assert!(
         matches!(stale, Err(StoreError::NotFound)),
@@ -357,13 +361,13 @@ async fn a_checkpoint_from_a_worker_whose_cursor_moved_underneath_it_is_refused(
         .await
         .expect("get")
         .expect("a state row");
-    assert_eq!(held.cursor.as_deref(), Some("seq-200"));
+    assert_eq!(held.cursor_sequence, Some(200));
 
     // CONTROL: the winner can carry on, so the refusal above is the stale expectation and not
     // the connection being wedged.
     store
         .scim_push_sync_state()
-        .advance(&connection, Some("seq-200"), "seq-300", None)
+        .advance(&connection, Some(200), 0, 300, true)
         .await
         .expect("the current holder continues");
 }
@@ -383,17 +387,22 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(100))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "seq-100")
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(&connection, Some("seq-100"), "seq-500", None)
+        .advance(&connection, Some(100), 0, 500, true)
         .await
         .expect("tail");
 
@@ -409,20 +418,20 @@ async fn a_rebuilt_downstream_can_be_enumerated_again() {
         .await
         .expect("get")
         .expect("a state row");
-    assert_eq!(restarted.backfill_state, ScimPushBackfillState::Running);
+    assert_eq!(restarted.backfill_state, ScimBackfillState::Users);
     // THE CURSOR IS CLEARED, which is what makes this safe rather than merely possible: a
     // connection that went back to enumerating must not also be tailing, and that is the
     // invariant the column CHECK states.
     assert_eq!(
-        restarted.cursor, None,
+        restarted.cursor_sequence, None,
         "a re-enumerating connection was left tailing: {restarted:?}"
     );
-    assert_eq!(restarted.backfill_after, None);
+    assert_eq!(restarted.backfill_after_id, None);
 
     // AND TAILING IS REFUSED AGAIN until the new enumeration finishes.
     let early = store
         .scim_push_sync_state()
-        .advance(&connection, None, "seq-600", None)
+        .advance(&connection, None, 0, 600, true)
         .await;
     assert!(
         matches!(early, Err(StoreError::NotFound)),
@@ -441,22 +450,22 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "cursor-0")
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
         .await
         .expect("complete");
     store
         .scim_push_sync_state()
-        .advance(
-            &connection,
-            Some("cursor-0"),
-            "cursor-7",
-            Some(now_micros(&env)),
-        )
+        .advance(&connection, Some(0), 0, 7, true)
         .await
         .expect("advance");
 
@@ -477,8 +486,8 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
     // rather than dropping events". A failure that advanced the cursor would skip exactly the
     // events that could not be delivered, and they would never be retried.
     assert_eq!(
-        paused.cursor.as_deref(),
-        Some("cursor-7"),
+        paused.cursor_sequence,
+        Some(7),
         "the failure moved the cursor"
     );
     assert_eq!(paused.consecutive_failures, 1);
@@ -506,12 +515,7 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
     // outage would need an operator to clear it, and nothing would tell them to.
     store
         .scim_push_sync_state()
-        .advance(
-            &connection,
-            Some("cursor-7"),
-            "cursor-8",
-            Some(now_micros(&env)),
-        )
+        .advance(&connection, Some(7), 2, 8, true)
         .await
         .expect("advance after recovery");
     let recovered = store
@@ -522,6 +526,112 @@ async fn an_outage_pauses_the_cursor_rather_than_moving_it() {
         .expect("a state row");
     assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.last_error, None);
+    assert_eq!(recovered.paused_until_unix_micros, None);
+}
+
+#[tokio::test]
+async fn a_checkpoint_cannot_erase_a_pause_that_began_after_the_pass_started() {
+    // WHY THIS EXISTS. The checkpoint compares the cursor but CLEARS seven columns: the failure
+    // count, the error and its time, and the pause, as well as moving the cursor and the clocks.
+    // `record_failure` writes those health columns without touching the cursor, so a guard that
+    // compared only the cursor could not see one at all.
+    //
+    // The sequence that breaks it is ordinary. A pass reads the state, pushes a page slowly, and
+    // while it is in flight the downstream fails a DIFFERENT pass, which pauses the connection.
+    // The slow pass then checkpoints against the cursor it still holds, which is unchanged, and
+    // the pause it never saw is erased. #137 asks for an outage to pause the cursor; a pause any
+    // in-flight pass can clear on its way past is not one.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+
+    // The slow pass reads here. Both of the values it will compare are what it holds from now on.
+    let read = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(read.cursor_sequence, Some(0));
+    assert_eq!(read.consecutive_failures, 0);
+
+    // The outage happens while it is in flight. Note the cursor does NOT move.
+    let resume_at = now_micros(&env) + 60_000_000;
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "downstream answered 503", Some(resume_at))
+        .await
+        .expect("record the failure");
+
+    let refused = store
+        .scim_push_sync_state()
+        .advance(
+            &connection,
+            read.cursor_sequence,
+            read.consecutive_failures,
+            9,
+            true,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::NotFound)),
+        "a checkpoint erased a failure state its caller never saw: {refused:?}"
+    );
+
+    // AND THE PAUSE IS STILL THERE, which is the half that matters operationally: refusing the
+    // write is only useful if the outage state survives it.
+    let after = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(after.consecutive_failures, 1, "the failure count was reset");
+    assert_eq!(
+        after.last_error.as_deref(),
+        Some("downstream answered 503"),
+        "the error was cleared"
+    );
+    assert!(
+        after.paused_until_unix_micros.is_some(),
+        "the pause was cleared"
+    );
+    assert_eq!(after.cursor_sequence, Some(0), "the cursor moved anyway");
+
+    // A PASS THAT DID SEE THE FAILURE STILL CHECKPOINTS. The guard has to refuse a stale caller
+    // without refusing recovery, or an outage would be permanent.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(0), 1, 9, true)
+        .await
+        .expect("a caller holding the current failure count checkpoints");
+    let recovered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(recovered.cursor_sequence, Some(9));
+    assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.paused_until_unix_micros, None);
 }
 
@@ -540,7 +650,7 @@ async fn a_failure_without_a_new_deadline_leaves_the_pause_that_is_already_runni
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
 
@@ -611,15 +721,25 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
     // So this asserts the index DEFINITION, which is the only place the property lives.
     let db = TestDatabase::start().await;
     let definition: String = sqlx::query_scalar(
-        "SELECT indexdef FROM pg_indexes WHERE indexname = 'scim_push_sync_state_due'",
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'scim_push_connections_due'",
     )
     .fetch_one(db.owner_pool())
     .await
     .expect("the due index exists");
 
+    // NOT "has no WHERE clause". 0192's index is partial on `active`, which is legitimate: a
+    // disabled connection is never due, so excluding it shrinks the index without hiding
+    // anything a query would ask for. The property that matters is narrower and precise: the
+    // predicate must not filter on `paused_until`, because the due query asks for rows whose
+    // pause has EXPIRED and a `paused_until IS NULL` predicate can never return one.
+    let predicate = definition
+        .split_once(" WHERE ")
+        .map(|(_, w)| w.to_owned())
+        .unwrap_or_default();
     assert!(
-        !definition.to_ascii_uppercase().contains(" WHERE "),
-        "the due index is partial, so an expired pause is unreachable through it: {definition}"
+        !predicate.contains("paused_until"),
+        "the due index filters on paused_until, so a connection whose outage ENDED is \
+         unreachable through it: {definition}"
     );
     assert!(
         definition.contains("paused_until"),
@@ -639,7 +759,7 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
     let store = db.store().scoped(scope);
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     // A pause that expired a minute ago.
@@ -654,7 +774,9 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
         .expect("record");
 
     let due: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM scim_push_sync_state          WHERE tenant_id = $1 AND environment_id = $2            AND (paused_until IS NULL OR paused_until <= now())",
+        "SELECT count(*) FROM scim_push_connections \
+         WHERE tenant_id = $1 AND environment_id = $2 AND active \
+           AND (paused_until IS NULL OR paused_until <= now())",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
@@ -664,6 +786,251 @@ async fn the_due_index_can_serve_a_pause_that_has_expired() {
     assert_eq!(
         due, 1,
         "a connection whose pause has expired is not due, so it would never run again"
+    );
+}
+
+#[tokio::test]
+async fn recording_backfill_progress_carries_the_same_two_guards_as_the_checkpoint() {
+    // WHY THIS EXISTS. `record_backfill_progress` clears the identical failure state the
+    // checkpoint clears -- the count, the error and its time, and the pause -- and it did so
+    // against no comparison at all, and stamped `last_success_at` whatever the subject did.
+    //
+    // Both are the defects that were fixed on the tail path, still live on the backfill path.
+    // Naming a guard on one of two sibling writers and calling the defect closed is how a fix
+    // gets believed to be everywhere while it is in one place.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+
+    // A subject that DID reach the downstream, so there is a success to be wrongly overwritten.
+    store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_100", 0, true)
+        .await
+        .expect("a delivered subject records progress");
+    let delivered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    let success_at = delivered
+        .last_success_at_unix_micros
+        .expect("a delivered subject records a success");
+
+    // A subject that was enumerated and then vanished: progress moves, the success does not.
+    store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_101", 0, false)
+        .await
+        .expect("a vanished subject still records progress");
+    let skipped = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(
+        skipped.backfill_after_id.as_deref(),
+        Some("usr_101"),
+        "progress must move: this subject will not be enumerated again"
+    );
+    assert_eq!(
+        skipped.last_success_at_unix_micros,
+        Some(success_at),
+        "a subject that reached no downstream claimed a delivery"
+    );
+
+    // AND THE OUTAGE STATE IS GUARDED. A pass that began before a failure cannot clear it.
+    let resume_at = now_micros(&env) + 60_000_000;
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection, "downstream answered 503", Some(resume_at))
+        .await
+        .expect("record the failure");
+    let stale = store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_102", 0, true)
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::NotFound)),
+        "a backfill record erased a failure state its caller never saw: {stale:?}"
+    );
+    let after = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(after.consecutive_failures, 1, "the failure count was reset");
+    assert!(
+        after.paused_until_unix_micros.is_some(),
+        "the pause was cleared"
+    );
+    assert_eq!(
+        after.backfill_after_id.as_deref(),
+        Some("usr_101"),
+        "the refused record moved progress anyway"
+    );
+
+    // A caller that DID see the failure still records, or an outage would freeze the backfill.
+    store
+        .scim_push_sync_state()
+        .record_backfill_progress(&connection, "usr_102", 1, true)
+        .await
+        .expect("a caller holding the current failure count records progress");
+    let recovered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert_eq!(recovered.consecutive_failures, 0);
+    assert_eq!(recovered.paused_until_unix_micros, None);
+}
+
+#[tokio::test]
+async fn completing_a_backfill_does_not_claim_a_success_it_never_made() {
+    // WHY THIS EXISTS. `complete_backfill` runs on the EMPTY groups page -- the pass that finds
+    // nothing left to enumerate -- and it stamped `last_success_at`. A connection whose scope
+    // filter matches nobody therefore reported a fresh delivery having never sent one request,
+    // which is the one case where an operator most needs the surface to say so.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+
+    let done = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    assert!(
+        done.backfill_state.is_done(),
+        "the backfill did not complete"
+    );
+    assert_eq!(
+        done.last_success_at_unix_micros, None,
+        "an empty scope claimed a delivery it never made"
+    );
+    assert_eq!(
+        done.cursor_sequence,
+        Some(0),
+        "completing must still hand the tail its starting position"
+    );
+}
+
+#[tokio::test]
+async fn a_page_that_delivered_nothing_moves_the_cursor_without_claiming_a_success() {
+    // WHY THIS EXISTS. The checkpoint stamped `last_success_at = now()` on any non-empty page,
+    // and the management view says of that column that it "moves only when something was written
+    // downstream". The two disagreed, and the view was the one telling the truth about what an
+    // operator needs.
+    //
+    // It is not a corner case. The feed carries every event the environment emits and a SCIM
+    // connection translates almost none of them, so a page with nothing to push is the ORDINARY
+    // page. Stamping success on it made the column an alias for `last_polled_at`, and the
+    // question it exists to answer -- has this connection delivered anything lately -- had no
+    // column left that could answer it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
+    let store = db.store().scoped(scope);
+
+    store
+        .scim_push_sync_state()
+        .begin_backfill(&connection, Some(0))
+        .await
+        .expect("begin");
+    store
+        .scim_push_sync_state()
+        .begin_group_backfill(&connection)
+        .await
+        .expect("users done, on to groups");
+    store
+        .scim_push_sync_state()
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+
+    // A page that DID deliver, so there is a success timestamp to be wrongly overwritten later.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(0), 0, 10, true)
+        .await
+        .expect("a delivering page checkpoints");
+    let delivered = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+    let success_at = delivered
+        .last_success_at_unix_micros
+        .expect("a delivering page records a success");
+
+    // Now a page that read events, moved the cursor, and pushed nothing at all.
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(10), 0, 20, false)
+        .await
+        .expect("a page carrying no provisioning signal still checkpoints");
+    let quiet = store
+        .scim_push_sync_state()
+        .get(&connection)
+        .await
+        .expect("get")
+        .expect("a state row");
+
+    assert_eq!(
+        quiet.cursor_sequence,
+        Some(20),
+        "the cursor must move: those events are read and will not be offered again"
+    );
+    assert_eq!(
+        quiet.last_success_at_unix_micros,
+        Some(success_at),
+        "a page that pushed nothing claimed a delivery"
+    );
+    // AND THE POLL CLOCK STILL MOVES, which is the pair that makes the surface readable: the
+    // worker is running (it polled) and it is not delivering (no success since).
+    assert!(
+        quiet.last_polled_at_unix_micros >= delivered.last_polled_at_unix_micros,
+        "the poll clock stalled, so a running worker looks wedged"
+    );
+    assert!(
+        quiet.last_polled_at_unix_micros.is_some(),
+        "a checkpoint that does not record the poll leaves nothing saying the worker ran"
     );
 }
 
@@ -678,18 +1045,22 @@ async fn an_empty_poll_is_distinguishable_from_a_wedged_worker() {
 
     store
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
     store
         .scim_push_sync_state()
-        .complete_backfill(&connection, "cursor-0")
+        .begin_group_backfill(&connection)
         .await
-        .expect("complete");
-    let applied_at = now_micros(&env);
+        .expect("users done, on to groups");
     store
         .scim_push_sync_state()
-        .advance(&connection, Some("cursor-0"), "cursor-3", Some(applied_at))
+        .complete_backfill(&connection)
+        .await
+        .expect("complete");
+    store
+        .scim_push_sync_state()
+        .advance(&connection, Some(0), 0, 3, true)
         .await
         .expect("advance");
 
@@ -717,11 +1088,11 @@ async fn an_empty_poll_is_distinguishable_from_a_wedged_worker() {
         .expect("a state row");
 
     assert_eq!(
-        after.last_event_at_unix_micros, before.last_event_at_unix_micros,
-        "an empty poll moved the event clock"
+        after.last_success_at_unix_micros, before.last_success_at_unix_micros,
+        "an empty poll moved the success clock"
     );
     assert_eq!(
-        after.cursor, before.cursor,
+        after.cursor_sequence, before.cursor_sequence,
         "an empty poll moved the cursor"
     );
     assert!(
@@ -742,7 +1113,7 @@ async fn deleting_the_connection_takes_its_sync_state_with_it() {
     db.store()
         .scoped(scope)
         .scim_push_sync_state()
-        .begin_backfill(&connection)
+        .begin_backfill(&connection, Some(0))
         .await
         .expect("begin");
 
@@ -782,7 +1153,7 @@ async fn every_backfill_state_round_trips_and_an_unknown_one_does_not() {
     let org = seed_org(&db, &env, scope, "Globex").await;
     let connection = seed_connection(&db, &env, scope, &org, "Okta production").await;
 
-    for state in ScimPushBackfillState::ALL.iter().copied() {
+    for state in ScimBackfillState::ALL.iter().copied() {
         let mut tx = db.app_pool().begin().await.expect("begin");
         for (name, value) in [
             ("ironauth.tenant_id", scope.tenant().to_string()),
@@ -796,10 +1167,8 @@ async fn every_backfill_state_round_trips_and_an_unknown_one_does_not() {
                 .expect("set the scope");
         }
         sqlx::query(
-            "INSERT INTO scim_push_sync_state \
-             (connection_id, tenant_id, environment_id, backfill_state) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (connection_id) DO UPDATE SET backfill_state = EXCLUDED.backfill_state",
+            "UPDATE scim_push_connections SET backfill_state = $4 \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3",
         )
         .bind(connection.to_string())
         .bind(scope.tenant().to_string())
@@ -838,8 +1207,8 @@ async fn every_backfill_state_round_trips_and_an_unknown_one_does_not() {
             .expect("set the scope");
     }
     let rogue = sqlx::query(
-        "UPDATE scim_push_sync_state SET backfill_state = 'halfway' \
-         WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+        "UPDATE scim_push_connections SET backfill_state = 'halfway' \
+         WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
     )
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())

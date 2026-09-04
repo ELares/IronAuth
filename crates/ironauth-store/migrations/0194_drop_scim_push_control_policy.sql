@@ -1,0 +1,39 @@
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+--
+-- 0194: remove a row-level security policy that grants nothing (issue #137).
+--
+-- 0189 installed TWO policies on `scim_push_connections` with byte-identical predicates:
+--
+--   `scim_push_connections_scope`, with no TO clause, so it applies to PUBLIC and therefore
+--   already covers every role including `ironauth_control`; and
+--
+--   `scim_push_connections_control`, TO ironauth_control, with the same USING and the same
+--   WITH CHECK.
+--
+-- Both are PERMISSIVE, and permissive policies are OR'd. The second can therefore only ever
+-- re-allow what the first already allows: it restricts nothing, permits nothing new, and reads
+-- to a later maintainer as though control-plane access were separately gated when it is not.
+--
+-- WHY THIS IS NOT THE HOUSE PATTERN, which is the check worth recording because two other tables
+-- do carry both an unqualified policy and a role-scoped one:
+--
+--   `scim_connections` (0183) adds `scim_connections_revoke_is_one_way`, and
+--   `environment_secrets` (0100) adds three `..._one_reserved_name_*` policies.
+--
+-- Every one of those is `AS RESTRICTIVE`. A restrictive policy is AND'd, so it NARROWS what the
+-- scope policy allows -- a revoke that cannot be undone, a control role that may write exactly
+-- one reserved secret name. That is a second rule, and it needs a second policy to express it.
+--
+-- 0189's is the only PERMISSIVE restatement in the schema, and a permissive policy that repeats
+-- an existing one is dead schema by construction. 0185 states the rule in terms: "a new policy
+-- would be a SECOND answer to a question 0087 and 0088 already answer, and two policies on one
+-- table are OR'd, so a permissive addition could only ever widen what they allow."
+--
+-- Dropping it is behaviour-preserving precisely because it never did anything: the scope policy
+-- it duplicates stays, and that one is the policy the structural test asserts by name and the
+-- only one covering `ironauth_app`, which holds SELECT here and, since 0192, the worker's
+-- column-scoped UPDATE.
+--
+-- Contract phase: a removal, and one nothing reads.
+
+DROP POLICY IF EXISTS scim_push_connections_control ON scim_push_connections;

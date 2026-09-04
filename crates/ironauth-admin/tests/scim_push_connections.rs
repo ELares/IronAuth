@@ -18,7 +18,19 @@ mod common;
 
 use axum::http::StatusCode;
 use common::Harness;
+use ironauth_env::Env;
+use ironauth_store::{
+    EnvironmentId, NewScimPushLink, ScimPushConnectionId, ScimPushLinkId, ScimPushResourceType,
+    Scope, TenantId,
+};
 use serde_json::Value;
+
+fn scope_of(tenant: &str, environment: &str) -> Scope {
+    Scope::new(
+        TenantId::parse(tenant).expect("tenant id"),
+        EnvironmentId::parse(environment).expect("environment id"),
+    )
+}
 
 /// Create an organization through the management API and return its id.
 async fn create_org(h: &Harness, tenant: &str, environment: &str, key: &str) -> String {
@@ -405,6 +417,231 @@ async fn a_handle_from_another_organization_is_not_found() {
 /// `jsonb_typeof(...) = 'object'` CHECK: without the surface check a caller meets that
 /// constraint as a database error rendered 500, and a malformed body deserves a 400.
 #[tokio::test]
+async fn a_scheme_the_fetcher_accepts_is_not_refused_by_the_surface_in_front_of_it() {
+    // RFC 3986 makes the scheme case insensitive, and the hardened fetcher accepts `HTTPS://`.
+    // The first version of `check_base_url` tested `starts_with("https://")` by hand and refused
+    // it, rejecting a configuration that would have worked.
+    //
+    // A validator stricter than the thing it guards is not "safer". It turns a working setup into
+    // a support ticket, and the divergence is invisible until somebody types it. `external_issuers`
+    // shipped exactly this against `jwks_uri` and was corrected by calling `parse_target`; this
+    // surface now composes the same function, so the two cannot drift again.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k1").await;
+    let path = push_path(&tenant, &environment, &org);
+
+    let body = serde_json::json!({
+        "display_name": "Downstream SaaS",
+        "base_url": "HTTPS://downstream.example/scim/v2",
+        "credential_secret_name": "scim_push_downstream",
+    })
+    .to_string();
+    let (status, _, response) = h.post(&path, "k-upper-scheme", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "an uppercase scheme the fetcher accepts was refused: {response}"
+    );
+}
+
+#[tokio::test]
+async fn the_listing_reports_the_health_a_operator_needs_to_act_on() {
+    // CRITERION 2: "per-app sync status reports cursor position, lag, and per-resource errors via
+    // the management API". This covers the first two; the per-resource half is the links listing.
+    //
+    // WHY LAG IS TWO NUMBERS AND NOT ONE. A single "600 behind" cannot distinguish a connection
+    // that has stalled from one whose feed has simply grown while it kept pace, and those need
+    // opposite responses from an operator. The connection's own position and the feed head are
+    // both reported, so the subtraction happens where the context is.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k1").await;
+    let path = push_path(&tenant, &environment, &org);
+
+    let body = serde_json::json!({
+        "display_name": "Downstream SaaS",
+        "base_url": "https://downstream.example/scim/v2",
+        "credential_secret_name": "scim_push_downstream",
+    })
+    .to_string();
+    let (status, _, _) = h.post(&path, "k-health", &body).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _, listed) = h.get(&path).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("json");
+    let connection = &listed["items"][0];
+
+    // A CONNECTION THAT HAS NEVER RUN says so by OMITTING the fields rather than reporting zero.
+    // A cursor of 0 is a real position (the start of the feed), so a surface that defaulted to it
+    // would report a connection that has never tailed as one sitting at the beginning, which is a
+    // different thing and would make its lag look like the whole feed.
+    assert!(
+        connection.get("cursor_sequence").is_none(),
+        "a connection that has not tailed reported a position: {connection}"
+    );
+    assert!(
+        connection.get("last_polled_at_unix_ms").is_none(),
+        "a connection the worker has never looked at reported a poll time: {connection}"
+    );
+    assert!(
+        connection.get("paused_until_unix_ms").is_none(),
+        "an unpaused connection reported a pause: {connection}"
+    );
+
+    // WHAT IT DOES REPORT, because these have meaningful values from the moment it is created.
+    assert_eq!(connection["backfill_state"], serde_json::json!("pending"));
+    assert_eq!(connection["consecutive_failures"], serde_json::json!(0));
+    assert_eq!(connection["active"], serde_json::json!(true));
+
+    // AND THE FEED HEAD IS ON THE LISTING, once, not once per connection.
+    assert!(
+        listed["items"].as_array().expect("items").len() == 1,
+        "{listed}"
+    );
+    // The tenant creation above wrote audit events, so the feed is not empty and the head is a
+    // real number. Asserting it is PRESENT rather than a particular value: the point is that a
+    // caller has both halves of the subtraction, not what this environment's sequence happens to
+    // be.
+    assert!(
+        listed["feed_head_sequence"].is_i64(),
+        "the listing did not report the feed head, so lag cannot be computed: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn the_per_resource_listing_reports_which_subjects_are_failing_and_why() {
+    // CRITERION 2's other half. The connection-level health answers "is this downstream
+    // reachable"; this answers "which PEOPLE are failing, and with what". They are different
+    // questions with different audiences: the first tells an operator whether to page somebody,
+    // the second tells them whose access is wrong.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "k1").await;
+    let base = push_path(&tenant, &environment, &org);
+    let (status, _, created) = h.post(&base, "k-res", &create_body()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let connection_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // The links are written by the WORKER on the data plane, so they are seeded through the
+    // store rather than through a route: no management surface creates one, and inventing a
+    // route to make this test easier would ship a capability nobody asked for.
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let connection = ScimPushConnectionId::parse_in_scope(&connection_id, &scope).expect("id");
+    for (subject, downstream, error) in [
+        ("usr_ada", "dsid-1", None),
+        (
+            "usr_grace",
+            "dsid-2",
+            Some("the downstream refused: mailbox already claimed"),
+        ),
+    ] {
+        let id = ScimPushLinkId::generate(&env, &scope);
+        h.store()
+            .scoped(scope)
+            .scim_push_links()
+            .upsert(NewScimPushLink {
+                id: &id,
+                connection_id: &connection,
+                resource_type: ScimPushResourceType::User,
+                subject_id: subject,
+                downstream_id: downstream,
+                external_id: subject,
+            })
+            .await
+            .expect("seed the link");
+        if let Some(error) = error {
+            h.store()
+                .scoped(scope)
+                .scim_push_links()
+                .record_failure(&connection, ScimPushResourceType::User, subject, error)
+                .await
+                .expect("record the failure");
+        }
+    }
+
+    let (status, _, listed) = h.get(&format!("{base}/{connection_id}/resources")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed: Value = serde_json::from_str(&listed).expect("json");
+    let items = listed["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "{listed}");
+
+    let failing = items
+        .iter()
+        .find(|item| item["subject_id"] == serde_json::json!("usr_grace"))
+        .expect("the failing subject is listed");
+    assert_eq!(
+        failing["last_error"],
+        serde_json::json!("the downstream refused: mailbox already claimed"),
+        "the per-resource error is not reported: {failing}"
+    );
+    assert!(failing["last_error_at_unix_ms"].is_i64(), "{failing}");
+    // THE DOWNSTREAM ID IS STILL THERE. A failed push does not mean the resource is gone, and
+    // clearing it would make the next run create a duplicate; the surface has to show that the
+    // mapping survived, or an operator reading this cannot tell a failing push from a lost one.
+    assert_eq!(
+        failing["downstream_id"],
+        serde_json::json!("dsid-2"),
+        "{failing}"
+    );
+
+    // THE HEALTHY ONE REPORTS NO ERROR, which is what makes the assertion above about that
+    // subject rather than about the shape of the response.
+    let healthy = items
+        .iter()
+        .find(|item| item["subject_id"] == serde_json::json!("usr_ada"))
+        .expect("the healthy subject is listed");
+    assert!(
+        healthy.get("last_error").is_none(),
+        "a subject with no failure reported one: {healthy}"
+    );
+    assert!(healthy["last_synced_at_unix_ms"].is_i64(), "{healthy}");
+}
+
+#[tokio::test]
+async fn the_per_resource_listing_cannot_be_reached_through_another_organizations_path() {
+    // THE CONFINEMENT THIS ROUTE NEEDED A NEW STORE METHOD FOR. `ScimPushConnectionRepo::get`
+    // scopes by tenant and environment only, so both organizations in one environment are
+    // reachable from it. A handler that parsed the id out of the path and called `get` would let
+    // a credential for organization A read organization B's provisioning state by naming B's
+    // connection id in A's path.
+    //
+    // The id is unguessable, and that is not an authorization check: an id leaks through a log,
+    // a support ticket, or a previous role. The organization goes in the WHERE predicate instead.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let org_a = create_org(&h, &tenant, &environment, "k-a").await;
+    let org_b = create_org(&h, &tenant, &environment, "k-b").await;
+
+    let base_b = push_path(&tenant, &environment, &org_b);
+    let (status, _, created) = h.post(&base_b, "k-b-conn", &create_body()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let b_connection = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // B's connection id, A's path.
+    let base_a = push_path(&tenant, &environment, &org_a);
+    let (status, _, body) = h.get(&format!("{base_a}/{b_connection}/resources")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one organization read another's provisioning state: {body}"
+    );
+
+    // CONTROL: the same id under its OWN organization answers, so the refusal is the confinement
+    // and not the route being broken.
+    let (status, _, body) = h.get(&format!("{base_b}/{b_connection}/resources")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn a_malformed_base_url_is_refused_before_the_write() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
@@ -424,6 +661,27 @@ async fn a_malformed_base_url_is_refused_before_the_write() {
             "https://user:pw@downstream.example/scim/v2",
         ),
         ("a space", "https://downstream.example/scim v2"),
+        // THE TWO THE HAND-WRITTEN GRAMMAR ACCEPTED. `check_base_url` used to split the
+        // authority itself and never looked at the port, so both of these were stored and then
+        // failed on every push for ever, which is the deferral the check exists to prevent.
+        // `parse_target` refuses them, and it is the function the fetcher itself runs.
+        ("a zero port", "https://downstream.example:0/scim/v2"),
+        (
+            "a port above the range",
+            "https://downstream.example:99999/scim/v2",
+        ),
+        (
+            "a non-numeric port",
+            "https://downstream.example:https/scim/v2",
+        ),
+        // A QUERY folds the SCIM path into it, so `/Users` becomes part of a parameter value and
+        // every request addresses the base path instead. A downstream that ignores unknown
+        // parameters answers 200 and the client reads a create that never happened as a success.
+        (
+            "a query string",
+            "https://downstream.example/scim/v2?tenant=acme",
+        ),
+        ("a fragment", "https://downstream.example/scim/v2#frag"),
     ] {
         let body = serde_json::json!({
             "display_name": "Downstream SaaS",

@@ -451,6 +451,7 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // already created. Pointing a connection at an existing secret is configuration; it mints
     // nothing and reveals nothing, which is the same line `setSecret` and `deleteSecret` sit on.
     ("listScimPushConnections", ManagementPermission::Read),
+    ("listScimPushResources", ManagementPermission::Read),
     (
         "createScimPushConnection",
         ManagementPermission::WriteConfig,
@@ -875,6 +876,7 @@ const PERMISSION_PROVEN: &[&str] = &[
     // the read is checked in both directions too. It also asserts the seeded connection is
     // still there AND still active, so a refusal that half-applied would fail it.
     "listScimPushConnections",
+    "listScimPushResources",
     "createScimPushConnection",
     "setScimPushConnectionActive",
     "deleteScimPushConnection",
@@ -1005,12 +1007,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        225,
+        226,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        81,
+        82,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();

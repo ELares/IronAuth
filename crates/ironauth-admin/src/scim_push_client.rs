@@ -36,34 +36,18 @@ use serde_json::Value;
 
 use crate::scim_push_transport::{ScimRequest, ScimResponse, ScimTransport, ScimTransportError};
 
-/// Which write verb a connection prefers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteMode {
-    /// Prefer `PATCH`, falling back to `PUT` when the downstream answers 501.
-    Patch,
-    /// Always `PUT`.
-    Put,
-}
+/// Whether this connection updates with `PATCH` or replaces with `PUT`.
+///
+/// Re-exported from the store rather than declared again. An earlier version of this module had
+/// its own two-variant `WriteMode`, so the same operator setting had two Rust spellings and a
+/// caller crossing the boundary had to translate between them: exactly the seam where a mapping
+/// gets inverted and nobody notices, because both sides typecheck.
+pub use ironauth_store::ScimWriteMode as WriteMode;
 
-/// What a connection does when a resource leaves scope or is removed upstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeletionPolicy {
-    /// Write the resource back with `active: false`, keeping every other attribute.
-    ///
-    /// The safer default: a DELETE against a downstream directory is not reversible and an
-    /// accidental scope change should not be.
-    ///
-    /// The body is the resource as the downstream currently holds it, not a two-key document.
-    /// That is not a detail: `PUT` is a full replace (RFC 7644 section 3.5.1), so a partial body
-    /// asks the downstream to erase `userName` and `externalId`, which a strict server refuses
-    /// and a lenient one obeys, losing the identifier the next lookup matches on.
-    ///
-    /// Only meaningful where the schema HAS an `active` attribute. RFC 7643 section 4.2 gives
-    /// Group none, so this policy is refused for groups rather than silently doing nothing.
-    Deactivate,
-    /// `DELETE` the resource.
-    Delete,
-}
+/// What this connection does when a subject leaves scope or is removed upstream.
+///
+/// Re-exported from the store, for the reason [`WriteMode`] gives.
+pub use ironauth_store::ScimDeletionPolicy as DeletionPolicy;
 
 /// What converging one resource did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,21 +566,11 @@ fn patch_document(resource: &Value, current: Option<&Value>) -> Value {
 /// address a different collection, one containing `?` turn the rest of the path into a query, and
 /// one containing `#` truncate the request. A hostile or merely careless downstream therefore
 /// chose which resource the next DELETE hit.
+///
+/// The encoder lives in the transport module and is shared with the filter encoder: two copies of
+/// one unreserved set drift, and the hole that opens when they do is in URL construction.
 fn encode_path_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            // RFC 3986 section 2.3 unreserved, plus the sub-delims that are safe in a segment.
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(char::from(byte));
-            }
-            _ => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "%{byte:02X}");
-            }
-        }
-    }
-    out
+    crate::scim_push_transport::percent_encode(segment)
 }
 
 /// Escape a literal for a SCIM filter comparison.

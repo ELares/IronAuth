@@ -75,7 +75,10 @@ mod messages;
 mod scim_connections;
 pub mod scim_push_client;
 mod scim_push_connections;
+pub mod scim_push_events;
+pub mod scim_push_mapping;
 pub mod scim_push_transport;
+pub mod scim_push_worker;
 pub mod usage;
 mod whoami;
 
@@ -612,6 +615,12 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/active",
             axum::routing::put(scim_push_connections::set_scim_push_connection_active),
+        )
+        // CRITERION 2's per-resource half (issue #137). Which SUBJECTS are failing to provision
+        // and with what, which is a different question from whether the downstream is reachable.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources",
+            axum::routing::get(scim_push_connections::list_scim_push_resources),
         )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",

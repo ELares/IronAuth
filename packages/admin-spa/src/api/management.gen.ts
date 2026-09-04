@@ -2489,6 +2489,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources` */
+        get: operations["listScimPushResources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships": {
         parameters: {
             query?: never;
@@ -7760,6 +7777,26 @@ export interface components {
         };
         /** @description A page of outbound connections. */
         ScimPushConnectionListView: {
+            /**
+             * Format: int64
+             * @description The newest sequence in this environment's event feed, absent when the feed is empty.
+             *
+             *     The OTHER half of criterion 2's lag, reported once for the page rather than per row
+             *     because it is the same number for every connection in the scope. A connection's lag is
+             *     this minus its own `cursor_sequence`.
+             *
+             *     The difference counts FEED POSITIONS, not people waiting to be provisioned. The feed
+             *     carries every event the environment emits and a SCIM connection translates almost none of
+             *     them: a sign-in, a token issuance and a consent are each one of "600 behind" that will
+             *     never produce a request to any downstream. So it says how far back in the feed the worker
+             *     is, and a surface built on it should say that rather than imply a queue of unsynced users.
+             *
+             *     It is the head the feed will actually SERVE, which is not simply the highest sequence in
+             *     the table: the feed withholds an event an older in-flight writer could still precede, and
+             *     this number withholds it too. Both sides of the subtraction therefore come from the same
+             *     feed, which is what lets a connection that has consumed everything on offer report zero.
+             */
+            feed_head_sequence?: number | null;
             /** @description This organization's outbound connections. */
             items: components["schemas"]["ScimPushConnectionView"][];
             /**
@@ -7794,6 +7831,16 @@ export interface components {
             consecutive_failures: number;
             /** @description The NAME of the environment secret holding the bearer token. */
             credential_secret_name: string;
+            /**
+             * Format: int64
+             * @description The feed sequence this connection has read through, absent until it starts tailing.
+             *
+             *     Criterion 2's "cursor position". Compare with `feed_head_sequence` on the listing to get
+             *     LAG. The two are reported separately rather than as one subtracted number, because a
+             *     caller shown only "600 behind" cannot tell a connection that has stalled from one whose
+             *     feed has simply grown, and those need different responses.
+             */
+            cursor_sequence?: number | null;
             /** @description `deactivate` or `delete`. */
             deletion_policy: string;
             /** @description The operator-facing label. */
@@ -7811,13 +7858,87 @@ export interface components {
             last_error?: string | null;
             /**
              * Format: int64
+             * @description When the worker last LOOKED, including polls that found nothing.
+             *
+             *     What separates "idle because the feed is quiet" from "idle because the worker is wedged".
+             *     `last_success_at_unix_ms` moves only when something was written downstream, so on its own
+             *     it cannot tell those apart, and they need opposite responses.
+             */
+            last_polled_at_unix_ms?: number | null;
+            /**
+             * Format: int64
              * @description The last success, in milliseconds since the epoch.
              */
             last_success_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description While this is in the future the worker is skipping this connection after a failure.
+             *
+             *     Present so an operator seeing a stalled cursor can tell a deliberate backoff from a
+             *     stopped worker without reading logs.
+             */
+            paused_until_unix_ms?: number | null;
             /** @description The RFC 7644 filter deciding which users are pushed, absent when all of them are. */
             user_scope_filter?: string | null;
             /** @description `patch` or `put`. */
             write_mode: string;
+        };
+        /** @description A page of one connection's per-resource state. */
+        ScimPushResourceListView: {
+            /** @description The subjects this connection has provisioned, oldest first. */
+            items: components["schemas"]["ScimPushResourceView"][];
+            /** @description The cursor for the next page, absent on the last one. */
+            next_cursor?: string | null;
+        };
+        /**
+         * @description What a connection calls one subject downstream, and how that subject's last push went.
+         *
+         *     Criterion 2's "per-resource errors". The connection-level health next door answers "is this
+         *     downstream reachable"; this answers "which PEOPLE are failing, and with what", which is a
+         *     different question and the one an operator asks second.
+         */
+        ScimPushResourceView: {
+            /**
+             * Format: int64
+             * @description When this subject was withdrawn downstream, absent while it is provisioned.
+             *
+             *     Present because the link row SURVIVES a withdrawal so a rehire resolves through it. Without
+             *     it this listing reported a departed person with a `last_synced_at` and no error, which is
+             *     indistinguishable from a healthy one: an operator auditing who still has access would have
+             *     read the removed people as present.
+             */
+            deprovisioned_at_unix_ms?: number | null;
+            /** @description What the downstream calls it. Server-issued there, opaque here. */
+            downstream_id: string;
+            /**
+             * @description The `externalId` this connection sent for the subject.
+             *
+             *     Recorded rather than recomputed: a connection's attribute mapping can change what is
+             *     sent, and an operator asking "what did we tell them this person was called" wants what
+             *     WAS sent, not what would be sent now.
+             */
+            external_id: string;
+            /**
+             * @description What that failure said, truncated to the column's bound.
+             *
+             *     Cleared on the next success, because recording a success and clearing the failure are the
+             *     same event: a stale error here would make this surface answer a question about the past.
+             */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description When this subject last failed to push.
+             */
+            last_error_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description When this subject was last pushed successfully.
+             */
+            last_synced_at_unix_ms?: number | null;
+            /** @description `user` or `group`. */
+            resource_type: string;
+            /** @description IronAuth's own id for the subject. */
+            subject_id: string;
         };
         /** @description One page of environment secret metadata. */
         SecretList: {
@@ -21776,6 +21897,82 @@ export interface operations {
                 };
             };
             /** @description No such organization or connection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listScimPushResources: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The desired page size, a positive integer. Clamped to
+                 *     `[1, max_page_size]`; defaults to the configured default when absent.
+                 */
+                limit?: number;
+                /**
+                 * @description The opaque cursor from a previous page's `next_cursor`. Absent for the
+                 *     first page (keyset pagination; there is no offset).
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Outbound SCIM connection identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The subjects this connection has provisioned, with per-resource error state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScimPushResourceListView"];
+                };
+            };
+            /** @description A malformed cursor or limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not read this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live organization or connection */
             404: {
                 headers: {
                     [name: string]: unknown;

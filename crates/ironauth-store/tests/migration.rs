@@ -82,7 +82,10 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      agent vault refresh, native SSO device secrets, SCIM connections, \
      SCIM external ids, SCIM group push, data plane column scopes, \
      SCIM enterprise attributes, group binding provenance, outbound SCIM push connections, outbound SCIM push links, \
-     outbound SCIM push sync state.";
+     outbound SCIM push sync state, outbound SCIM push worker grants, \
+     retired outbound SCIM push sync state, \
+     retired the duplicate outbound SCIM push policy, \
+     outbound SCIM push withdrawal state.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -713,7 +716,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        191,
+        195,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -754,7 +757,8 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
-            177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191
+            177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
+            194, 195
         ]
     );
     let phase_of = |version: i64| async move {
@@ -9033,7 +9037,6 @@ async fn every_scim_table_carries_its_isolation_structurally() {
         // tell the policy from its absence.
         ("scim_push_connections", "scim_push_connections_scope"),
         ("scim_push_links", "scim_push_links_scope"),
-        ("scim_push_sync_state", "scim_push_sync_state_scope"),
     ] {
         assert!(
             rls_enabled_and_forced(pool, table).await,
@@ -9198,9 +9201,58 @@ async fn the_outbound_connection_update_grant_is_scoped_to_the_columns_a_stateme
         );
     }
 
-    // AND THE DATA PLANE READS ONLY. The worker that will advance the cursor does not exist
-    // yet, so it holds no UPDATE anywhere on this table.
-    for column in ["active", "cursor_sequence", "backfill_state", "last_error"] {
+    // AND THE DATA PLANE WRITES ONLY WHAT THE WORKER WRITES.
+    //
+    // This assertion used to say the app role held no UPDATE anywhere on this table, "until the
+    // worker that performs it arrives". The worker arrived in 0192, which granted exactly the
+    // columns it writes, and this test failed at that moment: that is the guard doing its job,
+    // and the expectation is updated here deliberately rather than the grant being widened
+    // quietly.
+    //
+    // The split is the point. Everything below is the worker's own progress and health; the
+    // CONFIGURATION is absent, so a worker that was compromised or merely buggy still cannot
+    // repoint a live connection at another downstream or re-enable one an operator disabled.
+    for column in [
+        "cursor_sequence",
+        "backfill_state",
+        "backfill_after_id",
+        "backfill_from_sequence",
+        "last_success_at",
+        "last_error",
+        "consecutive_failures",
+        "last_polled_at",
+        "paused_until",
+    ] {
+        assert!(
+            role_has_column_privilege(
+                pool,
+                "ironauth_app",
+                "scim_push_connections",
+                column,
+                "UPDATE"
+            )
+            .await,
+            "the push worker writes scim_push_connections.{column} and cannot: 0192 grants it"
+        );
+    }
+
+    // WHAT THE WORKER MUST NOT TOUCH, which is the half that matters. `active` is the operator's
+    // switch, and the rest is the connection's identity and configuration: a role that could
+    // write `base_url` or `credential_secret_name` could point a live connection at a downstream
+    // of its choosing and send it somebody's directory.
+    for column in [
+        "active",
+        "base_url",
+        "credential_secret_name",
+        "attribute_mapping",
+        "user_scope_filter",
+        "group_scope_filter",
+        "write_mode",
+        "deletion_policy",
+        "organization_id",
+        "tenant_id",
+        "environment_id",
+    ] {
         assert!(
             !role_has_column_privilege(
                 pool,
@@ -9210,8 +9262,8 @@ async fn the_outbound_connection_update_grant_is_scoped_to_the_columns_a_stateme
                 "UPDATE"
             )
             .await,
-            "ironauth_app must NOT hold UPDATE on scim_push_connections.{column} until the \
-             worker that performs it arrives"
+            "ironauth_app must NOT hold UPDATE on scim_push_connections.{column}: it is the \
+             operator's, and a worker that could write it could redirect a live connection"
         );
     }
 }
