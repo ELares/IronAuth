@@ -83,6 +83,17 @@ enum Coverage {
     ///
     /// Separate from [`Coverage::NotApplicable`] because they are different facts and blurring
     /// them is how a gap becomes invisible: an N/A says "not ours", a gap says "ours, missing".
+    ///
+    /// # Currently unused, and kept on purpose
+    ///
+    /// Both gaps were XML Encryption and criterion 5 closed them, so nothing constructs this
+    /// today. Deleting it would leave the table unable to SAY "this is ours and it is missing",
+    /// and the alternative -- folding such an item into `NotApplicable` -- is exactly the
+    /// blurring the paragraph above refuses.
+    #[allow(
+        dead_code,
+        reason = "the vocabulary outlives the current gaps; see the note above"
+    )]
     Gap(&'static str),
 }
 
@@ -120,14 +131,12 @@ const CHEAT_SHEET: &[Item] = &[
     },
     Item {
         control: "Deprecate support for insecure XMLEnc algorithms",
-        coverage: Coverage::Gap(
-            "XML Encryption is not implemented, so there is no algorithm set to deprecate yet. \
-             Criterion 5 of this issue (#138) owns it, and the allowlist has to exclude \
-             RSA-1.5 (the Bleichenbacher class, Keycloak CVE-2026-2092) and CBC modes (the \
-             padding-oracle class) from the first line of code rather than later.",
-        ),
-        rationale: "Recorded as a GAP rather than an N/A: it is this crate's work and it is \
-                    missing, which is a different fact from being out of scope.",
+        coverage: Coverage::Tests(&["the_broken_algorithms_are_refused_before_the_seam"]),
+        rationale: "There was never anything to deprecate: the allowlist excluded RSA-1.5 (the \
+                    Bleichenbacher class) and every CBC mode (the Jager and Somorovsky \
+                    plaintext-recovery class) from its first line. CBC is refused structurally \
+                    because `ring` offers none, and RSA-1.5 is refused BEFORE the caller's \
+                    unwrapper is asked, so the unwrapper cannot become the oracle.",
     },
     // -- Validate Protocol Usage ------------------------------------------------------------
     Item {
@@ -534,14 +543,18 @@ const CHEAT_SHEET: &[Item] = &[
     // -- Encrypted assertions ---------------------------------------------------------------
     Item {
         control: "Decrypt encrypted assertions, then re-validate the decrypted content",
-        coverage: Coverage::Gap(
-            "XML Encryption is not implemented. It is criterion 5 of this same issue (#138) and \
-             is the next thing to land in this crate.",
-        ),
-        rationale: "A GAP, not an N/A: it is in this crate's scope and it is missing. An item \
-                    silently absent from a checklist is the failure this file exists to \
-                    prevent, and an item mislabelled as out of scope is the same failure with \
-                    better manners.",
+        coverage: Coverage::Tests(&[
+            "an_encrypted_assertion_decrypts_and_verifies",
+            "decryption_is_not_verification",
+            "the_broken_algorithms_are_refused_before_the_seam",
+            "the_limits_apply_to_the_decrypted_document",
+        ]),
+        rationale: "Decrypt then REVALIDATE, and the second test is the one that matters: an \
+                    assertion that decrypts but is signed by nobody pinned, or not signed, or \
+                    edited after signing, is refused exactly as it would be in the clear. \
+                    Keycloak CVE-2026-2092 and the Casdoor batch are both 'it decrypted' taken \
+                    as evidence about whose identity was asserted, and the encryption key is a \
+                    PUBLIC one out of the service provider's own metadata.",
     },
     // -- Fuzzing ----------------------------------------------------------------------------
     Item {
@@ -639,12 +652,15 @@ fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
     // At exact counts a deletion is a red build that a reader has to lower deliberately, in the
     // same commit, with the removed row visible in the diff. That is the most a same-file bound
     // can do: it cannot stop a removal, only make one loud.
-    assert_eq!(named, 18, "a row that names tests was added or removed");
+    assert_eq!(named, 20, "a row that names tests was added or removed");
     assert_eq!(
         excused, 22,
         "a row marked out of scope was added or removed"
     );
-    assert_eq!(gaps, 2, "a row marked as a gap was added or removed");
+    // ZERO GAPS. Both were XML Encryption, and criterion 5 closed them. The assertion stays at
+    // an exact count rather than being deleted: a checklist that cannot express "this is ours
+    // and it is missing" has no way to record the next one.
+    assert_eq!(gaps, 0, "a row marked as a gap was added or removed");
 }
 
 /// A row whose control TEXT enumerates several properties names several tests.

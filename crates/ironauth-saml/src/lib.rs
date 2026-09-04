@@ -183,8 +183,16 @@
 //!
 //! # What this crate does NOT do yet
 //!
-//! Encrypted assertions and the fuzz targets are the rest of #138 and are not here. Metadata
-//! parsing, anchor rotation, and the SP protocol flow are #139.
+//! Metadata parsing, anchor rotation, and the SP protocol flow are #139. Everything #138 asks
+//! for is here.
+//!
+//! ENCRYPTED ASSERTIONS ARE HERE, with the key transport as a CALLER'S SEAM rather than a key
+//! this crate holds. That is better architecture -- a production service provider keeps its
+//! decryption key in an HSM or a KMS, not in a parsing library's heap -- and it is also the only
+//! correct answer available: `ring` has no RSA decryption at all, and the `rsa` crate's advisory
+//! exemption in `deny.toml` rests on the written claim that it "NEVER DECRYPTS", which calling
+//! its decrypt here would have made false in the exact operation the Marvin advisory is about.
+//! See [`decrypt_and_verify`].
 //!
 //! COMMENT TRUNCATION IS HERE, and an earlier version of this list said it was not. A value
 //! split by a comment reads back whole, `tests/wrapping.rs` carries the corpus, and the note on
@@ -194,6 +202,7 @@
 #![forbid(unsafe_code)]
 
 mod c14n;
+mod encrypted;
 mod parse;
 mod tree;
 mod verify;
@@ -210,6 +219,7 @@ pub const ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 
 /// The SAML 2.0 protocol namespace, which `Response` and `AuthnRequest` are in.
 pub const PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+pub use encrypted::{DecryptError, KeyTransport, KeyTransportAlg, decrypt_and_verify};
 pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.
