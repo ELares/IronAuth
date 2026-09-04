@@ -128,6 +128,16 @@ pub struct ScimPushConnectionListView {
     /// The OTHER half of criterion 2's lag, reported once for the page rather than per row
     /// because it is the same number for every connection in the scope. A connection's lag is
     /// this minus its own `cursor_sequence`.
+    ///
+    /// The difference counts FEED POSITIONS, not people waiting to be provisioned. The feed
+    /// carries every event the environment emits and a SCIM connection translates almost none of
+    /// them: a sign-in, a token issuance and a consent are each one of "600 behind" that will
+    /// never produce a request to any downstream. So it says how far back in the feed the worker
+    /// is, and a surface built on it should say that rather than imply a queue of unsynced users.
+    ///
+    /// It is measured against the head the feed will actually SERVE, which is not `MAX(sequence)`:
+    /// `newest_sequence` applies the same visibility watermark the reads do, or a connection that
+    /// had consumed everything on offer would report a distance that never reached zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feed_head_sequence: Option<i64>,
 }
