@@ -655,3 +655,116 @@ async fn push_one<T: ScimTransport, S: SubjectSource>(
     progress.converged += 1;
     Ok(())
 }
+
+/// Runs one pass for every connection in `scope` that is due, and records what happened.
+///
+/// # Why this exists, and what it closes
+///
+/// [`run_tail_pass`] and [`run_backfill_pass`] had NO caller outside the tests. Issue #137's
+/// criteria 1, 3 and 4 were therefore satisfied by code that nothing ran: the suites called those
+/// functions directly, which is exactly why they passed and exactly why they proved less than
+/// they appeared to. The repository has a `dormant-module-scan` gate for that shape and it failed
+/// on this module.
+///
+/// This is the seam between the passes and a deployment. It decides WHICH pass a connection needs
+/// from its own stored state, so no caller can run the wrong one, and it is where a failure turns
+/// into a recorded pause rather than a log line nobody reads.
+///
+/// # The backoff, and why a failure has to be written down
+///
+/// A retryable failure pauses the connection for a bounded, growing interval. That is the whole
+/// mechanism behind #137's "a downstream outage pauses the cursor rather than dropping events":
+/// the cursor stays where it is, the connection is skipped until its deadline passes, and the
+/// deadline clears itself so an outage that ends unattended recovers with no intervention.
+///
+/// Before this, `record_failure` was called by nothing in `src`, so `consecutive_failures` stayed
+/// zero, `paused_until` stayed NULL, and criterion 2's health surface reported a healthy
+/// connection through an outage of any length.
+///
+/// # Errors
+///
+/// [`StoreError`] if the due listing itself cannot be read. A failure on one CONNECTION is
+/// recorded against that connection and does not stop the others: one downstream being unreachable
+/// is not a reason to stop syncing every other customer.
+pub async fn run_due_connections<T, S, F>(
+    store: &ironauth_store::ScopedStore<'_>,
+    scope: ironauth_store::Scope,
+    now_unix_micros: i64,
+    limit: i64,
+    mut build: F,
+) -> Result<Vec<(ScimPushConnectionId, Result<Progress, WorkerError>)>, StoreError>
+where
+    T: ScimTransport,
+    S: SubjectSource,
+    F: FnMut(&ScimPushConnection) -> Option<(ScimPushClient<T>, S, String)>,
+{
+    let due = store
+        .scim_push_connections()
+        .due_for_sync(now_unix_micros, limit)
+        .await?;
+
+    let mut outcomes = Vec::with_capacity(due.len());
+    for connection in due {
+        // The caller supplies the client and the directory for THIS connection, because both
+        // depend on its own configuration: its base URL, the secret its credential lives in, and
+        // the scope filters that decide who is in it. Returning `None` means the caller could not
+        // build them, which is a configuration problem rather than a sync failure.
+        let Some((client, subjects, organization_id)) = build(&connection) else {
+            continue;
+        };
+        let pass = Pass {
+            connection_id: &connection.id,
+            client: &client,
+            subjects: &subjects,
+            deletion_policy: connection.deletion_policy,
+            limit,
+            scope,
+            now_unix_micros,
+            organization_id,
+        };
+        let outcome = if connection.backfill_state.is_done() {
+            run_tail_pass(store, pass).await
+        } else {
+            run_backfill_pass(store, pass).await
+        };
+        if let Err(error) = &outcome {
+            record_connection_failure(store, &connection, error, now_unix_micros).await?;
+        }
+        outcomes.push((connection.id.clone(), outcome));
+    }
+    Ok(outcomes)
+}
+
+/// The backoff ceiling, so a long outage does not push a connection's next attempt past the point
+/// where anybody is still watching.
+const MAX_BACKOFF_MICROS: i64 = 15 * 60 * 1_000_000;
+
+/// Records a connection-level failure and pauses it for a growing interval.
+async fn record_connection_failure(
+    store: &ironauth_store::ScopedStore<'_>,
+    connection: &ScimPushConnection,
+    error: &WorkerError,
+    now_unix_micros: i64,
+) -> Result<(), StoreError> {
+    let (why, pause) = match error {
+        // A PERMANENT failure is not a backoff candidate: retrying reproduces it exactly, and a
+        // pause would only delay the moment an operator sees it. Recorded without one, so the
+        // health surface shows the reason and the connection keeps being picked up.
+        WorkerError::Permanent(why) => (why.clone(), None),
+        WorkerError::Retryable(why) => (why.clone(), Some(())),
+        WorkerError::Store(error) => (format!("the store refused the pass: {error:?}"), Some(())),
+    };
+    let deadline = pause.map(|()| {
+        // Doubling from a second, capped. `consecutive_failures` is the count BEFORE this failure,
+        // so the first outage waits one second rather than none.
+        let exponent = u32::try_from(connection.consecutive_failures)
+            .unwrap_or(u32::MAX)
+            .min(20);
+        let micros = 1_000_000_i64.saturating_mul(1_i64 << exponent.min(20));
+        now_unix_micros.saturating_add(micros.min(MAX_BACKOFF_MICROS))
+    });
+    store
+        .scim_push_sync_state()
+        .record_failure(&connection.id, &why, deadline)
+        .await
+}

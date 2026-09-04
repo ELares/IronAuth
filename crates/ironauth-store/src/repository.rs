@@ -75158,6 +75158,47 @@ impl ScimPushConnectionRepo<'_> {
         scim_push_connection_from_row(&row, &self.scope)
     }
 
+    /// Every ACTIVE connection in this scope that is ready to run, oldest poll first.
+    ///
+    /// # The query 0192's index exists for
+    ///
+    /// A connection is due when it is active and not inside a backoff, and a pause here is a
+    /// self-clearing DEADLINE, so "not paused" means `paused_until IS NULL OR paused_until <=
+    /// now()`. 0192 ships the index for exactly this predicate, and shipped it before anything
+    /// issued the query: this is the caller it was waiting for.
+    ///
+    /// Ordered by `last_polled_at` with NULLs first, so a connection that has never run goes
+    /// before one that ran a minute ago and no connection can be starved by a busier sibling.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn due_for_sync(
+        &self,
+        now_unix_micros: i64,
+        limit: i64,
+    ) -> Result<Vec<ScimPushConnection>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SCIM_PUSH_SELECT_COLUMNS} FROM scim_push_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND active \
+               AND (paused_until IS NULL \
+                    OR paused_until <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval) \
+             ORDER BY last_polled_at ASC NULLS FIRST, id \
+             LIMIT $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_unix_micros.to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| scim_push_connection_from_row(row, &self.scope))
+            .collect()
+    }
+
     /// One connection, resolved THROUGH the organization that owns it.
     ///
     /// # Why this exists beside `get`

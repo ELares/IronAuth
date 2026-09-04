@@ -29,7 +29,8 @@ use ironauth_admin::scim_push_transport::{
     ScimRequest, ScimResponse, ScimTransport, ScimTransportError,
 };
 use ironauth_admin::scim_push_worker::{
-    Pass, Progress, SubjectSource, WorkerError, run_backfill_pass, run_tail_pass,
+    Pass, Progress, SubjectSource, WorkerError, run_backfill_pass, run_due_connections,
+    run_tail_pass,
 };
 use ironauth_env::Env;
 use ironauth_scim::downstream::{Downstream, Health};
@@ -301,6 +302,11 @@ struct Harness {
 }
 
 impl Harness {
+    /// A moment safely after `now_micros`, so a second pass in one test is not racing the first.
+    fn scope_now(&self, env: &Env) -> i64 {
+        now_micros(env) + 1_000
+    }
+
     async fn start() -> Self {
         let db = TestDatabase::start().await;
         let env = Env::system();
@@ -555,6 +561,116 @@ async fn a_connection_that_is_not_enumerating_cannot_run_a_backfill_pass() {
         h.downstream.users().is_empty(),
         "it pushed anyway: {:?}",
         h.downstream.users()
+    );
+}
+
+#[tokio::test]
+async fn the_driver_runs_due_connections_and_writes_the_backoff_a_failure_earns() {
+    // WHY THIS TEST EXISTS. `run_tail_pass` and `run_backfill_pass` had no caller outside the
+    // suite, so criteria 1, 3 and 4 were satisfied by code nothing ran: the tests called those
+    // functions directly, which is exactly why they passed and exactly why they proved less than
+    // they appeared to. This drives the seam a deployment uses.
+    //
+    // It also reaches two things that were unreachable. `record_failure` was called by nothing in
+    // `src`, so `consecutive_failures` stayed zero and `paused_until` stayed NULL: criterion 2's
+    // health surface reported a healthy connection through an outage of any length. And 0192's
+    // due index was shipped for a query nothing issued.
+    let h = Harness::start().await;
+    let directory = Directory::with("usr_ada", "ada");
+    h.start_tailing_from(0).await;
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_1",
+        "user.created",
+        json!({ "user_id": "usr_ada", "state": "active" }),
+    )
+    .await;
+
+    let store = h.db.store().scoped(h.scope);
+    let now = now_micros(&h.env);
+
+    // A DUE CONNECTION IS FOUND AND RUN. Nothing here names the connection: the driver reads the
+    // due listing, which is the query 0192 indexed.
+    let outcomes = run_due_connections(&store, h.scope, now, 50, |connection| {
+        Some((
+            ScimPushClient::new(
+                FixtureTransport {
+                    downstream: h.downstream.clone(),
+                },
+                BASE,
+                TOKEN,
+                WriteMode::Patch,
+            ),
+            directory.clone(),
+            connection.organization_id.to_string(),
+        ))
+    })
+    .await
+    .expect("the due listing reads");
+    assert_eq!(outcomes.len(), 1, "the due connection was not picked up");
+    let progress = outcomes[0].1.as_ref().expect("the pass ran");
+    assert_eq!(progress.converged, 1, "{progress:?}");
+    assert_eq!(h.downstream.users().len(), 1);
+
+    // NOW AN OUTAGE. The failure must be recorded and the connection paused, which is the
+    // mechanism behind "an outage pauses the cursor rather than dropping events".
+    h.downstream.set_health(Health::Down);
+    enqueue(
+        &h.db,
+        h.scope,
+        "evt_2",
+        "user.updated",
+        json!({ "user_id": "usr_ada" }),
+    )
+    .await;
+    let outcomes = run_due_connections(&store, h.scope, h.scope_now(&h.env), 50, |connection| {
+        Some((
+            ScimPushClient::new(
+                FixtureTransport {
+                    downstream: h.downstream.clone(),
+                },
+                BASE,
+                TOKEN,
+                WriteMode::Patch,
+            ),
+            directory.clone(),
+            connection.organization_id.to_string(),
+        ))
+    })
+    .await
+    .expect("the due listing reads");
+    assert!(outcomes[0].1.is_err(), "the outage was not reported");
+
+    let after = store
+        .scim_push_sync_state()
+        .get(&h.connection)
+        .await
+        .expect("get")
+        .expect("state");
+    assert_eq!(
+        after.consecutive_failures, 1,
+        "the failure was not counted, so a health surface would report this connection healthy"
+    );
+    assert!(
+        after.last_error.is_some(),
+        "the failure recorded no reason: {after:?}"
+    );
+    assert!(
+        after.paused_until_unix_micros.is_some(),
+        "a retryable failure set no backoff, so the worker would hammer a downstream that is down"
+    );
+
+    // AND THE PAUSE TAKES THE CONNECTION OUT OF THE DUE LISTING, which is what makes the backoff
+    // a backoff rather than a number in a column.
+    let still_due = store
+        .scim_push_connections()
+        .due_for_sync(h.scope_now(&h.env), 50)
+        .await
+        .expect("due listing");
+    assert!(
+        still_due.is_empty(),
+        "a paused connection is still due, so the backoff does nothing: {still_due:?}"
     );
 }
 
