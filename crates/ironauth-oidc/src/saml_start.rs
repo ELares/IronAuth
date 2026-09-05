@@ -64,12 +64,26 @@ use crate::wellknown::parse_scope;
 /// we wrote and hold the other end of, where there is nothing to accommodate.
 const REQUEST_TTL_SECS: i64 = 300;
 
-/// The browser-binding cookie's name (issue #139).
+/// The browser-binding cookie's name for one outstanding request (issue #139).
+///
+/// ONE COOKIE PER FLOW, NOT ONE PER HOST, and an earlier version used a single fixed name.
+/// `__Host-` forbids a `Domain` and pins `Path=/`, so a fixed name is exactly ONE storage slot
+/// per host: a second sign-in started anywhere on the deployment -- another tab, another
+/// connection, another tenant -- overwrote the first flow's nonce. The first response then
+/// arrived, spent its outstanding request and burned its assertion id in the store BEFORE the
+/// transport compared cookies, and was refused with both already consumed. The user could not
+/// retry: their request was gone. Two tabs is not an attack, it is Tuesday.
+///
+/// THE REQUEST ID IS IN THE NAME rather than the value, so the consumer can ask for the ONE
+/// cookie belonging to the request the response names instead of guessing among several. Each
+/// carries the request's own five-minute `Max-Age`, so the jar drains by itself.
 ///
 /// SHARED WITH THE ASSERTION CONSUMER, which is the only other reader, so the two cannot drift
 /// into setting one name and checking another -- a divergence that would refuse every solicited
 /// login and read, from the outside, exactly like a broken identity provider.
-pub(crate) const BINDING_COOKIE: &str = "__Host-ironauth_saml_bind";
+pub(crate) fn binding_cookie_name(request_id: &str) -> String {
+    format!("__Host-ironauth_saml_bind_{request_id}")
+}
 
 /// The largest `RelayState` migration 0198's column will hold.
 ///
@@ -267,14 +281,14 @@ pub async fn start_get(
         return server_error();
     }
 
-    started(location, &nonce)
+    started(location, &request_id, &nonce)
 }
 
 /// The redirect that starts a flow: the identity provider's URL and the binding cookie.
 ///
 /// SPLIT OUT SO `start_get` STAYS READABLE, and because the three headers are one decision --
 /// where the browser goes, that the answer is never cached, and the binding it must carry back.
-fn started(location: axum::http::HeaderValue, nonce: &str) -> Response {
+fn started(location: axum::http::HeaderValue, request_id: &str, nonce: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [
@@ -285,9 +299,11 @@ fn started(location: axum::http::HeaderValue, nonce: &str) -> Response {
             ),
             (
                 axum::http::header::SET_COOKIE,
-                binding_cookie(nonce).parse().unwrap_or_else(|_| {
-                    axum::http::HeaderValue::from_static("__Host-ironauth_saml_bind=")
-                }),
+                binding_cookie(request_id, nonce)
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        axum::http::HeaderValue::from_static("__Host-ironauth_saml_bind_x=")
+                    }),
             ),
         ],
     )
@@ -327,10 +343,10 @@ fn mint_binding(state: &OidcState) -> (String, Vec<u8>) {
 ///
 /// `HttpOnly` keeps script from reading the nonce, and `Max-Age` matches the request's own TTL
 /// so a cookie cannot outlive the row it is the key to.
-fn binding_cookie(nonce: &str) -> String {
+fn binding_cookie(request_id: &str, nonce: &str) -> String {
     format!(
-        "{BINDING_COOKIE}={nonce}; Path=/; Max-Age={REQUEST_TTL_SECS}; Secure; HttpOnly; \
-         SameSite=None"
+        "{}={nonce}; Path=/; Max-Age={REQUEST_TTL_SECS}; Secure; HttpOnly; SameSite=None",
+        binding_cookie_name(request_id)
     )
 }
 

@@ -2020,8 +2020,12 @@ impl TraitSchemaView for StoreTraitSchema<'_> {
 /// reached a write. The SAML caller was filling those fields with computed values that went
 /// nowhere; removing the parameter is what made that visible rather than arguable.
 ///
-/// The identity KEY stays the verified, issuer-namespaced `(issuer, sub)` composite, NEVER the
-/// mapped subject. A first login creates the user with the mapped traits (or a minimal identity
+/// The identity KEY IS THE CALLER'S `external_id` AND NEVER THE MAPPED SUBJECT. An earlier
+/// version of this sentence said "the verified, issuer-namespaced `(issuer, sub)` composite",
+/// which is true of the OIDC caller and false of the SAML one: it namespaces by CONNECTION,
+/// because a SAML `idp_entity_id` is unique only per organization. What both callers guarantee,
+/// and what this function relies on, is that the key is derived from values the protocol
+/// VERIFIED rather than from anything the mapping produced. A first login creates the user with the mapped traits (or a minimal identity
 /// when the mapping maps none); a returning login refreshes the mapped traits (a documented
 /// policy: a re-login re-applies the mapping so upstream trait drift is reflected), or leaves a
 /// trait-free identity untouched. `trait_doc` has ALREADY been type-checked against the active

@@ -37,11 +37,19 @@
 //!
 //! THE LIFECYCLE FENCE COMES BEFORE THE ORGANIZATION MEMBERSHIP, and an earlier version had it
 //! the other way. `establish_session` is where a blocked, disabled or waitlisted account is
-//! refused, and it is the ONLY such check on this path -- the identity provider, not this
-//! server, decided who the human is. Joining somebody to an organization before that check runs
-//! means an unauthenticated cross-site POST writes an org membership for an account this
-//! deployment refuses to authenticate. The membership is therefore written AFTER the session is
-//! minted, so nothing lands for a person who is not admitted.
+//! refused -- the identity provider, not this server, decided who the human is. Joining somebody
+//! to an organization before that check runs means an unauthenticated cross-site POST writes an
+//! org membership for an account this deployment refuses to authenticate. The membership is
+//! therefore written AFTER the session is minted.
+//!
+//! THE IDENTITY WRITE STILL COMES FIRST, AND IT HAS TO. `establish_session` is given a USER ID,
+//! so the user must exist before it can be asked about them -- which means a returning person's
+//! mapped traits are refreshed before the fence is consulted. An earlier version of this
+//! paragraph said "nothing lands for a person who is not admitted" and that was false of exactly
+//! that write. What closes it is a lifecycle read of its own, before provisioning, for an
+//! account that already exists; the fence below remains authoritative. A FIRST login is not
+//! covered and cannot be: a person with no row has no state to fence on, and the row created is
+//! `Active` by construction.
 //!
 //! A LIVE IDENTITY PROVIDER ACCOUNT RE-JOINS THE ORGANIZATION on its next login, because that is
 //! what just-in-time provisioning means: the directory is the source of truth for who belongs.
@@ -110,18 +118,36 @@ const NAMEID_FORMAT_CLAIM: &str = "nameid_format";
 /// connection configured this way is asking its provider for exactly what it cannot use.
 const UNUSABLE_NAMEID_FORMATS: [&str; 1] = ["urn:oasis:names:tc:SAML:2.0:nameid-format:transient"];
 
+/// XSD `collapse` on a column value, matching what the assertion consumer already applies.
+///
+/// THE TWO SIDES HAVE TO NORMALIZE THE SAME WAY OR THE GUARD IS BYPASSABLE. `saml_acs` collapses
+/// BOTH the connection's `nameid_format` column and the document's `Format` before comparing
+/// them, because XML 1.0 attribute-value normalization means a padded column and a flush
+/// document say the same thing -- and it has a test pinning exactly that. An earlier version of
+/// the transient refusal below compared the column RAW, so a column holding the transient URI
+/// with one trailing space was admitted by the ACS as transient and then sailed past the check
+/// that exists to stop it, provisioning a new person and a new organization membership on every
+/// login.
+fn collapse(text: &str) -> String {
+    text.split(['\u{9}', '\u{a}', '\u{d}', ' '])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The local identity key for a `NameID` on a connection.
 ///
 /// NAMESPACED BY THE CONNECTION, which is the trust boundary: one connection is one set of
 /// pinned certificates belonging to one organization. See objection 1 in the module doc for what
 /// namespacing by `idp_entity_id` did instead.
 ///
-/// A DISTINCT PREFIX FROM THE OIDC ONE, so the two can never collide. `federated_external_id`
-/// builds `federated:v1:...` from an OIDC connector's ISSUER, and SAML entity ids are commonly
-/// issuer-shaped URLs -- so sharing the prefix would let a SAML connection whose `idp_entity_id`
-/// was set to an existing connector's issuer resolve that connector's users. The lengths are
-/// interleaved for the same reason they are in the federated form: without them, a key is a
-/// concatenation that two different pairs can produce.
+/// A DISTINCT PREFIX FROM THE OIDC ONE, so the two namespaces can never meet. This module no
+/// longer keys on `idp_entity_id` at all, so the collision that argument was written against --
+/// a SAML connection whose entity id was set to an existing connector's issuer -- is already
+/// impossible; the prefix is what keeps it impossible if a later change ever reintroduces an
+/// issuer-shaped component, and it costs nothing. THE LENGTHS ARE INTERLEAVED for a reason that
+/// applies today: without them the key is a concatenation two different (connection, NameID)
+/// pairs can produce, and a `NameID` is operator-visible text an identity provider chooses.
 #[must_use]
 pub fn saml_external_id(connection_id: &str, name_id: &str) -> String {
     format!(
@@ -154,7 +180,7 @@ pub(crate) async fn sign_in(
 ) -> Response {
     // A FORMAT THAT NAMES A DIFFERENT STRING EVERY TIME cannot key an account. Refused before
     // anything is written, because the first write is what would create the duplicate.
-    if UNUSABLE_NAMEID_FORMATS.contains(&connection.nameid_format.as_str()) {
+    if UNUSABLE_NAMEID_FORMATS.contains(&collapse(&connection.nameid_format).as_str()) {
         tracing::warn!(
             target: "ironauth.saml",
             connection = %connection.id,
@@ -194,6 +220,33 @@ pub(crate) async fn sign_in(
     let external_id = saml_external_id(&connection.id.to_string(), &consumed.accepted.name_id);
     let handle = format!("saml:{}:{}", connection.id, consumed.accepted.name_id);
 
+    // THE LIFECYCLE IS CHECKED BEFORE THE IDENTITY IS WRITTEN, for an account that already
+    // exists. `establish_session` is the authoritative fence and still runs below -- this does
+    // not replace it -- but it runs AFTER provisioning, and provisioning REWRITES a returning
+    // person's mapped traits. Without this, an unauthenticated cross-site POST could refresh a
+    // blocked or disabled person's stored identity from whatever their identity provider now
+    // says, on a sign-in this deployment then refuses. An earlier version of the module doc
+    // claimed "nothing lands for a person who is not admitted" while that write landed.
+    //
+    // IT CANNOT COVER A FIRST LOGIN, and saying so is the point: a person who does not exist yet
+    // has no state to be fenced on, and the row this creates is `Active` by construction. So the
+    // uncovered case is an account this deployment has never seen, which is the case JIT exists
+    // to serve.
+    //
+    // A STORE FAULT FAILS CLOSED, because the alternative is provisioning past a fence that
+    // could not be read.
+    match state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_external_id(&external_id)
+        .await
+    {
+        Ok(Some(existing)) if !existing.state.can_authenticate() => return refused_account(),
+        Ok(_) => {}
+        Err(_) => return server_error(),
+    }
+
     let user_id = match provision_federated_user(
         state,
         scope,
@@ -226,6 +279,14 @@ pub(crate) async fn sign_in(
     // account and a session here, exactly as on the federated callback: this path runs no
     // `can_authenticate` pre-check of its own, because the identity provider, not this server,
     // decided who the human is.
+    // SESSION ROTATION AND THE FOREIGN-SUBJECT CASCADE ARE INERT HERE, and that is a property of
+    // the transport rather than a choice. `establish_session` rotates or revokes a PRIOR session
+    // by reading its cookie, and the session cookie is `SameSite=Lax` -- so it is not sent on
+    // this cross-site POST at all, and the function sees a browser with no session whatever the
+    // jar holds. The consequence is that a SAML sign-in ADDS a session rather than replacing
+    // one. Recorded rather than fixed: making the session cookie readable here would mean
+    // `SameSite=None` on the session itself, which is a far larger weakening than the one it
+    // would buy back.
     let cookies = match interaction::establish_session(
         state,
         scope,
@@ -447,6 +508,32 @@ fn insert_at_path(
     let conflict = || ClaimsConflict {
         name: name.to_owned(),
     };
+
+    // THE SEGMENT COUNT IS BOUNDED, AND THE BOUND IS NOT A TIDINESS RULE. An `Attribute`'s
+    // `Name` is chosen by the identity provider and nothing upstream bounds its LENGTH:
+    // `max_name_bytes` in the parser applies to an XML attribute's KEY (the four bytes `Name`),
+    // not to its value, and `attributes()` checks only that the name is not blank. So a signed
+    // assertion inside the 512 KiB body cap can carry a `Name` of ~387,000 dots, and one nested
+    // `Map` per segment is a `serde_json::Value` that deep -- whose DERIVED, RECURSIVE
+    // destructor overflows a tokio worker's 2 MiB stack when it drops, on every exit path
+    // including the refusals. A stack overflow is not a panic: nothing catches it, and the whole
+    // multi-tenant process aborts.
+    //
+    // THIS CRATE ALREADY LEARNED THIS ONCE. `ironauth_saml::parse::Element` and `tree::
+    // RichElement` both carry hand-written iterative `Drop` impls because a reviewer watched the
+    // process abort at depth 60,000, and `DEPTH_CEILING` is 512 for the same reason. A verified
+    // signature does not make a document friendly, and this is the first place in the sign-in
+    // path that builds an unbounded recursive structure from one.
+    //
+    // TEN IS ABOVE EVERY REAL NAME. The dotted names this exists to serve are OID URNs and
+    // schema URIs -- `urn:oid:0.9.2342.19200300.100.1.3` is six segments, Entra's
+    // `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` is three -- so a name
+    // past this is not a mapping target anybody wrote.
+    const MAX_SEGMENTS: usize = 10;
+    if name.split('.').count() > MAX_SEGMENTS {
+        return Err(conflict());
+    }
+
     let mut segments = name.split('.').peekable();
     let mut current = root;
     while let Some(segment) = segments.next() {

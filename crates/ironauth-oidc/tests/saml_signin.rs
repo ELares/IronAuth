@@ -502,7 +502,7 @@ async fn a_first_assertion_provisions_the_person_and_mints_a_session() {
 async fn a_second_assertion_signs_in_the_same_person_rather_than_forking_the_account() {
     // JIT IS CREATE ON FIRST AND UPDATE ON SUBSEQUENT, which #139 states as one criterion
     // because the failure mode of getting the second half wrong is a duplicate account per
-    // login. The identity key is the (issuer, NameID) composite, so a second assertion resolves
+    // login. The identity key is the (connection, NameID) composite, so a second assertion resolves
     // the same row.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, ISSUER, &json!({})).await;
@@ -622,7 +622,7 @@ async fn a_response_presented_with_another_flows_cookie_signs_nobody_in() {
         &harness,
         &wired,
         &response,
-        Some("__Host-ironauth_saml_bind=somebody-elses-nonce"),
+        Some("__Host-ironauth_saml_bind__req_csrf2=somebody-elses-nonce"),
     )
     .await;
     assert!(status.is_client_error(), "{status} {body}");
@@ -642,7 +642,9 @@ async fn a_bound_response_in_its_own_browser_signs_in() {
         &harness,
         &wired,
         &response,
-        Some(&format!("__Host-ironauth_saml_bind={BINDING_NONCE}")),
+        Some(&format!(
+            "__Host-ironauth_saml_bind__req_bound1={BINDING_NONCE}"
+        )),
     )
     .await;
     assert_eq!(status, 303, "{body}");
@@ -703,6 +705,11 @@ async fn an_assertion_naming_one_claim_twice_signs_nobody_in() {
     // login that looked fine. The refusal names the key in the log, which is the only way the
     // operator learns to fix it.
     let harness = Harness::start_store_backed().await;
+    // THE SCHEMA IS SEEDED, and without it this test was vacuous: with no active trait schema a
+    // mapping that resolves any trait fails the write and answers the SAME 500 this asserts, so
+    // deleting the collision refusal left the test green. Seeding it means the only remaining
+    // route to a 500 is the refusal itself.
+    seed_trait_schema(&harness).await;
     let wired = wire(
         &harness,
         ISSUER,
@@ -1003,6 +1010,66 @@ async fn a_fenced_account_is_refused_and_joins_no_organization() {
 }
 
 #[tokio::test]
+async fn a_fenced_accounts_stored_identity_is_not_rewritten() {
+    // THE WRITE THAT LANDS BEFORE THE FENCE. `establish_session` is given a USER ID, so the user
+    // must exist before it can be asked about them -- which means provisioning, and provisioning
+    // REFRESHES a returning person's mapped traits. Without a lifecycle read of its own, an
+    // unauthenticated cross-site POST rewrote a disabled person's stored identity from whatever
+    // their identity provider now said, on a sign-in this deployment then refused. The module
+    // doc claimed "nothing lands for a person who is not admitted" while exactly that landed.
+    let harness = Harness::start_store_backed().await;
+    seed_trait_schema(&harness).await;
+    let wired = wire(
+        &harness,
+        ISSUER,
+        &json!({"traits": {"email": {"source": ["email"], "required": false}}}),
+    )
+    .await;
+
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(
+            &wired,
+            harness.env(),
+            ISSUER,
+            "_frozen1",
+            SUBJECT,
+            &[("email", "before@globex.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    assert_eq!(trait_emails(&harness).await, vec!["before@globex.example"]);
+
+    let people = users(&harness, harness.scope()).await;
+    harness
+        .set_user_state(&people[0].0, ironauth_store::UserState::Disabled)
+        .await;
+
+    // A GENUINE ASSERTION carrying a DIFFERENT address. Refused -- and the stored one unchanged.
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(
+            &wired,
+            harness.env(),
+            ISSUER,
+            "_frozen2",
+            SUBJECT,
+            &[("email", "after@globex.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(
+        trait_emails(&harness).await,
+        vec!["before@globex.example"],
+        "a refused sign-in rewrote a fenced account's stored identity"
+    );
+}
+
+#[tokio::test]
 async fn the_jit_membership_reaches_the_event_feed() {
     // THE OUTBOUND SCIM PUSH SHIPPED IN THIS MILESTONE drives its steady state entirely from the
     // event feed, so a membership committed with no envelope is a person who exists here and
@@ -1044,6 +1111,95 @@ async fn the_jit_membership_reaches_the_event_feed() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("the JIT membership enqueued no member_added envelope: {kinds:?}");
+}
+
+#[tokio::test]
+async fn a_deeply_dotted_attribute_name_signs_nobody_in_and_does_not_abort_the_process() {
+    // A DENIAL OF SERVICE ON THE WHOLE DEPLOYMENT, introduced by the dotted-path fix that made
+    // realistic attribute names addressable. Nothing upstream bounds an `Attribute` `Name`:
+    // `max_name_bytes` applies to the XML attribute KEY (`Name`, four bytes), not its value. So
+    // a signed assertion inside the body cap can carry a name of hundreds of thousands of dots,
+    // and one nested map per segment is a `serde_json::Value` that deep -- whose derived
+    // recursive destructor overflows the worker stack when it drops, aborting the process for
+    // every tenant. A stack overflow is not a panic: nothing catches it.
+    //
+    // THE TEST SURVIVING IS THE ASSERTION. If the bound is removed this does not fail, it takes
+    // the test binary down with it.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    let name = ".".repeat(200_000);
+    let statement = format!(
+        "<saml:AttributeStatement><saml:Attribute Name=\"{name}\">\
+         <saml:AttributeValue>x</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>"
+    );
+    let response =
+        signed_with_statement(&wired, harness.env(), ISSUER, "_deep1", SUBJECT, &statement);
+    let (status, headers, body) = post(&harness, &wired, &response).await;
+    assert!(status.is_server_error(), "{status}");
+    assert!(set_cookie(&headers).is_empty(), "{body}");
+    assert!(users(&harness, harness.scope()).await.is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn a_padded_transient_format_column_is_still_transient() {
+    // THE TWO SIDES MUST NORMALIZE ALIKE. `saml_acs` XSD-collapses both the connection's
+    // `nameid_format` column and the document's `Format` before comparing them, so a column
+    // holding the transient URI with a trailing space ADMITS a flush transient assertion. An
+    // earlier version of the refusal below compared the column raw, so exactly that connection
+    // sailed past the guard and provisioned a new person and a new membership on every login.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire_with_format(
+        &harness,
+        ISSUER,
+        &json!({}),
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient ",
+    )
+    .await;
+
+    let response = signed_with_format(
+        &wired,
+        harness.env(),
+        ISSUER,
+        "_padded1",
+        "_opaque_1",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+    );
+    let (status, headers, body) = post(&harness, &wired, &response).await;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(
+        users(&harness, harness.scope()).await.is_empty(),
+        "a padded transient format bypassed the refusal: {body}"
+    );
+    assert!(set_cookie(&headers).is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn two_flows_in_one_browser_do_not_destroy_each_other() {
+    // ONE COOKIE SLOT PER HOST WAS ONE FLOW PER BROWSER. `__Host-` forbids a Domain and pins
+    // `Path=/`, so a single fixed cookie name has exactly one slot: a second sign-in started in
+    // another tab overwrote the first flow's nonce, and the first response then spent its
+    // request and burned its assertion id before the transport compared cookies -- refused, with
+    // nothing left to retry. Two tabs is not an attack.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    // TWO FLOWS, in the order a browser would hold them: the second is the one whose cookie a
+    // single-slot scheme would keep.
+    let first = signed_solicited(&harness, &wired, "_two1", "_req_two1", true).await;
+    let second = signed_solicited(&harness, &wired, "_two2", "_req_two2", true).await;
+    let jar = format!(
+        "__Host-ironauth_saml_bind__req_two1={BINDING_NONCE}; \
+         __Host-ironauth_saml_bind__req_two2={BINDING_NONCE}"
+    );
+
+    for (assertion, response) in [("_two2", &second), ("_two1", &first)] {
+        let (status, _, body) = post_with_cookie(&harness, &wired, response, Some(&jar)).await;
+        assert_eq!(
+            status, 303,
+            "the {assertion} flow was destroyed by the other: {body}"
+        );
+    }
 }
 
 #[tokio::test]

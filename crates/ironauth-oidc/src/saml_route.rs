@@ -81,17 +81,35 @@
 //! issued to, and the start endpoint is unauthenticated, so an attacker can mint their own.
 //!
 //! THE OTHER HALF IS THE BROWSER BINDING, AND IT IS HERE NOW. Two earlier versions of this
-//! paragraph said it "lands with sign-in"; sign-in landed without it, so an attacker could
-//! auto-submit a genuine assertion for their OWN account into a victim's browser and the victim
-//! would be signed into the attacker's account. `saml_start` now sets a `SameSite=None; Secure;
-//! HttpOnly` `__Host-` cookie carrying a nonce and records its SHA-256 on the request row, and
-//! [`binding_matches`] below compares them. `SameSite=None` is what makes the cookie ARRIVE on
-//! this cross-site POST; a `Lax` one would refuse every genuine login and stop nothing.
+//! paragraph said it "lands with sign-in"; sign-in landed without it. `saml_start` now sets a
+//! `SameSite=None; Secure; HttpOnly` `__Host-` cookie carrying a nonce, records its SHA-256 on
+//! the request row, and [`binding_matches`] below compares them. `SameSite=None` is what makes
+//! the cookie ARRIVE on this cross-site POST; a `Lax` one would refuse every genuine login and
+//! stop nothing.
 //!
-//! IT DOES NOT COVER AN UNSOLICITED RESPONSE, which answers no request and so has no row to
-//! carry a digest. That is inherent rather than an omission -- there is no earlier moment at
-//! which this deployment met that browser -- and it is why unsolicited responses are off by
-//! default and why #139 asks for the risk to be documented where an operator turns them on.
+//! # What the binding closes, and the one it does not
+//!
+//! IT CLOSES THE CAPTURED-RESPONSE ATTACK: an attacker who starts a flow in THEIR OWN browser,
+//! authenticates at the identity provider as themselves and auto-submits the response into
+//! somebody else's browser now fails, because the nonce is in the attacker's cookie jar and not
+//! the victim's.
+//!
+//! IT DOES NOT CLOSE THE ATTACKER-INITIATED FLOW, and that is worth stating plainly rather than
+//! leaving a reader to infer that "login CSRF is handled". An attacker who CONTROLS A CONNECTION
+//! -- their own tenant, pointing `idp_sso_url` at a server they run and pinning a certificate
+//! they hold -- can top-level-navigate a victim's browser to that connection's START endpoint.
+//! The binding is then planted in the VICTIM'S jar, their own server answers immediately with an
+//! assertion naming the attacker, the cookie matches because it is the same browser, and the
+//! victim is signed into the attacker's account. The binding cannot see this: every fact it
+//! checks is true. What would close it is a first-party-initiation requirement on the start
+//! endpoint or a confirmation interstitial, and BOTH cost a legitimate flow -- a "sign in with
+//! SSO" link on a partner page or in an email is a cross-site navigation. Choosing which to pay
+//! is an operator-visible trade, so it is named here rather than decided quietly.
+//!
+//! IT ALSO DOES NOT COVER AN UNSOLICITED RESPONSE, which answers no request and so has no row to
+//! carry a digest. That is inherent -- there is no earlier moment at which this deployment met
+//! that browser -- and it is why unsolicited responses are off by default and why #139 asks for
+//! the risk to be documented where an operator turns them on.
 
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
@@ -154,12 +172,19 @@ pub struct AcsForm {
 ///
 /// # What a refusal leaves behind
 ///
-/// THIS MODULE MAKES SIX REFUSALS AND THEY DIVIDE IN TWO, which an earlier version of this
-/// paragraph flattened into "there are three ... all reached before the store". BEFORE THE STORE
-/// IS ADDRESSED: an unreadable scope, an oversized field, an undecodable body, and an unreadable
-/// connection id -- four, and none of them writes anything anywhere. AFTER: a connection that is
-/// absent or inactive, and a store fault reading the connection or its certificates. Those two
-/// have read and written nothing either, because the only statements they made were SELECTs.
+/// THIS MODULE MAKES SEVEN REFUSALS AND THEY DIVIDE IN THREE, which two earlier versions of
+/// this paragraph got wrong in turn -- first "there are three ... all reached before the store",
+/// then six. BEFORE THE STORE IS ADDRESSED: an unreadable scope, an oversized field, an
+/// undecodable body, and an unreadable connection id -- four, and none writes anything anywhere.
+/// AFTER, HAVING ONLY READ: a connection that is absent or inactive, and a store fault reading
+/// the connection or its certificates; their only statements were SELECTs.
+///
+/// AND ONE THAT REFUSES AFTER A WRITE, which is the seventh and the reason the split is no
+/// longer two. A response whose browser binding does not match has already spent its outstanding
+/// request and burned its assertion id inside [`consume`], because those are what prove it is a
+/// genuine unreplayed answer at all. The spend is deliberate rather than regrettable: a
+/// single-use request that survived being presented in the wrong browser would hand an attacker
+/// a retry.
 ///
 /// NOT NOTHING FOR EVERY REFUSAL [`consume`] MAKES, and an earlier version of this paragraph
 /// said so. `consume`'s property is narrower and its own doc states it correctly: nothing is
@@ -250,7 +275,11 @@ pub async fn acs_post(
     // this point and deliberately stays spent: a response presented in the wrong browser has
     // burned the sign-in it was answering, which is the correct outcome for a single-use
     // request and denies an attacker a retry.
-    if !binding_matches(&headers, consumed.browser_binding_sha256.as_deref()) {
+    if !binding_matches(
+        &headers,
+        consumed.accepted.in_response_to.as_deref(),
+        consumed.browser_binding_sha256.as_deref(),
+    ) {
         tracing::warn!(
             target: "ironauth.saml",
             connection = %connection.id,
@@ -290,11 +319,24 @@ pub async fn acs_post(
 ///
 /// A digest comparison that returns early leaks a prefix, and the value being probed is the one
 /// thing standing between a captured assertion and a forced sign-in.
-fn binding_matches(headers: &axum::http::HeaderMap, expected: Option<&[u8]>) -> bool {
+fn binding_matches(
+    headers: &axum::http::HeaderMap,
+    request_id: Option<&str>,
+    expected: Option<&[u8]>,
+) -> bool {
     let Some(expected) = expected else {
         return true;
     };
-    let Some(nonce) = cookie_value(headers, crate::saml_start::BINDING_COOKIE) else {
+    // THE COOKIE IS NAMED FOR THE REQUEST THE RESPONSE ANSWERS, so a browser with several flows
+    // in flight is asked for the right one rather than for whichever overwrote the others. A
+    // recorded binding with no request id cannot happen -- the digest comes off the row that
+    // `InResponseTo` just spent -- but the pair is passed together so the impossible case is
+    // refused rather than assumed.
+    let Some(request_id) = request_id else {
+        return false;
+    };
+    let Some(nonce) = cookie_value(headers, &crate::saml_start::binding_cookie_name(request_id))
+    else {
         return false;
     };
     let actual = {

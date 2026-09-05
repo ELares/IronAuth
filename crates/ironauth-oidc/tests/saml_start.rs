@@ -331,6 +331,17 @@ async fn a_started_flow_is_answerable_at_the_acs_that_refuses_unsolicited_respon
         "{location}"
     );
 
+    // THE REQUEST ID COMES OUT OF THE DOCUMENT THIS DEPLOYMENT JUST SENT, not out of a fixture:
+    // what is being measured is that the id the identity provider will echo is the id that was
+    // recorded, and inventing one here would measure neither.
+    let xml = request_xml(location);
+    let id = xml
+        .split("ID=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the request carries an ID")
+        .to_owned();
+
     // THE BROWSER BINDING COOKIE, WHICH THE BROWSER CARRIES BACK. This is what makes the loop a
     // real one: the assertion consumer now requires the response to arrive in the browser its
     // request was issued to, so a test that posted without this would be refused -- and one that
@@ -340,7 +351,7 @@ async fn a_started_flow_is_answerable_at_the_acs_that_refuses_unsolicited_respon
         .get_all(axum::http::header::SET_COOKIE)
         .iter()
         .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
-        .find(|value| value.starts_with("__Host-ironauth_saml_bind="))
+        .find(|value| value.starts_with(&format!("__Host-ironauth_saml_bind_{id}=")))
         .expect("the start endpoint set no browser-binding cookie");
     assert!(cookie.contains("SameSite=None"), "{cookie}");
     assert!(cookie.contains("Secure"), "{cookie}");
@@ -353,20 +364,9 @@ async fn a_started_flow_is_answerable_at_the_acs_that_refuses_unsolicited_respon
         .map(|(_, value)| value.to_owned())
         .expect("the cookie carries a nonce");
 
-    // THE REQUEST ID COMES OUT OF THE DOCUMENT THIS DEPLOYMENT JUST SENT, not out of a fixture:
-    // what is being measured is that the id the identity provider will echo is the id that was
-    // recorded, and inventing one here would measure neither.
-    let xml = request_xml(location);
-    let id = xml
-        .split("ID=\"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("the request carries an ID")
-        .to_owned();
-
     let response = signed(&wired, harness.env(), "_assertion_looped", &id);
     let encoded = base64::engine::general_purpose::STANDARD.encode(&response);
-    let bound = format!("__Host-ironauth_saml_bind={nonce}");
+    let bound = format!("__Host-ironauth_saml_bind_{id}={nonce}");
     let (status, _, body) = harness
         .post_form(
             &wired.acs_path,

@@ -377,7 +377,9 @@ async fn only_the_recorded_relay_state_becomes_a_redirect_and_never_the_posted_o
         .post_form(
             &wired.path,
             &form(&response, Some("https://evil.example/steal")),
-            Some(&format!("__Host-ironauth_saml_bind={BINDING_NONCE}")),
+            Some(&format!(
+                "__Host-ironauth_saml_bind__req_solicited={BINDING_NONCE}"
+            )),
         )
         .await;
 
