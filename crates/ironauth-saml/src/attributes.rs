@@ -40,7 +40,10 @@
 //! claim that makes somebody build a fix for a problem wider than the one they have. A `Name`
 //! with no dot in it is a one-segment path and resolves today -- and short names are what an
 //! Okta or a `OneLogin` app sends by default (`email`, `firstName`, `groups`). What is unreachable
-//! is exactly the dotted ones, which is every URI-shaped name and so every ADFS or Entra default.
+//! is exactly the dotted ones -- which is every ADFS and Entra default, and NOT every URI-shaped
+//! name: `urn:oasis:names:tc:SAML:attribute:subject-id`, the OASIS subject-id profile's own name,
+//! carries no dot and splits to one segment. Stating it as "every URI" would send somebody
+//! building the escape syntax after a wider problem than the one they have.
 //!
 //! AN EARLIER VERSION OF THIS PR CHANGED THE RESOLVER and it was a security defect, which is
 //! worth recording here rather than only in a commit message. Preferring a literal key let the

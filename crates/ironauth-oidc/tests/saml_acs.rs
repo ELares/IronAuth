@@ -41,6 +41,24 @@ const NAMEID_FORMAT: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddr
 /// 2026-01-01T00:00:00Z, which every window below is written around.
 const NOW: i64 = 1_767_225_600;
 
+/// [`NOW`] in the microseconds the store's request and replay tables are written in.
+///
+/// THE FIXTURES ISSUE REQUESTS OFF THIS, NOT THE WALL CLOCK. An earlier version issued them at
+/// the real system time while `Acs::now_unix_secs` stayed at `NOW` in January 2026, putting the
+/// two clocks 247 days apart -- so `consume_request`'s expiry predicate passed by that margin
+/// rather than by the 300-second window the fixture appears to set up, and rows were written
+/// with a `consumed_at` eight months before their `created_at`. Replacing the value the ACS
+/// hands the store with a literal `0` left all twelve tests green, which is to say the clock the
+/// endpoint reports was measured by nothing.
+const fn now_store_micros() -> i64 {
+    NOW * 1_000_000
+}
+
+/// A request window: 300 seconds from [`NOW`], which is what an `AuthnRequest` gets.
+const fn request_window() -> (i64, i64) {
+    (now_store_micros(), now_store_micros() + 300_000_000)
+}
+
 fn now_micros(env: &Env) -> i64 {
     i64::try_from(
         env.clock()
@@ -85,10 +103,21 @@ impl Fixture {
 }
 
 /// The connection columns a test varies. Everything else about the row is fixed.
+///
+/// # Why the entity id and the ACS URL are in here
+///
+/// Every connection the suite built once carried the same module constants the fixture documents
+/// are composed from, so "the endpoint compared the value FROM THE ROW" and "the endpoint
+/// compared a constant it carries" were indistinguishable -- and the audience test's own comment
+/// claimed the first. Replacing `&acs.connection.sp_entity_id` with the literal string left the
+/// suite green. A second connection whose columns differ from the constants is what tells them
+/// apart, so these are settings.
 struct Settings {
     allow_unsolicited: bool,
     nameid_format: &'static str,
     require_encrypted_assertion: bool,
+    sp_entity_id: &'static str,
+    acs_url: &'static str,
 }
 
 impl Default for Settings {
@@ -97,6 +126,8 @@ impl Default for Settings {
             allow_unsolicited: false,
             nameid_format: NAMEID_FORMAT,
             require_encrypted_assertion: false,
+            sp_entity_id: AUDIENCE,
+            acs_url: ACS_URL,
         }
     }
 }
@@ -133,8 +164,8 @@ async fn fixture_with(db: &TestDatabase, env: &Env, settings: Settings) -> Fixtu
                 display_name: "Okta",
                 idp_entity_id: ISSUER,
                 idp_sso_url: "https://idp.example/sso",
-                sp_entity_id: AUDIENCE,
-                acs_url: ACS_URL,
+                sp_entity_id: settings.sp_entity_id,
+                acs_url: settings.acs_url,
                 allow_unsolicited: settings.allow_unsolicited,
                 clock_skew_secs: 30,
                 max_assertion_age_secs: 300,
@@ -215,7 +246,10 @@ async fn fixture_with(db: &TestDatabase, env: &Env, settings: Settings) -> Fixtu
 struct Body {
     audience: &'static str,
     recipient: &'static str,
-    name_id_format: &'static str,
+    /// [`None`] writes NO `Format` attribute, which SAML Core 2.2.2 says MEANS `unspecified`.
+    name_id_format: Option<&'static str>,
+    /// `false` omits the whole `saml:Subject`, which `check` cannot read.
+    subject: bool,
     not_on_or_after: &'static str,
     in_response_to: Option<&'static str>,
     /// A second `Attribute` with the same `Name`, which the attribute reader refuses.
@@ -230,7 +264,8 @@ impl Default for Body {
         Self {
             audience: AUDIENCE,
             recipient: ACS_URL,
-            name_id_format: NAMEID_FORMAT,
+            name_id_format: Some(NAMEID_FORMAT),
+            subject: true,
             not_on_or_after: "2026-01-01T00:02:00Z",
             in_response_to: None,
             duplicate_attribute: false,
@@ -261,24 +296,33 @@ fn signed_body(key: &XmlTestKey, assertion_id: &str, body: &Body) -> String {
     } else {
         ""
     };
+    // WRITTEN ONLY WHEN THE BODY NAMES ONE, so a fixture can carry a `NameID` with no `Format`
+    // at all -- which is a conformant document and, per SAML Core 2.2.2, one that MEANS
+    // `unspecified`. Writing `Format=""` instead would be a different document entirely.
+    let format = body
+        .name_id_format
+        .map_or(String::new(), |value| format!(" Format=\"{value}\""));
+    let subject = if body.subject {
+        format!(
+            "<saml:Subject>\
+             <saml:NameID{format}>ada@globex.example</saml:NameID>\
+             <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+             <saml:SubjectConfirmationData{correlation} Recipient=\"{}\" \
+             NotOnOrAfter=\"{}\"/></saml:SubjectConfirmation></saml:Subject>",
+            body.recipient, body.not_on_or_after,
+        )
+    } else {
+        String::new()
+    };
     let children = format!(
-        "<saml:Issuer>{ISSUER}</saml:Issuer>\
-         <saml:Subject>\
-         <saml:NameID Format=\"{}\">ada@globex.example</saml:NameID>\
-         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
-         <saml:SubjectConfirmationData{correlation} Recipient=\"{}\" \
-         NotOnOrAfter=\"{}\"/></saml:SubjectConfirmation></saml:Subject>\
+        "<saml:Issuer>{ISSUER}</saml:Issuer>{subject}\
          <saml:Conditions NotBefore=\"2025-12-31T23:58:00Z\" NotOnOrAfter=\"{}\">\
          <saml:AudienceRestriction><saml:Audience>{}</saml:Audience>\
          </saml:AudienceRestriction></saml:Conditions>\
          <saml:AttributeStatement><saml:Attribute Name=\"{EMAIL_CLAIM}\">\
          <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
          {duplicate}{encrypted}</saml:AttributeStatement>",
-        body.name_id_format,
-        body.recipient,
-        body.not_on_or_after,
-        body.not_on_or_after,
-        body.audience,
+        body.not_on_or_after, body.audience,
     );
     ironauth_saml::test_util::signed_response_with(key, assertion_id, &children)
 }
@@ -303,14 +347,13 @@ async fn a_solicited_response_signs_somebody_in_and_spends_its_request_exactly_o
     let replay = db.store().scoped(fixture.scope).saml_replay();
 
     // THE REQUEST THIS DEPLOYMENT ISSUED, with the return URL recorded beside it.
-    let now = now_micros(&env);
     replay
         .issue_request(
             &fixture.connection.id,
             "_req_first",
             Some("/dashboard"),
-            now,
-            now + 300_000_000,
+            request_window().0,
+            request_window().1,
         )
         .await
         .expect("issue the request");
@@ -344,6 +387,31 @@ async fn a_solicited_response_signs_somebody_in_and_spends_its_request_exactly_o
         matches!(refused, Err(AcsError::UnknownRequest)),
         "an outstanding request was spendable twice: {refused:?}"
     );
+
+    // AND THE LOSING RESPONSE DID NOT BURN ITS ASSERTION ID. `consume` spends the request BEFORE
+    // admitting the assertion, and its doc says why: a response that loses the request race must
+    // not consume a replay slot it never used. Nothing measured that -- swapping the two writes
+    // left the whole suite green, because this test asserts only the error and the replay test
+    // gets `Replayed` from the conflict either way.
+    //
+    // WHAT THE LOST PROPERTY COSTS: the same assertion re-presented against a legitimately
+    // re-issued request would come back `Replayed` forever. So it is re-presented here.
+    replay
+        .issue_request(
+            &fixture.connection.id,
+            "_req_reissued",
+            Some("/settings"),
+            request_window().0,
+            request_window().1,
+        )
+        .await
+        .expect("issue a second request");
+    let retried = signed(&fixture.key, "_assertion_b", Some("_req_reissued"));
+    let consumed = consume(&replay, &fixture.acs(), retried.as_bytes())
+        .await
+        .expect("an assertion that lost its request race was still admissible");
+    assert_eq!(consumed.accepted.assertion_id, "_assertion_b");
+    assert_eq!(consumed.relay_state.as_deref(), Some("/settings"));
 }
 
 #[tokio::test]
@@ -352,7 +420,6 @@ async fn the_same_assertion_is_admitted_once_even_on_two_requests() {
     let env = Env::system();
     let fixture = fixture(&db, &env, false).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
-    let now = now_micros(&env);
 
     // TWO OUTSTANDING REQUESTS, so the request check cannot be what refuses the second attempt.
     // The SAME assertion id is presented against each; only the replay table can tell them apart.
@@ -362,8 +429,8 @@ async fn the_same_assertion_is_admitted_once_even_on_two_requests() {
                 &fixture.connection.id,
                 request,
                 None,
-                now,
-                now + 300_000_000,
+                request_window().0,
+                request_window().1,
             )
             .await
             .expect("issue");
@@ -392,14 +459,13 @@ async fn a_refused_response_does_not_spend_the_request_it_names() {
     let env = Env::system();
     let fixture = fixture(&db, &env, false).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
-    let now = now_micros(&env);
     replay
         .issue_request(
             &fixture.connection.id,
             "_req_victim",
             Some("/dashboard"),
-            now,
-            now + 300_000_000,
+            request_window().0,
+            request_window().1,
         )
         .await
         .expect("issue");
@@ -422,7 +488,7 @@ async fn a_refused_response_does_not_spend_the_request_it_names() {
 }
 
 #[tokio::test]
-async fn an_unsolicited_response_is_refused_by_default_and_admitted_once_on_opt_in() {
+async fn an_unsolicited_response_is_refused_by_default() {
     let db = TestDatabase::start().await;
     let env = Env::system();
 
@@ -475,14 +541,13 @@ async fn a_response_for_another_service_provider_is_refused_on_its_audience() {
     let fixture = fixture(&db, &env, true).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
 
-    let now = now_micros(&env);
     replay
         .issue_request(
             &fixture.connection.id,
             "_req_audience",
             Some("/dashboard"),
-            now,
-            now + 300_000_000,
+            request_window().0,
+            request_window().1,
         )
         .await
         .expect("issue");
@@ -548,6 +613,10 @@ async fn a_connection_with_no_usable_certificate_says_so_rather_than_blaming_the
     // AND AN RSA ROW WITH NO EXPONENT IS SKIPPED RATHER THAN PANICKING. The column forbids it,
     // so such a row should not exist -- and a panic in the ACS is a denial of service somebody
     // can reach by posting a response, so the code does not rely on that.
+    //
+    // A DIFFERENT ANSWER FROM THE ONE ABOVE, because the operator's next step is different: they
+    // are looking at a pinned row, not an empty list, and "you have no certificate" would send
+    // somebody staring at one to doubt their own screen.
     let mut broken = fixture.certificates.clone();
     broken[0].key_kind = SamlKeyKind::Rsa;
     broken[0].rsa_exponent = None;
@@ -559,15 +628,23 @@ async fn a_connection_with_no_usable_certificate_says_so_rather_than_blaming_the
     };
     assert!(matches!(
         examine(&with_broken, response.as_bytes()),
-        Err(AcsError::NoTrustAnchor)
+        Err(AcsError::AllCertificatesUnusable { pinned: 1 })
     ));
 }
 
 #[tokio::test]
 async fn a_second_pinned_certificate_lets_a_rollover_work() {
     // A CONNECTION HOLDS SEVERAL CERTIFICATES DURING A ROLLOVER, and a response signed by any
-    // pinned key must verify -- otherwise rotating one means an outage. The fixture signs with
-    // the SECOND key, so a pipeline that only tried the first would fail.
+    // pinned key must verify -- otherwise rotating one means an outage.
+    //
+    // WHICH KEY THE FIXTURE SIGNS WITH IS THE WHOLE TEST, and an earlier version had it exactly
+    // backwards. Its comment claimed to sign with "the SECOND key, so a pipeline that only
+    // tried the first would fail", but `certificates()` is `ORDER BY created_at DESC, id`, so
+    // the LATER-pinned key sorts FIRST -- and truncating the anchor list to `anchors[..1]` left
+    // the suite green. The key that becomes unreachable under a one-anchor pipeline is the
+    // ORIGINAL, which is precisely the one a rollover has to keep working while the identity
+    // provider switches over. So both are exercised below, and the order is asserted rather
+    // than assumed, because it is a property of a query in another crate.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let fixture = fixture(&db, &env, true).await;
@@ -608,6 +685,12 @@ async fn a_second_pinned_certificate_lets_a_rollover_work() {
         .await
         .expect("read both");
     assert_eq!(certificates.len(), 2, "the rollover fixture has one key");
+    assert_eq!(
+        certificates[0].public_key,
+        rolling.public_point(),
+        "certificates() no longer returns the newest first, so the assertions below no longer \
+         measure what they say they do"
+    );
 
     let acs = Acs {
         connection: &fixture.connection,
@@ -620,6 +703,14 @@ async fn a_second_pinned_certificate_lets_a_rollover_work() {
         .await
         .expect("a response signed by the newly pinned key");
     assert_eq!(consumed.accepted.name_id, "ada@globex.example");
+
+    // AND THE ORIGINAL KEY STILL WORKS, which is the half that fails under a pipeline trying
+    // only `anchors[0]`. During a rollover the identity provider is still signing with this one.
+    let original = signed(&fixture.key, "_assertion_original", None);
+    let consumed = consume(&replay, &acs, original.as_bytes())
+        .await
+        .expect("a response signed by the key pinned first");
+    assert_eq!(consumed.accepted.assertion_id, "_assertion_original");
 }
 
 #[tokio::test]
@@ -632,14 +723,13 @@ async fn an_unreadable_attribute_statement_is_refused_and_spends_nothing() {
     let env = Env::system();
     let fixture = fixture(&db, &env, false).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
-    let now = now_micros(&env);
     replay
         .issue_request(
             &fixture.connection.id,
             "_req_attributes",
             Some("/reports"),
-            now,
-            now + 300_000_000,
+            request_window().0,
+            request_window().1,
         )
         .await
         .expect("issue");
@@ -685,11 +775,28 @@ async fn a_nameid_in_another_format_than_the_connection_expects_is_refused() {
     let fixture = fixture(&db, &env, true).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
 
+    // ON THE SOLICITED PATH, so this also measures WHERE the check sits. Round 1 added three
+    // refusals to `examine` under the module's headline property -- nothing is spent until every
+    // stateless check has passed -- and gave all three of them unsolicited fixtures, which spend
+    // nothing either way. Moving the three checks after both store writes left the whole suite
+    // green: the property they were added under was measured for none of them.
+    replay
+        .issue_request(
+            &fixture.connection.id,
+            "_req_format",
+            Some("/reports"),
+            request_window().0,
+            request_window().1,
+        )
+        .await
+        .expect("issue");
+
     let transient = signed_body(
         &fixture.key,
         "_assertion_transient",
         &Body {
-            name_id_format: "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+            name_id_format: Some("urn:oasis:names:tc:SAML:2.0:nameid-format:transient"),
+            in_response_to: Some("_req_format"),
             ..Body::default()
         },
     );
@@ -703,11 +810,106 @@ async fn a_nameid_in_another_format_than_the_connection_expects_is_refused() {
         Some("urn:oasis:names:tc:SAML:2.0:nameid-format:transient")
     );
 
-    // AND THE CONNECTION'S OWN FORMAT STILL PASSES, so the check is not refusing everything.
-    let matching = signed(&fixture.key, "_assertion_matching_format", None);
-    consume(&replay, &fixture.acs(), matching.as_bytes())
+    // AND THE REQUEST IT NAMED IS UNSPENT: the refusal is stateless and comes before the spends.
+    let matching = signed(
+        &fixture.key,
+        "_assertion_matching_format",
+        Some("_req_format"),
+    );
+    let consumed = consume(&replay, &fixture.acs(), matching.as_bytes())
         .await
         .expect("a NameID in the configured format is admitted");
+    assert_eq!(
+        consumed.relay_state.as_deref(),
+        Some("/reports"),
+        "the refused response spent the request it named"
+    );
+
+    // PADDING IS NOT A DIFFERENT FORMAT. `Format` is an `xsd:anyURI`, whose `collapse` facet
+    // makes a padded spelling the same value -- and an earlier version compared the strings raw,
+    // so this document was refused.
+    let padded = signed_body(
+        &fixture.key,
+        "_assertion_padded_format",
+        &Body {
+            name_id_format: Some(" urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\n  "),
+            ..Body::default()
+        },
+    );
+    consume(&replay, &fixture.acs(), padded.as_bytes())
+        .await
+        .expect("a padded spelling of the configured format is the same format");
+}
+
+#[tokio::test]
+async fn a_nameid_with_no_format_is_the_unspecified_format_rather_than_no_format() {
+    // SAML CORE 2.2.2: an omitted `Format` MEANS
+    // `urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified`. An earlier version compared
+    // `Option<String>` against the column, so `None` matched nothing at all -- and a connection
+    // configured for `unspecified`, which is a value the column accepts and a real deployment
+    // sets, refused every conformant document that left the attribute off. Nobody on that
+    // connection could sign in, while the identical value spelled out explicitly worked.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let unspecified = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
+            ..Settings::default()
+        },
+    )
+    .await;
+    let replay = db.store().scoped(unspecified.scope).saml_replay();
+
+    let bare = signed_body(
+        &unspecified.key,
+        "_assertion_no_format",
+        &Body {
+            name_id_format: None,
+            ..Body::default()
+        },
+    );
+    let consumed = consume(&replay, &unspecified.acs(), bare.as_bytes())
+        .await
+        .expect("a NameID with no Format is the unspecified format");
+    assert_eq!(consumed.accepted.name_id_format, None);
+
+    // AND THE EXPLICIT SPELLING OF THE SAME VALUE IS THE SAME ANSWER, which is the pair the old
+    // comparison gave two different answers to.
+    let explicit = signed_body(
+        &unspecified.key,
+        "_assertion_explicit_unspecified",
+        &Body {
+            name_id_format: Some("urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"),
+            ..Body::default()
+        },
+    );
+    consume(&replay, &unspecified.acs(), explicit.as_bytes())
+        .await
+        .expect("the explicit spelling is the same format");
+
+    // AND ABSENT IS STILL NOT A WILDCARD. On a connection configured for `emailAddress`, a
+    // document with no `Format` is `unspecified`, which is a different value, so it is refused.
+    let strict = fixture(&db, &env, true).await;
+    let strict_replay = db.store().scoped(strict.scope).saml_replay();
+    let bare_elsewhere = signed_body(
+        &strict.key,
+        "_assertion_no_format_strict",
+        &Body {
+            name_id_format: None,
+            ..Body::default()
+        },
+    );
+    let refused = consume(&strict_replay, &strict.acs(), bare_elsewhere.as_bytes()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(AcsError::WrongNameIdFormat { found: None, .. })
+        ),
+        "an absent Format matched a connection configured for emailAddress: {refused:?}"
+    );
 }
 
 #[tokio::test]
@@ -729,14 +931,40 @@ async fn a_connection_requiring_encryption_refuses_a_cleartext_assertion() {
     )
     .await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
+    replay
+        .issue_request(
+            &fixture.connection.id,
+            "_req_encrypted",
+            Some("/reports"),
+            request_window().0,
+            request_window().1,
+        )
+        .await
+        .expect("issue");
 
     // OTHERWISE PERFECT: signed by the pinned key, right audience, right recipient, in date.
-    let cleartext = signed(&fixture.key, "_assertion_cleartext", None);
+    let cleartext = signed(&fixture.key, "_assertion_cleartext", Some("_req_encrypted"));
     let refused = consume(&replay, &fixture.acs(), cleartext.as_bytes()).await;
     assert!(
         matches!(refused, Err(AcsError::EncryptionRequired)),
         "a cleartext assertion was consumed on a connection requiring encryption: {refused:?}"
     );
+
+    // AND IT SPENT NOTHING. A connection whose operator set a column this build cannot honour
+    // must not also burn every outstanding request, which is what a refusal placed after the
+    // store writes would do: the same document reposted -- a browser refresh on the POST
+    // binding -- would come back `UnknownRequest`, and the replay table would fill with rows for
+    // sign-ins that never happened.
+    //
+    // SPENT DIRECTLY RATHER THAN THROUGH A SECOND RESPONSE, because on THIS connection every
+    // response is refused before the store is reached, so there is no document that could show
+    // the request still works. `consume_request` succeeding is the same fact: the row is
+    // outstanding, and it still carries the RelayState this deployment recorded.
+    let outstanding = replay
+        .consume_request(&fixture.connection.id, "_req_encrypted", now_store_micros())
+        .await
+        .expect("the refused response spent the request it named");
+    assert_eq!(outstanding.as_deref(), Some("/reports"));
 }
 
 #[tokio::test]
@@ -751,11 +979,23 @@ async fn an_encrypted_attribute_is_refused_rather_than_silently_dropped() {
     let fixture = fixture(&db, &env, true).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
 
+    replay
+        .issue_request(
+            &fixture.connection.id,
+            "_req_encrypted_attribute",
+            Some("/inbox"),
+            request_window().0,
+            request_window().1,
+        )
+        .await
+        .expect("issue");
+
     let with_encrypted = signed_body(
         &fixture.key,
         "_assertion_encrypted_attribute",
         &Body {
             encrypted_attribute: true,
+            in_response_to: Some("_req_encrypted_attribute"),
             ..Body::default()
         },
     );
@@ -765,10 +1005,161 @@ async fn an_encrypted_attribute_is_refused_rather_than_silently_dropped() {
         "an assertion with an unreadable attribute signed somebody in: {refused:?}"
     );
 
-    // AND THE SAME DOCUMENT WITHOUT IT IS ADMITTED, so this is the encrypted element being
-    // refused and not the fixture being broken in some other way.
-    let cleartext = signed(&fixture.key, "_assertion_cleartext_only", None);
-    consume(&replay, &fixture.acs(), cleartext.as_bytes())
+    // AND THE SAME DOCUMENT WITHOUT IT IS ADMITTED against the SAME request, which does two
+    // things at once: it shows the refusal is the encrypted element and not a broken fixture,
+    // and it shows the refusal spent nothing -- the request is still outstanding.
+    let cleartext = signed(
+        &fixture.key,
+        "_assertion_cleartext_only",
+        Some("_req_encrypted_attribute"),
+    );
+    let consumed = consume(&replay, &fixture.acs(), cleartext.as_bytes())
         .await
         .expect("an assertion with only cleartext attributes is admitted");
+    assert_eq!(
+        consumed.relay_state.as_deref(),
+        Some("/inbox"),
+        "the refused response spent the request it named"
+    );
+}
+
+#[tokio::test]
+async fn a_document_with_no_subject_is_malformed_rather_than_unsolicited() {
+    // ROUND 1'S HEADLINE BEHAVIOUR CHANGE, and nothing measured it. The unsolicited decision was
+    // moved from before `check` to after it, because `correlation` answers `None` for two
+    // different documents: one carrying no `InResponseTo`, and one whose bearer confirmation
+    // cannot be read at all. Deciding before `check` reported the second as
+    // `UnsolicitedRefused` -- which names a switch an operator could flip, and flipping it would
+    // not have fixed anything, while the real fault went unnamed.
+    //
+    // WHY THIS DOCUMENT SEPARATES THEM: `correlation` and `check` read `InResponseTo` through
+    // the same walk, so the two placements agree on everything `check` accepts. They can differ
+    // only on a document that verifies, correlates to `None`, and FAILS `check` -- which is what
+    // a missing `Subject` is.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let strict = fixture(&db, &env, false).await;
+    let replay = db.store().scoped(strict.scope).saml_replay();
+
+    let subjectless = signed_body(
+        &strict.key,
+        "_assertion_no_subject",
+        &Body {
+            subject: false,
+            ..Body::default()
+        },
+    );
+    let refused = consume(&replay, &strict.acs(), subjectless.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(AcsError::Condition(ConditionError::Malformed))),
+        "a malformed subject was reported as something an operator could configure away: \
+         {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_values_compared_come_from_the_connection_row_and_not_from_a_constant() {
+    // PROVENANCE, WHICH IS DIFFERENT FROM THE COMPARISON. Every connection the suite built once
+    // carried the same module constants the fixtures are composed from, so an endpoint reading
+    // `connection.sp_entity_id` and an endpoint carrying the literal string were
+    // indistinguishable -- and the audience test's comment claimed to prove the first. Two
+    // connections in one deployment, with different columns, is what tells them apart: under a
+    // constant, one connection's documents would validate against the other's settings.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    const OTHER_AUDIENCE: &str = "https://tenant-two.example/saml/metadata";
+    const OTHER_ACS: &str = "https://tenant-two.example/saml/acs";
+
+    let second = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            sp_entity_id: OTHER_AUDIENCE,
+            acs_url: OTHER_ACS,
+            ..Settings::default()
+        },
+    )
+    .await;
+    let replay = db.store().scoped(second.scope).saml_replay();
+
+    // ADDRESSED TO THE SECOND CONNECTION'S OWN ENTITY ID AND ACS URL, neither of which is a
+    // constant this file's other fixtures use. An endpoint comparing against `AUDIENCE` would
+    // refuse this document.
+    let addressed = signed_body(
+        &second.key,
+        "_assertion_second_connection",
+        &Body {
+            audience: OTHER_AUDIENCE,
+            recipient: OTHER_ACS,
+            ..Body::default()
+        },
+    );
+    let consumed = consume(&replay, &second.acs(), addressed.as_bytes())
+        .await
+        .expect("a response addressed to this connection's own entity id");
+    assert_eq!(consumed.connection_id, second.connection.id);
+
+    // AND THE FIRST CONNECTION'S DOCUMENT IS REFUSED HERE, which is the other half: a constant
+    // would accept it.
+    let elsewhere = signed(&second.key, "_assertion_first_connections", None);
+    let refused = consume(&replay, &second.acs(), elsewhere.as_bytes()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(AcsError::Condition(ConditionError::WrongAudience { .. }))
+        ),
+        "a response addressed to another connection was consumed here: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_request_is_unknown_at_the_clock_the_endpoint_reports() {
+    // THE CLOCK THE ACS HANDS THE STORE, which nothing measured. The fixtures once issued their
+    // requests at the real system time while `Acs::now_unix_secs` stayed at `NOW`, leaving the
+    // two clocks 247 days apart -- so `consume_request`'s expiry predicate passed by that margin
+    // rather than by the window the fixture set up, and replacing the value the endpoint hands
+    // the store with a literal `0` left every test green. An endpoint reporting the epoch would
+    // find no request ever expired.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(&db, &env, false).await;
+    let replay = db.store().scoped(fixture.scope).saml_replay();
+
+    // ISSUED AND ALREADY LAPSED AT `NOW`: a user who opened the sign-in page, left it, and came
+    // back after the window. The document is otherwise perfect.
+    replay
+        .issue_request(
+            &fixture.connection.id,
+            "_req_lapsed",
+            Some("/dashboard"),
+            now_store_micros() - 600_000_000,
+            now_store_micros() - 300_000_000,
+        )
+        .await
+        .expect("issue a request that has already lapsed");
+
+    let response = signed(&fixture.key, "_assertion_lapsed", Some("_req_lapsed"));
+    let refused = consume(&replay, &fixture.acs(), response.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(AcsError::UnknownRequest)),
+        "a request outside its window was still spendable: {refused:?}"
+    );
+
+    // AND A LIVE ONE IS NOT, so the clock is being compared rather than everything being
+    // refused. Same connection, same key, window open at `NOW`.
+    replay
+        .issue_request(
+            &fixture.connection.id,
+            "_req_live",
+            Some("/dashboard"),
+            request_window().0,
+            request_window().1,
+        )
+        .await
+        .expect("issue a live request");
+    let live = signed(&fixture.key, "_assertion_live", Some("_req_live"));
+    consume(&replay, &fixture.acs(), live.as_bytes())
+        .await
+        .expect("a request inside its window is spendable");
 }

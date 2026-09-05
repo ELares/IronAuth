@@ -1526,8 +1526,10 @@ path = "tests/native_sso.rs"
 # Needs a database.
 [[test]]
 name = "native_sso_flow"
+required-features = ["testing"]
 path = "tests/native_sso_flow.rs"
 
 [[test]]
 name = "saml_acs"
+required-features = ["testing"]
 path = "tests/saml_acs.rs"

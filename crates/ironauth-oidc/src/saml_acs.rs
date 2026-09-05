@@ -44,6 +44,23 @@ use ironauth_saml::{
 };
 use ironauth_store::{SamlCertificate, SamlConnection, SamlConnectionId, SamlKeyKind, StoreError};
 
+/// What SAML Core 2.2.2 says an omitted `NameID` `Format` means.
+const UNSPECIFIED_NAMEID: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified";
+
+/// XSD's `collapse` whiteSpace facet: the four characters it treats as whitespace, folded to
+/// single spaces with the ends trimmed.
+///
+/// EXACTLY FOUR, not `char::is_whitespace`. XSD 1.0 Part 2 3.1 names `#x9`, `#xA`, `#xD` and
+/// `#x20` and no others, so folding a NO-BREAK SPACE or an ideographic space would make this
+/// reader treat as one value a pair a schema-aware reader sees as two. `ironauth-saml` makes the
+/// same choice in two places, for the same reason.
+fn collapse(text: &str) -> String {
+    text.split(['\u{9}', '\u{a}', '\u{d}', ' '])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// What the assertion consumer service concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Consumed {
@@ -60,8 +77,13 @@ pub struct Consumed {
     /// taking the posted one is an open redirect with extra steps. The value here is the one
     /// this deployment recorded when it issued the request.
     ///
-    /// [`None`] for an unsolicited response, which by definition has no request to have
-    /// recorded one.
+    /// [`None`] FOR THREE DIFFERENT REASONS, and a caller must not read it as any one of them:
+    /// an unsolicited response, which has no request to have recorded one; a solicited response
+    /// whose request recorded no `RelayState`, which is the ordinary shape for a sign-in with
+    /// nowhere particular to return to; and a solicited response whose request recorded an
+    /// EMPTY one, which [`consume`] folds into `None` rather than handing back a return
+    /// location that is not one. "Was this solicited" is answered by `accepted.in_response_to`,
+    /// which is the field for that question.
     pub relay_state: Option<String>,
 }
 
@@ -70,7 +92,16 @@ pub struct Consumed {
 /// # Every variant is a thing somebody can act on
 ///
 /// A caller renders these to an operator through the connection-test flow #140 owns, so each one
-/// names a different fix. What none of them do is carry any part of the document.
+/// names a different fix.
+///
+/// WHAT THEY DO CARRY: a variant past [`Self::Signature`] may quote the document, and several
+/// do -- this enum's own `found`, and the `found` inside the wrapped [`ConditionError`] and
+/// [`Unreadable`] variants. An earlier version of this sentence said none of them did, which
+/// was false through the wrapped types before round 1 and false at this enum's own level after
+/// it. Quoting is SAFE HERE and deliberately not in those crates, because reaching any variant
+/// past `Signature` requires a signature by a certificate the operator pinned: the document is
+/// the identity provider's, not an attacker's. `VerifyError` sits before that gate and so
+/// quotes nothing.
 ///
 /// NOT `Clone`, `PartialEq` or `Eq`, because [`StoreError`] is none of those -- and wrapping it
 /// in something comparable to make the enum comparable would be inventing an equality for a
@@ -83,12 +114,23 @@ pub enum AcsError {
     /// which connection is supposed to be answering here -- and telling them about the `Issuer`
     /// inside the document would point them at a value the document chose.
     NoConnection,
-    /// The connection has no usable pinned certificate.
+    /// The connection has nothing pinned at all.
     ///
-    /// SEPARATE FROM A FAILED SIGNATURE. An operator who has not pinned a certificate yet, or
-    /// whose only pinned key is one this build cannot verify with, gets told that -- rather than
-    /// "the signature did not verify", which sends them to look at their identity provider.
+    /// SEPARATE FROM A FAILED SIGNATURE. An operator who has not pinned a certificate yet gets
+    /// told that -- rather than "the signature did not verify", which sends them to look at
+    /// their identity provider.
     NoTrustAnchor,
+    /// Certificates are pinned, and not one of them is usable at this moment.
+    ///
+    /// SEPARATE FROM [`Self::NoTrustAnchor`] BECAUSE THE FIX DIFFERS. "Pin a certificate" and
+    /// "the ones you pinned have expired, or are of a kind this build cannot verify with" send
+    /// an operator to two different places, and an expiry is the one they will hit years after
+    /// setup with nothing else changed. Collapsing them would tell somebody staring at three
+    /// pinned rows that they have none.
+    AllCertificatesUnusable {
+        /// How many are pinned, all of them unusable.
+        pinned: usize,
+    },
     /// The signature did not verify, or the document was not one this server will read.
     Signature(VerifyError),
     /// The signature held and a condition did not.
@@ -137,9 +179,12 @@ impl core::fmt::Display for AcsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoConnection => f.write_str("no active SAML connection is served at this URL"),
-            Self::NoTrustAnchor => {
-                f.write_str("the connection has no pinned certificate this server can verify with")
-            }
+            Self::NoTrustAnchor => f.write_str("the connection has no pinned certificate at all"),
+            Self::AllCertificatesUnusable { pinned } => write!(
+                f,
+                "all {pinned} of the connection's pinned certificates are outside their validity \
+                 window or of a kind this server cannot verify with"
+            ),
             Self::Signature(error) => write!(f, "the response did not verify: {error}"),
             Self::Condition(error) => write!(f, "the assertion was refused: {error}"),
             Self::Attributes(error) => write!(f, "the attributes could not be read: {error}"),
@@ -198,10 +243,18 @@ impl From<StoreError> for AcsError {
 /// one-element list cannot tell them apart. What "skipped" buys is the multi-certificate case,
 /// which is what a rollover is made of.
 ///
-/// EXPIRY IS NOT CHECKED HERE. A pinned certificate's `not_after` is what #141 alerts on; it is
-/// not a reason to stop verifying, because the trust decision is the PINNING and an operator who
-/// has not rotated yet is better served by a working login and an alert than by a locked door.
-/// Said out loud because the opposite is a defensible choice and this is not it.
+/// EXPIRY IS NOT CHECKED HERE, and a later round of review tried to add the check before
+/// reading this paragraph, so it is worth stating what holds it up. What is pinned on a
+/// connection is KEY MATERIAL -- `public_key` plus `key_kind`, verified against a fingerprint an
+/// operator compared by hand -- and not a chain anybody walks. The certificate's `notAfter` is a
+/// statement by an issuer nobody here consults; the trust decision is the pinning itself. This
+/// is the same position Shibboleth's explicit-key trust engine takes, and it is the majority
+/// behaviour among SAML service providers, because the failure mode of the alternative is an
+/// enterprise-wide lockout at midnight on a date nobody was watching.
+///
+/// SO THE COLUMNS ARE NOT DEAD, they belong to a different consumer: `not_after_unix_micros` is
+/// what #141's expiry alerting reads, which is the mechanism that actually gets a certificate
+/// rotated -- a warning weeks early, rather than a locked door on the day.
 fn anchors(certificates: &[SamlCertificate]) -> Vec<TrustAnchor> {
     certificates
         .iter()
@@ -249,6 +302,18 @@ pub struct Acs<'a> {
 pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), AcsError> {
     let anchors = anchors(acs.certificates);
     if anchors.is_empty() {
+        // WHICH EMPTINESS THIS IS decides what the operator does next, so the two are not one
+        // error. Nothing pinned is a setup step; everything pinned being unusable is an expiry
+        // or a key kind, and is what a connection that worked for a year turns into.
+        return Err(if acs.certificates.is_empty() {
+            AcsError::NoTrustAnchor
+        } else {
+            AcsError::AllCertificatesUnusable {
+                pinned: acs.certificates.len(),
+            }
+        });
+    }
+    if anchors.is_empty() {
         return Err(AcsError::NoTrustAnchor);
     }
     let assertion = verify(response, acs.limits, &anchors, ASSERTION_NS, "Assertion")
@@ -268,9 +333,16 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
         issuer: &acs.connection.idp_entity_id,
         audience: &acs.connection.sp_entity_id,
         recipient: &acs.connection.acs_url,
-        // WHAT THE ASSERTION CARRIED, so `check` confirms the value acted on below is the value
-        // the document holds -- and so a connection that does NOT correlate still refuses a
-        // response naming a request, because `carried` is `None` only when there is none.
+        // WHAT THE ASSERTION CARRIED, and an earlier comment here claimed more than that: it
+        // said a connection that does not correlate still refuses a response naming a request,
+        // "because `carried` is `None` only when there is none". Both halves were wrong, and
+        // the second contradicts the block twenty lines below. `correlation` and `check` read
+        // `InResponseTo` through the SAME `bearer_confirmation_data` walk, so this value is a
+        // copy of what `check` is about to look at: the comparison can only ever agree, and
+        // `ConditionError::UnknownRequest` is unreachable from this call site. It is passed
+        // anyway because `check`'s contract is that the caller states its expectation, and a
+        // future caller correlating from its own outstanding-request table -- rather than from
+        // the document -- gets the guard for free.
         in_response_to: carried.as_deref(),
         clock_skew_secs: i64::from(acs.connection.clock_skew_secs),
         max_age_secs: i64::from(acs.connection.max_assertion_age_secs),
@@ -302,7 +374,22 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
         // to be told which of the two it is.
         return Err(AcsError::EncryptionRequired);
     }
-    if accepted.name_id_format.as_deref() != Some(acs.connection.nameid_format.as_str()) {
+    // SAML CORE 2.2.2 GIVES AN OMITTED `Format` A MEANING: it is
+    // `urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified`, not "no value". An earlier
+    // version compared `Option<String>` against the column raw, so a connection configured for
+    // `unspecified` refused every conformant document that left the attribute off -- two
+    // spellings of one value, two outcomes, and nobody on that connection could sign in.
+    // COLLAPSED ON BOTH SIDES for the same reason `attributes.rs` collapses the sibling
+    // `NameFormat`: `Format` is an `xsd:anyURI`, and XSD gives that type the `collapse`
+    // whiteSpace facet, so a padded spelling is the same value to every schema-aware reader.
+    let expected_format = collapse(&acs.connection.nameid_format);
+    let found_format = collapse(
+        accepted
+            .name_id_format
+            .as_deref()
+            .unwrap_or(UNSPECIFIED_NAMEID),
+    );
+    if found_format != expected_format {
         // THE FORMAT IS PART OF THE IDENTITY, not decoration. `transient` names somebody for one
         // session and `persistent` names them forever; accepting a transient `NameID` where a
         // connection was configured for a persistent one keys an account to a value that will
@@ -316,14 +403,21 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
 
     let statement = attributes(&assertion).map_err(AcsError::Attributes)?;
     if statement.encrypted > 0 {
-        // AN ATTRIBUTE THIS PIPELINE CANNOT READ IS NOT AN ATTRIBUTE THAT IS ABSENT. The reader
-        // counts `EncryptedAttribute` rather than refusing, because refusing there would refuse
-        // a conformant document and would throw away everything sent in the clear beside it --
-        // it leaves the decision to whoever knows what the attributes are FOR. Here that is
-        // known: they feed the connection's mapping, so a dropped one is a trait the operator
-        // configured and this sign-in would silently not have. When that trait is a group
-        // membership, signing somebody in without it is signing them in with the wrong
-        // authorization, so this refuses and names the count.
+        // AN ATTRIBUTE THIS PIPELINE CANNOT READ IS NOT AN ATTRIBUTE THAT IS ABSENT. An earlier
+        // version of this comment justified the refusal by saying the withheld attributes "feed
+        // the connection's mapping, so a dropped one is a trait the operator configured" -- and
+        // this module never reads `connection.attribute_mapping`, while `Statement::encrypted`'s
+        // own doc says a count CANNOT tell whether a withheld attribute is one the mapping
+        // wants. The sentence asserted exactly what the upstream contract says is impossible.
+        //
+        // WHAT IS ACTUALLY TRUE: an `EncryptedAttribute` carries its `Name` INSIDE the
+        // ciphertext, so nothing on this side can tell whether it mattered. The choice is
+        // between signing somebody in from a document whose contents are partly unknown, and
+        // refusing. It refuses, because the unknown part can be a group membership and signing
+        // somebody in without one is signing them in with the wrong authorization. Making that
+        // governable needs a column, and a column needs an operator to set it, so it belongs
+        // with the connection API rather than being inferred here from a mapping whose default
+        // is `{}` on every row that exists.
         return Err(AcsError::EncryptedAttributes {
             count: statement.encrypted,
         });
