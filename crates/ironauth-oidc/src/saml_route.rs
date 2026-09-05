@@ -24,40 +24,65 @@
 //! It also means the ACS URL an operator pastes into Okta is per connection, which is what SP
 //! metadata generation will emit, and what the `acs_url` column already holds.
 //!
+//! # This endpoint does not sign anybody in, and that is the point of this change
+//!
+//! An earlier version of this module did: it resolved the `NameID` through the email identifier
+//! seam and minted a session. Review took it apart on four independent grounds, and each one is
+//! worth writing down, because they are the shape of the work that comes next rather than
+//! details to patch.
+//!
+//! 1. IT CROSSED ORGANIZATIONS. A `SamlConnection` carries an `organization_id`, and migration
+//!    0196 says why: "a trust anchor that reached two organizations would let one customer's
+//!    identity provider assert another customer's users." The identifier seam resolves per
+//!    ENVIRONMENT, so any identity provider with a key pinned anywhere in the environment could
+//!    have minted a session for any account in it.
+//! 2. IT BYPASSED THE CRATE'S OWN ANTI-TAKEOVER GATE. `account_linking` returns `AutoLink` from
+//!    exactly one arm of an exhaustive match, requiring an environment posture that is off by
+//!    default, a server-verified local address, an upstream that asserts verification, and a
+//!    connector marked trusted. The federated OIDC callback consults it on every login. Minting
+//!    a session on "a verified identifier exists" answers a question that module already owns,
+//!    and answers it differently.
+//! 3. THE POPULATION IT NAMED COULD NOT USE IT. Requiring a VERIFIED identifier is right, and
+//!    the SCIM inbound server in this same milestone deliberately writes `verified: false` --
+//!    "a provisioning system asserts that a person exists in its directory", which is not the
+//!    same as proving the address. So it would have signed in exactly none of the accounts it
+//!    existed to serve.
+//! 4. ITS ONLY REACHABLE MODE WAS THE ONE #139 REQUIRES OFF. Nothing in production issues a SAML
+//!    `AuthnRequest` yet, so no outstanding request can exist, so a solicited response is always
+//!    `UnknownRequest` and only `allow_unsolicited = true` could ever succeed.
+//!
+//! WHAT THIS SHIPS INSTEAD is the binding itself: a response arrives, is verified against the
+//! right connection, and is either consumed or refused with a typed reason. That is the surface
+//! #139 asks for when it says failures must "surface as typed connection-test failures ... so
+//! the test-connection flow can render actionable messages", and it is what an operator points
+//! Okta at to find out whether their certificate and audience are right.
+//!
 //! # There is no CSRF check here, deliberately
 //!
-//! Every other browser POST in this crate begins with a same-origin check. This one must not:
+//! Most browser-facing POSTs in this crate begin with a same-origin check. This one must not:
 //! the HTTP POST binding IS a cross-site form submission, auto-submitted by a page the identity
-//! provider served. A same-origin check here would refuse every real sign-in.
+//! provider served, so a same-origin check would refuse every real response.
 //!
-//! What stands in its place is the signature and the outstanding request. A response nobody
-//! could sign is refused at `verify`; a response that names no request is refused unless the
-//! connection opted in; and the request it names can be spent exactly once. That is a stronger
-//! guarantee than an origin header, and it is the reason the binding is safe without one.
+//! WHAT MAKES THAT SAFE TODAY IS THAT NOTHING IS AUTHENTICATED HERE. A cross-site POST reaches a
+//! signature check, a set of conditions, and a one-time spend, and then a page. The moment this
+//! endpoint mints a session, that argument stops being sufficient on its own: the assertion-id
+//! replay cache stops one assertion being re-used, and it does not stop somebody auto-submitting
+//! a FRESH assertion for their OWN account into a victim's browser. The defence for that is
+//! the outstanding request -- which is why `AuthnRequest` issuance is the piece that has to land
+//! before sign-in does, and not after.
 
 use axum::extract::{Form, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::Response;
 use base64::Engine as _;
 use ironauth_saml::Limits;
-use ironauth_store::{IdentifierType, SamlConnectionId, Scope};
+use ironauth_store::SamlConnectionId;
 use serde::Deserialize;
 
-use crate::authn::AuthenticationEvent;
-use crate::interaction;
 use crate::saml_acs::{Acs, AcsError, Consumed, consume};
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 use crate::wellknown::parse_scope;
-
-/// The `NameID` `Format` this build can resolve to a local account.
-///
-/// ONE FORMAT, STATED RATHER THAN ASSUMED. A `NameID` in the `emailAddress` format is an email
-/// address, so it resolves through the same identifier seam every other login uses. `persistent`
-/// and `transient` are opaque strings that mean nothing to the identifier table: binding one to
-/// an account needs a stored mapping, which is what the account-link work adds. A connection
-/// configured for either gets told so rather than being silently refused as "unknown user".
-const RESOLVABLE_NAMEID_FORMAT: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
 
 /// The largest `SAMLResponse` form field this endpoint will decode.
 ///
@@ -88,15 +113,16 @@ pub struct AcsForm {
 
 /// `POST /t/{tenant}/e/{environment}/saml/acs/{connection}`: consume a SAML response.
 ///
-/// # The order here is the same argument as the module it wraps
+/// # What a refusal leaves behind
 ///
-/// Nothing about the browser is touched -- no session, no cookie, no redirect -- until
-/// [`consume`] has returned a [`Consumed`]. A response that fails any check leaves this endpoint
-/// having written nothing and having said nothing about who might have signed in.
+/// NOTHING IN THE STORE, which is [`consume`]'s own property and the reason this endpoint can be
+/// this thin: every stateless check runs and passes before the outstanding request is spent or
+/// the assertion id recorded. What a refusal DOES leave is a page, and the two refusals this
+/// module adds on its own account -- an unreadable connection id and an undecodable body -- are
+/// reached before the store is touched at all.
 pub async fn acs_post(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, connection)): Path<(String, String, String)>,
-    headers: HeaderMap,
     Form(form): Form<AcsForm>,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
@@ -150,106 +176,39 @@ pub async fn acs_post(
         Err(error) => return refused_by(&error),
     };
 
-    sign_in(
-        &state,
-        scope,
-        &consumed,
-        &connection.nameid_format,
-        &headers,
-    )
-    .await
+    accepted(&consumed)
 }
 
-/// Turn a consumed assertion into a session, or say why it could not be one.
-async fn sign_in(
-    state: &OidcState,
-    scope: Scope,
-    consumed: &Consumed,
-    nameid_format: &str,
-    headers: &HeaderMap,
-) -> Response {
-    // WHAT THE CONNECTION SAYS THE NAME MEANS, not what this response's own `Format` said.
-    // `consume` has already refused any document whose `Format` disagrees with the column, so
-    // the two are equal here; reading the COLUMN is the habit that stays correct if that check
-    // ever moves.
-    if nameid_format.trim() != RESOLVABLE_NAMEID_FORMAT {
-        return refused(
-            StatusCode::NOT_IMPLEMENTED,
-            "this connection's NameID format cannot yet be resolved to an account; configure the \
-             connection for the emailAddress format",
-        );
-    }
-
-    let Ok(resolutions) = state
-        .store()
-        .scoped(scope)
-        .user_identifiers()
-        .resolve(IdentifierType::Email, &consumed.accepted.name_id)
-        .await
-    else {
-        return server_error();
-    };
-    // A VERIFIED IDENTIFIER, and only a verified one. An unverified row is somebody who typed
-    // that address and never proved it, so signing the assertion's subject into it would let an
-    // identity provider claim an account its user does not own. The identity provider vouches
-    // for the address it asserts, but not for a local row nobody proved.
-    let Some(subject) = resolutions
-        .into_iter()
-        .find(|resolution| resolution.verified)
-        .map(|resolution| resolution.user_id)
-    else {
-        return refused(
-            StatusCode::FORBIDDEN,
-            "no account in this environment is provisioned for that identity",
-        );
-    };
-
-    // THE UPSTREAM RAN THE FACTORS, NOT THIS DEPLOYMENT, which is exactly what
-    // `AuthenticationEvent::federated` records: `AuthMethod::Federated` contributes no `amr` of
-    // its own, so nothing here claims IronAuth verified a password or a passkey. The identity
-    // provider's own `AuthnContextClassRef` is the SAML analogue of an upstream `acr` and is not
-    // read yet -- `Accepted` does not carry it -- so this passes none rather than inventing one.
-    let event = AuthenticationEvent::federated(epoch_micros(state.now()), &[], None);
-    let actor = interaction::user_actor(&subject);
-    match interaction::establish_session(state, scope, &subject.to_string(), &event, actor, headers)
-        .await
-    {
-        Ok(cookies) => interaction::attach_session_cookies(landing(consumed), &cookies),
-        // THE CENTRAL LIFECYCLE FENCE REFUSED: blocked, disabled, waitlisted, pending. Answered
-        // exactly like an unprovisioned identity, so a valid assertion for a suspended account
-        // is not an account-state oracle for whoever posted it.
-        Err(interaction::EstablishSessionError::NotAuthenticatable) => refused(
-            StatusCode::FORBIDDEN,
-            "no account in this environment is provisioned for that identity",
-        ),
-        Err(interaction::EstablishSessionError::Store) => server_error(),
-    }
-}
-
-/// Where the browser goes once the session exists.
+/// What an accepted response answers with.
 ///
-/// THE RECORDED RELAYSTATE OR NOWHERE. The value came out of the request row this deployment
-/// wrote, and it is still put through [`interaction::parse_resume`] -- the same open-redirect
-/// defence every other resume goes through -- because "we wrote it" is a weaker claim than it
-/// sounds once a future writer takes it from an operator-supplied field. Anything that does not
-/// parse as a local `/authorize?` resume lands on a page instead of redirecting anywhere.
-fn landing(consumed: &Consumed) -> Response {
+/// NO SESSION, NO COOKIE, NO REDIRECT -- see the module doc for why that is this change's
+/// deliverable rather than a gap in it. The page is the same for every accepted response: it
+/// does not name the subject, the connection, or anything the poster did not already put in the
+/// document, because the party reading it is whoever posted, and nobody here has been
+/// authenticated as anyone.
+fn accepted(consumed: &Consumed) -> Response {
     use axum::response::IntoResponse;
 
-    if let Some(resume) = interaction::parse_resume(consumed.relay_state.as_deref()) {
-        return (
-            StatusCode::SEE_OTHER,
-            [(axum::http::header::LOCATION, resume.return_to)],
-            no_store(),
-        )
-            .into_response();
-    }
+    // THE RECORDED RELAYSTATE IS READ AND NOT ACTED ON. Reading it here rather than ignoring the
+    // field keeps the redirect-to-be anchored on the value `consume` returns from the store,
+    // so the day sign-in lands, the thing a redirect is built from is already the recorded value
+    // and not the posted one. An assertion rather than a branch, because there is no behaviour
+    // to gate yet.
+    debug_assert!(
+        consumed
+            .relay_state
+            .as_ref()
+            .is_none_or(|value| !value.is_empty()),
+        "consume folds an empty RelayState to None"
+    );
     (
         StatusCode::OK,
         no_store(),
         axum::response::Html(
-            "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
-             <p>You are signed in.</p>",
+            "<!doctype html><meta charset=\"utf-8\"><title>Response accepted</title>\
+             <p>The response was accepted, so this connection's certificate, audience and \
+             recipient are configured correctly.</p>\
+             <p>Signing in through SAML is not enabled on this build.</p>",
         ),
     )
         .into_response()
@@ -262,30 +221,46 @@ fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
 
 /// Render an [`AcsError`] for whoever posted the response.
 ///
-/// # Why this says as much as it does
+/// # The typed reason does not go in the page
 ///
-/// #139 asks for typed failures an operator can act on, because a SAML integration that answers
-/// "invalid response" costs days. Every variant here sits BEHIND the signature check -- reaching
-/// any of them means the document was signed by a certificate the operator pinned -- so what is
-/// being described is the identity provider's own document, not an attacker's guess. The two
-/// that sit in front of it, [`AcsError::Signature`] and the trust-anchor pair, say only which
-/// side of the pinning is wrong.
+/// #139 asks for failures that "surface as typed connection-test failures ... so the
+/// test-connection flow can render actionable messages", and an earlier version of this function
+/// read that as licence to render [`AcsError`]'s `Display` to the browser. It is not: some of
+/// those sentences quote THIS DEPLOYMENT'S configuration back -- `WrongNameIdFormat` names the
+/// format the connection is set to, and `AllCertificatesUnusable` counts its pinned rows -- and
+/// the browser reading them belongs to whoever posted, who on this endpoint is anybody.
+///
+/// THE TYPE IS THE DELIVERABLE, NOT THE PAGE. `AcsError` is a public enum with a variant per
+/// fixable cause; the connection-test flow #140 owns calls `examine` and renders it to an
+/// authenticated operator, which is a reader who is entitled to their own configuration. Here
+/// the page carries only the coarse class, and the status carries the rest.
 fn refused_by(error: &AcsError) -> Response {
-    let status = match error {
-        AcsError::NoConnection => StatusCode::NOT_FOUND,
-        AcsError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        AcsError::EncryptionRequired | AcsError::EncryptedAttributes { .. } => {
-            StatusCode::NOT_IMPLEMENTED
-        }
-        _ => StatusCode::BAD_REQUEST,
+    let (status, reason) = match error {
+        AcsError::NoConnection => return not_found(),
+        AcsError::Store(_) => return server_error(),
+        // NOT IMPLEMENTED, and saying so is safe: it describes this build, which an operator
+        // discovers from the release notes anyway, and it is the one class where "try again"
+        // would be a lie.
+        AcsError::EncryptionRequired | AcsError::EncryptedAttributes { .. } => (
+            StatusCode::NOT_IMPLEMENTED,
+            "this server cannot yet read an encrypted assertion",
+        ),
+        AcsError::Signature(_)
+        | AcsError::NoTrustAnchor
+        | AcsError::AllCertificatesUnusable { .. } => (
+            StatusCode::BAD_REQUEST,
+            "the response was not signed by a certificate this connection trusts",
+        ),
+        AcsError::UnknownRequest | AcsError::Replayed | AcsError::UnsolicitedRefused => (
+            StatusCode::BAD_REQUEST,
+            "the response does not answer a sign-in this server started",
+        ),
+        AcsError::Condition(_) | AcsError::Attributes(_) | AcsError::WrongNameIdFormat { .. } => (
+            StatusCode::BAD_REQUEST,
+            "the response is not one this connection accepts",
+        ),
     };
-    // A STORE FAULT NEVER SPEAKS. `AcsError::Store` wraps a database error whose message is
-    // about this deployment's internals, and the browser it would reach belongs to whoever
-    // posted the response.
-    if matches!(error, AcsError::Store(_)) {
-        return server_error();
-    }
-    refused(status, &error.to_string())
+    refused(status, reason)
 }
 
 /// An outcome page carrying `reason`, which is always an operator-facing sentence.

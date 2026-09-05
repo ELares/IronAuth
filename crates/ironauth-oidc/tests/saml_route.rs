@@ -13,20 +13,20 @@ use common::Harness;
 use ironauth_env::Env;
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_store::{
-    CorrelationId, IdentifierType, NewSamlCertificate, NewSamlConnection, NewUserIdentifier,
-    OrganizationId, SamlCertificateId, SamlConnectionId, SamlKeyKind, UniquenessMode, UserId,
-    UserIdentifierId,
+    CorrelationId, NewSamlCertificate, NewSamlConnection, OrganizationId, SamlCertificateId,
+    SamlConnectionId, SamlKeyKind,
 };
 use serde_json::json;
 use std::fmt::Write as _;
 
 const ISSUER: &str = "urn:idp";
-const EMAIL: &str = "ada@globex.example";
+const SUBJECT: &str = "ada@globex.example";
 const NAMEID_FORMAT: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
 
 /// The connection, the key pinned on it, and where its responses are posted.
 struct Wired {
     connection: SamlConnectionId,
+    issuer: String,
     key: XmlTestKey,
     audience: String,
     acs_url: String,
@@ -36,6 +36,19 @@ struct Wired {
 /// Create an organization, a SAML connection and a pinned key, and work out the URL the
 /// identity provider would be told to post to.
 async fn wire(harness: &Harness, nameid_format: &str) -> Wired {
+    wire_as(harness, nameid_format, ISSUER).await
+}
+
+/// [`wire`] with the identity provider's entity id chosen by the caller.
+///
+/// EACH CONNECTION GETS ITS OWN ISSUER when a test wires two, and the first version of this
+/// file had them SHARE one "so that resolution would find the wrong one". That is backwards: a
+/// lookup keyed on an issuer two rows share is ambiguous, so a build resolving the connection
+/// from the document could land on either -- including the one that then fails the signature,
+/// which is the answer the test asserts. Distinct issuers make such a build resolve
+/// DETERMINISTICALLY to the connection the document names, verify against its anchors, and
+/// succeed. That is the outcome that separates it from a build reading the URL.
+async fn wire_as(harness: &Harness, nameid_format: &str, idp_entity_id: &str) -> Wired {
     let env = harness.env().clone();
     let scope = harness.scope();
     let organization = OrganizationId::generate(&env, &scope);
@@ -62,7 +75,9 @@ async fn wire(harness: &Harness, nameid_format: &str) -> Wired {
         scope.environment()
     );
     let acs_url = format!("https://ironauth.example{path}");
-    let audience = format!("https://ironauth.example/t/{}/saml", scope.tenant());
+    // PER CONNECTION, like the ACS URL. A shared audience is a second value two connections
+    // agree on, and every value they agree on is one a wrong-connection test cannot see.
+    let audience = format!("https://ironauth.example/saml/{connection}/metadata");
 
     let acting = harness
         .db()
@@ -77,7 +92,7 @@ async fn wire(harness: &Harness, nameid_format: &str) -> Wired {
                 id: &connection,
                 organization_id: &organization,
                 display_name: "Okta",
-                idp_entity_id: ISSUER,
+                idp_entity_id,
                 idp_sso_url: "https://idp.example/sso",
                 sp_entity_id: &audience,
                 acs_url: &acs_url,
@@ -119,6 +134,7 @@ async fn wire(harness: &Harness, nameid_format: &str) -> Wired {
 
     Wired {
         connection,
+        issuer: idp_entity_id.to_owned(),
         key,
         audience,
         acs_url,
@@ -139,13 +155,17 @@ fn now_micros(env: &Env) -> i64 {
 
 /// An assertion signed for `wired`, valid around the harness's own clock.
 ///
-/// THE WINDOW IS WRITTEN AROUND THE REAL CLOCK, unlike `saml_acs.rs`'s fixtures, because the
-/// route reads its instant from the deployment's clock seam rather than taking one as an
-/// argument. A fixture pinned to a fixed date would be measuring nothing after it lapsed.
+/// THE WINDOW IS WRITTEN AROUND THE CLOCK THE ROUTE WILL READ, which is the harness's, and an
+/// earlier version of this sentence called that "the real clock, unlike `saml_acs.rs`'s
+/// fixtures". It is not: the harness environment is `Env::deterministic(UNIX_EPOCH, ..)`, so
+/// `now_micros` answers 0 and every window here sits in 1969-70 -- the same fixed-date shape
+/// `saml_acs.rs` uses, reached a different way. Deriving the window from the seam rather than
+/// writing the literals is still the right habit, because it is what keeps the fixture correct
+/// if the harness clock ever moves; the contrast the sentence drew was simply not there.
 fn signed(wired: &Wired, env: &Env, assertion_id: &str, name_id: &str, format: &str) -> String {
     let now = now_micros(env) / 1_000_000;
     let children = format!(
-        "<saml:Issuer>{ISSUER}</saml:Issuer>\
+        "<saml:Issuer>{}</saml:Issuer>\
          <saml:Subject>\
          <saml:NameID Format=\"{format}\">{name_id}</saml:NameID>\
          <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
@@ -155,6 +175,37 @@ fn signed(wired: &Wired, env: &Env, assertion_id: &str, name_id: &str, format: &
          <saml:AudienceRestriction><saml:Audience>{}</saml:Audience>\
          </saml:AudienceRestriction></saml:Conditions>\
          <saml:AttributeStatement/>",
+        wired.issuer,
+        wired.acs_url,
+        rfc3339(now + 120),
+        rfc3339(now - 120),
+        rfc3339(now + 120),
+        wired.audience,
+    );
+    ironauth_saml::test_util::signed_response_with(&wired.key, assertion_id, &children)
+}
+
+/// [`signed`], for a response that answers an outstanding request.
+fn signed_solicited(
+    wired: &Wired,
+    env: &Env,
+    assertion_id: &str,
+    name_id: &str,
+    in_response_to: &str,
+) -> String {
+    let now = now_micros(env) / 1_000_000;
+    let children = format!(
+        "<saml:Issuer>{}</saml:Issuer>\
+         <saml:Subject>\
+         <saml:NameID Format=\"{NAMEID_FORMAT}\">{name_id}</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{in_response_to}\" Recipient=\"{}\" \
+         NotOnOrAfter=\"{}\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"{}\" NotOnOrAfter=\"{}\">\
+         <saml:AudienceRestriction><saml:Audience>{}</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>\
+         <saml:AttributeStatement/>",
+        wired.issuer,
         wired.acs_url,
         rfc3339(now + 120),
         rfc3339(now - 120),
@@ -211,257 +262,99 @@ fn urlencode(raw: &str) -> String {
     out
 }
 
-/// Give `subject` a verified email identifier, which is what the route resolves the `NameID`
-/// against.
-async fn add_verified_email(harness: &Harness, subject: &UserId, raw: &str, verified: bool) {
-    let env = harness.env().clone();
-    harness
-        .db()
-        .control_store()
-        .scoped(harness.scope())
-        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
-        .user_identifiers()
-        .add(
-            &env,
-            NewUserIdentifier {
-                id: &UserIdentifierId::generate(&env, &harness.scope()),
-                user_id: subject,
-                identifier_type: IdentifierType::Email,
-                raw,
-                verified,
-                mode: UniquenessMode::EnvironmentWide,
-                org: None,
-            },
-            None,
-        )
-        .await
-        .expect("add the email identifier");
+/// Every header a response carries, as a comparable list.
+///
+/// COMPARED IN FULL by the anti-enumeration test, because a build that leaks which connection
+/// ids exist need not do it through the status or the page: one differing header -- a
+/// `Cache-Control`, a `WWW-Authenticate`, anything -- is a per-request yes/no.
+fn header_shape(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    let mut shape: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    shape.sort();
+    shape
 }
 
 #[tokio::test]
-async fn a_signed_response_signs_the_provisioned_user_in() {
-    // THE WHOLE POINT, end to end: an identity provider posts a base64 response to the URL its
-    // connection names, and the browser comes away with a session. Everything else in this file
-    // is a way for that not to happen.
+async fn a_signed_response_is_accepted_and_signs_nobody_in() {
+    // WHAT THIS BUILD DOES, exactly: a correctly signed, in-audience, in-window response is
+    // consumed and answered, and no session is minted. The second half is not an omission being
+    // papered over -- it is asserted, so that adding sign-in has to come here and say so.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
-    let subject = harness.seed_passwordless_user("ada").await;
-    let subject = UserId::parse_in_scope(&subject, &harness.scope()).expect("subject");
-    add_verified_email(&harness, &subject, EMAIL, true).await;
 
-    let response = signed(&wired, harness.env(), "_assertion_ok", EMAIL, NAMEID_FORMAT);
+    let response = signed(
+        &wired,
+        harness.env(),
+        "_assertion_ok",
+        SUBJECT,
+        NAMEID_FORMAT,
+    );
     let (status, headers, body) = harness
         .post_form(&wired.path, &form(&response, None), None)
         .await;
 
     assert_eq!(status, 200, "{body}");
-    let cookies = headers
-        .get_all(axum::http::header::SET_COOKIE)
-        .iter()
-        .count();
-    assert!(
-        cookies > 0,
-        "a verified assertion minted no session: {body}"
-    );
-}
-
-#[tokio::test]
-async fn the_same_response_cannot_be_posted_twice() {
-    // THE REPLAY CACHE, REACHED THROUGH HTTP. `saml_acs.rs` proves the store refuses the second
-    // admission; this proves the route does not somehow hand the second POST a session anyway --
-    // which is what an endpoint that established the session BEFORE consuming would do.
-    let harness = Harness::start_store_backed().await;
-    let wired = wire(&harness, NAMEID_FORMAT).await;
-    let subject = harness.seed_passwordless_user("ada").await;
-    let subject = UserId::parse_in_scope(&subject, &harness.scope()).expect("subject");
-    add_verified_email(&harness, &subject, EMAIL, true).await;
-
-    let response = signed(
-        &wired,
-        harness.env(),
-        "_assertion_once",
-        EMAIL,
-        NAMEID_FORMAT,
-    );
-    let (first, _, _) = harness
-        .post_form(&wired.path, &form(&response, None), None)
-        .await;
-    assert_eq!(first, 200);
-
-    let (second, headers, body) = harness
-        .post_form(&wired.path, &form(&response, None), None)
-        .await;
-    assert_eq!(second, 400, "a replayed response was accepted: {body}");
+    assert!(body.contains("accepted"), "{body}");
     assert_eq!(
         headers
             .get_all(axum::http::header::SET_COOKIE)
             .iter()
             .count(),
         0,
-        "a replayed response minted a session"
-    );
-}
-
-#[tokio::test]
-async fn a_response_for_another_connection_is_refused_at_the_url_it_was_posted_to() {
-    // THE CONNECTION COMES FROM THE PATH, NOT THE DOCUMENT. Two connections in one environment,
-    // each with its own pinned key, audience and ACS URL: a response built for the first and
-    // posted at the second's URL must be refused. An endpoint that resolved the connection from
-    // the response's `Issuer` would accept it, and the two connections here share an `Issuer` on
-    // purpose so that resolution would find the wrong one.
-    let harness = Harness::start_store_backed().await;
-    let first = wire(&harness, NAMEID_FORMAT).await;
-    let second = wire(&harness, NAMEID_FORMAT).await;
-    let subject = harness.seed_passwordless_user("ada").await;
-    let subject = UserId::parse_in_scope(&subject, &harness.scope()).expect("subject");
-    add_verified_email(&harness, &subject, EMAIL, true).await;
-
-    let for_first = signed(
-        &first,
-        harness.env(),
-        "_assertion_first",
-        EMAIL,
-        NAMEID_FORMAT,
-    );
-    let (status, headers, body) = harness
-        .post_form(&second.path, &form(&for_first, None), None)
-        .await;
-
-    assert_eq!(status, 400, "{body}");
-    assert_eq!(
-        headers
-            .get_all(axum::http::header::SET_COOKIE)
-            .iter()
-            .count(),
-        0,
-        "a response for another connection minted a session"
-    );
-    // AND IT FAILED ON THE SIGNATURE, which is the first thing the other connection's anchors
-    // disagree with -- not on the audience, which would mean the wrong key had verified it.
-    assert!(
-        body.contains("signature"),
-        "the refusal was not about the trust anchors: {body}"
-    );
-    assert_ne!(first.connection.to_string(), second.connection.to_string());
-}
-
-#[tokio::test]
-async fn an_identity_with_no_provisioned_account_is_refused_without_saying_which() {
-    // A VALID ASSERTION FOR SOMEBODY THIS ENVIRONMENT HAS NEVER HEARD OF. It verifies, every
-    // condition passes, and there is no local account -- so no session, and an answer that does
-    // not distinguish "no such account" from "that account cannot sign in", because the party
-    // reading it is whoever posted the response.
-    let harness = Harness::start_store_backed().await;
-    let wired = wire(&harness, NAMEID_FORMAT).await;
-
-    let response = signed(
-        &wired,
-        harness.env(),
-        "_assertion_stranger",
-        "stranger@globex.example",
-        NAMEID_FORMAT,
-    );
-    let (status, headers, body) = harness
-        .post_form(&wired.path, &form(&response, None), None)
-        .await;
-
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(
-        headers
-            .get_all(axum::http::header::SET_COOKIE)
-            .iter()
-            .count(),
-        0
+        "the assertion consumer minted a session: {body}"
     );
     assert!(
-        !body.contains("stranger@globex.example"),
-        "the refusal echoed the identity back: {body}"
+        headers.get(axum::http::header::LOCATION).is_none(),
+        "an accepted response redirected somewhere"
     );
-}
-
-#[tokio::test]
-async fn an_unverified_identifier_does_not_answer_for_an_account() {
-    // THE IDENTITY PROVIDER VOUCHES FOR THE ADDRESS IT ASSERTS, NOT FOR A LOCAL ROW NOBODY
-    // PROVED. An unverified identifier is somebody who typed that address during signup and
-    // never confirmed it; signing an asserted subject into it would let a connection claim an
-    // account its user does not own -- which is the account-takeover shape this whole surface
-    // exists inside.
-    let harness = Harness::start_store_backed().await;
-    let wired = wire(&harness, NAMEID_FORMAT).await;
-    let subject = harness.seed_passwordless_user("ada").await;
-    let subject = UserId::parse_in_scope(&subject, &harness.scope()).expect("subject");
-    add_verified_email(&harness, &subject, EMAIL, false).await;
-
-    let response = signed(
-        &wired,
-        harness.env(),
-        "_assertion_unverified",
-        EMAIL,
-        NAMEID_FORMAT,
-    );
-    let (status, headers, body) = harness
-        .post_form(&wired.path, &form(&response, None), None)
-        .await;
-
-    assert_eq!(status, 403, "{body}");
     assert_eq!(
         headers
-            .get_all(axum::http::header::SET_COOKIE)
-            .iter()
-            .count(),
-        0,
-        "an unverified identifier answered for an account"
+            .get(axum::http::header::CACHE_CONTROL)
+            .map(|value| value.to_str().unwrap_or_default()),
+        Some("no-store"),
+        "a page about a signed assertion was cacheable"
     );
 }
 
 #[tokio::test]
-async fn a_connection_in_an_unresolvable_nameid_format_says_so() {
-    // NOT "UNKNOWN USER". A connection configured for `persistent` names its subject with an
-    // opaque string that means nothing to the identifier table, and this build has nowhere to
-    // store the mapping yet. Refusing it as "no account is provisioned" would send an operator
-    // to look at their user list, which is not where the gap is.
-    const PERSISTENT: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent";
-
-    let harness = Harness::start_store_backed().await;
-    let wired = wire(&harness, PERSISTENT).await;
-
-    let response = signed(
-        &wired,
-        harness.env(),
-        "_assertion_persistent",
-        "9d3f1c0a",
-        PERSISTENT,
-    );
-    let (status, _, body) = harness
-        .post_form(&wired.path, &form(&response, None), None)
-        .await;
-
-    assert_eq!(status, 501, "{body}");
-    assert!(
-        body.contains("NameID format"),
-        "the refusal did not name the gap: {body}"
-    );
-}
-
-#[tokio::test]
-async fn the_posted_relay_state_never_becomes_a_redirect() {
-    // `RelayState` TRAVELS THROUGH THE BROWSER, so the posted value is whatever the last party
-    // to touch it wanted. Honouring it is an open redirect, and it is the one an attacker
-    // reaches WITHOUT any signature at all: the field is not covered by the assertion. The
-    // route reads the RelayState this deployment RECORDED, and this response is unsolicited, so
-    // there is none -- the answer must be a page, never a Location.
+async fn a_recorded_relay_state_does_not_become_a_redirect_either() {
+    // THE SOLICITED PATH, which no test in the first version of this file reached -- every
+    // fixture was unsolicited, so `Consumed::relay_state` was `None` everywhere and a build
+    // redirecting to the POSTED field would have passed the test that claimed to forbid it.
+    //
+    // HERE THERE IS A RECORDED RELAYSTATE AND A POSTED ONE, and they differ. Neither may become
+    // a `Location` on this build, and when sign-in lands only the recorded one may.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
-    let subject = harness.seed_passwordless_user("ada").await;
-    let subject = UserId::parse_in_scope(&subject, &harness.scope()).expect("subject");
-    add_verified_email(&harness, &subject, EMAIL, true).await;
+    let env = harness.env().clone();
+    let now = now_micros(&env);
+    harness
+        .store()
+        .scoped(harness.scope())
+        .saml_replay()
+        .issue_request(
+            &wired.connection,
+            "_req_solicited",
+            Some("/authorize?client_id=cli_recorded&scope=openid"),
+            now,
+            now + 300_000_000,
+        )
+        .await
+        .expect("issue the request");
 
-    let response = signed(
+    let response = signed_solicited(
         &wired,
-        harness.env(),
-        "_assertion_relay",
-        EMAIL,
-        NAMEID_FORMAT,
+        &env,
+        "_assertion_solicited",
+        SUBJECT,
+        "_req_solicited",
     );
     let (status, headers, body) = harness
         .post_form(
@@ -474,72 +367,199 @@ async fn the_posted_relay_state_never_becomes_a_redirect() {
     assert_eq!(status, 200, "{body}");
     assert!(
         headers.get(axum::http::header::LOCATION).is_none(),
-        "the posted RelayState became a redirect: {:?}",
+        "a RelayState became a redirect: {:?}",
         headers.get(axum::http::header::LOCATION)
     );
     assert!(
         !body.contains("evil.example"),
-        "the value was echoed: {body}"
+        "the posted value was echoed: {body}"
+    );
+    assert!(
+        !body.contains("cli_recorded"),
+        "the recorded value was echoed: {body}"
     );
 }
 
 #[tokio::test]
-async fn a_body_that_is_not_a_saml_response_is_refused_before_anything_is_read() {
+async fn the_same_response_cannot_be_posted_twice() {
+    // THE REPLAY CACHE, REACHED THROUGH HTTP. `saml_acs.rs` proves the store refuses the second
+    // admission; this proves the route does not answer the second POST as though it had.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
 
-    // NOT BASE64.
-    let (status, _, _) = harness
+    let response = signed(
+        &wired,
+        harness.env(),
+        "_assertion_once",
+        SUBJECT,
+        NAMEID_FORMAT,
+    );
+    let (first, _, body) = harness
+        .post_form(&wired.path, &form(&response, None), None)
+        .await;
+    assert_eq!(first, 200, "{body}");
+
+    let (second, _, body) = harness
+        .post_form(&wired.path, &form(&response, None), None)
+        .await;
+    assert_eq!(second, 400, "a replayed response was accepted: {body}");
+    assert!(
+        body.contains("does not answer a sign-in this server started"),
+        "the refusal was not the replay class: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_response_for_another_connection_is_refused_at_the_url_it_was_posted_to() {
+    // THE CONNECTION COMES FROM THE PATH, NOT THE DOCUMENT, and the fixture is built so a build
+    // that read the document would SUCCEED rather than fail differently. Two connections, each
+    // with its OWN issuer, audience, ACS URL and pinned key: a build resolving the connection
+    // from the response's `Issuer` finds the first one deterministically, verifies against its
+    // anchors, matches its audience and recipient, and accepts. This build reads the path,
+    // checks against the second connection's anchors, and refuses.
+    let harness = Harness::start_store_backed().await;
+    let first = wire_as(&harness, NAMEID_FORMAT, "urn:idp:one").await;
+    let second = wire_as(&harness, NAMEID_FORMAT, "urn:idp:two").await;
+    assert_ne!(first.issuer, second.issuer);
+
+    // POSTED AT THE SECOND CONNECTION'S URL, and correct in every respect for the FIRST.
+    let for_first = signed(
+        &first,
+        harness.env(),
+        "_assertion_first",
+        SUBJECT,
+        NAMEID_FORMAT,
+    );
+    let (status, headers, body) = harness
+        .post_form(&second.path, &form(&for_first, None), None)
+        .await;
+
+    assert_eq!(
+        status, 400,
+        "a response for another connection was accepted: {body}"
+    );
+    assert!(
+        body.contains("not signed by a certificate this connection trusts"),
+        "the refusal was not about the trust anchors: {body}"
+    );
+    assert_eq!(
+        headers
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .count(),
+        0
+    );
+
+    // AND AT ITS OWN URL THE SAME DOCUMENT IS ACCEPTED, so the refusal above is the connection
+    // and not a broken fixture.
+    let (status, _, body) = harness
+        .post_form(&first.path, &form(&for_first, None), None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_base64_is_refused_before_the_connection_is_read() {
+    // THE GATE HAS ITS OWN SENTENCE, and the test asserts it rather than the status: a body that
+    // reaches `ironauth-saml` and fails to parse answers 400 too, so a suite checking only the
+    // status cannot tell the base64 gate from its absence -- and without the gate, an
+    // unparseable body costs two scoped database round-trips and a full XML parse first.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, NAMEID_FORMAT).await;
+
+    let (status, _, body) = harness
         .post_form(&wired.path, "SAMLResponse=%7B%7Dnot-base64%21", None)
         .await;
     assert_eq!(status, 400);
+    assert!(body.contains("not valid base64"), "{body}");
 
-    // BASE64 OF SOMETHING THAT IS NOT XML.
-    let (status, _, _) = harness
+    // AND BASE64 OF SOMETHING THAT IS NOT XML IS A DIFFERENT SENTENCE, which is what says the
+    // two are distinguishable at all.
+    let (status, _, body) = harness
         .post_form(&wired.path, &form("this is not xml", None), None)
         .await;
     assert_eq!(status, 400);
+    assert!(!body.contains("not valid base64"), "{body}");
+    assert!(body.contains("not signed by a certificate"), "{body}");
 
-    // NO FIELD AT ALL: axum refuses the form before the handler runs.
+    // NO FIELD AT ALL: axum refuses the form before the handler runs, with the status it uses
+    // for a body it could not deserialize.
     let (status, _, _) = harness.post_form(&wired.path, "RelayState=%2F", None).await;
-    assert!(
-        status.is_client_error(),
-        "a form with no SAMLResponse was not refused: {status}"
+    assert_eq!(
+        status, 422,
+        "a form with no SAMLResponse was not refused as unprocessable"
     );
 }
 
 #[tokio::test]
 async fn an_unknown_connection_answers_exactly_like_a_malformed_one() {
-    // NO ENUMERATION ORACLE. Whoever is posting learns nothing about which connection ids this
-    // environment holds: a well-formed id for a connection that does not exist, an id from
-    // another scope, and a string that is not an id at all are one answer.
+    // NO ENUMERATION ORACLE. Four inputs across three code paths: a well-formed id for a
+    // connection that does not exist, a well-formed id belonging to ANOTHER SCOPE (which the id
+    // type refuses at `parse_in_scope`), and two strings that are not ids at all. Headers are
+    // compared as well as status and body, because a leak does not have to be in the page.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
     let scope = harness.scope();
     let absent = SamlConnectionId::generate(harness.env(), &scope);
+    let foreign_scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::generate(harness.env()),
+        ironauth_store::EnvironmentId::generate(harness.env()),
+    );
+    let foreign = SamlConnectionId::generate(harness.env(), &foreign_scope);
     let body = form(
-        &signed(&wired, harness.env(), "_assertion_x", EMAIL, NAMEID_FORMAT),
+        &signed(
+            &wired,
+            harness.env(),
+            "_assertion_x",
+            SUBJECT,
+            NAMEID_FORMAT,
+        ),
         None,
     );
 
     let mut answers = Vec::new();
     for id in [
         absent.to_string(),
+        foreign.to_string(),
         "not-an-id".to_owned(),
-        String::from("smc_"),
+        "smc_".to_owned(),
     ] {
         let path = format!(
             "/t/{}/e/{}/saml/acs/{id}",
             scope.tenant(),
             scope.environment()
         );
-        let (status, _, page) = harness.post_form(&path, &body, None).await;
-        answers.push((status, page));
+        let (status, headers, page) = harness.post_form(&path, &body, None).await;
+        answers.push((status, header_shape(&headers), page));
     }
-    let (first_status, first_page) = &answers[0];
-    assert_eq!(*first_status, 404);
-    for (status, page) in &answers[1..] {
-        assert_eq!(status, first_status, "the answers differ by status");
-        assert_eq!(page, first_page, "the answers differ by body");
+    assert_eq!(answers[0].0, 404);
+    for answer in &answers[1..] {
+        assert_eq!(answer.0, answers[0].0, "the answers differ by status");
+        assert_eq!(answer.1, answers[0].1, "the answers differ by header");
+        assert_eq!(answer.2, answers[0].2, "the answers differ by body");
     }
+}
+
+#[tokio::test]
+async fn an_oversized_field_is_refused_without_being_decoded() {
+    // THE CAP IS ON THE ENCODED FORM, which is the quantity the decode work is proportional to.
+    // Just over it is refused; just under it reaches the parser and fails there, which is what
+    // says the cap is the thing refusing rather than the size being unreachable.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, NAMEID_FORMAT).await;
+
+    let over = "A".repeat(512 * 1024 + 4);
+    let (status, _, body) = harness
+        .post_form(&wired.path, &format!("SAMLResponse={over}"), None)
+        .await;
+    assert_eq!(status, 413, "{body}");
+
+    let under = "A".repeat(512 * 1024 - 4);
+    let (status, _, body) = harness
+        .post_form(&wired.path, &format!("SAMLResponse={under}"), None)
+        .await;
+    assert_eq!(
+        status, 400,
+        "a body under the cap was refused by the cap: {body}"
+    );
 }
