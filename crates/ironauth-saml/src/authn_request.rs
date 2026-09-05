@@ -140,7 +140,7 @@ pub fn build(request: &Request<'_>) -> Result<String, RequestError> {
     ))
 }
 
-/// Escape `raw` for an XML attribute value, refusing what cannot be carried.
+/// Escape `raw` for an XML attribute value or a text node, refusing what cannot be carried.
 ///
 /// # Five characters, three that must become numeric references, and a class with no escape
 ///
@@ -155,14 +155,18 @@ pub fn build(request: &Request<'_>) -> Result<String, RequestError> {
 /// against the unmodified column and refuse. The numeric reference survives normalization, which
 /// is why this refuses nothing XML can carry.
 ///
-/// FIVE OF THE SIX FIELDS ARE ATTRIBUTES; `sp_entity_id` IS A TEXT NODE, where normalization
-/// does not apply and a raw tab would survive. An earlier version of this paragraph said "every
-/// value this module writes lands in an attribute", which was false for exactly the field the
-/// test exercised. Escaping both the same way is deliberate rather than accidental: one function
-/// with one contract cannot be applied to the wrong kind of node, and a numeric reference in a
-/// text node is the same value to every reader. The cost is that the emitted text is not
-/// byte-identical to the input where a control appears; the benefit is that no future field can
-/// be added to the wrong branch.
+/// FIVE OF THE SIX FIELDS ARE ATTRIBUTES; `sp_entity_id` IS A TEXT NODE. An earlier version of
+/// this paragraph said "every value this module writes lands in an attribute", which was false
+/// for exactly the field the test exercised -- and then said normalization "does not apply" in a
+/// text node, which is also wrong: XML 1.0 2.11 LINE-END normalization rewrites a raw CR (and a
+/// raw CRLF) to a single LF ANYWHERE in a document, text nodes included. A text node escapes
+/// less than an attribute does, not nothing.
+///
+/// ESCAPING BOTH THE SAME WAY IS DELIBERATE. One function with one contract cannot be applied to
+/// the wrong kind of node, a numeric reference is the same value to every reader in either
+/// position, and the CR case shows the two are not cleanly separable anyway. The cost is that
+/// the emitted text is not byte-identical to the input where a control appears; the benefit is
+/// that no future field can be added to the wrong branch.
 ///
 /// WHAT STILL HAS NO REPRESENTATION is the rest of C0, plus the two permanently unassigned
 /// noncharacters `U+FFFE` and `U+FFFF`: no escape makes them legal -- `&#x1;` is as invalid as
@@ -269,18 +273,31 @@ pub fn redirect(
 /// a few hundred bytes, so the difference between this and a compressed stream is tens of bytes
 /// in a URL. Pulling a compression crate onto this path to save them would be the larger change.
 ///
-/// WHAT IT COSTS, MEASURED RATHER THAN GUESSED: a real request built from scoped ids is about
-/// 780 bytes of highly repetitive XML -- two SAML namespace URIs, a 68-character connection id
-/// appearing twice, three more URIs -- which is exactly the shape DEFLATE compresses well, so a
-/// compressed stream would be roughly a quarter of the size and the redirect URL roughly 700
-/// characters shorter. An earlier version of this paragraph called the difference "tens of
-/// bytes", which understated it by more than an order of magnitude.
+/// WHAT IT COSTS. A request built from real scoped ids is 739 bytes of XML for this crate's own
+/// fixture shapes and 777 with a realistic identity-provider SSO URL; the stored stream is those
+/// plus five. Raw DEFLATE at level 9 gives 415 bytes -- 56% of the stored stream -- so the
+/// `SAMLRequest` value falls from 992 characters to 556, and the whole redirect URL from about
+/// 1490 to about 1070: a saving near 420.
 ///
-/// IT IS STILL THE RIGHT TRADE, for a reason the size does not touch: ~1050 characters is well
-/// inside every limit that matters (8 KiB is the common server cap), and the alternative is a
-/// compression dependency on the path that builds a security-relevant redirect. If a deployment
-/// ever meets an identity provider with a shorter URL limit, that is the moment to add one -- and
-/// this paragraph is what tells the next reader the option was weighed rather than missed.
+/// TWO EARLIER VERSIONS OF THIS PARAGRAPH WERE WRONG IN OPPOSITE DIRECTIONS, which is why the
+/// figures are now spelled out. The first called the difference "tens of bytes" and understated
+/// it by an order of magnitude. The second said "roughly a quarter of the size", "roughly 700
+/// characters shorter" and "~1050 characters" under the heading MEASURED RATHER THAN GUESSED --
+/// and none of the three was measured: the ratio is 56% and not 25%, the saving is ~420 and not
+/// 700, and 1050 was the `SAMLRequest` value alone rather than the URL, so it was then compared
+/// against a cap that applies to the whole request line.
+///
+/// A QUARTER WAS NEVER REACHABLE, and the reason is not the one the second version gave. It
+/// blamed high-entropy identifiers -- but replacing every id with a constant run, which is the
+/// best case compression could ever have, still only reaches 41%. A document this small is
+/// mostly URI text that occurs once or twice, and DEFLATE's own dynamic-Huffman header is a
+/// material fraction of the output at 700 bytes. The shape is not what compresses well.
+///
+/// IT IS STILL THE RIGHT TRADE, for a reason the size does not settle: ~1490 characters is well
+/// inside the 8 KiB request line every common server allows, and the alternative is a compression
+/// dependency on the path that builds a security-relevant redirect. If a deployment ever meets an
+/// identity provider with a shorter URL limit, that is the moment to add one -- and this
+/// paragraph is what tells the next reader the option was weighed rather than missed.
 ///
 /// A STORED BLOCK IS FIVE BYTES OF HEADER per 65535 bytes of payload: the final-block flag and
 /// the type in the first byte, then the length and its ones-complement, little-endian. The loop

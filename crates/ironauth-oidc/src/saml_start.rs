@@ -37,7 +37,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse as _;
 use axum::response::Response;
 use ironauth_jose::{JwsAlgorithm, SigningKey};
-use ironauth_saml::authn_request::{self, Request};
+use ironauth_saml::authn_request::{self, Redirect, Request};
 use ironauth_store::SamlConnectionId;
 use serde::Deserialize;
 
@@ -110,41 +110,15 @@ pub async fn start_get(
         Ok(None) => return not_found(),
         Err(_) => return server_error(),
     };
-    let key = match read.saml_connections().active_sp_key(&connection_id).await {
-        Ok(Some(key)) => key,
-        // A CONNECTION WITH NO KEY CANNOT START A FLOW, and says so rather than sending an
-        // unsigned request. The operator's next step is provisioning one and re-uploading their
-        // metadata, which is a different action from anything else on this page.
-        Ok(None) => {
-            return refused(
-                StatusCode::CONFLICT,
-                "this connection has no signing key yet; provision one and upload the updated \
-                 metadata to your identity provider",
-            );
-        }
-        Err(_) => return server_error(),
-    };
-    // THE ALGORITHM COMES FROM THE ROW, and an earlier version hardcoded `Rs256` here while
-    // `redirect` derived `SigAlg` from the key -- which made "SigAlg comes from the key" a
-    // tautology and left the `algorithm` column reading, as before, nothing at all. The column
-    // is the operator-visible fact; this is where it becomes the key's.
-    let Some(algorithm) = jws_algorithm_for(&key.algorithm) else {
-        // A ROW NAMING AN ALGORITHM THIS BUILD CANNOT LOAD. The column's CHECK admits one value
-        // today, so this is schema drift rather than configuration, and there is nothing the
-        // caller can do about it.
-        return server_error();
-    };
-    let Ok(signing_key) =
-        SigningKey::rsa_from_pkcs1_der(Some(key.id.to_string()), algorithm, key.material.expose())
-    else {
-        // THE STORED KEY DID NOT LOAD, which is a row this deployment wrote and cannot use. It
-        // is not the caller's fault and there is nothing they can do, so it is a 500 rather than
-        // an explanation.
-        return server_error();
+    let signing_key = match signing_key_for(&read, &connection_id).await {
+        Ok(key) => key,
+        Err(response) => return response,
     };
 
-    // THE RETURN LOCATION IS VALIDATED BEFORE IT IS RECORDED, not when it is used, so a value
-    // that could never be honoured is never written.
+    // THE RETURN LOCATION IS VALIDATED BEFORE IT IS RECORDED, not when it is used. That does not
+    // make every recorded value honourable -- `parse_resume` proves the shape and the scope, not
+    // that the client exists -- but it does mean a value of the wrong SHAPE or the wrong TENANT
+    // is never written, which are the two a use site could not detect for itself.
     //
     // THE VALIDATED VALUE IS THE ONE RECORDED, and an earlier version recorded the raw one.
     // `parse_resume` TRIMS before it checks, so a `return_to` wrapped in whitespace passed the
@@ -158,11 +132,20 @@ pub async fn start_get(
     // AND THE RESUME'S SCOPE MUST BE THIS ROUTE'S. `parse_resume` RECOVERS a scope by decoding
     // it out of the client id's bytes; it performs no existence check and knows nothing about
     // where it was called from, so every well-formed `cli_` from every tenant parses. The
-    // unscoped interaction routes can stop there because they DERIVE their scope from the resume
-    // -- this one is path-scoped, and its four path-scoped siblings (`federation`, `flow`,
-    // `flow::orchestration`, `webauthn`) all compare. Without the comparison a tenant's
-    // outstanding-request row records another tenant's authorization path, and the sentence
-    // below claiming a value that could never be honoured is never written becomes false.
+    // unscoped interaction routes can stop there because they DERIVE their scope from the
+    // resume; this one is path-scoped, and the path-scoped sites that compare are `federation`,
+    // `flow`, `flow::orchestration`, `flow::consent` and `webauthn`. The census is not a clean
+    // majority and saying so is more useful than a tidy number: `flow::signup_fields` and
+    // `broker_overlay` are path-scoped and do NOT compare, which is either two more instances of
+    // this defect or two places where the recovered scope is never acted on. Neither is this
+    // change's to settle, and both are why the argument here rests on what the comparison BUYS
+    // rather than on how many neighbours have it.
+    //
+    // WHAT IT BUYS is narrower than "a value that could never be honoured is never written":
+    // `parse_resume` performs no existence check, so a well-formed client id for a client that
+    // does not exist still passes, in this scope or any other. What the comparison removes is
+    // the CROSS-TENANT case -- a row of this tenant's recording another tenant's authorization
+    // path -- which is the half that is a boundary violation rather than a dangling link.
     let return_to = query
         .return_to
         .as_deref()
@@ -197,24 +180,6 @@ pub async fn start_get(
         }
     };
 
-    // RECORDED BEFORE THE BROWSER IS SENT, and the order is the whole point: an `AuthnRequest`
-    // the identity provider answers and this deployment never wrote down is a response the ACS
-    // refuses as `UnknownRequest`. Writing after the redirect would be writing after the race.
-    if read
-        .saml_replay()
-        .issue_request(
-            &connection_id,
-            &request_id,
-            return_to.as_deref(),
-            now_micros,
-            now_micros + REQUEST_TTL_SECS * 1_000_000,
-        )
-        .await
-        .is_err()
-    {
-        return server_error();
-    }
-
     // NO RELAYSTATE ON THE WIRE, and its absence is the deliberate part. OASIS Bindings 3.4.3
     // says a `RelayState` MUST NOT exceed 80 bytes, and the SHORTEST value this endpoint could
     // send is already 89: `parse_resume` requires the literal `/authorize?` (11) plus
@@ -233,23 +198,115 @@ pub async fn start_get(
         return server_error();
     };
 
-    // THE SEPARATOR DEPENDS ON THE CONFIGURED URL. An `idp_sso_url` may already carry a query --
-    // ADFS deployments commonly do -- and appending `?` to one that does produces a URL the
-    // identity provider reads as a single malformed parameter.
+    // THE REDIRECT IS BUILT BEFORE THE ROW IS WRITTEN, which is not the same as sending it
+    // first. `idp_sso_url` is constrained by 0196 to non-empty and 2048 bytes and nothing else,
+    // so it may hold an LF, a CR or a DEL -- `escape` turns the first two into numeric
+    // references for the DOCUMENT, and none of the three can appear in a `Location` header
+    // value. Assembling the header after the insert meant a connection with such a URL wrote a
+    // row it could never answer and returned a 500, once per attempt, forever.
+    let Ok(location) =
+        axum::http::HeaderValue::from_str(&redirect_location(&connection, &redirect))
+    else {
+        tracing::warn!(
+            target: "ironauth.saml",
+            "a SAML connection's idp_sso_url cannot be sent as a Location header",
+        );
+        return refused(
+            StatusCode::CONFLICT,
+            "this connection's identity provider URL cannot be used as a redirect target",
+        );
+    };
+
+    // AND ONLY THEN IS THE REQUEST RECORDED, which is the order that matters against the
+    // network: an `AuthnRequest` the identity provider answers and this deployment never wrote
+    // down is a response the ACS refuses as `UnknownRequest`. Nothing between here and the
+    // response can fail.
+    if read
+        .saml_replay()
+        .issue_request(
+            &connection_id,
+            &request_id,
+            return_to.as_deref(),
+            now_micros,
+            now_micros + REQUEST_TTL_SECS * 1_000_000,
+        )
+        .await
+        .is_err()
+    {
+        return server_error();
+    }
+
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (axum::http::header::LOCATION, location),
+            (
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// Load the key this connection signs with, or the response explaining why it cannot.
+///
+/// SPLIT OUT BECAUSE IT IS THE ONE STEP WITH THREE OUTCOMES -- a key, a connection that has none
+/// yet, and a row this build cannot load -- and each is a different thing to tell an operator.
+/// Returning the `Response` rather than an error type keeps every one of those sentences in one
+/// place instead of spreading them across a `From` impl.
+async fn signing_key_for(
+    read: &ironauth_store::ScopedStore<'_>,
+    connection_id: &SamlConnectionId,
+) -> Result<SigningKey, Response> {
+    let key = match read.saml_connections().active_sp_key(connection_id).await {
+        Ok(Some(key)) => key,
+        // A CONNECTION WITH NO KEY CANNOT START A FLOW, and says so rather than sending an
+        // unsigned request. The operator's next step is provisioning one and re-uploading their
+        // metadata, which is a different action from anything else on this page.
+        Ok(None) => {
+            return Err(refused(
+                StatusCode::CONFLICT,
+                "this connection has no signing key yet; provision one and upload the updated \
+                 metadata to your identity provider",
+            ));
+        }
+        Err(_) => return Err(server_error()),
+    };
+    // THE ALGORITHM COMES FROM THE ROW, and an earlier version hardcoded `Rs256` here while
+    // `redirect` derived `SigAlg` from the key -- which made "SigAlg comes from the key" a
+    // tautology and left the `algorithm` column reading, as before, nothing at all. The column
+    // is the operator-visible fact; this is where it becomes the key's.
+    let Some(algorithm) = jws_algorithm_for(&key.algorithm) else {
+        // A ROW NAMING AN ALGORITHM THIS BUILD CANNOT LOAD. The column's CHECK admits one value
+        // today, so this is schema drift rather than configuration, and there is nothing the
+        // caller can do about it.
+        return Err(server_error());
+    };
+    let Ok(signing_key) =
+        SigningKey::rsa_from_pkcs1_der(Some(key.id.to_string()), algorithm, key.material.expose())
+    else {
+        // THE STORED KEY DID NOT LOAD, which is a row this deployment wrote and cannot use. It
+        // is not the caller's fault and there is nothing they can do, so it is a 500 rather than
+        // an explanation.
+        return Err(server_error());
+    };
+
+    Ok(signing_key)
+}
+
+/// The absolute URL to send the browser to.
+///
+/// THE SEPARATOR DEPENDS ON THE CONFIGURED URL. An `idp_sso_url` may already carry a query --
+/// ADFS deployments commonly do -- and appending `?` to one that does produces a URL the
+/// identity provider reads as a single malformed parameter.
+fn redirect_location(connection: &ironauth_store::SamlConnection, redirect: &Redirect) -> String {
     let separator = if connection.idp_sso_url.contains('?') {
         '&'
     } else {
         '?'
     };
-    let location = format!("{}{separator}{}", connection.idp_sso_url, redirect.query);
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (axum::http::header::LOCATION, location),
-            (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
-        ],
-    )
-        .into_response()
+    format!("{}{separator}{}", connection.idp_sso_url, redirect.query)
 }
 
 /// The JOSE algorithm a stored `algorithm` fragment names, if this build has one for it.
@@ -257,8 +314,13 @@ pub async fn start_get(
 /// THE TRANSLATION IS EXPLICIT AND TOTAL, rather than a parse or a default: the column holds
 /// XML-Signature's spelling (`rsa-sha256`) because that is what an operator sees in their
 /// identity provider, and this crate signs by JOSE name. A row naming something this build has
-/// no signer for answers `None` and is refused, rather than being silently signed as RSA and
-/// announced as whatever the row said.
+/// no signer for answers `None` and is refused.
+///
+/// WHAT THAT PREVENTS is not a mismatched announcement -- `redirect` derives `SigAlg` from the
+/// key it is handed, so the URI and the signature cannot disagree. It is a row this build cannot
+/// honour being treated as one it can: without the lookup the loader would have to assume an
+/// algorithm, and assuming RSA for a row that says something else signs with a key the operator
+/// did not configure for the purpose.
 ///
 /// READING THE COLUMN IS NOT YET DISTINGUISHABLE FROM A CONSTANT, and that is worth admitting
 /// rather than claiming as coverage: 0199's CHECK admits `rsa-sha256` and nothing else, so no
@@ -266,7 +328,10 @@ pub async fn start_get(
 /// passes every test. The unit test below measures the MAPPING, which is the half that can be
 /// wrong today. The half that cannot be measured until a second algorithm exists is that the
 /// caller passes the row -- and it is written this way now so that adding one is a migration and
-/// a match arm, not a hunt for a hardcode.
+/// TWO match arms: this one, and `ironauth-saml`'s `SigAlg` mapping, which turns the JOSE name
+/// back into the XML-Signature URI that goes on the wire. Naming both is the point; an earlier
+/// version said "a match arm, not a hunt for a hardcode" and left the second site unmentioned,
+/// which is the hunt it was claiming to have prevented.
 fn jws_algorithm_for(algorithm: &str) -> Option<JwsAlgorithm> {
     match algorithm {
         "rsa-sha256" => Some(JwsAlgorithm::Rs256),

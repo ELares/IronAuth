@@ -58,12 +58,12 @@ CREATE TABLE saml_sp_signing_keys (
     --
     -- `retired_at` is NULL while this is the key the connection signs with.
     --
-    -- NOTHING ROTATES YET, and the column plus its UPDATE grant ship ahead of the operation for
-    -- one reason: retiring a key is a WRITE to a row that already exists, and adding the column
-    -- later would mean a second migration over a table holding live credentials. 0198 makes the
-    -- opposite call for its sweep -- no DELETE grant until something deletes -- and the
-    -- difference is that a missing grant blocks nothing until the sweep exists, while a missing
-    -- column would have to be added under load. The rotation itself is #141's.
+    -- NOTHING ROTATES YET, and the COLUMN ships ahead of the operation while the UPDATE GRANT
+    -- does not. The two are not the same decision: adding a column later means a migration over
+    -- a table holding live private keys, whereas a grant costs nothing to add later and blocks
+    -- nothing until something rotates -- which is exactly 0198's rule for its sweep, and this
+    -- file follows it rather than contrasting with it. See the grant block at the foot of this
+    -- migration. The rotation, and the grant it needs, are #141's.
     created_at        timestamptz NOT NULL,
     retired_at        timestamptz,
 

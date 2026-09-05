@@ -28,7 +28,6 @@ const NAMEID_FORMAT: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddr
 
 struct Wired {
     connection: SamlConnectionId,
-    sso_url: String,
     key: XmlTestKey,
     audience: String,
     acs_url: String,
@@ -69,7 +68,6 @@ async fn wire_at(harness: &Harness, with_sp_key: bool, idp_sso_url: &str) -> Wir
         scope.environment()
     );
     let acs_url = format!("https://ironauth.example{acs_path}");
-    let sso_url = idp_sso_url.to_owned();
     let audience = format!("https://ironauth.example/saml/{connection}/metadata");
 
     let acting = harness
@@ -135,7 +133,6 @@ async fn wire_at(harness: &Harness, with_sp_key: bool, idp_sso_url: &str) -> Wir
 
     Wired {
         connection,
-        sso_url,
         key,
         audience,
         acs_url,
@@ -239,6 +236,21 @@ async fn get(
         .body(axum::body::Body::empty())
         .expect("request builds");
     harness.send(request).await
+}
+
+/// Every header a response carries, as a comparable list.
+fn header_shape(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    let mut shape: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    shape.sort();
+    shape
 }
 
 /// The value of `name` in a query string, still percent-encoded.
@@ -460,8 +472,11 @@ async fn the_request_names_the_connections_own_values_and_is_recorded_before_the
         "{xml}"
     );
 
-    // AND IT WAS RECORDED BEFORE THE BROWSER WAS SENT. The witness is that the row can be spent:
-    // a request written after the redirect would be a race a real identity provider wins.
+    // AND THE ID THE BROWSER CARRIES IS ONE THAT WAS RECORDED. What this does NOT witness is
+    // the ORDER -- the handler returns only at the end, so nothing a caller observes could
+    // distinguish a row written before the response from one written during it, and an earlier
+    // comment here claimed otherwise. The ordering that matters is against the NETWORK and is
+    // enforced by the code's shape: the response is the first thing that leaves the process.
     let id = xml
         .split("ID=\"")
         .nth(1)
@@ -485,10 +500,20 @@ async fn an_unknown_connection_cannot_be_told_from_a_malformed_one() {
     let harness = Harness::start_store_backed().await;
     let scope = harness.scope();
     let absent = SamlConnectionId::generate(harness.env(), &scope);
+    // A WELL-FORMED ID FROM ANOTHER SCOPE, which the conformance row claims and this test did not
+    // drive: it takes a DIFFERENT branch from the other three, refused by `parse_in_scope` on the
+    // decoded scope rather than on the encoding. The ACS suite has had this case since its own
+    // round 2; this one was credited with it without having it.
+    let foreign_scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::generate(harness.env()),
+        ironauth_store::EnvironmentId::generate(harness.env()),
+    );
+    let foreign = SamlConnectionId::generate(harness.env(), &foreign_scope);
 
     let mut answers = Vec::new();
     for id in [
         absent.to_string(),
+        foreign.to_string(),
         "not-an-id".to_owned(),
         "smc_".to_owned(),
     ] {
@@ -497,13 +522,16 @@ async fn an_unknown_connection_cannot_be_told_from_a_malformed_one() {
             scope.tenant(),
             scope.environment()
         );
-        let (status, _, page) = get(&harness, &path).await;
-        answers.push((status, page));
+        let (status, headers, page) = get(&harness, &path).await;
+        answers.push((status, header_shape(&headers), page));
     }
     assert_eq!(answers[0].0, 404);
     for answer in &answers[1..] {
         assert_eq!(answer.0, answers[0].0, "the answers differ by status");
-        assert_eq!(answer.1, answers[0].1, "the answers differ by body");
+        // HEADERS TOO, because a leak need not be in the page: one differing `Cache-Control`, or
+        // a `WWW-Authenticate`, is a per-request yes/no on which ids this environment holds.
+        assert_eq!(answer.1, answers[0].1, "the answers differ by header");
+        assert_eq!(answer.2, answers[0].2, "the answers differ by body");
     }
 }
 
@@ -615,14 +643,16 @@ async fn the_recorded_return_to_is_the_validated_one_and_is_bounded() {
     // OVER THE COLUMN'S BOUND: refused as a return location rather than answering 500. The path
     // parses -- it is a valid resume with a very long scope -- so only the length bound can
     // refuse it.
-    let long = format!(
-        "/authorize?client_id={}&scope={}",
-        harness.client_id(),
-        "a".repeat(1200)
-    );
-    assert!(
-        long.len() > 1024,
-        "the over-long fixture must exceed migration 0198's relay_state bound"
+    // JUST OVER THE BOUND, not comfortably over. A first version used a 1296-byte fixture, so
+    // the constant could grow to 1295 -- 271 bytes past the column's 1024 -- with the suite
+    // green, and every one of those values is an insert that fails and a 500 an unauthenticated
+    // caller chose. One byte over is what pins it.
+    let prefix = format!("/authorize?client_id={}&scope=", harness.client_id());
+    let long = format!("{prefix}{}", "a".repeat(1025 - prefix.len()));
+    assert_eq!(
+        long.len(),
+        1025,
+        "the over-long fixture must be exactly one byte past the column bound"
     );
     let (status, headers, body) = get(
         &harness,
@@ -702,32 +732,42 @@ async fn a_resume_belonging_to_another_scope_is_not_recorded() {
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, true).await;
 
-    let foreign_scope = ironauth_store::Scope::new(
+    // ONE DIMENSION AT A TIME. A first version varied tenant AND environment together, so a
+    // build comparing only one half -- or comparing nothing but happening to differ -- passed;
+    // neither half of `Scope`'s equality was pinned. These two cases differ from the route's
+    // scope in exactly one component each.
+    let mine = harness.scope();
+    let other_tenant = ironauth_store::Scope::new(
         ironauth_store::TenantId::generate(harness.env()),
+        mine.environment(),
+    );
+    let other_environment = ironauth_store::Scope::new(
+        mine.tenant(),
         ironauth_store::EnvironmentId::generate(harness.env()),
     );
-    let foreign_client = ironauth_store::ClientId::generate(harness.env(), &foreign_scope);
-    let foreign = format!("/authorize?client_id={foreign_client}&scope=openid");
-
-    let (status, headers, body) = get(
-        &harness,
-        &format!("{}?return_to={}", wired.start_path, urlencode(&foreign)),
-    )
-    .await;
-    // THE FLOW STILL STARTS: a return location this route cannot honour is dropped, not a reason
-    // to refuse a sign-in the operator asked for. What must not happen is RECORDING it.
-    assert_eq!(status, 303, "{body}");
-    let location = headers
-        .get(axum::http::header::LOCATION)
-        .expect("a redirect")
-        .to_str()
-        .expect("ascii")
-        .to_owned();
-    assert_eq!(
-        spend_at(&harness, &wired, &location).await,
-        None,
-        "another scope's authorization path was recorded as this connection's return location"
-    );
+    for (label, foreign_scope) in [("tenant", other_tenant), ("environment", other_environment)] {
+        let foreign_client = ironauth_store::ClientId::generate(harness.env(), &foreign_scope);
+        let foreign = format!("/authorize?client_id={foreign_client}&scope=openid");
+        let (status, headers, body) = get(
+            &harness,
+            &format!("{}?return_to={}", wired.start_path, urlencode(&foreign)),
+        )
+        .await;
+        // THE FLOW STILL STARTS: a return location this route cannot honour is dropped, not a
+        // reason to refuse a sign-in the operator asked for. What must not happen is RECORDING it.
+        assert_eq!(status, 303, "{label}: {body}");
+        let location = headers
+            .get(axum::http::header::LOCATION)
+            .expect("a redirect")
+            .to_str()
+            .expect("ascii")
+            .to_owned();
+        assert_eq!(
+            spend_at(&harness, &wired, &location).await,
+            None,
+            "a resume differing only by {label} was recorded as this connection's return location"
+        );
+    }
 
     // AND THIS ROUTE'S OWN SCOPE IS STILL ACCEPTED, so the comparison is not refusing everything.
     let own = format!("/authorize?client_id={}&scope=openid", harness.client_id());
@@ -856,7 +896,6 @@ async fn an_sso_url_that_already_has_a_query_gets_an_ampersand() {
     let (_, query) = location.split_once('?').expect("a query");
     assert_eq!(param(query, "wa").as_deref(), Some("wsignin1.0"));
     assert!(param(query, "SAMLRequest").is_some());
-    assert_eq!(adfs.sso_url, "https://adfs.example/adfs/ls/?wa=wsignin1.0");
 }
 
 #[tokio::test]
@@ -880,12 +919,14 @@ async fn the_request_expires_at_the_window_the_endpoint_documents() {
     let issued = now_micros(harness.env());
     let replay = harness.store().scoped(harness.scope()).saml_replay();
 
-    // ONE SECOND PAST FIVE MINUTES: gone. The store's predicate is `expires_at > now`, so this
-    // reads back the value the endpoint chose rather than the one the test supplies.
+    // EXACTLY FIVE MINUTES: gone. The store's predicate is `expires_at > now`, so probing at
+    // precisely `issued + 300s` refuses if and only if the endpoint chose 300 or less -- and the
+    // second half refuses anything under 300. Together they pin the constant to one value. An
+    // earlier version probed at +301, which left 301 passing too.
     assert!(
         matches!(
             replay
-                .consume_request(&wired.connection, &id, issued + 301 * 1_000_000)
+                .consume_request(&wired.connection, &id, issued + 300 * 1_000_000)
                 .await,
             Err(ironauth_store::StoreError::NotFound)
         ),
