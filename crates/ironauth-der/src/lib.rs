@@ -189,12 +189,23 @@ fn read_tlv(bytes: &[u8]) -> Result<(u8, &[u8], &[u8]), DerError> {
         if len_bytes[0] == 0 {
             return Err(DerError::BadLength);
         }
+        // AND A LENGTH THAT FITS THE SHORT FORM MUST USE IT. DER admits exactly one encoding
+        // of each length; `81 02` is `02` written longer, and a reader that accepts both agrees
+        // with a stricter one about every conforming document and disagrees about that one.
+        //
+        // `checked_mul` for the same reason as in `oid_arcs`: `checked_shl(8)` reports success
+        // after dropping the high bits. Unreachable here, because `num_bytes` is bounded to the
+        // width of a `usize` -- but a guard that cannot guard is worse than none, because the
+        // next person to widen the bound will believe it.
         let mut length = 0usize;
         for &b in len_bytes {
             length = length
-                .checked_shl(8)
+                .checked_mul(256)
                 .and_then(|shifted| shifted.checked_add(usize::from(b)))
                 .ok_or(DerError::BadLength)?;
+        }
+        if length < 0x80 {
+            return Err(DerError::BadLength);
         }
         (length, after)
     };
@@ -229,8 +240,15 @@ pub fn oid_arcs(contents: &[u8]) -> Result<Vec<u64>, DerError> {
     let mut pending = false;
     for &b in rest {
         pending = true;
+        // `checked_mul(128)` RATHER THAN `checked_shl(7)`, WHICH GUARDS NOTHING HERE.
+        // `checked_shl` answers `None` only when the SHIFT AMOUNT is at least the bit width; a
+        // shift of 7 is always in range, so `u64::MAX.checked_shl(7)` is `Some(..488)` -- the
+        // high bits are gone and the call reports success. An OID arc is unbounded in DER, so
+        // this loop is reachable with as many bytes as an attacker likes, and a wrapped arc can
+        // be made to equal any value at all: `1.2.840.113549.1.1.1` included, which is the OID
+        // that decides a key is RSA.
         value = value
-            .checked_shl(7)
+            .checked_mul(128)
             .and_then(|shifted| shifted.checked_add(u64::from(b & 0x7F)))
             .ok_or(DerError::BadValue)?;
         if b & 0x80 == 0 {

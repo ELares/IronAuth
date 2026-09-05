@@ -314,6 +314,10 @@ fn both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with() 
     // held for one of the two numbers a key is made of. `ring` requires an odd exponent below
     // 2^33, so a 40-byte one is a key this deployment could pin and never verify with.
     for (exponent, accepted) in [
+        // `e = 1` IS THE IDENTITY: "signing" leaves the message unchanged. It is odd and one
+        // byte, so an earlier version's "odd, 1..=5 bytes" rule accepted it, and `ring` refuses
+        // it -- a key pinned here that fails every assertion later.
+        (vec![0x01], false),
         (vec![0x03], true),
         (vec![0x01, 0x00, 0x01], true),
         (vec![0x01_u8; 5], true),
@@ -462,6 +466,67 @@ fn an_interval_that_ends_before_it_starts_is_not_a_validity() {
     // certificate valid for no time at all.
     let instant = certificate_around(&key, true, "260101000000Z", "260101000000Z");
     assert_eq!(pinned(&instant), Err(X509Error::Malformed));
+}
+
+#[test]
+fn a_tbs_certificate_on_its_own_is_not_a_certificate() {
+    // READING A VALUE OUT OF A DOCUMENT IS A CLAIM THAT THE DOCUMENT IS ONE. An earlier version
+    // stopped at the SPKI, so `SEQUENCE { tbsCertificate }` -- no signature algorithm, no
+    // signature, a shape no encoder produces and nothing else accepts -- had its key pinned.
+    let key = spki_rsa(&[0xd0; 256], &[0x01, 0x00, 0x01]);
+    let whole = certificate_around(&key, true, "260101000000Z", "270101000000Z");
+    assert!(pinned(&whole).is_ok(), "the control does not parse");
+
+    // The TBSCertificate alone, wrapped as a Certificate would wrap it.
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&tlv(0xa0, &integer(&[2])));
+    inner.extend_from_slice(&integer(&[0x01]));
+    inner.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    inner.extend_from_slice(&tlv(0x30, &[]));
+    let mut validity = tlv(0x17, b"260101000000Z");
+    validity.extend_from_slice(&tlv(0x17, b"270101000000Z"));
+    inner.extend_from_slice(&tlv(0x30, &validity));
+    inner.extend_from_slice(&tlv(0x30, &[]));
+    inner.extend_from_slice(&key);
+    let tbs_only = tlv(0x30, &tlv(0x30, &inner));
+    assert_eq!(
+        pinned(&tbs_only),
+        Err(X509Error::Malformed),
+        "a bare TBSCertificate had its key pinned"
+    );
+
+    // AND THE SIGNATURE VALUE MUST BE A BIT STRING, not merely present: an OCTET STRING there is
+    // a different document that a lenient reader would step over without noticing.
+    let mut wrong_tail = tlv(0x30, &inner);
+    wrong_tail.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    wrong_tail.extend_from_slice(&tlv(0x04, &[0x11, 0x22])); // OCTET STRING
+    assert_eq!(pinned(&tlv(0x30, &wrong_tail)), Err(X509Error::Malformed));
+}
+
+#[test]
+fn an_object_identifier_whose_arcs_overflow_is_not_rsa_encryption() {
+    // THE SHARED READER BUILT EACH ARC WITH `checked_shl(7)`, WHICH GUARDS NOTHING: `checked_shl`
+    // answers `None` only when the SHIFT AMOUNT is at least the bit width, so a shift of 7 always
+    // succeeds and the high bits are simply gone. An OID arc is unbounded in DER, so a long
+    // enough arc could be made to wrap to ANY value -- `1.2.840.113549.1.1.1` included, which is
+    // the OID that decides a key is RSA.
+    //
+    // The encoding below is a single arc of eleven continuation bytes, which needs 77 bits.
+    let mut oid = vec![0x2a]; // 1.2, as the first byte encodes
+    // Ten continuation bytes (bit 7 set, seven bits of payload each) then a terminator: 77 bits
+    // of arc, which a u64 cannot hold.
+    oid.extend(std::iter::repeat_n(0xff_u8, 10));
+    oid.push(0x01);
+    let refused = public_key_from_spki(&spki(
+        &oid,
+        None,
+        &rsa_public_key(&[0xd0; 256], &[0x01, 0x00, 0x01]),
+    ));
+    assert_eq!(
+        refused,
+        Err(X509Error::Malformed),
+        "an OID with a wrapped arc was read rather than refused"
+    );
 }
 
 #[test]

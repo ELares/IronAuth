@@ -533,7 +533,7 @@ const CHEAT_SHEET: &[Item] = &[
     },
     // -- X.509 Certificate Considerations ---------------------------------------------------
     Item {
-        control: "Certificate strength, lifetime, key usage, and CRL/OCSP revocation checking",
+        control: "Certificate strength and lifetime (key usage and CRL/OCSP: see the rationale)",
         coverage: Coverage::Tests(&[
             "both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with",
             "an_algorithm_this_server_cannot_verify_with_is_named_as_such",

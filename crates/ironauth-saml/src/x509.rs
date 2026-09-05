@@ -24,10 +24,11 @@
 //! - It does not read the subject, the issuer, the extensions, the key usage or the basic
 //!   constraints. Every one of those is a string an attacker chose, and none of them changes
 //!   which key signed an assertion.
-//! - It does not DECIDE anything about the validity dates. It reads them so the store can record
-//!   them; whether a pinned certificate has expired is a question about the clock, which this
-//!   crate deliberately does not have -- the same reason [`crate::check`] takes `now` as an
-//!   argument.
+//! - It does not compare the validity dates TO A CLOCK. It reads them so the store can record
+//!   them, and it refuses an interval that ends before it starts -- which is a statement about
+//!   the certificate, not about the time. Whether a pinned certificate has EXPIRED is a question
+//!   about the clock, which this crate deliberately does not have, the same reason
+//!   [`crate::check`] takes `now` as an argument.
 //!
 //! # This is the MANAGEMENT surface, never the assertion path
 //!
@@ -39,10 +40,18 @@
 //!
 //! # The reader is shared, the policy is not
 //!
-//! The DER walking is [`ironauth_der`], which was `ironauth-webauthn`'s module until SAML needed
-//! it too. Two DER readers in one codebase is two answers to what a certificate says, and the
-//! interesting inputs are exactly the ones they disagree about. What stays here is POLICY, which
-//! genuinely differs from WebAuthn's: which curves, which RSA sizes, and what a caller gets back.
+//! The TLV reading is [`ironauth_der`], which was `ironauth-webauthn`'s module until SAML needed
+//! it too. Two readers of the same bytes is two answers, and the interesting inputs are exactly
+//! the ones they disagree about -- so the SPLITTER is shared and each caller keeps its own
+//! POLICY: which curves, which key sizes, what a caller gets back.
+//!
+//! WHAT IS NOT YET SHARED, SAID PLAINLY: `ironauth-webauthn::x509::parse_certificate` is a
+//! SECOND certificate walk, and this is a third of the way to being a third. They differ today
+//! in more than policy -- WebAuthn's reads the subject and issuer names and the extensions
+//! because attestation needs them, takes Ed25519 and P-256 only, and bounds no key size. So
+//! "the reader is shared" is true of the TLV layer and NOT of the certificate grammar above it.
+//! Merging the two is worth doing and is not this PR: WebAuthn's walk is on a verified
+//! attestation path, and changing it needs its own review rather than riding along here.
 
 use ironauth_der::{Der, DerError, oid_arcs, parse_time, tag};
 use ironauth_jose::xmldsig::XmlSigKey;
@@ -144,7 +153,7 @@ pub struct Pinned {
 /// fail every verification is refused at the one moment an operator is looking at it.
 const RSA_MODULUS_BYTES: core::ops::RangeInclusive<usize> = 256..=1024;
 
-/// The largest RSA PUBLIC EXPONENT, in bytes.
+/// The RSA PUBLIC EXPONENT range, in bytes.
 ///
 /// CHECKED FOR THE SAME REASON THE MODULUS IS, and an earlier version checked only the modulus --
 /// so `RsaKeySize`'s promise ("refused here rather than failing every assertion later") held for
@@ -193,8 +202,17 @@ pub fn pinned(der: &[u8]) -> Result<Pinned, X509Error> {
     let key = subject_public_key_info(tbs.take_sequence()?)?;
     // NOT `end(&tbs)`: `[1] issuerUniqueID`, `[2] subjectUniqueID` and `[3] extensions` are legal
     // here and this module reads none of them, so requiring emptiness would refuse every real
-    // certificate. That is the one place trailing content is expected, and saying so is what
-    // stops the rule below from looking arbitrary.
+    // certificate. That is the ONE place trailing content is expected, and saying so is what
+    // stops the rule everywhere else from looking arbitrary.
+    //
+    // THE REST OF THE CERTIFICATE MUST STILL BE THERE, though nothing here reads it. An earlier
+    // version stopped at the SPKI, so `SEQUENCE { tbsCertificate }` alone -- no signature
+    // algorithm, no signature, a shape no encoder produces and nothing else accepts -- was read
+    // as a certificate and its key pinned. Reading a value out of a document is a claim that the
+    // document is one, and the cheapest way to mean it is to require the parts to exist.
+    certificate.take_sequence()?; // signatureAlgorithm
+    certificate.take_tag(tag::BIT_STRING)?; // signatureValue
+    end(&certificate)?;
 
     Ok(Pinned {
         key,
@@ -208,9 +226,16 @@ pub fn pinned(der: &[u8]) -> Result<Pinned, X509Error> {
 /// # Why this is public beside [`pinned`]
 ///
 /// SAML metadata carries an identity provider's key inside `<ds:X509Certificate>`, which is a
-/// whole certificate -- so [`pinned`] is the ordinary path. `<ds:KeyValue>` carries the key
-/// alone, which is what this reads, and Shibboleth emits both. A caller that had only [`pinned`]
-/// would have to refuse a conformant metadata document, or invent a certificate around the key.
+/// whole certificate, so [`pinned`] is the ordinary path and the only one wired to the store
+/// today.
+///
+/// THIS ONE HAS NO PRODUCTION CALLER YET, and that is worth stating rather than leaving to be
+/// discovered. `<ds:KeyValue>` in a `KeyDescriptor` carries key material without a certificate,
+/// and the metadata reader that will consume it is not written. It is public now because the
+/// adversarial suite exercises the SPKI grammar directly -- every DER shape below the
+/// certificate wrapper is reachable through it and through nothing else -- and because a
+/// metadata reader that had only [`pinned`] would have to refuse a conformant document or invent
+/// a certificate around the key. If the metadata work lands without needing it, it should go.
 ///
 /// It answers no validity, because there is none in an SPKI: a caller pinning one supplies the
 /// dates itself or has none to supply.
@@ -284,9 +309,7 @@ fn subject_public_key_info(mut spki: Der<'_>) -> Result<XmlSigKey, X509Error> {
         // THE EXPONENT TOO, and an earlier version checked only the modulus. `ring` bounds the
         // exponent as well, so a key with a 40-byte exponent is one this deployment can pin and
         // never verify with.
-        if !RSA_EXPONENT_BYTES.contains(&exponent.len())
-            || exponent.last().is_none_or(|byte| byte % 2 == 0)
-        {
+        if !RSA_EXPONENT_BYTES.contains(&exponent.len()) || !is_public_exponent(exponent) {
             return Err(X509Error::RsaKeySize);
         }
         return Ok(XmlSigKey::Rsa {
@@ -339,6 +362,24 @@ fn bit_string(contents: &[u8]) -> Result<&[u8], X509Error> {
         Some((0, bits)) => Ok(bits),
         _ => Err(X509Error::Malformed),
     }
+}
+
+/// Whether these bytes are a usable RSA public exponent: ODD, and at least 3.
+///
+/// BOTH HALVES, AND AN EARLIER VERSION HAD ONLY ONE. It required odd, which `e = 1` satisfies --
+/// and `e = 1` is the identity: "signing" leaves the message unchanged. `ring` refuses it, so it
+/// would be pinned here and fail every assertion later with an error about a signature, which is
+/// the exact misdirection this whole check exists to prevent.
+///
+/// EVEN EXPONENTS are the other half: an even `e` shares a factor with phi(n), so it has no
+/// inverse and no signature ever verifies against it.
+fn is_public_exponent(exponent: &[u8]) -> bool {
+    let odd = exponent.last().is_some_and(|byte| byte % 2 == 1);
+    // "At least 3", written as "more than one byte, or a first byte of at least 3". The
+    // magnitude here has had its sign padding stripped by `unsigned_integer`, so a small
+    // exponent is a single byte.
+    let at_least_three = exponent.len() > 1 || exponent.first().is_some_and(|byte| *byte >= 3);
+    odd && at_least_three
 }
 
 /// A DER INTEGER's magnitude, with the sign padding removed and a negative one refused.
