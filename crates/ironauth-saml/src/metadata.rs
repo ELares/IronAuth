@@ -23,7 +23,7 @@
 //! side ignores certificate expiry too: what is pinned is key material, not a chain.
 
 use ironauth_der::write::{
-    bit_string, context, generalized_time, name_common, oid, seq, tlv, uint,
+    bit_string, context, name_common, oid, seq, tlv, uint, x509_time,
 };
 use ironauth_jose::SigningKey;
 
@@ -146,15 +146,29 @@ const METADATA_NS_PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 /// entity id. An identity provider displays this to an operator confirming they pasted the right
 /// document, so it should be the string they recognise rather than a hostname.
 fn self_signed_certificate(descriptor: &Descriptor<'_>) -> Result<Vec<u8>, MetadataError> {
+    // THE ANNOUNCED ALGORITHM COMES FROM THE KEY, and an earlier version of this function
+    // hardcoded sha256WithRSAEncryption while `sign_detached` routed on the key's own algorithm.
+    // Five of the six RSA algorithms `SigningKey` admits then produced a certificate that lied
+    // about its own signature: an Rs512 key signs with SHA-512 under a header saying SHA-256, and
+    // every verifier that checks a self-signature refuses it. A PSS key additionally breaks the
+    // byte-stability this module promises, because PSS salting is randomised.
+    //
+    // THIS IS THE SAME DEFECT `authn_request` ALREADY FIXED, one file away, for the redirect
+    // binding's `SigAlg`. Writing it again in a new module is why the refusal is here rather
+    // than in a comment: a key with no OID in this build cannot be published at all.
+    let signature_oid = match descriptor.key.algorithm() {
+        ironauth_jose::JwsAlgorithm::Rs256 => [1, 2, 840, 113_549, 1, 1, 11],
+        _ => return Err(MetadataError::UnsupportedKey),
+    };
     let public_key = descriptor
         .key
         .rsa_public_key_der()
         .ok_or(MetadataError::UnsupportedKey)?;
 
-    // `AlgorithmIdentifier` for sha256WithRSAEncryption, and for rsaEncryption in the SPKI. Both
-    // carry an explicit NULL parameter: RFC 4055 says RSA algorithm identifiers MUST, and a
-    // certificate omitting it is one some verifiers reject.
-    let signature_algorithm = seq(&[oid(&[1, 2, 840, 113_549, 1, 1, 11]), tlv(0x05, &[])]);
+    // `AlgorithmIdentifier` for the signature, and for rsaEncryption in the SPKI. Both carry an
+    // explicit NULL parameter: RFC 4055 says RSA algorithm identifiers MUST, and a certificate
+    // omitting it is one some verifiers reject.
+    let signature_algorithm = seq(&[oid(&signature_oid), tlv(0x05, &[])]);
     let key_algorithm = seq(&[oid(&[1, 2, 840, 113_549, 1, 1, 1]), tlv(0x05, &[])]);
     let spki = seq(&[key_algorithm, bit_string(public_key)]);
     let name = name_common(descriptor.entity_id);
@@ -162,16 +176,23 @@ fn self_signed_certificate(descriptor: &Descriptor<'_>) -> Result<Vec<u8>, Metad
     let tbs = seq(&[
         // [0] EXPLICIT version, v3 (the value 2). Required because extensions are present.
         context(0, &uint(2)),
-        // A SERIAL DERIVED FROM notBefore rather than random. It must be positive and unique per
-        // issuer, and here the issuer is this key: a rotation mints a new key with a new
-        // certificate, so the pair (issuer, serial) cannot repeat unless two certificates are
-        // minted for one key in the same second, which the one-live-key index forbids.
+        // A SERIAL DERIVED FROM notBefore rather than random, and the uniqueness argument has to
+        // name the right issuer. X.509 requires (issuer, serial) to be unique, and the ISSUER
+        // HERE IS THE `sp_entity_id` -- an operator-supplied column, which two connections in one
+        // deployment may perfectly well share. What makes a collision harmless is that these are
+        // self-signed leaves nobody chains through: no path builder ever looks one up by
+        // (issuer, serial), and the only consumer is an identity provider comparing the
+        // certificate it was given to the one presented. An earlier version of this comment
+        // claimed the issuer was the key, which is not what the field holds.
         uint(u64::try_from(descriptor.not_before_unix_secs.max(1)).unwrap_or(1)),
         signature_algorithm.clone(),
         name.clone(),
+        // RFC 5280 4.1.2.5 CHOOSES THE FORM, and it is a MUST: `UTCTime` through 2049 and
+        // `GeneralizedTime` after. An earlier version wrote `GeneralizedTime` always, which made
+        // every certificate this produced non-conforming for the next twenty-three years.
         seq(&[
-            generalized_time(descriptor.not_before_unix_secs),
-            generalized_time(descriptor.not_after_unix_secs),
+            x509_time(descriptor.not_before_unix_secs),
+            x509_time(descriptor.not_after_unix_secs),
         ]),
         name,
         spki,

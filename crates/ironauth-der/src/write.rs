@@ -70,9 +70,12 @@ pub fn set(elements: &[Vec<u8>]) -> Vec<u8> {
 
 /// Encode an `OBJECT IDENTIFIER` from its dotted arcs.
 ///
-/// THE FIRST TWO ARCS SHARE A BYTE, which is X.690's rule and the one place OID encoding
-/// surprises people: `1.2.840...` begins `0x2A` because 1 * 40 + 2 = 42. Arcs of 128 or more are
-/// base-128 with the continuation bit set on every byte but the last.
+/// THE FIRST TWO ARCS SHARE A SUBIDENTIFIER, which is X.690's rule and the one place OID encoding
+/// surprises people: `1.2.840...` begins `0x2A` because 1 * 40 + 2 = 42. It is a SUBIDENTIFIER
+/// and not a byte -- an earlier version wrote `40 * a + b` as a single `u8`, and `2.100.3` has a
+/// first subidentifier of 180, which does not fit and silently encoded a DIFFERENT OID. The
+/// combined value goes through the same base-128 encoding every other arc does, which is what
+/// makes that impossible rather than merely unlikely.
 ///
 /// # Panics
 ///
@@ -80,20 +83,24 @@ pub fn set(elements: &[Vec<u8>]) -> Vec<u8> {
 #[must_use]
 pub fn oid(arcs: &[u64]) -> Vec<u8> {
     assert!(arcs.len() >= 2, "an OID has at least two arcs");
-    let mut body = vec![u8::try_from(arcs[0] * 40 + arcs[1]).unwrap_or(0)];
+    let mut body = base128(arcs[0] * 40 + arcs[1]);
     for &arc in &arcs[2..] {
-        let mut stack = Vec::new();
-        let mut remaining = arc;
-        stack.push(u8::try_from(remaining & 0x7F).unwrap_or(0));
-        remaining >>= 7;
-        while remaining > 0 {
-            stack.push(u8::try_from(remaining & 0x7F).unwrap_or(0) | 0x80);
-            remaining >>= 7;
-        }
-        stack.reverse();
-        body.extend_from_slice(&stack);
+        body.extend_from_slice(&base128(arc));
     }
     tlv(tag::OID, &body)
+}
+
+/// One OID subidentifier: base-128, most significant group first, continuation bit set on every
+/// byte but the last.
+fn base128(value: u64) -> Vec<u8> {
+    let mut stack = vec![u8::try_from(value & 0x7F).unwrap_or(0)];
+    let mut remaining = value >> 7;
+    while remaining > 0 {
+        stack.push(u8::try_from(remaining & 0x7F).unwrap_or(0) | 0x80);
+        remaining >>= 7;
+    }
+    stack.reverse();
+    stack
 }
 
 /// Encode an `INTEGER` from an unsigned value.
@@ -106,11 +113,17 @@ pub fn uint(value: u64) -> Vec<u8> {
 ///
 /// TWO RULES, AND BOTH MATTER TO THE READER. Leading zero bytes are stripped, because DER
 /// requires the minimal encoding; and a zero byte is then prepended if the top bit is set,
-/// because ASN.1 integers are SIGNED and a modulus whose first bit is 1 would otherwise encode a
-/// negative number. An RSA modulus almost always has that bit set, so the second rule fires on
-/// nearly every certificate this writes.
+/// because ASN.1 integers are SIGNED and a magnitude whose first bit is 1 would otherwise encode
+/// a negative number.
+///
+/// THE SIGN RULE IS NOT EXERCISED BY THE CERTIFICATE WRITER TODAY, and an earlier version of this
+/// doc claimed the opposite -- that an RSA modulus "almost always has that bit set, so the second
+/// rule fires on nearly every certificate". It does not: a modulus reaches the SPKI as DER that
+/// ring already encoded, so it never passes through here at all, and the only integers this
+/// crate's own callers write are a version and a serial, both small and both positive. The rule
+/// is right and the unit test below is what holds it, not a certificate.
 #[must_use]
-pub fn uint_bytes(magnitude: &[u8]) -> Vec<u8> {
+fn uint_bytes(magnitude: &[u8]) -> Vec<u8> {
     let mut bytes: Vec<u8> = magnitude.to_vec();
     while bytes.len() > 1 && bytes[0] == 0 {
         bytes.remove(0);
@@ -140,21 +153,41 @@ pub fn octet_string(bytes: &[u8]) -> Vec<u8> {
 
 /// Encode a `UTF8String`.
 #[must_use]
-pub fn utf8_string(text: &str) -> Vec<u8> {
+fn utf8_string(text: &str) -> Vec<u8> {
     tlv(tag::UTF8_STRING, text.as_bytes())
 }
 
 /// Encode a `GeneralizedTime` from a Unix timestamp, at second precision in UTC.
 ///
-/// GENERALIZED RATHER THAN UTCTIME, deliberately. RFC 5280 says a certificate MUST use `UTCTime`
-/// for dates through 2049 and `GeneralizedTime` after -- and `UTCTime`'s two-digit year is the
-/// reason that rule exists. Every reader accepts `GeneralizedTime` in both ranges, the reader
-/// beside this one included, so writing it always costs two bytes and removes a boundary.
 #[must_use]
 pub fn generalized_time(unix_seconds: i64) -> Vec<u8> {
     let (year, month, day, hour, minute, second) = civil_from_unix(unix_seconds);
     let text = format!("{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z");
     tlv(tag::GENERALIZED_TIME, text.as_bytes())
+}
+
+/// Encode an X.509 `Time` from a Unix timestamp, choosing the form RFC 5280 requires.
+///
+/// THE RULE IS A MUST AND IT IS NOT ABOUT WHAT READERS ACCEPT. RFC 5280 4.1.2.5 says a conforming
+/// certificate MUST encode a date through 2049 as `UTCTime` and 2050 onwards as
+/// `GeneralizedTime` -- so a certificate writing `GeneralizedTime` for 2026 is non-conforming
+/// whatever a lenient parser does with it. An earlier version of this crate wrote
+/// `GeneralizedTime` always and argued that every reader accepts it, which answered a question
+/// the specification was not asking.
+///
+/// `UTCTime`'S TWO-DIGIT YEAR is read by RFC 5280 as 1950-2049, which is why the boundary sits
+/// where it does and why the choice is a year comparison rather than a preference.
+#[must_use]
+pub fn x509_time(unix_seconds: i64) -> Vec<u8> {
+    let (year, month, day, hour, minute, second) = civil_from_unix(unix_seconds);
+    if (1950..=2049).contains(&year) {
+        let text = format!(
+            "{:02}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z",
+            year % 100
+        );
+        return tlv(tag::UTC_TIME, text.as_bytes());
+    }
+    generalized_time(unix_seconds)
 }
 
 /// Encode a context-specific constructed field, as X.509's `[0] EXPLICIT` tags are.

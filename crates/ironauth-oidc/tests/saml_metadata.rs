@@ -139,6 +139,21 @@ async fn wire_at(harness: &Harness, with_sp_key: bool, idp_sso_url: &str) -> Wir
 /// this call with an admin endpoint: keeping it in one place is what makes that a one-line
 /// change rather than a hunt.
 async fn provision_key(harness: &Harness, connection: &SamlConnectionId) {
+    let created_at = now_micros(harness.env());
+    provision_key_at(harness, connection, created_at).await;
+}
+
+/// Provision the SP signing key with a CALLER-CHOSEN creation instant.
+///
+/// THE INSTANT IS A PARAMETER BECAUSE THE HARNESS CLOCK DOES NOT MOVE. A test that provisions
+/// "now" and then fetches cannot tell a window anchored to the key from one anchored to the
+/// request: under a frozen clock those are the same number, so the assertion passes either way.
+/// Backdating the key separates them.
+async fn provision_key_at(
+    harness: &Harness,
+    connection: &SamlConnectionId,
+    created_at_unix_micros: i64,
+) {
     let env = harness.env().clone();
     let scope = harness.scope();
     let der = ironauth_jose::generate_rsa_pkcs1_der(env.entropy()).expect("generate the SP key");
@@ -155,7 +170,7 @@ async fn provision_key(harness: &Harness, connection: &SamlConnectionId) {
                 connection_id: connection,
                 algorithm: "rsa-sha256",
                 key_material: &der,
-                created_at_unix_micros: now_micros(&env),
+                created_at_unix_micros,
             },
             None,
         )
@@ -333,13 +348,23 @@ async fn each_connection_publishes_its_own_key_and_not_another() {
 }
 
 #[tokio::test]
-async fn the_same_connection_publishes_the_same_certificate_every_time() {
+async fn the_validity_window_is_anchored_to_the_key_and_not_to_the_request() {
     // A DOCUMENT THAT CHANGED ON EVERY FETCH would look to an identity provider like a rotation
     // that never happened, and two operators fetching on different days would upload different
-    // certificates for one key. The validity window is anchored to the KEY's creation instant
-    // rather than to the request, which is what makes the bytes stable.
+    // certificates for one key.
+    //
+    // TWO FETCHES BEING EQUAL DOES NOT PROVE THAT, and an earlier version of this test asserted
+    // only that. The harness clock is frozen, so a window anchored to the REQUEST is also
+    // identical across two fetches -- the test passed against the defect it was written to
+    // catch. What separates the two anchors is a key whose creation instant is not the request
+    // instant, so this backdates the key by thirty days and reads the window back out of the
+    // published certificate with the pinning parser.
     let harness = Harness::start_store_backed().await;
-    let wired = wire(&harness, true).await;
+    let wired = wire(&harness, false).await;
+    let thirty_days_micros: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+    let created_at = now_micros(harness.env()) - thirty_days_micros;
+    provision_key_at(&harness, &wired.connection, created_at).await;
+
     let path = format!(
         "/t/{}/e/{}/saml/metadata/{}",
         harness.scope().tenant(),
@@ -347,7 +372,29 @@ async fn the_same_connection_publishes_the_same_certificate_every_time() {
         wired.connection
     );
 
-    let (_, _, first) = get(&harness, &path).await;
+    let (status, _, first) = get(&harness, &path).await;
+    assert_eq!(status, 200, "{first}");
+    let pinned = ironauth_saml::x509::pinned(&certificate_der(&first))
+        .expect("the published certificate is readable");
+
+    // THE KEY'S INSTANT, TO THE SECOND -- not the request's, which is thirty days later.
+    assert_eq!(
+        pinned.not_before_unix_secs,
+        created_at / 1_000_000,
+        "the validity window is not anchored to the key's creation instant"
+    );
+    assert_ne!(
+        pinned.not_before_unix_secs,
+        now_micros(harness.env()) / 1_000_000,
+        "the validity window is anchored to the request instant"
+    );
+    // AND FIVE YEARS WIDE from there, which is the constant the route documents.
+    assert_eq!(
+        pinned.not_after_unix_secs - pinned.not_before_unix_secs,
+        5 * 365 * 24 * 60 * 60
+    );
+
+    // AND STABLE, which is what the anchoring buys.
     let (_, _, second) = get(&harness, &path).await;
     assert_eq!(
         first, second,
@@ -356,10 +403,76 @@ async fn the_same_connection_publishes_the_same_certificate_every_time() {
 }
 
 #[tokio::test]
+async fn the_document_is_cacheable_and_every_refusal_is_not() {
+    // THE ROUTE'S DOC ARGUES A SPECIFIC max-age AND NOTHING MEASURED IT. A metadata document an
+    // identity provider re-signs on every poll is the cost this header exists to avoid, and a
+    // REFUSAL that got cached would outlive the thing it refused -- an operator who provisions a
+    // key would keep being told there is none.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, true).await;
+    let base = format!(
+        "/t/{}/e/{}/saml/metadata",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+
+    let (status, headers, body) = get(&harness, &format!("{base}/{}", wired.connection)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .map(|value| value.to_str().unwrap_or_default()),
+        Some("public, max-age=300"),
+        "the published document is not cacheable as the route documents"
+    );
+
+    // A CONNECTION WITH NO KEY (409) AND AN UNKNOWN ONE (404), both uncacheable.
+    let keyless = wire(&harness, false).await;
+    for path in [
+        format!("{base}/{}", keyless.connection),
+        format!("{base}/not-an-id"),
+    ] {
+        let (status, headers, body) = get(&harness, &path).await;
+        assert!(status.is_client_error(), "{status} {body}");
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .map(|value| value.to_str().unwrap_or_default()),
+            Some("no-store"),
+            "a refusal at {path} is cacheable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_here_does_not_talk_about_signing_in() {
+    // THE ROUTE SHARES ITS KEY LOADER WITH THE START ENDPOINT, and an earlier version shared the
+    // start endpoint's RENDERED PAGE with it: fetching metadata for a keyless connection
+    // answered "Sign-in unavailable" and advised uploading the very document being fetched. The
+    // shared step decides which outcome; the sentence belongs to the route.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, false).await;
+    let path = format!(
+        "/t/{}/e/{}/saml/metadata/{}",
+        harness.scope().tenant(),
+        harness.scope().environment(),
+        wired.connection
+    );
+
+    let (status, _, body) = get(&harness, &path).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        !body.contains("Sign-in unavailable"),
+        "the metadata route serves the start route's page: {body}"
+    );
+    assert!(body.contains("no certificate to publish"), "{body}");
+}
+
+#[tokio::test]
 async fn a_connection_with_no_key_has_no_metadata_to_publish() {
-    // THE SAME REFUSAL THE START ROUTE GIVES, because it is the same missing thing and the same
-    // next step: provision a key. A document without a `KeyDescriptor` would be accepted by an
-    // identity provider and then verify nothing.
+    // THE SAME OUTCOME THE START ROUTE REACHES -- it is the same missing thing and the same next
+    // step, provision a key -- but said in this route's own words. A document without a
+    // `KeyDescriptor` would be accepted by an identity provider and then verify nothing.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, false).await;
     let path = format!(

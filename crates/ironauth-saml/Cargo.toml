@@ -37,6 +37,10 @@ trybuild.workspace = true
 # THE ENTROPY SEAM, for generating the RSA key the AuthnRequest suite signs with. A dev
 # dependency because the crate itself never generates a key: it signs with one the caller loaded.
 ironauth-env.workspace = true
+# AN XML PARSER THE METADATA WRITER DOES NOT GO THROUGH, so the suite can assert the document it
+# emits is well-formed rather than assert that its own byte-building agrees with itself. A regular
+# dependency is not reachable from an integration test, which is why it is repeated here.
+quick-xml = { workspace = true }
 
 [features]
 default = []

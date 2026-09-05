@@ -215,3 +215,186 @@ fn the_certificate_is_base64_with_no_line_breaks() {
     );
     assert!(encoded.len() > 400, "the certificate is implausibly short");
 }
+
+#[test]
+fn the_certificate_verifies_under_its_own_published_key() {
+    // THE CHECK THAT WOULD HAVE CAUGHT THE WORST DEFECT IN THIS MODULE. `x509::pinned`
+    // deliberately never verifies a signature -- it reads a key out of a certificate an operator
+    // pinned, and the trust decision is the pinning -- so the round-trip test above accepts a
+    // certificate whose `signatureAlgorithm` says one thing and whose `signatureValue` is
+    // another. An earlier version hardcoded sha256WithRSAEncryption while signing with whatever
+    // the key declared, and five of the six RSA algorithms then produced a certificate every
+    // real verifier refuses.
+    let key = signing_key();
+    let document = metadata::entity_descriptor(&descriptor(&key)).expect("build");
+    let der = certificate_der(&document);
+
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    let mut outer = ironauth_der::Der::new(&der);
+    let mut certificate = outer.take_sequence().expect("a certificate");
+    let (_, tbs_bytes, _) = certificate.take_element().expect("the TBS");
+    let _algorithm = certificate.take_element().expect("the algorithm");
+    let signature = certificate
+        .take_tag(ironauth_der::tag::BIT_STRING)
+        .expect("the signature");
+
+    // THE SIGNATURE COVERS THE TBS BYTES EXACTLY AS EMITTED, which is why they are taken from
+    // the encoded certificate rather than rebuilt: a verifier re-encoding the TBS would be
+    // checking a different question from the one a real one asks.
+    ironauth_jose::verify_detached(
+        &key.verifying_key().expect("verifying key"),
+        ironauth_jose::JwsAlgorithm::Rs256,
+        tbs_bytes,
+        signature.strip_prefix(&[0x00]).expect("zero unused bits"),
+    )
+    .expect("the certificate does not verify under the key it publishes");
+}
+
+#[test]
+fn a_key_whose_algorithm_has_no_oid_in_this_build_is_refused() {
+    // AN RSA KEY IS NOT ENOUGH. The guard used to be "is it RSA", which admits Rs384, Rs512 and
+    // the three PSS variants -- each of which signs with a different digest or padding than the
+    // certificate announces. A certificate that lies about its own signature is refused by every
+    // verifier that checks, and by nothing here, so the refusal has to be at the writer.
+    let env = ironauth_env::Env::system();
+    let der = ironauth_jose::generate_rsa_pkcs1_der(env.entropy()).expect("generate");
+    for algorithm in [
+        JwsAlgorithm::Rs384,
+        JwsAlgorithm::Rs512,
+        JwsAlgorithm::Ps256,
+    ] {
+        let other = SigningKey::rsa_from_pkcs1_der(None, algorithm, &der).expect("load");
+        let mut spec = descriptor(&other);
+        spec.key = &other;
+        assert_eq!(
+            metadata::entity_descriptor(&spec),
+            Err(MetadataError::UnsupportedKey),
+            "{algorithm:?} produced a certificate announcing a different algorithm"
+        );
+    }
+}
+
+#[test]
+fn the_validity_uses_the_form_rfc_5280_requires_for_its_year() {
+    // RFC 5280 4.1.2.5 IS A MUST: `UTCTime` through 2049, `GeneralizedTime` after. An earlier
+    // version wrote `GeneralizedTime` always and justified it by what readers accept, which is
+    // not what the rule is about -- every certificate this produced was non-conforming for the
+    // next twenty-three years.
+    let key = signing_key();
+
+    // 2026: both bounds inside the UTCTime range.
+    let document = metadata::entity_descriptor(&descriptor(&key)).expect("build");
+    let der = certificate_der(&document);
+    assert_eq!(validity_tags(&der), (0x17, 0x17), "a pre-2050 date was not UTCTime");
+
+    // A WINDOW THAT CROSSES THE BOUNDARY takes one form each, which is the case a single-form
+    // encoder cannot produce and the one the rule exists for.
+    let mut spec = descriptor(&key);
+    spec.not_before_unix_secs = 2_524_608_000; // 2050-01-01
+    spec.not_after_unix_secs = 2_556_144_000; // 2051-01-01
+    let der = certificate_der(&metadata::entity_descriptor(&spec).expect("build"));
+    assert_eq!(
+        validity_tags(&der),
+        (0x18, 0x18),
+        "a post-2049 date was not GeneralizedTime"
+    );
+}
+
+/// The two tag bytes of a certificate's `Validity` pair.
+#[test]
+fn the_document_is_well_formed_xml() {
+    // NOTHING HERE PARSED THE DOCUMENT AS XML. Every other test in this file reads it with
+    // `split`, which is happy with a document no parser would accept: an unbalanced element, a
+    // stray `&`, a duplicate attribute. An identity provider parses it, so this suite has to --
+    // and with a parser the WRITER does not go through, which is why `quick-xml` is a dev
+    // dependency here rather than the crate's own reader.
+    let key = signing_key();
+    let document = metadata::entity_descriptor(&descriptor(&key)).expect("a document");
+
+    let mut reader = quick_xml::reader::Reader::from_str(&document);
+    // THE RULE THAT MAKES A START TAG AND ITS END TAG ONE THING, without which an unbalanced
+    // document parses cleanly and this test asserts nothing.
+    reader.config_mut().check_end_names = true;
+    let mut depth: i64 = 0;
+    let mut elements = 0_u32;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(_)) => {
+                depth += 1;
+                elements += 1;
+            }
+            Ok(quick_xml::events::Event::Empty(_)) => elements += 1,
+            Ok(quick_xml::events::Event::End(_)) => depth -= 1,
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => panic!("the metadata document is not well-formed XML: {error}"),
+        }
+    }
+    assert_eq!(depth, 0, "the document closes at a depth other than zero");
+    // AND IT IS NOT A DOCUMENT THAT PARSED BECAUSE IT WAS EMPTY, which is the degenerate input
+    // every assertion above is satisfied by.
+    assert!(elements >= 5, "only {elements} elements parsed");
+}
+
+#[test]
+fn a_value_carrying_xml_syntax_does_not_escape_its_attribute() {
+    // THE ESCAPING, MEASURED BY A PARSER RATHER THAN BY A SUBSTRING. An entity id closing its own
+    // attribute and opening an element is the injection this writer's escaping exists to stop,
+    // and a `contains` check cannot tell "escaped" from "absent".
+    let key = signing_key();
+    let hostile = r#"https://x/"><evil a="1"/><!--"#;
+    let mut descriptor = descriptor(&key);
+    descriptor.entity_id = hostile;
+    let document = metadata::entity_descriptor(&descriptor).expect("a document");
+
+    let mut reader = quick_xml::reader::Reader::from_str(&document);
+    reader.config_mut().check_end_names = true;
+    let mut names = Vec::new();
+    let mut entity_ids = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(tag) | quick_xml::events::Event::Empty(tag)) => {
+                names.push(String::from_utf8_lossy(tag.name().as_ref()).into_owned());
+                for attribute in tag.attributes() {
+                    let attribute = attribute.expect("a well-formed attribute");
+                    if attribute.key.as_ref() == b"entityID" {
+                        // `normalized_value` RATHER THAN THE DEPRECATED `unescape_value`, and
+                        // it is also the righter one: XML 1.0 3.3.3 attribute-value
+                        // normalization is what an identity provider's parser applies, so this
+                        // compares against the string the far side actually sees.
+                        entity_ids.push(
+                            attribute
+                                .normalized_value(quick_xml::XmlVersion::Explicit1_0)
+                                .expect("escaped")
+                                .into_owned(),
+                        );
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => panic!("the document is not well-formed with a hostile value: {error}"),
+        }
+    }
+    assert!(
+        !names.iter().any(|name| name == "evil"),
+        "a value opened an element: {names:?}"
+    );
+    // AND THE VALUE SURVIVES INTACT, which is the other half: escaping that mangles the entity id
+    // produces a document an identity provider accepts and then cannot match.
+    assert_eq!(entity_ids, vec![hostile.to_owned()]);
+}
+
+fn validity_tags(der: &[u8]) -> (u8, u8) {
+    let mut outer = ironauth_der::Der::new(der);
+    let mut certificate = outer.take_sequence().expect("a certificate");
+    let mut tbs = certificate.take_sequence().expect("the TBS");
+    // version [0], serial, signature, issuer, validity
+    for _ in 0..4 {
+        tbs.take_element().expect("a TBS field");
+    }
+    let mut validity = tbs.take_sequence().expect("the validity");
+    let (before, _, _) = validity.take_element().expect("notBefore");
+    let (after, _, _) = validity.take_element().expect("notAfter");
+    (before, after)
+}

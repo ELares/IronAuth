@@ -343,7 +343,6 @@ impl SigningKey {
         key.map_err(SigningKeyError::from)
     }
 
-    /// The public projection of this key as normalized components.
     /// The `RSAPublicKey` DER of an RSA key: `SEQUENCE { modulus INTEGER, exponent INTEGER }`.
     ///
     /// EXACTLY WHAT A `SubjectPublicKeyInfo` WRAPS, which is why this is the shape returned

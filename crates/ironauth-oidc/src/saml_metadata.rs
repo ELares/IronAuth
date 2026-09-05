@@ -27,7 +27,7 @@ use axum::response::{IntoResponse as _, Response};
 use ironauth_saml::metadata::{self, Descriptor};
 use ironauth_store::SamlConnectionId;
 
-use crate::saml_start::signing_key_for;
+use crate::saml_start::{KeyUnavailable, signing_key_for};
 use crate::state::OidcState;
 use crate::wellknown::parse_scope;
 
@@ -64,16 +64,25 @@ pub async fn metadata_get(
         Ok(None) => return not_found(),
         Err(_) => return server_error(),
     };
-    // THE SAME LOADER THE SIGNING PATH USES, which is what makes the published key the signing
-    // key rather than a second answer to the same question. A separate read here could drift --
-    // a different ordering, a different view of "active" -- and the failure would be a metadata
-    // document that verifies nothing, diagnosed as a signature problem.
-    let key = match signing_key_for(&read, &connection_id).await {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    let Ok(Some(stored)) = read.saml_connections().active_sp_key(&connection_id).await else {
-        return server_error();
+    // ONE READ, WHICH IS WHAT THE PARAGRAPH ABOVE CLAIMED AND THE CODE DID NOT DO. An earlier
+    // version called the shared loader and then read the row AGAIN for its creation instant --
+    // two reads in two transactions, so a rotation landing between them would publish one key's
+    // certificate with the other key's validity window, which is exactly the drift the shared
+    // loader exists to prevent. The loader now hands back the row it used.
+    let (key, stored) = match signing_key_for(&read, &connection_id).await {
+        Ok(loaded) => loaded,
+        // THE SENTENCES ARE THIS ROUTE'S OWN, and an earlier version had none: it surfaced the
+        // start route's rendered page, so fetching metadata for a keyless connection answered
+        // "Sign-in unavailable" and advised uploading the very document being fetched. There is
+        // no metadata to publish without a key, because the certificate IS the metadata's point.
+        Err(KeyUnavailable::NotProvisioned) => {
+            return refused(
+                StatusCode::CONFLICT,
+                "this connection has no signing key yet, so there is no certificate to publish; \
+                 provision one and fetch this document again",
+            );
+        }
+        Err(KeyUnavailable::Unusable) => return server_error(),
     };
 
     let not_before = stored.created_at_unix_micros / 1_000_000;
@@ -99,10 +108,12 @@ pub async fn metadata_get(
         }
     };
 
-    // `application/samlmetadata+xml` IS THE REGISTERED TYPE (OASIS Metadata 4.1), and it is what
-    // makes a browser offer to save the document rather than try to render it -- which is what an
-    // operator wants, because the next step is uploading the file. A provider fetching it
-    // programmatically accepts either.
+    // `application/samlmetadata+xml` IS THE TYPE OASIS REGISTERED WITH IANA FOR SAML METADATA,
+    // and it is what makes a browser offer to save the document rather than try to render it --
+    // which is what an operator wants, because the next step is uploading the file. A provider
+    // fetching it programmatically accepts either. AN EARLIER VERSION OF THIS COMMENT ATTACHED A
+    // SECTION NUMBER TO THE CLAIM and the section it named says something else; the registration
+    // is the citable fact, so it is the one stated.
     (
         StatusCode::OK,
         [
@@ -110,11 +121,15 @@ pub async fn metadata_get(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/samlmetadata+xml"),
             ),
-            // CACHEABLE, briefly, unlike everything else in this crate. The document changes only
-            // when the connection or its key does, it contains no secret, and an identity
-            // provider that refreshes metadata on a schedule should not be re-signing a
-            // certificate on every poll. Five minutes is short enough that a rotation propagates
-            // within one refresh cycle of every provider that honours it.
+            // CACHEABLE, briefly, which JWKS in this crate already is -- an earlier version of
+            // this comment claimed the endpoint was alone in that and it is not; `jwks` serves
+            // `public, max-age=3600`. The document changes only when the connection or its key
+            // does, it contains no secret, and an identity provider that refreshes metadata on a
+            // schedule should not be re-signing a certificate on every poll. FIVE MINUTES RATHER
+            // THAN THE HOUR JWKS USES, because a JWKS rotation is designed to overlap -- both
+            // keys are published while the old one drains -- and a metadata certificate is not:
+            // the operator uploads one file, so a stale answer is one an identity provider will
+            // trust until its next refresh.
             (
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("public, max-age=300"),
