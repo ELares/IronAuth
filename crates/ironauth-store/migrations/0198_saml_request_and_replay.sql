@@ -157,6 +157,11 @@ CREATE POLICY saml_assertion_replay_scope ON saml_assertion_replay
 -- request that is using it.
 --
 -- NO DELETE either, for the same reason as the table above: the sweep does not exist yet, and its
--- grant belongs with it. An expired row still refuses nothing it should admit -- the check reads
--- `expires_at` -- so what is missing is reclamation, not correctness.
+-- grant belongs with it.
+--
+-- AND THE CHECK DOES NOT READ `expires_at`. An earlier version of this line said it did, which
+-- contradicts the column's own note forty lines up: the check is the PRIMARY KEY, so an assertion
+-- is refused for as long as its row exists, and with no sweep that is for ever. Strictly safer
+-- than the window the column describes, and not what the column's name suggests, which is why
+-- both places now say so.
 GRANT SELECT, INSERT ON saml_assertion_replay TO ironauth_app;

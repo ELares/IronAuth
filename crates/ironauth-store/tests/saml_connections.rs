@@ -344,6 +344,9 @@ async fn the_assertion_consumer_resolves_by_connection_and_an_operator_switch_st
     let one = connect(&db, &env, scope, &globex, "https://idp.example/entity").await;
     let two = connect(&db, &env, scope, &initech, "https://idp.example/entity").await;
     assert_ne!(one, two);
+    // A PIN, so the assertion at the end that switching off keeps them is not satisfied by there
+    // being none.
+    pin(&db, &env, scope, &one, 3).await.expect("pin a key");
     let store = db.store().scoped(scope);
 
     let first = store
@@ -420,8 +423,42 @@ async fn the_assertion_consumer_resolves_by_connection_and_an_operator_switch_st
     .await
     .expect("the switch wrote an audit row");
     assert_eq!(
-        action, "saml_connection.active_changed",
+        action, "saml_connection.disabled",
         "switching a connection off is byte-identical in the trail to deleting it"
+    );
+
+    // AND SWITCHING BACK ON IS A DIFFERENT ACTION. One action for both directions would make
+    // "somebody turned this identity provider back on" indistinguishable from "somebody turned it
+    // off" in the trail, which is the question an incident review asks first.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .saml_connections()
+        .set_active(&env, &one, true, None)
+        .await
+        .expect("switch the connection back on");
+    let action: String = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE target_id = $1 ORDER BY occurred_at DESC, action \
+         LIMIT 1",
+    )
+    .bind(one.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the switch wrote an audit row");
+    assert_eq!(action, "saml_connection.enabled");
+
+    // AND THE PINS SURVIVED IT, which is the whole reason the switch is not a deletion and was
+    // asserted only in a comment before.
+    let pins = store
+        .saml_connections()
+        .certificates(&one)
+        .await
+        .expect("read the pins");
+    assert_eq!(
+        pins.len(),
+        1,
+        "switching a connection off and on lost its trust anchors, so recovering from an incident \
+         means re-pinning every key: {pins:?}"
     );
 }
 
@@ -609,9 +646,12 @@ async fn deleting_a_connection_takes_its_trust_anchors_with_it() {
 
 #[tokio::test]
 async fn one_organization_cannot_pin_two_connections_to_one_identity_provider() {
-    // The ACS resolves a response by its `Issuer`. Two connections in one organization naming one
-    // identity provider would make "which connection asserted this" ambiguous at exactly the
-    // moment the answer decides which trust anchors apply.
+    // NOT BECAUSE THE ACS WOULD BE AMBIGUOUS -- it resolves a response by the URL it arrived at,
+    // so two connections naming one identity provider are told apart the same way any two are.
+    // The reason is an operator's: two connections in one organization for one identity provider
+    // are two sets of trust anchors for one relationship, and every question about it -- which
+    // keys are current, which to revoke, why a sign-in failed -- then has two answers with no way
+    // to tell which is in play.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -760,9 +800,8 @@ async fn a_key_the_verifier_could_not_be_handed_cannot_be_written() {
         .await,
         "a P-256 point of the wrong length",
     );
-    // AN RSA MODULUS AT A SIZE NO VERIFIER ACCEPTS. 1024 bits is inside any plausible range bound
-    // and is not one of the three sizes `ring` will verify, which is why the constraint names the
-    // sizes rather than a range.
+    // AN RSA MODULUS BELOW `ring`'S FLOOR. 1024 bits: the first version of this constraint
+    // admitted it, and the key would have stored and then failed at every signature.
     assert_refused_by_a_constraint(
         &attempt(
             SamlKeyKind::Rsa,
@@ -773,7 +812,21 @@ async fn a_key_the_verifier_could_not_be_handed_cannot_be_written() {
             valid_to,
         )
         .await,
-        "an RSA modulus at a size ring cannot verify",
+        "an RSA modulus below ring's 2048-bit floor",
+    );
+    // AND ABOVE ITS CEILING. 8192 bits is the largest `RSA_PKCS1_2048_8192_*` accepts, so one
+    // byte past it is a key no signature can be checked against.
+    assert_refused_by_a_constraint(
+        &attempt(
+            SamlKeyKind::Rsa,
+            vec![0x01; 1025],
+            Some(vec![0x01, 0x00, 0x01]),
+            14,
+            valid_from,
+            valid_to,
+        )
+        .await,
+        "an RSA modulus above ring's 8192-bit ceiling",
     );
     // A VALIDITY WINDOW NO CLOCK IS INSIDE.
     assert_refused_by_a_constraint(
@@ -788,6 +841,59 @@ async fn a_key_the_verifier_could_not_be_handed_cannot_be_written() {
         .await,
         "a certificate whose validity ends before it starts",
     );
+}
+
+#[tokio::test]
+async fn every_rsa_size_ring_verifies_is_accepted() {
+    // WHY THIS EXISTS. A bound that refuses valid input is worse than a loose one, because the
+    // loose one fails visibly at the first signature while this one fails at CONFIGURATION, with
+    // an identity provider an operator cannot connect at all and no explanation but a constraint
+    // name.
+    //
+    // A version of this constraint named 256, 384 and 512 as "the three sizes ring will verify".
+    // It is a range, 2048 to 8192 bits, and a customer on a 8192-bit key would have been locked
+    // out. Only 2048 was ever written by a test, so narrowing it back would have gone unnoticed.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/entity").await;
+    let now = now_micros(&env);
+    let acting = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+
+    // The floor, a size in between that no enumeration would have listed, and the ceiling.
+    for (n, bytes) in [256_usize, 640, 1024].into_iter().enumerate() {
+        let seed = u8::try_from(n).expect("small") + 40;
+        let id = SamlCertificateId::generate(&env, &scope);
+        acting
+            .saml_connections()
+            .pin_certificate(
+                &env,
+                NewSamlCertificate {
+                    id: &id,
+                    connection_id: &connection,
+                    key_kind: SamlKeyKind::Rsa,
+                    public_key: &vec![seed; bytes],
+                    rsa_exponent: Some(&[0x01, 0x00, 0x01]),
+                    certificate_der: &[0x30, 0x82, seed],
+                    fingerprint_sha256: &fingerprint(seed),
+                    not_before_unix_micros: now - 1_000_000,
+                    not_after_unix_micros: now + 86_400_000_000,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a {}-bit RSA key, which ring verifies, could not be pinned: {error:?}",
+                    bytes * 8
+                )
+            });
+    }
 }
 
 #[tokio::test]

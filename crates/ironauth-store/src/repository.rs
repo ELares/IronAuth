@@ -76355,10 +76355,10 @@ impl ActingSamlConnectionRepo<'_> {
 
     /// Turn a connection on or off without deleting it.
     ///
-    /// # Why this exists in the same slice as the issuer lookup
+    /// # Why this exists in the same slice as the lookup
     ///
-    /// [`SamlConnectionRepo::active_by_issuer`] filters on `active`, and a column a query reads
-    /// that nothing can write is a filter that can never be false: the switch would be a comment.
+    /// [`SamlConnectionRepo::find_active`] filters on `active`, and a column a query reads that
+    /// nothing can write is a filter that can never be false: the switch would be a comment.
     ///
     /// # Why it is not a deletion
     ///
@@ -76389,11 +76389,17 @@ impl ActingSamlConnectionRepo<'_> {
                 scope,
                 acting: &self.acting,
                 env,
-                // ITS OWN ACTION, because the same action as a deletion would make "switched
-                // off" byte-identical to "removed" in the trail -- and only the second lost its
-                // trust anchors. The first version of this wrote exactly that while a comment
-                // beside it explained why it would be wrong.
-                action: Action::SamlConnectionActiveChanged,
+                // ONE ACTION PER DIRECTION. The same action as a deletion would make "switched
+                // off" byte-identical to "removed" -- and only the second lost its trust anchors.
+                // A single action for the switch would make "turned back on" byte-identical to
+                // "turned off", which is the first question an incident review asks. The first
+                // version wrote the deletion action while a comment beside it explained why that
+                // would be wrong; the second collapsed both directions into one.
+                action: if active {
+                    Action::SamlConnectionEnabled
+                } else {
+                    Action::SamlConnectionDisabled
+                },
                 target: &id,
             },
             async |tx| {

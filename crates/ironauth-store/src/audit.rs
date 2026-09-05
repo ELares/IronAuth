@@ -1365,13 +1365,19 @@ pub enum Action {
     SamlConnectionCreated,
     /// An inbound SAML connection was deleted (issue #139).
     SamlConnectionDeleted,
-    /// An inbound SAML connection was switched on or off (issue #139).
+    /// An inbound SAML connection was switched ON (issue #139).
     ///
-    /// DISTINCT FROM A DELETION, and the difference is what an operator reading the log needs: a
-    /// switched-off connection keeps its pins and comes back by being switched on, where a
-    /// deleted one took its trust anchors with it and coming back means re-pinning every key.
-    /// Writing the deletion action for a switch would make the two byte-identical in the trail.
-    SamlConnectionActiveChanged,
+    /// # One action per DIRECTION, not one for the switch
+    ///
+    /// A single `active_changed` would make "somebody turned this identity provider back on"
+    /// indistinguishable from "somebody turned it off" without decoding a detail field, and which
+    /// of those happened is the first question an incident review asks.
+    ///
+    /// Both are distinct from a DELETION: a switched-off connection keeps its pins and comes back
+    /// by being switched on, where a deleted one took its trust anchors with it.
+    SamlConnectionEnabled,
+    /// An inbound SAML connection was switched OFF (issue #139).
+    SamlConnectionDisabled,
     /// A signing key was pinned to an inbound SAML connection (issue #139).
     ///
     /// THE TRUST DECISION. After this, an assertion carrying a signature from this key is
@@ -1895,7 +1901,8 @@ impl Action {
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
             Action::SamlConnectionCreated => "saml_connection.created",
             Action::SamlConnectionDeleted => "saml_connection.deleted",
-            Action::SamlConnectionActiveChanged => "saml_connection.active_changed",
+            Action::SamlConnectionEnabled => "saml_connection.enabled",
+            Action::SamlConnectionDisabled => "saml_connection.disabled",
             Action::SamlCertificatePinned => "saml_certificate.pinned",
             Action::SamlCertificateUnpinned => "saml_certificate.unpinned",
             Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",

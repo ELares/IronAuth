@@ -71,11 +71,21 @@ CREATE TABLE saml_connection_certificates (
         CHECK (
             (key_kind = 'ecdsa_p256' AND octet_length(public_key) = 65)
             OR (key_kind = 'ecdsa_p384' AND octet_length(public_key) = 97)
-            -- RSA AT THE THREE SIZES `ring` WILL VERIFY: 2048, 3072 and 4096 bits. A range
-            -- admits lengths no verifier accepts, which is the exact failure this constraint
-            -- exists to prevent -- the key stores, and the refusal arrives at somebody's sign-in
-            -- as "the signature did not verify", which is the answer a forgery gets.
-            OR (key_kind = 'rsa' AND octet_length(public_key) IN (256, 384, 512))
+            -- RSA IN THE RANGE `ring` VERIFIES, which is 2048 to 8192 bits: the algorithms this
+            -- system uses are `RSA_PKCS1_2048_8192_SHA{256,384,512}` (ironauth-jose's
+            -- `xmldsig.rs`), so the modulus is 256 to 1024 bytes.
+            --
+            -- THE FLOOR IS THE POINT, and the first version had it at 128 bytes -- 1024 bits,
+            -- which `ring` refuses. A key stored there is one the verifier will not accept, and
+            -- the refusal arrives at somebody's sign-in as "the signature did not verify", which
+            -- is the answer a forgery gets.
+            --
+            -- A RANGE AND NOT AN ENUMERATION. A version of this named 256, 384 and 512 as "the
+            -- three sizes ring will verify", which is false: 5120, 6144 and 8192-bit keys verify
+            -- too, and an identity provider using one would have been unable to configure a
+            -- connection at all. A bound that refuses valid input is worse than a loose one,
+            -- because the loose one fails visibly at the first signature.
+            OR (key_kind = 'rsa' AND octet_length(public_key) BETWEEN 256 AND 1024)
         ),
     CONSTRAINT saml_connection_certificates_fingerprint_length
         CHECK (octet_length(fingerprint_sha256) = 32),

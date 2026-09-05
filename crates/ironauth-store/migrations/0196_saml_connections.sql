@@ -126,9 +126,16 @@ CREATE TABLE saml_connections (
     CONSTRAINT saml_connections_attribute_mapping_object
         CHECK (jsonb_typeof(attribute_mapping) = 'object'),
 
-    -- ONE CONNECTION PER IDENTITY PROVIDER PER ORGANIZATION. Two connections in one organization
-    -- pinning the same `idp_entity_id` would make "which connection asserted this" ambiguous at
-    -- the ACS, and the ACS resolves a response by its `Issuer`.
+    -- ONE CONNECTION PER IDENTITY PROVIDER PER ORGANIZATION, and NOT because the ACS would
+    -- otherwise be ambiguous -- it would not, since a response is resolved by the URL it arrived
+    -- at. An earlier version of this comment gave that reason, and the same commit that made the
+    -- ACS resolve by connection left it standing.
+    --
+    -- The reason it still has is an operator's. Two connections in one organization naming one
+    -- identity provider are two sets of trust anchors for one relationship, and every question
+    -- about that relationship -- which keys are current, which to revoke, why a sign-in failed --
+    -- then has two answers and no way to tell which one is in play. It is a configuration nobody
+    -- means to create, and the storage engine refusing it is how they find out at once.
     CONSTRAINT saml_connections_one_per_idp
         UNIQUE (tenant_id, environment_id, organization_id, idp_entity_id),
 
@@ -170,7 +177,7 @@ CREATE POLICY saml_connections_scope ON saml_connections
 --
 -- UPDATE IS COLUMN SCOPED, and to the two columns the one UPDATE statement writes.
 --
--- `set_active` is the operator's switch, and it exists in this slice because the ACS's issuer
+-- `set_active` is the operator's switch, and it exists in this slice because the ACS's connection
 -- lookup FILTERS ON `active`: a column a query reads and nothing can write is a filter that can
 -- never be false, which is a defence in the shape of a comment. The switch and the filter arrive
 -- together or neither should.
@@ -182,6 +189,7 @@ CREATE POLICY saml_connections_scope ON saml_connections
 GRANT SELECT, INSERT, DELETE ON saml_connections TO ironauth_control;
 GRANT UPDATE (active, updated_at) ON saml_connections TO ironauth_control;
 
--- The DATA plane READS. The ACS runs there: it resolves the connection by issuer, reads the
--- pinned keys, and validates. It writes nothing here.
+-- The DATA plane READS. The ACS runs there: it resolves the connection from the URL the response
+-- arrived at, reads the pinned keys, checks the `Issuer` against the row, and validates. It writes
+-- nothing here.
 GRANT SELECT ON saml_connections TO ironauth_app;
