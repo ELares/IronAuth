@@ -1600,3 +1600,50 @@ fn a_response_and_its_assertion_can_both_be_signed() {
         );
     }
 }
+
+#[test]
+fn the_signed_elements_own_name_answers_on_both_axes() {
+    // `VerifiedAssertion::is` EXISTS BECAUSE `name()` HANDS BACK A SPELLING. A caller that tested
+    // the qualified name was testing a prefix, which is the bypass this file's own wrapping tests
+    // are about, one layer up: the condition layer's assertion gate was
+    // `name().ends_with("Assertion")`.
+    //
+    // Both axes are asserted here rather than only through that gate, because the gate asks one
+    // fixed question -- is this `{SAML}Assertion` -- and a version of `is` that ignored its
+    // `local` argument entirely would answer it correctly every time while being wrong for every
+    // other caller.
+    let key = XmlTestKey::generate();
+    let document = ironauth_saml::test_util::signed_element_with(
+        &key,
+        "evil:Assertion",
+        r#" xmlns:evil="urn:evil""#,
+        "_assertion",
+        "<evil:Subject/>",
+    );
+    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
+    let signed = verify(
+        document.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        "urn:evil",
+        "Assertion",
+    )
+    .expect("the fixture must verify, or this test measures nothing");
+
+    assert!(
+        signed.is("urn:evil", "Assertion"),
+        "the element did not answer to its own resolved name"
+    );
+    // THE NAMESPACE AXIS: the same local name under the namespace this crate actually trusts.
+    assert!(
+        !signed.is(ironauth_saml::ASSERTION_NS, "Assertion"),
+        "an element in a namespace nobody trusts answered to the SAML assertion namespace"
+    );
+    // THE LOCAL-NAME AXIS: the right namespace, a name it does not have.
+    assert!(
+        !signed.is("urn:evil", "Response"),
+        "the element answered to a local name that is not its own"
+    );
+    // AND THE SPELLING IS NOT THE IDENTITY, which is the whole point:
+    assert_eq!(signed.name(), "evil:Assertion");
+}

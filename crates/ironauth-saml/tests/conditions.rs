@@ -971,4 +971,29 @@ fn a_signed_element_that_is_not_an_assertion_is_refused_by_name_not_by_spelling(
         matches!(refused, Err(ConditionError::Malformed)),
         "an element that merely ends with \"Assertion\" was read as one: {refused:?}"
     );
+
+    // AND THE OTHER HALF: an element whose LOCAL NAME really is `Assertion`, in a namespace
+    // nobody trusts. A gate that compared only the local name -- which is the mistake this
+    // crate's wrapping defence already made once, one layer down -- refuses the case above and
+    // admits this one. Both halves are needed because either check alone catches only one.
+    let masquerade = ironauth_saml::test_util::signed_element_with(
+        &key,
+        "evil:Assertion",
+        r#" xmlns:evil="urn:evil""#,
+        "_assertion",
+        &Body::default().xml(),
+    );
+    let signed = verify(
+        masquerade.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        "urn:evil",
+        "Assertion",
+    )
+    .expect("the fixture must verify, or this test measures nothing");
+    let refused = check(&signed, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "an `Assertion` in a namespace nobody trusts was read as a SAML one: {refused:?}"
+    );
 }
