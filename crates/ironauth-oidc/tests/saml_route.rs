@@ -287,10 +287,14 @@ fn header_shape(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
-async fn a_signed_response_is_accepted_and_signs_nobody_in() {
-    // WHAT THIS BUILD DOES, exactly: a correctly signed, in-audience, in-window response is
-    // consumed and answered, and no session is minted. The second half is not an omission being
-    // papered over -- it is asserted, so that adding sign-in has to come here and say so.
+async fn a_signed_response_is_accepted_and_signs_somebody_in() {
+    // ADDING SIGN-IN HAD TO COME HERE AND SAY SO, which is what the previous version of this
+    // test asked for: it asserted that no session was minted, "so that adding sign-in has to
+    // come here and say so". This is that. A correctly signed, in-audience, in-window response
+    // is consumed and now answers with a session cookie and a redirect.
+    //
+    // WHO IT SIGNS IN, and whether a second provider can name the same person, is
+    // `saml_signin`'s suite. What is asserted here is only that the TRANSPORT reached it.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
 
@@ -305,45 +309,32 @@ async fn a_signed_response_is_accepted_and_signs_nobody_in() {
         .post_form(&wired.path, &form(&response, None), None)
         .await;
 
-    assert_eq!(status, 200, "{body}");
-    // PINNED ON A SENTENCE ONLY THE ACCEPTED PAGE CARRIES. An earlier version asserted
-    // `contains("accepted")`, which the refusal page satisfied through its own negation
-    // ("This response was not accepted"), so replacing the success page with a refusal left the
-    // suite green -- on the page the module doc calls this change's deliverable.
+    assert_eq!(status, 303, "{body}");
     assert!(
-        body.contains("This connection is configured correctly"),
-        "the accepted page is not the accepted page: {body}"
-    );
-    assert!(!body.contains("refused"), "{body}");
-    assert_eq!(
         headers
             .get_all(axum::http::header::SET_COOKIE)
             .iter()
-            .count(),
-        0,
-        "the assertion consumer minted a session: {body}"
+            .any(|value| String::from_utf8_lossy(value.as_bytes()).contains("ironauth_session")),
+        "the assertion consumer minted no session: {body}"
     );
     assert!(
-        headers.get(axum::http::header::LOCATION).is_none(),
-        "an accepted response redirected somewhere"
-    );
-    assert_eq!(
-        headers
-            .get(axum::http::header::CACHE_CONTROL)
-            .map(|value| value.to_str().unwrap_or_default()),
-        Some("no-store"),
-        "a page about a signed assertion was cacheable"
+        headers.get(axum::http::header::LOCATION).is_some(),
+        "an accepted response did not redirect"
     );
 }
 
 #[tokio::test]
-async fn a_recorded_relay_state_does_not_become_a_redirect_either() {
+async fn only_the_recorded_relay_state_becomes_a_redirect_and_never_the_posted_one() {
     // THE SOLICITED PATH, which no test in the first version of this file reached -- every
     // fixture was unsolicited, so `Consumed::relay_state` was `None` everywhere and a build
     // redirecting to the POSTED field would have passed the test that claimed to forbid it.
     //
-    // HERE THERE IS A RECORDED RELAYSTATE AND A POSTED ONE, and they differ. Neither may become
-    // a `Location` on this build, and when sign-in lands only the recorded one may.
+    // HERE THERE IS A RECORDED RELAYSTATE AND A POSTED ONE, and they differ. THE PREVIOUS
+    // VERSION OF THIS TEST FORBADE BOTH, because this build minted no session and so redirected
+    // nowhere, and its own comment said "when sign-in lands only the recorded one may". Sign-in
+    // has landed, so that is now the assertion: the `Location` is the value THIS DEPLOYMENT
+    // recorded when it issued the request, and the posted field reaches nothing. Taking the
+    // posted one would be an open redirect with extra steps.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
     let env = harness.env().clone();
@@ -377,7 +368,7 @@ async fn a_recorded_relay_state_does_not_become_a_redirect_either() {
         )
         .await;
 
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 303, "{body}");
 
     // THE FIXTURE REALLY WAS SOLICITED, which nothing measured: `wire` sets
     // `allow_unsolicited: true`, so a response whose `InResponseTo` went unread would be
@@ -395,18 +386,21 @@ async fn a_recorded_relay_state_does_not_become_a_redirect_either() {
         "the response did not spend the request it named, so it was treated as unsolicited: \
          {spent:?}"
     );
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .expect("an accepted response redirects");
     assert!(
-        headers.get(axum::http::header::LOCATION).is_none(),
-        "a RelayState became a redirect: {:?}",
-        headers.get(axum::http::header::LOCATION)
+        location.contains("cli_recorded"),
+        "the redirect is not the RelayState this deployment recorded: {location}"
+    );
+    assert!(
+        !location.contains("evil.example"),
+        "the POSTED RelayState became the redirect: {location}"
     );
     assert!(
         !body.contains("evil.example"),
         "the posted value was echoed: {body}"
-    );
-    assert!(
-        !body.contains("cli_recorded"),
-        "the recorded value was echoed: {body}"
     );
 }
 
@@ -427,7 +421,7 @@ async fn the_same_response_cannot_be_posted_twice() {
     let (first, _, body) = harness
         .post_form(&wired.path, &form(&response, None), None)
         .await;
-    assert_eq!(first, 200, "{body}");
+    assert_eq!(first, 303, "{body}");
 
     let (second, _, body) = harness
         .post_form(&wired.path, &form(&response, None), None)
@@ -485,7 +479,7 @@ async fn a_response_for_another_connection_is_refused_at_the_url_it_was_posted_t
     let (status, _, body) = harness
         .post_form(&first.path, &form(&for_first, None), None)
         .await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 303, "{body}");
 }
 
 #[tokio::test]
@@ -703,7 +697,7 @@ async fn a_line_wrapped_field_is_decoded_and_a_url_safe_one_is_not() {
             None,
         )
         .await;
-    assert_eq!(status, 200, "a line-wrapped field was not decoded: {body}");
+    assert_eq!(status, 303, "a line-wrapped field was not decoded: {body}");
 
     // AND A SPACE IS NOT STRIPPED, which is the other half of the same decision.
     // `application/x-www-form-urlencoded` turns `+` into a space, and `+` is base64 character

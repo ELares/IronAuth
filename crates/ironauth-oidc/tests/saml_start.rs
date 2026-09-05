@@ -352,7 +352,7 @@ async fn a_started_flow_is_answerable_at_the_acs_that_refuses_unsolicited_respon
         )
         .await;
     assert_eq!(
-        status, 200,
+        status, 303,
         "a response answering a request this deployment issued was refused: {body}"
     );
 

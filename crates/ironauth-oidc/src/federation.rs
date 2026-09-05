@@ -1990,7 +1990,7 @@ pub fn federated_external_id(issuer: &str, subject: &str) -> String {
 /// assembled trait document without depending on `ironauth-store`. It maps the store's
 /// per-field [`ironauth_store::ValidationFailure`]s (RFC 6901 pointer + operator-safe
 /// message, never a claim value) into the evaluator's [`TraitPointerFailure`].
-struct StoreTraitSchema<'a>(&'a TraitSchema);
+pub(crate) struct StoreTraitSchema<'a>(pub(crate) &'a TraitSchema);
 
 impl TraitSchemaView for StoreTraitSchema<'_> {
     fn type_check(&self, document: &serde_json::Value) -> Vec<TraitPointerFailure> {
@@ -2023,7 +2023,7 @@ impl TraitSchemaView for StoreTraitSchema<'_> {
 // One provisioning entry point threading the identity, mapped traits, schema version,
 // and org binding; bundling them would only obscure the single create-or-update flow.
 #[allow(clippy::too_many_arguments)]
-async fn provision_federated_user(
+pub(crate) async fn provision_federated_user(
     state: &OidcState,
     scope: Scope,
     connector_slug: &str,

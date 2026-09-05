@@ -26,12 +26,14 @@
 //! It also means the ACS URL an operator pastes into Okta is per connection, which is what SP
 //! metadata generation will emit, and what the `acs_url` column already holds.
 //!
-//! # This endpoint does not sign anybody in, and that is the point of this change
+//! # This endpoint signs somebody in, and it took four objections to earn the right
 //!
-//! An earlier version of this module did: it resolved the `NameID` through the email identifier
-//! seam and minted a session. Review took it apart on four independent grounds, and each one is
-//! worth writing down, because they are the shape of the work that comes next rather than
-//! details to patch.
+//! AN EARLIER VERSION OF THIS SECTION SAID THE OPPOSITE, and the sentence "this endpoint does
+//! not sign anybody in, and that is the point of this change" was true of the change it was
+//! written for. It is not true now: the handoff at the end of `acs_post` establishes a session.
+//! The four objections that took the FIRST attempt apart are kept below because each is a
+//! constraint the current one satisfies, and [`crate::saml_signin`] answers them one by one.
+//! Read them as the specification they became rather than as a list of reasons not to.
 //!
 //! 1. IT CROSSED ORGANIZATIONS. A `SamlConnection` carries an `organization_id`, and migration
 //!    0196 says why: "a trust anchor that reached two organizations would let one customer's
@@ -53,11 +55,13 @@
 //!    `AuthnRequest` yet, so no outstanding request can exist, so a solicited response is always
 //!    `UnknownRequest` and only `allow_unsolicited = true` could ever succeed.
 //!
-//! WHAT THIS SHIPS INSTEAD is the binding itself: a response arrives, is verified against the
-//! right connection, and is either consumed or refused with a typed reason. That is the surface
-//! #139 asks for when it says failures must "surface as typed connection-test failures ... so
-//! the test-connection flow can render actionable messages", and it is what an operator points
-//! Okta at to find out whether their certificate and audience are right.
+//! WHAT STILL BELONGS TO THIS MODULE is the binding itself: a response arrives, is verified
+//! against the right connection, and is either consumed or refused with a typed reason. That is
+//! the surface #139 asks for when it says failures must "surface as typed connection-test
+//! failures ... so the test-connection flow can render actionable messages", and it is what an
+//! operator points Okta at to find out whether their certificate and audience are right. What
+//! happens AFTER a response is consumed is `saml_signin`'s, and the split is the same one this
+//! section opens with: protocol, transport, then identity.
 //!
 //! # There is no CSRF check here, deliberately
 //!
@@ -156,6 +160,9 @@ pub struct AcsForm {
 pub async fn acs_post(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, connection)): Path<(String, String, String)>,
+    // THE HEADERS COME BEFORE THE FORM because axum consumes the body last: a body extractor
+    // has to be the final argument, and putting `HeaderMap` after it does not compile.
+    headers: axum::http::HeaderMap,
     Form(form): Form<AcsForm>,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
@@ -228,34 +235,10 @@ pub async fn acs_post(
         Err(error) => return refused_by(&error),
     };
 
-    // THE CONSUMED ASSERTION IS DROPPED, deliberately and visibly: nothing on this build reads
-    // the subject, the attributes or the recorded `RelayState`, so binding them to a name here
-    // would be a value a reader could mistake for one that matters.
-    drop(consumed);
-    accepted()
-}
-
-/// What an accepted response answers with.
-///
-/// NO SESSION, NO COOKIE, NO REDIRECT -- see the module doc for why that is this change's
-/// deliverable rather than a gap in it. The page is a constant: it does not name the subject,
-/// the connection, or anything at all about the document, because the party reading it is
-/// whoever posted, and nobody here has been authenticated as anyone. It takes no argument for
-/// the same reason -- there is nothing about the outcome it is allowed to vary on.
-fn accepted() -> Response {
-    use axum::response::IntoResponse;
-
-    (
-        StatusCode::OK,
-        no_store(),
-        axum::response::Html(
-            "<!doctype html><meta charset=\"utf-8\"><title>Response accepted</title>\
-             <p>This connection is configured correctly: the response verified against a \
-             pinned certificate and satisfied every condition.</p>\
-             <p>Signing in through SAML is not enabled on this build.</p>",
-        ),
-    )
-        .into_response()
+    // AND NOW SOMEBODY IS SIGNED IN, which is what the four paragraphs above were waiting for.
+    // The transport half ends here: which connection, which bytes, and whether they verified are
+    // this module's questions, and who the `NameID` names locally is `saml_signin`'s.
+    crate::saml_signin::sign_in(&state, scope, &connection, &consumed, &headers).await
 }
 
 /// The no-store headers every response THIS HANDLER BUILDS carries.

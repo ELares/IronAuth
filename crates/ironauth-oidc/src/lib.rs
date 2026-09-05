@@ -181,6 +181,7 @@ pub mod routing;
 pub mod saml_acs;
 pub mod saml_metadata;
 pub mod saml_route;
+pub mod saml_signin;
 pub mod saml_start;
 mod scope_claims;
 mod sector;
