@@ -20,6 +20,10 @@ quick-xml = { workspace = true }
 # crate owns the XML -- what a SignedInfo is, which transforms are allowed, how a subtree
 # canonicalises, every wrapping refusal -- and jose owns the two lines where bytes meet a key.
 ironauth-jose.workspace = true
+# THE OUTBOUND DIRECTION ONLY (issue #139). The HTTP-Redirect binding carries a base64 payload,
+# and this crate encodes one it built rather than decoding one it was given -- the inbound ACS
+# does its own decoding at the transport layer, before anything here sees a byte.
+base64.workspace = true
 # THE SHARED DER READER, for the ONE place this crate meets DER: a certificate an operator
 # uploads at the management surface. It is `ironauth-webauthn`'s former `src/der.rs`, moved out
 # rather than copied, because two DER readers in a codebase is two answers to what a certificate
@@ -30,6 +34,9 @@ ironauth-der.workspace = true
 # trybuild drives the compile-fail proof that a value cannot be read out of an
 # unverified document, which is the shape `ironauth-jose` uses for the same job.
 trybuild.workspace = true
+# THE ENTROPY SEAM, for generating the RSA key the AuthnRequest suite signs with. A dev
+# dependency because the crate itself never generates a key: it signs with one the caller loaded.
+ironauth-env.workspace = true
 
 [features]
 default = []

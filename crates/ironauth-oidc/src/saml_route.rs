@@ -69,9 +69,16 @@
 //! signature check, a set of conditions, and a one-time spend, and then a page. The moment this
 //! endpoint mints a session, that argument stops being sufficient on its own: the assertion-id
 //! replay cache stops one assertion being re-used, and it does not stop somebody auto-submitting
-//! a FRESH assertion for their OWN account into a victim's browser. The defence for that is
-//! the outstanding request -- which is why `AuthnRequest` issuance is the piece that has to land
-//! before sign-in does, and not after.
+//! a FRESH assertion for their OWN account into a victim's browser.
+//!
+//! THE OUTSTANDING REQUEST IS HALF OF THAT DEFENCE and an earlier version of this sentence
+//! called it the whole of it. The row proves a response answers a request this deployment issued
+//! and has not spent; it does not prove the browser presenting it is the one the request was
+//! issued to, and the start endpoint is unauthenticated, so an attacker can mint their own. The
+//! other half is a BROWSER BINDING -- a cookie carrying the request id or its digest, set when
+//! the request is issued and matched here -- which lands with sign-in, and which must be
+//! `SameSite=None; Secure`, because THIS endpoint is the cross-site POST and a `Lax` cookie
+//! would simply not arrive.
 
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;

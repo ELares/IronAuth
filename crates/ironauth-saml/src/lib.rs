@@ -208,6 +208,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attributes;
+pub mod authn_request;
 mod c14n;
 pub mod conditions;
 mod encrypted;
@@ -230,6 +231,7 @@ pub const ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 /// The SAML 2.0 protocol namespace, which `Response` and `AuthnRequest` are in.
 pub const PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub use attributes::{Attribute, Child, Statement, Unreadable, Value, attributes};
+pub use authn_request::{Redirect, Request, RequestError};
 pub use conditions::{Accepted, ConditionError, Expectations, check, correlation};
 pub use encrypted::{
     DecryptError, KeyTransport, KeyTransportAlg, OaepDigest, OaepMgf, OaepParameters,

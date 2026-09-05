@@ -43,7 +43,7 @@ crates/ironauth-store/src/repository.rs:assign_with_event:3
 crates/ironauth-store/src/repository.rs:ban_with_event:1
 crates/ironauth-store/src/repository.rs:bulk_revoke_with_events:1
 crates/ironauth-store/src/repository.rs:clear_default_with_event:1
-crates/ironauth-store/src/repository.rs:create:2
+crates/ironauth-store/src/repository.rs:create:3
 crates/ironauth-store/src/repository.rs:create_for_service_account_with_event:1
 crates/ironauth-store/src/repository.rs:create_version_at_with_event:1
 crates/ironauth-store/src/repository.rs:create_version_with_event:1
@@ -52,7 +52,7 @@ crates/ironauth-store/src/repository.rs:create_with_id_with_event:2
 crates/ironauth-store/src/repository.rs:create_with_user_inner:1
 crates/ironauth-store/src/repository.rs:decide:1
 crates/ironauth-store/src/repository.rs:decide_with_event:2
-crates/ironauth-store/src/repository.rs:delete:5
+crates/ironauth-store/src/repository.rs:delete:6
 crates/ironauth-store/src/repository.rs:delete_with_event:23
 crates/ironauth-store/src/repository.rs:deploy:1
 crates/ironauth-store/src/repository.rs:disable:1
@@ -70,7 +70,9 @@ crates/ironauth-store/src/repository.rs:lift_with_event:1
 crates/ironauth-store/src/repository.rs:link_external_id_with_event:1
 crates/ironauth-store/src/repository.rs:meter_token_issued:1
 crates/ironauth-store/src/repository.rs:mint_with_event:1
+crates/ironauth-store/src/repository.rs:pin_certificate:1
 crates/ironauth-store/src/repository.rs:pin_with_event:1
+crates/ironauth-store/src/repository.rs:provision_sp_key:1
 crates/ironauth-store/src/repository.rs:publish_snapshot_inner:1
 crates/ironauth-store/src/repository.rs:put_with_event:1
 crates/ironauth-store/src/repository.rs:record_domain_verification_with_event:1
@@ -96,7 +98,7 @@ crates/ironauth-store/src/repository.rs:rotate_inner:1
 crates/ironauth-store/src/repository.rs:rotate_secret_with_event:1
 crates/ironauth-store/src/repository.rs:rotate_with_event:1
 crates/ironauth-store/src/repository.rs:set:1
-crates/ironauth-store/src/repository.rs:set_active:1
+crates/ironauth-store/src/repository.rs:set_active:2
 crates/ironauth-store/src/repository.rs:set_active_with_event:1
 crates/ironauth-store/src/repository.rs:set_allow_bearer_tokens_with_event:1
 crates/ironauth-store/src/repository.rs:set_auto_link_posture_with_event:1
@@ -117,6 +119,7 @@ crates/ironauth-store/src/repository.rs:transition:1
 crates/ironauth-store/src/repository.rs:transition_with_event:1
 crates/ironauth-store/src/repository.rs:unassign_with_event:3
 crates/ironauth-store/src/repository.rs:unlink_external_id_with_event:1
+crates/ironauth-store/src/repository.rs:unpin_certificate:1
 crates/ironauth-store/src/repository.rs:update_claims:1
 crates/ironauth-store/src/repository.rs:update_with_event:4
 crates/ironauth-store/src/repository.rs:verify_dynamic_client_with_event:1

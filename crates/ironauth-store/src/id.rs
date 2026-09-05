@@ -1293,6 +1293,24 @@ impl ScopedKind for SamlCertificateKind {
     const PREFIX: &'static str = "smk";
 }
 
+/// Marker for this deployment's OWN SAML signing key (`sps_`, issue #139).
+///
+/// THE OTHER DIRECTION FROM [`SamlCertificateKind`]. That one names a certificate an identity
+/// provider published and this deployment chose to trust; this one names a PRIVATE key that is
+/// ours, and that a customer's identity provider will trust because our metadata published its
+/// public half. The two are deliberately different types so that a value of one can never be
+/// passed where the other is expected -- the mistake being prevented is signing with an anchor
+/// or trusting our own key.
+///
+/// THE IDENTIFIER OF THE ROW, NEVER THE KEY. The material lives in a column and leaves the store
+/// only inside an opaque newtype; an id that embedded it would put a private key into every log
+/// line that mentioned the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SamlSpKeyKind;
+impl ScopedKind for SamlSpKeyKind {
+    const PREFIX: &'static str = "sps";
+}
+
 /// Marker for a Native SSO device secret (`nsd_`, issue #133, PROTOTYPE).
 ///
 /// The identifier of the ROW, never the secret. The secret itself is high-entropy, returned
@@ -2167,6 +2185,8 @@ pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
 pub type SamlConnectionId = ScopedId<SamlConnectionKind>;
 /// A pinned SAML signing key identifier (`smk_...`), issue #139.
 pub type SamlCertificateId = ScopedId<SamlCertificateKind>;
+/// This deployment's own SAML signing key identifier (`sps_...`), issue #139.
+pub type SamlSpKeyId = ScopedId<SamlSpKeyKind>;
 /// A Native SSO device secret row identifier (`nsd_...`), issue #133. The row, never the
 /// secret: the secret is stored only as a digest.
 pub type NativeSsoDeviceSecretId = ScopedId<NativeSsoDeviceSecretKind>;

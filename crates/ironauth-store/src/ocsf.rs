@@ -257,6 +257,12 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     // shaped. Wire strings freeze into the audit trail, so that is not correctable afterwards.
     "saml_connection",
     "saml_certificate",
+    // `saml_sp_key` is the third of the trio and belongs here for the same reason as the other
+    // two: it is the PRIVATE key this deployment signs its own AuthnRequests with, and whose
+    // public half an operator publishes to their identity provider. Minting one changes what a
+    // signature bearing our name means, which is an access-management fact and not a
+    // configuration edit.
+    "saml_sp_key",
     "scope",
     "admin",
     "credential_class",

@@ -1612,6 +1612,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0198_saml_request_and_replay.sql"),
         },
+        Migration {
+            version: 199,
+            name: "saml_sp_signing_keys",
+            // EXPAND. The key this deployment signs its OWN AuthnRequests with, which is the
+            // first SAML key in the schema that is not somebody else's.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0199_saml_sp_signing_keys.sql"),
+        },
     ]
 }
 

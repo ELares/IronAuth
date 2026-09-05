@@ -86,6 +86,7 @@
 /t/{tenant_id}/e/{environment_id}/recover/trusted-contact/confirm
 /t/{tenant_id}/e/{environment_id}/risk/signals
 /t/{tenant_id}/e/{environment_id}/saml/acs/{connection}
+/t/{tenant_id}/e/{environment_id}/saml/start/{connection}
 /t/{tenant_id}/e/{environment_id}/session-tokens/{template}/jwks.json
 /t/{tenant_id}/e/{environment_id}/session/token-mode
 /t/{tenant_id}/e/{environment_id}/session/tokenize
