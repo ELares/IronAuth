@@ -514,3 +514,170 @@ fn urlencode(raw: &str) -> String {
     }
     out
 }
+
+#[tokio::test]
+async fn each_connection_signs_with_its_own_key_and_not_another() {
+    // PER-CONNECTION, MEASURED. The earlier test verified the signature against the key it read
+    // back from the row, which a build selecting ANY key in the environment would also pass --
+    // there was only ever one. Two connections, each with its own key: each request must verify
+    // under its OWN connection's key and NOT under the other's.
+    let harness = Harness::start_store_backed().await;
+    let first = wire(&harness, true).await;
+    let second = wire(&harness, true).await;
+
+    let (status, headers, body) = get(&harness, &first.start_path).await;
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let (_, query) = location.split_once('?').expect("a query");
+    let saml_request = param(query, "SAMLRequest").expect("SAMLRequest");
+    let sig_alg = param(query, "SigAlg").expect("SigAlg");
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(percent_decode(
+            &param(query, "Signature").expect("Signature"),
+        ))
+        .expect("base64");
+    let signing_input = format!("SAMLRequest={saml_request}&SigAlg={sig_alg}");
+
+    let own = loaded_key(&harness, &first.connection).await;
+    ironauth_jose::verify_detached(
+        &own.verifying_key().expect("verifying key"),
+        ironauth_jose::JwsAlgorithm::Rs256,
+        signing_input.as_bytes(),
+        &signature,
+    )
+    .expect("the request did not verify under its own connection's key");
+
+    let other = loaded_key(&harness, &second.connection).await;
+    assert!(
+        ironauth_jose::verify_detached(
+            &other.verifying_key().expect("verifying key"),
+            ironauth_jose::JwsAlgorithm::Rs256,
+            signing_input.as_bytes(),
+            &signature,
+        )
+        .is_err(),
+        "one connection's request verified under another connection's key"
+    );
+}
+
+#[tokio::test]
+async fn the_recorded_return_to_is_the_validated_one_and_is_bounded() {
+    // TWO DEFECTS IN ONE LINE, both unmeasured. `parse_resume` TRIMS before it checks, so a
+    // value wrapped in whitespace passed the check while the UNTRIMMED string was recorded --
+    // validating one string and using another. And a value over migration 0198's 1024-byte
+    // column bound passed the check and then failed the INSERT, which an unauthenticated caller
+    // could trigger at will for a 500.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, true).await;
+
+    // WRAPPED IN WHITESPACE: accepted, and what lands in the row is the trimmed value.
+    // THE HARNESS'S REAL CLIENT ID, because `parse_resume` parses it as a SCOPED identifier: an
+    // invented `cli_recorded` is refused outright, and a first version of this test used one --
+    // so it read back `None` for a value that had never been accepted at all, and would have
+    // passed against a build that recorded the untrimmed string.
+    let resume = format!("/authorize?client_id={}&scope=openid", harness.client_id());
+    let (status, headers, body) = get(
+        &harness,
+        &format!(
+            "{}?return_to={}",
+            wired.start_path,
+            urlencode(&format!("  {resume}  "))
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let recorded = spend_at(&harness, &wired, &location).await;
+    assert_eq!(
+        recorded.as_deref(),
+        Some(resume.as_str()),
+        "the untrimmed value was recorded"
+    );
+
+    // OVER THE COLUMN'S BOUND: refused as a return location rather than answering 500. The path
+    // parses -- it is a valid resume with a very long scope -- so only the length bound can
+    // refuse it.
+    let long = format!(
+        "/authorize?client_id={}&scope={}",
+        harness.client_id(),
+        "a".repeat(1200)
+    );
+    assert!(
+        long.len() > 1024,
+        "the over-long fixture must exceed migration 0198's relay_state bound"
+    );
+    let (status, headers, body) = get(
+        &harness,
+        &format!("{}?return_to={}", wired.start_path, urlencode(&long)),
+    )
+    .await;
+    assert_eq!(
+        status, 303,
+        "an over-long return_to was a caller-triggered fault: {body}"
+    );
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert_eq!(
+        spend_at(&harness, &wired, &location).await,
+        None,
+        "an over-long return_to was recorded anyway"
+    );
+}
+
+/// The signing key stored for `connection`, loaded.
+async fn loaded_key(harness: &Harness, connection: &SamlConnectionId) -> ironauth_jose::SigningKey {
+    let stored = harness
+        .store()
+        .scoped(harness.scope())
+        .saml_connections()
+        .active_sp_key(connection)
+        .await
+        .expect("read the key")
+        .expect("the connection has a key");
+    ironauth_jose::SigningKey::rsa_from_pkcs1_der(
+        None,
+        ironauth_jose::JwsAlgorithm::Rs256,
+        stored.material.expose(),
+    )
+    .expect("load the stored key")
+}
+
+/// Spend the request named by `location` and return the `RelayState` it recorded.
+///
+/// READ BY SPENDING, because that is the only reader the store exposes -- and it is the path the
+/// ACS takes, so what this observes is what a real sign-in would.
+///
+/// THE LOCATION IS PASSED IN, not re-derived. A first version called the endpoint again to get
+/// one, which starts a SECOND flow and spends THAT request -- so it read back the `RelayState` of
+/// a request the test never made, and reported `None` for a value that had been recorded
+/// correctly. The test failed for a reason that was entirely its own.
+async fn spend_at(harness: &Harness, wired: &Wired, location: &str) -> Option<String> {
+    let xml = request_xml(location);
+    let id = xml
+        .split("ID=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("an ID")
+        .to_owned();
+    harness
+        .store()
+        .scoped(harness.scope())
+        .saml_replay()
+        .consume_request(&wired.connection, &id, now_micros(harness.env()))
+        .await
+        .expect("the request was recorded")
+}

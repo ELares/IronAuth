@@ -68,6 +68,26 @@ pub(crate) type SecureRandom = SystemRandom;
 /// `R || S` for ECDSA, the modulus-width octet string for RSA, the 64-byte
 /// signature for Ed25519). Any `ring` failure collapses to `Err(())`, carrying
 /// no detail, matching the verify side's opaque primitive.
+pub(crate) fn sign_asymmetric(key: &SigningKey, signing_input: &[u8]) -> Result<Vec<u8>, ()> {
+    match (key.algorithm(), &key.inner) {
+        (JwsAlgorithm::EdDsa, KeyInner::Ed25519(k)) => Ok(k.sign(signing_input).as_ref().to_vec()),
+        (JwsAlgorithm::Es256, KeyInner::EcdsaP256(k))
+        | (JwsAlgorithm::Es384, KeyInner::EcdsaP384(k)) => {
+            let sig = k.sign(&secure_random(), signing_input).map_err(|_| ())?;
+            Ok(sig.as_ref().to_vec())
+        }
+        (JwsAlgorithm::Rs256, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PKCS1_SHA256, signing_input),
+        (JwsAlgorithm::Rs384, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PKCS1_SHA384, signing_input),
+        (JwsAlgorithm::Rs512, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PKCS1_SHA512, signing_input),
+        (JwsAlgorithm::Ps256, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PSS_SHA256, signing_input),
+        (JwsAlgorithm::Ps384, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PSS_SHA384, signing_input),
+        (JwsAlgorithm::Ps512, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PSS_SHA512, signing_input),
+        // The mint checks the algorithm/key family before calling; this arm is
+        // the belt-and-braces backstop, matching the verify primitive.
+        _ => Err(()),
+    }
+}
+
 /// Sign an arbitrary octet string with `key`, for a protocol that is not JOSE.
 ///
 /// # Why this exists beside the JWS mint
@@ -125,26 +145,6 @@ pub fn verify_detached(
 ) -> Result<(), DetachedError> {
     crate::crypto::verify_signature(algorithm, key.material(), message, signature)
         .map_err(|()| DetachedError)
-}
-
-pub(crate) fn sign_asymmetric(key: &SigningKey, signing_input: &[u8]) -> Result<Vec<u8>, ()> {
-    match (key.algorithm(), &key.inner) {
-        (JwsAlgorithm::EdDsa, KeyInner::Ed25519(k)) => Ok(k.sign(signing_input).as_ref().to_vec()),
-        (JwsAlgorithm::Es256, KeyInner::EcdsaP256(k))
-        | (JwsAlgorithm::Es384, KeyInner::EcdsaP384(k)) => {
-            let sig = k.sign(&secure_random(), signing_input).map_err(|_| ())?;
-            Ok(sig.as_ref().to_vec())
-        }
-        (JwsAlgorithm::Rs256, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PKCS1_SHA256, signing_input),
-        (JwsAlgorithm::Rs384, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PKCS1_SHA384, signing_input),
-        (JwsAlgorithm::Rs512, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PKCS1_SHA512, signing_input),
-        (JwsAlgorithm::Ps256, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PSS_SHA256, signing_input),
-        (JwsAlgorithm::Ps384, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PSS_SHA384, signing_input),
-        (JwsAlgorithm::Ps512, KeyInner::Rsa(k)) => rsa_sign(k, &RSA_PSS_SHA512, signing_input),
-        // The mint checks the algorithm/key family before calling; this arm is
-        // the belt-and-braces backstop, matching the verify primitive.
-        _ => Err(()),
-    }
 }
 
 fn rsa_sign(

@@ -14,18 +14,26 @@
 -- would make rotating for one customer a rotation for all of them.
 --
 -- THE PUBLIC HALF IS NOT STORED. It is derivable from the private key, and a stored copy is a
--- second answer to "what is this connection's public key" that can drift from the first. What
--- publishes it is the SP metadata document, which derives it at render time.
+-- second answer to "what is this connection's public key" that can drift from the first.
+--
+-- NOTHING PUBLISHES IT YET, which is worth stating rather than implying: the SP metadata
+-- document that will derive it at render time is the next piece of #139, so today an operator
+-- has no way to give their identity provider the key to verify with. The signature is produced
+-- correctly and cannot yet be checked by the far side. That is a gap in the feature, not in this
+-- table, and it is recorded here because this is where somebody will come looking for the key.
 
 CREATE TABLE saml_sp_signing_keys (
     -- The `sps_` scoped identifier.
     id                text        PRIMARY KEY,
     tenant_id         text        NOT NULL,
     environment_id    text        NOT NULL,
-    -- The connection this key signs for. ON DELETE CASCADE, unlike 0197's pinned certificates,
-    -- which have no cascade: a pinned certificate is a record of a trust decision and outlives
-    -- the connection for audit, while a private key whose connection is gone is a credential
-    -- nobody can use and nobody should still be holding.
+    -- The connection this key signs for. ON DELETE CASCADE, which is what 0197's pinned
+    -- certificates already do -- an earlier version of this comment claimed the opposite and
+    -- built an argument on the contrast. The cascade is right for both and for the same reason
+    -- 0197 gives: deleting a connection revokes everything that made it able to assert an
+    -- identity, in one statement, with nothing left behind that a later connection reusing an id
+    -- could inherit. For a PRIVATE key there is a second reason: one whose connection is gone is
+    -- a credential nobody can use and nobody should still be holding.
     connection_id     text        NOT NULL,
 
     -- The signature algorithm this key produces, as the SAML/XML-Signature URI fragment rather
@@ -48,9 +56,14 @@ CREATE TABLE saml_sp_signing_keys (
     -- 0198 gives at length: a default here would be the database's clock deciding a bound the
     -- application is also computing, and the two disagree under load.
     --
-    -- `retired_at` is NULL while this is the key the connection signs with. A rotation writes a
-    -- successor and stamps this, so a verifier that cached the old public key during the
-    -- changeover has a window in which BOTH are published by the metadata document.
+    -- `retired_at` is NULL while this is the key the connection signs with.
+    --
+    -- NOTHING ROTATES YET, and the column plus its UPDATE grant ship ahead of the operation for
+    -- one reason: retiring a key is a WRITE to a row that already exists, and adding the column
+    -- later would mean a second migration over a table holding live credentials. 0198 makes the
+    -- opposite call for its sweep -- no DELETE grant until something deletes -- and the
+    -- difference is that a missing grant blocks nothing until the sweep exists, while a missing
+    -- column would have to be added under load. The rotation itself is #141's.
     created_at        timestamptz NOT NULL,
     retired_at        timestamptz,
 
@@ -59,8 +72,13 @@ CREATE TABLE saml_sp_signing_keys (
     CONSTRAINT saml_sp_signing_keys_algorithm_known
         CHECK (algorithm IN ('rsa-sha256')),
     -- A 2048-bit RSA private key in PKCS#1 is about 1.2 KiB and a 4096-bit one about 2.4 KiB.
-    -- The floor is what makes an empty or truncated write a database error rather than a
-    -- signature failure at the first sign-in.
+    -- The floor catches an empty or truncated write here rather than at the first sign-in.
+    --
+    -- IT IS NOT A KEY-STRENGTH CHECK, and an earlier version of this comment implied it was: 512
+    -- bytes is roughly a 1024-bit key, so a weak one would pass. A byte count cannot express key
+    -- strength -- the modulus is inside the DER -- and the check that CAN is where it belongs,
+    -- in `SigningKey::rsa_from_pkcs1_der`, which refuses anything under 2048 bits on the way to
+    -- signing. The floor here is a corruption bound and says so.
     CONSTRAINT saml_sp_signing_keys_material_bounded
         CHECK (octet_length(key_material) BETWEEN 512 AND 8192),
     CONSTRAINT saml_sp_signing_keys_retired_after_created

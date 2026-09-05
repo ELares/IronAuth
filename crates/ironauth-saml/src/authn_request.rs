@@ -14,8 +14,21 @@
 //! and the connection has to have opted into accepting those. #139 requires that mode be OFF by
 //! default, and migration 0198 calls the assertion-id replay cache "the weaker defence" for a
 //! reason -- it stops one assertion being used twice, and it does not stop somebody
-//! auto-submitting a FRESH assertion for their own account into a victim's browser. The
-//! outstanding request is what closes that, and it exists only if something issues one.
+//! auto-submitting a FRESH assertion for their own account into a victim's browser.
+//!
+//! THE OUTSTANDING REQUEST IS NECESSARY FOR THAT AND NOT YET SUFFICIENT, and an earlier version
+//! of this paragraph said it "closes" it. What the row proves is that a response answers a
+//! request THIS DEPLOYMENT issued and has not spent -- not that it answers one issued to the
+//! browser now presenting it. The start endpoint is unauthenticated, so an attacker can mint
+//! their own request, answer it at the identity provider as themselves, and auto-submit the
+//! result into somebody else's browser; the row is spent exactly once either way.
+//!
+//! THE MISSING HALF IS A BROWSER BINDING: a cookie set at issue time carrying the request id or
+//! its digest, checked at the assertion consumer service. It lands with sign-in, because that is
+//! when a session first depends on it and this build's consumer mints nothing. One constraint is
+//! worth writing down now rather than rediscovering: the response arrives on a CROSS-SITE POST,
+//! so that cookie must be `SameSite=None; Secure` -- a `Lax` or `Strict` one is simply not sent,
+//! and the binding would silently never match.
 
 use ironauth_jose::SigningKey;
 use std::fmt::Write as _;
@@ -121,14 +134,25 @@ pub fn build(request: &Request<'_>) -> Result<String, RequestError> {
     ))
 }
 
-/// Escape `raw` for an XML attribute value or text node, refusing what cannot be carried.
+/// Escape `raw` for an XML attribute value, refusing what cannot be carried.
 ///
-/// # Five characters, and one class that has no escape
+/// # Five characters, three that must become numeric references, and a class with no escape
 ///
-/// `&`, `<`, `>`, `"` and `'` become entities. What has no representation is most of C0: XML 1.0
-/// permits only tab, newline and carriage return below `0x20`, and there is no numeric escape
-/// that makes the others legal -- `&#x1;` is as invalid as the raw byte. A reader that stripped
-/// them would change the value; this refuses instead, and names the column.
+/// `&`, `<`, `>`, `"` and `'` become entities.
+///
+/// TAB, NEWLINE AND CARRIAGE RETURN BECOME `&#x9;`, `&#xA;` and `&#xD;`, and an earlier version
+/// emitted them raw on the grounds that XML permits them. It does -- and XML 1.0 2.11/3.3.3 then
+/// applies ATTRIBUTE-VALUE NORMALIZATION, which silently rewrites each of them to a SPACE before
+/// any consumer sees the value. Every value this module writes lands in an attribute, so a
+/// `Destination` or an `acs_url` holding one would reach the identity provider as a different
+/// string than the row holds, and the ACS would then compare the `Recipient` it gets back
+/// against the unmodified column and refuse. The numeric reference is what survives
+/// normalization, and it is why this refuses nothing that XML can actually carry.
+///
+/// WHAT STILL HAS NO REPRESENTATION is the rest of C0, plus the two permanently unassigned
+/// noncharacters `U+FFFE` and `U+FFFF`: no escape makes them legal -- `&#x1;` is as invalid as
+/// the raw byte -- so a document containing one is rejected by a conforming parser. A reader
+/// that stripped them would change the value; this refuses instead, and names the column.
 fn escape(raw: &str, field: &'static str) -> Result<String, RequestError> {
     let mut out = String::with_capacity(raw.len());
     for character in raw.chars() {
@@ -138,7 +162,12 @@ fn escape(raw: &str, field: &'static str) -> Result<String, RequestError> {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            '\t' | '\n' | '\r' => out.push(character),
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xA;"),
+            '\r' => out.push_str("&#xD;"),
+            '\u{fffe}' | '\u{ffff}' => {
+                return Err(RequestError::Unrepresentable { field });
+            }
             other if (other as u32) < 0x20 => {
                 return Err(RequestError::Unrepresentable { field });
             }
@@ -178,9 +207,21 @@ pub fn redirect(
     relay_state: Option<&str>,
     key: &SigningKey,
 ) -> Result<Redirect, RequestError> {
+    // THE ALGORITHM COMES FROM THE KEY, not from a constant beside it. An earlier version
+    // hardcoded the RSA URI while the connection's `algorithm` column was read by nothing -- so
+    // the column configured nothing, and a key of another kind would have been ANNOUNCED as RSA
+    // and refused by every verifier, with no clue as to why. `SigAlg` is now derived from what
+    // the key actually signs with, which is the value that column constrains.
+    let sig_alg_uri = match key.algorithm() {
+        ironauth_jose::JwsAlgorithm::Rs256 => RSA_SHA256,
+        // THE BINDING NAMES ONE ALGORITHM PER URI, and this build provisions one kind of key, so
+        // anything else is a row the schema should not hold. Refusing beats announcing a URI the
+        // signature does not match.
+        _ => return Err(RequestError::Unsignable),
+    };
     let deflated = deflate(xml.as_bytes());
     let encoded = urlencode(&base64_standard(&deflated));
-    let sig_alg = urlencode(RSA_SHA256);
+    let sig_alg = urlencode(sig_alg_uri);
 
     let mut signing_input = format!("SAMLRequest={encoded}");
     let mut query = signing_input.clone();

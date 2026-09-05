@@ -96,14 +96,40 @@ fn a_value_xml_cannot_carry_is_refused_and_names_its_column() {
         })
     );
 
-    // TAB, NEWLINE AND CARRIAGE RETURN ARE LEGAL XML and are kept, because refusing them would
-    // refuse a value a schema-aware reader accepts.
+    // TAB, NEWLINE AND CARRIAGE RETURN ARE LEGAL XML, and are written as NUMERIC REFERENCES
+    // rather than raw. Raw is what an earlier version emitted, and XML 1.0's attribute-value
+    // normalization then rewrites each of them to a SPACE before any consumer sees the value --
+    // so a `Recipient` the identity provider echoes back would no longer equal the `acs_url`
+    // column the ACS compares it against, and every sign-in on that connection would be refused
+    // for a reason nothing in the pipeline could name.
     let kept = authn_request::build(&Request {
-        issuer: "https://ironauth.example/\tmetadata",
+        issuer: "https://ironauth.example/\tmeta\ndata\r",
         ..request()
     })
     .expect("a tab is representable");
-    assert!(kept.contains("/\tmetadata"), "{kept}");
+    assert!(
+        kept.contains("/&#x9;meta&#xA;data&#xD;"),
+        "a control XML normalises to a space was emitted raw: {kept}"
+    );
+    assert!(!kept.contains('\t'), "{kept}");
+
+    // AND THE TWO NONCHARACTERS ARE REFUSED. `U+FFFE` and `U+FFFF` are permanently unassigned
+    // and no escape makes them legal, so emitting one produces a document a conforming parser
+    // rejects -- which is the outcome `Unrepresentable` exists to prevent, reached by a
+    // different door.
+    for noncharacter in ['\u{fffe}', '\u{ffff}'] {
+        let refused = authn_request::build(&Request {
+            issuer: Box::leak(format!("https://ironauth.example/{noncharacter}").into_boxed_str()),
+            ..request()
+        });
+        assert_eq!(
+            refused,
+            Err(RequestError::Unrepresentable {
+                field: "sp_entity_id"
+            }),
+            "a noncharacter reached the document"
+        );
+    }
 
     // AND THE FIVE THAT DO HAVE ESCAPES ARE ESCAPED. An `sp_entity_id` holding a quote would
     // otherwise close the attribute it sits in and let the rest of the value become markup.
@@ -272,4 +298,72 @@ fn inflate_stored(raw: &[u8]) -> Option<Vec<u8>> {
             return (index == raw.len()).then_some(out);
         }
     }
+}
+
+/// One column of the request, and how to put an unwritable value in it.
+type Case = (&'static str, fn(&'static str) -> Request<'static>);
+
+#[test]
+fn every_column_the_request_carries_names_itself_when_it_cannot_be_written() {
+    // "NAMES ITS COLUMN" WAS MEASURED FOR ONE COLUMN OF SIX, so five of the six names were free
+    // to be wrong -- and the whole value of the variant is that an operator is sent to the right
+    // row. Each field is broken in turn and asserted against its own name.
+    let cases: [Case; 6] = [
+        ("AuthnRequest ID", |bad| Request {
+            id: bad,
+            ..request()
+        }),
+        ("IssueInstant", |bad| Request {
+            issue_instant: bad,
+            ..request()
+        }),
+        ("idp_sso_url", |bad| Request {
+            destination: bad,
+            ..request()
+        }),
+        ("sp_entity_id", |bad| Request {
+            issuer: bad,
+            ..request()
+        }),
+        ("acs_url", |bad| Request {
+            assertion_consumer_service_url: bad,
+            ..request()
+        }),
+        ("nameid_format", |bad| Request {
+            name_id_format: bad,
+            ..request()
+        }),
+    ];
+    for (field, make) in cases {
+        let built = authn_request::build(&make("bad\u{1}value"));
+        assert_eq!(
+            built,
+            Err(RequestError::Unrepresentable { field }),
+            "the refusal named the wrong column for {field}"
+        );
+    }
+}
+
+#[test]
+fn the_sig_alg_announced_is_the_one_the_key_signs_with() {
+    // THE COLUMN THAT CONFIGURED NOTHING. `SigAlg` was a hardcoded constant while the connection
+    // carried an `algorithm` column nothing read, so a key of another kind would have been
+    // ANNOUNCED as RSA and refused by every verifier with no clue as to why. Now the URI is
+    // derived from the key, and a key this binding has no URI for is refused here rather than
+    // mis-announced on the wire.
+    let key = signing_key();
+    let xml = authn_request::build(&request()).expect("build");
+    let redirect = authn_request::redirect(&xml, None, &key).expect("encode");
+    let sig_alg = param(&redirect.query, "SigAlg").expect("SigAlg");
+    assert_eq!(percent_decode(&sig_alg), RSA_SHA256);
+
+    // AN ECDSA KEY HAS NO URI IN THIS BUILD, so it is refused rather than announced as RSA.
+    let env = ironauth_env::Env::system();
+    let der = ironauth_jose::generate_ecdsa_p256_pkcs8_der(env.entropy()).expect("generate");
+    let ec = SigningKey::ecdsa_p256_from_pkcs8(None, &der).expect("load");
+    assert_eq!(
+        authn_request::redirect(&xml, None, &ec).err(),
+        Some(RequestError::Unsignable),
+        "a key with no SigAlg URI was announced as RSA"
+    );
 }

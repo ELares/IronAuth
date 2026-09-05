@@ -21,6 +21,16 @@
 //! strictly worse and which somebody would eventually set. What a connection can lack is a KEY,
 //! and a connection with no key cannot start a flow -- it is told so, rather than falling back to
 //! an unsigned request nobody asked for.
+//!
+//! # What the outstanding request does NOT prove
+//!
+//! It proves a response answers a request THIS DEPLOYMENT issued and has not spent. It does not
+//! prove the browser presenting the response is the one the request was issued to, because this
+//! endpoint is unauthenticated and sets no cookie: anybody can mint a request, answer it at the
+//! identity provider as themselves, and auto-submit the result into somebody else's browser.
+//! Closing that needs a browser binding, it lands with sign-in -- which is when a session first
+//! depends on it -- and the cookie must be `SameSite=None; Secure`, because the response comes
+//! back on a cross-site POST and a `Lax` one would not be sent.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -46,6 +56,15 @@ use crate::wellknown::parse_scope;
 /// bound a document somebody ELSE wrote and so have to accommodate their clock; this bounds one
 /// we wrote and hold the other end of, where there is nothing to accommodate.
 const REQUEST_TTL_SECS: i64 = 300;
+
+/// The largest `RelayState` migration 0198's column will hold.
+///
+/// THE COLUMN'S OWN BOUND, restated here because this is where a value is admitted. 0198 checks
+/// `octet_length(relay_state) <= 1024`, so a longer one is a constraint violation at the insert
+/// -- and on this endpoint that is a 500 for an unauthenticated caller who chose the length.
+/// Refusing to record it is not a loss: an unrecorded return location lands the user on the
+/// default page, which is what happens for a `return_to` that fails to parse anyway.
+const MAX_RELAY_STATE_BYTES: usize = 1024;
 
 /// The query this endpoint accepts.
 #[derive(Deserialize)]
@@ -111,14 +130,23 @@ pub async fn start_get(
         return server_error();
     };
 
-    // THE RETURN LOCATION IS VALIDATED BEFORE IT IS RECORDED, not when it is used. The ACS puts
-    // the recorded value through the same `parse_resume` open-redirect defence, and doing it
-    // here as well means a value that could never be honoured is never written -- so a
-    // sign-in does not complete and then land nowhere.
+    // THE RETURN LOCATION IS VALIDATED BEFORE IT IS RECORDED, not when it is used, so a value
+    // that could never be honoured is never written.
+    //
+    // THE VALIDATED VALUE IS THE ONE RECORDED, and an earlier version recorded the raw one.
+    // `parse_resume` TRIMS before it checks, so a `return_to` wrapped in whitespace passed the
+    // check while the untrimmed string went into the row and onto the wire -- validating one
+    // string and using another, which is the shape every validation bypass has.
+    //
+    // AND IT IS BOUNDED HERE, because migration 0198 caps `relay_state` at 1024 bytes and a
+    // longer value that parses is a database CHECK violation -- which this endpoint would
+    // answer as a 500 on an unauthenticated GET, a fault a caller can trigger at will. The
+    // bound is the column's, named once so the two cannot drift.
     let return_to = query
         .return_to
         .as_deref()
-        .filter(|value| interaction::parse_resume(Some(value)).is_some());
+        .and_then(|value| interaction::parse_resume(Some(value)).map(|resume| resume.return_to))
+        .filter(|value| value.len() <= MAX_RELAY_STATE_BYTES);
 
     let now_micros = epoch_micros(state.now());
     let request_id = format!("_{}", ironauth_store::CorrelationId::generate(state.env()));
@@ -154,7 +182,7 @@ pub async fn start_get(
         .issue_request(
             &connection_id,
             &request_id,
-            return_to,
+            return_to.as_deref(),
             now_micros,
             now_micros + REQUEST_TTL_SECS * 1_000_000,
         )
@@ -164,7 +192,16 @@ pub async fn start_get(
         return server_error();
     }
 
-    let Ok(redirect) = authn_request::redirect(&xml, return_to, &signing_key) else {
+    // NO RELAYSTATE ON THE WIRE, and its absence is the deliberate part. OASIS Bindings 3.4.3
+    // says a `RelayState` MUST NOT exceed 80 bytes, and every value this endpoint could send is
+    // an `/authorize?client_id=...` resume path that exceeds it before the query begins -- so
+    // sending one would violate the binding on every request, and hand the identity provider a
+    // return path that is this deployment's business.
+    //
+    // NOTHING IS LOST BY OMITTING IT. The return location is in the outstanding-request row,
+    // which is where the ACS reads it from; the copy that travels through the browser was only
+    // ever a convenience, and one the ACS deliberately discards.
+    let Ok(redirect) = authn_request::redirect(&xml, None, &signing_key) else {
         return server_error();
     };
 
