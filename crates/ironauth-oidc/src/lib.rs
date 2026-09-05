@@ -179,6 +179,7 @@ mod risk;
 mod risk_signals;
 pub mod routing;
 pub mod saml_acs;
+pub mod saml_route;
 mod scope_claims;
 mod sector;
 mod session;
@@ -467,6 +468,18 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/authorize",
             get(authorize::scoped_authorize_get).post(authorize::scoped_authorize_post),
+        )
+        // THE SAML HTTP POST BINDING (issue #139). Scope-routed and connection-routed, because
+        // an assertion consumer service URL is per connection: the response is checked against
+        // the trust anchors of the connection the identity provider was TOLD to post to, never
+        // one chosen from the document. See `saml_route`.
+        //
+        // POST ONLY. There is no GET half: the POST binding is the only one this consumes, and
+        // a GET that took a response from the query string would put a signed assertion in
+        // every access log and browser history between here and the identity provider.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/saml/acs/{connection}",
+            post(saml_route::acs_post),
         )
         .route("/token", post(token::token))
         // The agent vault exchange (issue #132): an agent trades its IronAuth token for the
