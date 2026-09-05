@@ -996,6 +996,23 @@ fn collapse(text: &str) -> String {
         .join(" ")
 }
 
+/// The first descendant with this qualified name.
+///
+/// ONLY THE TEST CANONICALIZER USES THIS, which is why it is behind the feature: every reader
+/// on the verification path resolves a namespace and a local name, and this one matches a
+/// QUALIFIED name -- a spelling. `cargo build` without the feature warned it was dead, and
+/// deleting it broke the feature build, which is the shape a `#[cfg]` says out loud.
+#[cfg(feature = "test-util")]
+fn find<'a>(element: &'a RichElement, name: &str) -> Option<&'a RichElement> {
+    if element.name == name {
+        return Some(element);
+    }
+    element.children.iter().find_map(|child| match child {
+        RichNode::Element(nested) => find(nested, name),
+        RichNode::Text(_) | RichNode::ProcessingInstruction(_) => None,
+    })
+}
+
 /// Every descendant (and the root itself) whose qualified name matches.
 pub(crate) fn collect<'a>(
     root: &'a RichElement,
@@ -1017,17 +1034,6 @@ pub(crate) fn collect<'a>(
         }
     }
     found
-}
-
-/// The first descendant with this qualified name.
-fn find<'a>(element: &'a RichElement, name: &str) -> Option<&'a RichElement> {
-    if element.name == name {
-        return Some(element);
-    }
-    element.children.iter().find_map(|child| match child {
-        RichNode::Element(nested) => find(nested, name),
-        RichNode::Text(_) | RichNode::ProcessingInstruction(_) => None,
-    })
 }
 
 /// All the text under an element, concatenated.
