@@ -25,8 +25,8 @@
 
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_saml::{
-    ASSERTION_NS, Limits, PROTOCOL_NS, Statement, TrustAnchor, Unreadable, Value, attributes,
-    verify,
+    ASSERTION_NS, Child, Limits, PROTOCOL_NS, Statement, TrustAnchor, Unreadable, Value,
+    attributes, verify,
 };
 
 const EMAIL: &str = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress";
@@ -432,8 +432,16 @@ fn a_value_carrying_elements_reports_its_shape_and_is_not_flattened() {
         vec![
             Value::Text("engineering".to_owned()),
             Value::Structured(vec![
-                (ASSERTION_NS.to_owned(), "NameID".to_owned()),
-                (ASSERTION_NS.to_owned(), "SubjectConfirmation".to_owned()),
+                Child {
+                    namespace: ASSERTION_NS.to_owned(),
+                    local: "NameID".to_owned(),
+                    text: "ada@globex.example".to_owned(),
+                },
+                Child {
+                    namespace: ASSERTION_NS.to_owned(),
+                    local: "SubjectConfirmation".to_owned(),
+                    text: String::new(),
+                },
             ])
         ],
         "a structured value was flattened, dropped so the text values shifted, or reported \
@@ -471,10 +479,13 @@ fn an_attribute_statement_inside_a_value_belongs_to_whoever_wrote_it() {
     );
     assert_eq!(
         found.attributes[1].values,
-        vec![Value::Structured(vec![(
-            ASSERTION_NS.to_owned(),
-            "AttributeStatement".to_owned(),
-        )])],
+        vec![Value::Structured(vec![Child {
+            namespace: ASSERTION_NS.to_owned(),
+            local: "AttributeStatement".to_owned(),
+            // Its own text is empty: it has element children, so concatenating theirs is the
+            // fiction this whole variant exists to refuse, one level down.
+            text: String::new(),
+        }])],
         "the nested statement was read as text rather than left alone"
     );
 }
@@ -538,9 +549,14 @@ fn an_element_in_a_foreign_namespace_is_not_this_assertions_attribute() {
 #[test]
 fn a_verified_response_is_not_an_assertion_and_answering_nothing_would_be_worse() {
     // `verify` TAKES THE ELEMENT TO READ AS AN ARGUMENT and hands back whatever was signed, so a
-    // caller may hold a verified `samlp:Response` -- and in the Response-only-signed profile
-    // Okta and ADFS emit, that is the ONLY value obtainable, because assertion-level verify
-    // answers `SignatureMissing`.
+    // caller may hold a verified `samlp:Response`. The fixture below is the DOUBLY signed
+    // document -- which is what `test_util::sign_response` builds and what its doc says Okta and
+    // ADFS emit -- so BOTH elements verify here, and that is what makes the pair meaningful: the
+    // same bytes, read at two levels, must answer differently.
+    //
+    // An earlier version of this comment claimed Okta and ADFS emit a Response-ONLY-signed
+    // profile, which contradicts that helper's own doc. Response-only signing is a real
+    // configuration and the guard does not need it.
     //
     // A `Response`'s direct children hold no `AttributeStatement`, so without the guard the
     // answer was an empty list -- which THIS MODULE DOCUMENTS AS A REAL ANSWER meaning "the
@@ -656,4 +672,132 @@ fn a_name_that_is_only_whitespace_is_not_a_name_and_the_one_returned_is_untouche
         "the Name was trimmed on its way out, so two distinct attributes would collide"
     );
     assert_ne!(found.attributes[0].name, EMAIL);
+}
+
+#[test]
+fn a_name_format_padded_with_whitespace_is_the_same_format() {
+    // `NameFormat` IS AN `xsd:anyURI`, which XSD gives the `collapse` facet -- so
+    // ` urn:...:unspecified ` and the flush spelling are ONE value to every schema-aware reader.
+    // Comparing them raw re-opens, one space at a time, the exact hole the effective-format rule
+    // was written to close: a provider that pads the attribute on one of two elements turns a
+    // refusal back into a silent choice between two emails.
+    assert!(
+        matches!(
+            read(&body(&statement(&format!(
+                "{}{}",
+                attribute(EMAIL, Some(BASIC), &["ada@globex.example"]),
+                attribute(
+                    EMAIL,
+                    Some(&format!("  {BASIC} ")),
+                    &["attacker@evil.example"]
+                )
+            )))),
+            Err(Unreadable::Duplicate { .. })
+        ),
+        "a padded NameFormat was read as a different format"
+    );
+
+    // THE PADDING ON THE FIRST ELEMENT, which is the half a one-sided fixture cannot reach: the
+    // STORED format is what gets compared against, so collapsing only the incoming one leaves
+    // the rule half-applied and a provider padding its first element still slips through.
+    assert!(
+        matches!(
+            read(&body(&statement(&format!(
+                "{}{}",
+                attribute(EMAIL, Some(&format!(" {BASIC}  ")), &["ada@globex.example"]),
+                attribute(EMAIL, Some(BASIC), &["attacker@evil.example"])
+            )))),
+            Err(Unreadable::Duplicate { .. })
+        ),
+        "a padded NameFormat on the FIRST element was stored raw and never matched"
+    );
+
+    // AND A NO-BREAK SPACE IS NOT WHITESPACE. XML Schema names exactly `#x9`, `#xA`, `#xD` and
+    // `#x20`, so `urn:a<NBSP>b` and `urn:a b` are DIFFERENT `anyURI` values -- while a collapse
+    // over the whole Unicode whitespace property makes them equal, and would refuse a conformant
+    // assertion as a duplicate. The pair below differs ONLY in that one character.
+    let with_nbsp = format!("urn:a{NBSP}b", NBSP = '\u{a0}');
+    assert_eq!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, Some(&with_nbsp), &["ada@globex.example"]),
+            attribute(EMAIL, Some("urn:a b"), &["also-ada@globex.example"])
+        ))))
+        .expect("two formats differing by a NO-BREAK SPACE are two formats")
+        .attributes
+        .len(),
+        2,
+        "a NO-BREAK SPACE was folded as though XSD called it whitespace, so two conformant \
+         attributes were refused as one"
+    );
+
+    // AND AN ABSENT ONE AGAINST A PADDED `unspecified`, which is the same rule crossed with the
+    // defaulting rule.
+    assert!(matches!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, None, &["ada@globex.example"]),
+            attribute(
+                EMAIL,
+                Some(&format!(" {UNSPECIFIED}")),
+                &["attacker@evil.example"]
+            )
+        )))),
+        Err(Unreadable::Duplicate { .. })
+    ));
+
+    // THE CONTROL: two genuinely different formats are still two attributes, so collapsing has
+    // not made every format equal.
+    assert_eq!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, Some(BASIC), &["ada@globex.example"]),
+            attribute(EMAIL, Some(URI_FORMAT), &["also-ada@globex.example"])
+        ))))
+        .expect("two formats")
+        .attributes
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn a_structured_value_carries_the_name_inside_it_and_not_only_its_shape() {
+    // THE CASE `Value::Structured`'S OWN DOC NAMES AS THE REASON IT EXISTS is `saml:NameID`
+    // inside an `AttributeValue` -- and a caller that has identified it wants the NAME inside it.
+    // An earlier version answered the shape and threw the value away, so the one attribute the
+    // doc called common was the one nothing could be done with.
+    let found = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{GROUPS}\"><saml:AttributeValue>\
+         <saml:NameID Format=\"urn:oasis:names:tc:SAML:2.0:nameid-format:persistent\">\
+         ada@globex.example</saml:NameID></saml:AttributeValue></saml:Attribute>"
+    ))))
+    .expect("a NameID inside an AttributeValue");
+    assert_eq!(
+        found.attributes[0].values,
+        vec![Value::Structured(vec![Child {
+            namespace: ASSERTION_NS.to_owned(),
+            local: "NameID".to_owned(),
+            text: "ada@globex.example".to_owned(),
+        }])],
+        "the shape came back without the name inside it"
+    );
+
+    // AND A CHILD WITH ITS OWN ELEMENT CHILDREN ANSWERS EMPTY TEXT rather than its descendants
+    // concatenated -- the same refusal one level down, for the same reason.
+    let nested = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{GROUPS}\"><saml:AttributeValue>\
+         <saml:Subject><saml:NameID>ada@globex.example</saml:NameID></saml:Subject>\
+         </saml:AttributeValue></saml:Attribute>"
+    ))))
+    .expect("a nested subtree");
+    assert_eq!(
+        nested.attributes[0].values,
+        vec![Value::Structured(vec![Child {
+            namespace: ASSERTION_NS.to_owned(),
+            local: "Subject".to_owned(),
+            text: String::new(),
+        }])],
+        "a child with element children had its descendants' text concatenated"
+    );
 }

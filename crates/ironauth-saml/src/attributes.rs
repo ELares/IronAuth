@@ -21,16 +21,33 @@
 //!
 //! # And why it answers Rust rather than JSON
 //!
-//! The mapping this feeds is `ironauth-connector`'s, which resolves paths through `serde_json`
-//! maps. Projecting into that shape is a caller's job on purpose: this crate is the choke point
-//! through which hostile SAML XML enters, and its dependency list is part of the argument. A
-//! JSON library here would be a second parser reachable from the same bytes.
+//! The mapping this is meant to feed is `ironauth-connector`'s, which resolves paths through
+//! `serde_json` maps. Projecting into that shape is a caller's job on purpose: this crate is the
+//! choke point through which hostile SAML XML enters, and its dependency list is part of the
+//! argument. A JSON library here would be a second parser reachable from the same bytes.
 //!
-//! A SAML attribute `Name` IS A URI AND CONTAINS DOTS -- ADFS and Entra send
-//! `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` -- and the mapper's
-//! path resolver used to split on `.` unconditionally, so it looked up a key called
-//! `http://schemas` and no real SAML attribute was addressable at all. It now tries the whole
-//! path as a literal key first, which is what makes a mapping over these names reachable.
+//! # A SAML attribute cannot yet be ADDRESSED by that mapper, and this says so
+//!
+//! `claim_mapping::resolve_path` splits a mapping path on `.`, and a SAML attribute `Name` is a
+//! URI full of them: ADFS and Entra send
+//! `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`, which the resolver
+//! reads as a key called `http://schemas` followed by five more segments. So no real SAML
+//! attribute is addressable by a mapping path as the language stands.
+//!
+//! AN EARLIER VERSION OF THIS PR CHANGED THE RESOLVER and it was a security defect, which is
+//! worth recording here rather than only in a commit message. Preferring a literal key let the
+//! UPSTREAM choose which reading a mapping got: a provider emitting a claim named
+//! `https://app.example.com/roles.1` captured a mapping that meant element 1 of `roles`, on the
+//! OIDC callback that runs today. Trying traversal first and the literal key second moved the
+//! defect rather than removing it, because for a URI path the first segment is never a
+//! top-level key -- traversal always fails, so the literal key always answers, which is the
+//! rule that was supposed to have been removed.
+//!
+//! ANY PRECEDENCE RULE HAS THIS SHAPE: if the document's key names decide which reading wins,
+//! the document participates in the choice. What criterion 6 needs is an EXPLICIT escape in the
+//! mapping path language -- a way for an author to say "this segment is a literal key" -- and
+//! that is a change to a stored configuration format, which belongs with the endpoint that has
+//! a real mapping in hand rather than with this reader. Recorded on the issue.
 
 use crate::verify::VerifiedAssertion;
 
@@ -75,9 +92,14 @@ pub enum Value {
     /// COVERS BOTH `<AttributeValue/>` AND `<AttributeValue xsi:nil="true"/>`, and does NOT
     /// distinguish them -- reading `xsi:nil` needs the attribute's NAMESPACE resolved, and this
     /// crate deliberately exposes attributes by their literal spelling only, because a prefix is
-    /// not an identity and resolving one for attributes is a surface it has not needed. Said out
-    /// loud rather than left for a caller to discover, since SAML Core 2.7.3.2 does treat the
-    /// two as different.
+    /// not an identity and resolving one for attributes is a surface it has not needed.
+    ///
+    /// SAML DOES DISTINGUISH THEM, so this is a documented narrowing rather than a reading of
+    /// the specification: an `xsi:nil` value is the absence of a value, and an empty one is a
+    /// value that happens to be the empty string. Collapsing them loses that, and the loss is in
+    /// the SAFE direction for the decision a mapping makes -- both are treated as "no value
+    /// here", which is what an absent value would do -- but a caller that needs the difference
+    /// does not get it from this type. Said out loud rather than left to be discovered.
     ///
     /// SEPARATE FROM `Text(String::new())` BECAUSE A MAPPING TREATS THEM DIFFERENTLY. The
     /// connector's rules take the first source that resolves to a non-null value, so an empty
@@ -85,7 +107,7 @@ pub enum Value {
     /// was cleared would get `""` written into their profile instead of the next source's value,
     /// or instead of nothing.
     Empty,
-    /// A value carrying ELEMENT children, each as its RESOLVED `(namespace, local name)`.
+    /// A value carrying ELEMENT children, each as its resolved name AND its text.
     ///
     /// `AttributeValue` is `xs:anyType`, so a conformant assertion may put a whole XML subtree
     /// in one. `saml:NameID` inside an `AttributeValue` is the case with published
@@ -103,7 +125,25 @@ pub enum Value {
     /// been making the allowlist-on-spelling decision this crate removed from its own condition
     /// layer -- `evil:NameID` and `saml:NameID` are different elements and a bare `"NameID"`
     /// cannot tell them apart. The namespace is the empty string for a child in none.
-    Structured(Vec<(String, String)>),
+    ///
+    /// AND WITH EACH CHILD'S OWN TEXT, because the case this doc names as the reason the variant
+    /// exists is `saml:NameID` inside an `AttributeValue` -- and a caller that has identified it
+    /// wants the name inside it. An earlier version answered the shape and threw the value away,
+    /// so the one attribute it described as common was the one nothing could be done with. The
+    /// text is that child's own, not its descendants' concatenated: a child that itself has
+    /// element children answers an empty string, for the reason this whole variant exists.
+    Structured(Vec<Child>),
+}
+
+/// One element child of an `AttributeValue` this module did not turn into text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    /// The resolved namespace, empty for a child in none.
+    pub namespace: String,
+    /// The local name.
+    pub local: String,
+    /// This child's own text, empty when it has element children of its own.
+    pub text: String,
 }
 
 /// Why an `AttributeStatement` could not be read.
@@ -186,13 +226,23 @@ pub struct Statement {
     /// one encrypted attribute contradicts this module's opening rule -- an attribute a caller
     /// cannot use is not a reason to refuse anybody -- and skipping them silently means an
     /// attribute an operator configured, that the provider sent, never arrives with nothing
-    /// said. So the readable attributes come back AND this comes back, and the caller decides:
-    /// a deployment mapping none of the encrypted names carries on, one mapping a name it can no
-    /// longer see stops.
+    /// said.
     ///
-    /// A COUNT rather than the names, because the `Name` is INSIDE the ciphertext -- an
-    /// `EncryptedAttribute` carries an `xenc:EncryptedData` and nothing this layer can read. A
-    /// field promising names would be one that could never be filled.
+    /// # What a caller can and CANNOT decide from it
+    ///
+    /// A count says only THAT something was withheld, never WHICH. The `Name` is inside the
+    /// ciphertext -- an `EncryptedAttribute` carries an `xenc:EncryptedData` and nothing this
+    /// layer can read -- so a field promising names would be one that could never be filled.
+    ///
+    /// So the decision this supports is coarse, and saying otherwise would be a contract nobody
+    /// can honour: a caller can tell that a mapped trait's absence MIGHT be explained by an
+    /// encrypted attribute rather than by the provider not sending it, and can log or surface
+    /// that. It CANNOT tell whether the withheld attribute is one it maps. An earlier version of
+    /// this doc claimed a deployment "mapping a name it can no longer see stops", which is a
+    /// decision a `usize` makes impossible.
+    ///
+    /// A DEPLOYMENT THAT NEEDS THE DIFFERENCE has to decrypt, which needs the connection's
+    /// private key -- the ACS endpoint's to hold, not this function's.
     pub encrypted: usize,
 }
 
@@ -259,9 +309,14 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Statement, Unreadable
             // [`Attribute::name_format`]'s own doc -- so comparing `Option<String>` made one
             // attribute sent twice into two attributes, and adding the optional attribute to
             // the second element turned a refusal into a silent choice between two values.
-            let effective = name_format.as_deref().unwrap_or(UNSPECIFIED);
+            // COLLAPSED BEFORE COMPARING, because `NameFormat` is an `xsd:anyURI` and XSD gives
+            // that type the `collapse` whiteSpace facet -- so ` urn:...:unspecified ` and the
+            // flush spelling are one value to every schema-aware reader. Comparing them raw
+            // re-opens the hole this rule was written to close, one space at a time.
+            let effective = collapse(name_format.as_deref().unwrap_or(UNSPECIFIED));
             if out.attributes.iter().any(|seen| {
-                seen.name == name && seen.name_format.as_deref().unwrap_or(UNSPECIFIED) == effective
+                seen.name == name
+                    && collapse(seen.name_format.as_deref().unwrap_or(UNSPECIFIED)) == effective
             }) {
                 return Err(Unreadable::Duplicate {
                     name: name.to_owned(),
@@ -283,11 +338,35 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Statement, Unreadable
     Ok(out)
 }
 
+/// XSD `whiteSpace="collapse"`, over the four characters the specification names.
+///
+/// Not `split_whitespace`, which splits on the whole Unicode whitespace property: XML Schema
+/// Part 2 names exactly `#x9`, `#xA`, `#xD` and `#x20`, and everything else is a character of
+/// the value. The same rule `ironauth-saml`'s condition layer applies to `saml:Audience`.
+fn collapse(text: &str) -> String {
+    text.split(['\t', '\n', '\r', ' '])
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// One `AttributeValue`, as text, emptiness, or a shape.
 fn value_of(value: &crate::verify::SignedElement<'_>) -> Value {
-    let children = value.element_children();
+    let children = value.element_children_resolved();
     if !children.is_empty() {
-        return Value::Structured(children);
+        return Value::Structured(
+            children
+                .into_iter()
+                .map(|(namespace, local, element)| Child {
+                    namespace,
+                    local,
+                    // `text_simple` and not `text`: a child that itself has element children
+                    // answers an empty string rather than its descendants concatenated, for the
+                    // reason this whole variant exists.
+                    text: element.text_simple().unwrap_or_default(),
+                })
+                .collect(),
+        );
     }
     match value.text_simple() {
         Some(text) if !text.is_empty() => Value::Text(text),

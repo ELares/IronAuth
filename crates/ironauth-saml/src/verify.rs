@@ -385,6 +385,36 @@ impl<'a> SignedElement<'a> {
             .collect()
     }
 
+    /// Every element child, with its RESOLVED name, as something to read further into.
+    ///
+    /// [`Self::element_children`] answers names alone, which is all an allowlist needs. A caller
+    /// that has IDENTIFIED a child and wants what is inside it needs the child itself -- the
+    /// SAML case being a `saml:NameID` inside an `AttributeValue`, where recognising it and then
+    /// having no way to read the name it carries is recognising it for nothing.
+    #[must_use]
+    pub fn element_children_resolved(&self) -> Vec<(String, String, SignedElement<'a>)> {
+        let scope = self.scoped.scope();
+        self.scoped
+            .element
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                RichNode::Element(nested) => {
+                    let inner = scope_within(nested, &scope);
+                    let namespace = resolve(&nested.name, &inner).unwrap_or_default();
+                    Some((
+                        namespace,
+                        local_name(&nested.name).to_owned(),
+                        SignedElement {
+                            scoped: Scoped::new(nested, scope.clone()),
+                        },
+                    ))
+                }
+                RichNode::Text(_) | RichNode::ProcessingInstruction(_) => None,
+            })
+            .collect()
+    }
+
     /// This element's text, refused outright if it has ELEMENT CHILDREN.
     ///
     /// # Simple content cannot contain elements, and concatenating across them invents a value
