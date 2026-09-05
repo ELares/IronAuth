@@ -103,6 +103,30 @@ pub enum AcsError {
     UnknownRequest,
     /// The response is unsolicited and this connection does not accept those.
     UnsolicitedRefused,
+    /// The assertion carries attributes encrypted for a key this pipeline was not given.
+    ///
+    /// SEPARATE FROM [`Self::EncryptionRequired`], which is about a CONNECTION SETTING this
+    /// build cannot honour. This one is about a DOCUMENT: the connection asked for nothing
+    /// special and the identity provider encrypted some attributes anyway, which this cannot
+    /// read and will not quietly drop.
+    EncryptedAttributes {
+        /// How many `EncryptedAttribute` elements were passed over.
+        count: usize,
+    },
+    /// The connection requires an encrypted assertion and this pipeline does not decrypt.
+    ///
+    /// ITS OWN VARIANT BECAUSE THE OPERATOR'S SITUATION IS SPECIFIC: they set a column this
+    /// build cannot honour. Silently accepting cleartext would be a control that configures
+    /// nothing, and folding it into a generic refusal would send them looking at their identity
+    /// provider for a limitation on this side.
+    EncryptionRequired,
+    /// The `NameID` carries a `Format` other than the one this connection is configured for.
+    WrongNameIdFormat {
+        /// What the connection expects.
+        expected: String,
+        /// What the assertion carried, if it carried one.
+        found: Option<String>,
+    },
     /// This assertion has been admitted before.
     Replayed,
     /// The store could not be reached, or refused the write.
@@ -125,6 +149,26 @@ impl core::fmt::Display for AcsError {
             Self::UnsolicitedRefused => {
                 f.write_str("this connection does not accept unsolicited responses")
             }
+            Self::EncryptedAttributes { count } => write!(
+                f,
+                "the assertion carries {count} encrypted attribute(s) this server cannot read"
+            ),
+            Self::EncryptionRequired => f.write_str(
+                "this connection requires an encrypted assertion, which this server does not yet \
+                 decrypt",
+            ),
+            Self::WrongNameIdFormat { expected, found } => match found {
+                Some(found) => write!(
+                    f,
+                    "the assertion's NameID Format is {found:?} and this connection expects \
+                     {expected:?}"
+                ),
+                None => write!(
+                    f,
+                    "the assertion's NameID names no Format and this connection expects \
+                     {expected:?}"
+                ),
+            },
             Self::Replayed => f.write_str("this assertion has already been used"),
             Self::Store(error) => write!(f, "the store refused the sign-in: {error}"),
         }
@@ -149,8 +193,10 @@ impl From<StoreError> for AcsError {
 /// your three certificates is unusable" into "nobody can sign in", which is the wrong blast
 /// radius for a configuration problem.
 ///
-/// An empty result is [`AcsError::NoTrustAnchor`] at the call site, which is the case an
-/// operator can act on.
+/// An empty result is [`AcsError::NoTrustAnchor`] at the call site -- so "skipped" and "fatal"
+/// are the SAME OUTCOME when the unusable certificate is the only one, and a test with a
+/// one-element list cannot tell them apart. What "skipped" buys is the multi-certificate case,
+/// which is what a rollover is made of.
 ///
 /// EXPIRY IS NOT CHECKED HERE. A pinned certificate's `not_after` is what #141 alerts on; it is
 /// not a reason to stop verifying, because the trust decision is the PINNING and an operator who
@@ -218,13 +264,6 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
     // defect this whole stack is built against.
     let carried = ironauth_saml::correlation(&assertion);
 
-    // AN UNSOLICITED RESPONSE IS ADMISSIBLE ONLY BY OPT-IN, and this is where that is decided --
-    // before any condition, because "this connection does not accept these at all" is a
-    // different answer from "this one is malformed" and the operator's fix differs.
-    if carried.is_none() && !acs.connection.allow_unsolicited {
-        return Err(AcsError::UnsolicitedRefused);
-    }
-
     let expectations = Expectations {
         issuer: &acs.connection.idp_entity_id,
         audience: &acs.connection.sp_entity_id,
@@ -238,7 +277,57 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
     };
     let accepted =
         check(&assertion, &expectations, acs.now_unix_secs).map_err(AcsError::Condition)?;
+
+    // THE UNSOLICITED DECISION COMES AFTER `check`, and an earlier version made it before.
+    // `correlation` answers `None` for TWO different documents: one carrying no `InResponseTo`,
+    // and one whose bearer confirmation cannot be read at all -- two of them, none, or no
+    // `Subject`. Deciding on `carried.is_none()` reported the malformed one as
+    // `UnsolicitedRefused`, which names a switch an operator could flip and that would not fix
+    // it, while the real fault went unnamed. After `check`, a malformed subject is already
+    // `Condition(Malformed)` and this sees only documents that are genuinely unsolicited.
+    //
+    // NOTHING IS SPENT EITHER WAY: both are stateless, and the caller spends nothing until this
+    // whole function has returned.
+    if accepted.in_response_to.is_none() && !acs.connection.allow_unsolicited {
+        return Err(AcsError::UnsolicitedRefused);
+    }
+
+    // AND THE CONNECTION'S OWN TWO REMAINING CONTROLS, which an earlier version read from the row
+    // and then ignored. A column that configures nothing is worse than no column, because an
+    // operator sets it and believes it.
+    if acs.connection.require_encrypted_assertion {
+        // NOT IMPLEMENTED, SO REFUSED. `ironauth-saml` can decrypt, but this pipeline is not
+        // wired to it and the connection's private key is not plumbed here. A connection that
+        // demands encryption and gets cleartext must not sign anybody in, and the operator has
+        // to be told which of the two it is.
+        return Err(AcsError::EncryptionRequired);
+    }
+    if accepted.name_id_format.as_deref() != Some(acs.connection.nameid_format.as_str()) {
+        // THE FORMAT IS PART OF THE IDENTITY, not decoration. `transient` names somebody for one
+        // session and `persistent` names them forever; accepting a transient `NameID` where a
+        // connection was configured for a persistent one keys an account to a value that will
+        // never be seen again -- and accepting a persistent one where transient was configured
+        // stores a correlatable identifier the operator chose not to.
+        return Err(AcsError::WrongNameIdFormat {
+            expected: acs.connection.nameid_format.clone(),
+            found: accepted.name_id_format.clone(),
+        });
+    }
+
     let statement = attributes(&assertion).map_err(AcsError::Attributes)?;
+    if statement.encrypted > 0 {
+        // AN ATTRIBUTE THIS PIPELINE CANNOT READ IS NOT AN ATTRIBUTE THAT IS ABSENT. The reader
+        // counts `EncryptedAttribute` rather than refusing, because refusing there would refuse
+        // a conformant document and would throw away everything sent in the clear beside it --
+        // it leaves the decision to whoever knows what the attributes are FOR. Here that is
+        // known: they feed the connection's mapping, so a dropped one is a trait the operator
+        // configured and this sign-in would silently not have. When that trait is a group
+        // membership, signing somebody in without it is signing them in with the wrong
+        // authorization, so this refuses and names the count.
+        return Err(AcsError::EncryptedAttributes {
+            count: statement.encrypted,
+        });
+    }
     Ok((accepted, statement))
 }
 

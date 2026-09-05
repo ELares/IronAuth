@@ -26,13 +26,21 @@
 //! choke point through which hostile SAML XML enters, and its dependency list is part of the
 //! argument. A JSON library here would be a second parser reachable from the same bytes.
 //!
-//! # A SAML attribute cannot yet be ADDRESSED by that mapper, and this says so
+//! # A DOTTED attribute Name cannot yet be ADDRESSED by that mapper, and this says so
 //!
-//! `claim_mapping::resolve_path` splits a mapping path on `.`, and a SAML attribute `Name` is a
-//! URI full of them: ADFS and Entra send
+//! `claim_mapping::resolve_path` splits a mapping path on `.`, and a SAML attribute `Name` is
+//! often a URI full of them: ADFS and Entra send
 //! `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`, which the resolver
-//! reads as a key called `http://schemas` followed by five more segments. So no real SAML
-//! attribute is addressable by a mapping path as the language stands.
+//! reads as three segments -- a key called `http://schemas`, then `xmlsoap`, then
+//! `org/ws/2005/05/identity/claims/emailaddress`. There is no key by any of those names, so that
+//! attribute is unreachable.
+//!
+//! THE LIMIT IS THE DOT, NOT SAML. An earlier version of this sentence said "no real SAML
+//! attribute is addressable", which is false and was worth catching, because it is the kind of
+//! claim that makes somebody build a fix for a problem wider than the one they have. A `Name`
+//! with no dot in it is a one-segment path and resolves today -- and short names are what an
+//! Okta or a `OneLogin` app sends by default (`email`, `firstName`, `groups`). What is unreachable
+//! is exactly the dotted ones, which is every URI-shaped name and so every ADFS or Entra default.
 //!
 //! AN EARLIER VERSION OF THIS PR CHANGED THE RESOLVER and it was a security defect, which is
 //! worth recording here rather than only in a commit message. Preferring a literal key let the
@@ -177,6 +185,19 @@ pub enum Unreadable {
     ///
     /// THE EMPTY STRING IS THE DEGENERATE INPUT the presence check alone does not catch, and a
     /// mapping keyed on `""` is not one anybody wrote on purpose.
+    ///
+    /// # Why this refuses where an `EncryptedAttribute` is merely counted
+    ///
+    /// Both are attributes this reader cannot hand back, so the two rules look inconsistent
+    /// sitting next to each other. They differ in whose choice produced them. An
+    /// `EncryptedAttribute` is a CONFORMANT element that the identity provider deliberately
+    /// encrypted for a key this pipeline was not given: refusing the assertion would refuse a
+    /// document that is exactly right, and the count says how many were passed over so the
+    /// caller can decide -- which the SAML endpoint does, by refusing rather than signing
+    /// somebody in with traits missing. A `Name`-less `Attribute` is SCHEMA-INVALID; `Name` is
+    /// required by SAML Core 2.7.3.1. Nothing downstream can decide anything useful about it,
+    /// there is no count that would let it, and a document breaking a MUST is a document whose
+    /// other contents are worth less trust, not more.
     NamelessAttribute,
     /// Two `Attribute`s that name the same thing.
     ///
@@ -188,7 +209,16 @@ pub enum Unreadable {
     Duplicate {
         /// The `Name` both carried.
         name: String,
-        /// The `NameFormat` both carried, if any.
+        /// The SECOND element's `NameFormat`, exactly as it was written, when it wrote one.
+        ///
+        /// NOT NECESSARILY WHAT THE FIRST CARRIED, and an earlier version of this doc said
+        /// "both". The comparison that produced this collapses whitespace and reads an absent
+        /// `NameFormat` as `unspecified`, so the pair that collided can be spelled two ways: an
+        /// element with no `NameFormat` at all collides with one written
+        /// `" ...:unspecified "`, and this reports the latter while the former carried `None`.
+        /// Reporting the raw spelling is the useful half -- it is the string an operator will
+        /// find in their identity provider's configuration -- but a reader that treats it as
+        /// what BOTH said would be wrong.
         name_format: Option<String>,
     },
 }
