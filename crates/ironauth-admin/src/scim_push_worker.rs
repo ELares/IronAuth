@@ -481,15 +481,22 @@ async fn record_subject_failure<T: ScimTransport, S: SubjectSource>(
         .record_failure(pass.connection_id, resource_type, &subject_id, why)
         .await
     {
-        Ok(()) => Ok(()),
-        // No link means this connection never provisioned the subject, so there is no per-resource
-        // row to carry the error. Counted in `refused` regardless, so the pass still reports it.
-        Err(StoreError::NotFound) => Ok(()),
+        // TWO DIFFERENT FACTS, ONE ANSWER, and the arms are merged because clippy is right
+        // that they are one branch -- the distinction is in the comment, not in the control
+        // flow. A write that succeeded, and one that found no link because this connection
+        // never provisioned the subject: neither leaves a per-resource row to carry an error,
+        // and both are counted in `refused` regardless, so the pass still reports it.
+        Ok(()) | Err(StoreError::NotFound) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
 
 /// Applies one event, recording what it did in `progress`.
+// The length is one event's whole journey: resolve the subject, map it, push it, and
+// record what happened -- each step with the reasoning for its failure handling. The
+// steps share the progress record, so splitting them would thread it through four
+// signatures to save nothing.
+#[allow(clippy::too_many_lines)]
 async fn apply_one<T: ScimTransport, S: SubjectSource>(
     store: &ironauth_store::ScopedStore<'_>,
     pass: &Pass<'_, T, S>,
@@ -971,7 +978,7 @@ where
         if let Err(error) = &outcome {
             record_connection_failure(store, &connection, error, now_unix_micros).await?;
         }
-        outcomes.push((connection.id.clone(), outcome));
+        outcomes.push((connection.id, outcome));
     }
     Ok(outcomes)
 }

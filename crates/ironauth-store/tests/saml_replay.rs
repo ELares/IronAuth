@@ -231,7 +231,6 @@ async fn concurrent_responses_naming_one_request_admit_exactly_one() {
     let mut handles = Vec::with_capacity(attempts);
     for _ in 0..attempts {
         let store = db.store().clone();
-        let connection = connection;
         handles.push(tokio::spawn(async move {
             store
                 .scoped(scope)
@@ -269,7 +268,6 @@ async fn concurrent_redemptions_of_one_assertion_admit_exactly_one() {
     let mut handles = Vec::with_capacity(attempts);
     for _ in 0..attempts {
         let store = db.store().clone();
-        let connection = connection;
         handles.push(tokio::spawn(async move {
             store
                 .scoped(scope)

@@ -200,6 +200,10 @@ impl Drop for ScimPushScheduler {
 /// worth proving is on THIS side of the transport: opening a sealed credential, building the
 /// directory, telling an observer about a connection that could not be prepared, and reaching
 /// the driver at all. The transport's own suite proves it speaks HTTP.
+// The length is the tick's own: claiming due connections, running each through the
+// worker, and recording every outcome with the reasoning that makes the ordering safe.
+// Splitting it would put the claim and the release of one lease in different functions.
+#[allow(clippy::too_many_lines)]
 pub async fn tick<T: ScimTransport + Clone>(
     store: &Store,
     scope: Scope,
@@ -283,7 +287,7 @@ pub async fn tick<T: ScimTransport + Clone>(
             .await
         {
             Ok(value) => match String::from_utf8(value) {
-                Ok(token) => credentials.push((connection.id.clone(), token)),
+                Ok(token) => credentials.push((connection.id, token)),
                 Err(_) => observer.connection_unavailable(
                     scope,
                     &connection.id,

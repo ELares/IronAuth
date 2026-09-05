@@ -461,7 +461,10 @@ struct Harness {
 
 impl Harness {
     /// A moment safely after `now_micros`, so a second pass in one test is not racing the first.
-    fn scope_now(&self, env: &Env) -> i64 {
+    ///
+    /// AN ASSOCIATED FUNCTION, not a method: it reads nothing from the harness, and taking
+    /// `&self` for a value derived only from the clock says it depends on state it does not.
+    fn scope_now(env: &Env) -> i64 {
         now_micros(env) + 1_000
     }
 
@@ -1081,20 +1084,26 @@ async fn the_driver_runs_due_connections_and_writes_the_backoff_a_failure_earns(
         json!({ "user_id": "usr_ada" }),
     )
     .await;
-    let outcomes = run_due_connections(&store, h.scope, h.scope_now(&h.env), 50, |connection| {
-        Some((
-            ScimPushClient::new(
-                FixtureTransport {
-                    downstream: h.downstream.clone(),
-                },
-                BASE,
-                TOKEN,
-                WriteMode::Patch,
-            ),
-            directory.clone(),
-            connection.organization_id.to_string(),
-        ))
-    })
+    let outcomes = run_due_connections(
+        &store,
+        h.scope,
+        Harness::scope_now(&h.env),
+        50,
+        |connection| {
+            Some((
+                ScimPushClient::new(
+                    FixtureTransport {
+                        downstream: h.downstream.clone(),
+                    },
+                    BASE,
+                    TOKEN,
+                    WriteMode::Patch,
+                ),
+                directory.clone(),
+                connection.organization_id.to_string(),
+            ))
+        },
+    )
     .await
     .expect("the due listing reads");
     assert!(outcomes[0].1.is_err(), "the outage was not reported");
@@ -1122,7 +1131,7 @@ async fn the_driver_runs_due_connections_and_writes_the_backoff_a_failure_earns(
     // a backoff rather than a number in a column.
     let still_due = store
         .scim_push_connections()
-        .due_for_sync(h.scope_now(&h.env), 50)
+        .due_for_sync(Harness::scope_now(&h.env), 50)
         .await
         .expect("due listing");
     assert!(
