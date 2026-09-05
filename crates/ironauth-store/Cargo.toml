@@ -1001,3 +1001,17 @@ required-features = ["testing"]
 name = "scim_push_connections"
 path = "tests/scim_push_connections.rs"
 required-features = ["testing"]
+
+# Inbound SAML connections and their pinned trust anchors. The only connection table whose
+# misconfiguration lets somebody else sign in as your users, so its isolation gets its own file.
+[[test]]
+name = "saml_connections"
+path = "tests/saml_connections.rs"
+required-features = ["testing"]
+
+# What makes a SAML response usable exactly once. Separate from the connection file because the
+# property it measures is a concurrency property, and #139 asks for it to be proven as one.
+[[test]]
+name = "saml_replay"
+path = "tests/saml_replay.rs"
+required-features = ["testing"]

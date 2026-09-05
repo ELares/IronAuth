@@ -1267,6 +1267,32 @@ impl ScopedKind for ScimPushLinkKind {
     const PREFIX: &'static str = "spl";
 }
 
+/// Marker for an inbound SAML connection (`smc_`, issue #139).
+///
+/// The identifier of the TRUST DECISION: which identity provider an organization signs in
+/// through, and on what terms. It holds no key material -- the pinned keys are rows of their own
+/// -- so this handle is safe in a log line, which matters because it is what an ACS failure is
+/// attributed to and those get read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SamlConnectionKind;
+impl ScopedKind for SamlConnectionKind {
+    const PREFIX: &'static str = "smc";
+}
+
+/// Marker for a pinned SAML signing key (`smk_`, issue #139).
+///
+/// The identifier of ONE trust anchor on one connection. A connection pins several so a
+/// certificate rotation is not an outage, and this is what an operator names to remove the one
+/// that has expired.
+///
+/// PUBLIC KEY MATERIAL ONLY, so unlike a credential handle there is nothing here to protect: the
+/// row holds an identity provider's published certificate and the key parsed out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SamlCertificateKind;
+impl ScopedKind for SamlCertificateKind {
+    const PREFIX: &'static str = "smk";
+}
+
 /// Marker for a Native SSO device secret (`nsd_`, issue #133, PROTOTYPE).
 ///
 /// The identifier of the ROW, never the secret. The secret itself is high-entropy, returned
@@ -2137,6 +2163,10 @@ pub type ScimPushLinkId = ScopedId<ScimPushLinkKind>;
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
 /// An OUTBOUND SCIM connection identifier (`spc_...`), issue #137.
 pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
+/// An inbound SAML connection identifier (`smc_...`), issue #139. The trust decision, never a key.
+pub type SamlConnectionId = ScopedId<SamlConnectionKind>;
+/// A pinned SAML signing key identifier (`smk_...`), issue #139.
+pub type SamlCertificateId = ScopedId<SamlCertificateKind>;
 /// A Native SSO device secret row identifier (`nsd_...`), issue #133. The row, never the
 /// secret: the secret is stored only as a digest.
 pub type NativeSsoDeviceSecretId = ScopedId<NativeSsoDeviceSecretKind>;

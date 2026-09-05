@@ -97,12 +97,13 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, ScimConnectionId, ScimEnterpriseId, ScimExternalIdId,
-    ScimPushConnectionId, ScimPushLinkId, ScopeStepUpPolicyId, ServiceAccountId, SessionId,
-    SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId, SmsOtpCodeId,
-    SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId,
-    TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
-    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, ScimConnectionId,
+    ScimEnterpriseId, ScimExternalIdId, ScimPushConnectionId, ScimPushLinkId, ScopeStepUpPolicyId,
+    ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId,
+    SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId,
+    TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId,
+    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
+    WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -205,6 +206,31 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ScimConnectionRepo<'a> {
         ScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The inbound SAML connections an organization signs in through (issue #139).
+    ///
+    /// READ-ONLY here. Pinning a trust anchor decides who may assert an identity in this
+    /// environment, so the lifecycle goes through [`ScopedStore::acting`] and the CONTROL plane;
+    /// the assertion consumer runs on the data plane and only reads.
+    #[must_use]
+    pub fn saml_connections(&self) -> SamlConnectionRepo<'a> {
+        SamlConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The one-time-use state that makes a SAML response unrepeatable (issue #139).
+    ///
+    /// WRITEABLE here, unlike the connection, because issuing an AuthnRequest and consuming the
+    /// response are both sign-in and sign-in runs on the data plane.
+    #[must_use]
+    pub fn saml_replay(&self) -> SamlReplayRepo<'a> {
+        SamlReplayRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1666,6 +1692,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ActingScimConnectionRepo<'a> {
         ActingScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of the inbound SAML connections and their pinned keys (issue #139).
+    #[must_use]
+    pub fn saml_connections(&self) -> ActingSamlConnectionRepo<'a> {
+        ActingSamlConnectionRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -75292,6 +75328,533 @@ fn scim_push_connection_from_row(
     })
 }
 
+/// A SAML connection as stored (issue #139). Carries no key material: the pinned keys are
+/// [`SamlCertificate`] rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamlConnection {
+    /// The `smc_` identifier.
+    pub id: SamlConnectionId,
+    /// The organization whose people sign in through this identity provider.
+    pub organization_id: OrganizationId,
+    /// The operator-facing label.
+    pub display_name: String,
+    /// What the identity provider calls itself. A response's `Issuer` must equal this.
+    pub idp_entity_id: String,
+    /// Where an AuthnRequest is sent.
+    pub idp_sso_url: String,
+    /// What this deployment calls itself to this identity provider. The `Audience` must equal it.
+    pub sp_entity_id: String,
+    /// The assertion consumer service URL a response must name in `Destination` and `Recipient`.
+    pub acs_url: String,
+    /// Whether a response with no `InResponseTo` is accepted at all.
+    pub allow_unsolicited: bool,
+    /// The tolerance applied to `NotBefore` and `NotOnOrAfter`.
+    pub clock_skew_secs: i32,
+    /// The longest an assertion may be valid for, whatever the identity provider asserted.
+    pub max_assertion_age_secs: i32,
+    /// The `NameID` format this connection expects.
+    pub nameid_format: String,
+    /// How assertion attributes become identity traits.
+    pub attribute_mapping: serde_json::Value,
+    /// Whether the assertion must arrive encrypted.
+    pub require_encrypted_assertion: bool,
+    /// Whether an operator has left this connection switched on.
+    pub active: bool,
+    /// Creation, in microseconds since the epoch.
+    pub created_at_unix_micros: i64,
+    /// Last update, in microseconds since the epoch.
+    pub updated_at_unix_micros: i64,
+}
+
+/// Which curve or algorithm a pinned key is for.
+///
+/// A stored vocabulary the column's CHECK pins, so the wire strings are the contract and are
+/// spelled once here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamlKeyKind {
+    /// ECDSA on P-256, key as the uncompressed point.
+    EcdsaP256,
+    /// ECDSA on P-384, key as the uncompressed point.
+    EcdsaP384,
+    /// RSA, key as the big-endian modulus with the exponent beside it.
+    Rsa,
+}
+
+impl SamlKeyKind {
+    /// Every kind, so a caller can walk the vocabulary without repeating it.
+    pub const ALL: [Self; 3] = [Self::EcdsaP256, Self::EcdsaP384, Self::Rsa];
+
+    /// The wire string the column stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EcdsaP256 => "ecdsa_p256",
+            Self::EcdsaP384 => "ecdsa_p384",
+            Self::Rsa => "rsa",
+        }
+    }
+
+    /// Parse a stored value.
+    ///
+    /// NOT `FromStr`, and the name says why: this reads a value THIS crate wrote under a CHECK
+    /// constraint, not caller input. An unknown one is a schema drift, and answering `None` lets
+    /// the read report that rather than a parse failure a caller might retry.
+    #[must_use]
+    pub fn parse_stored(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == raw)
+    }
+}
+
+/// A signing key one SAML connection trusts (issue #139).
+///
+/// # `public_key` is the verifier's input and `certificate_der` is the operator's view
+///
+/// `ironauth-saml` verifies against raw key material and deliberately never parses X.509, so the
+/// certificate is parsed ONCE at pinning time and both halves are kept. Nothing on the assertion
+/// path reads `certificate_der`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamlCertificate {
+    /// The `smk_` identifier.
+    pub id: SamlCertificateId,
+    /// The connection this key is pinned on.
+    pub connection_id: SamlConnectionId,
+    /// Which curve or algorithm.
+    pub key_kind: SamlKeyKind,
+    /// The raw key material, in the encoding `key_kind` names.
+    pub public_key: Vec<u8>,
+    /// The RSA public exponent, present only for [`SamlKeyKind::Rsa`].
+    pub rsa_exponent: Option<Vec<u8>>,
+    /// The certificate the key was parsed out of.
+    pub certificate_der: Vec<u8>,
+    /// SHA-256 of `certificate_der`, which is what an operator compares against what their
+    /// identity provider published.
+    pub fingerprint_sha256: Vec<u8>,
+    /// Validity start, in microseconds since the epoch.
+    pub not_before_unix_micros: i64,
+    /// Validity end, in microseconds since the epoch. What #141's expiry alerting reads.
+    pub not_after_unix_micros: i64,
+    /// When it was pinned, in microseconds since the epoch.
+    pub created_at_unix_micros: i64,
+}
+
+/// The columns a SAML connection read projects.
+const SAML_CONNECTION_COLUMNS: &str = "id, organization_id, display_name, idp_entity_id, \
+     idp_sso_url, sp_entity_id, acs_url, allow_unsolicited, clock_skew_secs, \
+     max_assertion_age_secs, nameid_format, attribute_mapping, \
+     require_encrypted_assertion, active, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// The columns a pinned-key read projects.
+const SAML_CERTIFICATE_COLUMNS: &str = "id, connection_id, key_kind, public_key, rsa_exponent, \
+     certificate_der, fingerprint_sha256, \
+     (EXTRACT(EPOCH FROM not_before) * 1000000)::bigint AS not_before_us, \
+     (EXTRACT(EPOCH FROM not_after) * 1000000)::bigint AS not_after_us, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
+
+/// Reconstruct a [`SamlConnection`] from a read row.
+fn saml_connection_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<SamlConnection, StoreError> {
+    let id_text: String = row.get("id");
+    let id =
+        SamlConnectionId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    let org_text: String = row.get("organization_id");
+    let organization_id =
+        OrganizationId::parse_in_scope(&org_text, &scope).map_err(|_| StoreError::NotFound)?;
+    Ok(SamlConnection {
+        id,
+        organization_id,
+        display_name: row.get("display_name"),
+        idp_entity_id: row.get("idp_entity_id"),
+        idp_sso_url: row.get("idp_sso_url"),
+        sp_entity_id: row.get("sp_entity_id"),
+        acs_url: row.get("acs_url"),
+        allow_unsolicited: row.get("allow_unsolicited"),
+        clock_skew_secs: row.get("clock_skew_secs"),
+        max_assertion_age_secs: row.get("max_assertion_age_secs"),
+        nameid_format: row.get("nameid_format"),
+        attribute_mapping: row.get("attribute_mapping"),
+        require_encrypted_assertion: row.get("require_encrypted_assertion"),
+        active: row.get("active"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reconstruct a [`SamlCertificate`] from a read row.
+fn saml_certificate_from_row(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<SamlCertificate, StoreError> {
+    let id_text: String = row.get("id");
+    let id =
+        SamlCertificateId::parse_in_scope(&id_text, &scope).map_err(|_| StoreError::NotFound)?;
+    let connection_text: String = row.get("connection_id");
+    let connection_id = SamlConnectionId::parse_in_scope(&connection_text, &scope)
+        .map_err(|_| StoreError::NotFound)?;
+    let kind_text: String = row.get("key_kind");
+    // A VALUE THE CHECK CONSTRAINT PINS, so an unknown one is schema drift and not caller input.
+    // Reported as `NotFound` rather than decoded loosely: a key whose kind this binary does not
+    // understand is a key it must not hand a verifier.
+    let key_kind = SamlKeyKind::parse_stored(&kind_text).ok_or(StoreError::NotFound)?;
+    Ok(SamlCertificate {
+        id,
+        connection_id,
+        key_kind,
+        public_key: row.get("public_key"),
+        rsa_exponent: row.get("rsa_exponent"),
+        certificate_der: row.get("certificate_der"),
+        fingerprint_sha256: row.get("fingerprint_sha256"),
+        not_before_unix_micros: row.get("not_before_us"),
+        not_after_unix_micros: row.get("not_after_us"),
+        created_at_unix_micros: row.get("created_us"),
+    })
+}
+
+/// Read-only access to the SAML connections and their pinned keys (issue #139).
+pub struct SamlConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SamlConnectionRepo<'_> {
+    /// Parse an `smc_` handle, refusing one from another scope.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a malformed handle or one belonging to another scope. The
+    /// UNIFORM not-found: a caller must not be able to tell "no such connection" from "not
+    /// yours", because the difference is a probe.
+    pub fn parse_id(&self, raw: &str) -> Result<SamlConnectionId, StoreError> {
+        SamlConnectionId::parse_in_scope(raw, &self.scope).map_err(|_| StoreError::NotFound)
+    }
+
+    /// One connection by id, within one organization.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. A connection in another organization is
+    /// `Ok(None)`, the same as one that does not exist.
+    pub async fn find_in_org(
+        &self,
+        org_id: &OrganizationId,
+        id: &SamlConnectionId,
+    ) -> Result<Option<SamlConnection>, StoreError> {
+        if org_id.scope() != self.scope || id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SAML_CONNECTION_COLUMNS} FROM saml_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 AND id = $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| saml_connection_from_row(row, self.scope))
+            .transpose()
+    }
+
+    /// The LIVE connection a response arrived for, named by the assertion consumer URL it was
+    /// posted to.
+    ///
+    /// # Why the ACS is per connection, and why the `Issuer` is a CHECK rather than a lookup
+    ///
+    /// The obvious design resolves the connection from the response's `Issuer`. It does not work,
+    /// and the reason is a configuration customers have all the time: two organizations in one
+    /// environment behind ONE identity provider tenant. A customer with two workspaces in your
+    /// product signs both into their single Okta, so both connections carry the same
+    /// `idp_entity_id` -- and an issuer lookup then has two rows to choose from and no basis for
+    /// choosing. Whichever it returned, the organization it reported would not be determined by
+    /// the response.
+    ///
+    /// Making the issuer globally unique instead would REFUSE that configuration, which is not a
+    /// defect to fix but a customer to serve.
+    ///
+    /// So the connection is identified by WHERE the response arrived: each one publishes its own
+    /// assertion consumer URL, which is what an operator pastes into their identity provider, and
+    /// the id is in the path. The `Issuer` is then checked AGAINST the resolved connection --
+    /// which is the stronger statement anyway, because a lookup can only find a row that matches
+    /// while a check can refuse one that does not.
+    ///
+    /// DISABLED CONNECTIONS ARE INVISIBLE HERE. An operator's switch has to mean the identity
+    /// provider stops being trusted, and returning the row for the caller to check would make
+    /// that a rule every caller has to remember.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn find_active(
+        &self,
+        id: &SamlConnectionId,
+    ) -> Result<Option<SamlConnection>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SAML_CONNECTION_COLUMNS} FROM saml_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND active"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| saml_connection_from_row(row, self.scope))
+            .transpose()
+    }
+
+    /// One organization's connections, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_org(
+        &self,
+        org_id: &OrganizationId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<SamlConnection>, StoreError> {
+        if org_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SAML_CONNECTION_COLUMNS} FROM saml_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND ($4::bigint IS NULL OR (created_at, id) > \
+                  (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| saml_connection_from_row(row, self.scope))
+            .collect()
+    }
+
+    /// Every key pinned on one connection, newest first.
+    ///
+    /// # Every one of these verifies, and that is the rollover
+    ///
+    /// A caller hands the whole set to the verifier. An identity provider rotates on its own
+    /// schedule, so an operator pins the new certificate before the switch and removes the old
+    /// one after; during the overlap both are here and either signature is accepted.
+    ///
+    /// EXPIRY IS NOT FILTERED HERE. A certificate's own validity window says when the identity
+    /// provider intended it to be usable, and this deployment is not the one that decides that:
+    /// refusing an expired pin silently would turn a customer's certificate lapse into an outage
+    /// with no explanation, where returning it lets the caller say which pin was used and #141
+    /// warn before it lapses.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn certificates(
+        &self,
+        connection_id: &SamlConnectionId,
+    ) -> Result<Vec<SamlCertificate>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SAML_CERTIFICATE_COLUMNS} FROM saml_connection_certificates \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+             ORDER BY created_at DESC, id"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| saml_certificate_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// The one-time-use state that makes a SAML response unrepeatable (issue #139).
+///
+/// # Two defences, and which one applies is the connection's choice
+///
+/// An outstanding request is the strong one: a response must name an AuthnRequest this
+/// deployment issued and has not consumed, so a captured response is useless a second time and a
+/// response nobody asked for is useless the first. It is what `allow_unsolicited = false` means.
+///
+/// The assertion replay cache is what stands in for it when an operator opts into IdP-initiated
+/// sign-in. There is no request to correlate then, so the assertion's own ID is remembered for
+/// its validity window instead.
+pub struct SamlReplayRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SamlReplayRepo<'_> {
+    /// Record an AuthnRequest this deployment has just issued.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, including the unique violation a
+    /// repeated request id raises. An id this deployment minted twice is a broken entropy seam,
+    /// not a condition to handle.
+    pub async fn issue_request(
+        &self,
+        connection_id: &SamlConnectionId,
+        request_id: &str,
+        relay_state: Option<&str>,
+        issued_at_unix_micros: i64,
+        expires_at_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // THE PARENT IS CHECKED IN THE STATEMENT. The foreign key proves the connection EXISTS
+        // and not that it is visible here, because referential integrity bypasses row-level
+        // security. Without this a request could be issued against another scope's connection,
+        // and the redemption keyed on it would then be answerable there.
+        let inserted = sqlx::query(
+            "INSERT INTO saml_outstanding_requests \
+             (id, tenant_id, environment_id, connection_id, relay_state, created_at, expires_at) \
+             SELECT $1, $2, $3, $4, $5, \
+                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                    TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             WHERE EXISTS (SELECT 1 FROM saml_connections \
+                           WHERE tenant_id = $2 AND environment_id = $3 AND id = $4)",
+        )
+        .bind(request_id)
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(relay_state)
+        .bind(issued_at_unix_micros)
+        .bind(expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Consume the request a response names, answering the relay state it carried.
+    ///
+    /// # One statement, because two would be a race
+    ///
+    /// The check and the consumption are one conditional UPDATE: `WHERE consumed_at IS NULL AND
+    /// expires_at > now()`. Two concurrent responses naming one request therefore produce exactly
+    /// one winner, and the loser cannot tell that from a request that never existed -- which is
+    /// what "one-time use" has to mean under concurrency.
+    ///
+    /// A read followed by a write would admit both, and the window is exactly the one an attacker
+    /// replaying a captured response is aiming at.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no live unconsumed request of that id belongs to this
+    /// connection: unknown, expired, already used, or another connection's. The four are
+    /// deliberately indistinguishable. [`StoreError::Database`] otherwise.
+    pub async fn consume_request(
+        &self,
+        connection_id: &SamlConnectionId,
+        request_id: &str,
+        now_unix_micros: i64,
+    ) -> Result<Option<String>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "UPDATE saml_outstanding_requests \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 AND id = $4 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             RETURNING relay_state",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(request_id)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        Ok(row.get::<Option<String>, _>("relay_state"))
+    }
+
+    /// Admit an assertion id exactly once, for the window it stays valid.
+    ///
+    /// # The INSERT is the check
+    ///
+    /// A read-then-write would admit two concurrent redemptions of one assertion, and that is the
+    /// whole attack an unsolicited response invites. The primary key makes the duplicate a unique
+    /// violation inside the transaction that is admitting it, so exactly one wins however many
+    /// arrive together.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] when this assertion has already been seen. [`StoreError::Database`]
+    /// otherwise.
+    pub async fn admit_assertion(
+        &self,
+        connection_id: &SamlConnectionId,
+        assertion_id: &str,
+        seen_at_unix_micros: i64,
+        expires_at_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        if connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO saml_assertion_replay \
+             (tenant_id, environment_id, connection_id, assertion_id, seen_at, expires_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .bind(assertion_id)
+        .bind(seen_at_unix_micros)
+        .bind(expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+}
+
 /// The OUTBOUND SCIM connections for one scope, read only (issue #137).
 pub struct ScimPushConnectionRepo<'a> {
     store: &'a Store,
@@ -75472,6 +76035,447 @@ pub struct NewScimPushConnection<'a> {
     pub write_mode: ScimWriteMode,
     /// What a departure means downstream.
     pub deletion_policy: ScimDeletionPolicy,
+}
+
+/// What a new SAML connection names.
+#[derive(Debug, Clone, Copy)]
+pub struct NewSamlConnection<'a> {
+    /// The `smc_` handle the caller minted.
+    pub id: &'a SamlConnectionId,
+    /// The organization whose people sign in through this identity provider.
+    pub organization_id: &'a OrganizationId,
+    /// The operator-facing label.
+    pub display_name: &'a str,
+    /// What the identity provider calls itself; a response's `Issuer` must equal it.
+    pub idp_entity_id: &'a str,
+    /// Where an AuthnRequest is sent.
+    pub idp_sso_url: &'a str,
+    /// What this deployment calls itself to this identity provider.
+    pub sp_entity_id: &'a str,
+    /// The assertion consumer service URL a response must name.
+    pub acs_url: &'a str,
+    /// Whether a response with no `InResponseTo` is accepted at all.
+    pub allow_unsolicited: bool,
+    /// The tolerance applied to the assertion's time bounds.
+    pub clock_skew_secs: i32,
+    /// The longest an assertion may be valid for, whatever the identity provider asserted.
+    pub max_assertion_age_secs: i32,
+    /// The `NameID` format this connection expects.
+    pub nameid_format: &'a str,
+    /// How assertion attributes become identity traits.
+    pub attribute_mapping: &'a serde_json::Value,
+    /// Whether the assertion must arrive encrypted.
+    pub require_encrypted_assertion: bool,
+}
+
+/// What a new pinned key carries.
+///
+/// # The caller has already parsed the certificate
+///
+/// The split between `public_key` and `certificate_der` is the whole reason this type exists:
+/// `ironauth-saml` verifies against raw key material and never parses X.509, so the parse happens
+/// at the surface, once, and both halves arrive here. A repository that took only the certificate
+/// would have to parse it, which would put an X.509 parser under the store.
+#[derive(Debug, Clone, Copy)]
+pub struct NewSamlCertificate<'a> {
+    /// The `smk_` handle the caller minted.
+    pub id: &'a SamlCertificateId,
+    /// The connection this key is pinned on.
+    pub connection_id: &'a SamlConnectionId,
+    /// Which curve or algorithm.
+    pub key_kind: SamlKeyKind,
+    /// The raw key material, in the encoding `key_kind` names.
+    pub public_key: &'a [u8],
+    /// The RSA public exponent. Must be present for [`SamlKeyKind::Rsa`] and absent otherwise;
+    /// the column's CHECK says so too, so a mismatch is refused rather than stored.
+    pub rsa_exponent: Option<&'a [u8]>,
+    /// The certificate the key came out of.
+    pub certificate_der: &'a [u8],
+    /// SHA-256 of `certificate_der`.
+    pub fingerprint_sha256: &'a [u8],
+    /// Validity start, in microseconds since the epoch.
+    pub not_before_unix_micros: i64,
+    /// Validity end, in microseconds since the epoch.
+    pub not_after_unix_micros: i64,
+}
+
+/// The WRITE side of the inbound SAML connections (issue #139).
+pub struct ActingSamlConnectionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSamlConnectionRepo<'_> {
+    /// Create a connection. It trusts nothing until a key is pinned to it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id belongs to another scope, [`StoreError::Conflict`]
+    /// if the handle is taken or this organization already has a connection for that identity
+    /// provider, [`StoreError::Database`] otherwise.
+    pub async fn create(
+        &self,
+        env: &Env,
+        spec: NewSamlConnection<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let NewSamlConnection {
+            id,
+            organization_id,
+            display_name,
+            idp_entity_id,
+            idp_sso_url,
+            sp_entity_id,
+            acs_url,
+            allow_unsolicited,
+            clock_skew_secs,
+            max_assertion_age_secs,
+            nameid_format,
+            attribute_mapping,
+            require_encrypted_assertion,
+        } = spec;
+        // BOTH ids. The organization guard is the one this exists for: without it a control-plane
+        // caller attaches an identity provider to another tenant's organization and the foreign
+        // key waves it through, because referential integrity does not see row-level security.
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let organization_id = organization_id.to_string();
+        let display_name = display_name.to_owned();
+        let idp_entity_id = idp_entity_id.to_owned();
+        let idp_sso_url = idp_sso_url.to_owned();
+        let sp_entity_id = sp_entity_id.to_owned();
+        let acs_url = acs_url.to_owned();
+        let nameid_format = nameid_format.to_owned();
+        let attribute_mapping = attribute_mapping.clone();
+        let organization_detail = organization_id.clone();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SamlConnectionCreated,
+                target: &id,
+            },
+            async |tx| {
+                sqlx::query(
+                    "INSERT INTO saml_connections \
+                     (id, tenant_id, environment_id, organization_id, display_name, \
+                      idp_entity_id, idp_sso_url, sp_entity_id, acs_url, allow_unsolicited, \
+                      clock_skew_secs, max_assertion_age_secs, nameid_format, \
+                      attribute_mapping, require_encrypted_assertion) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&display_name)
+                .bind(&idp_entity_id)
+                .bind(&idp_sso_url)
+                .bind(&sp_entity_id)
+                .bind(&acs_url)
+                .bind(allow_unsolicited)
+                .bind(clock_skew_secs)
+                .bind(max_assertion_age_secs)
+                .bind(&nameid_format)
+                .bind(&attribute_mapping)
+                .bind(require_encrypted_assertion)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
+                insert_idempotency(tx, idempotency).await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(&organization_detail),
+        )
+        .await
+    }
+
+    /// Pin a signing key to a connection.
+    ///
+    /// # This is the trust decision, and it is audited as its own action
+    ///
+    /// After this, a signature from this key is believed to come from that identity provider.
+    /// It happens repeatedly over a connection's life as certificates rotate, which is why it is
+    /// `SamlCertificatePinned` rather than an update to the connection: an operator reading the
+    /// log has to see each rotation as an event.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either id belongs to another scope or no such connection is
+    /// visible here, [`StoreError::Conflict`] if this key is already pinned on this connection,
+    /// [`StoreError::Database`] otherwise.
+    pub async fn pin_certificate(
+        &self,
+        env: &Env,
+        spec: NewSamlCertificate<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let NewSamlCertificate {
+            id,
+            connection_id,
+            key_kind,
+            public_key,
+            rsa_exponent,
+            certificate_der,
+            fingerprint_sha256,
+            not_before_unix_micros,
+            not_after_unix_micros,
+        } = spec;
+        if id.scope() != self.scope || connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let connection_text = connection_id.to_string();
+        let public_key = public_key.to_vec();
+        let rsa_exponent = rsa_exponent.map(<[u8]>::to_vec);
+        let certificate_der = certificate_der.to_vec();
+        let fingerprint_sha256 = fingerprint_sha256.to_vec();
+        let connection_detail = connection_text.clone();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SamlCertificatePinned,
+                target: &id,
+            },
+            async |tx| {
+                // THE PARENT IS CHECKED IN THE STATEMENT, not before it. The foreign key proves
+                // the connection EXISTS and does not prove it is visible here: referential
+                // integrity bypasses row-level security, so a key could otherwise be pinned to
+                // another scope's connection. The `SELECT` in the `INSERT` runs under the policy.
+                let inserted = sqlx::query(
+                    "INSERT INTO saml_connection_certificates \
+                     (id, tenant_id, environment_id, connection_id, key_kind, public_key, \
+                      rsa_exponent, certificate_der, fingerprint_sha256, not_before, not_after) \
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                            TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                            TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval \
+                     WHERE EXISTS (SELECT 1 FROM saml_connections \
+                                   WHERE tenant_id = $2 AND environment_id = $3 AND id = $4)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&connection_text)
+                .bind(key_kind.as_str())
+                .bind(&public_key)
+                .bind(&rsa_exponent)
+                .bind(&certificate_der)
+                .bind(&fingerprint_sha256)
+                .bind(not_before_unix_micros)
+                .bind(not_after_unix_micros)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
+                if inserted.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                insert_idempotency(tx, idempotency).await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(&connection_detail),
+        )
+        .await
+    }
+
+    /// Remove a pinned key.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such pin is visible here, [`StoreError::Database`]
+    /// otherwise.
+    pub async fn unpin_certificate(
+        &self,
+        env: &Env,
+        id: &SamlCertificateId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SamlCertificateUnpinned,
+                target: &id,
+            },
+            async |tx| {
+                let deleted = sqlx::query(
+                    "DELETE FROM saml_connection_certificates \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if deleted.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Turn a connection on or off without deleting it.
+    ///
+    /// # Why this exists in the same slice as the lookup
+    ///
+    /// [`SamlConnectionRepo::find_active`] filters on `active`, and a column a query reads that
+    /// nothing can write is a filter that can never be false: the switch would be a comment.
+    ///
+    /// # Why it is not a deletion
+    ///
+    /// Turning an identity provider off is the action an operator takes under pressure -- a
+    /// customer reports a compromise, or a certificate turns out to be wrong -- and it has to be
+    /// reversible without losing the pins. Deleting cascades them away, so recovering means
+    /// re-pinning every key, which is the slowest possible thing to ask for at that moment.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such connection is visible here, [`StoreError::Database`]
+    /// otherwise.
+    pub async fn set_active(
+        &self,
+        env: &Env,
+        id: &SamlConnectionId,
+        active: bool,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                // ONE ACTION PER DIRECTION. The same action as a deletion would make "switched
+                // off" byte-identical to "removed" -- and only the second lost its trust anchors.
+                // A single action for the switch would make "turned back on" byte-identical to
+                // "turned off", which is the first question an incident review asks. The first
+                // version wrote the deletion action while a comment beside it explained why that
+                // would be wrong; the second collapsed both directions into one.
+                action: if active {
+                    Action::SamlConnectionEnabled
+                } else {
+                    Action::SamlConnectionDisabled
+                },
+                target: &id,
+            },
+            async |tx| {
+                let updated = sqlx::query(
+                    "UPDATE saml_connections SET active = $4, updated_at = now() \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(active)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Delete a connection, and with it every key pinned to it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no such connection is visible here, [`StoreError::Database`]
+    /// otherwise.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        id: &SamlConnectionId,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SamlConnectionDeleted,
+                target: &id,
+            },
+            async |tx| {
+                // THE PINS GO WITH IT, by the cascade the child table declares. Leaving them
+                // would leave trust anchors behind for a connection an operator believes they
+                // deleted, and a later connection reusing the identity provider would inherit
+                // keys nobody re-approved.
+                let deleted = sqlx::query(
+                    "DELETE FROM saml_connections \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if deleted.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await
+    }
 }
 
 /// The WRITE side of the outbound SCIM connections (issue #137).
