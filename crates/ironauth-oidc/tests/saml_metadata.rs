@@ -5,8 +5,14 @@
 //! The start endpoint signs every `AuthnRequest` with the connection's key and nothing published
 //! the public half, so an identity provider configured to verify had nothing to verify against.
 //! The headline test here drives both ends: fetch the metadata, take the certificate out of it,
-//! and verify a real request this deployment signed -- which is exactly what the far side does,
-//! and the only check that proves the document is about the right key.
+//! and verify a real request this deployment signed -- which is exactly what the far side does.
+//!
+//! IT IS NOT THE ONLY CHECK THAT CATCHES A CERTIFICATE FOR THE WRONG KEY, which earlier versions
+//! of this paragraph and of the headline test claimed. `ironauth-saml`'s own suite compares the
+//! published modulus to the signing key's in a second, and would fail the same mutant. What this
+//! one adds is that it goes through the ROUTE and through a real signature: the far side's
+//! question is "does this certificate verify what you send me", and a modulus comparison answers
+//! a question one step short of it.
 #![cfg(feature = "testing")]
 
 mod common;
@@ -256,10 +262,15 @@ fn certificate_der(document: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn the_published_certificate_verifies_a_request_this_deployment_signed() {
-    // BOTH ENDS, which is the only check that proves the document is about the right key. A
-    // metadata document carrying a well-formed certificate for a DIFFERENT key passes every
-    // structural assertion and fails every real sign-in, diagnosed at the identity provider as
-    // a signature problem with no hint that the metadata is where to look.
+    // BOTH ENDS, which is the strongest form of the question and not the only check that asks
+    // it: `ironauth-saml`'s round-trip test compares the published modulus to the signing key's
+    // and fails the same mutant in a second, without a database. What this adds is the ROUTE and
+    // a real signature.
+    //
+    // A metadata document carrying a well-formed certificate for a DIFFERENT key passes every
+    // STRUCTURAL assertion -- an earlier version of this comment said "every assertion", which
+    // the modulus comparison disproves -- and fails every real sign-in, diagnosed at the
+    // identity provider as a signature problem with no hint that the metadata is where to look.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, true).await;
     let metadata_path = format!(

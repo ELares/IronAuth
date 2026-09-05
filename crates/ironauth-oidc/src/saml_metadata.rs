@@ -129,10 +129,18 @@ pub async fn metadata_get(
             // CACHEABLE, BRIEFLY, AS JWKS IN THIS CRATE ALREADY IS. Two earlier versions of
             // this comment got the comparison wrong and each was checkable: the first said this
             // endpoint was alone in being cacheable, and its correction gave JWKS an hour.
-            // `JwksCacheWindow` admits 300..=900 and defaults to 600 (`issuer.rs`), a config
-            // outside that range refuses the process at load, and `issuer_http.rs` pins the
-            // served value at 600 -- so no configuration of this build serves an hour, and an
-            // operator at the floor gets the SAME window from both endpoints.
+            // `JwksCacheWindow` admits 300..=900 and defaults to 600 (`issuer.rs`), and a
+            // config outside that range refuses the process at load -- so no configuration of
+            // this build serves an hour, and an operator at the floor gets the SAME window from
+            // both endpoints.
+            //
+            // THE BOUND IS THE CONFIG RANGE, NOT A PINNED FIGURE. A third version of this
+            // comment said "`issuer_http.rs` pins the served value at 600", which was wrong
+            // twice over: that is a TEST file, not source, and it asserts 600 against a window
+            // its own fixture built from a literal, so it pins neither the default nor anything
+            // served. The JWKS handlers serve `state.registry.cache().max_age_secs()`, which
+            // tracks configuration -- which is what makes the "operator at the floor" sentence
+            // beside it true, and what "pins at 600" would have made false.
             //
             // The document changes only when the connection or its key does, it contains no
             // secret, and a provider refreshing on a schedule should not make this deployment

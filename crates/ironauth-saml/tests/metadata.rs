@@ -253,6 +253,21 @@ fn the_certificate_verifies_under_its_own_published_key() {
          signed with"
     );
 
+    // AND ITS `parameters NULL`, which RFC 4055 2.1 makes a MUST for an RSA AlgorithmIdentifier
+    // and which some verifiers reject a certificate for omitting. Reading only the OID and
+    // walking away left that byte pair measured by nothing: deleting both NULLs from the writer
+    // passed the entire workspace, because the signature is computed over the TBS as emitted, so
+    // a shorter TBS is signed and checked in lockstep.
+    assert_eq!(
+        announced.take_tag(0x05).expect("the NULL parameter"),
+        &[] as &[u8],
+        "the AlgorithmIdentifier's parameters are not an explicit NULL"
+    );
+    assert!(
+        announced.take_element().is_err(),
+        "the AlgorithmIdentifier carries a third field"
+    );
+
     // AND THE TBS SAYS THE SAME THING. RFC 5280 4.1.1.2 requires the outer `signatureAlgorithm`
     // to equal the TBS `signature` field, and a verifier that reads only one of them is the
     // reason the requirement exists.
@@ -441,12 +456,22 @@ fn a_value_carrying_xml_syntax_does_not_escape_its_attribute() {
 fn the_key_usage_extension_is_critical_and_says_digital_signature_only() {
     // CLAIMED IN THREE PLACES AND READ BY NOBODY. The module says the extension is critical and
     // `digitalSignature` only, the helper's doc repeats it, and the TBS comment repeats it
-    // again -- and every reader in the suite walks past it. `x509::pinned` stops after the SPKI
-    // and never calls `end`, `validity_tags` stops inside `Validity`, and the self-verification
-    // test lifts the TBS as opaque bytes and so agrees with whatever is inside it. Widening the
-    // bits to `keyCertSign | cRLSign` keeps the encoded length identical, so nothing downstream
-    // shifts and the whole workspace stays green while every operator downloads a certificate
-    // asserting it may sign other certificates.
+    // again -- and every reader in the suite walks past it. `x509::pinned` reads the SPKI and
+    // then requires the signatureAlgorithm and signatureValue after it, but it deliberately
+    // does NOT call `end` on the TBS, so `[3] extensions` is never examined; `validity_tags`
+    // stops inside `Validity`; and the self-verification test lifts the TBS as opaque bytes and
+    // so agrees with whatever is inside it.
+    //
+    // AN EARLIER VERSION OF THIS COMMENT SAID `pinned` "stops after the SPKI and never calls
+    // `end`", which describes the reader before it was fixed: it calls `end` twice, and
+    // `certificates.rs::a_tbs_certificate_on_its_own_is_not_a_certificate` is the test that
+    // holds it. The un-ended cursor is the TBS one, and that omission is deliberate -- the
+    // optional `[1]`/`[2]` unique-id fields may follow -- which is exactly why the extension
+    // needs a reader of its own rather than a stricter `pinned`.
+    //
+    // Widening the bits to `keyCertSign | cRLSign` keeps the encoded length identical, so
+    // nothing downstream shifts and the whole workspace stays green while every operator
+    // downloads a certificate asserting it may sign other certificates.
     let key = signing_key();
     let der = certificate_der(&metadata::entity_descriptor(&descriptor(&key)).expect("build"));
 
