@@ -68,6 +68,65 @@ pub(crate) type SecureRandom = SystemRandom;
 /// `R || S` for ECDSA, the modulus-width octet string for RSA, the 64-byte
 /// signature for Ed25519). Any `ring` failure collapses to `Err(())`, carrying
 /// no detail, matching the verify side's opaque primitive.
+/// Sign an arbitrary octet string with `key`, for a protocol that is not JOSE.
+///
+/// # Why this exists beside the JWS mint
+///
+/// SAML's HTTP-Redirect binding (OASIS Bindings 3.4.4.1) signs a URL-ENCODED QUERY STRING, not a
+/// JWS signing input: there is no header, no base64url segments, and no `alg` to confuse with a
+/// key. The bytes are ours, assembled by us, and what comes back is the raw signature the
+/// binding puts in its `Signature` parameter.
+///
+/// IT ROUTES TO THE SAME PRIMITIVE the mint uses, which is the point of putting it here rather
+/// than letting another crate reach for `ring` on its own. A second signing path is a second
+/// place for an algorithm to be chosen from something other than the key, and closing that is
+/// what this crate is for.
+///
+/// # Errors
+///
+/// [`DetachedError`] if the key's declared algorithm and its material disagree, or if the
+/// primitive fails -- carrying no detail, matching the verify side.
+pub fn sign_detached(key: &SigningKey, message: &[u8]) -> Result<Vec<u8>, DetachedError> {
+    sign_asymmetric(key, message).map_err(|()| DetachedError)
+}
+
+/// A detached signature could not be produced or did not verify.
+///
+/// ONE VARIANT, CARRYING NOTHING, which is the same opacity the verify path already practises:
+/// a caller learns that the operation failed and nothing about which step or which byte. There
+/// is no branch a caller could usefully take on a finer answer, and a finer answer is an oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetachedError;
+
+impl core::fmt::Display for DetachedError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the detached signature operation failed")
+    }
+}
+
+impl std::error::Error for DetachedError {}
+
+/// Verify a signature made by [`sign_detached`].
+///
+/// THE ALGORITHM COMES FROM THE CALLER, never from anything travelling with the message, which
+/// is the rule this whole crate exists to enforce. SAML's redirect binding puts a `SigAlg`
+/// parameter on the wire beside the signature, and a verifier that read the algorithm out of it
+/// would be letting the sender pick -- the same shape as a JWS `alg` header. A caller compares
+/// `SigAlg` against what it expects and passes its OWN expectation here.
+///
+/// # Errors
+///
+/// [`DetachedError`] if the signature does not verify, or if the key and algorithm disagree.
+pub fn verify_detached(
+    key: &crate::TrustedKey,
+    algorithm: JwsAlgorithm,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), DetachedError> {
+    crate::crypto::verify_signature(algorithm, key.material(), message, signature)
+        .map_err(|()| DetachedError)
+}
+
 pub(crate) fn sign_asymmetric(key: &SigningKey, signing_input: &[u8]) -> Result<Vec<u8>, ()> {
     match (key.algorithm(), &key.inner) {
         (JwsAlgorithm::EdDsa, KeyInner::Ed25519(k)) => Ok(k.sign(signing_input).as_ref().to_vec()),

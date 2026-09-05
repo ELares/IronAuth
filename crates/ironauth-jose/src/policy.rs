@@ -177,6 +177,15 @@ pub struct TrustedKey {
 }
 
 impl TrustedKey {
+    /// The public key material, for the one detached-signature verifier.
+    ///
+    /// `pub(crate)` DELIBERATELY: exposing the material publicly would let a caller assemble a
+    /// verification outside this crate's algorithm discipline, which is the thing the crate is
+    /// for. [`crate::verify_detached`] is the door.
+    pub(crate) fn material(&self) -> &KeyMaterial {
+        &self.material
+    }
+
     /// An Ed25519 trusted key from its raw 32-byte public key.
     ///
     /// # Errors

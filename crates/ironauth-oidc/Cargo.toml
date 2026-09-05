@@ -1532,6 +1532,14 @@ path = "tests/native_sso_flow.rs"
 # THE HTTP POST BINDING over the real router (issue #139): that the form reaches the protocol,
 # that the connection comes from the URL, and that every refusal is actionable without being an
 # oracle. Needs a database.
+# STARTING A SAML SIGN-IN (issue #139): that the AuthnRequest is signed with the connection's own
+# key, recorded before the browser is sent, and answerable at an ACS that refuses unsolicited
+# responses. Needs a database.
+[[test]]
+name = "saml_start"
+required-features = ["testing"]
+path = "tests/saml_start.rs"
+
 [[test]]
 name = "saml_route"
 required-features = ["testing"]

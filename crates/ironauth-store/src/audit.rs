@@ -1383,6 +1383,13 @@ pub enum Action {
     /// THE TRUST DECISION. After this, an assertion carrying a signature from this key is
     /// believed to come from that identity provider.
     SamlCertificatePinned,
+    /// This deployment minted its OWN SAML signing key for a connection (issue #139).
+    ///
+    /// SEPARATE FROM `SamlCertificatePinned`, which records a decision about somebody else's
+    /// key. This records the creation of a PRIVATE key that is ours, and whose public half an
+    /// operator is about to publish to their identity provider -- so "when did this key come
+    /// into being, and who asked for it" is a question an incident will ask.
+    SamlSpKeyProvisioned,
     /// A pinned signing key was removed from an inbound SAML connection (issue #139).
     SamlCertificateUnpinned,
     /// An outbound SCIM connection was deleted (issue #137).
@@ -1904,6 +1911,7 @@ impl Action {
             Action::SamlConnectionEnabled => "saml_connection.enabled",
             Action::SamlConnectionDisabled => "saml_connection.disabled",
             Action::SamlCertificatePinned => "saml_certificate.pinned",
+            Action::SamlSpKeyProvisioned => "saml_sp_key.provisioned",
             Action::SamlCertificateUnpinned => "saml_certificate.unpinned",
             Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",
             Action::ApiKeyRevoked => "api_key.revoked",
