@@ -2071,6 +2071,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironauth-der"
+version = "0.1.0"
+
+[[package]]
 name = "ironauth-env"
 version = "0.1.0"
 dependencies = [
@@ -2259,6 +2263,7 @@ dependencies = [
 name = "ironauth-saml"
 version = "0.1.0"
 dependencies = [
+ "ironauth-der",
  "ironauth-jose",
  "quick-xml",
  "trybuild",
@@ -2341,6 +2346,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "ciborium",
+ "ironauth-der",
  "ironauth-jose",
  "serde",
  "serde_json",

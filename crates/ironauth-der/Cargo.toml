@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "ironauth-der"
+version = "0.1.0"
+description = "IronAuth's one ASN.1 DER reader: definite-length TLV over a borrowed slice, the handful of universal tags X.509 needs, and a clean error for every malformed length rather than a panic -- shared so that WebAuthn attestation chains and SAML certificate pinning read DER the same way"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -22,6 +22,7 @@ members = [
     "crates/ironauth-fetch",
     "crates/ironauth-jose",
     "crates/ironauth-hash-scheme",
+    "crates/ironauth-der",
     "crates/ironauth-webauthn",
     "crates/ironauth-kms",
     "crates/ironauth-admin",
@@ -78,6 +79,7 @@ ironauth-store = { path = "crates/ironauth-store", version = "0.1.0" }
 ironauth-fetch = { path = "crates/ironauth-fetch", version = "0.1.0" }
 ironauth-jose = { path = "crates/ironauth-jose", version = "0.1.0" }
 ironauth-hooks = { path = "crates/ironauth-hooks", version = "0.1.0" }
+ironauth-der = { path = "crates/ironauth-der" }
 ironauth-webauthn = { path = "crates/ironauth-webauthn", version = "0.1.0" }
 ironauth-kms = { path = "crates/ironauth-kms", version = "0.1.0" }
 ironauth-admin = { path = "crates/ironauth-admin", version = "0.1.0" }

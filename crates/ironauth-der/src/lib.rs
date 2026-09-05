@@ -1,23 +1,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A minimal, allocation-light ASN.1 DER reader (issue #66 PR B).
+//! IronAuth's ONE ASN.1 DER reader.
 //!
-//! The FIDO Metadata Service BLOB is a JWS whose `x5c` header carries an X.509
-//! certificate chain, and a packed attestation statement carries the same. To
-//! verify those chains without pulling in `openssl`, `webpki`, or a `RustCrypto`
-//! `der`/`x509-cert` tree (the workspace `cargo deny` and the in-tree bespoke
-//! bias, mirroring the #65 ceremony-over-ciborium decision), this module reads
-//! exactly the DER structures a certificate and an SPKI need: nested TLV triples,
-//! tagged fields, integers, OIDs, bit/octet strings, and the two X.509 time
-//! forms. It is a READER only: it never allocates a parse tree, it borrows from
-//! the input, and every malformed length or truncation is a clean
-//! [`DerError`], never a panic.
+//! # Why it is a crate and not a module
 //!
-//! It is deliberately NOT a general ASN.1 library. It supports definite-length
-//! DER (the only form a conformant certificate uses), single-byte and multi-byte
-//! lengths, and the handful of universal tags X.509 needs. An indefinite length,
-//! a constructed primitive, or an unknown high-tag-number form is rejected rather
-//! than guessed.
+//! It began as a module inside `ironauth-webauthn` (issue #66), where the FIDO Metadata Service
+//! BLOB's `x5c` chain and a packed attestation statement both needed it. SAML certificate
+//! pinning (issue #139) needs the same thing: an operator uploads the certificate their identity
+//! provider gave them, and the key inside it gets pinned.
+//!
+//! A SECOND READER WOULD BE THE DEFECT. Two DER readers in one codebase is two answers to "what
+//! does this certificate say", and the interesting inputs are exactly the ones they disagree
+//! about -- a non-minimal length, a trailing element, an integer with a spare sign byte. One of
+//! the two would then be the permissive reader, and which one an attacker reaches decides what
+//! gets accepted. So this moved out rather than being written twice, and both callers read DER
+//! the same way by construction.
+//!
+//! WHAT EACH CALLER KEEPS is its own POLICY, which genuinely differs: WebAuthn verifies
+//! attestation chains and accepts Ed25519 and P-256; SAML pins a key with no chain to verify
+//! and accepts P-256, P-384 and RSA in the range its signature backend can use. Policy belongs
+//! with the caller. Reading bytes does not.
+//!
+//! # What it is
+//!
+//! A READER only: it never allocates a parse tree, it borrows from the input, and every
+//! malformed length or truncation is a clean [`DerError`], never a panic. It reads exactly the
+//! DER structures a certificate and an SPKI need -- nested TLV triples, tagged fields, integers,
+//! OIDs, bit and octet strings, and the two X.509 time forms.
+//!
+//! It is deliberately NOT a general ASN.1 library, and deliberately not `der`/`x509-cert`: the
+//! workspace's bias is a bespoke reader for the subset actually used, the same decision #65 made
+//! about ceremony parsing over `ciborium`. It supports definite-length DER, single- and
+//! multi-byte lengths, and the universal tags X.509 needs. An indefinite length, a constructed
+//! primitive, or an unknown high-tag-number form is rejected rather than guessed.
 
 /// A DER parse failure. One opaque reason set: the caller collapses every X.509
 /// or MDS3 failure to a single non-enumerating outcome, so this carries no wire

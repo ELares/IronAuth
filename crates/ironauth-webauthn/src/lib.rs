@@ -51,7 +51,10 @@ mod attestation;
 mod authdata;
 mod client_data;
 mod cose;
-mod der;
+// THE DER READER LIVES IN ITS OWN CRATE, because SAML certificate pinning needs the same one
+// and two readers in a codebase is two answers to what a certificate says. Aliased rather than
+// re-pointed at every call site: what moved is the reader, not this crate's use of it.
+use ironauth_der as der;
 mod digest;
 mod encoding;
 mod error;

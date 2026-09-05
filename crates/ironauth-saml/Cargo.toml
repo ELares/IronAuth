@@ -20,6 +20,11 @@ quick-xml = { workspace = true }
 # crate owns the XML -- what a SignedInfo is, which transforms are allowed, how a subtree
 # canonicalises, every wrapping refusal -- and jose owns the two lines where bytes meet a key.
 ironauth-jose.workspace = true
+# THE SHARED DER READER, for the ONE place this crate meets DER: a certificate an operator
+# uploads at the management surface. It is `ironauth-webauthn`'s former `src/der.rs`, moved out
+# rather than copied, because two DER readers in a codebase is two answers to what a certificate
+# says and an attacker picks which one to reach.
+ironauth-der.workspace = true
 
 [dev-dependencies]
 # trybuild drives the compile-fail proof that a value cannot be read out of an

@@ -20,12 +20,14 @@
 //! the ones the caller passed in. That closes the whole "valid self-signature from an unpinned
 //! key" class, which criterion 4 asks for by name.
 //!
-//! # What a caller must do that this does not
+//! # Where a certificate becomes one of these keys
 //!
-//! Turning a pinned CERTIFICATE into the key material here wants is the caller's job today.
-//! This crate has no X.509 parser and adding one would be a large new surface for
-//! attacker-adjacent bytes; the metadata half of SAML SP inbound (#139) is where certificates
-//! are handled, and it will hand this the keys it extracted.
+//! An operator supplies a certificate, not a raw key, so something has to convert one.
+//! [`crate::x509`] does, at the MANAGEMENT surface: it runs when a certificate is UPLOADED,
+//! answers the key and the validity dates the store records, and is never reached by a response
+//! arriving at the ACS endpoint. So the property this module depends on is unchanged -- no X.509
+//! parsing sits between a signed assertion and the decision to trust it -- but the honest form
+//! of the sentence is "not on this path", not "not in this crate".
 
 use ironauth_jose::xmldsig::{
     XmlDigestAlg, XmlSigAlg, XmlSigKey, verify_xml_signature, xml_digest,
