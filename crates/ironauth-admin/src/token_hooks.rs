@@ -217,7 +217,10 @@ pub(crate) async fn precompile(
 /// keyword here would make the feature flag change the shape of the API rather than only its
 /// behaviour.
 #[cfg(not(feature = "wasm-hooks"))]
-#[allow(clippy::unused_async, reason = "the cfg'd sibling awaits; the signatures must match")]
+#[allow(
+    clippy::unused_async,
+    reason = "the cfg'd sibling awaits; the signatures must match"
+)]
 pub(crate) async fn precompile(
     _state: &AdminState,
     _component: &[u8],

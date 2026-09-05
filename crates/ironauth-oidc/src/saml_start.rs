@@ -271,8 +271,12 @@ pub async fn start_get(
 pub(crate) enum KeyUnavailable {
     /// No key is provisioned for this connection. The operator can act on this.
     NotProvisioned,
-    /// A row this deployment wrote and this build cannot use -- an algorithm it does not know, or
-    /// material that did not load. There is nothing the caller can do about it.
+    /// The key could not be produced: the read failed, or the row named an algorithm this build
+    /// does not know, or its material did not load. THREE CAUSES, NOT THE TWO AN EARLIER VERSION
+    /// of this doc listed -- it omitted the store read, which is the one that is not the
+    /// operator's doing at all. They collapse to one variant because they collapse to one
+    /// answer: there is nothing the caller can do about any of them, and saying which would
+    /// describe this deployment's internals to an unauthenticated fetch.
     Unusable,
 }
 

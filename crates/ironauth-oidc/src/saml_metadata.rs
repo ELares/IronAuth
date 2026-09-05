@@ -64,11 +64,16 @@ pub async fn metadata_get(
         Ok(None) => return not_found(),
         Err(_) => return server_error(),
     };
-    // ONE READ, WHICH IS WHAT THE PARAGRAPH ABOVE CLAIMED AND THE CODE DID NOT DO. An earlier
-    // version called the shared loader and then read the row AGAIN for its creation instant --
-    // two reads in two transactions, so a rotation landing between them would publish one key's
-    // certificate with the other key's validity window, which is exactly the drift the shared
-    // loader exists to prevent. The loader now hands back the row it used.
+    // ONE READ OF THE KEY ROW. An earlier version called the shared loader and then read the
+    // row AGAIN for its creation instant -- two reads in two transactions, so a rotation landing
+    // between them would publish one key's certificate with the other key's validity window,
+    // which is exactly the drift the shared loader exists to prevent. The loader now hands back
+    // the row it used.
+    //
+    // ONE READ OF THE KEY, NOT ONE READ IN THE HANDLER: the connection row above is a second
+    // read in a second transaction. That one is not the same hazard -- the entity id and ACS URL
+    // it carries are not derived from the key -- but a previous version of this comment said
+    // "ONE READ" without the qualifier and pointed at a paragraph it had itself deleted.
     let (key, stored) = match signing_key_for(&read, &connection_id).await {
         Ok(loaded) => loaded,
         // THE SENTENCES ARE THIS ROUTE'S OWN, and an earlier version had none: it surfaced the
@@ -121,15 +126,22 @@ pub async fn metadata_get(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/samlmetadata+xml"),
             ),
-            // CACHEABLE, briefly, which JWKS in this crate already is -- an earlier version of
-            // this comment claimed the endpoint was alone in that and it is not; `jwks` serves
-            // `public, max-age=3600`. The document changes only when the connection or its key
-            // does, it contains no secret, and an identity provider that refreshes metadata on a
-            // schedule should not be re-signing a certificate on every poll. FIVE MINUTES RATHER
-            // THAN THE HOUR JWKS USES, because a JWKS rotation is designed to overlap -- both
-            // keys are published while the old one drains -- and a metadata certificate is not:
-            // the operator uploads one file, so a stale answer is one an identity provider will
-            // trust until its next refresh.
+            // CACHEABLE, BRIEFLY, AS JWKS IN THIS CRATE ALREADY IS. Two earlier versions of
+            // this comment got the comparison wrong and each was checkable: the first said this
+            // endpoint was alone in being cacheable, and its correction gave JWKS an hour.
+            // `JwksCacheWindow` admits 300..=900 and defaults to 600 (`issuer.rs`), a config
+            // outside that range refuses the process at load, and `issuer_http.rs` pins the
+            // served value at 600 -- so no configuration of this build serves an hour, and an
+            // operator at the floor gets the SAME window from both endpoints.
+            //
+            // The document changes only when the connection or its key does, it contains no
+            // secret, and a provider refreshing on a schedule should not make this deployment
+            // re-sign a certificate on every poll. FIVE MINUTES AS A CONSTANT RATHER THAN A
+            // KNOB, because there is nothing for an operator to trade off yet: SP key rotation
+            // does not exist (migration 0199 grants no UPDATE; it waits for #141), so no
+            // rotation can be waiting on a cache to drain. Until one can, the shortest window
+            // this crate already treats as acceptable for a public document is the conservative
+            // choice, and it costs a provider one fetch per five minutes.
             (
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("public, max-age=300"),

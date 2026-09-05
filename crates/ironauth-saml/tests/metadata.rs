@@ -233,10 +233,38 @@ fn the_certificate_verifies_under_its_own_published_key() {
     let mut outer = ironauth_der::Der::new(&der);
     let mut certificate = outer.take_sequence().expect("a certificate");
     let (_, tbs_bytes, _) = certificate.take_element().expect("the TBS");
-    let _algorithm = certificate.take_element().expect("the algorithm");
+    let (_, algorithm_bytes, _) = certificate.take_element().expect("the algorithm");
     let signature = certificate
         .take_tag(ironauth_der::tag::BIT_STRING)
         .expect("the signature");
+
+    // THE ANNOUNCED ALGORITHM, COMPARED TO SOMETHING. An earlier version of this test bound it
+    // to `_algorithm` and threw it away, then verified with a literal `Rs256` -- so the OID the
+    // certificate publishes was compared to nothing here or anywhere in the workspace, and
+    // changing it to sha512WithRSAEncryption left the whole suite green while every identity
+    // provider that checks a self-signature would refuse the document.
+    let mut announced = ironauth_der::Der::new(algorithm_bytes);
+    let mut announced = announced.take_sequence().expect("an AlgorithmIdentifier");
+    assert_eq!(
+        ironauth_der::oid_arcs(announced.take_tag(ironauth_der::tag::OID).expect("an oid"))
+            .expect("arcs"),
+        vec![1, 2, 840, 113_549, 1, 1, 11],
+        "the certificate announces an algorithm other than the sha256WithRSAEncryption it is \
+         signed with"
+    );
+
+    // AND THE TBS SAYS THE SAME THING. RFC 5280 4.1.1.2 requires the outer `signatureAlgorithm`
+    // to equal the TBS `signature` field, and a verifier that reads only one of them is the
+    // reason the requirement exists.
+    let mut tbs = ironauth_der::Der::new(tbs_bytes);
+    let mut tbs = tbs.take_sequence().expect("the TBS");
+    tbs.take_element().expect("version [0]");
+    tbs.take_element().expect("serial");
+    let (_, inner_algorithm, _) = tbs.take_element().expect("the TBS signature field");
+    assert_eq!(
+        inner_algorithm, algorithm_bytes,
+        "the TBS signature field and the outer signatureAlgorithm disagree"
+    );
 
     // THE SIGNATURE COVERS THE TBS BYTES EXACTLY AS EMITTED, which is why they are taken from
     // the encoded certificate rather than rebuilt: a verifier re-encoding the TBS would be
@@ -285,10 +313,14 @@ fn the_validity_uses_the_form_rfc_5280_requires_for_its_year() {
     // 2026: both bounds inside the UTCTime range.
     let document = metadata::entity_descriptor(&descriptor(&key)).expect("build");
     let der = certificate_der(&document);
-    assert_eq!(validity_tags(&der), (0x17, 0x17), "a pre-2050 date was not UTCTime");
+    assert_eq!(
+        validity_tags(&der),
+        (0x17, 0x17),
+        "a pre-2050 date was not UTCTime"
+    );
 
-    // A WINDOW THAT CROSSES THE BOUNDARY takes one form each, which is the case a single-form
-    // encoder cannot produce and the one the rule exists for.
+    // BOTH BOUNDS PAST THE PIVOT. 2050-01-01 is the first instant the rule sends the other way,
+    // so this also pins the boundary itself rather than a year safely beyond it.
     let mut spec = descriptor(&key);
     spec.not_before_unix_secs = 2_524_608_000; // 2050-01-01
     spec.not_after_unix_secs = 2_556_144_000; // 2051-01-01
@@ -298,16 +330,36 @@ fn the_validity_uses_the_form_rfc_5280_requires_for_its_year() {
         (0x18, 0x18),
         "a post-2049 date was not GeneralizedTime"
     );
+
+    // AND A WINDOW THAT ACTUALLY CROSSES IT, taking one form each. An earlier version of this
+    // test claimed the fixture above was the crossing case and it was not -- both its bounds
+    // are post-2049. That left a whole class of encoder alive: one that decides the form ONCE,
+    // from `not_before`, and applies it to both bounds. Every same-side fixture passes against
+    // it, and a real five-year window spanning 2049 publishes a `notAfter` in the wrong form.
+    let mut spec = descriptor(&key);
+    spec.not_before_unix_secs = 2_493_072_000; // 2049-01-01, UTCTime
+    spec.not_after_unix_secs = 2_556_144_000; // 2051-01-01, GeneralizedTime
+    let der = certificate_der(&metadata::entity_descriptor(&spec).expect("build"));
+    assert_eq!(
+        validity_tags(&der),
+        (0x17, 0x18),
+        "a window spanning the 2049 pivot did not take one form on each side"
+    );
 }
 
-/// The two tag bytes of a certificate's `Validity` pair.
 #[test]
 fn the_document_is_well_formed_xml() {
     // NOTHING HERE PARSED THE DOCUMENT AS XML. Every other test in this file reads it with
     // `split`, which is happy with a document no parser would accept: an unbalanced element, a
-    // stray `&`, a duplicate attribute. An identity provider parses it, so this suite has to --
-    // and with a parser the WRITER does not go through, which is why `quick-xml` is a dev
-    // dependency here rather than the crate's own reader.
+    // stray `&`, a duplicate attribute. An identity provider parses it, so this suite has to.
+    //
+    // `quick-xml` IS THIS CRATE'S OWN PARSER, NOT AN INDEPENDENT ONE, and an earlier version of
+    // this comment claimed otherwise -- and added a redundant `[dev-dependencies]` entry to say
+    // so, on the false premise that a package's regular dependencies are out of reach of its
+    // integration tests. They are not; this file already reaches `ironauth-der` and `base64`
+    // that way. What the check buys is still real and worth having: the WRITER in `metadata.rs`
+    // and the reader in `parse.rs` share no code, so a document this emits and a parser rejects
+    // fails here. It does not buy independence from quick-xml's own reading of the spec.
     let key = signing_key();
     let document = metadata::entity_descriptor(&descriptor(&key)).expect("a document");
 
@@ -385,6 +437,76 @@ fn a_value_carrying_xml_syntax_does_not_escape_its_attribute() {
     assert_eq!(entity_ids, vec![hostile.to_owned()]);
 }
 
+#[test]
+fn the_key_usage_extension_is_critical_and_says_digital_signature_only() {
+    // CLAIMED IN THREE PLACES AND READ BY NOBODY. The module says the extension is critical and
+    // `digitalSignature` only, the helper's doc repeats it, and the TBS comment repeats it
+    // again -- and every reader in the suite walks past it. `x509::pinned` stops after the SPKI
+    // and never calls `end`, `validity_tags` stops inside `Validity`, and the self-verification
+    // test lifts the TBS as opaque bytes and so agrees with whatever is inside it. Widening the
+    // bits to `keyCertSign | cRLSign` keeps the encoded length identical, so nothing downstream
+    // shifts and the whole workspace stays green while every operator downloads a certificate
+    // asserting it may sign other certificates.
+    let key = signing_key();
+    let der = certificate_der(&metadata::entity_descriptor(&descriptor(&key)).expect("build"));
+
+    let mut outer = ironauth_der::Der::new(&der);
+    let mut certificate = outer.take_sequence().expect("a certificate");
+    let mut tbs = certificate.take_sequence().expect("the TBS");
+    // version [0], serial, signature, issuer, validity, subject, spki
+    for _ in 0..7 {
+        tbs.take_element().expect("a TBS field");
+    }
+    // [3] EXPLICIT extensions, context-constructed.
+    let (tag, extensions_body, _) = tbs.take_element().expect("the extensions");
+    assert_eq!(tag, 0xA3, "the extensions are not in the [3] EXPLICIT slot");
+
+    // `take_element` hands back the WHOLE element, header included, so the [3] wrapper has to be
+    // opened before the SEQUENCE OF inside it is reachable.
+    let mut explicit = ironauth_der::Der::new(extensions_body);
+    let inner = explicit.take_tag(0xA3).expect("the [3] wrapper");
+    let mut list = ironauth_der::Der::new(inner);
+    let mut extensions = list.take_sequence().expect("the extension sequence");
+    let mut extension = extensions.take_sequence().expect("one extension");
+
+    assert_eq!(
+        ironauth_der::oid_arcs(extension.take_tag(ironauth_der::tag::OID).expect("an oid"))
+            .expect("arcs"),
+        vec![2, 5, 29, 15],
+        "the only extension is not keyUsage"
+    );
+
+    // CRITICAL. DER encodes a BOOLEAN true as 0xFF and forbids any other non-zero byte, and an
+    // extension a verifier is allowed to ignore is not a restriction.
+    assert_eq!(
+        extension.take_tag(0x01).expect("the critical flag"),
+        &[0xFF],
+        "keyUsage is not marked critical"
+    );
+
+    // AND THE BITS THEMSELVES: one unused-bit count of 7 and one byte 0x80, which is bit 0
+    // (digitalSignature) and nothing else, minimally encoded as DER requires.
+    let bits = extension
+        .take_tag(ironauth_der::tag::OCTET_STRING)
+        .expect("the extension value");
+    let mut wrapped = ironauth_der::Der::new(bits);
+    assert_eq!(
+        wrapped
+            .take_tag(ironauth_der::tag::BIT_STRING)
+            .expect("a BIT STRING"),
+        &[0x07, 0x80],
+        "keyUsage asserts something other than digitalSignature alone"
+    );
+
+    // AND NOTHING ELSE IS ASSERTED: a second extension would be a second claim this document
+    // makes about the key, and the sentence says there is one.
+    assert!(
+        extensions.take_element().is_err(),
+        "the certificate carries an extension beyond keyUsage"
+    );
+}
+
+/// The two tag bytes of a certificate's `Validity` pair.
 fn validity_tags(der: &[u8]) -> (u8, u8) {
     let mut outer = ironauth_der::Der::new(der);
     let mut certificate = outer.take_sequence().expect("a certificate");

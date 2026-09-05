@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oid_shares_its_first_two_arcs_in_one_byte() {
+    fn an_oid_combines_its_first_two_arcs_into_one_subidentifier() {
         // rsaEncryption, 1.2.840.113549.1.1.1: 1*40+2 = 42 = 0x2A, then base-128 for 840.
         assert_eq!(
             oid(&[1, 2, 840, 113_549, 1, 1, 1]),
@@ -266,13 +266,30 @@ mod tests {
         );
         // commonName, 2.5.4.3: 2*40+5 = 85 = 0x55.
         assert_eq!(oid(&[2, 5, 4, 3]), vec![0x06, 0x03, 0x55, 0x04, 0x03]);
+
+        // A FIRST SUBIDENTIFIER OVER 127, which is the case that distinguishes a subidentifier
+        // from a byte and the one every OID this workspace writes today happens to avoid --
+        // which is why an encoder that wrote it as a single `u8` passed every test. `2.100.3`
+        // combines to 180, and X.690 8.19.2 spreads that over two base-128 bytes; writing one
+        // emits a DIFFERENT OID, silently.
+        assert_eq!(oid(&[2, 100, 3]), vec![0x06, 0x03, 0x81, 0x34, 0x03]);
+
+        // AND IT DECODES BACK to the arcs it was built from, through the reader beside it. The
+        // reader had the same defect, in the same place, and this round trip is what found it.
+        assert_eq!(
+            crate::oid_arcs(&oid(&[2, 100, 3])[2..]).expect("arcs"),
+            vec![2, 100, 3]
+        );
     }
 
     #[test]
     fn an_integer_is_minimal_and_never_accidentally_negative() {
-        // ASN.1 INTEGERs are SIGNED. An RSA modulus almost always has its top bit set, so
-        // omitting the pad byte would encode a negative modulus -- a certificate every verifier
-        // refuses, and one this crate's own reader would read as a different number.
+        // ASN.1 INTEGERs are SIGNED, so a magnitude whose top bit is set needs a pad byte or it
+        // encodes a negative number. THIS COMMENT USED TO SAY THAT AN RSA MODULUS IS THE VALUE
+        // AT RISK, which is the same false sentence `uint_bytes`'s own doc retracts 150 lines
+        // above and then points the reader down here to see held. No modulus reaches this
+        // function: it arrives at the SPKI as DER ring already encoded. What omitting the pad
+        // byte actually breaks is a version or a serial, and that is what these cases pin.
         assert_eq!(uint(0), vec![0x02, 0x01, 0x00]);
         assert_eq!(uint(127), vec![0x02, 0x01, 0x7F]);
         assert_eq!(uint(128), vec![0x02, 0x02, 0x00, 0x80]);

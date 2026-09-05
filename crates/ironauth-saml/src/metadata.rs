@@ -22,9 +22,7 @@
 //! trust engine is built on exactly that reading, and it is the reason `anchors` on the inbound
 //! side ignores certificate expiry too: what is pinned is key material, not a chain.
 
-use ironauth_der::write::{
-    bit_string, context, name_common, oid, seq, tlv, uint, x509_time,
-};
+use ironauth_der::write::{bit_string, context, name_common, oid, seq, tlv, uint, x509_time};
 use ironauth_jose::SigningKey;
 
 /// The SAML 2.0 metadata namespace.

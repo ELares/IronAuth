@@ -2,11 +2,19 @@
 
 //! Test-only DER X.509 certificate and JWS builders (issue #66 PR B).
 //!
-//! THE ENCODER IS NO LONGER HERE. These primitives were the workspace's only DER writer and are
-//! now `ironauth_der::write`, because the SP metadata document (issue #139) needs a certificate
-//! writer in production and two encoders would be two answers to what a certificate says -- the
-//! same argument the reader half already makes. What stays here is the FIDO-specific grammar:
-//! the AAGUID extension, the chain shape, and the Ed25519 spelling.
+//! THE ENCODER IS NO LONGER HERE. These primitives are now `ironauth_der::write`, because the
+//! SP metadata document (issue #139) needs a certificate writer in production and two encoders
+//! would be two answers to what a certificate says -- the same argument the reader half already
+//! makes. What stays here is the FIDO-specific grammar: the AAGUID extension, the chain shape,
+//! and the Ed25519 spelling.
+//!
+//! IT WAS NOT THE WORKSPACE'S ONLY DER WRITER, which an earlier version of this paragraph said.
+//! Two more live in test files -- `ironauth-saml/tests/certificates.rs` and
+//! `ironauth-oidc/tests/webauthn_attestation.rs` -- and each builds fixtures for a READER, which
+//! is why they were left alone: a fixture that agrees with the production encoder by
+//! construction cannot catch the encoder disagreeing with a real certificate. They are not
+//! covered by the base-128 first-subidentifier fix in this change, and no OID they write reaches
+//! the case it fixes.
 //!
 //! Used ONLY by unit tests to synthesise a fake FIDO PKI (a root, an intermediate,
 //! and an AAGUID leaf) and a hand-built MDS3 BLOB JWS, so the chain verifier and
@@ -19,9 +27,9 @@
 
 use ironauth_jose::webauthn::test_util;
 
-use ironauth_der::write::{bit_string, generalized_time, oid, seq, tlv, uint as int};
-use ironauth_der::write::name_common as name_cn;
 use crate::der::tag;
+use ironauth_der::write::name_common as name_cn;
+use ironauth_der::write::{bit_string, generalized_time, oid, seq, tlv, uint as int};
 
 /// The Ed25519 `AlgorithmIdentifier` (`SEQUENCE { OID 1.3.101.112 }`, no params).
 fn ed25519_alg_id() -> Vec<u8> {
