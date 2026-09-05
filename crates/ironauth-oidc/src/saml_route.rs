@@ -5,8 +5,10 @@
 //! `saml_acs` is the PROTOCOL: verify a response against the connection's pinned certificates,
 //! check every condition, spend the outstanding request and admit the assertion id, in that
 //! order. It takes bytes and a connection row and touches no HTTP. This module is the
-//! TRANSPORT around it: which connection a request is for, how the bytes arrive, who the
-//! `NameID` names locally, and what the browser is told afterwards.
+//! TRANSPORT around it: which connection a request is for, how the bytes arrive, and what the
+//! poster is told afterwards. WHO THE `NameID` NAMES LOCALLY IS NOT ITS JOB -- that sentence
+//! survived from a version that resolved identities, and the section below says why it no
+//! longer does.
 //!
 //! Splitting them is not tidiness. The protocol half is the part with the CVEs in it, and it is
 //! testable with no server at all -- which is how it came to have twenty-three tests against a
@@ -78,6 +80,7 @@ use base64::Engine as _;
 use ironauth_saml::Limits;
 use ironauth_store::SamlConnectionId;
 use serde::Deserialize;
+use std::time::SystemTime;
 
 use crate::saml_acs::{Acs, AcsError, consume};
 use crate::state::OidcState;
@@ -92,6 +95,18 @@ use crate::wellknown::parse_scope;
 /// tens of kilobytes, so this is roughly an order of magnitude of headroom over the real ones and
 /// still small enough that the decode is uninteresting.
 const MAX_ENCODED_RESPONSE: usize = 512 * 1024;
+
+/// The deployment clock in the unit `ironauth-saml` reads it in.
+///
+/// A NAMED SEAM WITH ITS OWN TEST, because this is the module's only unit conversion and the
+/// harness cannot exercise it: the test environment's clock is frozen at the Unix epoch, so
+/// micros and seconds are the same number there and deleting the division left every route test
+/// green. On a real clock the same mistake passes ~1.8e15 as a second count, which puts every
+/// window tens of millions of years in the future and refuses every genuine response as expired.
+/// The unit test below is where that is measured.
+fn unix_seconds(now: SystemTime) -> i64 {
+    epoch_micros(now) / 1_000_000
+}
 
 /// The HTTP POST binding's form.
 #[derive(Deserialize)]
@@ -117,9 +132,12 @@ pub struct AcsForm {
 ///
 /// # What a refusal leaves behind
 ///
-/// NOTHING, FOR EVERY REFUSAL THIS MODULE MAKES. There are three -- an unreadable connection id,
-/// an oversized field, and an undecodable body -- and all three are reached before the store is
-/// addressed at all.
+/// THIS MODULE MAKES SIX REFUSALS AND THEY DIVIDE IN TWO, which an earlier version of this
+/// paragraph flattened into "there are three ... all reached before the store". BEFORE THE STORE
+/// IS ADDRESSED: an unreadable scope, an oversized field, an undecodable body, and an unreadable
+/// connection id -- four, and none of them writes anything anywhere. AFTER: a connection that is
+/// absent or inactive, and a store fault reading the connection or its certificates. Those two
+/// have read and written nothing either, because the only statements they made were SELECTs.
 ///
 /// NOT NOTHING FOR EVERY REFUSAL [`consume`] MAKES, and an earlier version of this paragraph
 /// said so. `consume`'s property is narrower and its own doc states it correctly: nothing is
@@ -143,13 +161,22 @@ pub async fn acs_post(
         );
     }
     // STANDARD BASE64 WITH PADDING, which is what OASIS Bindings 3.5.4 specifies for this field
-    // -- not the URL-safe alphabet the rest of this crate uses for its own tokens. Whitespace is
-    // stripped first because identity providers line-wrap the field and a conformant decoder
-    // rejects the newline.
+    // -- not the URL-safe alphabet the rest of this crate uses for its own tokens.
+    //
+    // ONLY CR AND LF ARE STRIPPED, because line wrapping is the whole reason to strip anything:
+    // identity providers wrap the field and a conformant decoder rejects the break. An earlier
+    // version used `is_ascii_whitespace`, which also matches SPACE -- and by the time this runs,
+    // a space is ambiguous. `application/x-www-form-urlencoded` decodes `+` to a space, and `+`
+    // is base64 character 62, so a poster who failed to percent-encode their field arrives here
+    // with spaces where their data had `+`. Deleting them SILENTLY REPAIRS the field into a
+    // shorter string that, whenever the count is a multiple of four, still decodes -- to bytes
+    // the identity provider never signed. The operator is then told the signature is wrong, on
+    // the one endpoint whose job is telling them whether their certificate is right. Leaving
+    // SPACE in place makes the same input answer "not valid base64", which names the real fault.
     let packed: String = form
         .saml_response
         .chars()
-        .filter(|character| !character.is_ascii_whitespace())
+        .filter(|character| !matches!(character, '\r' | '\n'))
         .collect();
     let Ok(response) = base64::engine::general_purpose::STANDARD.decode(packed) else {
         return refused(StatusCode::BAD_REQUEST, "the response is not valid base64");
@@ -168,10 +195,16 @@ pub async fn acs_post(
     };
 
     let read = state.store().scoped(scope);
-    let Ok(Some(connection)) = read.saml_connections().find_active(&connection_id).await else {
-        // A STORE FAULT LANDS HERE TOO, and that is the fail-closed direction: unable to read
-        // which certificates to trust, this endpoint signs nobody in.
-        return not_found();
+    // A STORE FAULT IS NOT AN ABSENT CONNECTION, and an earlier version collapsed the two into
+    // one 404 under the heading "the fail-closed direction". Failing closed is about whether
+    // anybody is admitted, and both answers admit nobody; what differs is what the operator
+    // does next. "No connection is served here" sends them to delete and re-create a connection
+    // that is fine, while the very next read one line below already answered a transient fault
+    // with "try again". Two answers to one class of fault, ten milliseconds apart.
+    let connection = match read.saml_connections().find_active(&connection_id).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return not_found(),
+        Err(_) => return server_error(),
     };
     let Ok(certificates) = read.saml_connections().certificates(&connection_id).await else {
         return server_error();
@@ -180,7 +213,7 @@ pub async fn acs_post(
     let acs = Acs {
         connection: &connection,
         certificates: &certificates,
-        now_unix_secs: epoch_micros(state.now()) / 1_000_000,
+        now_unix_secs: unix_seconds(state.now()),
         limits: &Limits::default(),
     };
     let consumed = match consume(&read.saml_replay(), &acs, &response).await {
@@ -210,15 +243,20 @@ fn accepted() -> Response {
         no_store(),
         axum::response::Html(
             "<!doctype html><meta charset=\"utf-8\"><title>Response accepted</title>\
-             <p>The response was accepted, so this connection's certificate, audience and \
-             recipient are configured correctly.</p>\
+             <p>This connection is configured correctly: the response verified against a \
+             pinned certificate and satisfied every condition.</p>\
              <p>Signing in through SAML is not enabled on this build.</p>",
         ),
     )
         .into_response()
 }
 
-/// The no-store headers every response on this path carries.
+/// The no-store headers every response THIS HANDLER BUILDS carries.
+///
+/// NOT EVERY RESPONSE ON THE PATH, which an earlier version claimed: a POST with no
+/// `SAMLResponse` field is refused by the `Form` extractor before this module runs, and that
+/// 422 carries no `Cache-Control` at all. Nothing here can reach it, so the honest scope of the
+/// sentence is the handler rather than the route.
 fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
     [(axum::http::header::CACHE_CONTROL, "no-store")]
 }
@@ -241,6 +279,21 @@ fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
 /// somebody: today the variant reaches a Rust caller and nothing else, and the page carries the
 /// coarse class. What this function decides is only that the page is not the place.
 fn refused_by(error: &AcsError) -> Response {
+    // THE TYPED REASON GOES TO THE LOG, which is the only place it can go today: the page is
+    // read by whoever posted, and the connection-test flow that will render it to an
+    // authenticated operator is not built. Without this the variant reached a `match` and was
+    // dropped on the stack -- so `NoTrustAnchor`, whose whole purpose is to tell an operator
+    // they have pinned nothing rather than blaming their identity provider, was recoverable
+    // from nowhere at all.
+    //
+    // `Display` RATHER THAN `Debug`, because `AcsError::Store` wraps a database error whose
+    // `Debug` carries connection detail; every `Display` in that enum is a sentence written to
+    // be read.
+    tracing::warn!(
+        target: "ironauth.saml",
+        reason = %error,
+        "a SAML response was refused",
+    );
     let (status, reason) = match error {
         AcsError::NoConnection => return not_found(),
         AcsError::Store(_) => return server_error(),
@@ -282,7 +335,7 @@ fn refused(status: StatusCode, reason: &'static str) -> Response {
 
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Response refused</title>\
-         <p>This response was not accepted.</p><p>{reason}</p>"
+         <p>This response was refused.</p><p>{reason}</p>"
     );
     (status, no_store(), axum::response::Html(body)).into_response()
 }
@@ -299,4 +352,28 @@ fn server_error() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "this response could not be processed; try again",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unix_seconds;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_clock_reaches_the_protocol_in_seconds() {
+        // THE ONE UNIT CONVERSION IN THIS MODULE, and the integration suite cannot see it: the
+        // harness clock is frozen at the Unix epoch, where micros and seconds are the same
+        // number, so deleting the division left all eight route tests green. On a real clock
+        // that mistake hands `check` a second count about 1.8e15 -- tens of millions of years
+        // ahead -- and every genuine enterprise response is refused as expired, which is a total
+        // outage behind a green suite.
+        let instant = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600);
+        assert_eq!(unix_seconds(instant), 1_767_225_600);
+
+        // AND IT TRUNCATES TOWARD THE PAST rather than rounding, which is the safe direction for
+        // a `NotOnOrAfter`: an instant 999_999 microseconds into a second is still that second,
+        // so a bound is never treated as having passed before it has.
+        let mid = SystemTime::UNIX_EPOCH + Duration::from_micros(1_767_225_600_999_999);
+        assert_eq!(unix_seconds(mid), 1_767_225_600);
+    }
 }

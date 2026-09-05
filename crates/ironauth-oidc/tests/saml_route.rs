@@ -306,7 +306,15 @@ async fn a_signed_response_is_accepted_and_signs_nobody_in() {
         .await;
 
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains("accepted"), "{body}");
+    // PINNED ON A SENTENCE ONLY THE ACCEPTED PAGE CARRIES. An earlier version asserted
+    // `contains("accepted")`, which the refusal page satisfied through its own negation
+    // ("This response was not accepted"), so replacing the success page with a refusal left the
+    // suite green -- on the page the module doc calls this change's deliverable.
+    assert!(
+        body.contains("This connection is configured correctly"),
+        "the accepted page is not the accepted page: {body}"
+    );
+    assert!(!body.contains("refused"), "{body}");
     assert_eq!(
         headers
             .get_all(axum::http::header::SET_COOKIE)
@@ -370,6 +378,23 @@ async fn a_recorded_relay_state_does_not_become_a_redirect_either() {
         .await;
 
     assert_eq!(status, 200, "{body}");
+
+    // THE FIXTURE REALLY WAS SOLICITED, which nothing measured: `wire` sets
+    // `allow_unsolicited: true`, so a response whose `InResponseTo` went unread would be
+    // ACCEPTED as unsolicited with the identical 200 and `Consumed::relay_state` back to `None`
+    // -- the exact state the previous round's fix existed to leave behind. The request row is
+    // the witness: consuming it again must fail, because the response already spent it.
+    let spent = harness
+        .store()
+        .scoped(harness.scope())
+        .saml_replay()
+        .consume_request(&wired.connection, "_req_solicited", now_micros(&env))
+        .await;
+    assert!(
+        matches!(spent, Err(ironauth_store::StoreError::NotFound)),
+        "the response did not spend the request it named, so it was treated as unsolicited: \
+         {spent:?}"
+    );
     assert!(
         headers.get(axum::http::header::LOCATION).is_none(),
         "a RelayState became a redirect: {:?}",
@@ -679,6 +704,36 @@ async fn a_line_wrapped_field_is_decoded_and_a_url_safe_one_is_not() {
         )
         .await;
     assert_eq!(status, 200, "a line-wrapped field was not decoded: {body}");
+
+    // AND A SPACE IS NOT STRIPPED, which is the other half of the same decision.
+    // `application/x-www-form-urlencoded` turns `+` into a space, and `+` is base64 character
+    // 62, so a poster who failed to percent-encode their field arrives with spaces where their
+    // data had `+`. Deleting those SILENTLY REPAIRS the field into a different document, and
+    // when the count is a multiple of four the repair still decodes -- to bytes the identity
+    // provider never signed -- so the operator is told their certificate is wrong.
+    //
+    // FOUR SPACES, DELIBERATELY. A first attempt replaced every `+` with a space and asserted
+    // "not valid base64", which BOTH builds answer whenever the count is not a multiple of
+    // four -- so reverting the filter to `is_ascii_whitespace` left the suite green. Inserting
+    // exactly four separates them with no arithmetic left to chance: a build that strips them
+    // recovers the original document and answers 200, and this build cannot decode it.
+    let spaced = format!("{}    {}", &encoded[..8], &encoded[8..]);
+    let (status, _, body) = harness
+        .post_form(
+            &wired.path,
+            &format!("SAMLResponse={}", urlencode(&spaced)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "spaces were stripped, so a mis-encoded field was repaired into a document nobody \
+         signed: {body}"
+    );
+    assert!(
+        body.contains("not valid base64"),
+        "a mis-encoded field was reported as something other than a decoding fault: {body}"
+    );
 
     // AND THE ALPHABET IS THE STANDARD ONE, which the same comment claims and nothing measured.
     // A URL-safe encoding of the identical document must not be accepted: OASIS Bindings names
