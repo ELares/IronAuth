@@ -1,23 +1,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A minimal, allocation-light ASN.1 DER reader (issue #66 PR B).
+//! IronAuth's ONE ASN.1 DER reader.
 //!
-//! The FIDO Metadata Service BLOB is a JWS whose `x5c` header carries an X.509
-//! certificate chain, and a packed attestation statement carries the same. To
-//! verify those chains without pulling in `openssl`, `webpki`, or a `RustCrypto`
-//! `der`/`x509-cert` tree (the workspace `cargo deny` and the in-tree bespoke
-//! bias, mirroring the #65 ceremony-over-ciborium decision), this module reads
-//! exactly the DER structures a certificate and an SPKI need: nested TLV triples,
-//! tagged fields, integers, OIDs, bit/octet strings, and the two X.509 time
-//! forms. It is a READER only: it never allocates a parse tree, it borrows from
-//! the input, and every malformed length or truncation is a clean
-//! [`DerError`], never a panic.
+//! # Why it is a crate and not a module
 //!
-//! It is deliberately NOT a general ASN.1 library. It supports definite-length
-//! DER (the only form a conformant certificate uses), single-byte and multi-byte
-//! lengths, and the handful of universal tags X.509 needs. An indefinite length,
-//! a constructed primitive, or an unknown high-tag-number form is rejected rather
-//! than guessed.
+//! It began as a module inside `ironauth-webauthn` (issue #66), where the FIDO Metadata Service
+//! BLOB's `x5c` chain and a packed attestation statement both needed it. SAML certificate
+//! pinning (issue #139) needs the same thing: an operator uploads the certificate their identity
+//! provider gave them, and the key inside it gets pinned.
+//!
+//! A SECOND READER WOULD BE THE DEFECT. Two DER readers in one codebase is two answers to "what
+//! does this certificate say", and the interesting inputs are exactly the ones they disagree
+//! about -- a non-minimal length, a trailing element, an integer with a spare sign byte. One of
+//! the two would then be the permissive reader, and which one an attacker reaches decides what
+//! gets accepted. So this moved out rather than being written twice, and both callers read DER
+//! the same way by construction.
+//!
+//! WHAT EACH CALLER KEEPS is its own POLICY, which genuinely differs: WebAuthn verifies
+//! attestation chains and accepts Ed25519 and P-256; SAML pins a key with no chain to verify
+//! and accepts P-256, P-384 and RSA in the range its signature backend can use. Policy belongs
+//! with the caller. Reading bytes does not.
+//!
+//! # What it is
+//!
+//! A READER only: it never allocates a parse tree, it borrows from the input, and every
+//! malformed length or truncation is a clean [`DerError`], never a panic. It reads exactly the
+//! DER structures a certificate and an SPKI need -- nested TLV triples, tagged fields, integers,
+//! OIDs, bit and octet strings, and the two X.509 time forms.
+//!
+//! It is deliberately NOT a general ASN.1 library, and deliberately not `der`/`x509-cert`: the
+//! workspace's bias is a bespoke reader for the subset actually used, the same decision #65 made
+//! about ceremony parsing over `ciborium`. It supports definite-length DER, single- and
+//! multi-byte lengths, and the universal tags X.509 needs. An indefinite length, a constructed
+//! primitive, or an unknown high-tag-number form is rejected rather than guessed.
 
 /// A DER parse failure. One opaque reason set: the caller collapses every X.509
 /// or MDS3 failure to a single non-enumerating outcome, so this carries no wire
@@ -174,12 +189,23 @@ fn read_tlv(bytes: &[u8]) -> Result<(u8, &[u8], &[u8]), DerError> {
         if len_bytes[0] == 0 {
             return Err(DerError::BadLength);
         }
+        // AND A LENGTH THAT FITS THE SHORT FORM MUST USE IT. DER admits exactly one encoding
+        // of each length; `81 02` is `02` written longer, and a reader that accepts both agrees
+        // with a stricter one about every conforming document and disagrees about that one.
+        //
+        // `checked_mul` for the same reason as in `oid_arcs`: `checked_shl(8)` reports success
+        // after dropping the high bits. Unreachable here, because `num_bytes` is bounded to the
+        // width of a `usize` -- but a guard that cannot guard is worse than none, because the
+        // next person to widen the bound will believe it.
         let mut length = 0usize;
         for &b in len_bytes {
             length = length
-                .checked_shl(8)
+                .checked_mul(256)
                 .and_then(|shifted| shifted.checked_add(usize::from(b)))
                 .ok_or(DerError::BadLength)?;
+        }
+        if length < 0x80 {
+            return Err(DerError::BadLength);
         }
         (length, after)
     };
@@ -213,9 +239,24 @@ pub fn oid_arcs(contents: &[u8]) -> Result<Vec<u64>, DerError> {
     let mut value: u64 = 0;
     let mut pending = false;
     for &b in rest {
+        // A LEADING CONTINUATION BYTE OF 0x80 IS A NON-MINIMAL ARC: seven zero bits in front of
+        // the number, which X.690 8.19.2 forbids and which is a SECOND encoding of one value.
+        // OpenSSL compares an OBJECT IDENTIFIER by its ENCODED BYTES, so it reads such an OID as
+        // a different one entirely and refuses the certificate -- leaving this the permissive
+        // reader in a disagreement, which is the hazard this crate's own doc claims to close.
+        if !pending && b == 0x80 {
+            return Err(DerError::BadValue);
+        }
         pending = true;
+        // `checked_mul(128)` RATHER THAN `checked_shl(7)`, WHICH GUARDS NOTHING HERE.
+        // `checked_shl` answers `None` only when the SHIFT AMOUNT is at least the bit width; a
+        // shift of 7 is always in range, so `u64::MAX.checked_shl(7)` is `Some(..488)` -- the
+        // high bits are gone and the call reports success. An OID arc is unbounded in DER, so
+        // this loop is reachable with as many bytes as an attacker likes, and a wrapped arc can
+        // be made to equal any value at all: `1.2.840.113549.1.1.1` included, which is the OID
+        // that decides a key is RSA.
         value = value
-            .checked_shl(7)
+            .checked_mul(128)
             .and_then(|shifted| shifted.checked_add(u64::from(b & 0x7F)))
             .ok_or(DerError::BadValue)?;
         if b & 0x80 == 0 {
@@ -268,6 +309,12 @@ pub fn parse_time(tag_byte: u8, contents: &[u8]) -> Result<i64, DerError> {
         }
         tag::GENERALIZED_TIME => {
             if text.len() != 14 {
+                return Err(DerError::BadValue);
+            }
+            // `i64::from_str` ACCEPTS A LEADING SIGN, so `-226` and `+226` both parse -- and a
+            // negative year becomes a negative epoch, which a caller then writes into a column
+            // as a real instant. X.690 gives GeneralizedTime four DIGITS and no sign.
+            if !text[0..4].bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(DerError::BadValue);
             }
             let yyyy: i64 = text[0..4].parse().map_err(|_| DerError::BadValue)?;

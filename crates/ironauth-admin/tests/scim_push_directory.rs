@@ -49,11 +49,12 @@ const TOKEN: &str = "downstream-bearer-token";
 const BASE: &str = "https://downstream.example/scim/v2";
 const PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNo";
 
-fn now_micros(_env: &Env) -> i64 {
+fn now_micros(env: &Env) -> i64 {
     i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("after the epoch")
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
             .as_micros(),
     )
     .expect("fits i64")

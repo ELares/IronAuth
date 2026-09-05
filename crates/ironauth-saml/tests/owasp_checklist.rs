@@ -533,16 +533,28 @@ const CHEAT_SHEET: &[Item] = &[
     },
     // -- X.509 Certificate Considerations ---------------------------------------------------
     Item {
-        control: "Certificate strength, lifetime, key usage, and CRL/OCSP revocation checking",
-        coverage: Coverage::NotApplicable(
-            "This crate never sees a certificate. A trust anchor here is a raw public key -- an \
-             uncompressed point or an RSA modulus and exponent -- supplied by the caller, so \
-             there is no chain to validate, no lifetime to bound and no revocation list to \
-             consult. Issue #139 introduces certificate pinning and metadata, and owns every \
-             item in this section.",
-        ),
-        rationale: "The raw-key shape is deliberate: it is what makes 'never take the anchor \
-                    from the document' structural rather than a rule somebody has to follow.",
+        control: "Certificate strength and lifetime (key usage and CRL/OCSP: see the rationale)",
+        coverage: Coverage::Tests(&[
+            "both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with",
+            "an_algorithm_this_server_cannot_verify_with_is_named_as_such",
+            "the_curve_comes_from_the_algorithm_parameter_and_not_from_the_point_length",
+            "an_interval_that_ends_before_it_starts_is_not_a_validity",
+            "what_is_read_from_a_real_certificate_is_what_openssl_says_is_in_it",
+        ]),
+        rationale: "NOT ON THE ASSERTION PATH, which is the claim that matters. A trust anchor is a \
+             raw public key -- an uncompressed point, or an RSA modulus and exponent -- so a \
+             response arriving at the ACS reaches no certificate handling at all. `x509::pinned` \
+             does read a certificate, at the MANAGEMENT surface when an operator uploads one, \
+             and it deliberately validates NO chain: the trust decision IS the pinning, and a \
+             certificate that chains to a public root is not more trustworthy for that purpose. \
+             What it does read is the key and the validity interval the store records, so \
+             #141's expiry alerting has a producer. Strength IS bounded, at upload, by what the \
+             signature backend can verify with -- see \
+             `both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with`. \
+             Revocation stays out of scope: a pinned key is revoked by unpinning it, which is an \
+             operator action this deployment can see, not a list somebody else publishes. And \
+             the raw-key shape stays deliberate: it is what makes 'never take the anchor from \
+             the document' structural rather than a rule somebody has to follow.",
     },
     Item {
         control: "Protect the signing key (HSM or equivalent) and fetch metadata over trusted TLS",
@@ -684,9 +696,9 @@ fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
     // At exact counts a deletion is a red build that a reader has to lower deliberately, in the
     // same commit, with the removed row visible in the diff. That is the most a same-file bound
     // can do: it cannot stop a removal, only make one loud.
-    assert_eq!(named, 23, "a row that names tests was added or removed");
+    assert_eq!(named, 24, "a row that names tests was added or removed");
     assert_eq!(
-        excused, 19,
+        excused, 18,
         "a row marked out of scope was added or removed"
     );
     // ZERO GAPS. Both were XML Encryption, and criterion 5 closed them. The assertion stays at

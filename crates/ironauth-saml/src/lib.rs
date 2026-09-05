@@ -214,6 +214,7 @@ mod instant;
 mod parse;
 mod tree;
 mod verify;
+pub mod x509;
 
 pub use parse::{DEPTH_CEILING, Document, Element, Limits, SamlError, parse};
 
