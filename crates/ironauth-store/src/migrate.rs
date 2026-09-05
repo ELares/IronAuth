@@ -1589,6 +1589,29 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0195_scim_push_link_deprovisioned.sql"),
         },
+        Migration {
+            version: 196,
+            name: "saml_connections",
+            // EXPAND: a new table nothing reads yet. No existing row and no old binary is
+            // touched by it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0196_saml_connections.sql"),
+        },
+        Migration {
+            version: 197,
+            name: "saml_connection_certificates",
+            // EXPAND, and it must follow 196: the connection is its parent and the key cascades
+            // from it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0197_saml_connection_certificates.sql"),
+        },
+        Migration {
+            version: 198,
+            name: "saml_request_and_replay",
+            // EXPAND. Two tables that make a response one-time, both children of 196.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0198_saml_request_and_replay.sql"),
+        },
     ]
 }
 

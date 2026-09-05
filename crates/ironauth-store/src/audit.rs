@@ -1355,6 +1355,23 @@ pub enum Action {
     ScimPushConnectionCreated,
     /// An outbound SCIM connection's configuration changed (issue #137).
     ScimPushConnectionUpdated,
+    /// An inbound SAML connection was created (issue #139).
+    ///
+    /// SEPARATE FROM PINNING A KEY, below. Creating the connection says which identity provider
+    /// an organization will sign in through; pinning a key says which signature is believed to
+    /// come from it. The second is the one that decides trust, and it happens repeatedly over a
+    /// connection's life as certificates rotate, so an operator reading the log has to be able to
+    /// see each rotation without decoding a detail field.
+    SamlConnectionCreated,
+    /// An inbound SAML connection was deleted (issue #139).
+    SamlConnectionDeleted,
+    /// A signing key was pinned to an inbound SAML connection (issue #139).
+    ///
+    /// THE TRUST DECISION. After this, an assertion carrying a signature from this key is
+    /// believed to come from that identity provider.
+    SamlCertificatePinned,
+    /// A pinned signing key was removed from an inbound SAML connection (issue #139).
+    SamlCertificateUnpinned,
     /// An outbound SCIM connection was deleted (issue #137).
     ScimPushConnectionDeleted,
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
@@ -1869,6 +1886,10 @@ impl Action {
             Action::ScimConnectionBindingsRevoked => "scim_connection.bindings.revoke",
             Action::ScimPushConnectionCreated => "scim_push_connection.created",
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
+            Action::SamlConnectionCreated => "saml_connection.created",
+            Action::SamlConnectionDeleted => "saml_connection.deleted",
+            Action::SamlCertificatePinned => "saml_certificate.pinned",
+            Action::SamlCertificateUnpinned => "saml_certificate.unpinned",
             Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",
             Action::ApiKeyRevoked => "api_key.revoked",
             Action::ImpersonationAuthorized => "impersonation.authorized",

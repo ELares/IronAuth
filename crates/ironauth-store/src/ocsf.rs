@@ -237,6 +237,26 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     // are account-change and entity-management shaped. Wire strings freeze into the audit
     // trail, so that mistake is not correctable afterwards.
     "scim_connection",
+    // A SAML CONNECTION AND ITS PINNED KEYS ARE ACCESS MANAGEMENT, on the same reasoning that
+    // puts the INBOUND SCIM connection here and the outbound one on the entity list below.
+    //
+    // Pinning a key is the grant. After it, an assertion carrying that signature is believed to
+    // come from that identity provider, so the operator has handed somebody the ability to say
+    // who a person is in this environment. That is the strongest right this system gives away,
+    // and it is given away repeatedly, because certificates rotate.
+    //
+    // The connection is here too rather than on the entity list, and the difference from
+    // `scim_push_connection` is worth stating: that row points an existing right somewhere and
+    // holds no credential, while this one carries the audience and the assertion consumer URL
+    // that decide what a signature is ACCEPTED FOR, and deleting it revokes every pin at once
+    // through the cascade. Both halves change who may assert an identity.
+    //
+    // `saml_connection` and `saml_certificate`, NOT `saml`. This classifier keys on the text
+    // before the first dot, so the bare domain would file every later `saml.*` action here --
+    // and the sign-in actions the ACS slice adds (`saml.login_succeeded`) are authentication
+    // shaped. Wire strings freeze into the audit trail, so that is not correctable afterwards.
+    "saml_connection",
+    "saml_certificate",
     "scope",
     "admin",
     "credential_class",
