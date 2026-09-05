@@ -149,10 +149,19 @@ impl VerifiedAssertion {
     ///
     /// [`Self::name`] hands back the QUALIFIED name, prefix and all, and a caller that tested it
     /// was testing a spelling. `name().ends_with("Assertion")` -- which is what the condition
-    /// layer did -- answers true for `evil:NotAnAssertion` in any namespace whatsoever, and false
-    /// for the `Assertion` an identity provider writes under a default `xmlns`. This crate's own
-    /// wrapping defence was once a rule about prefix spelling and it was a bypass; the same
-    /// mistake one layer up is the same bypass.
+    /// layer did -- is wrong on TWO axes at once, and each admits a different document:
+    ///
+    /// - THE LOCAL NAME. It answers true for `evil:NotAnAssertion`, because the suffix is a
+    ///   suffix of that name too.
+    /// - THE NAMESPACE. It never looks at one, so `evil:Assertion` bound to `urn:evil` answers
+    ///   true as readily as the real thing.
+    ///
+    /// (It also answers TRUE, correctly, for the unprefixed `Assertion` an identity provider
+    /// writes under a default `xmlns` -- so the suffix test is not simply "too strict". It is
+    /// answering a different question from the one the caller meant.)
+    ///
+    /// This crate's own wrapping defence was once a rule about prefix spelling and it was a
+    /// bypass; the same mistake one layer up is the same bypass.
     #[must_use]
     pub fn is(&self, namespace: &str, local: &str) -> bool {
         Scoped::new(&self.signed, self.inherited.clone()).is(namespace, local)
@@ -225,47 +234,30 @@ impl VerifiedAssertion {
             .collect()
     }
 
-    /// An ATTRIBUTE of the descendant in `namespace` with local name `local`, if there is
-    /// EXACTLY ONE such descendant.
+    /// The DIRECT CHILDREN of the signed element that are `namespace`:`local`.
     ///
-    /// # Why this exists beside [`Self::text_of`], and why SAML needs it
+    /// # Why a caller almost always wants THIS rather than [`Self::elements`]
     ///
-    /// Every condition a service provider has to enforce lives in an attribute of a descendant,
-    /// not in text and not on the assertion element: `Conditions/@NotBefore` and
-    /// `@NotOnOrAfter`, `SubjectConfirmationData/@Recipient`, `@InResponseTo` and its own
-    /// `@NotOnOrAfter`, `AudienceRestriction` alone being the exception. [`Self::attribute`]
-    /// reads the SIGNED ELEMENT's own attributes and [`Self::text_of`] reads a descendant's TEXT,
-    /// so between them a caller could read none of the values that decide whether an assertion is
-    /// usable -- and would have had to reach for the raw document to get them, which is exactly
-    /// the reach this type exists to prevent.
+    /// SAML puts an assertion's own `Issuer`, `Subject`, `Conditions` and statements at the top
+    /// level, and it ALSO permits whole nested assertions and arbitrary elements deeper down:
+    /// `saml:Advice` carries advisory assertions, and `saml:AttributeValue` is `xs:anyType`, so
+    /// an attribute's value may legitimately contain a `saml:Subject`, a `saml:Conditions` or a
+    /// `saml:Issuer` of its own. Those are somebody else's, and they are inside the signature
+    /// just as much as the real ones.
     ///
-    /// # The same exactly-one rule, for the same reason
+    /// A descendant search therefore finds elements that were never meant to answer the
+    /// question. It is also not even ordered the way a reader expects: the walk uses a stack, so
+    /// the first match returned is the LAST in document order.
     ///
-    /// Two `Conditions` elements inside one signed assertion verify like any other document. A
-    /// reader that took the first would be choosing which half of a contradiction to believe, and
-    /// two readers choosing differently is the defect class this crate is about -- so an
-    /// ambiguous read answers `None` and the caller decides.
-    ///
-    /// # NOT A NAMESPACE DECLARATION
-    ///
-    /// The same refusal [`Self::attribute`] makes, and for the same reason: exclusive
-    /// canonicalization emits only the declarations a subtree visibly USES, so an unused
-    /// `xmlns:evil` is never digested and returning it would hand a caller undigested
-    /// attacker-controlled bytes it believes were signed.
+    /// So the rule is: the values that decide who this is and whether it is valid are read as
+    /// DIRECT CHILDREN, and "exactly one" is enforced by the caller on the result.
     #[must_use]
-    pub fn attribute_of(&self, namespace: &str, local: &str, attribute: &str) -> Option<&str> {
-        if attribute == "xmlns" || attribute.starts_with("xmlns:") {
-            return None;
-        }
-        let found = collect(&self.signed, &self.inherited, namespace, local);
-        let [single] = found.as_slice() else {
-            return None;
-        };
-        single
-            .attributes
-            .iter()
-            .find(|candidate| candidate.name == attribute)
-            .map(|candidate| candidate.value.as_str())
+    pub fn children(&self, namespace: &str, local: &str) -> Vec<SignedElement<'_>> {
+        Scoped::new(&self.signed, self.inherited.clone())
+            .children(namespace, local)
+            .into_iter()
+            .map(|scoped| SignedElement { scoped })
+            .collect()
     }
 
     /// The text of the descendant in `namespace` with local name `local`, if there is EXACTLY
@@ -293,10 +285,12 @@ impl VerifiedAssertion {
 ///
 /// # Everything reachable from here was digested
 ///
-/// This is handed out only by [`VerifiedAssertion::elements`], which walks the subtree the
-/// signature covered. So the same guarantee holds one level down: a value read through this was
-/// signed, and the namespace scope its ancestors put in force travels with it, so a qualified
-/// name resolves the way the document meant.
+/// Every constructor of this type -- [`VerifiedAssertion::elements`],
+/// [`VerifiedAssertion::children`], and [`Self::children`] on an element already inside one --
+/// walks only the subtree the signature covered, and each hands back another value of this same
+/// type. So the guarantee is closed under reading further: a value read through this was signed,
+/// and the namespace scope its ancestors put in force travels with it, so a qualified name
+/// resolves the way the document meant.
 ///
 /// NOT DERIVED for `Debug`, for the reason [`VerifiedAssertion`] gives: the derived one would
 /// print every attribute of the retained element, namespace declarations included, and those are
@@ -332,16 +326,27 @@ impl<'a> SignedElement<'a> {
             .map(|candidate| candidate.value.as_str())
     }
 
-    /// The text of every DIRECT CHILD in `namespace` with local name `local`, in document order.
+    /// The COLLAPSED text of every DIRECT CHILD in `namespace` with local name `local`, in
+    /// document order.
     ///
     /// DIRECT children, which is the whole point of this type: a descendant search would find the
     /// same names under a different parent, which in SAML means something else.
+    ///
+    /// COLLAPSED for the reason [`Self::text_collapsed`] gives: the one list of direct-child text
+    /// SAML asks a service provider to compare -- an `AudienceRestriction`'s `Audience` children
+    /// -- is a list of `xsd:anyURI`, and comparing those raw refuses a pretty-printed document
+    /// that says exactly the same thing.
     #[must_use]
     pub fn child_texts(&self, namespace: &str, local: &str) -> Vec<String> {
         self.scoped
             .children(namespace, local)
             .into_iter()
-            .map(|child| text_content(child.element))
+            .map(|child| {
+                text_content(child.element)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .collect()
     }
 
@@ -357,19 +362,56 @@ impl<'a> SignedElement<'a> {
     ///
     /// SAML Core 2.5 requires a service provider that cannot evaluate a `Condition` to treat the
     /// assertion as invalid, and a check written as an allowlist needs to see what is actually
-    /// there. Local names rather than qualified ones, because the caller has already resolved the
-    /// parent it is reading within.
+    /// there.
+    ///
+    /// EACH NAME IS RESOLVED, NOT SPELLED. An earlier version answered LOCAL names only, on the
+    /// reasoning that the caller had already resolved the parent -- which does not follow: the
+    /// parent's namespace says nothing about its children's. An allowlist over local names
+    /// admits `evil:OneTimeUse` bound to `urn:evil` as something this server understands, which
+    /// is the identical bypass [`VerifiedAssertion::is`] exists to prevent one level up. The
+    /// namespace is the empty string for a child in no namespace at all.
     #[must_use]
-    pub fn element_children(&self) -> Vec<String> {
+    pub fn element_children(&self) -> Vec<(String, String)> {
+        let scope = self.scoped.scope();
         self.scoped
             .element
             .children
             .iter()
             .filter_map(|child| match child {
-                RichNode::Element(nested) => Some(local_name(&nested.name).to_owned()),
+                RichNode::Element(nested) => {
+                    let inner = scope_within(nested, &scope);
+                    let namespace = resolve(&nested.name, &inner).unwrap_or_default();
+                    Some((namespace, local_name(&nested.name).to_owned()))
+                }
                 RichNode::Text(_) | RichNode::ProcessingInstruction(_) => None,
             })
             .collect()
+    }
+
+    /// This element's text with XSD `whiteSpace="collapse"` applied, for comparing a URI.
+    ///
+    /// # Why raw text is the wrong thing to compare for `saml:Audience` and `saml:Issuer`
+    ///
+    /// Both are `xsd:anyURI`, and XML Schema Part 2 gives `anyURI` the `collapse` whiteSpace
+    /// facet: leading and trailing whitespace is stripped and internal runs become one space
+    /// BEFORE any comparison, so
+    ///
+    /// ```xml
+    /// <saml:Audience>
+    ///   https://sp.example/metadata
+    /// </saml:Audience>
+    /// ```
+    ///
+    /// is the same value as the flush one, and an identity provider that pretty-prints its
+    /// assertions is not sending a different audience. Comparing raw text refuses a conformant
+    /// document -- and does it with "the assertion is addressed to a different service provider",
+    /// which sends an operator looking for a misconfiguration that is not there.
+    ///
+    /// NOT FOR `saml:NameID`, whose content is `xsd:string` and preserves whitespace: collapsing
+    /// there would map two distinct names onto one account.
+    #[must_use]
+    pub fn text_collapsed(&self) -> String {
+        self.text().split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// The DIRECT CHILDREN in `namespace` with local name `local`, to read further into.

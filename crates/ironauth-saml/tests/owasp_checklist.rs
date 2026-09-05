@@ -214,10 +214,16 @@ const CHEAT_SHEET: &[Item] = &[
         rationale: "The cheat sheet's target is `getElementsByTagName`, and this crate's \
                     equivalent is `collect`. It is not a tag-name search: identity is (namespace \
                     URI, local name), resolved against the declarations in scope, which the \
-                    first test exists because an earlier version got wrong. Everything under the \
-                    signature is found by DIRECT CHILD rather than by descendant search, which \
-                    is the property an absolute path buys, and the last test is the one that \
-                    pins it -- a signature nested below the assertion is not the assertion's.",
+                    first test exists because an earlier version got wrong. `collect` IS a \
+                    descendant search, though -- so what an absolute path buys is bought one \
+                    layer up instead, by every SAML value that decides identity or validity \
+                    being read as a DIRECT CHILD: see `VerifiedAssertion::children` and the \
+                    conditions suite's \
+                    `an_assertion_nested_in_an_attribute_value_supplies_none_of_this_ones_answers`, \
+                    which is there because a descendant search let a nested assertion's Issuer, \
+                    Subject and Conditions answer for the real one. The last test here pins the \
+                    signature half -- a signature nested below the assertion is not the \
+                    assertion's.",
     },
     Item {
         control: "Prefer OneTimeUse and short lifetimes on the Response",

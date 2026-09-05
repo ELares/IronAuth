@@ -55,6 +55,11 @@ struct Body {
     second_confirmation: bool,
     /// A `ProxyRestriction` naming this deployment, which is not an address to it.
     proxy_audience: Option<&'static str>,
+    /// A second `Issuer`, appended AFTER the Conditions, for the ambiguity case.
+    second_issuer: Option<&'static str>,
+    /// An `AttributeStatement` whose value carries a whole nested Issuer, Subject and
+    /// Conditions -- all of which `xs:anyType` permits and none of which are this assertion's.
+    nested_impostor: bool,
 }
 
 impl Default for Body {
@@ -74,6 +79,8 @@ impl Default for Body {
             confirmation_name_id: None,
             second_confirmation: false,
             proxy_audience: None,
+            second_issuer: None,
+            nested_impostor: false,
         }
     }
 }
@@ -162,6 +169,28 @@ impl Body {
             out.push_str(extra);
         }
         out.push_str("</saml:Conditions>");
+        if self.nested_impostor {
+            // `saml:AttributeValue` IS `xs:anyType`, so all of this is a conformant document.
+            out.push_str(concat!(
+                "<saml:AttributeStatement><saml:Attribute Name=\"dept\"><saml:AttributeValue>",
+                "<saml:Issuer>urn:idp</saml:Issuer>",
+                "<saml:Subject><saml:NameID>attacker@evil.example</saml:NameID>",
+                "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">",
+                "<saml:SubjectConfirmationData InResponseTo=\"_req_12345\" ",
+                "Recipient=\"https://ironauth.example/saml/acs/globex\" ",
+                "NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>",
+                "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
+                "NotOnOrAfter=\"2026-01-01T00:05:00Z\"><saml:AudienceRestriction><saml:Audience>",
+                "https://ironauth.example/saml/globex",
+                "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
+                "</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>",
+            ));
+        }
+        if let Some(issuer) = self.second_issuer {
+            out.push_str("<saml:Issuer>");
+            out.push_str(issuer);
+            out.push_str("</saml:Issuer>");
+        }
         out
     }
 }
@@ -320,7 +349,7 @@ fn an_assertion_with_no_expiry_is_refused_rather_than_treated_as_open() {
 }
 
 #[test]
-fn the_clock_skew_is_applied_at_both_edges_and_is_not_unbounded() {
+fn the_clock_skew_is_applied_at_both_edges_and_a_smaller_one_refuses_more() {
     // THE SKEW HAS TO WORK AND HAS TO BE BOUNDED. Identity provider clocks drift, so a strict
     // comparison refuses genuine sign-ins; an unbounded one is the same as no time check at all.
     let body = Body {
@@ -506,8 +535,10 @@ fn the_accepted_expiry_is_the_earlier_of_the_two_bounds() {
         ..Body::default()
     };
     let accepted = accept(&body, &expectations(), NOW);
-    // The assertion's own two-minute window is shorter than the ten-minute ceiling, so it wins.
-    assert_eq!(accepted.expires_at_unix_secs, 1_767_225_720);
+    // The assertion's own two-minute window is shorter than the ten-minute ceiling, so it wins
+    // -- PLUS THE THIRTY-SECOND SKEW, because the window comparison admits the assertion for
+    // that long past the bound and a cache that forgot it sooner would admit the replay.
+    assert_eq!(accepted.expires_at_unix_secs, 1_767_225_720 + 30);
     assert_eq!(accepted.assertion_id, "_assertion");
     assert_eq!(
         accepted.name_id_format.as_deref(),
@@ -577,9 +608,15 @@ fn two_conditions_elements_make_the_window_unreadable_rather_than_letting_one_wi
         "<saml:AudienceRestriction><saml:Audience>",
         AUDIENCE,
         "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
-        // AND ALSO LIVE, with a different window. Either would be accepted alone.
-        "<saml:Conditions NotBefore=\"2025-12-31T23:50:00Z\" ",
-        "NotOnOrAfter=\"2026-01-01T00:02:00Z\"/>",
+        // AND ALSO LIVE, with a different window -- AND COMPLETE, which the first version of
+        // this fixture was not. It was self-closing, so it named no audience and its window was
+        // 720s against a 600s ceiling: TWO further reasons to refuse it, either of which would
+        // have satisfied the assertion below without the ambiguity rule existing at all.
+        "<saml:Conditions NotBefore=\"2025-12-31T23:57:00Z\" ",
+        "NotOnOrAfter=\"2026-01-01T00:02:00Z\">",
+        "<saml:AudienceRestriction><saml:Audience>",
+        AUDIENCE,
+        "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
     ]
     .concat();
     let refused = decide_raw(&children, &expectations(), NOW);
@@ -834,7 +871,8 @@ fn what_is_remembered_is_bounded_by_the_confirmations_expiry_too() {
     };
     let accepted = accept(&body, &expectations(), NOW);
     assert_eq!(
-        accepted.expires_at_unix_secs, 1_767_225_660,
+        accepted.expires_at_unix_secs,
+        1_767_225_660 + 30,
         "the confirmation's one-minute expiry is the earliest of the three and did not bound what \
          is remembered"
     );
@@ -847,7 +885,7 @@ fn what_is_remembered_is_bounded_by_the_confirmations_expiry_too() {
     };
     assert_eq!(
         accept(&later, &expectations(), NOW).expires_at_unix_secs,
-        1_767_225_900,
+        1_767_225_900 + 30,
         "a confirmation expiry later than the assertion's shortened the window anyway"
     );
 }
@@ -865,8 +903,80 @@ fn a_ceiling_of_i64_max_does_not_overflow_the_expiry_it_stamps() {
     };
     let accepted = accept(&Body::default(), &boundless, NOW);
     assert_eq!(
-        accepted.expires_at_unix_secs, 1_767_225_900,
+        accepted.expires_at_unix_secs,
+        1_767_225_900 + 30,
         "an unbounded ceiling did not leave the assertion's own expiry as the answer"
+    );
+
+    // AND THE SAME FOR THE SKEW, which is the sibling public field the round-1 overflow fix did
+    // not sweep to: `now + skew` and `now - skew` are the window comparison, and `+ skew` is the
+    // last term of the stamped expiry.
+    let boundless_skew = Expectations {
+        clock_skew_secs: i64::MAX,
+        ..expectations()
+    };
+    let accepted = accept(&Body::default(), &boundless_skew, NOW);
+    assert_eq!(
+        accepted.expires_at_unix_secs,
+        i64::MAX,
+        "an unbounded skew did not saturate"
+    );
+}
+
+#[test]
+fn what_is_remembered_outlasts_the_window_by_the_skew_that_admitted_it() {
+    // THE CACHE MUST OUTLIVE THE ADMISSION. `check` accepts while `now - skew < not_on_or_after`,
+    // so an assertion stays presentable for `skew` seconds past every bound it names. A replay
+    // cache told to forget it AT the bound has a window exactly `skew` seconds wide in which the
+    // assertion is forgotten and still admissible -- which is the replay the cache exists to
+    // stop.
+    let body = Body {
+        not_before: Some("2026-01-01T00:00:00Z"),
+        not_on_or_after: Some("2026-01-01T00:02:00Z"),
+        confirmation_expiry: Some("2026-01-01T00:02:00Z"),
+        ..Body::default()
+    };
+    let bound = 1_767_225_720; // 2026-01-01T00:02:00Z
+
+    // The same document under two skews. The bounds are identical, so the ONLY thing that can
+    // move the answer is the skew term -- which is what makes this measure that term and not
+    // some other operand of the minimum.
+    let generous = accept(&body, &expectations(), NOW).expires_at_unix_secs;
+    let strict = accept(
+        &body,
+        &Expectations {
+            clock_skew_secs: 5,
+            ..expectations()
+        },
+        NOW,
+    )
+    .expires_at_unix_secs;
+    assert_eq!(
+        generous,
+        bound + 30,
+        "the thirty-second skew is not in the stamp"
+    );
+    assert_eq!(
+        strict,
+        bound + 5,
+        "the five-second skew is not in the stamp"
+    );
+
+    // AND A NEGATIVE SKEW ADDS NOTHING RATHER THAN SUBTRACTING, matching the `.max(0)` the
+    // window comparison applies: the two must read the same field the same way or the cache
+    // forgets an assertion the comparison would still admit.
+    let backwards = accept(
+        &body,
+        &Expectations {
+            clock_skew_secs: -30,
+            ..expectations()
+        },
+        NOW,
+    )
+    .expires_at_unix_secs;
+    assert_eq!(
+        backwards, bound,
+        "a negative skew shortened what is remembered"
     );
 }
 
@@ -995,5 +1105,352 @@ fn a_signed_element_that_is_not_an_assertion_is_refused_by_name_not_by_spelling(
     assert!(
         matches!(refused, Err(ConditionError::Malformed)),
         "an `Assertion` in a namespace nobody trusts was read as a SAML one: {refused:?}"
+    );
+}
+
+#[test]
+fn a_second_issuer_appended_after_the_fact_does_not_become_the_author() {
+    // THE ROUND-1 ISSUER FIX READ BY DESCENDANT SEARCH AND TOOK `.first()`, and the walk uses a
+    // stack -- so `.first()` was the LAST in document order and appending an `Issuer` naming the
+    // trusted provider was enough to defeat the check the same round had just added.
+    let body = Body {
+        issuer: Some("urn:attacker-idp"),
+        second_issuer: Some(ISSUER),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongIssuer { found: None })),
+        "an appended Issuer became the assertion's author: {refused:?}"
+    );
+
+    // AND THE OTHER ORDER REFUSES TOO, which is what shows the read is not merely first-wins
+    // instead of last-wins: two authors is no author whichever came first.
+    let reversed = Body {
+        issuer: Some(ISSUER),
+        second_issuer: Some("urn:attacker-idp"),
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&reversed, &expectations(), NOW),
+            Err(ConditionError::WrongIssuer { found: None })
+        ),
+        "a genuine assertion with an appended second Issuer was accepted"
+    );
+}
+
+#[test]
+fn an_assertion_nested_in_an_attribute_value_supplies_none_of_this_ones_answers() {
+    // `saml:AttributeValue` IS `xs:anyType` AND `saml:Advice` CARRIES WHOLE ASSERTIONS, so a
+    // conformant SAML document can contain a second `Issuer`, `Subject` and `Conditions` that
+    // are somebody else's -- and they are inside this signature just as much as the real ones.
+    // Reading any of the three by descendant search let the nested copies answer instead.
+    //
+    // THE OUTER ASSERTION IS OTHERWISE UNIMPEACHABLE and the nested one names a different
+    // person, so if a nested value ever wins, the wrong human is signed in.
+    let body = Body {
+        nested_impostor: true,
+        ..Body::default()
+    };
+    assert_eq!(
+        decide(&body, &expectations(), NOW).expect("the outer assertion is valid"),
+        "ada@globex.example",
+        "a Subject buried in an AttributeValue became the signed-in identity"
+    );
+
+    // AND THE NESTED COPIES DO NOT RESCUE A BROKEN OUTER ONE, which is the direction that
+    // matters: with the outer Conditions naming somebody else, the nested Conditions naming us
+    // must not supply the audience.
+    let wrong_audience = Body {
+        nested_impostor: true,
+        restrictions: vec![vec!["https://someone-else.example/sp"]],
+        ..Body::default()
+    };
+    let refused = decide(&wrong_audience, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongAudience { .. })),
+        "a nested Conditions supplied the audience the real one did not name: {refused:?}"
+    );
+
+    // Same for the issuer, whose own read is the one round 1 got wrong.
+    let wrong_issuer = Body {
+        nested_impostor: true,
+        issuer: Some("urn:somebody-else"),
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&wrong_issuer, &expectations(), NOW),
+            Err(ConditionError::WrongIssuer { .. })
+        ),
+        "a nested Issuer supplied the authorship the real one did not claim"
+    );
+}
+
+#[test]
+fn a_condition_in_a_foreign_namespace_is_not_understood_by_spelling_alone() {
+    // THE ALLOWLIST COMPARED LOCAL NAMES. The parent's namespace says nothing about its
+    // children's, so `evil:OneTimeUse` bound to `urn:evil` passed as something this server
+    // understands -- the identical bypass the assertion gate one level up exists to prevent, and
+    // the one this crate's wrapping defence was built around in the first place.
+    for spelling in [
+        "<evil:OneTimeUse xmlns:evil=\"urn:evil\"/>",
+        "<evil:AudienceRestriction xmlns:evil=\"urn:evil\"><evil:Audience>\
+         https://ironauth.example/saml/globex</evil:Audience></evil:AudienceRestriction>",
+    ] {
+        let body = Body {
+            extra_condition: Some(spelling),
+            ..Body::default()
+        };
+        let refused = decide(&body, &expectations(), NOW);
+        assert!(
+            matches!(refused, Err(ConditionError::UnsupportedCondition { .. })),
+            "a condition in a namespace nobody trusts passed by spelling: {spelling} -> {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pretty_printed_audience_is_the_same_audience() {
+    // `saml:Audience` AND `saml:Issuer` ARE `xsd:anyURI`, which XML Schema gives the `collapse`
+    // whiteSpace facet: leading and trailing whitespace is stripped BEFORE any comparison. An
+    // identity provider that indents its assertions is not naming a different audience -- and
+    // refusing it says "addressed to a different service provider", which sends an operator
+    // hunting a misconfiguration that does not exist.
+    let indented = [
+        "<saml:Issuer>\n  urn:idp\n</saml:Issuer>",
+        "<saml:Subject><saml:NameID>ada@globex.example</saml:NameID>",
+        "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">",
+        "<saml:SubjectConfirmationData InResponseTo=\"",
+        REQUEST,
+        "\" Recipient=\"",
+        RECIPIENT,
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/>",
+        "</saml:SubjectConfirmation></saml:Subject>",
+        "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
+        "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
+        "<saml:AudienceRestriction>\n    <saml:Audience>\n      ",
+        AUDIENCE,
+        "\n    </saml:Audience>\n  </saml:AudienceRestriction></saml:Conditions>",
+    ]
+    .concat();
+    assert_eq!(
+        decide_raw(&indented, &expectations(), NOW).expect("a pretty-printed assertion is valid"),
+        "ada@globex.example",
+        "an indented Audience or Issuer was read as a different value"
+    );
+
+    // AND COLLAPSING DOES NOT MAKE TWO DIFFERENT URIS EQUAL: internal whitespace collapses to
+    // one space, it does not vanish, so this is still not our audience.
+    let smuggled = indented.replace(
+        AUDIENCE,
+        "https://ironauth.example/saml/globex https://evil.example/sp",
+    );
+    assert!(
+        matches!(
+            decide_raw(&smuggled, &expectations(), NOW),
+            Err(ConditionError::WrongAudience { .. })
+        ),
+        "collapsing let two audiences in one element pass as ours"
+    );
+}
+
+#[test]
+fn a_name_id_padded_with_whitespace_is_refused_rather_than_signed_in_padded() {
+    // THE GUARD CHECKED `name_id.trim()` AND THE VALUE RETURNED WAS UNTRIMMED, so
+    // " ada@globex.example " passed a check on a string the caller never sees and was signed in
+    // with its spaces -- a different account key from the same name flush, which is a way to
+    // mint a second identity for one person.
+    //
+    // REFUSED RATHER THAN TRIMMED: `NameID` content is `xsd:string` and PRESERVES whitespace,
+    // unlike the `anyURI` audience the test above collapses, so trimming would be this server
+    // deciding two schema-distinct values name one person.
+    for padded in [
+        " ada@globex.example",
+        "ada@globex.example ",
+        "\n  ada@globex.example  \n",
+    ] {
+        let children = format!(
+            "<saml:Issuer>{ISSUER}</saml:Issuer>\
+             <saml:Subject><saml:NameID>{padded}</saml:NameID>\
+             <saml:SubjectConfirmation Method=\"{BEARER}\">\
+             <saml:SubjectConfirmationData InResponseTo=\"{REQUEST}\" Recipient=\"{RECIPIENT}\" \
+             NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+             <saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" \
+             NotOnOrAfter=\"2026-01-01T00:05:00Z\"><saml:AudienceRestriction><saml:Audience>\
+             {AUDIENCE}</saml:Audience></saml:AudienceRestriction></saml:Conditions>"
+        );
+        let refused = decide_raw(&children, &expectations(), NOW);
+        assert!(
+            matches!(refused, Err(ConditionError::Malformed)),
+            "a padded NameID was signed in: {padded:?} -> {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bound_that_is_present_and_unreadable_is_not_reported_as_absent() {
+    // THE TWO FAULTS HAVE DIFFERENT FIXES. "The assertion carries no Conditions/@NotBefore" sent
+    // an operator looking for an attribute that is right there in the document; what actually
+    // happened is that its VALUE is not the narrow form `parse_utc` accepts. An offset instead
+    // of `Z` is the common one, and `9999-12-31T23:59:59Z` -- the conventional never-expires
+    // sentinel -- is another, since the parser's range stops at 2200.
+    for (body, attribute, found) in [
+        (
+            Body {
+                not_before: Some("2025-12-31T23:55:00+00:00"),
+                ..Body::default()
+            },
+            "Conditions/@NotBefore",
+            "2025-12-31T23:55:00+00:00",
+        ),
+        (
+            Body {
+                not_on_or_after: Some("9999-12-31T23:59:59Z"),
+                ..Body::default()
+            },
+            "Conditions/@NotOnOrAfter",
+            "9999-12-31T23:59:59Z",
+        ),
+        (
+            Body {
+                confirmation_expiry: Some("2026-01-01T00:05:60Z"),
+                ..Body::default()
+            },
+            "SubjectConfirmationData/@NotOnOrAfter",
+            "2026-01-01T00:05:60Z",
+        ),
+    ] {
+        let refused = decide(&body, &expectations(), NOW);
+        let Err(ConditionError::UnreadableBound {
+            attribute: named,
+            found: said,
+        }) = &refused
+        else {
+            panic!("a present but unreadable {attribute} was not reported as such: {refused:?}");
+        };
+        assert_eq!(*named, attribute, "the wrong attribute was named");
+        assert_eq!(
+            said, found,
+            "the operator was not shown what their provider sent"
+        );
+    }
+}
+
+#[test]
+fn every_time_comparison_is_pinned_at_its_exact_boundary() {
+    // A WINDOW TEST WITH MINUTES OF MARGIN CANNOT TELL `<` FROM `<=`. Every fixture in this
+    // suite sits comfortably inside or outside its window, so all four comparisons in `check`
+    // could have their strictness flipped and nothing would fail. Each pair below differs by ONE
+    // SECOND across the boundary the comparison names.
+    //
+    // The skew is zero throughout, so the boundary is the bound itself and nothing else can move
+    // the answer.
+    let exact = Expectations {
+        clock_skew_secs: 0,
+        ..expectations()
+    };
+
+    // (1) `NotOnOrAfter` IS EXCLUSIVE -- the name says so. At the instant it names the assertion
+    // is already over.
+    // THE CONFIRMATION EXPIRY IS PUSHED WELL PAST THE ASSERTION'S, deliberately. With
+    // `Body::default()`'s it lands on the SAME instant as `NotOnOrAfter`, and the confirmation
+    // comparison would then refuse at the boundary no matter what the assertion comparison did
+    // -- so making `NotOnOrAfter` inclusive survived this test until the two were separated.
+    // Only one bound may be at its boundary at a time.
+    let window = Body {
+        not_before: Some("2026-01-01T00:00:00Z"),
+        not_on_or_after: Some("2026-01-01T00:05:00Z"),
+        confirmation_expiry: Some("2026-01-01T00:09:00Z"),
+        ..Body::default()
+    };
+    let expiry = 1_767_225_900; // 2026-01-01T00:05:00Z
+    assert!(
+        decide(&window, &exact, expiry - 1).is_ok(),
+        "one second before NotOnOrAfter was refused"
+    );
+    assert!(
+        matches!(
+            decide(&window, &exact, expiry),
+            Err(ConditionError::Expired)
+        ),
+        "AT NotOnOrAfter the assertion was still accepted; the bound is not exclusive"
+    );
+
+    // (2) `NotBefore` IS INCLUSIVE, for the same reason: it is the instant validity begins.
+    let start = 1_767_225_600; // 2026-01-01T00:00:00Z
+    assert!(
+        decide(&window, &exact, start).is_ok(),
+        "AT NotBefore the assertion was refused; the bound is not inclusive"
+    );
+    assert!(
+        matches!(
+            decide(&window, &exact, start - 1),
+            Err(ConditionError::Expired)
+        ),
+        "one second before NotBefore was accepted"
+    );
+
+    // (3) THE CONFIRMATION'S OWN EXPIRY, the same rule, measured where it is the binding one.
+    // Mirror image: the assertion's own window is wide, so only the confirmation's bound is at
+    // its boundary.
+    let confirmation = Body {
+        not_before: Some("2025-12-31T23:55:00Z"),
+        not_on_or_after: Some("2026-01-01T00:05:00Z"),
+        confirmation_expiry: Some("2026-01-01T00:01:00Z"),
+        ..Body::default()
+    };
+    let confirmation_expiry = 1_767_225_660; // 2026-01-01T00:01:00Z
+    assert!(
+        decide(&confirmation, &exact, confirmation_expiry - 1).is_ok(),
+        "one second before the confirmation expiry was refused"
+    );
+    assert!(
+        matches!(
+            decide(&confirmation, &exact, confirmation_expiry),
+            Err(ConditionError::Expired)
+        ),
+        "AT the confirmation expiry the response was still accepted"
+    );
+
+    // (4) THE LENGTH CEILING IS INCLUSIVE: a window exactly `max_age_secs` long is allowed, and
+    // one second longer is not. `expectations()` sets 600.
+    let exactly_at_ceiling = Body {
+        not_before: Some("2026-01-01T00:00:00Z"),
+        not_on_or_after: Some("2026-01-01T00:10:00Z"),
+        confirmation_expiry: Some("2026-01-01T00:10:00Z"),
+        ..Body::default()
+    };
+    assert!(
+        decide(&exactly_at_ceiling, &exact, start).is_ok(),
+        "a window exactly max_age_secs long was refused as too long-lived"
+    );
+    let one_second_over = Body {
+        not_on_or_after: Some("2026-01-01T00:10:01Z"),
+        ..exactly_at_ceiling
+    };
+    assert!(
+        matches!(
+            decide(&one_second_over, &exact, start),
+            Err(ConditionError::TooLongLived)
+        ),
+        "a window one second past the ceiling was accepted"
+    );
+
+    // (5) THE INVERTED-WINDOW GUARD is `<=`, so a ZERO-LENGTH window is inverted too: an
+    // assertion valid for no time at all is not a window, and it is the degenerate input the
+    // guard would otherwise let through into a comparison nothing is inside.
+    let zero_length = Body {
+        not_before: Some("2026-01-01T00:00:00Z"),
+        not_on_or_after: Some("2026-01-01T00:00:00Z"),
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&zero_length, &exact, start),
+            Err(ConditionError::Malformed)
+        ),
+        "a window that opens and closes at the same instant was not read as malformed"
     );
 }

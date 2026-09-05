@@ -60,8 +60,11 @@ pub struct Expectations<'a> {
     /// This deployment's entity id for the connection the response arrived for. The assertion's
     /// `Audience` must equal it.
     pub audience: &'a str,
-    /// The assertion consumer URL the response arrived at. The bearer `Recipient` must
-    /// equal it where they are present.
+    /// The assertion consumer URL the response arrived at. The bearer confirmation's
+    /// `Recipient` must equal it, and its ABSENCE is a refusal -- an earlier version of this
+    /// sentence ended "where they are present", which licensed exactly the defect the code now
+    /// refuses: the recipient-confusion defence disappearing when an attacker omits the one
+    /// attribute they control.
     pub recipient: &'a str,
     /// The `AuthnRequest` this response must answer.
     ///
@@ -70,6 +73,14 @@ pub struct Expectations<'a> {
     /// way -- see the module note.
     pub in_response_to: Option<&'a str>,
     /// How far outside a window a clock may be and still be believed, in seconds.
+    ///
+    /// NOT BOUNDED HERE, AND THAT IS THE CALLER'S PROBLEM TO SOLVE. A large enough value is the
+    /// same as no time check at all, and nothing in this module can say what "large enough"
+    /// means for a deployment -- so it clamps the value at zero from below (a negative skew is
+    /// read as none, never as a narrowing) and saturates its arithmetic, but the ceiling belongs
+    /// with whatever constructs `Expectations` from a connection's configuration. Said plainly
+    /// because an earlier test named itself "and is not unbounded" while measuring only that a
+    /// SMALLER value refused more, which is a property of the caller's choice, not of a bound.
     pub clock_skew_secs: i64,
     /// The longest this deployment will treat an assertion as valid, whatever the identity
     /// provider asserted, in seconds.
@@ -135,6 +146,20 @@ pub enum ConditionError {
         /// The attribute, or the element, that was not there.
         attribute: &'static str,
     },
+    /// A bound is present and this server cannot read it.
+    ///
+    /// SEPARATE FROM [`Self::MissingBound`] FOR THE SAME REASON THAT ONE IS SEPARATE FROM
+    /// [`Self::Expired`]: the operator's fix differs. "Carries no `NotBefore`" sends somebody to
+    /// look for an attribute that is right there in the document; what actually happened is that
+    /// its VALUE is not the narrow `xsd:dateTime` form [`crate::parse_utc`] accepts -- an offset
+    /// instead of `Z`, a year outside 1900..=2200, a leap second. Collapsing the two put a
+    /// document an operator can see on screen behind an error saying it does not exist.
+    UnreadableBound {
+        /// The attribute whose value could not be read.
+        attribute: &'static str,
+        /// What it said, so an operator can see what their identity provider emitted.
+        found: String,
+    },
     /// The assertion is valid for longer than this deployment will believe.
     ///
     /// Separate from [`Self::Expired`] because the fix is different: an operator has to shorten
@@ -165,9 +190,14 @@ pub enum ConditionError {
     },
     /// The assertion is not a `saml:Assertion`, or carries two of something it may carry one of.
     ///
-    /// An ambiguous read is no read: [`VerifiedAssertion`] answers `None` for two matches as
-    /// well as none, so a document carrying two `Conditions` lands here rather than having one
-    /// of them believed.
+    /// An ambiguous read is no read, so a document carrying two `Conditions`, two `Subject`s or
+    /// two bearer `SubjectConfirmation`s lands here rather than having one of them believed.
+    ///
+    /// ABSENCE DOES NOT LAND HERE. Zero and two are different faults with different fixes, so an
+    /// assertion carrying no `Conditions` at all is [`Self::MissingBound`] naming the element,
+    /// not this. Two `Issuer` elements are the exception in the other direction: they are
+    /// [`Self::WrongIssuer`] with `found: None`, because the caller's question there is which
+    /// provider signed this, and "neither, unambiguously" is an answer to that question.
     Malformed,
 }
 
@@ -190,6 +220,11 @@ impl core::fmt::Display for ConditionError {
                     "the assertion carries no {attribute}, which this server requires"
                 )
             }
+            Self::UnreadableBound { attribute, found } => write!(
+                f,
+                "the assertion's {attribute} is {found:?}, which is not a UTC xsd:dateTime this \
+                 server can read"
+            ),
             Self::TooLongLived => {
                 f.write_str("the assertion is valid for longer than this connection allows")
             }
@@ -215,9 +250,18 @@ pub struct Accepted {
     pub name_id_format: Option<String>,
     /// The assertion's own `ID`, which a caller records so the same one cannot be admitted twice.
     pub assertion_id: String,
-    /// When this deployment stops treating the assertion as valid, in epoch seconds. The EARLIER
-    /// of what the assertion said and what `max_age_secs` allows, which is what a replay cache
-    /// remembers it until.
+    /// When this deployment stops treating the assertion as valid, in epoch seconds, which is
+    /// what a replay cache remembers it until.
+    ///
+    /// The EARLIEST of FOUR things, not two: the assertion's own `NotOnOrAfter`, the bearer
+    /// confirmation's own `NotOnOrAfter`, and `max_age_secs` measured from `NotBefore` -- plus
+    /// `clock_skew_secs`, added at the end, because the window comparison admits the assertion
+    /// for that long past every one of them. Remembering it only to the bound would forget it
+    /// while it could still be presented, and then admit the replay.
+    ///
+    /// The `max_age_secs` operand cannot bind on its own: a window longer than it was already
+    /// refused as [`ConditionError::TooLongLived`]. It is in the minimum so that a later change
+    /// to that refusal cannot silently make this value outlast what was accepted.
     pub expires_at_unix_secs: i64,
 }
 
@@ -262,10 +306,21 @@ pub fn check(
     // the issuer as "a check the caller makes" and gave no field to make it with, which is a
     // control that exists only in prose. A response is resolved by the URL it arrived at, so this
     // is what ties the assertion's own claim of authorship to the connection it was resolved to.
-    let issuer = assertion
-        .elements(ASSERTION, "Issuer")
-        .first()
-        .map(SignedElement::text);
+    //
+    // A DIRECT CHILD, AND EXACTLY ONE. `elements` searches every descendant, and SAML puts
+    // `saml:Issuer` in more than one place: `saml:Advice` carries whole advisory assertions with
+    // issuers of their own, and `saml:AttributeValue` is `xs:anyType`, so an attribute's value
+    // may legitimately contain one. Reading by descendant search let an attacker append a
+    // second `Issuer` naming the trusted provider and have it believed -- and because the walk
+    // uses a stack, "the first" was the LAST in document order, so appending was enough.
+    let issuers = assertion.children(ASSERTION, "Issuer");
+    let issuer = match issuers.as_slice() {
+        [single] => Some(single.text_collapsed()),
+        // TWO IS NOT ONE, and this module refuses ambiguity everywhere else. Reported as
+        // `WrongIssuer { found: None }` rather than naming either: naming one would print the
+        // value this server did NOT act on, which is worse than printing nothing.
+        [] | [_, ..] => None,
+    };
     match issuer.as_deref() {
         Some(found) if found == expectations.issuer => {}
         found => {
@@ -275,8 +330,10 @@ pub fn check(
         }
     }
 
-    // EXACTLY ONE `Conditions`, resolved as an element so everything below is read WITHIN it.
-    let conditions = assertion.elements(ASSERTION, "Conditions");
+    // EXACTLY ONE `Conditions`, AS A DIRECT CHILD, resolved as an element so everything below is
+    // read WITHIN it. A descendant search reached the advisory `Conditions` of an assertion
+    // nested in `saml:Advice`, which then supplied this assertion's window and audience.
+    let conditions = assertion.children(ASSERTION, "Conditions");
     let conditions = match conditions.as_slice() {
         [single] => single,
         // NONE AND TWO ARE DIFFERENT FAULTS and the operator's fix differs, so they do not share
@@ -291,11 +348,23 @@ pub fn check(
         _ => return Err(ConditionError::Malformed),
     };
 
-    let (not_before, not_on_or_after) = read_conditions(conditions, expectations, now_unix_secs)?;
+    let skew = expectations.clock_skew_secs.max(0);
+    let (not_before, not_on_or_after) =
+        read_conditions(conditions, expectations, now_unix_secs, skew)?;
     let (name_id_element, confirmation_expiry) =
-        read_subject(assertion, expectations, now_unix_secs)?;
+        read_subject(assertion, expectations, now_unix_secs, skew)?;
+    // THE VALUE THE GUARD CHECKED MUST BE THE VALUE RETURNED. An earlier version tested
+    // `name_id.trim().is_empty()` and then returned the UNTRIMMED text, so " ada@globex.example "
+    // passed a check on a string the caller never sees and was signed in with its spaces --
+    // which is a different account key from the same name flush, and a way to mint a second
+    // identity for one person.
+    //
+    // REFUSED RATHER THAN SILENTLY TRIMMED. `NameID` content is `xsd:string`, which PRESERVES
+    // whitespace (unlike the `anyURI` audience and issuer, which XSD collapses before any
+    // comparison), so trimming here would be this server deciding that two values the schema
+    // says are different name one person. Refusing says so out loud.
     let name_id = name_id_element.text();
-    if name_id.trim().is_empty() {
+    if name_id.is_empty() || name_id.trim() != name_id {
         return Err(ConditionError::Malformed);
     }
     let name_id_format = name_id_element.attribute("Format").map(ToOwned::to_owned);
@@ -321,7 +390,30 @@ pub fn check(
         // accepted, stamped as having expired in 1969.
         expires_at_unix_secs: not_on_or_after
             .min(not_before.saturating_add(expectations.max_age_secs))
-            .min(confirmation_expiry),
+            .min(confirmation_expiry)
+            // AND THE SKEW THAT ADMITTED IT. The window comparison accepts while
+            // `now - skew < not_on_or_after`, so this assertion stays admissible for `skew`
+            // seconds past every bound above. A replay cache told to forget it at the bound
+            // would forget it while it could still be presented, and would then admit the
+            // replay -- which is the one thing the cache exists to stop.
+            .saturating_add(skew),
+    })
+}
+
+/// One `xsd:dateTime` bound, distinguishing ABSENT from PRESENT-AND-UNREADABLE.
+///
+/// `Option::and_then(parse_utc).ok_or(MissingBound)` collapses the two, and the resulting error
+/// says "the assertion carries no Conditions/@NotBefore" about an attribute an operator can see
+/// on screen. The two faults have different fixes: one is an identity provider that does not
+/// emit the attribute, the other is one that emits it in a form this server refuses -- an offset
+/// instead of `Z`, a year outside [`crate::parse_utc`]'s range, a leap second.
+fn read_instant(raw: Option<&str>, attribute: &'static str) -> Result<i64, ConditionError> {
+    let Some(raw) = raw else {
+        return Err(ConditionError::MissingBound { attribute });
+    };
+    parse_utc(raw).ok_or_else(|| ConditionError::UnreadableBound {
+        attribute,
+        found: raw.to_owned(),
     })
 }
 
@@ -335,6 +427,7 @@ fn read_conditions(
     conditions: &SignedElement<'_>,
     expectations: &Expectations<'_>,
     now_unix_secs: i64,
+    skew: i64,
 ) -> Result<(i64, i64), ConditionError> {
     // THE AUDIENCE, read only from `AudienceRestriction` children of `Conditions`.
     //
@@ -356,6 +449,8 @@ fn read_conditions(
             .any(|audience| audience == expectations.audience)
         {
             return Err(ConditionError::WrongAudience {
+                // The FIRST of this restriction's audiences, not of the assertion's: an operator
+                // reading the error needs the restriction that actually excluded them.
                 found: named.first().cloned(),
             });
         }
@@ -365,39 +460,45 @@ fn read_conditions(
     // service provider that cannot evaluate a `Condition` MUST treat the assertion as invalid.
     // The whole point of the element is that an identity provider can add a restriction and rely
     // on it being honoured; silently ignoring one turns every future restriction into a no-op.
-    for child in conditions.element_children() {
-        if !matches!(
-            child.as_str(),
-            "AudienceRestriction" | "OneTimeUse" | "ProxyRestriction"
-        ) {
-            return Err(ConditionError::UnsupportedCondition {
-                name: child.clone(),
-            });
+    for (namespace, local) in conditions.element_children() {
+        // THE NAMESPACE IS PART OF THE NAME. An allowlist over local names alone admits
+        // `evil:OneTimeUse` bound to a namespace nobody trusts as something this server
+        // understands -- the identical bypass the assertion gate above exists to prevent.
+        // `OneTimeUse` IS ALLOWED THROUGH BECAUSE IT IS ALREADY ENFORCED, not because it is
+        // ignored: `SamlReplayRepo::admit_assertion` in ironauth-store admits each assertion id
+        // exactly once, so every assertion this deployment accepts is one-time-use whether or
+        // not it says so. `ProxyRestriction` restricts who may RE-ASSERT this to somebody else,
+        // which is a constraint on a proxying identity provider and not on a relying party.
+        if namespace != ASSERTION
+            || !matches!(
+                local.as_str(),
+                "AudienceRestriction" | "OneTimeUse" | "ProxyRestriction"
+            )
+        {
+            return Err(ConditionError::UnsupportedCondition { name: local });
         }
     }
 
     // THE TIME BOUNDS, read as attributes OF `Conditions`. Both are required: an assertion with
     // no `NotOnOrAfter` never expires, and one with no `NotBefore` can be pre-dated.
-    let not_before = conditions
-        .attribute("NotBefore")
-        .and_then(parse_utc)
-        .ok_or(ConditionError::MissingBound {
-            attribute: "Conditions/@NotBefore",
-        })?;
-    let not_on_or_after = conditions
-        .attribute("NotOnOrAfter")
-        .and_then(parse_utc)
-        .ok_or(ConditionError::MissingBound {
-            attribute: "Conditions/@NotOnOrAfter",
-        })?;
+    let not_before = read_instant(conditions.attribute("NotBefore"), "Conditions/@NotBefore")?;
+    let not_on_or_after = read_instant(
+        conditions.attribute("NotOnOrAfter"),
+        "Conditions/@NotOnOrAfter",
+    )?;
     // A WINDOW THAT ENDS BEFORE IT STARTS is not a window. Refused as `Malformed` rather than
     // `Expired`, because nothing about a clock would make it valid and telling an operator it
     // expired sends them to look at clock skew.
     if not_on_or_after <= not_before {
         return Err(ConditionError::Malformed);
     }
-    let skew = expectations.clock_skew_secs.max(0);
-    if now_unix_secs + skew < not_before || now_unix_secs - skew >= not_on_or_after {
+    // SATURATING ON BOTH SIDES, for the reason the ceiling below is saturating: `skew` comes
+    // from a public field with no validator, so `i64::MAX` reaches here, and `now + skew` would
+    // panic in debug and wrap NEGATIVE in release. The `.max(0)` above bounds it below; nothing
+    // bounded it above.
+    if now_unix_secs.saturating_add(skew) < not_before
+        || now_unix_secs.saturating_sub(skew) >= not_on_or_after
+    {
         return Err(ConditionError::Expired);
     }
     // AND THIS DEPLOYMENT'S OWN CEILING, applied to what the identity provider asserted rather
@@ -416,11 +517,14 @@ fn read_subject<'a>(
     assertion: &'a VerifiedAssertion,
     expectations: &Expectations<'_>,
     now_unix_secs: i64,
+    skew: i64,
 ) -> Result<(SignedElement<'a>, i64), ConditionError> {
-    let skew = expectations.clock_skew_secs.max(0);
-    // THE SUBJECT, and EXACTLY ONE of it. Everything about who this is and how they may present
-    // it is read within here, never by descendant search.
-    let subjects = assertion.elements(ASSERTION, "Subject");
+    // THE SUBJECT, and EXACTLY ONE of it, AS A DIRECT CHILD. Everything about who this is and
+    // how they may present it is read within here, never by descendant search -- and the Subject
+    // itself is found the same way, because `saml:AttributeValue` is `xs:anyType` and
+    // `saml:Advice` carries whole assertions, so a descendant search finds Subjects that are
+    // somebody else's and are inside this signature just as much as the real one.
+    let subjects = assertion.children(ASSERTION, "Subject");
     let [subject] = subjects.as_slice() else {
         return Err(ConditionError::Malformed);
     };
@@ -475,13 +579,11 @@ fn read_subject<'a>(
     // THE CONFIRMATION'S OWN EXPIRY, which is the bearer profile's and is a DIFFERENT bound from
     // the assertion's: 4.1.4.2 requires it, and it is usually much shorter, because it bounds how
     // long the response may be in flight rather than how long the statement is true.
-    let confirmation_expiry =
-        data.attribute("NotOnOrAfter")
-            .and_then(parse_utc)
-            .ok_or(ConditionError::MissingBound {
-                attribute: "SubjectConfirmationData/@NotOnOrAfter",
-            })?;
-    if now_unix_secs - skew >= confirmation_expiry {
+    let confirmation_expiry = read_instant(
+        data.attribute("NotOnOrAfter"),
+        "SubjectConfirmationData/@NotOnOrAfter",
+    )?;
+    if now_unix_secs.saturating_sub(skew) >= confirmation_expiry {
         return Err(ConditionError::Expired);
     }
 
