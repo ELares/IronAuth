@@ -139,7 +139,7 @@ fn a_v3_certificate_with_extensions_reads_the_same_as_a_v1_one() {
 fn nothing_may_follow_the_certificate_or_the_key() {
     // AN OPERATOR WHO APPENDS A ROTATION CERTIFICATE TO THE OLD ONE would otherwise silently pin
     // the OLD key and then watch every assertion fail with an error about a signature -- the
-    // exact misdirection `RsaKeySize` exists to prevent. Two certificates in one upload is what
+    // exact misdirection `RsaUnusableKey` exists to prevent. Two certificates in one upload is what
     // somebody produces by concatenating two PEM blocks.
     let mut two = certificate("rsa2048");
     two.extend_from_slice(&certificate("ecdsa-p256"));
@@ -252,10 +252,13 @@ fn the_curve_comes_from_the_algorithm_parameter_and_not_from_the_point_length() 
 
 #[test]
 fn a_compressed_point_is_refused_for_being_compressed_and_not_for_its_length() {
-    // AN EARLIER VERSION CHECKED THE LENGTH FIRST, so every compressed fixture was 33 bytes and
-    // the `0x04` guard was never reached: deleting it left the whole suite green. The prefix is
-    // checked FIRST now, and these points are the RIGHT TOTAL LENGTH for their curve, so a
-    // length-only reader accepts every one of them.
+    // AN EARLIER VERSION'S FIXTURES WERE ALL 33 BYTES, so the length check answered first and
+    // the `0x04` guard was never reached: deleting it left the whole suite green. These points
+    // are the RIGHT TOTAL LENGTH for their curve, so the length check cannot answer and only the
+    // prefix can -- which is what makes deleting the prefix guard fail this test.
+    //
+    // The operand ORDER in `x509.rs` is not what fixed it and no test can measure it: both
+    // halves answer `Malformed`, so swapping them changes nothing observable.
     for prefix in [0x02_u8, 0x03] {
         assert_eq!(
             public_key_from_spki(&spki_ec(P256_OID, &point(prefix, 64))),
@@ -290,7 +293,7 @@ fn both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with() 
     // the certificate they uploaded.
     assert_eq!(
         pinned(&certificate("rsa1024")),
-        Err(X509Error::RsaKeySize),
+        Err(X509Error::RsaUnusableKey),
         "a real 1024-bit RSA certificate was pinned"
     );
 
@@ -304,13 +307,13 @@ fn both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with() 
         if !accepted {
             assert_eq!(
                 result,
-                Err(X509Error::RsaKeySize),
+                Err(X509Error::RsaUnusableKey),
                 "refused for the wrong reason"
             );
         }
     }
 
-    // THE EXPONENT, WHICH AN EARLIER VERSION DID NOT CHECK AT ALL -- so `RsaKeySize`'s promise
+    // THE EXPONENT, WHICH AN EARLIER VERSION DID NOT CHECK AT ALL -- so `RsaUnusableKey`'s promise
     // held for one of the two numbers a key is made of. `ring` requires an odd exponent below
     // 2^33, so a 40-byte one is a key this deployment could pin and never verify with.
     for (exponent, accepted) in [
@@ -320,8 +323,15 @@ fn both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with() 
         (vec![0x01], false),
         (vec![0x03], true),
         (vec![0x01, 0x00, 0x01], true),
+        // 0x0101010101 = 4_311_810_305, BELOW 2^33 by accident -- so this fixture alone cannot
+        // tell a byte-count rule from ring's value ceiling, and an earlier version's table was
+        // derived from the implemented rule rather than from ring.
         (vec![0x01_u8; 5], true),
-        (vec![0x01_u8; 6], false),
+        // THE CEILING ITSELF, one either side: 2^33-1 = 0x1_FFFF_FFFF is ring's largest.
+        (vec![0x01, 0xff, 0xff, 0xff, 0xff], true),
+        (vec![0x02, 0x00, 0x00, 0x00, 0x01], false),
+        (vec![0xff; 5], false),
+        (vec![0x01_u8; 9], false),
         (vec![0x01_u8; 40], false),
         // AN EVEN EXPONENT IS NOT A PUBLIC EXPONENT: it shares a factor with phi(n), so it is not
         // invertible and no signature ever verifies against it.
@@ -337,7 +347,7 @@ fn both_halves_of_an_rsa_key_are_bounded_by_what_the_backend_will_verify_with() 
             exponent.last().copied().unwrap_or_default()
         );
         if !accepted {
-            assert_eq!(result, Err(X509Error::RsaKeySize));
+            assert_eq!(result, Err(X509Error::RsaUnusableKey));
         }
     }
 }
@@ -609,7 +619,7 @@ fn every_fixture_reads_and_no_truncation_of_one_is_read_as_a_certificate() {
             .to_string();
         let result = pinned(&der);
         if name == "rsa1024" {
-            assert_eq!(result, Err(X509Error::RsaKeySize), "{name}");
+            assert_eq!(result, Err(X509Error::RsaUnusableKey), "{name}");
         } else {
             assert!(result.is_ok(), "{name} did not read: {result:?}");
         }
@@ -766,6 +776,26 @@ fn spki_rsa_raw_modulus(modulus_der_value: &[u8], exponent: &[u8]) -> Vec<u8> {
     spki_around(&rsa_identifier(), &tlv(0x30, &inner))
 }
 
+/// [`certificate_around`], with `GeneralizedTime` (tag `0x18`) instead of `UTCTime`.
+///
+/// A separate builder because the two tags take different-length text, and a test that patched
+/// the tag byte alone would produce a document refused for its LENGTH rather than its year.
+fn certificate_around_generalized(key: &[u8], not_before: &str, not_after: &str) -> Vec<u8> {
+    let mut tbs = tlv(0xa0, &integer(&[2]));
+    tbs.extend_from_slice(&integer(&[0x01]));
+    tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    tbs.extend_from_slice(&tlv(0x30, &[]));
+    let mut validity = tlv(0x18, not_before.as_bytes());
+    validity.extend_from_slice(&tlv(0x18, not_after.as_bytes()));
+    tbs.extend_from_slice(&tlv(0x30, &validity));
+    tbs.extend_from_slice(&tlv(0x30, &[]));
+    tbs.extend_from_slice(key);
+    let mut certificate = tlv(0x30, &tbs);
+    certificate.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    certificate.extend_from_slice(&tlv(0x03, &[0, 0x11, 0x22]));
+    tlv(0x30, &certificate)
+}
+
 /// A certificate whose `subjectPublicKeyInfo` is `key`, with or without `[0] version`, and with
 /// these two `UTCTime` values.
 ///
@@ -789,4 +819,142 @@ fn certificate_around(key: &[u8], versioned: bool, not_before: &str, not_after: 
     certificate.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID))); // signatureAlgorithm
     certificate.extend_from_slice(&tlv(0x03, &[0, 0x11, 0x22])); // signatureValue
     tlv(0x30, &certificate)
+}
+
+#[test]
+fn the_der_rules_this_reader_adds_are_each_measured_on_their_own() {
+    // FOUR RULES ROUNDS 2 AND 3 ADDED, EACH WITH A FIXTURE THAT ONLY THAT RULE REFUSES. An
+    // earlier version's minimality cases were answered by the buffer-overrun check or by the
+    // contents not being an SPKI, so deleting both minimality rules left the suite green -- the
+    // exact defect this file's own header warns about.
+    let control = spki_rsa(&[0xd0; 256], &[0x01, 0x00, 0x01]);
+    assert!(
+        public_key_from_spki(&control).is_ok(),
+        "the control does not parse, so nothing below measures a rule"
+    );
+
+    // (1) A LENGTH WITH A LEADING ZERO BYTE: the same number written longer, on an otherwise
+    // complete document.
+    let mut long_form = vec![control[0], 0x83, 0x00];
+    long_form.extend_from_slice(&control[2..4]); // the original two length bytes
+    long_form.extend_from_slice(&control[4..]); // and the body, unchanged
+    assert_eq!(
+        public_key_from_spki(&long_form),
+        Err(X509Error::Malformed),
+        "a length with a leading zero byte was accepted"
+    );
+
+    // AND THE SHORT FORM WRITTEN LONG, ON AN OTHERWISE VALID DOCUMENT. This is the one an
+    // earlier version could not isolate: it used `30 81 02 05 00`, whose CONTENTS are a NULL
+    // where an AlgorithmIdentifier belongs -- so it was refused with or without the length rule,
+    // and the blanket `From<DerError>` mapped both faults to `Malformed` where `assert_eq!`
+    // cannot tell them apart. Deleting the rule left the assertion green.
+    //
+    // The rule is only reachable on a valid document at an element SHORT enough for the short
+    // form, and an SPKI is 300 bytes. The rsaEncryption `AlgorithmIdentifier` is thirteen, so
+    // rewriting ITS length is the one change, and everything else is byte-identical to the
+    // control above.
+    let identifier_length = control
+        .windows(3)
+        .position(|window| window == [0x30, 0x0d, 0x06])
+        .expect("the AlgorithmIdentifier header is where the builder puts it");
+    let mut long_inner = control[..=identifier_length].to_vec();
+    long_inner.extend_from_slice(&[0x81, 0x0d]); // the same length, in the long form
+    long_inner.extend_from_slice(&control[identifier_length + 2..]);
+    // The outer SEQUENCE now describes one byte less than it holds, so grow its length too --
+    // otherwise the document is refused for a truncation and this measures that instead.
+    let grown = u16::from_be_bytes([long_inner[2], long_inner[3]]) + 1;
+    long_inner[2..4].copy_from_slice(&grown.to_be_bytes());
+    assert_eq!(
+        public_key_from_spki(&long_inner),
+        Err(X509Error::Malformed),
+        "a thirteen-byte length written in the long form was accepted, on a document that is \
+         otherwise byte-identical to the accepted control"
+    );
+
+    // (2) A NON-MINIMAL OID ARC: a leading `0x80` continuation byte is seven zero bits in front
+    // of the number, a SECOND encoding of `1.2.840.113549.1.1.1`. OpenSSL compares an OID by its
+    // encoded bytes, so it reads this as a different OID and refuses the document.
+    let mut padded_oid = vec![0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01];
+    padded_oid.extend_from_slice(&[0x80, 0x01]);
+    assert_eq!(
+        public_key_from_spki(&spki(
+            &padded_oid,
+            None,
+            &rsa_public_key(&[0xd0; 256], &[0x01, 0x00, 0x01])
+        )),
+        Err(X509Error::Malformed),
+        "a non-minimally encoded rsaEncryption OID was read as rsaEncryption"
+    );
+
+    // (3) A FOURTH ELEMENT AFTER signatureValue, inside the Certificate SEQUENCE.
+    let key = spki_rsa(&[0xd0; 256], &[0x01, 0x00, 0x01]);
+    let mut tbs = tlv(0xa0, &integer(&[2]));
+    tbs.extend_from_slice(&integer(&[0x01]));
+    tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    tbs.extend_from_slice(&tlv(0x30, &[]));
+    let mut validity = tlv(0x17, b"260101000000Z");
+    validity.extend_from_slice(&tlv(0x17, b"270101000000Z"));
+    tbs.extend_from_slice(&tlv(0x30, &validity));
+    tbs.extend_from_slice(&tlv(0x30, &[]));
+    tbs.extend_from_slice(&key);
+    let mut certificate = tlv(0x30, &tbs);
+    certificate.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    certificate.extend_from_slice(&tlv(0x03, &[0, 0x11, 0x22]));
+    assert!(
+        pinned(&tlv(0x30, &certificate)).is_ok(),
+        "the certificate control does not parse"
+    );
+    let mut extra = certificate.clone();
+    extra.extend_from_slice(&tlv(0x05, &[]));
+    assert_eq!(
+        pinned(&tlv(0x30, &extra)),
+        Err(X509Error::Malformed),
+        "a fourth element inside the Certificate SEQUENCE was ignored"
+    );
+
+    // (4) A THIRD ELEMENT INSIDE Validity, which is the `end()` inside `validity()`.
+    let mut three = tlv(0x17, b"260101000000Z");
+    three.extend_from_slice(&tlv(0x17, b"270101000000Z"));
+    three.extend_from_slice(&tlv(0x05, &[]));
+    let mut wide_tbs = tlv(0xa0, &integer(&[2]));
+    wide_tbs.extend_from_slice(&integer(&[0x01]));
+    wide_tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    wide_tbs.extend_from_slice(&tlv(0x30, &[]));
+    wide_tbs.extend_from_slice(&tlv(0x30, &three));
+    wide_tbs.extend_from_slice(&tlv(0x30, &[]));
+    wide_tbs.extend_from_slice(&key);
+    let mut wide = tlv(0x30, &wide_tbs);
+    wide.extend_from_slice(&tlv(0x30, &tlv(0x06, RSA_OID)));
+    wide.extend_from_slice(&tlv(0x03, &[0, 0x11, 0x22]));
+    assert_eq!(
+        pinned(&tlv(0x30, &wide)),
+        Err(X509Error::Malformed),
+        "a third element inside Validity was ignored"
+    );
+}
+
+#[test]
+fn a_signed_year_is_not_a_year() {
+    // `i64::from_str` ACCEPTS A LEADING SIGN, so `-226` parses -- and a negative year becomes a
+    // negative epoch, which a caller writes into a NOT NULL column as a real instant and #141's
+    // expiry alerting then reads. X.690 gives GeneralizedTime four DIGITS and no sign.
+    let key = spki_rsa(&[0xd0; 256], &[0x01, 0x00, 0x01]);
+    for year in ["-226", "+226"] {
+        let signed =
+            certificate_around_generalized(&key, &format!("{year}0101000000Z"), "20270101000000Z");
+        assert_eq!(
+            pinned(&signed),
+            Err(X509Error::Malformed),
+            "a GeneralizedTime year of {year} was read as a year"
+        );
+    }
+    // THE CONTROL, so the refusals are about the sign and not about the tag: the same shape with
+    // a four-digit year parses, and its epoch is the one the calendar gives.
+    let ordinary = certificate_around_generalized(&key, "20260101000000Z", "20270101000000Z");
+    let read = pinned(&ordinary).expect("a GeneralizedTime certificate");
+    assert_eq!(
+        read.not_before_unix_secs, 1_767_225_600,
+        "2026-01-01T00:00:00Z"
+    );
 }

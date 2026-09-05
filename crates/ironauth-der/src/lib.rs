@@ -239,6 +239,14 @@ pub fn oid_arcs(contents: &[u8]) -> Result<Vec<u64>, DerError> {
     let mut value: u64 = 0;
     let mut pending = false;
     for &b in rest {
+        // A LEADING CONTINUATION BYTE OF 0x80 IS A NON-MINIMAL ARC: seven zero bits in front of
+        // the number, which X.690 8.19.2 forbids and which is a SECOND encoding of one value.
+        // OpenSSL compares an OBJECT IDENTIFIER by its ENCODED BYTES, so it reads such an OID as
+        // a different one entirely and refuses the certificate -- leaving this the permissive
+        // reader in a disagreement, which is the hazard this crate's own doc claims to close.
+        if !pending && b == 0x80 {
+            return Err(DerError::BadValue);
+        }
         pending = true;
         // `checked_mul(128)` RATHER THAN `checked_shl(7)`, WHICH GUARDS NOTHING HERE.
         // `checked_shl` answers `None` only when the SHIFT AMOUNT is at least the bit width; a
@@ -301,6 +309,12 @@ pub fn parse_time(tag_byte: u8, contents: &[u8]) -> Result<i64, DerError> {
         }
         tag::GENERALIZED_TIME => {
             if text.len() != 14 {
+                return Err(DerError::BadValue);
+            }
+            // `i64::from_str` ACCEPTS A LEADING SIGN, so `-226` and `+226` both parse -- and a
+            // negative year becomes a negative epoch, which a caller then writes into a column
+            // as a real instant. X.690 gives GeneralizedTime four DIGITS and no sign.
+            if !text[0..4].bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(DerError::BadValue);
             }
             let yyyy: i64 = text[0..4].parse().map_err(|_| DerError::BadValue)?;

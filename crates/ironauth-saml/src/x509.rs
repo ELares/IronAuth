@@ -14,6 +14,11 @@
 //!   required columns with no producer;
 //! - `certificate_der`, the bytes themselves, which the caller already has.
 //!
+//! NOTHING CALLS THIS YET. The management handler that accepts an upload is the next piece of
+//! #139, and until it lands the paragraph above describes an intended wiring rather than a live
+//! one. Said plainly because a module doc that describes a caller nobody wrote is how a layer
+//! ends up shipped, tested, and never executed.
+//!
 //! # What it deliberately does NOT do
 //!
 //! - It does not verify a signature on the certificate. There is no chain to verify against,
@@ -33,8 +38,10 @@
 //! # This is the MANAGEMENT surface, never the assertion path
 //!
 //! [`crate::TrustAnchor`] is a RAW key -- an EC point, or an RSA modulus and exponent. That is
-//! deliberate, and the crate doc's claim that no X.509 parser sits between a signed assertion and
-//! the decision to trust it is unchanged by this module: it runs when an operator UPLOADS a
+//! deliberate, and the property [`crate::verify`] depends on -- that no X.509 parsing sits
+//! between a signed assertion and the decision to trust it -- is unchanged by this module,
+//! though the sentence has to be about the PATH rather than the crate now. It runs when an
+//! operator UPLOADS a
 //! certificate, converts it once, and the store keeps the raw key. A response arriving at the ACS
 //! endpoint never reaches this code.
 //!
@@ -47,8 +54,9 @@
 //!
 //! WHAT IS NOT YET SHARED, SAID PLAINLY: `ironauth-webauthn::x509::parse_certificate` is a
 //! SECOND certificate walk, and this is a third of the way to being a third. They differ today
-//! in more than policy -- WebAuthn's reads the subject and issuer names and the extensions
-//! because attestation needs them, takes Ed25519 and P-256 only, and bounds no key size. So
+//! in more than policy -- WebAuthn's reads the subject and issuer names, the extensions and the
+//! AAGUID because attestation needs them; takes Ed25519, P-256 and RSA with NO size bound at
+//! all; and verifies a chain, which this deliberately does not. So
 //! "the reader is shared" is true of the TLV layer and NOT of the certificate grammar above it.
 //! Merging the two is worth doing and is not this PR: WebAuthn's walk is on a verified
 //! attestation path, and changing it needs its own review rather than riding along here.
@@ -105,12 +113,16 @@ pub enum X509Error {
     /// possible -- their identity provider can issue a key this deployment supports, which is
     /// not something they can do about a corrupt file.
     UnsupportedAlgorithm,
-    /// An RSA key outside the size range the signature backend will verify with.
+    /// An RSA key the signature backend will not verify with.
     ///
-    /// `ring` verifies `RSA_PKCS1_2048_8192_SHA*`, so a 1024-bit key is refused HERE rather than
-    /// pinned and then failing every assertion at verification time with an error about the
-    /// signature. Upload is the only moment an operator can still act on it.
-    RsaKeySize,
+    /// SIZE IS THE COMMON CASE AND NOT THE ONLY ONE. `ring` verifies
+    /// `RSA_PKCS1_2048_8192_SHA*`, so a 1024-bit modulus lands here -- and so does an exponent
+    /// outside `3..=2^33-1`, or an even one, which `ring` rejects as a KEY before it looks at
+    /// any signature. All of them are refused HERE rather than pinned and then failing every
+    /// assertion with an error about the SIGNATURE, which would send an operator to look at
+    /// their identity provider's signing configuration rather than at what they uploaded.
+    /// Upload is the only moment anybody can still act on it.
+    RsaUnusableKey,
 }
 
 impl core::fmt::Display for X509Error {
@@ -121,7 +133,11 @@ impl core::fmt::Display for X509Error {
             Self::UnsupportedAlgorithm => {
                 "the certificate's key is not one this server can verify signatures with"
             }
-            Self::RsaKeySize => "the certificate's RSA key is outside the supported size range",
+            Self::RsaUnusableKey => {
+                "the certificate's RSA key is not one this server can verify signatures with: \
+                 the modulus must be 2048 to 8192 bits and the exponent an odd number from 3 to \
+                 2^33-1"
+            }
         })
     }
 }
@@ -153,15 +169,15 @@ pub struct Pinned {
 /// fail every verification is refused at the one moment an operator is looking at it.
 const RSA_MODULUS_BYTES: core::ops::RangeInclusive<usize> = 256..=1024;
 
-/// The RSA PUBLIC EXPONENT range, in bytes.
+/// The RSA PUBLIC EXPONENT range, as VALUES.
 ///
 /// CHECKED FOR THE SAME REASON THE MODULUS IS, and an earlier version checked only the modulus --
-/// so `RsaKeySize`'s promise ("refused here rather than failing every assertion later") held for
+/// so `RsaUnusableKey`'s promise ("refused here rather than failing every assertion later") held for
 /// one of the two numbers a key is made of. `ring` bounds the exponent to 33 bits (it must be
 /// odd, at least 3, and less than 2^33), so five bytes is the ceiling; every real key uses three
 /// (65537). A zero-length exponent is refused too: `rsa_exponent` in the store is
 /// `CHECK (octet_length(rsa_exponent) > 0)`, and a key with no exponent verifies nothing.
-const RSA_EXPONENT_BYTES: core::ops::RangeInclusive<usize> = 1..=5;
+const RSA_EXPONENT: core::ops::RangeInclusive<u64> = 3..=((1 << 33) - 1);
 
 /// The key and validity inside a DER-encoded X.509 certificate.
 ///
@@ -177,7 +193,7 @@ pub fn pinned(der: &[u8]) -> Result<Pinned, X509Error> {
     let mut certificate = outer.take_sequence()?;
     // NOTHING MAY FOLLOW THE CERTIFICATE. An operator who appends a rotation certificate to the
     // old one would otherwise silently pin the OLD key and then watch every assertion fail with
-    // an error about a signature -- the exact misdirection `RsaKeySize` exists to prevent.
+    // an error about a signature -- the exact misdirection `RsaUnusableKey` exists to prevent.
     end(&outer)?;
 
     // TBSCertificate ::= SEQUENCE {
@@ -304,13 +320,13 @@ fn subject_public_key_info(mut spki: Der<'_>) -> Result<XmlSigKey, X509Error> {
         let exponent = unsigned_integer(rsa.take_tag(tag::INTEGER)?)?;
         end(&rsa)?;
         if !RSA_MODULUS_BYTES.contains(&modulus.len()) {
-            return Err(X509Error::RsaKeySize);
+            return Err(X509Error::RsaUnusableKey);
         }
         // THE EXPONENT TOO, and an earlier version checked only the modulus. `ring` bounds the
         // exponent as well, so a key with a 40-byte exponent is one this deployment can pin and
         // never verify with.
-        if !RSA_EXPONENT_BYTES.contains(&exponent.len()) || !is_public_exponent(exponent) {
-            return Err(X509Error::RsaKeySize);
+        if !is_public_exponent(exponent) {
+            return Err(X509Error::RsaUnusableKey);
         }
         return Ok(XmlSigKey::Rsa {
             modulus: modulus.to_vec(),
@@ -337,8 +353,11 @@ fn subject_public_key_info(mut spki: Der<'_>) -> Result<XmlSigKey, X509Error> {
         // is a modular square root, which is arithmetic this crate has no business doing on a
         // value somebody uploaded, and no identity provider emits one.
         //
-        // The prefix is checked BEFORE the length, so a compressed point of the right total
-        // length is still refused for being compressed rather than passing a length test.
+        // THE OPERAND ORDER IS A PREFERENCE, NOT THE GUARD. Both halves are `||`, both answer
+        // `Malformed`, and no input can tell which fired -- swapping them survives the suite,
+        // which is the honest way to say that the earlier version's defect was its FIXTURES
+        // (every compressed point was 33 bytes, so the length check answered first and the
+        // prefix check was never reached) and not this line.
         if key.first() != Some(&0x04) || key.len() != expected {
             return Err(X509Error::Malformed);
         }
@@ -374,12 +393,20 @@ fn bit_string(contents: &[u8]) -> Result<&[u8], X509Error> {
 /// EVEN EXPONENTS are the other half: an even `e` shares a factor with phi(n), so it has no
 /// inverse and no signature ever verifies against it.
 fn is_public_exponent(exponent: &[u8]) -> bool {
-    let odd = exponent.last().is_some_and(|byte| byte % 2 == 1);
-    // "At least 3", written as "more than one byte, or a first byte of at least 3". The
-    // magnitude here has had its sign padding stripped by `unsigned_integer`, so a small
-    // exponent is a single byte.
-    let at_least_three = exponent.len() > 1 || exponent.first().is_some_and(|byte| *byte >= 3);
-    odd && at_least_three
+    // THE BYTE COUNT IS A PRE-FILTER, NOT THE RULE, and an earlier version made it the rule:
+    // `1..=5` bytes admits 2^40-1 while ring's ceiling is 2^33-1, so `FF FF FF FF FF` was pinned
+    // here and answered `too_large` there. Nine bytes cannot hold a value in range, so refusing
+    // early is only about not folding a number that cannot fit.
+    if exponent.is_empty() || exponent.len() > 8 {
+        return false;
+    }
+    let mut value: u64 = 0;
+    for byte in exponent {
+        // The magnitude has had its sign padding stripped by `unsigned_integer`, so this is at
+        // most eight bytes of a u64 and cannot overflow.
+        value = value * 256 + u64::from(*byte);
+    }
+    RSA_EXPONENT.contains(&value) && value % 2 == 1
 }
 
 /// A DER INTEGER's magnitude, with the sign padding removed and a negative one refused.
