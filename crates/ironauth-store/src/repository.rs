@@ -211,11 +211,6 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
-    /// The OUTBOUND SCIM connections for this scope (issue #137).
-    ///
-    /// READ side. Creating and deleting one points a credential at somebody else's directory, so
-    /// both go through [`ScopedStore::acting`] and the CONTROL plane. The DATA plane reads this,
-    /// because the push worker runs there.
     /// The inbound SAML connections an organization signs in through (issue #139).
     ///
     /// READ-ONLY here. Pinning a trust anchor decides who may assert an identity in this
@@ -241,6 +236,11 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The OUTBOUND SCIM connections for this scope (issue #137).
+    ///
+    /// READ side. Creating and deleting one points a credential at somebody else's directory, so
+    /// both go through [`ScopedStore::acting`] and the CONTROL plane. The DATA plane reads this,
+    /// because the push worker runs there.
     #[must_use]
     pub fn scim_push_connections(&self) -> ScimPushConnectionRepo<'a> {
         ScimPushConnectionRepo {
@@ -75328,7 +75328,6 @@ fn scim_push_connection_from_row(
     })
 }
 
-/// The OUTBOUND SCIM connections for one scope, read only (issue #137).
 /// A SAML connection as stored (issue #139). Carries no key material: the pinned keys are
 /// [`SamlCertificate`] rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75563,15 +75562,27 @@ impl SamlConnectionRepo<'_> {
             .transpose()
     }
 
-    /// The LIVE connection an identity provider's `Issuer` resolves to.
+    /// The LIVE connection a response arrived for, named by the assertion consumer URL it was
+    /// posted to.
     ///
-    /// # Why the assertion consumer resolves by issuer and not by organization
+    /// # Why the ACS is per connection, and why the `Issuer` is a CHECK rather than a lookup
     ///
-    /// A SAML response arrives at a per-environment endpoint carrying an `Issuer` and nothing
-    /// else this deployment chose. The organization comes OUT of this lookup, so a response
-    /// cannot name the organization it wants to be validated against -- which is the property
-    /// that stops a response signed by one customer's identity provider being aimed at another
-    /// customer's connection.
+    /// The obvious design resolves the connection from the response's `Issuer`. It does not work,
+    /// and the reason is a configuration customers have all the time: two organizations in one
+    /// environment behind ONE identity provider tenant. A customer with two workspaces in your
+    /// product signs both into their single Okta, so both connections carry the same
+    /// `idp_entity_id` -- and an issuer lookup then has two rows to choose from and no basis for
+    /// choosing. Whichever it returned, the organization it reported would not be determined by
+    /// the response.
+    ///
+    /// Making the issuer globally unique instead would REFUSE that configuration, which is not a
+    /// defect to fix but a customer to serve.
+    ///
+    /// So the connection is identified by WHERE the response arrived: each one publishes its own
+    /// assertion consumer URL, which is what an operator pastes into their identity provider, and
+    /// the id is in the path. The `Issuer` is then checked AGAINST the resolved connection --
+    /// which is the stronger statement anyway, because a lookup can only find a row that matches
+    /// while a check can refuse one that does not.
     ///
     /// DISABLED CONNECTIONS ARE INVISIBLE HERE. An operator's switch has to mean the identity
     /// provider stops being trusted, and returning the row for the caller to check would make
@@ -75580,18 +75591,21 @@ impl SamlConnectionRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn active_by_issuer(
+    pub async fn find_active(
         &self,
-        idp_entity_id: &str,
+        id: &SamlConnectionId,
     ) -> Result<Option<SamlConnection>, StoreError> {
+        if id.scope() != self.scope {
+            return Ok(None);
+        }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(&format!(
             "SELECT {SAML_CONNECTION_COLUMNS} FROM saml_connections \
-             WHERE tenant_id = $1 AND environment_id = $2 AND idp_entity_id = $3 AND active"
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND active"
         ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
-        .bind(idp_entity_id)
+        .bind(id.to_string())
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -75715,12 +75729,18 @@ impl SamlReplayRepo<'_> {
             return Err(StoreError::NotFound);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
-        sqlx::query(
+        // THE PARENT IS CHECKED IN THE STATEMENT. The foreign key proves the connection EXISTS
+        // and not that it is visible here, because referential integrity bypasses row-level
+        // security. Without this a request could be issued against another scope's connection,
+        // and the redemption keyed on it would then be answerable there.
+        let inserted = sqlx::query(
             "INSERT INTO saml_outstanding_requests \
              (id, tenant_id, environment_id, connection_id, relay_state, created_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, \
-                     TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
-                     TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval)",
+             SELECT $1, $2, $3, $4, $5, \
+                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
+                    TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             WHERE EXISTS (SELECT 1 FROM saml_connections \
+                           WHERE tenant_id = $2 AND environment_id = $3 AND id = $4)",
         )
         .bind(request_id)
         .bind(self.scope.tenant().to_string())
@@ -75731,6 +75751,9 @@ impl SamlReplayRepo<'_> {
         .bind(expires_at_unix_micros)
         .execute(&mut *tx)
         .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -75832,6 +75855,7 @@ impl SamlReplayRepo<'_> {
     }
 }
 
+/// The OUTBOUND SCIM connections for one scope, read only (issue #137).
 pub struct ScimPushConnectionRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -76013,10 +76037,6 @@ pub struct NewScimPushConnection<'a> {
     pub deletion_policy: ScimDeletionPolicy,
 }
 
-/// The WRITE side of the outbound SCIM connections (issue #137).
-///
-/// Creating one points a credential at somebody else's directory, which is an operator action for
-/// the same reason creating an inbound one is.
 /// What a new SAML connection names.
 #[derive(Debug, Clone, Copy)]
 pub struct NewSamlConnection<'a> {
@@ -76369,14 +76389,11 @@ impl ActingSamlConnectionRepo<'_> {
                 scope,
                 acting: &self.acting,
                 env,
-                // THE SAME ACTION AS A DELETION, and not a separate one, would be wrong: an
-                // operator reading the log needs to tell a connection that was switched off from
-                // one that was removed, because only the second lost its trust anchors.
-                action: if active {
-                    Action::SamlConnectionCreated
-                } else {
-                    Action::SamlConnectionDeleted
-                },
+                // ITS OWN ACTION, because the same action as a deletion would make "switched
+                // off" byte-identical to "removed" in the trail -- and only the second lost its
+                // trust anchors. The first version of this wrote exactly that while a comment
+                // beside it explained why it would be wrong.
+                action: Action::SamlConnectionActiveChanged,
                 target: &id,
             },
             async |tx| {
@@ -76455,6 +76472,10 @@ impl ActingSamlConnectionRepo<'_> {
     }
 }
 
+/// The WRITE side of the outbound SCIM connections (issue #137).
+///
+/// Creating one points a credential at somebody else's directory, which is an operator action for
+/// the same reason creating an inbound one is.
 pub struct ActingScimPushConnectionRepo<'a> {
     store: &'a Store,
     scope: Scope,

@@ -71,7 +71,11 @@ CREATE TABLE saml_connection_certificates (
         CHECK (
             (key_kind = 'ecdsa_p256' AND octet_length(public_key) = 65)
             OR (key_kind = 'ecdsa_p384' AND octet_length(public_key) = 97)
-            OR (key_kind = 'rsa' AND octet_length(public_key) BETWEEN 128 AND 1024)
+            -- RSA AT THE THREE SIZES `ring` WILL VERIFY: 2048, 3072 and 4096 bits. A range
+            -- admits lengths no verifier accepts, which is the exact failure this constraint
+            -- exists to prevent -- the key stores, and the refusal arrives at somebody's sign-in
+            -- as "the signature did not verify", which is the answer a forgery gets.
+            OR (key_kind = 'rsa' AND octet_length(public_key) IN (256, 384, 512))
         ),
     CONSTRAINT saml_connection_certificates_fingerprint_length
         CHECK (octet_length(fingerprint_sha256) = 32),
@@ -100,11 +104,10 @@ CREATE TABLE saml_connection_certificates (
 CREATE INDEX saml_connection_certificates_by_connection
     ON saml_connection_certificates (tenant_id, environment_id, connection_id);
 
--- #141's expiry sweep reads by expiry across the scope. Added here rather than there because the
--- column is here and an index on a column its own table defines is not a forward reference: the
--- listing route in THIS slice orders by it.
-CREATE INDEX saml_connection_certificates_by_expiry
-    ON saml_connection_certificates (tenant_id, environment_id, not_after);
+-- NO INDEX ON `not_after`. One was here, justified by "the listing route in this slice orders by
+-- it", and that was false: the only read orders by `created_at`. #141's expiry sweep is the query
+-- that wants it, and the index belongs in the migration that adds the sweep -- which is the rule
+-- 0189 states about a grant and which applies to an index for the same reason.
 
 ALTER TABLE saml_connection_certificates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE saml_connection_certificates FORCE ROW LEVEL SECURITY;

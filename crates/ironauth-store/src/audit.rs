@@ -1365,6 +1365,13 @@ pub enum Action {
     SamlConnectionCreated,
     /// An inbound SAML connection was deleted (issue #139).
     SamlConnectionDeleted,
+    /// An inbound SAML connection was switched on or off (issue #139).
+    ///
+    /// DISTINCT FROM A DELETION, and the difference is what an operator reading the log needs: a
+    /// switched-off connection keeps its pins and comes back by being switched on, where a
+    /// deleted one took its trust anchors with it and coming back means re-pinning every key.
+    /// Writing the deletion action for a switch would make the two byte-identical in the trail.
+    SamlConnectionActiveChanged,
     /// A signing key was pinned to an inbound SAML connection (issue #139).
     ///
     /// THE TRUST DECISION. After this, an assertion carrying a signature from this key is
@@ -1888,6 +1895,7 @@ impl Action {
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
             Action::SamlConnectionCreated => "saml_connection.created",
             Action::SamlConnectionDeleted => "saml_connection.deleted",
+            Action::SamlConnectionActiveChanged => "saml_connection.active_changed",
             Action::SamlCertificatePinned => "saml_certificate.pinned",
             Action::SamlCertificateUnpinned => "saml_certificate.unpinned",
             Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",

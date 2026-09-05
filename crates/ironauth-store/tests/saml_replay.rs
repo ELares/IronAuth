@@ -355,3 +355,40 @@ async fn a_request_cannot_be_issued_for_another_scopes_connection() {
         "a request was issued against another scope's connection: {refused:?}"
     );
 }
+
+#[tokio::test]
+async fn a_request_cannot_be_issued_against_a_connection_that_does_not_exist() {
+    // THE `WHERE EXISTS` INSIDE THE INSERT, which the id-scope check shadows for a FOREIGN handle
+    // and which is the only thing covering a well-formed handle in THIS scope naming no row.
+    //
+    // Without it the insert reaches the foreign key and answers a raw constraint violation, so
+    // starting a sign-in against a connection somebody deleted a moment ago is a 500 where it
+    // should be a not-found. The test above could not see that: it hands a cross-scope handle,
+    // which never reaches the statement.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let absent = SamlConnectionId::generate(&env, &scope);
+    let now = now_micros(&env);
+
+    let refused = db
+        .store()
+        .scoped(scope)
+        .saml_replay()
+        .issue_request(&absent, "_req_absent", None, now, now + 300_000_000)
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::NotFound)),
+        "issuing against a connection that does not exist was not a not-found: {refused:?}"
+    );
+
+    // AND NOTHING WAS WRITTEN, so the id is still free: a row inserted before the error would
+    // make the retry a duplicate-key failure an operator cannot explain.
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM saml_outstanding_requests WHERE id = $1")
+            .bind("_req_absent")
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("count");
+    assert_eq!(rows, 0, "the refused request was written anyway");
+}

@@ -106,9 +106,16 @@ CREATE TABLE saml_assertion_replay (
     -- From the application clock seam, like `saml_outstanding_requests.created_at` and for the
     -- same reason: it is compared against `expires_at`, which comes from there.
     seen_at             timestamptz NOT NULL,
-    -- REMEMBERED UNTIL THE ASSERTION COULD NO LONGER BE VALID, which is what makes this a replay
-    -- cache rather than a rate limit. Forgetting earlier would reopen exactly the window the
-    -- assertion is still usable in.
+    -- WHEN THE ROW COULD SAFELY BE FORGOTTEN, and NOTHING READS IT YET.
+    --
+    -- The check is the primary key, so an assertion is refused for as long as its row exists --
+    -- which, with no sweep, is for ever. That is strictly SAFER than the window this column
+    -- describes and it is not what an operator would expect from the column's name, so the
+    -- discrepancy is written down rather than left to be discovered.
+    --
+    -- It is recorded now because the sweep needs it and because it is knowable only here, at
+    -- admission: the assertion's own `NotOnOrAfter`, bounded by the connection's
+    -- `max_assertion_age_secs`. Reconstructing it later would mean keeping the assertion.
     expires_at          timestamptz NOT NULL,
 
     -- THE INSERT IS THE CHECK. A composite primary key makes a duplicate a unique violation

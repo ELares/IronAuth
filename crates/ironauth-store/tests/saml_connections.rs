@@ -172,42 +172,200 @@ async fn a_connection_round_trips_and_holds_no_key_of_its_own() {
 }
 
 #[tokio::test]
-async fn the_assertion_consumer_resolves_by_issuer_and_an_operator_switch_stops_it() {
-    // WHY BY ISSUER. A response arrives at a per-environment endpoint carrying an `Issuer` and
-    // nothing else this deployment chose; the organization comes OUT of the lookup. That is what
-    // stops a response signed by one customer's identity provider being aimed at another
-    // customer's connection: the aiming is not the caller's to do.
+async fn the_columns_the_verifier_and_the_conditions_read_round_trip_exactly() {
+    // WHY THIS IS SEPARATE. The round-trip above uses the fixture, which supplies exactly the
+    // column DEFAULT for every defaulted field -- so a read that dropped a column and returned
+    // the default instead would have passed it. Every value here differs from its default, and
+    // `public_key` is asserted BYTE FOR BYTE because it is the only column on the assertion path:
+    // a truncation or a re-encoding there is a key that verifies nothing, reported as a forgery.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Globex").await;
-    let connection = connect(&db, &env, scope, &org, "https://idp.example/entity").await;
-    let store = db.store().scoped(scope);
-
-    let found = store
+    let id = SamlConnectionId::generate(&env, &scope);
+    let mapping = json!({ "email": "urn:oid:0.9.2342.19200300.100.1.3" });
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .saml_connections()
-        .active_by_issuer("https://idp.example/entity")
+        .create(
+            &env,
+            NewSamlConnection {
+                id: &id,
+                organization_id: &org,
+                display_name: "Entra",
+                idp_entity_id: "https://sts.windows.net/tenant/",
+                idp_sso_url: "https://login.microsoftonline.com/tenant/saml2",
+                sp_entity_id: "https://ironauth.example/saml/globex",
+                acs_url: "https://ironauth.example/saml/acs/globex",
+                // ALL FIVE DIFFER FROM THE DEFAULT.
+                allow_unsolicited: true,
+                clock_skew_secs: 5,
+                max_assertion_age_secs: 120,
+                nameid_format: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+                attribute_mapping: &mapping,
+                require_encrypted_assertion: true,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create");
+
+    let store = db.store().scoped(scope);
+    let stored = store
+        .saml_connections()
+        .find_in_org(&org, &id)
         .await
         .expect("read")
-        .expect("the issuer resolves");
-    assert_eq!(found.id, connection);
+        .expect("exists");
+    assert!(stored.allow_unsolicited);
+    assert_eq!(stored.clock_skew_secs, 5);
+    assert_eq!(stored.max_assertion_age_secs, 120);
     assert_eq!(
-        found.organization_id, org,
-        "the organization must come out of the lookup, not into it"
+        stored.nameid_format,
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
     );
+    assert_eq!(stored.attribute_mapping, mapping);
+    assert!(stored.require_encrypted_assertion);
+    assert_eq!(stored.sp_entity_id, "https://ironauth.example/saml/globex");
+    assert_eq!(stored.acs_url, "https://ironauth.example/saml/acs/globex");
 
-    // AN UNKNOWN ISSUER RESOLVES TO NOTHING, which is what makes an unpinned identity provider
-    // unable to get as far as signature checking.
-    assert!(
-        store
-            .saml_connections()
-            .active_by_issuer("https://attacker.example/entity")
-            .await
-            .expect("read")
-            .is_none()
+    // AND THE KEY MATERIAL, byte for byte.
+    let key = p256_point(7);
+    let der = vec![0x30, 0x82, 0x07, 0xAB, 0xCD];
+    let print = fingerprint(7);
+    let cert_id = SamlCertificateId::generate(&env, &scope);
+    let now = now_micros(&env);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .saml_connections()
+        .pin_certificate(
+            &env,
+            NewSamlCertificate {
+                id: &cert_id,
+                connection_id: &id,
+                key_kind: SamlKeyKind::Rsa,
+                public_key: &vec![0xA5; 256],
+                rsa_exponent: Some(&[0x01, 0x00, 0x01]),
+                certificate_der: &der,
+                fingerprint_sha256: &print,
+                not_before_unix_micros: now - 1_000_000,
+                not_after_unix_micros: now + 86_400_000_000,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("pin");
+    let pins = store
+        .saml_connections()
+        .certificates(&id)
+        .await
+        .expect("read the pins");
+    let pin = pins.first().expect("one pin");
+    assert_eq!(pin.key_kind, SamlKeyKind::Rsa);
+    assert_eq!(
+        pin.public_key,
+        vec![0xA5; 256],
+        "the key the verifier is handed did not survive the round trip"
     );
+    assert_eq!(
+        pin.rsa_exponent.as_deref(),
+        Some(&[0x01_u8, 0x00, 0x01][..]),
+        "the RSA exponent did not survive; ring needs both halves"
+    );
+    assert_eq!(pin.certificate_der, der);
+    assert_eq!(pin.fingerprint_sha256, print);
+    assert_eq!(pin.not_before_unix_micros, now - 1_000_000);
+    assert_eq!(pin.not_after_unix_micros, now + 86_400_000_000);
+    let _ = key;
+}
 
-    // AND AN OPERATOR'S SWITCH STOPS IT RESOLVING AT ALL.
+#[tokio::test]
+async fn one_connections_pins_are_not_another_connections() {
+    // The filter on `connection_id` in `certificates()`, which nothing measured: a read that
+    // dropped it would hand one identity provider's key to a response from another, so a customer
+    // whose IdP is compromised could assert identities on every connection in the environment.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let first = connect(&db, &env, scope, &org, "https://idp-a.example/entity").await;
+    let second = connect(&db, &env, scope, &org, "https://idp-b.example/entity").await;
+    pin(&db, &env, scope, &first, 1)
+        .await
+        .expect("pin the first");
+    pin(&db, &env, scope, &second, 2)
+        .await
+        .expect("pin the second");
+
+    let store = db.store().scoped(scope);
+    let firsts = store
+        .saml_connections()
+        .certificates(&first)
+        .await
+        .expect("read");
+    assert_eq!(
+        firsts.len(),
+        1,
+        "one connection saw another's pins: {firsts:?}"
+    );
+    assert_eq!(firsts[0].public_key, p256_point(1));
+    let seconds = store
+        .saml_connections()
+        .certificates(&second)
+        .await
+        .expect("read");
+    assert_eq!(seconds.len(), 1);
+    assert_eq!(seconds[0].public_key, p256_point(2));
+}
+
+#[tokio::test]
+async fn the_assertion_consumer_resolves_by_connection_and_an_operator_switch_stops_it() {
+    // WHY BY CONNECTION AND NOT BY ISSUER. Each connection publishes its own assertion consumer
+    // URL, so the id is in the path a response arrives at, and the `Issuer` is CHECKED against
+    // the resolved connection rather than used to find one.
+    //
+    // The first version looked connections up by issuer, and the configuration that breaks that
+    // is ordinary: a customer with two organizations here signs both into their ONE identity
+    // provider tenant, so both connections carry the same `idp_entity_id` and the lookup has two
+    // rows and no basis for choosing. It returned whichever Postgres emitted first, so the
+    // organization it reported was not determined by the response. The test below is the one that
+    // could not have existed under that design.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let globex = seed_org(&db, &env, scope, "Globex").await;
+    let initech = seed_org(&db, &env, scope, "Initech").await;
+    // ONE IDENTITY PROVIDER, TWO ORGANIZATIONS. This must be a supported configuration, not a
+    // conflict: it is a customer with two workspaces and one Okta.
+    let one = connect(&db, &env, scope, &globex, "https://idp.example/entity").await;
+    let two = connect(&db, &env, scope, &initech, "https://idp.example/entity").await;
+    assert_ne!(one, two);
+    let store = db.store().scoped(scope);
+
+    let first = store
+        .saml_connections()
+        .find_active(&one)
+        .await
+        .expect("read")
+        .expect("the connection resolves");
+    assert_eq!(
+        first.organization_id, globex,
+        "the connection resolved to the wrong organization, which an issuer lookup could not \
+         have got right at all"
+    );
+    let second = store
+        .saml_connections()
+        .find_active(&two)
+        .await
+        .expect("read")
+        .expect("the connection resolves");
+    assert_eq!(second.organization_id, initech);
+
+    // AN OPERATOR'S SWITCH STOPS IT RESOLVING AT ALL.
     //
     // The lookup filters on `active`, and the first version of this slice had no way to set that
     // column: a filter nothing can make false is a defence in the shape of a comment. Removing
@@ -216,28 +374,55 @@ async fn the_assertion_consumer_resolves_by_issuer_and_an_operator_switch_stops_
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .saml_connections()
-        .set_active(&env, &connection, false, None)
+        .set_active(&env, &one, false, None)
         .await
         .expect("switch the connection off");
     assert!(
         store
             .saml_connections()
-            .active_by_issuer("https://idp.example/entity")
+            .find_active(&one)
             .await
             .expect("read")
             .is_none(),
         "a switched-off identity provider still resolves, so turning it off means only that the \
          management surface says so"
     );
+    // AND THE OTHER ORGANIZATION'S IS UNTOUCHED, which is what proves the switch is per
+    // connection and not per issuer.
+    assert!(
+        store
+            .saml_connections()
+            .find_active(&two)
+            .await
+            .expect("read")
+            .is_some(),
+        "switching one connection off disabled another organization's"
+    );
     // THE ROW IS STILL THERE, with its pins, which is the difference from a deletion: switching
     // back on must not require re-pinning every key.
     let still_there = store
         .saml_connections()
-        .find_in_org(&org, &connection)
+        .find_in_org(&globex, &one)
         .await
         .expect("read")
         .expect("the connection was not deleted");
     assert!(!still_there.active);
+
+    // AND THE TRAIL SAYS WHICH HAPPENED. The first version wrote the DELETION action for a
+    // switch, beside a comment explaining why that would be wrong: an operator reading the log
+    // could not tell a connection that was switched off from one that was removed, and only the
+    // second lost its trust anchors. Nothing measured it, so the contradiction survived review.
+    let action: String = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE target_id = $1 ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(one.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the switch wrote an audit row");
+    assert_eq!(
+        action, "saml_connection.active_changed",
+        "switching a connection off is byte-identical in the trail to deleting it"
+    );
 }
 
 #[tokio::test]
@@ -466,12 +651,35 @@ async fn one_organization_cannot_pin_two_connections_to_one_identity_provider() 
     );
 }
 
+/// The SQLSTATE a CHECK constraint violation raises.
+const CHECK_VIOLATION: &str = "23514";
+
+/// Assert a write was refused BY A CHECK CONSTRAINT, not by anything else.
+///
+/// `is_err()` is not enough here. A scope refusal, a foreign key, a missing audit classification
+/// and a constraint all answer `Err`, so a test asserting only that passes against a write that
+/// never reached the column it names -- which is the shape that would let the constraint be
+/// deleted with the suite still green.
+fn assert_refused_by_a_constraint(outcome: &Result<(), StoreError>, what: &str) {
+    let Err(StoreError::Database(error)) = outcome else {
+        panic!("{what} was not refused by the database at all: {outcome:?}");
+    };
+    let code = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(
+        code.as_deref(),
+        Some(CHECK_VIOLATION),
+        "{what} was refused, but not by a CHECK constraint: {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_key_the_verifier_could_not_be_handed_cannot_be_written() {
-    // THE SHAPE IS ENFORCED WHERE IT IS STORED, not only where it is parsed. A row claiming RSA
-    // with no exponent, or a P-256 point of the wrong length, is one the verifier cannot use --
-    // and the failure would surface at somebody's sign-in rather than at pinning, as
-    // "the signature did not verify", which is the same answer a forgery gets.
+    // THE SHAPE IS ENFORCED WHERE IT IS STORED, not only where it is parsed. A row the verifier
+    // cannot use would surface at somebody's sign-in as "the signature did not verify", which is
+    // the same answer a forgery gets.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -483,82 +691,102 @@ async fn a_key_the_verifier_could_not_be_handed_cannot_be_written() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env));
 
-    // RSA WITHOUT AN EXPONENT.
-    let id = SamlCertificateId::generate(&env, &scope);
-    let no_exponent = acting
-        .saml_connections()
-        .pin_certificate(
-            &env,
-            NewSamlCertificate {
-                id: &id,
-                connection_id: &connection,
-                key_kind: SamlKeyKind::Rsa,
-                public_key: &vec![0x01; 256],
-                rsa_exponent: None,
-                certificate_der: &[0x30, 0x82, 0x01],
-                fingerprint_sha256: &fingerprint(9),
-                not_before_unix_micros: now - 1_000_000,
-                not_after_unix_micros: now + 86_400_000_000,
-            },
-            None,
-            None,
-        )
-        .await;
-    assert!(
-        no_exponent.is_err(),
-        "an RSA key with no exponent was stored, so the verifier gets a key it cannot use"
-    );
+    let attempt = async |kind: SamlKeyKind,
+                         key: Vec<u8>,
+                         exponent: Option<Vec<u8>>,
+                         seed: u8,
+                         not_before: i64,
+                         not_after: i64| {
+        let id = SamlCertificateId::generate(&env, &scope);
+        acting
+            .saml_connections()
+            .pin_certificate(
+                &env,
+                NewSamlCertificate {
+                    id: &id,
+                    connection_id: &connection,
+                    key_kind: kind,
+                    public_key: &key,
+                    rsa_exponent: exponent.as_deref(),
+                    certificate_der: &[0x30, 0x82, seed],
+                    fingerprint_sha256: &fingerprint(seed),
+                    not_before_unix_micros: not_before,
+                    not_after_unix_micros: not_after,
+                },
+                None,
+                None,
+            )
+            .await
+    };
+    let (valid_from, valid_to) = (now - 1_000_000, now + 86_400_000_000);
 
+    // RSA WITHOUT AN EXPONENT: `ring` needs both halves.
+    assert_refused_by_a_constraint(
+        &attempt(
+            SamlKeyKind::Rsa,
+            vec![0x01; 256],
+            None,
+            9,
+            valid_from,
+            valid_to,
+        )
+        .await,
+        "an RSA key with no exponent",
+    );
+    // AN EC KEY *WITH* ONE, which is the mirror and which the CHECK also has to refuse: a row
+    // carrying material for two different key types is one nobody can interpret.
+    assert_refused_by_a_constraint(
+        &attempt(
+            SamlKeyKind::EcdsaP256,
+            p256_point(12),
+            Some(vec![0x01, 0x00, 0x01]),
+            12,
+            valid_from,
+            valid_to,
+        )
+        .await,
+        "an EC key carrying an RSA exponent",
+    );
     // A P-256 POINT OF THE WRONG LENGTH.
-    let id = SamlCertificateId::generate(&env, &scope);
-    let short_point = acting
-        .saml_connections()
-        .pin_certificate(
-            &env,
-            NewSamlCertificate {
-                id: &id,
-                connection_id: &connection,
-                key_kind: SamlKeyKind::EcdsaP256,
-                public_key: &vec![0x04; 33],
-                rsa_exponent: None,
-                certificate_der: &[0x30, 0x82, 0x02],
-                fingerprint_sha256: &fingerprint(10),
-                not_before_unix_micros: now - 1_000_000,
-                not_after_unix_micros: now + 86_400_000_000,
-            },
+    assert_refused_by_a_constraint(
+        &attempt(
+            SamlKeyKind::EcdsaP256,
+            vec![0x04; 33],
             None,
-            None,
+            10,
+            valid_from,
+            valid_to,
         )
-        .await;
-    assert!(
-        short_point.is_err(),
-        "a P-256 point of the wrong length was stored"
+        .await,
+        "a P-256 point of the wrong length",
     );
-
-    // A VALIDITY WINDOW NO CLOCK IS INSIDE.
-    let id = SamlCertificateId::generate(&env, &scope);
-    let inverted = acting
-        .saml_connections()
-        .pin_certificate(
-            &env,
-            NewSamlCertificate {
-                id: &id,
-                connection_id: &connection,
-                key_kind: SamlKeyKind::EcdsaP256,
-                public_key: &p256_point(11),
-                rsa_exponent: None,
-                certificate_der: &[0x30, 0x82, 0x03],
-                fingerprint_sha256: &fingerprint(11),
-                not_before_unix_micros: now + 86_400_000_000,
-                not_after_unix_micros: now - 1_000_000,
-            },
-            None,
-            None,
+    // AN RSA MODULUS AT A SIZE NO VERIFIER ACCEPTS. 1024 bits is inside any plausible range bound
+    // and is not one of the three sizes `ring` will verify, which is why the constraint names the
+    // sizes rather than a range.
+    assert_refused_by_a_constraint(
+        &attempt(
+            SamlKeyKind::Rsa,
+            vec![0x01; 128],
+            Some(vec![0x01, 0x00, 0x01]),
+            13,
+            valid_from,
+            valid_to,
         )
-        .await;
-    assert!(
-        inverted.is_err(),
-        "a certificate whose validity ends before it starts was pinned, which is pinning nothing"
+        .await,
+        "an RSA modulus at a size ring cannot verify",
+    );
+    // A VALIDITY WINDOW NO CLOCK IS INSIDE.
+    assert_refused_by_a_constraint(
+        &attempt(
+            SamlKeyKind::EcdsaP256,
+            p256_point(11),
+            None,
+            11,
+            valid_to,
+            valid_from,
+        )
+        .await,
+        "a certificate whose validity ends before it starts",
     );
 }
 
@@ -627,6 +855,11 @@ async fn every_key_kind_round_trips_and_an_unknown_one_does_not() {
     }
     // AND A VALUE OUTSIDE THE VOCABULARY IS REFUSED BY THE COLUMN, so a kind added to the enum
     // and not the CHECK is caught here rather than at somebody's sign-in.
+    //
+    // THE KEY MATERIAL HERE MUST BE OTHERWISE LEGAL, or the insert fails on the point-length
+    // CHECK first and proves nothing about the vocabulary. It cannot be: every branch of that
+    // CHECK is keyed on a kind, so an unknown kind fails BOTH. The vocabulary CHECK is therefore
+    // asserted by name below rather than by the insert merely failing.
     let raw = sqlx::query(
         "INSERT INTO saml_connection_certificates \
          (id, tenant_id, environment_id, connection_id, key_kind, public_key, certificate_der, \
@@ -642,5 +875,15 @@ async fn every_key_kind_round_trips_and_an_unknown_one_does_not() {
     .bind(fingerprint(99))
     .execute(db.owner_pool())
     .await;
-    assert!(raw.is_err(), "a key kind outside the vocabulary was stored");
+    let error = raw.expect_err("a key kind outside the vocabulary was stored");
+    let constraint = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::constraint)
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(
+        constraint, "saml_connection_certificates_key_kind_check",
+        "the insert was refused, but not by the vocabulary CHECK, so this proves nothing about \
+         the vocabulary: {error:?}"
+    );
 }

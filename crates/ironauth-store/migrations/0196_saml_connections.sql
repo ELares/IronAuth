@@ -54,8 +54,19 @@ CREATE TABLE saml_connections (
     -- that an operator and their customer coordinate, which is what SAML metadata exchange is.
     sp_entity_id             text        NOT NULL,
     -- The assertion consumer service URL this connection's responses must name, for the
-    -- `Destination` and `Recipient` checks SAML 2.0 Profiles section 4.1.4.3 requires. Stored for
-    -- the same reason as `sp_entity_id`.
+    -- `Destination` and `Recipient` checks SAML 2.0 Profiles section 4.1.4.3 requires.
+    --
+    -- PER CONNECTION, and that is what identifies the connection a response arrived for.
+    --
+    -- Resolving instead by the response's `Issuer` cannot work, and the configuration that breaks
+    -- it is ordinary: a customer with two organizations in this environment signs both into their
+    -- ONE identity provider tenant, so both connections carry the same `idp_entity_id` and an
+    -- issuer lookup has two rows and no basis for choosing. Making the issuer unique per
+    -- environment would refuse that customer instead, which is not a fix.
+    --
+    -- So each connection publishes its own ACS URL, an operator pastes it into their identity
+    -- provider, and the connection id is in the path. The `Issuer` is then CHECKED against the
+    -- resolved connection, which is stronger than looking one up by it.
     acs_url                  text        NOT NULL,
 
     -- IDP-INITIATED SIGN-IN IS OFF, and this is the CVE-2026-9098 class.
@@ -136,11 +147,10 @@ CREATE TABLE saml_connections (
 CREATE INDEX saml_connections_by_org
     ON saml_connections (tenant_id, environment_id, organization_id, created_at, id);
 
--- THE ACS RESOLVES BY ISSUER, and that read has no organization in hand: a response arrives at a
--- per-environment endpoint carrying an `Issuer` and nothing else this deployment chose. So the
--- lookup is (scope, idp_entity_id) and the organization comes OUT of it.
-CREATE INDEX saml_connections_by_issuer
-    ON saml_connections (tenant_id, environment_id, idp_entity_id);
+-- NO INDEX ON `idp_entity_id`. The ACS resolves a connection by its own id, which the primary
+-- key already serves; nothing queries by issuer, and an index for a query nothing issues is a
+-- write cost nobody can account for. The UNIQUE constraint above still indexes it as its leading
+-- columns allow, which is what the create's conflict check needs.
 
 ALTER TABLE saml_connections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE saml_connections FORCE ROW LEVEL SECURITY;
