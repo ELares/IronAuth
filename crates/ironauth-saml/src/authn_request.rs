@@ -74,7 +74,13 @@ pub enum RequestError {
         /// Which field, so the operator knows which column to fix.
         field: &'static str,
     },
-    /// The signature primitive refused the key.
+    /// The key cannot be used for this binding.
+    ///
+    /// TWO PRODUCERS, and only one of them is a signing failure. A key whose algorithm this
+    /// module has no `SigAlg` URI for is refused BEFORE anything is signed, because announcing
+    /// one URI and sending a signature of another kind fails at the identity provider with no
+    /// diagnosis. The other is the primitive itself declining, which means the key's declared
+    /// algorithm and its material disagree.
     Unsignable,
 }
 
@@ -141,13 +147,22 @@ pub fn build(request: &Request<'_>) -> Result<String, RequestError> {
 /// `&`, `<`, `>`, `"` and `'` become entities.
 ///
 /// TAB, NEWLINE AND CARRIAGE RETURN BECOME `&#x9;`, `&#xA;` and `&#xD;`, and an earlier version
-/// emitted them raw on the grounds that XML permits them. It does -- and XML 1.0 2.11/3.3.3 then
-/// applies ATTRIBUTE-VALUE NORMALIZATION, which silently rewrites each of them to a SPACE before
-/// any consumer sees the value. Every value this module writes lands in an attribute, so a
-/// `Destination` or an `acs_url` holding one would reach the identity provider as a different
+/// emitted them raw on the grounds that XML permits them. It does -- and inside an ATTRIBUTE
+/// VALUE, XML 1.0 3.3.3 then applies attribute-value normalization, which silently rewrites each
+/// of them to a SPACE before any consumer sees the value. A `Destination` or an
+/// `AssertionConsumerServiceURL` holding one would reach the identity provider as a different
 /// string than the row holds, and the ACS would then compare the `Recipient` it gets back
-/// against the unmodified column and refuse. The numeric reference is what survives
-/// normalization, and it is why this refuses nothing that XML can actually carry.
+/// against the unmodified column and refuse. The numeric reference survives normalization, which
+/// is why this refuses nothing XML can carry.
+///
+/// FIVE OF THE SIX FIELDS ARE ATTRIBUTES; `sp_entity_id` IS A TEXT NODE, where normalization
+/// does not apply and a raw tab would survive. An earlier version of this paragraph said "every
+/// value this module writes lands in an attribute", which was false for exactly the field the
+/// test exercised. Escaping both the same way is deliberate rather than accidental: one function
+/// with one contract cannot be applied to the wrong kind of node, and a numeric reference in a
+/// text node is the same value to every reader. The cost is that the emitted text is not
+/// byte-identical to the input where a control appears; the benefit is that no future field can
+/// be added to the wrong branch.
 ///
 /// WHAT STILL HAS NO REPRESENTATION is the rest of C0, plus the two permanently unassigned
 /// noncharacters `U+FFFE` and `U+FFFF`: no escape makes them legal -- `&#x1;` is as invalid as
@@ -201,7 +216,8 @@ pub struct Redirect {
 ///
 /// # Errors
 ///
-/// [`RequestError::Unsignable`] if the key cannot sign.
+/// [`RequestError::Unsignable`] if the key's algorithm has no `SigAlg` URI in this build, or if
+/// the signing primitive declines it.
 pub fn redirect(
     xml: &str,
     relay_state: Option<&str>,
@@ -252,6 +268,19 @@ pub fn redirect(
 /// to BE a DEFLATE stream; it does not require the stream to be small, and an `AuthnRequest` is
 /// a few hundred bytes, so the difference between this and a compressed stream is tens of bytes
 /// in a URL. Pulling a compression crate onto this path to save them would be the larger change.
+///
+/// WHAT IT COSTS, MEASURED RATHER THAN GUESSED: a real request built from scoped ids is about
+/// 780 bytes of highly repetitive XML -- two SAML namespace URIs, a 68-character connection id
+/// appearing twice, three more URIs -- which is exactly the shape DEFLATE compresses well, so a
+/// compressed stream would be roughly a quarter of the size and the redirect URL roughly 700
+/// characters shorter. An earlier version of this paragraph called the difference "tens of
+/// bytes", which understated it by more than an order of magnitude.
+///
+/// IT IS STILL THE RIGHT TRADE, for a reason the size does not touch: ~1050 characters is well
+/// inside every limit that matters (8 KiB is the common server cap), and the alternative is a
+/// compression dependency on the path that builds a security-relevant redirect. If a deployment
+/// ever meets an identity provider with a shorter URL limit, that is the moment to add one -- and
+/// this paragraph is what tells the next reader the option was weighed rather than missed.
 ///
 /// A STORED BLOCK IS FIVE BYTES OF HEADER per 65535 bytes of payload: the final-block flag and
 /// the type in the first byte, then the length and its ones-complement, little-endian. The loop

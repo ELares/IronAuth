@@ -102,14 +102,31 @@ fn a_value_xml_cannot_carry_is_refused_and_names_its_column() {
     // so a `Recipient` the identity provider echoes back would no longer equal the `acs_url`
     // column the ACS compares it against, and every sign-in on that connection would be refused
     // for a reason nothing in the pipeline could name.
+    // MEASURED IN AN ATTRIBUTE, which is where normalization applies. An earlier version proved
+    // it only through `sp_entity_id`, and that field is the ONE text node in the document -- the
+    // single place the defect being fixed does not occur.
+    let attribute = authn_request::build(&Request {
+        destination: "https://idp.example/\tsso\nx\ry",
+        ..request()
+    })
+    .expect("a tab is representable");
+    assert!(
+        attribute.contains("Destination=\"https://idp.example/&#x9;sso&#xA;x&#xD;y\""),
+        "a control XML normalises to a space was emitted raw in an attribute: {attribute}"
+    );
+
+    // AND IN THE TEXT NODE, where it is harmless and consistent rather than necessary: one
+    // function with one contract cannot be applied to the wrong kind of node.
     let kept = authn_request::build(&Request {
         issuer: "https://ironauth.example/\tmeta\ndata\r",
         ..request()
     })
     .expect("a tab is representable");
     assert!(
-        kept.contains("/&#x9;meta&#xA;data&#xD;"),
-        "a control XML normalises to a space was emitted raw: {kept}"
+        kept.contains(
+            "<saml:Issuer>https://ironauth.example/&#x9;meta&#xA;data&#xD;</saml:Issuer>"
+        ),
+        "{kept}"
     );
     assert!(!kept.contains('\t'), "{kept}");
 

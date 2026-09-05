@@ -59,11 +59,16 @@ const REQUEST_TTL_SECS: i64 = 300;
 
 /// The largest `RelayState` migration 0198's column will hold.
 ///
-/// THE COLUMN'S OWN BOUND, restated here because this is where a value is admitted. 0198 checks
-/// `octet_length(relay_state) <= 1024`, so a longer one is a constraint violation at the insert
-/// -- and on this endpoint that is a 500 for an unauthenticated caller who chose the length.
-/// Refusing to record it is not a loss: an unrecorded return location lands the user on the
-/// default page, which is what happens for a `return_to` that fails to parse anyway.
+/// A SECOND COPY OF THE COLUMN'S BOUND, and calling it "named once so the two cannot drift"
+/// -- as an earlier version of the comment at the filter site did -- was false: this literal and
+/// 0198's `octet_length(relay_state) <= 1024` are independent, and the migration is frozen by
+/// checksum, so only this one can move. Nothing links them and nothing can: a test that read the
+/// migration text would be asserting a claim about another file rather than a behaviour.
+///
+/// WHAT KEEPS THEM TOGETHER IS THE DIRECTION OF FAILURE. If this shrinks, a return location is
+/// dropped that the column would have held -- a user lands on the default page. If it grows past
+/// the column, the insert fails and an unauthenticated caller who chose the length gets a 500.
+/// Only the second is a fault, and it is the one the suite drives, at a length over BOTH.
 const MAX_RELAY_STATE_BYTES: usize = 1024;
 
 /// The query this endpoint accepts.
@@ -119,11 +124,19 @@ pub async fn start_get(
         }
         Err(_) => return server_error(),
     };
-    let Ok(signing_key) = SigningKey::rsa_from_pkcs1_der(
-        Some(key.id.to_string()),
-        JwsAlgorithm::Rs256,
-        key.material.expose(),
-    ) else {
+    // THE ALGORITHM COMES FROM THE ROW, and an earlier version hardcoded `Rs256` here while
+    // `redirect` derived `SigAlg` from the key -- which made "SigAlg comes from the key" a
+    // tautology and left the `algorithm` column reading, as before, nothing at all. The column
+    // is the operator-visible fact; this is where it becomes the key's.
+    let Some(algorithm) = jws_algorithm_for(&key.algorithm) else {
+        // A ROW NAMING AN ALGORITHM THIS BUILD CANNOT LOAD. The column's CHECK admits one value
+        // today, so this is schema drift rather than configuration, and there is nothing the
+        // caller can do about it.
+        return server_error();
+    };
+    let Ok(signing_key) =
+        SigningKey::rsa_from_pkcs1_der(Some(key.id.to_string()), algorithm, key.material.expose())
+    else {
         // THE STORED KEY DID NOT LOAD, which is a row this deployment wrote and cannot use. It
         // is not the caller's fault and there is nothing they can do, so it is a 500 rather than
         // an explanation.
@@ -141,11 +154,21 @@ pub async fn start_get(
     // AND IT IS BOUNDED HERE, because migration 0198 caps `relay_state` at 1024 bytes and a
     // longer value that parses is a database CHECK violation -- which this endpoint would
     // answer as a 500 on an unauthenticated GET, a fault a caller can trigger at will. The
-    // bound is the column's, named once so the two cannot drift.
+    // bound is the column's; see the constant for why the two copies cannot be linked.
+    // AND THE RESUME'S SCOPE MUST BE THIS ROUTE'S. `parse_resume` RECOVERS a scope by decoding
+    // it out of the client id's bytes; it performs no existence check and knows nothing about
+    // where it was called from, so every well-formed `cli_` from every tenant parses. The
+    // unscoped interaction routes can stop there because they DERIVE their scope from the resume
+    // -- this one is path-scoped, and its four path-scoped siblings (`federation`, `flow`,
+    // `flow::orchestration`, `webauthn`) all compare. Without the comparison a tenant's
+    // outstanding-request row records another tenant's authorization path, and the sentence
+    // below claiming a value that could never be honoured is never written becomes false.
     let return_to = query
         .return_to
         .as_deref()
-        .and_then(|value| interaction::parse_resume(Some(value)).map(|resume| resume.return_to))
+        .and_then(|value| interaction::parse_resume(Some(value)))
+        .filter(|resume| resume.scope == scope)
+        .map(|resume| resume.return_to)
         .filter(|value| value.len() <= MAX_RELAY_STATE_BYTES);
 
     let now_micros = epoch_micros(state.now());
@@ -193,10 +216,15 @@ pub async fn start_get(
     }
 
     // NO RELAYSTATE ON THE WIRE, and its absence is the deliberate part. OASIS Bindings 3.4.3
-    // says a `RelayState` MUST NOT exceed 80 bytes, and every value this endpoint could send is
-    // an `/authorize?client_id=...` resume path that exceeds it before the query begins -- so
-    // sending one would violate the binding on every request, and hand the identity provider a
-    // return path that is this deployment's business.
+    // says a `RelayState` MUST NOT exceed 80 bytes, and the SHORTEST value this endpoint could
+    // send is already 89: `parse_resume` requires the literal `/authorize?` (11) plus
+    // `client_id=` (10) plus a scoped client id, which is `cli_` and 64 base64url characters
+    // (68). An earlier version of this comment said the path "exceeds it before the query
+    // begins", which is wrong -- `/authorize?` is 11 bytes -- and reached the right conclusion
+    // by leaving out the id that does the exceeding. Every real value is longer still.
+    //
+    // AND THE LENGTH IS NOT THE ONLY REASON: sending one hands the identity provider a return
+    // path that is this deployment's business.
     //
     // NOTHING IS LOST BY OMITTING IT. The return location is in the outstanding-request row,
     // which is where the ACS reads it from; the copy that travels through the browser was only
@@ -222,6 +250,28 @@ pub async fn start_get(
         ],
     )
         .into_response()
+}
+
+/// The JOSE algorithm a stored `algorithm` fragment names, if this build has one for it.
+///
+/// THE TRANSLATION IS EXPLICIT AND TOTAL, rather than a parse or a default: the column holds
+/// XML-Signature's spelling (`rsa-sha256`) because that is what an operator sees in their
+/// identity provider, and this crate signs by JOSE name. A row naming something this build has
+/// no signer for answers `None` and is refused, rather than being silently signed as RSA and
+/// announced as whatever the row said.
+///
+/// READING THE COLUMN IS NOT YET DISTINGUISHABLE FROM A CONSTANT, and that is worth admitting
+/// rather than claiming as coverage: 0199's CHECK admits `rsa-sha256` and nothing else, so no
+/// row can disagree with the literal, and replacing `key.algorithm` here with `"rsa-sha256"`
+/// passes every test. The unit test below measures the MAPPING, which is the half that can be
+/// wrong today. The half that cannot be measured until a second algorithm exists is that the
+/// caller passes the row -- and it is written this way now so that adding one is a migration and
+/// a match arm, not a hunt for a hardcode.
+fn jws_algorithm_for(algorithm: &str) -> Option<JwsAlgorithm> {
+    match algorithm {
+        "rsa-sha256" => Some(JwsAlgorithm::Rs256),
+        _ => None,
+    }
 }
 
 /// `seconds` since the epoch as the `xsd:dateTime` SAML writes.
@@ -279,6 +329,31 @@ fn server_error() -> Response {
 #[cfg(test)]
 mod tests {
     use super::rfc3339_utc;
+
+    #[test]
+    fn the_algorithm_column_maps_to_one_jose_name_and_nothing_else() {
+        use super::jws_algorithm_for;
+        use ironauth_jose::JwsAlgorithm;
+
+        // THE HALF THAT CAN BE WRONG TODAY. The column is single-valued by CHECK, so no
+        // integration test can tell a read from a constant; what it CAN tell is whether the one
+        // value maps to the right signer, and whether anything else is refused rather than
+        // defaulted. A default here would sign with RSA whatever the row said.
+        assert_eq!(jws_algorithm_for("rsa-sha256"), Some(JwsAlgorithm::Rs256));
+        for unknown in [
+            "",
+            "rsa-sha1",
+            "RSA-SHA256",
+            "ecdsa-sha256",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+        ] {
+            assert_eq!(
+                jws_algorithm_for(unknown),
+                None,
+                "{unknown} was accepted as an algorithm"
+            );
+        }
+    }
 
     #[test]
     fn the_issue_instant_is_the_datetime_saml_reads() {

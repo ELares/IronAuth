@@ -113,12 +113,19 @@ CREATE POLICY saml_sp_signing_keys_scope ON saml_sp_signing_keys
         AND environment_id = current_setting('ironauth.environment_id', true)
     );
 
--- THE CONTROL PLANE MINTS AND RETIRES; THE DATA PLANE READS. Provisioning a key is an operator
+-- THE CONTROL PLANE MINTS; THE DATA PLANE READS. Provisioning a key is an operator
 -- action with a lasting consequence -- the metadata an operator uploads to their identity
 -- provider is derived from it -- so it goes through `ScopedStore::acting` and its audit trail,
 -- exactly as pinning a certificate does in 0197. Signing an AuthnRequest happens on a sign-in,
 -- which runs on the data plane, and needs nothing but a read.
-GRANT SELECT, INSERT, UPDATE ON saml_sp_signing_keys TO ironauth_control;
+-- NO UPDATE GRANT, and its absence follows 0198's rule rather than arguing against it. The
+-- `retired_at` column ships ahead of the rotation that will stamp it, because adding a column
+-- later means a migration over a table holding live credentials -- but a GRANT costs nothing to
+-- add later and blocks nothing until something rotates. An earlier version of this file granted
+-- UPDATE and justified it with a sentence -- "a missing grant blocks nothing" -- that is the
+-- argument for withholding it. The grant lands with #141's rotation, in the migration that
+-- teaches this table how to retire a key.
+GRANT SELECT, INSERT ON saml_sp_signing_keys TO ironauth_control;
 
 -- SELECT ALONE FOR THE APP ROLE, and the absence of the others is the point. The endpoint that
 -- signs an AuthnRequest has no reason to mint a key, and a compromise of the data-plane role

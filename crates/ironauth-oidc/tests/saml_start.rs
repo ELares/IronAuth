@@ -28,6 +28,7 @@ const NAMEID_FORMAT: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddr
 
 struct Wired {
     connection: SamlConnectionId,
+    sso_url: String,
     key: XmlTestKey,
     audience: String,
     acs_url: String,
@@ -38,6 +39,11 @@ struct Wired {
 /// Create a connection with a pinned identity-provider certificate, and optionally the SP
 /// signing key this deployment needs to start a flow.
 async fn wire(harness: &Harness, with_sp_key: bool) -> Wired {
+    wire_at(harness, with_sp_key, "https://idp.example/sso").await
+}
+
+/// [`wire`] with the identity provider's SSO URL chosen by the caller.
+async fn wire_at(harness: &Harness, with_sp_key: bool, idp_sso_url: &str) -> Wired {
     let env = harness.env().clone();
     let scope = harness.scope();
     let organization = OrganizationId::generate(&env, &scope);
@@ -63,6 +69,7 @@ async fn wire(harness: &Harness, with_sp_key: bool) -> Wired {
         scope.environment()
     );
     let acs_url = format!("https://ironauth.example{acs_path}");
+    let sso_url = idp_sso_url.to_owned();
     let audience = format!("https://ironauth.example/saml/{connection}/metadata");
 
     let acting = harness
@@ -79,7 +86,7 @@ async fn wire(harness: &Harness, with_sp_key: bool) -> Wired {
                 organization_id: &organization,
                 display_name: "Okta",
                 idp_entity_id: ISSUER,
-                idp_sso_url: "https://idp.example/sso",
+                idp_sso_url,
                 sp_entity_id: &audience,
                 acs_url: &acs_url,
                 // FALSE, WHICH IS THE POINT OF THIS FILE. Every other SAML suite opts in, because
@@ -128,6 +135,7 @@ async fn wire(harness: &Harness, with_sp_key: bool) -> Wired {
 
     Wired {
         connection,
+        sso_url,
         key,
         audience,
         acs_url,
@@ -680,4 +688,235 @@ async fn spend_at(harness: &Harness, wired: &Wired, location: &str) -> Option<St
         .consume_request(&wired.connection, &id, now_micros(harness.env()))
         .await
         .expect("the request was recorded")
+}
+
+#[tokio::test]
+async fn a_resume_belonging_to_another_scope_is_not_recorded() {
+    // THE HALF ROUND 1 DROPPED. Reaching into `ResumeTarget` for `return_to` also put its `scope`
+    // in hand, and discarding it left a PATH-SCOPED route admitting another tenant's authorization
+    // path: `parse_resume` recovers the scope by decoding the client id's bytes, with no existence
+    // check and no idea which route called it, so every well-formed `cli_` from every tenant
+    // parses. This deployment's own row would then hold a return location belonging to somebody
+    // else, and the sentence promising a value that could never be honoured is never written
+    // would be false.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, true).await;
+
+    let foreign_scope = ironauth_store::Scope::new(
+        ironauth_store::TenantId::generate(harness.env()),
+        ironauth_store::EnvironmentId::generate(harness.env()),
+    );
+    let foreign_client = ironauth_store::ClientId::generate(harness.env(), &foreign_scope);
+    let foreign = format!("/authorize?client_id={foreign_client}&scope=openid");
+
+    let (status, headers, body) = get(
+        &harness,
+        &format!("{}?return_to={}", wired.start_path, urlencode(&foreign)),
+    )
+    .await;
+    // THE FLOW STILL STARTS: a return location this route cannot honour is dropped, not a reason
+    // to refuse a sign-in the operator asked for. What must not happen is RECORDING it.
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert_eq!(
+        spend_at(&harness, &wired, &location).await,
+        None,
+        "another scope's authorization path was recorded as this connection's return location"
+    );
+
+    // AND THIS ROUTE'S OWN SCOPE IS STILL ACCEPTED, so the comparison is not refusing everything.
+    let own = format!("/authorize?client_id={}&scope=openid", harness.client_id());
+    let (status, headers, body) = get(
+        &harness,
+        &format!("{}?return_to={}", wired.start_path, urlencode(&own)),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert_eq!(
+        spend_at(&harness, &wired, &location).await.as_deref(),
+        Some(own.as_str())
+    );
+}
+
+#[tokio::test]
+async fn nothing_that_is_not_a_resume_path_is_recorded() {
+    // THE OPEN-REDIRECT DEFENCE ITSELF, which nothing measured: replacing `parse_resume` with a
+    // bare trim would have left every test green. Each of these is a value somebody would try,
+    // and none may reach the row that the sign-in work will build a `Location` from.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, true).await;
+
+    for hostile in [
+        "https://evil.example/steal",
+        "//evil.example/steal",
+        "/authorize?client_id=not-a-client-id",
+        "/dashboard",
+        "javascript:alert(1)",
+        "/authorize",
+    ] {
+        let (status, headers, body) = get(
+            &harness,
+            &format!("{}?return_to={}", wired.start_path, urlencode(hostile)),
+        )
+        .await;
+        assert_eq!(status, 303, "{hostile}: {body}");
+        let location = headers
+            .get(axum::http::header::LOCATION)
+            .expect("a redirect")
+            .to_str()
+            .expect("ascii")
+            .to_owned();
+        assert_eq!(
+            spend_at(&harness, &wired, &location).await,
+            None,
+            "{hostile} was recorded as a return location"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_relay_state_reaches_the_identity_provider() {
+    // THE THIRD HEADLINE CHANGE OF THE PREVIOUS ROUND, measured by nothing. Every value this
+    // endpoint could send exceeds OASIS Bindings 3.4.3's 80-byte cap, so it sends none -- and
+    // that is only true while nothing puts one back. A `RelayState` on the wire would also hand
+    // the identity provider a return path that is this deployment's business.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, true).await;
+    let resume = format!("/authorize?client_id={}&scope=openid", harness.client_id());
+
+    let (status, headers, body) = get(
+        &harness,
+        &format!("{}?return_to={}", wired.start_path, urlencode(&resume)),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let (_, query) = location.split_once('?').expect("a query");
+
+    assert!(
+        param(query, "RelayState").is_none(),
+        "a RelayState was sent: {location}"
+    );
+    assert!(
+        !location.contains(harness.client_id().to_string().as_str()),
+        "the return location reached the identity provider by another name: {location}"
+    );
+
+    // AND IT IS RECORDED, which is what makes sending it unnecessary rather than a loss.
+    assert_eq!(
+        spend_at(&harness, &wired, &location).await.as_deref(),
+        Some(resume.as_str())
+    );
+}
+
+#[tokio::test]
+async fn an_sso_url_that_already_has_a_query_gets_an_ampersand() {
+    // EVERY FIXTURE IN THIS FILE USED A QUERY-FREE SSO URL, so the `&` arm was dead and
+    // collapsing the branch to a bare `?` passed the whole suite -- while breaking every sign-in
+    // on the connections the comment names. ADFS deployments commonly carry a query
+    // (`?wa=wsignin1.0`), and appending `?` to one that does produces a URL the identity
+    // provider reads as one malformed parameter.
+    let harness = Harness::start_store_backed().await;
+    let adfs = wire_at(
+        &harness,
+        true,
+        "https://adfs.example/adfs/ls/?wa=wsignin1.0",
+    )
+    .await;
+
+    let (status, headers, body) = get(&harness, &adfs.start_path).await;
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    assert!(
+        location.starts_with("https://adfs.example/adfs/ls/?wa=wsignin1.0&SAMLRequest="),
+        "the request was appended with the wrong separator: {location}"
+    );
+    // AND THE PROVIDER'S OWN PARAMETER SURVIVES, which is what the separator is protecting.
+    let (_, query) = location.split_once('?').expect("a query");
+    assert_eq!(param(query, "wa").as_deref(), Some("wsignin1.0"));
+    assert!(param(query, "SAMLRequest").is_some());
+    assert_eq!(adfs.sso_url, "https://adfs.example/adfs/ls/?wa=wsignin1.0");
+}
+
+#[tokio::test]
+async fn the_request_expires_at_the_window_the_endpoint_documents() {
+    // THE FIVE-MINUTE WINDOW, which the constant's doc calls a security bound -- "a longer window
+    // here is a longer window there" -- and which nothing asserted: a ten-year TTL passed every
+    // test. The store measures that `consume_request` HONOURS an expiry; what was unmeasured is
+    // the value this endpoint writes.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, true).await;
+
+    let (status, headers, body) = get(&harness, &wired.start_path).await;
+    assert_eq!(status, 303, "{body}");
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let id = request_id(&location);
+    let issued = now_micros(harness.env());
+    let replay = harness.store().scoped(harness.scope()).saml_replay();
+
+    // ONE SECOND PAST FIVE MINUTES: gone. The store's predicate is `expires_at > now`, so this
+    // reads back the value the endpoint chose rather than the one the test supplies.
+    assert!(
+        matches!(
+            replay
+                .consume_request(&wired.connection, &id, issued + 301 * 1_000_000)
+                .await,
+            Err(ironauth_store::StoreError::NotFound)
+        ),
+        "the request outlived the documented five-minute window"
+    );
+
+    // AND A SECOND INSIDE IT IS STILL THERE, on a fresh request, so the bound is the window and
+    // not a request that was never answerable.
+    let (_, headers, _) = get(&harness, &wired.start_path).await;
+    let location = headers
+        .get(axum::http::header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let id = request_id(&location);
+    assert!(
+        replay
+            .consume_request(&wired.connection, &id, issued + 299 * 1_000_000)
+            .await
+            .is_ok(),
+        "the request expired before the documented window"
+    );
+}
+
+/// The `AuthnRequest` ID carried by the request in `location`.
+fn request_id(location: &str) -> String {
+    request_xml(location)
+        .split("ID=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the request carries an ID")
+        .to_owned()
 }
