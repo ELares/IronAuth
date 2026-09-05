@@ -29,6 +29,11 @@
 //! reach for that switch except to make an integration work that should not, and the CVE list
 //! above is what happens after they do.
 //!
+//! ONE HONEST EXCEPTION: [`Expectations::clock_skew_secs`] is unbounded above, and a large enough
+//! value is the same as no time check at all. This module clamps it at zero from below and
+//! saturates its arithmetic, but the ceiling belongs with whatever builds `Expectations` from a
+//! connection's configuration -- nothing here can say what "too large" means for a deployment.
+//!
 //! The one thing an operator chooses is whether an UNSOLICITED response is admissible at all, and
 //! that is expressed by whether [`Expectations::in_response_to`] carries a request id: `Some`
 //! means this response must name that request, `None` means the caller has accepted an
@@ -74,8 +79,8 @@ pub struct Expectations<'a> {
     pub in_response_to: Option<&'a str>,
     /// How far outside a window a clock may be and still be believed, in seconds.
     ///
-    /// NOT BOUNDED HERE, AND THAT IS THE CALLER'S PROBLEM TO SOLVE. A large enough value is the
-    /// same as no time check at all, and nothing in this module can say what "large enough"
+    /// NOT BOUNDED HERE, AND THAT IS THE CALLER'S PROBLEM TO SOLVE -- the one hole in the module
+    /// note's "no way to turn one off". A large enough value is the same as no time check at all, and nothing in this module can say what "large enough"
     /// means for a deployment -- so it clamps the value at zero from below (a negative skew is
     /// read as none, never as a narrowing) and saturates its arithmetic, but the ceiling belongs
     /// with whatever constructs `Expectations` from a connection's configuration. Said plainly
@@ -193,11 +198,17 @@ pub enum ConditionError {
     /// An ambiguous read is no read, so a document carrying two `Conditions`, two `Subject`s or
     /// two bearer `SubjectConfirmation`s lands here rather than having one of them believed.
     ///
-    /// ABSENCE DOES NOT LAND HERE. Zero and two are different faults with different fixes, so an
-    /// assertion carrying no `Conditions` at all is [`Self::MissingBound`] naming the element,
-    /// not this. Two `Issuer` elements are the exception in the other direction: they are
-    /// [`Self::WrongIssuer`] with `found: None`, because the caller's question there is which
-    /// provider signed this, and "neither, unambiguously" is an answer to that question.
+    /// ABSENCE LANDS HERE TOO, for everything except the time bounds. An assertion with no
+    /// `Subject`, no `NameID`, no bearer `SubjectConfirmation` and no `SubjectConfirmationData`
+    /// is refused here rather than through a variant of its own, because there is nothing an
+    /// operator could configure differently in response: a bearer assertion without a subject is
+    /// not a misconfiguration, it is not an assertion this profile describes.
+    ///
+    /// The two exceptions are where naming the fault DOES change what somebody does about it.
+    /// A missing time bound is [`Self::MissingBound`], because SAML makes `NotBefore` optional
+    /// and this server requires it -- an operator has to be told that on purpose. And two
+    /// `Issuer` elements are [`Self::WrongIssuer`] with `found: None`, because the question
+    /// there is which provider signed this and "neither, unambiguously" answers that question.
     Malformed,
 }
 
@@ -292,8 +303,9 @@ pub fn check(
     // IT MUST BE AN ASSERTION, resolved rather than spelled. `verify` takes the element to read
     // as an argument, so a caller could have asked it for something else entirely and handed the
     // result here. An earlier version tested `name().ends_with("Assertion")`, which is a test on
-    // the QUALIFIED name: true for `evil:NotAnAssertion` in any namespace at all, and false for
-    // the `Assertion` Entra writes under a default `xmlns`.
+    // the QUALIFIED name and is wrong on two axes: true for `evil:NotAnAssertion` because the
+    // suffix matches, and true for `evil:Assertion` in a namespace nobody trusts because it
+    // never looks at one.
     if !assertion.is(ASSERTION, "Assertion") {
         return Err(ConditionError::Malformed);
     }
@@ -308,14 +320,29 @@ pub fn check(
     // is what ties the assertion's own claim of authorship to the connection it was resolved to.
     //
     // A DIRECT CHILD, AND EXACTLY ONE. `elements` searches every descendant, and SAML puts
-    // `saml:Issuer` in more than one place: `saml:Advice` carries whole advisory assertions with
-    // issuers of their own, and `saml:AttributeValue` is `xs:anyType`, so an attribute's value
-    // may legitimately contain one. Reading by descendant search let an attacker append a
+    // `saml:Issuer` in more than one place: `saml:AttributeValue` is `xs:anyType`, so an
+    // attribute's value may legitimately contain one, and nothing stops a second one being
+    // appended at the top level either.
+    //
+    // (`saml:Advice` carries whole advisory ASSERTIONS, which would be the same problem -- but
+    // `verify` refuses a document with two `saml:Assertion` candidates before this function sees
+    // it, so that half is unreachable here and no fixture can express it. Said explicitly
+    // because naming an unreachable example as the reason for a guard is how a guard ends up
+    // with no test.) Reading by descendant search let an attacker append a
     // second `Issuer` naming the trusted provider and have it believed -- and because the walk
     // uses a stack, "the first" was the LAST in document order, so appending was enough.
     let issuers = assertion.children(ASSERTION, "Issuer");
     let issuer = match issuers.as_slice() {
-        [single] => Some(single.text_collapsed()),
+        // COLLAPSED, AND NOT BECAUSE `Issuer` IS `anyURI` -- IT IS NOT. `saml:Issuer` is a
+        // `saml:NameIDType`, whose content is `xsd:string` and preserves whitespace. It is
+        // collapsed here because it is compared against ONE configured value: trimming can make
+        // a padded spelling of the provider we already trust match, and it cannot make a
+        // DIFFERENT provider match. `NameID` gets the opposite treatment, and for the opposite
+        // reason: there the comparison is against an account, and collapsing would map two
+        // schema-distinct people onto one.
+        //
+        // `None` here is either no text at all or MIXED CONTENT, which is a refusal.
+        [single] => single.text_collapsed(),
         // TWO IS NOT ONE, and this module refuses ambiguity everywhere else. Reported as
         // `WrongIssuer { found: None }` rather than naming either: naming one would print the
         // value this server did NOT act on, which is worse than printing nothing.
@@ -363,7 +390,12 @@ pub fn check(
     // whitespace (unlike the `anyURI` audience and issuer, which XSD collapses before any
     // comparison), so trimming here would be this server deciding that two values the schema
     // says are different name one person. Refusing says so out loud.
-    let name_id = name_id_element.text();
+    // `text_simple` RATHER THAN `text`: `saml:NameID` is `xsd:string`, which is SIMPLE content,
+    // so an element child inside it is not a name with a decoration -- it is a document no
+    // conforming reader would agree with this one about.
+    let Some(name_id) = name_id_element.text_simple() else {
+        return Err(ConditionError::Malformed);
+    };
     if name_id.is_empty() || name_id.trim() != name_id {
         return Err(ConditionError::Malformed);
     }
@@ -411,9 +443,15 @@ fn read_instant(raw: Option<&str>, attribute: &'static str) -> Result<i64, Condi
     let Some(raw) = raw else {
         return Err(ConditionError::MissingBound { attribute });
     };
-    parse_utc(raw).ok_or_else(|| ConditionError::UnreadableBound {
-        attribute,
-        found: raw.to_owned(),
+    // COLLAPSED FIRST. `xsd:dateTime` carries the same `whiteSpace="collapse"` facet as
+    // `anyURI`, so ` 2026-01-01T00:00:00Z ` in an attribute is the same instant to any
+    // schema-aware reader -- and `parse_utc` is deliberately positional, so it would refuse it
+    // and this server would report a conformant document as unreadable.
+    parse_utc(raw.trim_matches(['\t', '\n', '\r', ' '])).ok_or_else(|| {
+        ConditionError::UnreadableBound {
+            attribute,
+            found: raw.to_owned(),
+        }
     })
 }
 
@@ -446,12 +484,12 @@ fn read_conditions(
         let named = restriction.child_texts(ASSERTION, "Audience");
         if !named
             .iter()
-            .any(|audience| audience == expectations.audience)
+            .any(|audience| audience.as_deref() == Some(expectations.audience))
         {
             return Err(ConditionError::WrongAudience {
                 // The FIRST of this restriction's audiences, not of the assertion's: an operator
                 // reading the error needs the restriction that actually excluded them.
-                found: named.first().cloned(),
+                found: named.first().cloned().flatten(),
             });
         }
     }
@@ -464,11 +502,21 @@ fn read_conditions(
         // THE NAMESPACE IS PART OF THE NAME. An allowlist over local names alone admits
         // `evil:OneTimeUse` bound to a namespace nobody trusts as something this server
         // understands -- the identical bypass the assertion gate above exists to prevent.
-        // `OneTimeUse` IS ALLOWED THROUGH BECAUSE IT IS ALREADY ENFORCED, not because it is
-        // ignored: `SamlReplayRepo::admit_assertion` in ironauth-store admits each assertion id
-        // exactly once, so every assertion this deployment accepts is one-time-use whether or
-        // not it says so. `ProxyRestriction` restricts who may RE-ASSERT this to somebody else,
-        // which is a constraint on a proxying identity provider and not on a relying party.
+        // WHY EACH ENTRY IS UNDERSTOOD RATHER THAN IGNORED:
+        //
+        // `AudienceRestriction` is evaluated three statements above.
+        //
+        // `ProxyRestriction` restricts who may RE-ASSERT this assertion to somebody else. It
+        // binds a proxying identity provider, not a relying party, so this deployment satisfies
+        // it by not proxying, which it has no code to do.
+        //
+        // `OneTimeUse` is satisfied by `Accepted::assertion_id` and
+        // `Accepted::expires_at_unix_secs`, which this function computes SO THAT a caller can
+        // admit each id exactly once. That is a contract with the caller, not an enforcement
+        // here, and the endpoint that closes it is not written yet -- so a deployment that
+        // ignored those two fields would be honouring `OneTimeUse` in name only. Said out loud
+        // because an earlier version of this comment claimed the store already enforced it,
+        // naming a method no code path calls.
         if namespace != ASSERTION
             || !matches!(
                 local.as_str(),
@@ -521,9 +569,10 @@ fn read_subject<'a>(
 ) -> Result<(SignedElement<'a>, i64), ConditionError> {
     // THE SUBJECT, and EXACTLY ONE of it, AS A DIRECT CHILD. Everything about who this is and
     // how they may present it is read within here, never by descendant search -- and the Subject
-    // itself is found the same way, because `saml:AttributeValue` is `xs:anyType` and
-    // `saml:Advice` carries whole assertions, so a descendant search finds Subjects that are
-    // somebody else's and are inside this signature just as much as the real one.
+    // itself is found the same way, because `saml:AttributeValue` is `xs:anyType`, so a
+    // descendant search finds Subjects that are somebody else's and are inside this signature
+    // just as much as the real one. (`saml:Advice` would be the other route and `verify` closes
+    // it, as the Issuer read above records.)
     let subjects = assertion.children(ASSERTION, "Subject");
     let [subject] = subjects.as_slice() else {
         return Err(ConditionError::Malformed);
@@ -574,6 +623,18 @@ fn read_subject<'a>(
                 found: found.map(ToOwned::to_owned),
             });
         }
+    }
+
+    // AND ITS ONE PROHIBITION. SAML Profiles 4.1.4.2 says a bearer `SubjectConfirmationData`
+    // MUST NOT contain a `NotBefore` attribute -- the whole point of the bearer profile is that
+    // the response is presented IMMEDIATELY, so a confirmation that only becomes usable later
+    // describes something the profile does not have. Honouring it silently means honouring a
+    // window this server never evaluates: an assertion the identity provider marked as not yet
+    // presentable would be presented and accepted.
+    if let Some(found) = data.attribute("NotBefore") {
+        return Err(ConditionError::UnsupportedCondition {
+            name: format!("SubjectConfirmationData/@NotBefore={found}"),
+        });
     }
 
     // THE CONFIRMATION'S OWN EXPIRY, which is the bearer profile's and is a DIFFERENT bound from

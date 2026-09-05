@@ -79,7 +79,12 @@ const MAX_YEAR: i64 = 2200;
 ///
 /// `None` for anything outside `YYYY-MM-DDThh:mm:ssZ` with an optional fraction: an offset, a
 /// missing `Z`, a leap second, a day that does not exist in that month, a year outside
-/// [`MIN_YEAR`]..=[`MAX_YEAR`], or any character where a digit belongs.
+/// 1900..=2200, or any character where a digit belongs.
+///
+/// The range is written as literals because `MIN_YEAR` and `MAX_YEAR` are PRIVATE: a published
+/// sentence naming them tells a reader of these docs nothing, and this is the bound that makes
+/// `9999-12-31T23:59:59Z` -- the conventional never-expires sentinel -- unreadable rather than
+/// eternal.
 #[must_use]
 pub fn parse_utc(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();

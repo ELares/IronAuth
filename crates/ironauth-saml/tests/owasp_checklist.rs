@@ -174,11 +174,25 @@ const CHEAT_SHEET: &[Item] = &[
     },
     Item {
         control: "Validate the Recipient, InResponseTo and SubjectConfirmationData",
-        coverage: Coverage::NotApplicable(
-            "The correlation is with a request this crate never made, and there is no \
-             configured recipient here to compare against. Issue #139 owns it.",
-        ),
-        rationale: "Half a check in a crate with no configuration reads as a whole one.",
+        coverage: Coverage::Tests(&[
+            "a_response_naming_no_request_is_refused_when_one_was_required",
+            "a_response_naming_a_different_request_is_refused",
+            "an_unsolicited_response_is_admissible_only_when_it_names_no_request",
+            "a_missing_recipient_is_a_refusal_and_not_a_pass",
+            "an_assertion_addressed_to_another_endpoint_is_refused",
+            "the_confirmations_own_expiry_is_checked_and_is_a_different_bound",
+            "a_bearer_confirmation_that_is_not_yet_usable_is_refused_rather_than_used",
+            "a_holder_of_key_confirmation_is_not_honoured_as_a_bearer_one",
+            "two_bearer_confirmations_are_refused_rather_than_letting_one_win",
+        ]),
+        rationale: "`conditions::check` compares all three against an `Expectations` the caller \
+                    supplies, so the configuration this row once said was missing is now the \
+                    argument. ABSENCE IS A REFUSAL for the recipient and for the confirmation \
+                    expiry, which is the half an earlier version of this crate got wrong: the \
+                    defence disappeared exactly when an attacker omitted the attribute. The \
+                    profile's one MUST NOT is covered too -- a bearer `SubjectConfirmationData` \
+                    carrying a `NotBefore` is refused rather than honoured through a window \
+                    nothing evaluates.",
     },
     Item {
         control: "Validate the Destination against this service provider's ACS URL",
@@ -192,12 +206,13 @@ const CHEAT_SHEET: &[Item] = &[
     },
     Item {
         control: "Validate the assertion's audience (Recipient and AudienceRestriction)",
-        coverage: Coverage::NotApplicable(
-            "There is no configured audience here to compare against: this crate returns a \
-             verified subtree and holds no service provider identity. Issue #139 owns it, and it \
-             is the control against an assertion minted for one service provider being replayed \
-             at another.",
-        ),
+        coverage: Coverage::Tests(&[
+            "an_assertion_for_another_service_provider_is_refused",
+            "an_assertion_restricted_to_nobody_is_refused",
+            "an_assertion_naming_several_audiences_is_accepted_and_every_restriction_must_hold",
+            "a_proxy_restriction_naming_us_is_not_an_address_to_us",
+            "a_value_spliced_across_nested_elements_is_not_the_value_it_spells",
+        ]),
         rationale: "RESTORED. This row existed, and the commit that added two dozen missing \
                     items DELETED it while claiming the checklist was now complete. No count \
                     floor noticed, because the total went up. That is the limit of a ratchet \
@@ -250,11 +265,22 @@ const CHEAT_SHEET: &[Item] = &[
     },
     Item {
         control: "Validate NotBefore / NotOnOrAfter and bound clock skew",
-        coverage: Coverage::NotApplicable(
-            "There is no clock in this crate, deliberately: a verifier that took one would make \
-             every test in it time-dependent. Issue #139 owns the condition checks.",
-        ),
-        rationale: "The checks belong with the flow that has a clock and a skew setting.",
+        coverage: Coverage::Tests(&[
+            "an_expired_assertion_and_one_not_yet_valid_are_both_refused",
+            "an_assertion_with_no_expiry_is_refused_rather_than_treated_as_open",
+            "an_assertion_valid_for_longer_than_this_connection_allows_is_refused",
+            "the_clock_skew_is_applied_at_both_edges_and_a_smaller_one_refuses_more",
+            "every_time_comparison_is_pinned_at_its_exact_boundary",
+            "an_inverted_window_is_malformed_rather_than_expired",
+            "a_missing_bound_says_which_one_rather_than_reporting_an_expiry",
+            "a_bound_that_is_present_and_unreadable_is_not_reported_as_absent",
+        ]),
+        rationale: "STILL NO CLOCK: `check` takes `now_unix_secs` as an argument, so the \
+                    property this row used to defer for -- every test being time-dependent -- is \
+                    preserved, and the boundaries can be driven exactly. The skew is bounded \
+                    below at zero and saturating; it is NOT bounded above, which \
+                    `Expectations::clock_skew_secs` says out loud, because nothing here can \
+                    know what too large means for a deployment.",
     },
     Item {
         control: "Prevent assertion replay",
@@ -658,9 +684,9 @@ fn every_checklist_item_names_a_test_that_exists_or_a_reason() {
     // At exact counts a deletion is a red build that a reader has to lower deliberately, in the
     // same commit, with the removed row visible in the diff. That is the most a same-file bound
     // can do: it cannot stop a removal, only make one loud.
-    assert_eq!(named, 20, "a row that names tests was added or removed");
+    assert_eq!(named, 23, "a row that names tests was added or removed");
     assert_eq!(
-        excused, 22,
+        excused, 19,
         "a row marked out of scope was added or removed"
     );
     // ZERO GAPS. Both were XML Encryption, and criterion 5 closed them. The assertion stays at

@@ -512,23 +512,155 @@ fn an_assertion_with_no_subject_is_refused_rather_than_signing_in_nobody() {
     // A document that verifies and says who nobody is. Accepting it would create or match an
     // identity from an empty string, which is the worst possible outcome of a successful
     // signature check.
-    let body = Body {
+    //
+    // THE NAME AND THE SUBJECT ARE SEPARATE FIXTURES. An earlier version set only
+    // `name_id: None`, which leaves the `Subject` element there holding a confirmation -- so it
+    // was refused at the `NameID` guard and the zero-`Subject` branch the test is named after
+    // was never reached. Deleting that branch left this test green.
+    let no_name = Body {
         name_id: None,
         ..Body::default()
     };
-    let refused = decide(&body, &expectations(), NOW);
+    let refused = decide(&no_name, &expectations(), NOW);
     assert!(
         matches!(refused, Err(ConditionError::Malformed)),
         "an assertion naming nobody was accepted: {refused:?}"
     );
+
+    // NO `Subject` ELEMENT AT ALL, which `Body` cannot express because everything about who this
+    // is lives inside one.
+    let no_subject = [
+        "<saml:Issuer>",
+        ISSUER,
+        "</saml:Issuer>",
+        "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
+        "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
+        "<saml:AudienceRestriction><saml:Audience>",
+        AUDIENCE,
+        "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
+    ]
+    .concat();
+    let refused = decide_raw(&no_subject, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "an assertion with no Subject at all was accepted: {refused:?}"
+    );
+
+    // AND TWO SUBJECTS, which is the ambiguity half of the same guard: one names the person the
+    // identity provider meant and the other names whoever appended it.
+    let two_subjects = [
+        "<saml:Issuer>",
+        ISSUER,
+        "</saml:Issuer>",
+        &Body::default().xml()[format!("<saml:Issuer>{ISSUER}</saml:Issuer>").len()..],
+        "<saml:Subject><saml:NameID>attacker@evil.example</saml:NameID>",
+        "<saml:SubjectConfirmation Method=\"",
+        BEARER,
+        "\"><saml:SubjectConfirmationData InResponseTo=\"",
+        REQUEST,
+        "\" Recipient=\"",
+        RECIPIENT,
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>",
+    ]
+    .concat();
+    let refused = decide_raw(&two_subjects, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "an assertion carrying two Subjects had one of them believed: {refused:?}"
+    );
 }
 
 #[test]
-fn the_accepted_expiry_is_the_earlier_of_the_two_bounds() {
+fn the_exactly_one_rule_holds_inside_the_subject_as_well() {
+    // THE TWO GUARDS NO FIXTURE REACHED. A bearer `SubjectConfirmation` may hold exactly one
+    // `SubjectConfirmationData` and a `Subject` exactly one `NameID`; relaxing either to
+    // first-wins left the whole suite green, because every fixture built one of each.
+    //
+    // Each document below is otherwise a valid one, so the ambiguity is the only thing that can
+    // refuse it -- and each pair disagrees about a value that decides the outcome.
+    let two_datas = [
+        "<saml:Issuer>",
+        ISSUER,
+        "</saml:Issuer>",
+        "<saml:Subject><saml:NameID>ada@globex.example</saml:NameID>",
+        "<saml:SubjectConfirmation Method=\"",
+        BEARER,
+        "\"><saml:SubjectConfirmationData InResponseTo=\"",
+        REQUEST,
+        "\" Recipient=\"",
+        RECIPIENT,
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/>",
+        "<saml:SubjectConfirmationData InResponseTo=\"_req_somebody_elses\" Recipient=\"",
+        RECIPIENT,
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/>",
+        "</saml:SubjectConfirmation></saml:Subject>",
+        "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
+        "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
+        "<saml:AudienceRestriction><saml:Audience>",
+        AUDIENCE,
+        "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
+    ]
+    .concat();
+    let refused = decide_raw(&two_datas, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "two SubjectConfirmationData elements had one of them believed: {refused:?}"
+    );
+
+    // AND TWO `NameID`s WITH ONLY ONE CONFIRMATION DATA, so the guard under test is the only
+    // one that can refuse it. An earlier version built this from the fixture above and left the
+    // duplicate `SubjectConfirmationData` in place, so first-wins on the NameID survived: the
+    // OTHER guard refused the document and the assertion never noticed.
+    let two_names = [
+        "<saml:Issuer>",
+        ISSUER,
+        "</saml:Issuer>",
+        "<saml:Subject><saml:NameID>ada@globex.example</saml:NameID>",
+        "<saml:NameID>attacker@evil.example</saml:NameID>",
+        "<saml:SubjectConfirmation Method=\"",
+        BEARER,
+        "\"><saml:SubjectConfirmationData InResponseTo=\"",
+        REQUEST,
+        "\" Recipient=\"",
+        RECIPIENT,
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/>",
+        "</saml:SubjectConfirmation></saml:Subject>",
+        "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
+        "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
+        "<saml:AudienceRestriction><saml:Audience>",
+        AUDIENCE,
+        "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
+    ]
+    .concat();
+    let refused = decide_raw(&two_names, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "two NameID elements had one of them believed: {refused:?}"
+    );
+
+    // THE CONTROL: the same document with the second name removed is ACCEPTED, which is what
+    // shows the refusal above is about the duplicate and not about anything else here.
+    let one_name = two_names.replace("<saml:NameID>attacker@evil.example</saml:NameID>", "");
+    assert_eq!(
+        decide_raw(&one_name, &expectations(), NOW).expect("otherwise valid"),
+        "ada@globex.example"
+    );
+}
+
+#[test]
+fn the_accepted_expiry_is_the_assertions_own_when_it_is_the_shortest() {
+    // ONE OPERAND OF FOUR, measured where it is the binding one. The full expression is the
+    // minimum of the assertion's `NotOnOrAfter`, the confirmation's, and `max_age_secs` from
+    // `NotBefore`, plus the skew. The other three are pinned by
+    // `what_is_remembered_is_bounded_by_the_confirmations_expiry_too`,
+    // `a_ceiling_of_i64_max_does_not_overflow_the_expiry_it_stamps` and
+    // `what_is_remembered_outlasts_the_window_by_the_skew_that_admitted_it` -- named here
+    // because a test called "the earlier of the two bounds" over a four-term minimum is a name
+    // that tells a reader the expression is smaller than it is.
+    //
     // WHAT THE REPLAY CACHE REMEMBERS. Recording the identity provider's own expiry would keep a
     // long-lived assertion beyond what this deployment actually accepted, and recording the
-    // ceiling alone would forget a short one too late. The earlier of the two is what matches
-    // the decision that was made.
+    // ceiling alone would forget a short one too late.
     let body = Body {
         not_before: Some("2026-01-01T00:00:00Z"),
         not_on_or_after: Some("2026-01-01T00:02:00Z"),
@@ -1452,5 +1584,211 @@ fn every_time_comparison_is_pinned_at_its_exact_boundary() {
             Err(ConditionError::Malformed)
         ),
         "a window that opens and closes at the same instant was not read as malformed"
+    );
+}
+
+#[test]
+fn a_value_spliced_across_nested_elements_is_not_the_value_it_spells() {
+    // THE ROUND-2 COLLAPSE FIX REASONED FROM THE SCHEMA TYPE AND APPLIED HALF OF IT. `Audience`
+    // and `Issuer` are `xsd:anyURI` and `NameID` is `xsd:string` -- all SIMPLE content, which
+    // cannot have element children at all. Reading their text by concatenating every descendant
+    // manufactures a value no schema-validating reader and no `firstChild.nodeValue` reader
+    // would ever produce, and for the audience that is CVE-2026-9093 itself: the element's own
+    // text names one relying party while this crate reads another.
+    let head = format!("<saml:Issuer>{ISSUER}</saml:Issuer>");
+    let tail = format!(
+        "<saml:Subject><saml:NameID>ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"{BEARER}\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{REQUEST}\" Recipient=\"{RECIPIENT}\" \
+         NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" \
+         NotOnOrAfter=\"2026-01-01T00:05:00Z\"><saml:AudienceRestriction>{{AUDIENCE}}\
+         </saml:AudienceRestriction></saml:Conditions>"
+    );
+    let with_audience = |audience: &str| format!("{head}{}", tail.replace("{AUDIENCE}", audience));
+
+    // THE CONTROL, which is what makes the splice meaningful: the element's OWN text names a
+    // shorter, different audience, and written flush this deployment refuses it.
+    let flush = with_audience("<saml:Audience>https://ironauth.example</saml:Audience>");
+    assert!(
+        matches!(
+            decide_raw(&flush, &expectations(), NOW),
+            Err(ConditionError::WrongAudience { .. })
+        ),
+        "the control is not a different audience, so the splice below proves nothing"
+    );
+
+    // THE SPLICE. Concatenating descendants reads this as the full audience.
+    let spliced = with_audience(
+        "<saml:Audience>https://ironauth.example\
+         <saml:Audience>/saml/globex</saml:Audience></saml:Audience>",
+    );
+    let refused = decide_raw(&spliced, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongAudience { .. })),
+        "an Audience spliced across a nested element was read as our audience: {refused:?}"
+    );
+
+    // THE ISSUER, whose element has NO text of its own: a foreign-namespace child supplied the
+    // whole value.
+    let issuer_child = format!(
+        "<saml:Issuer><x:c xmlns:x=\"urn:x\">{ISSUER}</x:c></saml:Issuer>{}",
+        tail.replace(
+            "{AUDIENCE}",
+            &format!("<saml:Audience>{AUDIENCE}</saml:Audience>")
+        )
+    );
+    let refused = decide_raw(&issuer_child, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongIssuer { found: None })),
+        "an Issuer whose value lived in a child element was believed: {refused:?}"
+    );
+
+    // AND THE NAME ID, where the splice is a second account key for one person -- exactly what
+    // the whitespace guard beside it refuses to allow.
+    let name_spliced = with_audience(&format!("<saml:Audience>{AUDIENCE}</saml:Audience>"))
+        .replace(
+            "<saml:NameID>ada@globex.example</saml:NameID>",
+            "<saml:NameID>ada@globex.example<x:c xmlns:x=\"urn:x\">.attacker.example</x:c>\
+         </saml:NameID>",
+        );
+    let refused = decide_raw(&name_spliced, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "a NameID spliced across a nested element was signed in: {refused:?}"
+    );
+}
+
+#[test]
+fn only_the_four_characters_xsd_calls_whitespace_are_collapsed() {
+    // XML SCHEMA PART 2 NAMES EXACTLY `#x9`, `#xA`, `#xD` AND `#x20`. Rust's
+    // `str::split_whitespace` splits on the whole Unicode White_Space property, so a NO-BREAK
+    // SPACE inside a URI would be collapsed away -- and two values XSD says are DIFFERENT would
+    // compare equal, which is the collapse fix creating the confusion it was meant to remove.
+    let padded = format!(
+        "<saml:Issuer>{ISSUER}</saml:Issuer>\
+         <saml:Subject><saml:NameID>ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"{BEARER}\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{REQUEST}\" Recipient=\"{RECIPIENT}\" \
+         NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"  2025-12-31T23:55:00Z  \" \
+         NotOnOrAfter=\"2026-01-01T00:05:00Z\"><saml:AudienceRestriction><saml:Audience>\
+         {NBSP}{AUDIENCE}</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
+        NBSP = '\u{a0}',
+    );
+    let refused = decide_raw(&padded, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongAudience { .. })),
+        "a NO-BREAK SPACE was collapsed as though XSD called it whitespace: {refused:?}"
+    );
+
+    // AND THE `NotBefore` PADDED WITH REAL XSD WHITESPACE IS READ, not reported unreadable:
+    // `xsd:dateTime` carries the same collapse facet, and `parse_utc` is positional.
+    let ordinary = padded.replace("\u{a0}", "");
+    assert_eq!(
+        decide_raw(&ordinary, &expectations(), NOW).expect("a padded dateTime attribute is valid"),
+        "ada@globex.example",
+        "a NotBefore padded with spaces was reported as unreadable"
+    );
+}
+
+#[test]
+fn a_bearer_confirmation_that_is_not_yet_usable_is_refused_rather_than_used() {
+    // SAML PROFILES 4.1.4.2's ONE "MUST NOT": a bearer `SubjectConfirmationData` must not carry
+    // a `NotBefore`, because the bearer profile is about a response presented IMMEDIATELY. An
+    // implementation that ignores it honours a window it never evaluates -- so an assertion the
+    // identity provider marked as not yet presentable gets presented and accepted.
+    let children = format!(
+        "<saml:Issuer>{ISSUER}</saml:Issuer>\
+         <saml:Subject><saml:NameID>ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"{BEARER}\">\
+         <saml:SubjectConfirmationData NotBefore=\"2026-01-01T00:04:00Z\" \
+         InResponseTo=\"{REQUEST}\" Recipient=\"{RECIPIENT}\" \
+         NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" \
+         NotOnOrAfter=\"2026-01-01T00:05:00Z\"><saml:AudienceRestriction><saml:Audience>\
+         {AUDIENCE}</saml:Audience></saml:AudienceRestriction></saml:Conditions>"
+    );
+    let refused = decide_raw(&children, &expectations(), NOW);
+    let Err(ConditionError::UnsupportedCondition { name }) = &refused else {
+        panic!("a bearer confirmation carrying a NotBefore was honoured: {refused:?}");
+    };
+    assert!(
+        name.contains("SubjectConfirmationData/@NotBefore"),
+        "the refusal did not name what the operator has to remove: {name}"
+    );
+
+    // The same document without it is accepted, so the refusal is about that attribute and not
+    // about anything else in the fixture.
+    let without = children.replace("NotBefore=\"2026-01-01T00:04:00Z\" ", "");
+    assert_eq!(
+        decide_raw(&without, &expectations(), NOW).expect("otherwise valid"),
+        "ada@globex.example"
+    );
+}
+
+#[test]
+fn every_refusal_carries_the_value_an_operator_has_to_look_at() {
+    // THE DIAGNOSTIC PAYLOADS THE TAXONOMY DOCUMENTS were asserted only as `None` or discarded
+    // with `{ .. }`, so each could have been filled with the wrong value, or the expected one,
+    // and nothing would fail. An operator reading "addressed to a different service provider"
+    // needs to see WHICH one their provider named.
+    let wrong_audience = Body {
+        restrictions: vec![vec!["https://someone-else.example/sp"]],
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&wrong_audience, &expectations(), NOW),
+            Err(ConditionError::WrongAudience { found: Some(said) }) if said == "https://someone-else.example/sp"
+        ),
+        "the audience refusal did not name the audience the assertion carried"
+    );
+
+    let wrong_issuer = Body {
+        issuer: Some("urn:somebody-else"),
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&wrong_issuer, &expectations(), NOW),
+            Err(ConditionError::WrongIssuer { found: Some(said) }) if said == "urn:somebody-else"
+        ),
+        "the issuer refusal did not name the issuer the assertion claimed"
+    );
+
+    let wrong_recipient = Body {
+        recipient: Some("https://someone-else.example/saml/acs"),
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&wrong_recipient, &expectations(), NOW),
+            Err(ConditionError::WrongRecipient { found: Some(said) })
+                if said == "https://someone-else.example/saml/acs"
+        ),
+        "the recipient refusal did not name where the assertion was addressed"
+    );
+
+    let unsupported = Body {
+        extra_condition: Some("<saml:Condition/>"),
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&unsupported, &expectations(), NOW),
+            Err(ConditionError::UnsupportedCondition { name }) if name == "Condition"
+        ),
+        "the unsupported-condition refusal did not name the condition"
+    );
+
+    // AND EACH MESSAGE RENDERS THE VALUE, because a payload nothing prints is a payload nobody
+    // reads: these strings are what reaches a log.
+    let rendered = decide(&unsupported, &expectations(), NOW)
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        !rendered.is_empty() && rendered.chars().next().is_some_and(char::is_lowercase),
+        "an error message does not read as a sentence fragment in a log line: {rendered:?}"
     );
 }

@@ -210,8 +210,7 @@ impl VerifiedAssertion {
     ///
     /// # Why a caller needs the PARENT and not just the name
     ///
-    /// [`Self::text_of`] and [`Self::attribute_of`] search every descendant, and for SAML that is
-    /// the wrong question more often than it is the right one, because SAML reuses element names
+    /// [`Self::text_of`] searches every descendant, and for SAML that is the wrong question more often than it is the right one, because SAML reuses element names
     /// under different parents with DIFFERENT MEANINGS:
     ///
     /// - `saml:Audience` is a child of `AudienceRestriction` ("this assertion is addressed to
@@ -221,7 +220,8 @@ impl VerifiedAssertion {
     ///   present this"). A reader that took either could sign in the confirming party.
     ///
     /// So a caller resolves the PARENT it means, and reads within it. The scope travels with the
-    /// element, which is what makes reading inside one safe: the same rule [`Scoped`] exists for.
+    /// element, which is what makes reading inside one safe: the same rule the internal
+    /// scope-carrying type exists for.
     ///
     /// EVERY match is returned rather than the unique one, because "exactly one" is not always
     /// the rule: SAML permits several `AudienceRestriction` elements and requires the service
@@ -337,16 +337,11 @@ impl<'a> SignedElement<'a> {
     /// -- is a list of `xsd:anyURI`, and comparing those raw refuses a pretty-printed document
     /// that says exactly the same thing.
     #[must_use]
-    pub fn child_texts(&self, namespace: &str, local: &str) -> Vec<String> {
+    pub fn child_texts(&self, namespace: &str, local: &str) -> Vec<Option<String>> {
         self.scoped
             .children(namespace, local)
             .into_iter()
-            .map(|child| {
-                text_content(child.element)
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
+            .map(|scoped| SignedElement { scoped }.text_collapsed())
             .collect()
     }
 
@@ -356,7 +351,7 @@ impl<'a> SignedElement<'a> {
         text_content(self.scoped.element)
     }
 
-    /// The LOCAL NAME of every direct child element, in document order.
+    /// The RESOLVED `(namespace, local name)` of every direct child element, in document order.
     ///
     /// # For refusing what is not understood
     ///
@@ -388,7 +383,43 @@ impl<'a> SignedElement<'a> {
             .collect()
     }
 
-    /// This element's text with XSD `whiteSpace="collapse"` applied, for comparing a URI.
+    /// This element's text, refused outright if it has ELEMENT CHILDREN.
+    ///
+    /// # Simple content cannot contain elements, and concatenating across them invents a value
+    ///
+    /// `saml:Audience` and `saml:Issuer` are `xsd:anyURI` and `saml:NameID` is `xsd:string`. All
+    /// three are SIMPLE content: the schema forbids element children entirely. [`Self::text`]
+    /// concatenates the text of every descendant, so
+    ///
+    /// ```xml
+    /// <saml:Audience>https://sp.example<saml:Audience>/tenant</saml:Audience></saml:Audience>
+    /// ```
+    ///
+    /// reads as `https://sp.example/tenant` here while a schema-validating reader rejects the
+    /// document and a `firstChild.nodeValue` reader sees `https://sp.example`. Two readers
+    /// picking differently is the defect class this crate exists for, and for the audience it is
+    /// CVE-2026-9093 itself: the element's own text names one relying party and this crate reads
+    /// another.
+    ///
+    /// So the answer is `None` rather than a spliced string, and every caller treats that as the
+    /// refusal it is. This mirrors what the signature side already does with `has_element_child`
+    /// inside `ds:Transform`.
+    #[must_use]
+    pub fn text_simple(&self) -> Option<String> {
+        if self
+            .scoped
+            .element
+            .children
+            .iter()
+            .any(|child| matches!(child, RichNode::Element(_)))
+        {
+            return None;
+        }
+        Some(self.text())
+    }
+
+    /// This element's text with XSD `whiteSpace="collapse"` applied, refused if it has ELEMENT
+    /// CHILDREN for the reason [`Self::text_simple`] gives.
     ///
     /// # Why raw text is the wrong thing to compare for `saml:Audience` and `saml:Issuer`
     ///
@@ -410,8 +441,8 @@ impl<'a> SignedElement<'a> {
     /// NOT FOR `saml:NameID`, whose content is `xsd:string` and preserves whitespace: collapsing
     /// there would map two distinct names onto one account.
     #[must_use]
-    pub fn text_collapsed(&self) -> String {
-        self.text().split_whitespace().collect::<Vec<_>>().join(" ")
+    pub fn text_collapsed(&self) -> Option<String> {
+        self.text_simple().as_deref().map(collapse)
     }
 
     /// The DIRECT CHILDREN in `namespace` with local name `local`, to read further into.
@@ -950,6 +981,19 @@ fn resolve(name: &str, scope: &[Binding]) -> Option<String> {
         .find(|binding| binding.prefix == prefix)
         .map(|binding| binding.uri.clone())
         .filter(|uri| !uri.is_empty())
+}
+
+/// XSD `whiteSpace="collapse"`, over the four characters the specification names.
+///
+/// NOT `str::split_whitespace`, which splits on the whole Unicode whitespace property -- so a
+/// NO-BREAK SPACE or an IDEOGRAPHIC SPACE inside a URI would be collapsed away and two values
+/// XSD says are DIFFERENT would compare equal. XML Schema Part 2 names exactly `#x9`, `#xA`,
+/// `#xD` and `#x20`, and everything else, whitespace-looking or not, is a character of the value.
+fn collapse(text: &str) -> String {
+    text.split(['\t', '\n', '\r', ' '])
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Every descendant (and the root itself) whose qualified name matches.
