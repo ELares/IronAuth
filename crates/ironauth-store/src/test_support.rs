@@ -906,74 +906,6 @@ fn host_port_of(url: &str) -> (String, u16) {
     }
 }
 
-#[cfg(test)]
-mod reclaim_threshold_tests {
-    use super::{RECLAIM_MIN_AGE_FLOOR_SECS, RECLAIM_MIN_AGE_SECS, reclaim_min_age_from};
-
-    /// The override lowers the threshold, clamps at the floor, and ignores nonsense.
-    ///
-    /// The floor is the load-bearing case. `reclaim_leaked_databases_now` skips any
-    /// database with a live connection, but that guard does not cover the window between
-    /// `CREATE DATABASE` and the first connection to it, so a threshold of zero would let
-    /// one test's sweep drop a database another test had just created. A harness that
-    /// lets its own safety bound be configured to nothing is not bounded.
-    ///
-    /// The last case is the one that is easy to get backwards: a value that does not
-    /// parse falls back to the DEFAULT, not to the floor. A typo must never silently make
-    /// the sweep more aggressive than it was.
-    #[test]
-    fn the_reclaim_threshold_override_is_clamped_at_its_floor() {
-        // THE CONSTANTS THEMSELVES, pinned to literals. Every case below builds its
-        // expectation FROM these values, so without this a change to either moves both sides
-        // of the assertion and passes: measured, the floor could drift 300 to 600 with the
-        // whole suite green. Pinning them means a deliberate change costs a test edit.
-        assert_eq!(
-            RECLAIM_MIN_AGE_FLOOR_SECS, 300,
-            "five minutes, and the comment at the constant reasons about that number"
-        );
-        assert_eq!(
-            RECLAIM_MIN_AGE_SECS,
-            6 * 60 * 60,
-            "six hours, which is what makes the CI override a LOWERING and therefore guarded"
-        );
-        assert_eq!(
-            reclaim_min_age_from(None),
-            RECLAIM_MIN_AGE_SECS,
-            "unset keeps the six-hour default a developer machine needs"
-        );
-        assert_eq!(
-            reclaim_min_age_from(Some("600")),
-            600,
-            "a value above the floor is taken as given"
-        );
-        assert_eq!(
-            reclaim_min_age_from(Some(" 600 ")),
-            600,
-            "surrounding whitespace is not a typo"
-        );
-        assert_eq!(
-            reclaim_min_age_from(Some("0")),
-            RECLAIM_MIN_AGE_FLOOR_SECS,
-            "zero clamps to the floor rather than disabling the create-then-connect guard"
-        );
-        assert_eq!(
-            reclaim_min_age_from(Some("1")),
-            RECLAIM_MIN_AGE_FLOOR_SECS,
-            "and so does anything else below it"
-        );
-        assert_eq!(
-            reclaim_min_age_from(Some("not-a-number")),
-            RECLAIM_MIN_AGE_SECS,
-            "an unparseable value falls back to the DEFAULT, never to the floor"
-        );
-        assert_eq!(
-            reclaim_min_age_from(Some("")),
-            RECLAIM_MIN_AGE_SECS,
-            "and so does an empty one"
-        );
-    }
-}
-
 /// A payload the event registry accepts for `event_type`, with `overrides` written over it.
 ///
 /// # Why this is not written by hand in each test
@@ -1051,5 +983,73 @@ fn schema_value(schema: &serde_json::Value, name: &str) -> serde_json::Value {
             serde_json::Value::Object(nested)
         }
         _ => serde_json::Value::String(format!("seed-{name}")),
+    }
+}
+
+#[cfg(test)]
+mod reclaim_threshold_tests {
+    use super::{RECLAIM_MIN_AGE_FLOOR_SECS, RECLAIM_MIN_AGE_SECS, reclaim_min_age_from};
+
+    /// The override lowers the threshold, clamps at the floor, and ignores nonsense.
+    ///
+    /// The floor is the load-bearing case. `reclaim_leaked_databases_now` skips any
+    /// database with a live connection, but that guard does not cover the window between
+    /// `CREATE DATABASE` and the first connection to it, so a threshold of zero would let
+    /// one test's sweep drop a database another test had just created. A harness that
+    /// lets its own safety bound be configured to nothing is not bounded.
+    ///
+    /// The last case is the one that is easy to get backwards: a value that does not
+    /// parse falls back to the DEFAULT, not to the floor. A typo must never silently make
+    /// the sweep more aggressive than it was.
+    #[test]
+    fn the_reclaim_threshold_override_is_clamped_at_its_floor() {
+        // THE CONSTANTS THEMSELVES, pinned to literals. Every case below builds its
+        // expectation FROM these values, so without this a change to either moves both sides
+        // of the assertion and passes: measured, the floor could drift 300 to 600 with the
+        // whole suite green. Pinning them means a deliberate change costs a test edit.
+        assert_eq!(
+            RECLAIM_MIN_AGE_FLOOR_SECS, 300,
+            "five minutes, and the comment at the constant reasons about that number"
+        );
+        assert_eq!(
+            RECLAIM_MIN_AGE_SECS,
+            6 * 60 * 60,
+            "six hours, which is what makes the CI override a LOWERING and therefore guarded"
+        );
+        assert_eq!(
+            reclaim_min_age_from(None),
+            RECLAIM_MIN_AGE_SECS,
+            "unset keeps the six-hour default a developer machine needs"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("600")),
+            600,
+            "a value above the floor is taken as given"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some(" 600 ")),
+            600,
+            "surrounding whitespace is not a typo"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("0")),
+            RECLAIM_MIN_AGE_FLOOR_SECS,
+            "zero clamps to the floor rather than disabling the create-then-connect guard"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("1")),
+            RECLAIM_MIN_AGE_FLOOR_SECS,
+            "and so does anything else below it"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("not-a-number")),
+            RECLAIM_MIN_AGE_SECS,
+            "an unparseable value falls back to the DEFAULT, never to the floor"
+        );
+        assert_eq!(
+            reclaim_min_age_from(Some("")),
+            RECLAIM_MIN_AGE_SECS,
+            "and so does an empty one"
+        );
     }
 }

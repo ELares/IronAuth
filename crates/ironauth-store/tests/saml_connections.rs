@@ -715,6 +715,10 @@ fn assert_refused_by_a_constraint(outcome: &Result<(), StoreError>, what: &str) 
     );
 }
 
+// A TEST, and its length is the point: it walks one connection through pin, rotate and
+// unpin, asserting the invariant after each. Splitting it into three tests would let two
+// of them pass against a store that lost the row in between.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn a_key_the_verifier_could_not_be_handed_cannot_be_written() {
     // THE SHAPE IS ENFORCED WHERE IT IS STORED, not only where it is parsed. A row the verifier

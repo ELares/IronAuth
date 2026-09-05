@@ -83,6 +83,10 @@ ironauth-fetch.workspace = true
 # I/O-free discovery parser (which owns the upstream metadata field names, keeping the
 # self-discovery lint's generator the single place IronAuth's OWN document is built).
 ironauth-connector.workspace = true
+# THE SAML HARNESS, for the assertion consumer service (issue #139). This is the crate's FIRST
+# dependent: `ironauth-saml` verifies and checks, and until this module existed nothing called
+# any of it.
+ironauth-saml.workspace = true
 # Breached-password screening and the NIST SP 800-63B-4 policy (issue #63): the
 # k-anonymity screening providers, the Screener, and the PasswordPolicy evaluator plus
 # NFKC normalization the set/change/reset and login paths call. The HIBP provider's only
@@ -140,7 +144,7 @@ default = []
 wasm-hooks = ["dep:ironauth-hooks"]
 # Enables the ironauth-store real-database harness for the DB-backed integration
 # tests (mirrors ironauth-admin's `testing` gate). Adds no runtime surface.
-testing = ["ironauth-store/testing"]
+testing = ["ironauth-store/testing", "ironauth-saml/test-util"]
 
 [dev-dependencies]
 # Test senders implement the same async seam the production one does.
@@ -1522,4 +1526,10 @@ path = "tests/native_sso.rs"
 # Needs a database.
 [[test]]
 name = "native_sso_flow"
+required-features = ["testing"]
 path = "tests/native_sso_flow.rs"
+
+[[test]]
+name = "saml_acs"
+required-features = ["testing"]
+path = "tests/saml_acs.rs"

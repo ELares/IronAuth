@@ -129,11 +129,26 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
         // A USER'S STATE CHANGED, which includes being created. Converge sends the whole mapped
         // representation, so one intent covers create and update: the client decides which by
         // looking the subject up, which is also what makes a replay idempotent.
+        // AND ORGANIZATION MEMBERSHIP, merged into this arm because it produces the identical
+        // intent and two arms returning one value are one branch.
+        //
+        // JOINING OR LEAVING THE ORGANIZATION a connection pushes is the most literal reading of
+        // criterion 4: "out-of-scope users are never pushed, and a user leaving scope is
+        // deactivated downstream per policy". Both are a CONVERGE rather than an explicit push
+        // or withdraw, because `scope_decision` already decides which one they are: a member who
+        // has left is out of scope with a link, which is exactly `Withdraw`.
+        //
+        // Classified as `NotASubject` by the first version, so the one event that says a person
+        // left produced no request at all and their downstream account stayed live. The catalog
+        // walk did not catch it: these are `organization.*`, and the walk only asserted a
+        // decision for `user.*` and `org_group.*`.
         "user.created"
         | "user.updated"
         | "user.state_changed"
         | "user.identifier_added"
-        | "user.identifier_removed" => match subject("user_id") {
+        | "user.identifier_removed"
+        | "organization.member_added"
+        | "organization.member_removed" => match subject("user_id") {
             Some(id) => PushIntent::Converge {
                 collection: Collection::User,
                 subject_id: id.to_owned(),
@@ -183,24 +198,6 @@ pub fn intent_for(event_type: &str, payload: &serde_json::Value) -> PushIntent {
         "org_group.deleted" => match subject("org_group_id") {
             Some(id) => PushIntent::Deprovision {
                 collection: Collection::Group,
-                subject_id: id.to_owned(),
-                organization_id: organization.map(str::to_owned),
-            },
-            None => PushIntent::Ignore(Ignored::MalformedPayload),
-        },
-        // JOINING OR LEAVING THE ORGANIZATION a connection pushes is the most literal reading of
-        // criterion 4: "out-of-scope users are never pushed, and a user leaving scope is
-        // deactivated downstream per policy". Both are a CONVERGE rather than an explicit push or
-        // withdraw, because `scope_decision` already decides which one they are: a member who has
-        // left is out of scope with a link, which is exactly `Withdraw`.
-        //
-        // Classified as `NotASubject` by the first version, so the one event that says a person
-        // left produced no request at all and their downstream account stayed live. The catalog
-        // walk did not catch it: these are `organization.*`, and the walk only asserted a
-        // decision for `user.*` and `org_group.*`.
-        "organization.member_added" | "organization.member_removed" => match subject("user_id") {
-            Some(id) => PushIntent::Converge {
-                collection: Collection::User,
                 subject_id: id.to_owned(),
                 organization_id: organization.map(str::to_owned),
             },

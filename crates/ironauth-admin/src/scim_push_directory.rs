@@ -300,7 +300,7 @@ impl<'a> PushDirectory<'a> {
                 subject_id: subject_id.to_owned(),
             });
         }
-        let membership_ids: Vec<_> = members.iter().map(|m| m.membership_id.clone()).collect();
+        let membership_ids: Vec<_> = members.iter().map(|m| m.membership_id).collect();
         let users = self
             .store
             .org_memberships()

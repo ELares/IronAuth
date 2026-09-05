@@ -4870,6 +4870,10 @@ async fn the_agent_vault_surface_splits_deciding_from_reading_the_queue() {
 /// `environment_secrets` row somebody else created, so pointing one at an existing secret mints
 /// nothing. Asserting the string here is what stops that reasoning from being only a comment: if
 /// a later edit "aligned" these handlers with the inbound ones, this test names the difference.
+// A TEST whose length is its subject: one delegated administrator exercised across every
+// surface the delegation covers. Split, each half would pass against a grant the other
+// half proves is missing.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn a_read_only_credential_can_list_scim_push_connections_and_cannot_change_one() {
     let h = Harness::start(50).await;

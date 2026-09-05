@@ -3224,6 +3224,9 @@ async fn drive(h: &Harness, case: &Case, key: &str) -> (StatusCode, String) {
     (status, body)
 }
 
+// A TEST that walks the whole live surface in one pass, which is what makes it able to
+// say a route is missing rather than merely that some route works.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn every_documented_operation_is_driven_by_a_case() {
     // The guard on the guard. It needs no database, so it is the cheapest thing in the

@@ -226,7 +226,7 @@ impl<'a> ScopedStore<'a> {
 
     /// The one-time-use state that makes a SAML response unrepeatable (issue #139).
     ///
-    /// WRITEABLE here, unlike the connection, because issuing an AuthnRequest and consuming the
+    /// WRITEABLE here, unlike the connection, because issuing an `AuthnRequest` and consuming the
     /// response are both sign-in and sign-in runs on the data plane.
     #[must_use]
     pub fn saml_replay(&self) -> SamlReplayRepo<'a> {
@@ -75340,7 +75340,7 @@ pub struct SamlConnection {
     pub display_name: String,
     /// What the identity provider calls itself. A response's `Issuer` must equal this.
     pub idp_entity_id: String,
-    /// Where an AuthnRequest is sent.
+    /// Where an `AuthnRequest` is sent.
     pub idp_sso_url: String,
     /// What this deployment calls itself to this identity provider. The `Audience` must equal it.
     pub sp_entity_id: String,
@@ -75701,7 +75701,7 @@ impl SamlConnectionRepo<'_> {
 ///
 /// # Two defences, and which one applies is the connection's choice
 ///
-/// An outstanding request is the strong one: a response must name an AuthnRequest this
+/// An outstanding request is the strong one: a response must name an `AuthnRequest` this
 /// deployment issued and has not consumed, so a captured response is useless a second time and a
 /// response nobody asked for is useless the first. It is what `allow_unsolicited = false` means.
 ///
@@ -75714,7 +75714,7 @@ pub struct SamlReplayRepo<'a> {
 }
 
 impl SamlReplayRepo<'_> {
-    /// Record an AuthnRequest this deployment has just issued.
+    /// Record an `AuthnRequest` this deployment has just issued.
     ///
     /// # Errors
     ///
@@ -76052,7 +76052,7 @@ pub struct NewSamlConnection<'a> {
     pub display_name: &'a str,
     /// What the identity provider calls itself; a response's `Issuer` must equal it.
     pub idp_entity_id: &'a str,
-    /// Where an AuthnRequest is sent.
+    /// Where an `AuthnRequest` is sent.
     pub idp_sso_url: &'a str,
     /// What this deployment calls itself to this identity provider.
     pub sp_entity_id: &'a str,
