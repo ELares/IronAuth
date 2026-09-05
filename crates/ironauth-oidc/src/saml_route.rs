@@ -79,7 +79,7 @@ use ironauth_saml::Limits;
 use ironauth_store::SamlConnectionId;
 use serde::Deserialize;
 
-use crate::saml_acs::{Acs, AcsError, Consumed, consume};
+use crate::saml_acs::{Acs, AcsError, consume};
 use crate::state::OidcState;
 use crate::util::epoch_micros;
 use crate::wellknown::parse_scope;
@@ -106,7 +106,9 @@ pub struct AcsForm {
     /// whatever the last party to touch it wanted; it is where a service provider puts the URL
     /// to return to, which makes honouring the posted one an open redirect with extra steps.
     /// [`consume`] reads the `RelayState` this deployment RECORDED when it issued the request,
-    /// and that is the only one that reaches a redirect.
+    /// and when a redirect exists that is the only value it will be built from. NOTHING
+    /// REDIRECTS ON THIS BUILD -- there is no `Location` on any path -- so today this field is
+    /// discarded and no value at all reaches a browser.
     #[serde(rename = "RelayState")]
     _relay_state: Option<String>,
 }
@@ -115,11 +117,17 @@ pub struct AcsForm {
 ///
 /// # What a refusal leaves behind
 ///
-/// NOTHING IN THE STORE, which is [`consume`]'s own property and the reason this endpoint can be
-/// this thin: every stateless check runs and passes before the outstanding request is spent or
-/// the assertion id recorded. What a refusal DOES leave is a page, and the two refusals this
-/// module adds on its own account -- an unreadable connection id and an undecodable body -- are
-/// reached before the store is touched at all.
+/// NOTHING, FOR EVERY REFUSAL THIS MODULE MAKES. There are three -- an unreadable connection id,
+/// an oversized field, and an undecodable body -- and all three are reached before the store is
+/// addressed at all.
+///
+/// NOT NOTHING FOR EVERY REFUSAL [`consume`] MAKES, and an earlier version of this paragraph
+/// said so. `consume`'s property is narrower and its own doc states it correctly: nothing is
+/// spent until every STATELESS check has passed. Past that point it performs two writes in two
+/// transactions, so a response that spends its outstanding request and then loses the
+/// assertion-id race comes back [`AcsError::Replayed`] -- a refusal, with the request already
+/// spent. That is the deliberate order (the alternative burns a replay slot a losing response
+/// never used) and it means "a refusal writes nothing" is false at the seam below this one.
 pub async fn acs_post(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, connection)): Path<(String, String, String)>,
@@ -128,14 +136,6 @@ pub async fn acs_post(
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
         return not_found();
     };
-    // A MALFORMED ID AND AN UNKNOWN ONE ANSWER IDENTICALLY, and so does an inactive connection,
-    // because the difference is only interesting to somebody enumerating which connections a
-    // deployment has. An operator testing their own connection is looking at the id they just
-    // pasted, and gets the same answer either way.
-    let Ok(connection_id) = SamlConnectionId::parse_in_scope(&connection, &scope) else {
-        return not_found();
-    };
-
     if form.saml_response.len() > MAX_ENCODED_RESPONSE {
         return refused(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -153,6 +153,18 @@ pub async fn acs_post(
         .collect();
     let Ok(response) = base64::engine::general_purpose::STANDARD.decode(packed) else {
         return refused(StatusCode::BAD_REQUEST, "the response is not valid base64");
+    };
+
+    // A MALFORMED ID AND AN UNKNOWN ONE ANSWER IDENTICALLY, and so does an inactive connection.
+    // THE PARSE SITS HERE, BELOW THE BODY GATES, and an earlier version had it above them --
+    // which made that sentence false: an undecodable body posted at `not-an-id` answered 404
+    // while the same body at a well-formed id naming no connection answered 400, so the pair
+    // told an enumerator whether a string parses as an in-scope `smc_` id. That much is
+    // computable offline and the leak was worth little, but a written property that is false
+    // for most bodies is worth less than none. Below the gates, every body class gets one
+    // answer for both.
+    let Ok(connection_id) = SamlConnectionId::parse_in_scope(&connection, &scope) else {
+        return not_found();
     };
 
     let read = state.store().scoped(scope);
@@ -176,31 +188,23 @@ pub async fn acs_post(
         Err(error) => return refused_by(&error),
     };
 
-    accepted(&consumed)
+    // THE CONSUMED ASSERTION IS DROPPED, deliberately and visibly: nothing on this build reads
+    // the subject, the attributes or the recorded `RelayState`, so binding them to a name here
+    // would be a value a reader could mistake for one that matters.
+    drop(consumed);
+    accepted()
 }
 
 /// What an accepted response answers with.
 ///
 /// NO SESSION, NO COOKIE, NO REDIRECT -- see the module doc for why that is this change's
-/// deliverable rather than a gap in it. The page is the same for every accepted response: it
-/// does not name the subject, the connection, or anything the poster did not already put in the
-/// document, because the party reading it is whoever posted, and nobody here has been
-/// authenticated as anyone.
-fn accepted(consumed: &Consumed) -> Response {
+/// deliverable rather than a gap in it. The page is a constant: it does not name the subject,
+/// the connection, or anything at all about the document, because the party reading it is
+/// whoever posted, and nobody here has been authenticated as anyone. It takes no argument for
+/// the same reason -- there is nothing about the outcome it is allowed to vary on.
+fn accepted() -> Response {
     use axum::response::IntoResponse;
 
-    // THE RECORDED RELAYSTATE IS READ AND NOT ACTED ON. Reading it here rather than ignoring the
-    // field keeps the redirect-to-be anchored on the value `consume` returns from the store,
-    // so the day sign-in lands, the thing a redirect is built from is already the recorded value
-    // and not the posted one. An assertion rather than a branch, because there is no behaviour
-    // to gate yet.
-    debug_assert!(
-        consumed
-            .relay_state
-            .as_ref()
-            .is_none_or(|value| !value.is_empty()),
-        "consume folds an empty RelayState to None"
-    );
     (
         StatusCode::OK,
         no_store(),
@@ -231,9 +235,11 @@ fn no_store() -> [(axum::http::header::HeaderName, &'static str); 1] {
 /// the browser reading them belongs to whoever posted, who on this endpoint is anybody.
 ///
 /// THE TYPE IS THE DELIVERABLE, NOT THE PAGE. `AcsError` is a public enum with a variant per
-/// fixable cause; the connection-test flow #140 owns calls `examine` and renders it to an
-/// authenticated operator, which is a reader who is entitled to their own configuration. Here
-/// the page carries only the coarse class, and the status carries the rest.
+/// fixable cause, for the connection-test flow #140 owns to render to an authenticated operator
+/// -- a reader entitled to their own configuration. THAT FLOW IS NOT BUILT, and saying so
+/// belongs here rather than in a sentence that reads as though the detail already reaches
+/// somebody: today the variant reaches a Rust caller and nothing else, and the page carries the
+/// coarse class. What this function decides is only that the page is not the place.
 fn refused_by(error: &AcsError) -> Response {
     let (status, reason) = match error {
         AcsError::NoConnection => return not_found(),
@@ -263,18 +269,20 @@ fn refused_by(error: &AcsError) -> Response {
     refused(status, reason)
 }
 
-/// An outcome page carrying `reason`, which is always an operator-facing sentence.
-fn refused(status: StatusCode, reason: &str) -> Response {
+/// An outcome page carrying `reason`.
+///
+/// `reason` IS A `&'static str` AND THAT IS LOAD-BEARING. An earlier version took an arbitrary
+/// string, because it rendered [`AcsError`]'s `Display` -- which quotes the document and this
+/// deployment's configuration -- and escaped it on the way out. Both halves are gone: the page
+/// carries one of a fixed set of sentences written in this file, so there is no untrusted text
+/// on this path to escape, and an escaping helper kept "in case" would be a defence nothing
+/// reaches and nothing measures. The TYPE is what stops document text arriving here.
+fn refused(status: StatusCode, reason: &'static str) -> Response {
     use axum::response::IntoResponse;
 
-    // ESCAPED, because some of these sentences quote the document: `WrongNameIdFormat` carries
-    // the `Format` the assertion named, and a signed assertion is still a place a hostile string
-    // can be written. Only a certificate the operator pinned can put text here, but "the
-    // attacker had to be the identity provider" is not a reason to render markup.
     let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Sign-in failed</title>\
-         <p>This sign-in could not be completed.</p><p>{}</p>",
-        escape(reason)
+        "<!doctype html><meta charset=\"utf-8\"><title>Response refused</title>\
+         <p>This response was not accepted.</p><p>{reason}</p>"
     );
     (status, no_store(), axum::response::Html(body)).into_response()
 }
@@ -289,22 +297,6 @@ fn not_found() -> Response {
 fn server_error() -> Response {
     refused(
         StatusCode::INTERNAL_SERVER_ERROR,
-        "this sign-in could not be completed; try again",
+        "this response could not be processed; try again",
     )
-}
-
-/// The five characters that matter in an HTML text node or a quoted attribute.
-fn escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for character in raw.chars() {
-        match character {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            other => out.push(other),
-        }
-    }
-    out
 }

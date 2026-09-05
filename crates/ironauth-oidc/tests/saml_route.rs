@@ -2,8 +2,13 @@
 //!
 //! `saml_acs.rs` measures the PROTOCOL against a real database and does not know what HTTP is.
 //! This measures the TRANSPORT: that a base64 form field reaches it, that the connection comes
-//! from the URL and not the document, that a verified assertion mints a session cookie, and that
-//! every refusal says something an operator can act on without saying anything to an attacker.
+//! from the URL and not the document, that the body gates run before the store is addressed, and
+//! that every refusal answers the same way for every input class an enumerator can vary.
+//!
+//! AND THAT NOTHING IS AUTHENTICATED. An earlier version of this sentence said the suite proved
+//! "a verified assertion mints a session cookie", which the endpoint deliberately no longer does
+//! -- see the module doc for the four reasons. The assertion is now the other way round, so
+//! adding sign-in has to come through here and say so.
 #![cfg(feature = "testing")]
 
 mod common;
@@ -462,11 +467,33 @@ async fn a_response_for_another_connection_is_refused_at_the_url_it_was_posted_t
 async fn a_body_that_is_not_base64_is_refused_before_the_connection_is_read() {
     // THE GATE HAS ITS OWN SENTENCE, and the test asserts it rather than the status: a body that
     // reaches `ironauth-saml` and fails to parse answers 400 too, so a suite checking only the
-    // status cannot tell the base64 gate from its absence -- and without the gate, an
-    // unparseable body costs two scoped database round-trips and a full XML parse first.
+    // status cannot tell the base64 gate from its absence.
+    //
+    // AND THE ORDER IS MEASURED, not just the sentence, by posting the undecodable body at a
+    // connection id that names NO CONNECTION. If the store were consulted first the answer
+    // would be the 404 that an absent connection gets; the base64 sentence can only come back
+    // if the gate ran before the lookup. Asserting the sentence alone left the whole
+    // decode-before-the-store block free to move below both reads with the suite green.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
+    let absent = SamlConnectionId::generate(harness.env(), &harness.scope());
+    let absent_path = format!(
+        "/t/{}/e/{}/saml/acs/{absent}",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
 
+    let (status, _, body) = harness
+        .post_form(&absent_path, "SAMLResponse=%7B%7Dnot-base64%21", None)
+        .await;
+    assert_eq!(
+        status, 400,
+        "the store was consulted before the body: {body}"
+    );
+    assert!(body.contains("not valid base64"), "{body}");
+
+    // THE SAME BODY AT A LIVE CONNECTION IS THE SAME ANSWER, which is what says the sentence
+    // above is the gate speaking and not an accident of the absent connection.
     let (status, _, body) = harness
         .post_form(&wired.path, "SAMLResponse=%7B%7Dnot-base64%21", None)
         .await;
@@ -517,6 +544,11 @@ async fn an_unknown_connection_answers_exactly_like_a_malformed_one() {
         None,
     );
 
+    // AND THE BODY CLASS IS VARIED TOO, because the identity is only interesting if it holds for
+    // every body: with the id parse above the body gates, an undecodable body at a malformed id
+    // answered 404 while the same body at a well-formed absent id answered 400, so the pair told
+    // an enumerator whether a string parses as an in-scope id. The loop below runs each id
+    // against a valid signed response AND against an undecodable body.
     let mut answers = Vec::new();
     for id in [
         absent.to_string(),
@@ -531,6 +563,37 @@ async fn an_unknown_connection_answers_exactly_like_a_malformed_one() {
         );
         let (status, headers, page) = harness.post_form(&path, &body, None).await;
         answers.push((status, header_shape(&headers), page));
+    }
+    let mut undecodable = Vec::new();
+    for id in [
+        absent.to_string(),
+        foreign.to_string(),
+        "not-an-id".to_owned(),
+        "smc_".to_owned(),
+    ] {
+        let path = format!(
+            "/t/{}/e/{}/saml/acs/{id}",
+            scope.tenant(),
+            scope.environment()
+        );
+        let (status, headers, page) = harness
+            .post_form(&path, "SAMLResponse=%7B%7Dnot-base64%21", None)
+            .await;
+        undecodable.push((status, header_shape(&headers), page));
+    }
+    for answer in &undecodable[1..] {
+        assert_eq!(
+            answer.0, undecodable[0].0,
+            "an undecodable body differs by status"
+        );
+        assert_eq!(
+            answer.1, undecodable[0].1,
+            "an undecodable body differs by header"
+        );
+        assert_eq!(
+            answer.2, undecodable[0].2,
+            "an undecodable body differs by body"
+        );
     }
     assert_eq!(answers[0].0, 404);
     for answer in &answers[1..] {
@@ -548,13 +611,29 @@ async fn an_oversized_field_is_refused_without_being_decoded() {
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, NAMEID_FORMAT).await;
 
-    let over = "A".repeat(512 * 1024 + 4);
+    // OVER THE CAP AND NOT VALID BASE64: 413, not 400. A build that decoded first would answer
+    // 400 here, so this is what says the cap is consulted BEFORE the decode rather than merely
+    // somewhere before the store. `!` is outside the alphabet, so a decode-first build cannot
+    // reach the cap at all.
+    let over = format!("{}!", "A".repeat(512 * 1024 + 4));
     let (status, _, body) = harness
-        .post_form(&wired.path, &format!("SAMLResponse={over}"), None)
+        .post_form(
+            &wired.path,
+            &format!("SAMLResponse={}", urlencode(&over)),
+            None,
+        )
         .await;
-    assert_eq!(status, 413, "{body}");
+    assert_eq!(
+        status, 413,
+        "the body was decoded before the cap was consulted: {body}"
+    );
 
+    // UNDER THE CAP AND DECODABLE, so what refuses it is past both gates. The length is a
+    // multiple of four deliberately: an earlier version used one that was not, so the under-cap
+    // body was refused by the BASE64 gate while the comment claimed it "reaches the parser",
+    // and an assertion on a bare 400 could not tell the two apart.
     let under = "A".repeat(512 * 1024 - 4);
+    assert_eq!(under.len() % 4, 0, "the under-cap body must be decodable");
     let (status, _, body) = harness
         .post_form(&wired.path, &format!("SAMLResponse={under}"), None)
         .await;
@@ -562,4 +641,63 @@ async fn an_oversized_field_is_refused_without_being_decoded() {
         status, 400,
         "a body under the cap was refused by the cap: {body}"
     );
+    assert!(
+        !body.contains("not valid base64"),
+        "the under-cap body was refused by the base64 gate, not past it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_line_wrapped_field_is_decoded_and_a_url_safe_one_is_not() {
+    // THE ONE INTEROP BEHAVIOUR THIS ENDPOINT ADDS, and nothing measured it: identity providers
+    // line-wrap the base64 field, and a conformant decoder rejects the newline. Removing the
+    // whitespace strip left all seven tests green and would have refused every response from a
+    // wrapping provider as "not valid base64" -- telling the operator their base64 is broken.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, NAMEID_FORMAT).await;
+    let response = signed(
+        &wired,
+        harness.env(),
+        "_assertion_wrapped",
+        SUBJECT,
+        NAMEID_FORMAT,
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&response);
+
+    let wrapped: String = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    assert!(wrapped.contains("\r\n"), "the fixture did not wrap");
+    let (status, _, body) = harness
+        .post_form(
+            &wired.path,
+            &format!("SAMLResponse={}", urlencode(&wrapped)),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "a line-wrapped field was not decoded: {body}");
+
+    // AND THE ALPHABET IS THE STANDARD ONE, which the same comment claims and nothing measured.
+    // A URL-safe encoding of the identical document must not be accepted: OASIS Bindings names
+    // one encoding, and quietly taking a second is a second reading of the same bytes.
+    let url_safe = base64::engine::general_purpose::URL_SAFE.encode(&response);
+    if url_safe == encoded {
+        // The document happened to encode without `+` or `/`; nothing to distinguish.
+        return;
+    }
+    let (status, _, body) = harness
+        .post_form(
+            &wired.path,
+            &format!("SAMLResponse={}", urlencode(&url_safe)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a URL-safe encoding was accepted where OASIS names the standard alphabet: {body}"
+    );
+    assert!(body.contains("not valid base64"), "{body}");
 }
