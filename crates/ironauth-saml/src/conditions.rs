@@ -261,6 +261,24 @@ pub struct Accepted {
     pub name_id_format: Option<String>,
     /// The assertion's own `ID`, which a caller records so the same one cannot be admitted twice.
     pub assertion_id: String,
+    /// The `InResponseTo` the bearer confirmation carried, when it carried one.
+    ///
+    /// # Why a caller needs this back, having just supplied it
+    ///
+    /// It supplied [`Expectations::in_response_to`] as a POLICY -- whether this connection
+    /// correlates at all -- and a correlating connection does not know WHICH outstanding request
+    /// a given response answers until it reads one. The endpoint has to spend exactly that
+    /// request, once, and it can only name it if this hands it back.
+    ///
+    /// SAFE TO ACT ON BECAUSE IT IS POST-CHECK. By the time this exists the signature verified,
+    /// and if the caller asked for correlation then this value equalled what the caller
+    /// expected -- so a caller looping over its outstanding requests is not the shape here. What
+    /// a caller does with it is prove the request was ITS OWN and unspent, which is a fact only
+    /// the store has.
+    ///
+    /// [`None`] for a response this deployment did not solicit, which is admissible only on a
+    /// connection that opted in.
+    pub in_response_to: Option<String>,
     /// When this deployment stops treating the assertion as valid, in epoch seconds, which is
     /// what a replay cache remembers it until.
     ///
@@ -378,7 +396,7 @@ pub fn check(
     let skew = expectations.clock_skew_secs.max(0);
     let (not_before, not_on_or_after) =
         read_conditions(conditions, expectations, now_unix_secs, skew)?;
-    let (name_id_element, confirmation_expiry) =
+    let (name_id_element, confirmation_expiry, correlation) =
         read_subject(assertion, expectations, now_unix_secs, skew)?;
     // THE VALUE THE GUARD CHECKED MUST BE THE VALUE RETURNED. An earlier version tested
     // `name_id.trim().is_empty()` and then returned the UNTRIMMED text, so " ada@globex.example "
@@ -405,6 +423,7 @@ pub fn check(
         name_id,
         name_id_format,
         assertion_id,
+        in_response_to: correlation,
         // THE EARLIEST OF THE THREE. The replay cache remembers an assertion until it could no
         // longer be accepted, and the confirmation's expiry is usually the soonest of them --
         // remembering only the assertion's would keep it long past the point it stopped being
@@ -430,6 +449,61 @@ pub fn check(
             // replay -- which is the one thing the cache exists to stop.
             .saturating_add(skew),
     })
+}
+
+/// The one bearer `SubjectConfirmationData` inside a `Subject`.
+///
+/// SAML Profiles 4.1.4.2 requires at least one bearer `SubjectConfirmation`; more than one is
+/// ambiguity this crate refuses everywhere else, and here the ambiguity decides which request
+/// the response answers. Same for the `SubjectConfirmationData` inside it.
+fn bearer_confirmation_data<'a>(
+    subject: &SignedElement<'a>,
+) -> Result<SignedElement<'a>, ConditionError> {
+    let confirmations: Vec<_> = subject
+        .children(ASSERTION, "SubjectConfirmation")
+        .into_iter()
+        .filter(|confirmation| confirmation.attribute("Method") == Some(BEARER))
+        .collect();
+    let [confirmation] = confirmations.as_slice() else {
+        return Err(ConditionError::Malformed);
+    };
+    let datas = confirmation.children(ASSERTION, "SubjectConfirmationData");
+    let [data] = datas.as_slice() else {
+        return Err(ConditionError::Malformed);
+    };
+    Ok(data.clone())
+}
+
+/// The `InResponseTo` a verified assertion carries, if it carries one unambiguously.
+///
+/// # Why a caller needs this BEFORE `check`
+///
+/// [`Expectations::in_response_to`] is a policy -- whether this connection correlates -- and a
+/// correlating deployment does not know WHICH of its outstanding requests a response answers
+/// until it reads one. So the endpoint reads it, looks it up, and spends it; `check` then
+/// confirms the value it acted on is the value the assertion carried.
+///
+/// # This is not authorization and must not be treated as it
+///
+/// It says a response NAMES a request, never that this deployment issued one. Only the store
+/// knows that, and only an atomic spend proves it was unspent. A caller that stopped here would
+/// accept any response that names any id.
+///
+/// READ THE SAME WAY `check` READS IT, through the same direct-child walk, so the two cannot
+/// disagree about which confirmation is the one -- which is the defect class this crate is
+/// built against. [`None`] for an assertion with no bearer confirmation, two of them, or no
+/// `InResponseTo`: all three are "no unambiguous request named", and `check` gives each its own
+/// refusal on the pass that matters.
+#[must_use]
+pub fn correlation(assertion: &VerifiedAssertion) -> Option<String> {
+    let subjects = assertion.children(ASSERTION, "Subject");
+    let [subject] = subjects.as_slice() else {
+        return None;
+    };
+    bearer_confirmation_data(subject)
+        .ok()?
+        .attribute("InResponseTo")
+        .map(ToOwned::to_owned)
 }
 
 /// One `xsd:dateTime` bound, distinguishing ABSENT from PRESENT-AND-UNREADABLE.
@@ -566,7 +640,7 @@ fn read_subject<'a>(
     expectations: &Expectations<'_>,
     now_unix_secs: i64,
     skew: i64,
-) -> Result<(SignedElement<'a>, i64), ConditionError> {
+) -> Result<(SignedElement<'a>, i64, Option<String>), ConditionError> {
     // THE SUBJECT, and EXACTLY ONE of it, AS A DIRECT CHILD. Everything about who this is and
     // how they may present it is read within here, never by descendant search -- and the Subject
     // itself is found the same way, because `saml:AttributeValue` is `xs:anyType`, so a
@@ -578,21 +652,11 @@ fn read_subject<'a>(
         return Err(ConditionError::Malformed);
     };
 
-    // THE BEARER CONFIRMATION, and exactly one. SAML Profiles 4.1.4.2 requires at least one
-    // bearer `SubjectConfirmation`; more than one is ambiguity this crate refuses everywhere
-    // else, and here the ambiguity decides which request the response answers.
-    let confirmations: Vec<_> = subject
-        .children(ASSERTION, "SubjectConfirmation")
-        .into_iter()
-        .filter(|confirmation| confirmation.attribute("Method") == Some(BEARER))
-        .collect();
-    let [confirmation] = confirmations.as_slice() else {
-        return Err(ConditionError::Malformed);
-    };
-    let datas = confirmation.children(ASSERTION, "SubjectConfirmationData");
-    let [data] = datas.as_slice() else {
-        return Err(ConditionError::Malformed);
-    };
+    // THE BEARER CONFIRMATION AND ITS DATA, exactly one of each. Shared with
+    // [`correlation`] rather than written twice, because two readers of `InResponseTo`
+    // disagreeing about which confirmation is the one is the whole defect class this crate
+    // exists for.
+    let data = &bearer_confirmation_data(subject)?;
 
     // THE CORRELATION. Where a request was required its absence is a refusal: silence is not a
     // match.
@@ -655,5 +719,13 @@ fn read_subject<'a>(
     let [name_id_element] = name_ids.as_slice() else {
         return Err(ConditionError::Malformed);
     };
-    Ok((name_id_element.clone(), confirmation_expiry))
+    Ok((
+        name_id_element.clone(),
+        confirmation_expiry,
+        // THE VALUE THE CONFIRMATION CARRIED, not the one the caller expected: on a correlating
+        // connection the two are equal by the check above, and on a non-correlating one this is
+        // `None` by the same check. Handing back the caller's own argument would be a field that
+        // tells them nothing.
+        carried.map(ToOwned::to_owned),
+    ))
 }

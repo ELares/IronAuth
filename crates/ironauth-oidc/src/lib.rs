@@ -178,6 +178,7 @@ mod revocation;
 mod risk;
 mod risk_signals;
 pub mod routing;
+pub mod saml_acs;
 mod scope_claims;
 mod sector;
 mod session;

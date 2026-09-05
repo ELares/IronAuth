@@ -2233,6 +2233,7 @@ dependencies = [
  "ironauth-jose",
  "ironauth-journey",
  "ironauth-quota",
+ "ironauth-saml",
  "ironauth-screening",
  "ironauth-store",
  "ironauth-webauthn",
