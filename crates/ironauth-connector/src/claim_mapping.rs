@@ -390,7 +390,25 @@ fn resolve_rule(rule: &ClaimRule, views: &[&Map<String, Value>]) -> Option<Value
 /// object by key or into an array by a numeric index (for example `emails.0`). A
 /// segment that hits a scalar, an absent key, or an out-of-range index resolves to
 /// [`None`]. Pure and total: no path can panic.
+///
+/// # The WHOLE path is tried as a literal key first, and SAML is why
+///
+/// A SAML attribute's `Name` is a URI, and every one an enterprise identity provider sends
+/// contains dots: `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` is what
+/// ADFS and Entra emit for an email address. Splitting on `.` unconditionally looks up the key
+/// `http://schemas`, which no claim object has -- so a mapping could not address a single real
+/// SAML attribute, and issue #139's "attribute mapping round-trips through the same JIT mapper"
+/// would have been a sentence with no reachable path behind it.
+///
+/// A LITERAL KEY IS THE MORE SPECIFIC READING, so it wins. This changes nothing for any existing
+/// OIDC mapping: a path with no dots (`email`, `sub`) resolves identically either way, and one
+/// that means traversal (`emails.0`) has no literal key to find, so it falls through. The only
+/// documents affected are those carrying a key that literally contains a dot -- where the
+/// literal match is what a mapping author writing that key meant.
 fn resolve_path<'a>(root: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    if let Some(value) = root.get(path) {
+        return Some(value);
+    }
     let mut segments = path.split('.');
     let first = segments.next()?;
     let mut current = root.get(first)?;
@@ -790,5 +808,73 @@ mod tests {
         )
         .expect_err("numeric subject");
         assert!(matches!(error, ClaimMappingError::UpstreamClaim { .. }));
+    }
+
+    #[test]
+    fn a_claim_name_containing_dots_resolves_as_a_literal_key() {
+        // EVERY REAL SAML ATTRIBUTE NAME IS A URI AND CONTAINS DOTS. ADFS and Entra send
+        // `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`, and splitting on
+        // `.` unconditionally looks up a key called `http://schemas`, which no claim object has
+        // -- so a mapping could not address a single real SAML attribute, and issue #139's
+        // "attribute mapping round-trips through the same JIT mapper" was a sentence with no
+        // reachable path behind it.
+        const SAML_EMAIL: &str =
+            "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress";
+        let claims = json!({ SAML_EMAIL: "ada@globex.example" });
+        let Value::Object(root) = &claims else {
+            panic!("an object")
+        };
+        assert_eq!(
+            resolve_path(root, SAML_EMAIL),
+            Some(&Value::String("ada@globex.example".to_owned())),
+            "a SAML attribute name was not addressable"
+        );
+
+        // AND THE FIRST SEGMENT ALONE STILL DOES NOT RESOLVE, which is what shows the literal
+        // lookup answered rather than the split happening to land somewhere.
+        assert_eq!(resolve_path(root, "http://schemas"), None);
+    }
+
+    #[test]
+    fn traversal_still_works_and_the_literal_key_wins_where_both_could() {
+        // THE LITERAL LOOKUP MUST NOT COST TRAVERSAL. Every existing OIDC mapping path is either
+        // dotless (`email`) -- identical either way -- or means traversal (`emails.0`), which has
+        // no literal key to find and falls through exactly as before.
+        let claims = json!({
+            "email": "ada@globex.example",
+            "emails": ["first@globex.example", "second@globex.example"],
+            "address": { "country": "IE" },
+        });
+        let Value::Object(root) = &claims else {
+            panic!("an object")
+        };
+        assert_eq!(
+            resolve_path(root, "email"),
+            Some(&Value::String("ada@globex.example".to_owned()))
+        );
+        assert_eq!(
+            resolve_path(root, "emails.1"),
+            Some(&Value::String("second@globex.example".to_owned())),
+            "array traversal stopped working"
+        );
+        assert_eq!(
+            resolve_path(root, "address.country"),
+            Some(&Value::String("IE".to_owned())),
+            "object traversal stopped working"
+        );
+        assert_eq!(resolve_path(root, "address.postcode"), None);
+        assert_eq!(resolve_path(root, "emails.9"), None);
+
+        // WHERE BOTH COULD RESOLVE, THE LITERAL KEY WINS. It is the more specific reading: a
+        // mapping author who wrote `a.b` as a key meant that key, and the traversal is still
+        // reachable through the nested object under its own name.
+        let ambiguous = json!({ "a.b": "literal", "a": { "b": "traversed" } });
+        let Value::Object(root) = &ambiguous else {
+            panic!("an object")
+        };
+        assert_eq!(
+            resolve_path(root, "a.b"),
+            Some(&Value::String("literal".to_owned()))
+        );
     }
 }

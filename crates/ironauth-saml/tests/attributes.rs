@@ -12,22 +12,30 @@
 //! telling anybody, so the interesting cases are not malformed documents -- they are conformant
 //! ones this crate has to keep reading the same way:
 //!
-//! - the same `Name` sent twice, which is a contradiction and not a longer list;
-//! - an `AttributeValue` holding ELEMENTS, which `xs:anyType` permits and Entra emits;
+//! - the same `Name` sent twice under ONE format, which is a contradiction, against the same
+//!   `Name` under TWO formats, which SAML says is two attributes;
+//! - an `AttributeValue` holding ELEMENTS, which `xs:anyType` permits;
 //! - an attribute with NO values, which is how a directory says a field was cleared;
-//! - attributes nested inside somebody else's assertion, which are inside this signature too.
+//! - a `saml:EncryptedAttribute`, which is the sibling of the element being read;
+//! - attributes nested inside somebody else's assertion, which are inside this signature too;
+//! - a verified `samlp:Response` rather than the assertion inside it, which is the ONLY value
+//!   the Response-only-signed profile yields.
 //!
 //! Needs no database.
 
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
-use ironauth_saml::{ASSERTION_NS, Attribute, Limits, TrustAnchor, Value, attributes, verify};
+use ironauth_saml::{
+    ASSERTION_NS, Attribute, Limits, PROTOCOL_NS, TrustAnchor, Unreadable, Value, attributes,
+    verify,
+};
 
 const EMAIL: &str = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress";
 const GROUPS: &str = "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups";
 const BASIC: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:basic";
+const URI_FORMAT: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:uri";
 
-/// Sign these assertion children, verify, and read the attributes.
-fn read(children: &str) -> Result<Vec<Attribute>, ironauth_saml::Ambiguous> {
+/// Sign these assertion children, verify the ASSERTION, and read the attributes.
+fn read(children: &str) -> Result<Vec<Attribute>, Unreadable> {
     let key = XmlTestKey::generate();
     let document = ironauth_saml::test_util::signed_response_with(&key, "_assertion", children);
     let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
@@ -47,19 +55,30 @@ fn body(statements: &str) -> String {
     format!("<saml:Issuer>urn:idp</saml:Issuer>{statements}")
 }
 
+/// One `saml:Attribute` with these values, and a `NameFormat` if given.
+fn attribute(name: &str, name_format: Option<&str>, values: &[&str]) -> String {
+    let format = name_format.map_or(String::new(), |f| format!(" NameFormat=\"{f}\""));
+    let mut rendered = String::new();
+    for value in values {
+        rendered.push_str("<saml:AttributeValue>");
+        rendered.push_str(value);
+        rendered.push_str("</saml:AttributeValue>");
+    }
+    format!("<saml:Attribute Name=\"{name}\"{format}>{rendered}</saml:Attribute>")
+}
+
+/// A `saml:AttributeStatement` around these children.
+fn statement(children: &str) -> String {
+    format!("<saml:AttributeStatement>{children}</saml:AttributeStatement>")
+}
+
 #[test]
 fn an_ordinary_statement_reads_in_document_order_with_its_formats() {
-    let found = read(&body(&format!(
-        "<saml:AttributeStatement>\
-         <saml:Attribute Name=\"{EMAIL}\" NameFormat=\"{BASIC}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue>\
-         </saml:Attribute>\
-         <saml:Attribute Name=\"{GROUPS}\">\
-         <saml:AttributeValue>engineering</saml:AttributeValue>\
-         <saml:AttributeValue>oncall</saml:AttributeValue>\
-         </saml:Attribute>\
-         </saml:AttributeStatement>"
-    )))
+    let found = read(&body(&statement(&format!(
+        "{}{}",
+        attribute(EMAIL, Some(BASIC), &["ada@globex.example"]),
+        attribute(GROUPS, None, &["engineering", "oncall"])
+    ))))
     .expect("an ordinary statement");
 
     assert_eq!(found.len(), 2, "an attribute was dropped or invented");
@@ -87,26 +106,29 @@ fn an_ordinary_statement_reads_in_document_order_with_its_formats() {
 }
 
 #[test]
-fn several_statements_are_one_list_and_no_statement_is_an_empty_one() {
-    // SAML PERMITS SEVERAL `AttributeStatement`s, and an identity provider that assembles a
-    // response from two sources emits exactly that. They are one list of attributes, not two
-    // sets of them, and reading only the first would silently drop half.
+fn several_statements_are_one_list_in_document_order() {
+    // SAML PERMITS SEVERAL `AttributeStatement`s, and a provider assembling a response from two
+    // sources emits exactly that. They are ONE list, not two sets, and reading only the first
+    // would silently drop half.
+    //
+    // THE ORDER ACROSS statements is asserted, not just the count: the API documents "in
+    // document order", and a reader that walked them with a stack -- which is how the condition
+    // layer's bug arrived -- would keep the count and reverse the list.
     let two = read(&body(&format!(
-        "<saml:AttributeStatement>\
-         <saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>\
-         <saml:AttributeStatement>\
-         <saml:Attribute Name=\"{GROUPS}\">\
-         <saml:AttributeValue>engineering</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>"
+        "{}{}",
+        statement(&attribute(EMAIL, None, &["ada@globex.example"])),
+        statement(&attribute(GROUPS, None, &["engineering"]))
     )))
     .expect("two statements");
     assert_eq!(two.len(), 2, "a second AttributeStatement was ignored");
+    assert_eq!(
+        (two[0].name.as_str(), two[1].name.as_str()),
+        (EMAIL, GROUPS),
+        "the statements were collected out of document order"
+    );
 
     // AND NO STATEMENT AT ALL IS NOT AN ERROR. An assertion carrying only an `AuthnStatement` is
-    // ordinary -- it is what a provider sends when the relying party asked for nothing -- so
-    // refusing it would refuse a conformant sign-in for saying nothing extra.
+    // ordinary -- it is what a provider sends when the relying party asked for nothing.
     let none = read(&body(
         "<saml:AuthnStatement AuthnInstant=\"2026-01-01T00:00:00Z\"/>",
     ))
@@ -120,133 +142,244 @@ fn an_attribute_with_no_values_is_not_the_same_as_an_absent_attribute() {
     // "not sent" loses the difference between "we do not know their department" and "they have
     // none", and a mapping that reuses a stored value on absence would then keep a department
     // the identity provider just removed.
-    let found = read(&body(&format!(
-        "<saml:AttributeStatement><saml:Attribute Name=\"{GROUPS}\"/>\
-         </saml:AttributeStatement>"
-    )))
+    let found = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{GROUPS}\"/>"
+    ))))
     .expect("an attribute with no values");
     assert_eq!(found.len(), 1, "an empty attribute was dropped");
     assert!(found[0].values.is_empty());
 }
 
 #[test]
-fn the_same_name_sent_twice_is_a_contradiction_and_not_a_longer_list() {
-    // SAML CORE 2.7.3.1 PUTS AN ATTRIBUTE'S VALUES IN ONE `Attribute` ELEMENT, so a second one
-    // with the same `Name` is a second CLAIM about that name. Taking either is choosing which
-    // half to believe, and somebody who can append chooses for the reader -- the rule this crate
-    // applies to `Conditions`, `Subject` and `Issuer` for exactly the same reason.
-    //
-    // The two carry DIFFERENT values, so a reader that concatenated them and one that took
-    // either would each produce something, and all three answers differ.
-    let refused = read(&body(&format!(
-        "<saml:AttributeStatement>\
-         <saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
-         <saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>attacker@evil.example</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>"
-    )));
-    let Err(ambiguous) = &refused else {
-        panic!("an assertion claiming two emails had one of them believed: {refused:?}");
-    };
+fn an_empty_value_is_not_the_empty_string() {
+    // THE CONNECTOR'S RULES TAKE THE FIRST SOURCE THAT RESOLVES TO A NON-NULL VALUE, so an empty
+    // STRING wins a fallback that an absent value loses. A person whose department was cleared
+    // would get `""` written into their profile instead of the next source's value -- which is
+    // the difference between "we do not know" and "we know it is nothing", decided in favour of
+    // a value nobody sent.
+    let found = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{GROUPS}\">\
+         <saml:AttributeValue></saml:AttributeValue>\
+         <saml:AttributeValue/>\
+         <saml:AttributeValue xsi:nil=\"true\" \
+         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"/>\
+         <saml:AttributeValue>engineering</saml:AttributeValue>\
+         </saml:Attribute>"
+    ))))
+    .expect("empty values are not a refusal");
     assert_eq!(
-        ambiguous.name.as_deref(),
-        Some(EMAIL),
-        "the refusal did not name the attribute an operator has to look at"
+        found[0].values,
+        vec![
+            Value::Empty,
+            Value::Empty,
+            Value::Empty,
+            Value::Text("engineering".to_owned())
+        ],
+        "an empty value came back as Text(\"\"), which a mapping fallback treats as a value"
+    );
+
+    // AND WHITESPACE IS NOT EMPTY. `xsd:string` preserves it, so a value of one space is a value
+    // -- collapsing it into `Empty` would be this crate deciding a provider meant nothing when
+    // it sent something.
+    let spaced = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{GROUPS}\"><saml:AttributeValue> </saml:AttributeValue>\
+         </saml:Attribute>"
+    ))))
+    .expect("a whitespace value");
+    assert_eq!(spaced[0].values, vec![Value::Text(" ".to_owned())]);
+}
+
+#[test]
+fn the_same_name_under_one_format_is_a_contradiction_and_under_two_is_two_attributes() {
+    // SAML CORE 2.7.3.1 IDENTIFIES AN ATTRIBUTE BY `Name` AND `NameFormat` TOGETHER. So the
+    // duplicate rule compares both -- keying on `Name` alone refuses a conformant assertion that
+    // sends one name in two formats, which is what a provider migrating from the basic format to
+    // the URI format emits during the overlap.
+    let two_formats = read(&body(&statement(&format!(
+        "{}{}",
+        attribute(EMAIL, Some(BASIC), &["ada@globex.example"]),
+        attribute(EMAIL, Some(URI_FORMAT), &["ada@globex.example"])
+    ))))
+    .expect("one name in two formats is two attributes");
+    assert_eq!(two_formats.len(), 2, "a conformant pair was refused");
+
+    // UNDER ONE FORMAT IT IS A SECOND CLAIM. Taking either is choosing which half of a
+    // contradiction to believe, and somebody who can append chooses for the reader. The two
+    // carry DIFFERENT values, so a reader that concatenated them and one that took either would
+    // each produce something, and all three answers differ.
+    assert_eq!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, Some(BASIC), &["ada@globex.example"]),
+            attribute(EMAIL, Some(BASIC), &["attacker@evil.example"])
+        )))),
+        Err(Unreadable::Duplicate {
+            name: EMAIL.to_owned(),
+            name_format: Some(BASIC.to_owned()),
+        }),
+        "an assertion claiming two emails in one format had one of them believed"
+    );
+
+    // AND WITH NO FORMAT ON EITHER, which is the shape most providers send.
+    assert_eq!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, None, &["ada@globex.example"]),
+            attribute(EMAIL, None, &["attacker@evil.example"])
+        )))),
+        Err(Unreadable::Duplicate {
+            name: EMAIL.to_owned(),
+            name_format: None,
+        })
+    );
+}
+
+#[test]
+fn the_duplicate_rule_reaches_past_the_attribute_next_to_it() {
+    // A CHECK AGAINST ONLY THE PREVIOUS ATTRIBUTE passes every adjacent fixture, and an earlier
+    // version of this file had only adjacent ones. Here the pair is separated by two unrelated
+    // attributes, so only a check that scans what it has already seen refuses it.
+    let separated = read(&body(&statement(&format!(
+        "{}{}{}{}",
+        attribute(EMAIL, None, &["ada@globex.example"]),
+        attribute(GROUPS, None, &["engineering"]),
+        attribute("urn:example:department", None, &["platform"]),
+        attribute(EMAIL, None, &["attacker@evil.example"])
+    ))));
+    assert!(
+        matches!(separated, Err(Unreadable::Duplicate { .. })),
+        "a duplicate two attributes away was not seen: {separated:?}"
     );
 
     // ACROSS TWO STATEMENTS TOO, which is how it arrives when a provider merges two sources and
-    // is the case a per-statement check would miss.
-    let split = read(&body(&format!(
-        "<saml:AttributeStatement><saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>\
-         <saml:AttributeStatement><saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>attacker@evil.example</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>"
-    )));
-    assert!(
-        split.is_err(),
-        "the same Name in two statements was read as two attributes"
+    // is the case a per-statement check would miss. The refusal must NAME the duplicated
+    // attribute: asserting only that it failed cannot tell this from any other refusal.
+    assert_eq!(
+        read(&body(&format!(
+            "{}{}",
+            statement(&attribute(EMAIL, None, &["ada@globex.example"])),
+            statement(&attribute(EMAIL, None, &["attacker@evil.example"]))
+        ))),
+        Err(Unreadable::Duplicate {
+            name: EMAIL.to_owned(),
+            name_format: None,
+        }),
+        "the same Name in two statements was read as two attributes, or refused without saying \
+         which attribute an operator has to look at"
     );
 
-    // AND THE CONTROL: two DIFFERENT names in one statement are two attributes, so the refusal
-    // above is about the name and not about there being two of anything.
-    let distinct = read(&body(&format!(
-        "<saml:AttributeStatement>\
-         <saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
-         <saml:Attribute Name=\"{GROUPS}\">\
-         <saml:AttributeValue>engineering</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>"
-    )));
-    assert_eq!(distinct.expect("two distinct names").len(), 2);
+    // AND THE CONTROL: names differing only in CASE or in surrounding WHITESPACE are different
+    // names. A SAML attribute Name is a URI compared as a string, so folding either would merge
+    // two attributes an identity provider deliberately sent apart.
+    let nearly = read(&body(&statement(&format!(
+        "{}{}{}",
+        attribute(EMAIL, None, &["ada@globex.example"]),
+        attribute(&EMAIL.to_uppercase(), None, &["upper"]),
+        attribute(&format!(" {EMAIL}"), None, &["padded"])
+    ))))
+    .expect("three names that differ");
+    assert_eq!(nearly.len(), 3, "two distinct names were folded into one");
 }
 
 #[test]
-fn an_attribute_with_no_name_is_refused_rather_than_dropped() {
+fn an_attribute_with_no_usable_name_is_refused_rather_than_dropped() {
     // `Name` IS REQUIRED AND IS WHAT A MAPPING KEYS ON, so an attribute without one could never
     // be reached. Dropping it silently would hide a misconfiguration behind a trait that is
-    // simply never populated -- and the operator would go looking at their mapping, which is
-    // fine, rather than at their identity provider, which is where the fault is.
-    let refused = read(&body(
-        "<saml:AttributeStatement>\
-         <saml:Attribute><saml:AttributeValue>x</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>",
-    ));
-    let Err(ambiguous) = &refused else {
-        panic!("a nameless attribute was silently dropped: {refused:?}");
-    };
-    assert_eq!(ambiguous.name, None);
+    // simply never populated.
+    assert_eq!(
+        read(&body(&statement(
+            "<saml:Attribute><saml:AttributeValue>x</saml:AttributeValue></saml:Attribute>"
+        ))),
+        Err(Unreadable::NamelessAttribute)
+    );
+
+    // AND THE EMPTY STRING, which is the degenerate input a presence check alone does not catch:
+    // `Name=""` is present, and a mapping keyed on `""` is not one anybody wrote on purpose.
+    assert_eq!(
+        read(&body(&statement(
+            "<saml:Attribute Name=\"\"><saml:AttributeValue>x</saml:AttributeValue>\
+             </saml:Attribute>"
+        ))),
+        Err(Unreadable::NamelessAttribute),
+        "Name=\"\" satisfied the guard its own doc says it exists to catch"
+    );
 }
 
 #[test]
-fn a_value_carrying_elements_is_reported_as_structured_and_not_flattened() {
+fn an_encrypted_attribute_is_reported_rather_than_stepped_over() {
+    // `saml:EncryptedAttribute` IS THE SIBLING OF `saml:Attribute` in an `AttributeStatement`,
+    // and this module reads only the second. Skipping it silently means an attribute an operator
+    // configured, that the provider sent, and that never arrives -- and if it carries a `Name`
+    // the assertion ALSO sends in the clear, the duplicate rule never sees the pair.
+    assert_eq!(
+        read(&body(&statement(&format!(
+            "{}<saml:EncryptedAttribute><xenc:EncryptedData \
+             xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\"/></saml:EncryptedAttribute>",
+            attribute(EMAIL, None, &["ada@globex.example"])
+        )))),
+        Err(Unreadable::EncryptedAttribute),
+        "an encrypted attribute was silently dropped"
+    );
+
+    // THE CONTROL: the same statement without it reads, so the refusal is about the encrypted
+    // element and not about anything else in the fixture.
+    assert_eq!(
+        read(&body(&statement(&attribute(
+            EMAIL,
+            None,
+            &["ada@globex.example"]
+        ))))
+        .expect("the control")
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn a_value_carrying_elements_reports_its_shape_and_is_not_flattened() {
     // `AttributeValue` IS `xs:anyType`, so a conformant assertion may put a subtree in one --
-    // Entra does for some claim types, and `saml:NameID` inside an `AttributeValue` is common
-    // enough to have its own interoperability notes.
+    // `saml:NameID` inside one is the case with published interoperability notes.
     //
     // CONCATENATING ITS DESCENDANTS WOULD INVENT A VALUE. `<a>x</a><b>y</b>` gives "xy", which
     // no other reader produces and which a mapping would then write into somebody's profile.
-    let found = read(&body(&format!(
-        "<saml:AttributeStatement><saml:Attribute Name=\"{GROUPS}\">\
+    // The child NAMES come back so a caller can log what it declined to map and decide whether
+    // the attribute is one it should handle at all -- a payload-free marker would leave it a
+    // choice between a fiction and a silence.
+    let found = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{GROUPS}\">\
          <saml:AttributeValue>engineering</saml:AttributeValue>\
-         <saml:AttributeValue><saml:NameID>ada@globex.example</saml:NameID></saml:AttributeValue>\
-         </saml:Attribute></saml:AttributeStatement>"
-    )))
+         <saml:AttributeValue><saml:NameID>ada@globex.example</saml:NameID>\
+         <saml:SubjectConfirmation/></saml:AttributeValue>\
+         </saml:Attribute>"
+    ))))
     .expect("a structured value is not a refusal");
     assert_eq!(
         found[0].values,
-        vec![Value::Text("engineering".to_owned()), Value::Structured],
-        "a structured value was flattened into text, or dropped so the text values shifted"
+        vec![
+            Value::Text("engineering".to_owned()),
+            Value::Structured(vec!["NameID".to_owned(), "SubjectConfirmation".to_owned()])
+        ],
+        "a structured value was flattened, dropped so the text values shifted, or reported \
+         without the shape a caller has to act on"
     );
-
-    // THE POSITION MATTERS, which is why the text value is beside it: a caller skipping the
-    // structured one must still see `engineering` as the FIRST value, not the only one.
-    assert_eq!(found[0].values.len(), 2);
 }
 
 #[test]
 fn an_attribute_statement_inside_a_value_belongs_to_whoever_wrote_it() {
-    // THE DEFECT THE CONDITION LAYER PAID FOR THREE TIMES, in the one place it is easiest to
-    // reach: `AttributeValue` is `xs:anyType`, so an assertion may legitimately carry an entire
+    // THE DEFECT THE CONDITION LAYER PAID FOR THREE TIMES, in the place it is easiest to reach:
+    // `AttributeValue` is `xs:anyType`, so an assertion may legitimately carry an entire
     // `AttributeStatement` inside one -- and it is inside this signature just as much as the
-    // real one. A descendant search collects both, and the nested attributes then arrive as
-    // though the identity provider had asserted them.
+    // real one. A descendant search collects both.
     //
-    // The nested statement here claims the SAME names with different values, so a descendant
-    // search does not merely add attributes: it produces the ambiguity refusal, and this
-    // assertion would be rejected outright.
-    let found = read(&body(&format!(
-        "<saml:AttributeStatement><saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue>\
-         </saml:Attribute>\
-         <saml:Attribute Name=\"{GROUPS}\"><saml:AttributeValue>\
-         <saml:AttributeStatement><saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>attacker@evil.example</saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement></saml:AttributeValue></saml:Attribute>\
-         </saml:AttributeStatement>"
-    )))
+    // The nested statement claims the SAME name with a different value, so a descendant search
+    // does not merely add attributes: it produces the duplicate refusal and this assertion is
+    // rejected outright.
+    let found = read(&body(&statement(&format!(
+        "{}<saml:Attribute Name=\"{GROUPS}\"><saml:AttributeValue>{}</saml:AttributeValue>\
+         </saml:Attribute>",
+        attribute(EMAIL, None, &["ada@globex.example"]),
+        statement(&attribute(EMAIL, None, &["attacker@evil.example"]))
+    ))))
     .expect("a nested statement is not this assertion's problem");
 
     assert_eq!(found.len(), 2, "a nested AttributeStatement was collected");
@@ -257,23 +390,21 @@ fn an_attribute_statement_inside_a_value_belongs_to_whoever_wrote_it() {
     );
     assert_eq!(
         found[1].values,
-        vec![Value::Structured],
+        vec![Value::Structured(vec!["AttributeStatement".to_owned()])],
         "the nested statement was read as text rather than left alone"
     );
 }
 
 #[test]
-fn an_attribute_in_a_foreign_namespace_is_not_this_assertions_attribute() {
-    // THE ALLOWLIST LESSON FROM THE CONDITION LAYER: a name is a namespace AND a local name, and
-    // an element called `Attribute` bound to a namespace nobody trusts is not a SAML attribute.
-    // Reading it would let anything that can add an element to a signed document add a claim.
+fn an_element_in_a_foreign_namespace_is_not_this_assertions_attribute() {
+    // A NAME IS A NAMESPACE AND A LOCAL NAME. An element called `Attribute` bound to a namespace
+    // nobody trusts is not a SAML attribute, and reading it would let anything that can add an
+    // element to a signed document add a claim.
     let found = read(&body(&format!(
-        "<saml:AttributeStatement xmlns:evil=\"urn:evil\">\
-         <saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
-         <evil:Attribute Name=\"{GROUPS}\">\
-         <evil:AttributeValue>admins</evil:AttributeValue></evil:Attribute>\
-         </saml:AttributeStatement>"
+        "<saml:AttributeStatement xmlns:evil=\"urn:evil\">{}\
+         <evil:Attribute Name=\"{GROUPS}\"><evil:AttributeValue>admins</evil:AttributeValue>\
+         </evil:Attribute></saml:AttributeStatement>",
+        attribute(EMAIL, None, &["ada@globex.example"])
     )))
     .expect("a foreign element beside a real attribute");
     assert_eq!(
@@ -281,19 +412,93 @@ fn an_attribute_in_a_foreign_namespace_is_not_this_assertions_attribute() {
         1,
         "an element merely NAMED Attribute became one of this assertion's attributes"
     );
-    assert_eq!(found[0].name, EMAIL);
 
-    // AND A FOREIGN STATEMENT WRAPPING A REAL ATTRIBUTE is not a statement either: the elements
-    // inside it are conformant SAML, and what makes them somebody else's is their parent.
+    // A FOREIGN `AttributeValue` INSIDE A REAL ATTRIBUTE is not a value either. The real
+    // attribute keeps exactly its own values, and the foreign one is not read at all -- this is
+    // the one check in the module that had no fixture before.
+    let inner = read(&body(&statement(&format!(
+        "<saml:Attribute Name=\"{EMAIL}\" xmlns:evil=\"urn:evil\">\
+         <saml:AttributeValue>ada@globex.example</saml:AttributeValue>\
+         <evil:AttributeValue>attacker@evil.example</evil:AttributeValue></saml:Attribute>"
+    ))))
+    .expect("a foreign value beside a real one");
+    assert_eq!(
+        inner[0].values,
+        vec![Value::Text("ada@globex.example".to_owned())],
+        "a foreign AttributeValue became one of this attribute's values"
+    );
+
+    // AND A FOREIGN STATEMENT WRAPPING A REAL ATTRIBUTE is not a statement: the elements inside
+    // it are conformant SAML, and what makes them somebody else's is their parent.
     let wrapped = read(&body(&format!(
-        "<evil:AttributeStatement xmlns:evil=\"urn:evil\">\
-         <saml:Attribute Name=\"{EMAIL}\">\
-         <saml:AttributeValue>attacker@evil.example</saml:AttributeValue></saml:Attribute>\
-         </evil:AttributeStatement>"
+        "<evil:AttributeStatement xmlns:evil=\"urn:evil\">{}</evil:AttributeStatement>",
+        attribute(EMAIL, None, &["attacker@evil.example"])
     )))
     .expect("a foreign statement");
     assert!(
         wrapped.is_empty(),
         "an attribute inside a foreign AttributeStatement was collected"
+    );
+
+    // A FOREIGN `EncryptedAttribute` IS NOT ONE EITHER, so the refusal above cannot be triggered
+    // by anything that merely spells the name.
+    let foreign_encrypted = read(&body(&format!(
+        "<saml:AttributeStatement xmlns:evil=\"urn:evil\">{}\
+         <evil:EncryptedAttribute/></saml:AttributeStatement>",
+        attribute(EMAIL, None, &["ada@globex.example"])
+    )))
+    .expect("a foreign EncryptedAttribute is not this assertion's");
+    assert_eq!(foreign_encrypted.len(), 1);
+}
+
+#[test]
+fn a_verified_response_is_not_an_assertion_and_answering_nothing_would_be_worse() {
+    // `verify` TAKES THE ELEMENT TO READ AS AN ARGUMENT and hands back whatever was signed, so a
+    // caller may hold a verified `samlp:Response` -- and in the Response-only-signed profile
+    // Okta and ADFS emit, that is the ONLY value obtainable, because assertion-level verify
+    // answers `SignatureMissing`.
+    //
+    // A `Response`'s direct children hold no `AttributeStatement`, so without the guard the
+    // answer was an empty list -- which THIS MODULE DOCUMENTS AS A REAL ANSWER meaning "the
+    // provider sent none". A mapping that clears traits on absence would wipe a department and a
+    // group list on a document that verified, and nothing would say why.
+    let key = XmlTestKey::generate();
+    let inner = ironauth_saml::test_util::signed_response_with(
+        &key,
+        "_assertion",
+        &body(&statement(&attribute(EMAIL, None, &["ada@globex.example"]))),
+    );
+    let both = ironauth_saml::test_util::sign_response(&key, &inner);
+    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
+
+    let response = verify(
+        both.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        PROTOCOL_NS,
+        "Response",
+    )
+    .expect("the Response is signed and verifies");
+    assert_eq!(
+        attributes(&response),
+        Err(Unreadable::NotAnAssertion),
+        "a verified Response answered 'this person has no attributes'"
+    );
+
+    // AND THE ASSERTION INSIDE THE SAME DOCUMENT READS, which is what shows the refusal is about
+    // the element handed in and not about the document.
+    let assertion = verify(
+        both.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        ASSERTION_NS,
+        "Assertion",
+    )
+    .expect("the assertion is signed too");
+    let found = attributes(&assertion).expect("the assertion reads");
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].values,
+        vec![Value::Text("ada@globex.example".to_owned())]
     );
 }

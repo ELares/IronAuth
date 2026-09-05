@@ -15,15 +15,21 @@
 //! relying party, and a service provider that refused every assertion carrying an attribute it
 //! had no mapping for would break on the day somebody edited a profile schema.
 //!
-//! So this reads what is there, refuses what is AMBIGUOUS, and leaves what to do with it to the
-//! mapping.
+//! So this reads what is there, refuses what is AMBIGUOUS or UNREADABLE, and leaves what to do
+//! with the rest to the mapping.
 //!
 //! # And why it answers Rust rather than JSON
 //!
-//! The mapping this feeds is `ironauth-connector`'s, which resolves dotted paths through
-//! `serde_json` maps. Projecting into that shape is a caller's job on purpose: this crate is the
-//! choke point through which hostile SAML XML enters, and its dependency list is part of the
-//! argument. A JSON library here would be a second parser reachable from the same bytes.
+//! The mapping this feeds is `ironauth-connector`'s, which resolves paths through `serde_json`
+//! maps. Projecting into that shape is a caller's job on purpose: this crate is the choke point
+//! through which hostile SAML XML enters, and its dependency list is part of the argument. A
+//! JSON library here would be a second parser reachable from the same bytes.
+//!
+//! A SAML attribute `Name` IS A URI AND CONTAINS DOTS -- ADFS and Entra send
+//! `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` -- and the mapper's
+//! path resolver used to split on `.` unconditionally, so it looked up a key called
+//! `http://schemas` and no real SAML attribute was addressable at all. It now tries the whole
+//! path as a literal key first, which is what makes a mapping over these names reachable.
 
 use crate::verify::VerifiedAssertion;
 
@@ -39,7 +45,7 @@ pub struct Attribute {
     ///
     /// NOT DEFAULTED to `unspecified`. SAML says an absent `NameFormat` MEANS unspecified, and
     /// filling it in here would make "the provider said unspecified" and "the provider said
-    /// nothing" the same answer to a caller trying to tell one Entra tenant's configuration from
+    /// nothing" the same answer to a caller trying to tell one tenant's configuration from
     /// another's. A caller that wants the default can apply it; one that wants to know cannot
     /// recover it.
     pub name_format: Option<String>,
@@ -56,95 +62,202 @@ pub struct Attribute {
 pub enum Value {
     /// Text, which is what every mappable attribute is.
     Text(String),
-    /// A value carrying ELEMENT children, which this does not flatten.
+    /// A value that says the person has none of this attribute.
+    ///
+    /// COVERS BOTH `<AttributeValue/>` AND `<AttributeValue xsi:nil="true"/>`, and does NOT
+    /// distinguish them -- reading `xsi:nil` needs the attribute's NAMESPACE resolved, and this
+    /// crate deliberately exposes attributes by their literal spelling only, because a prefix is
+    /// not an identity and resolving one for attributes is a surface it has not needed. Said out
+    /// loud rather than left for a caller to discover, since SAML Core 2.7.3.2 does treat the
+    /// two as different.
+    ///
+    /// SEPARATE FROM `Text(String::new())` BECAUSE A MAPPING TREATS THEM DIFFERENTLY. The
+    /// connector's rules take the first source that resolves to a non-null value, so an empty
+    /// STRING wins a fallback that an absent value would lose -- and a person whose department
+    /// was cleared would get `""` written into their profile instead of the next source's value,
+    /// or instead of nothing.
+    Empty,
+    /// A value carrying ELEMENT children, with their local names in document order.
     ///
     /// `AttributeValue` is `xs:anyType`, so a conformant assertion may put a whole XML subtree
-    /// in one -- Entra does it for some claim types, and `saml:NameID` inside an
-    /// `AttributeValue` is common enough to have its own interoperability notes.
+    /// in one. `saml:NameID` inside an `AttributeValue` is the case with published
+    /// interoperability notes -- it is how a SAML attribute carries a subject reference.
     ///
     /// FLATTENING IT TO TEXT WOULD INVENT A VALUE. Concatenating the descendants of
     /// `<AttributeValue><a>x</a><b>y</b></AttributeValue>` gives `"xy"`, which no other reader
-    /// produces and which a mapping would then write into somebody's profile. So the shape is
-    /// reported and the text is not, and a caller that has no use for it skips the value rather
-    /// than being handed a fiction.
-    Structured,
+    /// produces and which a mapping would then write into somebody's profile. So the SHAPE is
+    /// reported instead: the child names let a caller log what it declined to map, and decide
+    /// whether the attribute is one it should be handling at all, rather than being handed
+    /// either a fiction or a silence.
+    Structured(Vec<String>),
 }
 
 /// Why an `AttributeStatement` could not be read.
-///
-/// # One variant, because there is one thing to do about it
-///
-/// Every case here is an assertion that says two contradictory things about one attribute name.
-/// An operator's fix is the same each time -- their identity provider is emitting a shape this
-/// server will not guess at -- and naming which of them occurred would describe the attacker's
-/// probe rather than the operator's problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ambiguous {
-    /// The attribute name the ambiguity is about, or `None` when an `Attribute` carried no
-    /// `Name` at all.
-    pub name: Option<String>,
+pub enum Unreadable {
+    /// The element handed in is not a `saml:Assertion`.
+    ///
+    /// [`crate::verify`] takes the element to read as an ARGUMENT and hands back whatever was
+    /// signed, so a caller may hold a verified `samlp:Response` -- which is the ONLY value
+    /// obtainable from the Response-only-signed profile Okta and ADFS emit. Its direct children
+    /// hold no `AttributeStatement`, so without this guard the answer was an empty list.
+    ///
+    /// AND AN EMPTY LIST IS A REAL ANSWER HERE, which is what makes the silence dangerous: this
+    /// module documents "no attributes" as "the identity provider sent none", so a mapping that
+    /// clears traits on absence would have wiped a department and a group list on a document
+    /// that verified. [`crate::check`] guards its own input for the same reason.
+    NotAnAssertion,
+    /// An `Attribute` with no `Name`, or with an empty one.
+    ///
+    /// `Name` is required and is what a mapping keys on, so an attribute without a usable one
+    /// could never be reached. Dropping it silently would hide a misconfiguration behind a trait
+    /// that is simply never populated -- and send the operator to look at their mapping, which
+    /// is fine, rather than at their identity provider, which is where the fault is.
+    ///
+    /// THE EMPTY STRING IS THE DEGENERATE INPUT the presence check alone does not catch, and a
+    /// mapping keyed on `""` is not one anybody wrote on purpose.
+    NamelessAttribute,
+    /// Two `Attribute`s that name the same thing.
+    ///
+    /// SAML Core 2.7.3.1 identifies an attribute by its `Name` AND its `NameFormat`, so this
+    /// compares BOTH: same `Name` under two different formats is two attributes, not a
+    /// contradiction, and refusing that pair would refuse a conformant assertion. Under one
+    /// format, a second element is a second CLAIM -- and taking either is choosing which half to
+    /// believe, which somebody who can append chooses for the reader.
+    Duplicate {
+        /// The `Name` both carried.
+        name: String,
+        /// The `NameFormat` both carried, if any.
+        name_format: Option<String>,
+    },
+    /// The statement carries a `saml:EncryptedAttribute`.
+    ///
+    /// It is the SIBLING of `saml:Attribute` in an `AttributeStatement`, and this module reads
+    /// only the plaintext one. Reporting it rather than skipping it is the point: an encrypted
+    /// attribute silently dropped is an attribute an operator configured, that the identity
+    /// provider sent, and that simply never arrives -- and if it carries a `Name` this assertion
+    /// ALSO sends in the clear, the duplicate rule above never sees the pair.
+    ///
+    /// This is a refusal rather than a decryption because decrypting needs the connection's
+    /// private key, which is the ACS endpoint's to hold, not this function's.
+    EncryptedAttribute,
 }
 
-impl core::fmt::Display for Ambiguous {
+impl core::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match &self.name {
-            Some(name) => write!(f, "the assertion says two different things about {name:?}"),
-            None => f.write_str("the assertion carries an attribute with no name"),
+        match self {
+            Self::NotAnAssertion => {
+                f.write_str("the signed element handed in is not a SAML assertion")
+            }
+            Self::NamelessAttribute => {
+                f.write_str("the assertion carries an attribute with no usable name")
+            }
+            Self::Duplicate { name, name_format } => match name_format {
+                Some(format) => write!(
+                    f,
+                    "the assertion says two different things about {name:?} in format {format:?}"
+                ),
+                None => write!(f, "the assertion says two different things about {name:?}"),
+            },
+            Self::EncryptedAttribute => f.write_str(
+                "the assertion carries an encrypted attribute, which this server does not decrypt",
+            ),
         }
     }
 }
 
-impl core::error::Error for Ambiguous {}
+impl core::error::Error for Unreadable {}
 
 /// Every attribute in the assertion's `AttributeStatement`s, in document order.
 ///
 /// # What is refused, and what is merely absent
 ///
-/// - An `Attribute` with no `Name` is REFUSED. `Name` is required, and an attribute nothing can
-///   key on is one a mapping could never reach -- so silently dropping it would hide a
-///   misconfiguration behind a trait that is simply never populated.
-/// - TWO `Attribute`s WITH THE SAME `Name` are REFUSED, the same rule this crate applies
-///   everywhere: taking either is choosing which half of a contradiction to believe, and
-///   somebody who can append chooses for the reader. SAML Core 2.7.3.1 says an attribute's
-///   values belong in ONE `Attribute` element, so a second one is not a longer list, it is a
-///   second claim.
-/// - NO `AttributeStatement` AT ALL is not an error and answers an empty list. An authentication
-///   assertion that carries only an `AuthnStatement` is ordinary, and it is what an identity
-///   provider sends when a relying party asked for nothing.
+/// Each refusal is an [`Unreadable`] variant with its own reason; see that type. What is NOT an
+/// error:
+///
+/// - NO `AttributeStatement` AT ALL answers an empty list. An authentication assertion carrying
+///   only an `AuthnStatement` is ordinary, and it is what an identity provider sends when a
+///   relying party asked for nothing.
+/// - An `Attribute` with no VALUES answers an attribute with an empty value list, for the reason
+///   [`Attribute::values`] gives.
+/// - An `AttributeValue` this module cannot turn into text answers [`Value::Structured`] rather
+///   than failing the whole assertion.
 ///
 /// # Errors
 ///
-/// [`Ambiguous`], naming the attribute if it had a name.
-pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Ambiguous> {
+/// [`Unreadable`].
+pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Unreadable> {
+    // IT MUST BE AN ASSERTION, resolved rather than spelled, and [`crate::check`] guards its own
+    // input with the identical line for the identical reason: `verify` takes the element to read
+    // as an argument, so what arrives here is not necessarily an assertion -- and answering an
+    // empty list for a `samlp:Response` is a silence this module's own semantics read as "the
+    // identity provider sent no attributes".
+    if !assertion.is(ASSERTION, "Assertion") {
+        return Err(Unreadable::NotAnAssertion);
+    }
+
     let mut out: Vec<Attribute> = Vec::new();
-    // DIRECT CHILDREN, at both levels. `saml:Advice` carries whole assertions and an
-    // `AttributeValue` may itself contain an `AttributeStatement`, so a descendant search would
-    // collect somebody else's attributes -- which are inside this signature just as much as the
-    // real ones. The condition layer learned this the expensive way.
+    // DIRECT CHILDREN, at both levels. `AttributeValue` is `xs:anyType`, so an assertion may
+    // legitimately carry a whole `AttributeStatement` inside one -- and it is inside this
+    // signature just as much as the real one, so a descendant search would collect somebody
+    // else's attributes. The condition layer learned this the expensive way.
+    //
+    // (`saml:Advice` would be the other route to a nested statement, and `verify` closes it
+    // upstream by refusing a document with two `saml:Assertion` candidates. Named as unreachable
+    // rather than offered as the reason, because a guard justified by an example no fixture can
+    // build is a guard nobody will keep.)
     for statement in assertion.children(ASSERTION, "AttributeStatement") {
+        // AN ENCRYPTED ATTRIBUTE IS THE SIBLING OF A PLAINTEXT ONE and this reads only the
+        // second, so the presence of one has to be reported rather than stepped over.
+        if !statement
+            .children(ASSERTION, "EncryptedAttribute")
+            .is_empty()
+        {
+            return Err(Unreadable::EncryptedAttribute);
+        }
         for attribute in statement.children(ASSERTION, "Attribute") {
-            let Some(name) = attribute.attribute("Name") else {
-                return Err(Ambiguous { name: None });
-            };
-            if out.iter().any(|seen| seen.name == name) {
-                return Err(Ambiguous {
-                    name: Some(name.to_owned()),
+            let name = attribute.attribute("Name").unwrap_or_default();
+            if name.is_empty() {
+                return Err(Unreadable::NamelessAttribute);
+            }
+            let name_format = attribute.attribute("NameFormat").map(ToOwned::to_owned);
+            // ACROSS THE WHOLE ASSERTION, not per statement: an identity provider assembling a
+            // response from two sources emits two statements, and that is exactly where a
+            // collision arrives.
+            if out
+                .iter()
+                .any(|seen| seen.name == name && seen.name_format == name_format)
+            {
+                return Err(Unreadable::Duplicate {
+                    name: name.to_owned(),
+                    name_format,
                 });
             }
             let values = attribute
                 .children(ASSERTION, "AttributeValue")
                 .iter()
-                .map(|value| match value.text_simple() {
-                    Some(text) => Value::Text(text),
-                    None => Value::Structured,
-                })
+                .map(value_of)
                 .collect();
             out.push(Attribute {
                 name: name.to_owned(),
-                name_format: attribute.attribute("NameFormat").map(ToOwned::to_owned),
+                name_format,
                 values,
             });
         }
     }
     Ok(out)
+}
+
+/// One `AttributeValue`, as text, emptiness, or a shape.
+fn value_of(value: &crate::verify::SignedElement<'_>) -> Value {
+    let children = value.element_children();
+    if !children.is_empty() {
+        return Value::Structured(children.into_iter().map(|(_, local)| local).collect());
+    }
+    match value.text_simple() {
+        Some(text) if !text.is_empty() => Value::Text(text),
+        // No text and no elements. `<AttributeValue/>`, `<AttributeValue></AttributeValue>` and
+        // `<AttributeValue xsi:nil="true"/>` all land here; see [`Value::Empty`].
+        _ => Value::Empty,
+    }
 }
