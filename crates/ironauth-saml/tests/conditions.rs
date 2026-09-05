@@ -23,9 +23,11 @@
 //! Needs no database.
 
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
-use ironauth_saml::conditions::{ConditionError, Expectations, check};
+use ironauth_saml::conditions::{Accepted, ConditionError, Expectations, check};
 use ironauth_saml::{ASSERTION_NS, Limits, TrustAnchor, verify};
 
+const ISSUER: &str = "urn:idp";
+const BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const AUDIENCE: &str = "https://ironauth.example/saml/globex";
 const RECIPIENT: &str = "https://ironauth.example/saml/acs/globex";
 const REQUEST: &str = "_req_12345";
@@ -34,31 +36,89 @@ const NOW: i64 = 1_767_225_600;
 
 /// The children of an assertion, composed so one test can vary one value.
 struct Body {
-    audience: Option<&'static str>,
+    issuer: Option<&'static str>,
+    /// Each entry is one `AudienceRestriction`, holding the `Audience` children named.
+    restrictions: Vec<Vec<&'static str>>,
+    /// A condition element beyond the three this server evaluates.
+    extra_condition: Option<&'static str>,
     not_before: Option<&'static str>,
     not_on_or_after: Option<&'static str>,
     in_response_to: Option<&'static str>,
     recipient: Option<&'static str>,
+    /// The bearer confirmation's own expiry, which the profile requires.
+    confirmation_expiry: Option<&'static str>,
+    method: Option<&'static str>,
     name_id: Option<&'static str>,
+    /// A `NameID` inside the confirmation, naming who may PRESENT the assertion.
+    confirmation_name_id: Option<&'static str>,
+    /// A second bearer confirmation, for the ambiguity cases.
+    second_confirmation: bool,
+    /// A `ProxyRestriction` naming this deployment, which is not an address to it.
+    proxy_audience: Option<&'static str>,
 }
 
 impl Default for Body {
     /// A body that satisfies every condition. Each test changes exactly one field.
     fn default() -> Self {
         Self {
-            audience: Some(AUDIENCE),
+            issuer: Some(ISSUER),
+            restrictions: vec![vec![AUDIENCE]],
+            extra_condition: None,
             not_before: Some("2025-12-31T23:55:00Z"),
             not_on_or_after: Some("2026-01-01T00:05:00Z"),
             in_response_to: Some(REQUEST),
             recipient: Some(RECIPIENT),
+            confirmation_expiry: Some("2026-01-01T00:05:00Z"),
+            method: Some(BEARER),
             name_id: Some("ada@globex.example"),
+            confirmation_name_id: None,
+            second_confirmation: false,
+            proxy_audience: None,
         }
     }
 }
 
 impl Body {
+    fn confirmation(&self, in_response_to: Option<&str>, recipient: Option<&str>) -> String {
+        let mut out = String::from("<saml:SubjectConfirmation");
+        if let Some(method) = self.method {
+            out.push_str(" Method=\"");
+            out.push_str(method);
+            out.push('"');
+        }
+        out.push('>');
+        if let Some(who) = self.confirmation_name_id {
+            out.push_str("<saml:NameID>");
+            out.push_str(who);
+            out.push_str("</saml:NameID>");
+        }
+        out.push_str("<saml:SubjectConfirmationData");
+        if let Some(value) = in_response_to {
+            out.push_str(" InResponseTo=\"");
+            out.push_str(value);
+            out.push('"');
+        }
+        if let Some(value) = recipient {
+            out.push_str(" Recipient=\"");
+            out.push_str(value);
+            out.push('"');
+        }
+        if let Some(value) = self.confirmation_expiry {
+            out.push_str(" NotOnOrAfter=\"");
+            out.push_str(value);
+            out.push('"');
+        }
+        out.push_str("/></saml:SubjectConfirmation>");
+        out
+    }
+
     fn xml(&self) -> String {
-        let mut out = String::from("<saml:Issuer>urn:idp</saml:Issuer>");
+        let mut out = String::new();
+        if let Some(issuer) = self.issuer {
+            out.push_str("<saml:Issuer>");
+            out.push_str(issuer);
+            out.push_str("</saml:Issuer>");
+        }
         out.push_str("<saml:Subject>");
         if let Some(name_id) = self.name_id {
             out.push_str(
@@ -67,19 +127,11 @@ impl Body {
             out.push_str(name_id);
             out.push_str("</saml:NameID>");
         }
-        out.push_str("<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">");
-        out.push_str("<saml:SubjectConfirmationData");
-        if let Some(value) = self.in_response_to {
-            out.push_str(" InResponseTo=\"");
-            out.push_str(value);
-            out.push('"');
+        out.push_str(&self.confirmation(self.in_response_to, self.recipient));
+        if self.second_confirmation {
+            out.push_str(&self.confirmation(Some("_req_somebody_elses"), Some(RECIPIENT)));
         }
-        if let Some(value) = self.recipient {
-            out.push_str(" Recipient=\"");
-            out.push_str(value);
-            out.push('"');
-        }
-        out.push_str("/></saml:SubjectConfirmation></saml:Subject>");
+        out.push_str("</saml:Subject>");
         out.push_str("<saml:Conditions");
         if let Some(value) = self.not_before {
             out.push_str(" NotBefore=\"");
@@ -92,10 +144,22 @@ impl Body {
             out.push('"');
         }
         out.push('>');
-        if let Some(audience) = self.audience {
-            out.push_str("<saml:AudienceRestriction><saml:Audience>");
+        for restriction in &self.restrictions {
+            out.push_str("<saml:AudienceRestriction>");
+            for audience in restriction {
+                out.push_str("<saml:Audience>");
+                out.push_str(audience);
+                out.push_str("</saml:Audience>");
+            }
+            out.push_str("</saml:AudienceRestriction>");
+        }
+        if let Some(audience) = self.proxy_audience {
+            out.push_str("<saml:ProxyRestriction Count=\"1\"><saml:Audience>");
             out.push_str(audience);
-            out.push_str("</saml:Audience></saml:AudienceRestriction>");
+            out.push_str("</saml:Audience></saml:ProxyRestriction>");
+        }
+        if let Some(extra) = self.extra_condition {
+            out.push_str(extra);
         }
         out.push_str("</saml:Conditions>");
         out
@@ -104,6 +168,7 @@ impl Body {
 
 fn expectations() -> Expectations<'static> {
     Expectations {
+        issuer: ISSUER,
         audience: AUDIENCE,
         recipient: RECIPIENT,
         in_response_to: Some(REQUEST),
@@ -122,8 +187,33 @@ fn decide(
     expectations: &Expectations<'_>,
     now: i64,
 ) -> Result<String, ConditionError> {
+    decide_raw(&body.xml(), expectations, now)
+}
+
+/// Sign `body` and hand back the whole decision, for the tests that read more than the name.
+fn accept(body: &Body, expectations: &Expectations<'_>, now: i64) -> Accepted {
     let key = XmlTestKey::generate();
     let document = ironauth_saml::test_util::signed_response_with(&key, "_assertion", &body.xml());
+    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
+    let assertion = verify(
+        document.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        ASSERTION_NS,
+        "Assertion",
+    )
+    .expect("the fixture's signature must verify, or this test measures nothing");
+    check(&assertion, expectations, now).expect("accepted")
+}
+
+/// Sign arbitrary assertion children and run the conditions, for shapes [`Body`] cannot compose.
+fn decide_raw(
+    children: &str,
+    expectations: &Expectations<'_>,
+    now: i64,
+) -> Result<String, ConditionError> {
+    let key = XmlTestKey::generate();
+    let document = ironauth_saml::test_util::signed_response_with(&key, "_assertion", children);
     let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
     let assertion = verify(
         document.as_bytes(),
@@ -150,7 +240,7 @@ fn an_assertion_for_another_service_provider_is_refused() {
     // provider really minted, for somebody else. Without the audience check, every relying party
     // that customer uses can replay each other's assertions here.
     let body = Body {
-        audience: Some("https://someone-else.example/saml/metadata"),
+        restrictions: vec![vec!["https://someone-else.example/saml/metadata"]],
         ..Body::default()
     };
     let refused = decide(&body, &expectations(), NOW);
@@ -166,7 +256,7 @@ fn an_assertion_restricted_to_nobody_is_refused() {
     // audience and compares it when present accepts an assertion carrying none. An assertion
     // that restricts itself to nobody is one every relying party would take.
     let body = Body {
-        audience: None,
+        restrictions: Vec::new(),
         ..Body::default()
     };
     let refused = decide(&body, &expectations(), NOW);
@@ -223,7 +313,7 @@ fn an_assertion_with_no_expiry_is_refused_rather_than_treated_as_open() {
     ] {
         let refused = decide(&body, &expectations(), NOW);
         assert!(
-            matches!(refused, Err(ConditionError::Expired)),
+            matches!(refused, Err(ConditionError::MissingBound { .. })),
             "an assertion missing a time bound was accepted: {refused:?}"
         );
     }
@@ -251,6 +341,44 @@ fn the_clock_skew_is_applied_at_both_edges_and_is_not_unbounded() {
     assert!(
         matches!(decide(&body, &strict, NOW), Err(ConditionError::Expired)),
         "a five-second skew admitted a twenty-second difference"
+    );
+
+    // NOW THE OTHER EDGE, which is the half the name claimed and no fixture reached: every window
+    // in this suite ended at least 120 seconds after `NOW`, so the expiry-side skew term could be
+    // deleted, or its sign flipped, and nothing would notice. Here the window closed twenty
+    // seconds AGO.
+    let just_closed = Body {
+        not_before: Some("2025-12-31T23:55:00Z"),
+        not_on_or_after: Some("2025-12-31T23:59:40Z"),
+        ..Body::default()
+    };
+    assert!(
+        decide(&just_closed, &expectations(), NOW).is_ok(),
+        "a sign-in twenty seconds past the window was refused with a thirty-second skew"
+    );
+    assert!(
+        matches!(
+            decide(&just_closed, &strict, NOW),
+            Err(ConditionError::Expired)
+        ),
+        "a five-second skew admitted a window that closed twenty seconds ago"
+    );
+
+    // AND A NEGATIVE SKEW IS ZERO, NOT A NARROWING. `clock_skew_secs` is a public field with no
+    // validator, and without the `.max(0)` a negative value would subtract from both edges --
+    // refusing an assertion that became valid at this very instant.
+    let backwards = Expectations {
+        clock_skew_secs: -30,
+        ..expectations()
+    };
+    let exactly_now = Body {
+        not_before: Some("2026-01-01T00:00:00Z"),
+        not_on_or_after: Some("2026-01-01T00:05:00Z"),
+        ..Body::default()
+    };
+    assert!(
+        decide(&exactly_now, &backwards, NOW).is_ok(),
+        "a negative skew narrowed the window instead of being read as none at all"
     );
 }
 
@@ -372,23 +500,12 @@ fn the_accepted_expiry_is_the_earlier_of_the_two_bounds() {
     // long-lived assertion beyond what this deployment actually accepted, and recording the
     // ceiling alone would forget a short one too late. The earlier of the two is what matches
     // the decision that was made.
-    let key = XmlTestKey::generate();
     let body = Body {
         not_before: Some("2026-01-01T00:00:00Z"),
         not_on_or_after: Some("2026-01-01T00:02:00Z"),
         ..Body::default()
     };
-    let document = ironauth_saml::test_util::signed_response_with(&key, "_assertion", &body.xml());
-    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
-    let assertion = verify(
-        document.as_bytes(),
-        &Limits::default(),
-        &anchors,
-        ASSERTION_NS,
-        "Assertion",
-    )
-    .expect("verifies");
-    let accepted = check(&assertion, &expectations(), NOW).expect("accepted");
+    let accepted = accept(&body, &expectations(), NOW);
     // The assertion's own two-minute window is shorter than the ten-minute ceiling, so it wins.
     assert_eq!(accepted.expires_at_unix_secs, 1_767_225_720);
     assert_eq!(accepted.assertion_id, "_assertion");
@@ -396,26 +513,6 @@ fn the_accepted_expiry_is_the_earlier_of_the_two_bounds() {
         accepted.name_id_format.as_deref(),
         Some("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
     );
-}
-
-/// Sign arbitrary assertion children and run the conditions, for shapes [`Body`] cannot compose.
-fn decide_raw(
-    children: &str,
-    expectations: &Expectations<'_>,
-    now: i64,
-) -> Result<String, ConditionError> {
-    let key = XmlTestKey::generate();
-    let document = ironauth_saml::test_util::signed_response_with(&key, "_assertion", children);
-    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
-    let assertion = verify(
-        document.as_bytes(),
-        &Limits::default(),
-        &anchors,
-        ASSERTION_NS,
-        "Assertion",
-    )
-    .expect("the fixture's signature must verify, or this test measures nothing");
-    check(&assertion, expectations, now).map(|accepted| accepted.name_id)
 }
 
 #[test]
@@ -436,7 +533,8 @@ fn a_present_but_empty_subject_is_refused_as_firmly_as_a_missing_one() {
             REQUEST,
             "\" Recipient=\"",
             RECIPIENT,
-            "\"/></saml:SubjectConfirmation></saml:Subject>",
+            "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"",
+            "/></saml:SubjectConfirmation></saml:Subject>",
             "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
             "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
             "<saml:AudienceRestriction><saml:Audience>",
@@ -457,10 +555,13 @@ fn two_conditions_elements_make_the_window_unreadable_rather_than_letting_one_wi
     // THE AMBIGUITY RULE, on the values that decide validity. Two `Conditions` inside one signed
     // assertion verify like any other document, and a reader that took the first would be
     // choosing which half of a contradiction to believe -- so an attacker who can influence the
-    // document chooses for it. Here the first window is live and the second is a year old.
+    // document chooses for it.
     //
-    // The refusal is `Expired` rather than `Malformed` because the read of the bound is what came
-    // back empty, and the caller cannot be told the window is fine when nothing could read it.
+    // BOTH WINDOWS ARE LIVE, and that is deliberate. An earlier version made the second a year
+    // old, so it would have passed against a reader that took EITHER one and simply found the
+    // older expired -- and `collect` walks with a stack, so "the first" is not even document
+    // order. With both live, only the ambiguity itself can refuse it, and the refusal is
+    // `Malformed` for the same reason it is everywhere else in this module.
     let children = [
         "<saml:Issuer>urn:idp</saml:Issuer>",
         "<saml:Subject><saml:NameID>ada@globex.example</saml:NameID>",
@@ -469,7 +570,7 @@ fn two_conditions_elements_make_the_window_unreadable_rather_than_letting_one_wi
         REQUEST,
         "\" Recipient=\"",
         RECIPIENT,
-        "\"/></saml:SubjectConfirmation></saml:Subject>",
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/></saml:SubjectConfirmation></saml:Subject>",
         // LIVE.
         "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
         "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
@@ -483,18 +584,331 @@ fn two_conditions_elements_make_the_window_unreadable_rather_than_letting_one_wi
     .concat();
     let refused = decide_raw(&children, &expectations(), NOW);
     assert!(
-        matches!(refused, Err(ConditionError::Expired)),
+        matches!(refused, Err(ConditionError::Malformed)),
         "an assertion carrying two contradicting windows had one of them believed: {refused:?}"
     );
 }
 
 #[test]
-fn two_subject_confirmations_make_the_correlation_unreadable() {
-    // The same rule on the value that decides WHICH SIGN-IN this answers. One confirmation names
-    // the request this deployment issued and the other names somebody else's; taking the first
-    // would let an attacker append a confirmation and have the genuine one believed, or prepend
-    // one and have theirs believed, depending on which end the reader started from.
-    let children = [
+fn a_proxy_restriction_naming_us_is_not_an_address_to_us() {
+    // THE ROUTE-AROUND THE FIRST VERSION HAD. `saml:Audience` is a child of `AudienceRestriction`
+    // ("this assertion is addressed to you") AND of `ProxyRestriction` ("somebody else may
+    // re-assert this to you"). Same namespace, same local name, opposite meaning -- and the first
+    // version searched every descendant, so an assertion carrying no `AudienceRestriction` at all
+    // but a `ProxyRestriction` naming this deployment passed the audience check.
+    let body = Body {
+        restrictions: Vec::new(),
+        proxy_audience: Some(AUDIENCE),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongAudience { .. })),
+        "permission for somebody else to proxy this assertion was read as an address to us: \
+         {refused:?}"
+    );
+    // AND IT IS HARMLESS BESIDE A REAL RESTRICTION, which is what stops the fix from refusing a
+    // legitimate proxying assertion.
+    let both = Body {
+        proxy_audience: Some(AUDIENCE),
+        ..Body::default()
+    };
+    assert!(
+        decide(&both, &expectations(), NOW).is_ok(),
+        "a genuine assertion that also permits proxying was refused"
+    );
+}
+
+#[test]
+fn an_assertion_naming_several_audiences_is_accepted_and_every_restriction_must_hold() {
+    // SAML CORE 2.5.1.4. An `AudienceRestriction` may name several audiences and an assertion may
+    // carry several restrictions; the service provider must be named in EVERY restriction, and
+    // within one it is enough to be named at all. The first version demanded exactly one
+    // `Audience` in the whole assertion, which refused the ordinary case where a relying party
+    // has more than one entity id -- and reported it as "the assertion named no audience".
+    let several = Body {
+        restrictions: vec![vec!["https://other.example/sp", AUDIENCE]],
+        ..Body::default()
+    };
+    assert!(
+        decide(&several, &expectations(), NOW).is_ok(),
+        "an assertion naming us among several audiences was refused"
+    );
+
+    // TWO RESTRICTIONS INTERSECT. Named in the first and not the second is not named.
+    let intersecting = Body {
+        restrictions: vec![vec![AUDIENCE], vec!["https://other.example/sp"]],
+        ..Body::default()
+    };
+    let refused = decide(&intersecting, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongAudience { .. })),
+        "a second restriction that excludes us was ignored: {refused:?}"
+    );
+}
+
+#[test]
+fn a_condition_this_server_cannot_evaluate_is_a_refusal() {
+    // SAML CORE 2.5 IS EXPLICIT: a service provider that cannot evaluate a `Condition` MUST treat
+    // the assertion as invalid. The whole point of the element is that an identity provider can
+    // add a restriction and rely on it being honoured; ignoring one turns every future
+    // restriction into a no-op.
+    let body = Body {
+        extra_condition: Some("<saml:Condition/>"),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::UnsupportedCondition { .. })),
+        "a condition this server cannot evaluate was ignored: {refused:?}"
+    );
+    // AND THE ONES IT CAN ARE NOT REFUSED, or the check would reject every ordinary assertion.
+    let one_time = Body {
+        extra_condition: Some("<saml:OneTimeUse/>"),
+        ..Body::default()
+    };
+    assert!(
+        decide(&one_time, &expectations(), NOW).is_ok(),
+        "OneTimeUse, which this server evaluates by remembering the assertion, was refused"
+    );
+}
+
+#[test]
+fn an_assertion_from_another_identity_provider_is_refused() {
+    // A response is resolved by the URL it arrived at, so the `Issuer` is what ties the
+    // assertion's own claim of authorship to the connection whose keys verified it. The first
+    // version documented this as "a check the caller makes" and gave `Expectations` no field to
+    // make it with, which is a control that exists only in prose.
+    let body = Body {
+        issuer: Some("urn:somebody-else"),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongIssuer { .. })),
+        "an assertion claiming another identity provider was accepted: {refused:?}"
+    );
+    let none = Body {
+        issuer: None,
+        ..Body::default()
+    };
+    assert!(
+        matches!(
+            decide(&none, &expectations(), NOW),
+            Err(ConditionError::WrongIssuer { found: None })
+        ),
+        "an assertion claiming no author was accepted"
+    );
+}
+
+#[test]
+fn a_missing_recipient_is_a_refusal_and_not_a_pass() {
+    // SAML PROFILES 4.1.4.2 REQUIRES IT on a bearer confirmation. The first version skipped the
+    // check when the attribute was absent, so the recipient-confusion defence disappeared exactly
+    // when an attacker omitted it -- which is the one thing they control.
+    let body = Body {
+        recipient: None,
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::WrongRecipient { found: None })),
+        "an assertion with no Recipient was accepted: {refused:?}"
+    );
+}
+
+#[test]
+fn the_confirmations_own_expiry_is_checked_and_is_a_different_bound() {
+    // THE BEARER PROFILE'S OWN WINDOW. It bounds how long the response may be IN FLIGHT, where
+    // the assertion's bounds how long the statement is true, and it is usually much shorter.
+    // The first version read it from nowhere, so a response captured hours after its confirmation
+    // expired was accepted as long as the assertion itself was still live.
+    let expired = Body {
+        not_before: Some("2025-12-31T23:55:00Z"),
+        not_on_or_after: Some("2026-01-01T00:05:00Z"),
+        confirmation_expiry: Some("2025-12-31T23:56:00Z"),
+        ..Body::default()
+    };
+    let refused = decide(&expired, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Expired)),
+        "a response whose confirmation had expired was accepted while the assertion was live: \
+         {refused:?}"
+    );
+    // Its ABSENCE is a refusal too, and it names itself:
+    // `a_missing_bound_says_which_one_rather_than_reporting_an_expiry` pins that, because the
+    // fault an operator has to fix there is a different one.
+}
+
+#[test]
+fn a_holder_of_key_confirmation_is_not_honoured_as_a_bearer_one() {
+    // A HOLDER-OF-KEY CONFIRMATION ASKS THE SERVICE PROVIDER TO PROVE POSSESSION OF A KEY, which
+    // is a different protocol. Reading whichever confirmation came first, without checking the
+    // `Method`, would honour it as a bearer one -- which is the entire difference between them.
+    let body = Body {
+        method: Some("urn:oasis:names:tc:SAML:2.0:cm:holder-of-key"),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "a holder-of-key confirmation was honoured as a bearer one: {refused:?}"
+    );
+}
+
+#[test]
+fn the_confirming_partys_name_is_not_the_signed_in_identity() {
+    // A `SubjectConfirmation` MAY CARRY ITS OWN `NameID`, naming who may PRESENT the assertion.
+    // The first version read `NameID` by descendant search, so with the Subject's own omitted the
+    // confirming party's would have become the signed-in identity -- and with both present the
+    // read was ambiguous, which at least refused, but for the wrong reason.
+    let body = Body {
+        name_id: None,
+        confirmation_name_id: Some("attacker@evil.example"),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "the confirming party became the signed-in identity: {refused:?}"
+    );
+    // AND WITH BOTH PRESENT THE SUBJECT'S OWN IS USED, which a descendant search could not have
+    // done at all.
+    let both = Body {
+        confirmation_name_id: Some("attacker@evil.example"),
+        ..Body::default()
+    };
+    assert_eq!(
+        decide(&both, &expectations(), NOW).expect("accepted"),
+        "ada@globex.example",
+        "the wrong NameID was read"
+    );
+}
+
+#[test]
+fn two_bearer_confirmations_are_refused_rather_than_letting_one_win() {
+    // One names the request this deployment issued and the other names somebody else's. Taking
+    // either is choosing which half of a contradiction to believe, and an attacker who can append
+    // or prepend chooses for the reader. BOTH ARE INDIVIDUALLY WELL-FORMED -- same recipient,
+    // same expiry -- so only the ambiguity itself can refuse this document.
+    let body = Body {
+        second_confirmation: true,
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "an assertion carrying two bearer confirmations had one of them believed: {refused:?}"
+    );
+}
+
+#[test]
+fn an_inverted_window_is_malformed_rather_than_expired() {
+    // A WINDOW THAT ENDS BEFORE IT STARTS is not a window, and nothing about a clock would make
+    // it valid. Reporting it as expired sends an operator to look at clock skew, which is the one
+    // thing that cannot be the problem.
+    let body = Body {
+        not_before: Some("2026-01-01T00:05:00Z"),
+        not_on_or_after: Some("2025-12-31T23:55:00Z"),
+        ..Body::default()
+    };
+    let refused = decide(&body, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "an inverted window was reported as an expiry: {refused:?}"
+    );
+}
+
+#[test]
+fn what_is_remembered_is_bounded_by_the_confirmations_expiry_too() {
+    // THE THIRD OPERAND OF THE SAME CEILING. `expires_at_unix_secs` is what a replay cache
+    // remembers the assertion until, and the bearer confirmation's own expiry is usually the
+    // soonest of the three -- so a value that ignored it would keep an assertion long past the
+    // point this server would still accept it, and evict on the identity provider's schedule
+    // rather than on the one that was actually enforced.
+    let body = Body {
+        not_before: Some("2026-01-01T00:00:00Z"),
+        not_on_or_after: Some("2026-01-01T00:05:00Z"),
+        confirmation_expiry: Some("2026-01-01T00:01:00Z"),
+        ..Body::default()
+    };
+    let accepted = accept(&body, &expectations(), NOW);
+    assert_eq!(
+        accepted.expires_at_unix_secs, 1_767_225_660,
+        "the confirmation's one-minute expiry is the earliest of the three and did not bound what \
+         is remembered"
+    );
+
+    // AND IT DOES NOT BIND WHEN IT IS THE LATEST, which is what keeps the assertion above from
+    // passing for the wrong reason: same document, confirmation expiry moved past both.
+    let later = Body {
+        confirmation_expiry: Some("2026-01-01T00:09:00Z"),
+        ..body
+    };
+    assert_eq!(
+        accept(&later, &expectations(), NOW).expires_at_unix_secs,
+        1_767_225_900,
+        "a confirmation expiry later than the assertion's shortened the window anyway"
+    );
+}
+
+#[test]
+fn a_ceiling_of_i64_max_does_not_overflow_the_expiry_it_stamps() {
+    // `max_age_secs` IS A PUBLIC FIELD WITH NO BOUND AND NO CONSTRUCTOR, so `i64::MAX` is the
+    // only way this API lets a caller say "impose no ceiling of my own". A plain `+` would panic
+    // here in debug and wrap to a large negative in release -- and the wrapped value would WIN
+    // the `min`, so an assertion this function had just ACCEPTED would be stamped as having
+    // expired in 1969, and a replay cache keyed on that value would forget it immediately.
+    let boundless = Expectations {
+        max_age_secs: i64::MAX,
+        ..expectations()
+    };
+    let accepted = accept(&Body::default(), &boundless, NOW);
+    assert_eq!(
+        accepted.expires_at_unix_secs, 1_767_225_900,
+        "an unbounded ceiling did not leave the assertion's own expiry as the answer"
+    );
+}
+
+#[test]
+fn a_missing_bound_says_which_one_rather_than_reporting_an_expiry() {
+    // WHAT THE OPERATOR HAS TO FIX IS DIFFERENT. "Expired" sends somebody to look at clock skew;
+    // what happened is that their identity provider does not emit the attribute. SAML Core
+    // 2.5.1.2 makes `NotBefore` OPTIONAL and this server requires it anyway, which is a
+    // deliberate tightening -- and one an operator can only act on if the refusal names it.
+    for (body, expected) in [
+        (
+            Body {
+                not_before: None,
+                ..Body::default()
+            },
+            "Conditions/@NotBefore",
+        ),
+        (
+            Body {
+                not_on_or_after: None,
+                ..Body::default()
+            },
+            "Conditions/@NotOnOrAfter",
+        ),
+        (
+            Body {
+                confirmation_expiry: None,
+                ..Body::default()
+            },
+            "SubjectConfirmationData/@NotOnOrAfter",
+        ),
+    ] {
+        let refused = decide(&body, &expectations(), NOW);
+        assert!(
+            matches!(&refused, Err(ConditionError::MissingBound { attribute }) if *attribute == expected),
+            "a missing {expected} was not reported as the missing bound it is: {refused:?}"
+        );
+    }
+
+    // AND AN ASSERTION WITH NO `Conditions` AT ALL names the element, not one of its attributes:
+    // it is not a window that could not be read, it is a statement that never named one.
+    let no_conditions = [
         "<saml:Issuer>urn:idp</saml:Issuer>",
         "<saml:Subject><saml:NameID>ada@globex.example</saml:NameID>",
         "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">",
@@ -502,20 +916,59 @@ fn two_subject_confirmations_make_the_correlation_unreadable() {
         REQUEST,
         "\" Recipient=\"",
         RECIPIENT,
-        "\"/></saml:SubjectConfirmation>",
-        "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">",
-        "<saml:SubjectConfirmationData InResponseTo=\"_req_somebody_elses\"/>",
+        "\" NotOnOrAfter=\"2026-01-01T00:05:00Z\"/>",
         "</saml:SubjectConfirmation></saml:Subject>",
-        "<saml:Conditions NotBefore=\"2025-12-31T23:55:00Z\" ",
-        "NotOnOrAfter=\"2026-01-01T00:05:00Z\">",
-        "<saml:AudienceRestriction><saml:Audience>",
-        AUDIENCE,
-        "</saml:Audience></saml:AudienceRestriction></saml:Conditions>",
     ]
     .concat();
-    let refused = decide_raw(&children, &expectations(), NOW);
+    let refused = decide_raw(&no_conditions, &expectations(), NOW);
     assert!(
-        matches!(refused, Err(ConditionError::UnknownRequest)),
-        "an assertion carrying two confirmations had one of them believed: {refused:?}"
+        matches!(
+            refused,
+            Err(ConditionError::MissingBound {
+                attribute: "Conditions element"
+            })
+        ),
+        "an assertion that never named a window was not reported as missing one: {refused:?}"
+    );
+}
+
+#[test]
+fn a_signed_element_that_is_not_an_assertion_is_refused_by_name_not_by_spelling() {
+    // `verify` TAKES THE ELEMENT TO READ AS AN ARGUMENT, so a caller can hand this function
+    // something that is not an assertion at all. The first version tested
+    // `name().ends_with("Assertion")`, which is a test on the QUALIFIED name -- so an element
+    // called `evil:NotAnAssertion`, in a namespace nobody trusts, answered to it.
+    //
+    // THE BODY IS A COMPLETE, VALID ONE. That is the point: with the suffix test in place this
+    // document passes every condition below the gate and is ACCEPTED, signing in
+    // ada@globex.example on the authority of an element this crate never agreed to read. A
+    // fixture with a broken body would refuse for the wrong reason and the bypass would stay
+    // invisible.
+    let key = XmlTestKey::generate();
+    let document = ironauth_saml::test_util::signed_element_with(
+        &key,
+        "evil:NotAnAssertion",
+        r#" xmlns:evil="urn:evil""#,
+        "_assertion",
+        &Body::default().xml(),
+    );
+    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
+    let signed = verify(
+        document.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        "urn:evil",
+        "NotAnAssertion",
+    )
+    .expect("the fixture must verify, or this test measures nothing");
+    assert!(
+        signed.name().ends_with("Assertion"),
+        "the fixture no longer expresses the bypass: its name must END WITH \"Assertion\" while \
+         resolving to something else, or the suffix test and the resolved test agree on it"
+    );
+    let refused = check(&signed, &expectations(), NOW);
+    assert!(
+        matches!(refused, Err(ConditionError::Malformed)),
+        "an element that merely ends with \"Assertion\" was read as one: {refused:?}"
     );
 }

@@ -142,12 +142,21 @@ fn anything_that_is_not_the_one_form_is_refused() {
 
 #[test]
 fn a_known_instant_matches_arithmetic_stated_here() {
-    // 2026-01-01T00:00:00Z. Derived rather than copied from the parser: 56 years from the epoch,
-    // of which 1972, 1976, ... 2024 are leap years -- 14 of them (every fourth from 1972 to 2024
-    // inclusive, with 2000 a leap year by the 400 rule and no century skipped in between).
-    let years = 2026 - 1970;
-    let leaps = 14;
-    let expected = (i64::from(years) * 365 + leaps) * DAY;
+    // 2026-01-01T00:00:00Z, derived here rather than copied from the parser -- and the LEAP
+    // COUNT is derived too. Writing `let leaps = 14;` would be the same defect one level down: a
+    // number this test asserts against, hand-computed by the same person who wrote the parser,
+    // agreeing with it for whatever reason they both got it wrong.
+    let years: i64 = 2026 - 1970;
+    let leaps: i64 = (1970..2026)
+        .filter(|year| (year % 4 == 0 && year % 100 != 0) || year % 400 == 0)
+        .count()
+        .try_into()
+        .expect("fifty-six years hold fewer leap days than an i64");
+    assert_eq!(
+        leaps, 14,
+        "the Gregorian rule as spelled here counts a different number"
+    );
+    let expected = (years * 365 + leaps) * DAY;
     assert_eq!(
         parse_utc("2026-01-01T00:00:00Z"),
         Some(expected),

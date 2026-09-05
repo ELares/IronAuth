@@ -75344,7 +75344,11 @@ pub struct SamlConnection {
     pub idp_sso_url: String,
     /// What this deployment calls itself to this identity provider. The `Audience` must equal it.
     pub sp_entity_id: String,
-    /// The assertion consumer service URL a response must name in `Destination` and `Recipient`.
+    /// The assertion consumer service URL a response must name in its bearer `Recipient`.
+    ///
+    /// `Recipient` RATHER THAN `Destination`: `Destination` sits on the Response, which Okta and
+    /// Entra leave unsigned by default, so it is attacker-mutable and reading it is a no-op
+    /// check. `Recipient` is inside the signed assertion.
     pub acs_url: String,
     /// Whether a response with no `InResponseTo` is accepted at all.
     pub allow_unsolicited: bool,

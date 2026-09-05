@@ -233,7 +233,7 @@ pub use encrypted::{
     decrypt_and_verify,
 };
 pub use instant::parse_utc;
-pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
+pub use verify::{SignedElement, TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.
 ///
@@ -454,16 +454,48 @@ pub mod test_util {
         id: &str,
         children: &str,
     ) -> String {
+        signed_element_with(key, "saml:Assertion", "", id, children)
+    }
+
+    /// [`signed_response_with`], for a root element that is NOT a `saml:Assertion`.
+    ///
+    /// `qualified` is written into the document verbatim and `declarations` is spliced into its
+    /// start tag, so a caller can sign an element in a namespace of its own invention.
+    ///
+    /// # Why a caller needs this
+    ///
+    /// `verify` takes the element to read as an ARGUMENT, so what it hands back is not
+    /// necessarily an assertion, and a condition check that tested the element's QUALIFIED name
+    /// -- `name().ends_with("Assertion")`, which is what an earlier version did -- answers true
+    /// for `evil:NotAnAssertion` in a namespace nobody trusts. That bypass is only testable if a
+    /// fixture can sign such an element, and signing an assertion in a loop cannot express it.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_element_with(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        qualified: &str,
+        declarations: &str,
+        id: &str,
+        children: &str,
+    ) -> String {
         let assertion = [
-            r#"<saml:Assertion ID=""#,
+            "<",
+            qualified,
+            declarations,
+            r#" ID=""#,
             id,
             r#"">"#,
             children,
-            "</saml:Assertion>",
+            "</",
+            qualified,
+            ">",
         ]
         .concat();
         let unsigned = wrap(&assertion);
-        let digest = digest_of(&unsigned, "saml:Assertion");
+        let digest = digest_of(&unsigned, qualified);
         let signed_info = [
             "<ds:SignedInfo>",
             r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
@@ -497,12 +529,25 @@ pub mod test_util {
     }
 
     /// Splice a signature into an assertion, immediately after its issuer.
+    ///
+    /// AN ASSERTION WITH NO ISSUER IS SIGNED AS THE FIRST CHILD INSTEAD, rather than refused
+    /// here. A document that names no author is exactly what a caller has to be able to compose,
+    /// because it is exactly what an attacker can send -- and a fixture builder that cannot
+    /// express it would make that case untestable.
     fn with_signature(assertion: &str, signed_info: &str, value: &str) -> String {
         let signature = format!(
             r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info}<ds:SignatureValue>{value}</ds:SignatureValue></ds:Signature>"#
         );
         let marker = "</saml:Issuer>";
-        let at = assertion.find(marker).expect("the issuer is there") + marker.len();
+        let at = match assertion.find(marker) {
+            Some(at) => at + marker.len(),
+            None => {
+                assertion
+                    .find('>')
+                    .expect("the assertion's own start tag is there")
+                    + 1
+            }
+        };
         format!("{}{signature}{}", &assertion[..at], &assertion[at..])
     }
 
