@@ -27,6 +27,7 @@ const SUBJECT: &str = "ada@globex.example";
 const NAMEID_FORMAT: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
 
 struct Wired {
+    connection: SamlConnectionId,
     organization: OrganizationId,
     key: XmlTestKey,
     audience: String,
@@ -42,6 +43,16 @@ struct Wired {
 /// a real `AuthnRequest` through every case would make each test measure the start endpoint
 /// again while telling us nothing new about who gets signed in.
 async fn wire(harness: &Harness, issuer: &str, mapping: &serde_json::Value) -> Wired {
+    wire_with_format(harness, issuer, mapping, NAMEID_FORMAT).await
+}
+
+/// [`wire`] with the connection's `NameID` format chosen by the caller.
+async fn wire_with_format(
+    harness: &Harness,
+    issuer: &str,
+    mapping: &serde_json::Value,
+    nameid_format: &str,
+) -> Wired {
     let env = harness.env().clone();
     let scope = harness.scope();
     let organization = OrganizationId::generate(&env, &scope);
@@ -84,7 +95,7 @@ async fn wire(harness: &Harness, issuer: &str, mapping: &serde_json::Value) -> W
                 allow_unsolicited: true,
                 clock_skew_secs: 30,
                 max_assertion_age_secs: 300,
-                nameid_format: NAMEID_FORMAT,
+                nameid_format,
                 attribute_mapping: mapping,
                 require_encrypted_assertion: false,
             },
@@ -118,6 +129,7 @@ async fn wire(harness: &Harness, issuer: &str, mapping: &serde_json::Value) -> W
         .expect("pin the certificate");
 
     Wired {
+        connection,
         organization,
         key,
         audience,
@@ -179,6 +191,81 @@ fn signed(
     subject: &str,
     attributes: &[(&str, &str)],
 ) -> String {
+    signed_inner(
+        wired,
+        env,
+        issuer,
+        assertion_id,
+        subject,
+        NAMEID_FORMAT,
+        attributes,
+    )
+}
+
+/// [`signed`] with the `NameID`'s `Format` chosen by the caller.
+///
+/// THE DOCUMENT'S FORMAT MUST EQUAL THE CONNECTION'S or `examine` refuses the assertion before
+/// anything this file is about can run, so a test varying one has to vary both.
+fn signed_with_format(
+    wired: &Wired,
+    env: &Env,
+    issuer: &str,
+    assertion_id: &str,
+    subject: &str,
+    nameid_format: &str,
+) -> String {
+    signed_inner(
+        wired,
+        env,
+        issuer,
+        assertion_id,
+        subject,
+        nameid_format,
+        &[],
+    )
+}
+
+/// [`signed`] with the whole `AttributeStatement` written by the caller.
+///
+/// FOR THE CASES THE `(name, value)` SHAPE CANNOT EXPRESS, which is anything involving a
+/// `NameFormat` -- and `NameFormat` is exactly what makes two attributes sharing a `Name` legal.
+fn signed_with_statement(
+    wired: &Wired,
+    env: &Env,
+    issuer: &str,
+    assertion_id: &str,
+    subject: &str,
+    statement: &str,
+) -> String {
+    let now = now_micros(env) / 1_000_000;
+    let children = format!(
+        "<saml:Issuer>{issuer}</saml:Issuer>\
+         <saml:Subject>\
+         <saml:NameID Format=\"{NAMEID_FORMAT}\">{subject}</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData Recipient=\"{}\" NotOnOrAfter=\"{}\"/>\
+         </saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"{}\" NotOnOrAfter=\"{}\">\
+         <saml:AudienceRestriction><saml:Audience>{}</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions>{statement}",
+        wired.acs_url,
+        rfc3339(now + 120),
+        rfc3339(now - 120),
+        rfc3339(now + 120),
+        wired.audience,
+    );
+    ironauth_saml::test_util::signed_response_with(&wired.key, assertion_id, &children)
+}
+
+fn signed_inner(
+    wired: &Wired,
+    env: &Env,
+    issuer: &str,
+    assertion_id: &str,
+    subject: &str,
+    nameid_format: &str,
+    attributes: &[(&str, &str)],
+) -> String {
     let now = now_micros(env) / 1_000_000;
     let statement = if attributes.is_empty() {
         "<saml:AttributeStatement/>".to_owned()
@@ -199,7 +286,7 @@ fn signed(
     let children = format!(
         "<saml:Issuer>{issuer}</saml:Issuer>\
          <saml:Subject>\
-         <saml:NameID Format=\"{NAMEID_FORMAT}\">{subject}</saml:NameID>\
+         <saml:NameID Format=\"{nameid_format}\">{subject}</saml:NameID>\
          <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
          <saml:SubjectConfirmationData Recipient=\"{}\" NotOnOrAfter=\"{}\"/>\
          </saml:SubjectConfirmation></saml:Subject>\
@@ -233,6 +320,80 @@ fn rfc3339(seconds: i64) -> String {
         (rest % 3600) / 60,
         rest % 60
     )
+}
+
+/// The nonce the solicited fixtures put in their binding cookie.
+const BINDING_NONCE: &str = "test-binding-nonce";
+
+/// SHA-256 of a binding nonce, which is what the request row stores.
+fn binding_digest(nonce: &str) -> Vec<u8> {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(nonce.as_bytes()).to_vec()
+}
+
+/// Issue an outstanding request bound to [`BINDING_NONCE`], and answer it.
+///
+/// THE SOLICITED PATH IS WHERE THE BROWSER BINDING LIVES, so every test about it has to go
+/// through here rather than through the unsolicited fixture the rest of this file uses.
+async fn signed_solicited(
+    harness: &Harness,
+    wired: &Wired,
+    assertion_id: &str,
+    request_id: &str,
+    bound: bool,
+) -> String {
+    let env = harness.env().clone();
+    let now = now_micros(&env);
+    harness
+        .store()
+        .scoped(harness.scope())
+        .saml_replay()
+        .issue_request(
+            &wired.connection,
+            request_id,
+            Some("/dashboard"),
+            bound.then(|| binding_digest(BINDING_NONCE)).as_deref(),
+            now,
+            now + 300_000_000,
+        )
+        .await
+        .expect("issue the request");
+
+    let now_secs = now / 1_000_000;
+    let children = format!(
+        "<saml:Issuer>{ISSUER}</saml:Issuer>\
+         <saml:Subject>\
+         <saml:NameID Format=\"{NAMEID_FORMAT}\">{SUBJECT}</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{request_id}\" Recipient=\"{}\" \
+         NotOnOrAfter=\"{}\"/></saml:SubjectConfirmation></saml:Subject>\
+         <saml:Conditions NotBefore=\"{}\" NotOnOrAfter=\"{}\">\
+         <saml:AudienceRestriction><saml:Audience>{}</saml:Audience>\
+         </saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement/>",
+        wired.acs_url,
+        rfc3339(now_secs + 120),
+        rfc3339(now_secs - 120),
+        rfc3339(now_secs + 120),
+        wired.audience,
+    );
+    ironauth_saml::test_util::signed_response_with(&wired.key, assertion_id, &children)
+}
+
+/// POST a response with an explicit `Cookie` header.
+async fn post_with_cookie(
+    harness: &Harness,
+    wired: &Wired,
+    response: &str,
+    cookie: Option<&str>,
+) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(response);
+    harness
+        .post_form(
+            &wired.acs_path,
+            &format!("SAMLResponse={}", urlencode(&encoded)),
+            cookie,
+        )
+        .await
 }
 
 fn urlencode(raw: &str) -> String {
@@ -319,12 +480,22 @@ async fn a_first_assertion_provisions_the_person_and_mints_a_session() {
         "no session cookie was set: {cookies:?}"
     );
 
-    // AND EXACTLY ONE PERSON, keyed on the connection's issuer rather than on the NameID alone.
+    // AND EXACTLY ONE PERSON, keyed on the CONNECTION rather than on the NameID alone -- see
+    // `two_organizations_sharing_one_identity_provider_are_two_people` for why the connection
+    // and not the identity provider's entity id.
     let people = users(&harness, harness.scope()).await;
     assert_eq!(people.len(), 1, "{people:?}");
     let external = people[0].1.as_deref().expect("a federated external id");
-    assert!(external.contains(ISSUER), "{external}");
-    assert!(external.contains(SUBJECT), "{external}");
+    assert_eq!(
+        external,
+        format!(
+            "saml:v1:{}:{}:{}:{SUBJECT}",
+            wired.connection.to_string().len(),
+            wired.connection,
+            SUBJECT.len()
+        ),
+        "the identity key is not the connection-namespaced one"
+    );
 }
 
 #[tokio::test]
@@ -351,16 +522,25 @@ async fn a_second_assertion_signs_in_the_same_person_rather_than_forking_the_acc
 }
 
 #[tokio::test]
-async fn one_identity_provider_cannot_name_a_person_another_one_created() {
-    // THE OBJECTION THAT TOOK THE FIRST ATTEMPT APART, as a test. Migration 0196's sentence is
-    // that "a trust anchor that reached two organizations would let one customer's identity
-    // provider assert another customer's users", and the defect that produced it was resolving
-    // the NameID through an environment-wide identifier seam. Two connections, two issuers, the
-    // SAME NameID: if the key were the NameID alone, the second assertion would sign in the
-    // first person and the count below would be one.
+async fn two_organizations_sharing_one_identity_provider_are_two_people() {
+    // THE OBJECTION THAT TOOK THE FIRST ATTEMPT APART, as a test, and in the shape that actually
+    // reaches it. Migration 0196 makes `idp_entity_id` unique per (tenant, environment,
+    // ORGANIZATION) and its comment says why: "a customer with two organizations in this
+    // environment signs both into their ONE identity provider tenant, so both connections carry
+    // the same `idp_entity_id`". So the dangerous pair is not two DIFFERENT entity ids -- an
+    // earlier version of this test used two, which any namespacing at all separates -- it is the
+    // SAME entity id in two organizations, each pinning its own certificates.
+    //
+    // Keyed on the entity id those collapse to one local user, and whoever holds the second
+    // connection's key signs in as the first organization's people. Keyed on the CONNECTION they
+    // are two.
     let harness = Harness::start_store_backed().await;
     let first = wire(&harness, ISSUER, &json!({})).await;
-    let second = wire(&harness, OTHER_ISSUER, &json!({})).await;
+    let second = wire(&harness, ISSUER, &json!({})).await;
+    assert_ne!(
+        first.organization, second.organization,
+        "the fixture put both connections in one organization, so it cannot see the crossing"
+    );
 
     let (status, _, body) = post(
         &harness,
@@ -372,7 +552,7 @@ async fn one_identity_provider_cannot_name_a_person_another_one_created() {
     let (status, _, body) = post(
         &harness,
         &second,
-        &signed(&second, harness.env(), OTHER_ISSUER, "_c2", SUBJECT, &[]),
+        &signed(&second, harness.env(), ISSUER, "_c2", SUBJECT, &[]),
     )
     .await;
     assert_eq!(status, 303, "{body}");
@@ -381,19 +561,207 @@ async fn one_identity_provider_cannot_name_a_person_another_one_created() {
     assert_eq!(
         people.len(),
         2,
-        "two identity providers asserting the same NameID resolved to one account: {people:?}"
+        "two organizations sharing an identity provider resolved to one account: {people:?}"
     );
 
-    // AND EACH IS IN ITS OWN ORGANIZATION, which is the half the count alone does not show.
+    // AND EACH ORGANIZATION HOLDS A DIFFERENT ONE OF THEM, which a count cannot show: an earlier
+    // version asserted `members.len() == 1` for each, which is equally true of a build that put
+    // the SAME person in both.
     let scoped = harness.db().store().scoped(harness.scope());
-    for (organization, expected) in [(&first.organization, 1), (&second.organization, 1)] {
+    let mut members_by_org = Vec::new();
+    for organization in [&first.organization, &second.organization] {
         let members = scoped
             .org_memberships()
             .list_for_org(organization, 100, None)
             .await
             .expect("list members");
-        assert_eq!(members.len(), expected, "{organization}");
+        assert_eq!(members.len(), 1, "{organization}");
+        members_by_org.push(members[0].user_id.to_string());
     }
+    assert_ne!(
+        members_by_org[0], members_by_org[1],
+        "one person is a member of both organizations, so the two connections resolved to one \
+         account: {members_by_org:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_response_presented_without_the_binding_cookie_signs_nobody_in() {
+    // LOGIN CSRF, which sign-in created and the browser binding closes. Mallory starts a flow,
+    // authenticates at the identity provider AS HERSELF, captures the response, and auto-submits
+    // it into a victim's browser. Every check upstream of the binding passes: the signature is
+    // genuine, the conditions hold, the assertion is fresh, and the outstanding request is one
+    // this deployment really issued and has not spent. What the victim's browser does not carry
+    // is the cookie that request was issued to, and without the binding the victim ends up
+    // signed into MALLORY'S account -- where everything they then do is hers to read.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    let response = signed_solicited(&harness, &wired, "_csrf1", "_req_csrf1", true).await;
+    let (status, headers, body) = post_with_cookie(&harness, &wired, &response, None).await;
+    assert!(status.is_client_error(), "{status} {body}");
+    assert!(
+        set_cookie(&headers).is_empty(),
+        "a response with no binding cookie minted a session"
+    );
+    assert!(
+        users(&harness, harness.scope()).await.is_empty(),
+        "a response with no binding cookie provisioned somebody"
+    );
+}
+
+#[tokio::test]
+async fn a_response_presented_with_another_flows_cookie_signs_nobody_in() {
+    // THE SHARPER HALF: the victim's browser is not cookie-less, it carries a binding from its
+    // OWN earlier flow. A check that only asked "is there a cookie" would pass this.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    let response = signed_solicited(&harness, &wired, "_csrf2", "_req_csrf2", true).await;
+    let (status, headers, body) = post_with_cookie(
+        &harness,
+        &wired,
+        &response,
+        Some("__Host-ironauth_saml_bind=somebody-elses-nonce"),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status} {body}");
+    assert!(set_cookie(&headers).is_empty(), "{body}");
+    assert!(users(&harness, harness.scope()).await.is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn a_bound_response_in_its_own_browser_signs_in() {
+    // THE CONTROL, and it is what keeps the two tests above from passing on a build that refuses
+    // every solicited response. Same fixture, same request, the RIGHT cookie.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    let response = signed_solicited(&harness, &wired, "_bound1", "_req_bound1", true).await;
+    let (status, headers, body) = post_with_cookie(
+        &harness,
+        &wired,
+        &response,
+        Some(&format!("__Host-ironauth_saml_bind={BINDING_NONCE}")),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    assert!(
+        set_cookie(&headers)
+            .iter()
+            .any(|cookie| cookie.contains("ironauth_session")),
+        "the bound response minted no session"
+    );
+    // AND IT LANDS ON THE RECORDED RelayState rather than anywhere the POST named.
+    assert_eq!(
+        headers
+            .get(axum::http::header::LOCATION)
+            .map(|value| value.to_str().unwrap_or_default()),
+        Some("/dashboard")
+    );
+}
+
+#[tokio::test]
+async fn a_transient_nameid_format_signs_nobody_in() {
+    // A FORMAT THAT NAMES A DIFFERENT STRING EVERY LOGIN cannot key an account: each assertion
+    // would provision a new person and a new membership, so an operator's member list fills with
+    // strangers who are all one person. The connection's column also travels outward, in the
+    // metadata document and in every AuthnRequest's NameIDPolicy, so a connection configured
+    // this way is asking its provider for exactly what this deployment cannot use.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire_with_format(
+        &harness,
+        ISSUER,
+        &json!({}),
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+    )
+    .await;
+
+    let response = signed_with_format(
+        &wired,
+        harness.env(),
+        ISSUER,
+        "_transient1",
+        "_opaque_9f3a",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+    );
+    let (status, headers, body) = post(&harness, &wired, &response).await;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(set_cookie(&headers).is_empty(), "{body}");
+    assert!(
+        users(&harness, harness.scope()).await.is_empty(),
+        "a transient NameID provisioned an account that no second login could ever find again"
+    );
+}
+
+#[tokio::test]
+async fn an_assertion_naming_one_claim_twice_signs_nobody_in() {
+    // TWO VALUES FOR ONE KEY IS NOT A CHOICE TO MAKE SILENTLY. SAML admits two `Attribute`
+    // elements sharing a `Name` when their `NameFormat` differs, and the claims object the
+    // shared mapper reads has nowhere to put a format -- so an earlier version kept the first
+    // and dropped the second, handing a mapping author the wrong one of two addresses with a
+    // login that looked fine. The refusal names the key in the log, which is the only way the
+    // operator learns to fix it.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(
+        &harness,
+        ISSUER,
+        &json!({"traits": {"email": {"source": ["email"], "required": false}}}),
+    )
+    .await;
+
+    // TWO `Name="email"` ATTRIBUTES WITH DIFFERENT `NameFormat`s, which is the pair SAML admits
+    // as distinct and the claims object cannot hold. An identical pair -- same Name, same format
+    // -- is refused one layer earlier by `ironauth-saml`'s own duplicate check, so a fixture
+    // built that way would answer 400 without this module's rule ever running, and would pass
+    // with the rule deleted.
+    let statement = concat!(
+        "<saml:AttributeStatement>",
+        "<saml:Attribute Name=\"email\" ",
+        "NameFormat=\"urn:oasis:names:tc:SAML:2.0:attrname-format:basic\">",
+        "<saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>",
+        "<saml:Attribute Name=\"email\" ",
+        "NameFormat=\"urn:oasis:names:tc:SAML:2.0:attrname-format:uri\">",
+        "<saml:AttributeValue>ada@evil.example</saml:AttributeValue></saml:Attribute>",
+        "</saml:AttributeStatement>"
+    );
+    let response =
+        signed_with_statement(&wired, harness.env(), ISSUER, "_dupe1", SUBJECT, statement);
+    let (status, headers, body) = post(&harness, &wired, &response).await;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(set_cookie(&headers).is_empty(), "{body}");
+    assert!(users(&harness, harness.scope()).await.is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn an_attribute_that_would_overwrite_the_nameid_signs_nobody_in() {
+    // THE `sub` CASE, which is the same rule. The NameID is placed under `sub` because that is
+    // what the shared evaluator's default subject rule reads, so a provider that also sends an
+    // attribute literally named `sub` is naming one person in the signed NameID and another in
+    // the claims every mapping is written against.
+    //
+    // AN EARLIER VERSION OF THIS TEST ASSERTED THE SIGN-IN SUCCEEDED with the NameID winning,
+    // and it passed with the guard deleted: the NameID was inserted first and the attribute
+    // insert used `or_insert`, which does not overwrite. The property was forced by code the
+    // guard was not part of, so the test measured nothing.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    let response = signed(
+        &wired,
+        harness.env(),
+        ISSUER,
+        "_sub1",
+        SUBJECT,
+        &[("sub", "mallory@evil.example")],
+    );
+    let (status, headers, body) = post(&harness, &wired, &response).await;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(set_cookie(&headers).is_empty(), "{body}");
+    assert!(
+        users(&harness, harness.scope()).await.is_empty(),
+        "an assertion that named the subject twice signed somebody in"
+    );
 }
 
 #[tokio::test]
@@ -427,8 +795,11 @@ async fn the_person_joins_the_connections_own_organization() {
 
 #[tokio::test]
 async fn a_repeated_assertion_does_not_add_a_second_membership() {
-    // THE MEMBERSHIP WRITE IS IDEMPOTENT, and the reason to measure it is that the read-then-
-    // write shape it uses is exactly the shape that produces duplicates when the read is wrong.
+    // THE MEMBERSHIP WRITE IS IDEMPOTENT. An earlier version of this comment credited a
+    // read-then-write guard in `ensure_membership` for that, and the guard turned out to be
+    // removable without changing this test's answer: the store's own `ON CONFLICT DO NOTHING`
+    // was already doing the work. The guard is gone, and what this measures is the property
+    // rather than a particular implementation of it.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, ISSUER, &json!({})).await;
 
@@ -478,6 +849,11 @@ async fn the_traits_come_from_the_connections_own_mapping_and_not_from_a_constan
     )
     .await;
 
+    // THE MAPPED ANSWER DIFFERS FROM THE NameID, which an earlier version of this fixture did
+    // not arrange: it signed in `ada@globex.example` and expected the mapped email to be
+    // `ada@globex.example` too, so a build that ignored every `source` and wrote the NameID into
+    // every trait passed. Here the NameID is a directory id and the address is an attribute, so
+    // only a build that actually read the mapping can produce it.
     let (status, _, body) = post(
         &harness,
         &by_email,
@@ -486,7 +862,7 @@ async fn the_traits_come_from_the_connections_own_mapping_and_not_from_a_constan
             harness.env(),
             ISSUER,
             "_f1",
-            SUBJECT,
+            "uid=ada,ou=people",
             &[
                 ("email", "ada@globex.example"),
                 ("urn:oid:0.9.2342.19200300.100.1.3", "wrong@x"),
@@ -504,7 +880,7 @@ async fn the_traits_come_from_the_connections_own_mapping_and_not_from_a_constan
             harness.env(),
             OTHER_ISSUER,
             "_f2",
-            "bob@globex.example",
+            "uid=bob,ou=people",
             &[
                 ("email", "wrong@x"),
                 ("urn:oid:0.9.2342.19200300.100.1.3", "bob@globex.example"),
@@ -550,36 +926,124 @@ async fn trait_emails(harness: &Harness) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn an_attribute_named_sub_cannot_displace_the_nameid() {
-    // THE NameID IS THE IDENTITY KEY, and it reaches the mapper under `sub` because that is what
-    // the shared evaluator's default subject rule reads. An identity provider that also sends an
-    // attribute literally named `sub` would otherwise name one person in the signed `NameID` and
-    // another in the claims every mapping is written against.
+async fn a_fenced_account_is_refused_and_joins_no_organization() {
+    // THE ORDER OF THE WRITES, MEASURED. `establish_session` carries the account-lifecycle fence
+    // and is the ONLY such check on this path, because the identity provider decided who the
+    // human is. An earlier version joined the person to the organization BEFORE calling it, so
+    // an unauthenticated cross-site POST wrote an org membership for an account this deployment
+    // refuses to authenticate -- and it kept doing so on every attempt.
+    //
+    // THE SECOND MEMBERSHIP IS THE ONE THAT MATTERS. The first login is genuine and creates
+    // both. The operator then disables the account and removes the membership; a further
+    // assertion must add neither.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, ISSUER, &json!({})).await;
 
-    let response = signed(
+    let (status, _, body) = post(
+        &harness,
         &wired,
-        harness.env(),
-        ISSUER,
-        "_g1",
-        SUBJECT,
-        &[("sub", "mallory@evil.example")],
+        &signed(&wired, harness.env(), ISSUER, "_fence1", SUBJECT, &[]),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let people = users(&harness, harness.scope()).await;
+    let user_id =
+        ironauth_store::UserId::parse_in_scope(&people[0].0, &harness.scope()).expect("a user id");
+
+    let scoped = harness.db().store().scoped(harness.scope());
+    let membership = scoped
+        .org_memberships()
+        .for_user_in_org(&wired.organization, &user_id)
+        .await
+        .expect("read")
+        .expect("the first login joined the organization");
+    harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            harness.db().test_actor(harness.env()),
+            CorrelationId::generate(harness.env()),
+        )
+        .org_memberships()
+        .remove(harness.env(), &membership.id)
+        .await
+        .expect("remove the membership");
+    harness
+        .set_user_state(&people[0].0, ironauth_store::UserState::Disabled)
+        .await;
+
+    // A GENUINE, FRESH ASSERTION for the disabled person.
+    let (status, headers, body) = post(
+        &harness,
+        &wired,
+        &signed(&wired, harness.env(), ISSUER, "_fence2", SUBJECT, &[]),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        set_cookie(&headers).is_empty(),
+        "a fenced account minted a session"
     );
-    let (status, _, body) = post(&harness, &wired, &response).await;
+    // NOT A 500, which is what an earlier version answered: reporting a server fault for a
+    // deliberate administrative state sends an operator hunting a bug that is not there.
+    assert!(
+        !body.contains("could not be completed"),
+        "the fenced refusal was reported as a server fault: {body}"
+    );
+    assert!(
+        scoped
+            .org_memberships()
+            .for_user_in_org(&wired.organization, &user_id)
+            .await
+            .expect("read")
+            .is_none(),
+        "a refused sign-in re-joined the person to the organization"
+    );
+}
+
+#[tokio::test]
+async fn the_jit_membership_reaches_the_event_feed() {
+    // THE OUTBOUND SCIM PUSH SHIPPED IN THIS MILESTONE drives its steady state entirely from the
+    // event feed, so a membership committed with no envelope is a person who exists here and
+    // never reaches the downstream directory. An earlier version called the four-argument
+    // `create`, which forwards no event, and nothing noticed because every other assertion in
+    // this file reads the row rather than the feed.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(&wired, harness.env(), ISSUER, "_evt1", SUBJECT, &[]),
+    )
+    .await;
     assert_eq!(status, 303, "{body}");
 
-    let people = users(&harness, harness.scope()).await;
-    assert_eq!(people.len(), 1, "{people:?}");
-    let external = people[0].1.as_deref().expect("an external id");
-    assert!(
-        external.contains(SUBJECT),
-        "the identity was keyed on something other than the NameID: {external}"
-    );
-    assert!(
-        !external.contains("mallory@evil.example"),
-        "an attribute displaced the NameID as the identity key: {external}"
-    );
+    // POLLED, NOT READ ONCE. The feed holds back rows behind a CLUSTER-WIDE snapshot watermark,
+    // so a sibling test with an open transaction delays this scope's own rows -- which made a
+    // single read pass alone and fail in the suite. Waiting is the correct fix rather than a
+    // flake workaround: the guarantee the feed offers is eventual visibility in order.
+    let mut kinds: Vec<String> = Vec::new();
+    for _ in 0..50 {
+        let events = harness
+            .db()
+            .store()
+            .scoped(harness.scope())
+            .outbox()
+            .events_after(0, 200)
+            .await
+            .expect("read the feed");
+        kinds = events
+            .iter()
+            .filter_map(|message| message.payload.get("type")?.as_str().map(str::to_owned))
+            .collect();
+        if kinds.iter().any(|kind| kind == "organization.member_added") {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the JIT membership enqueued no member_added envelope: {kinds:?}");
 }
 
 #[tokio::test]

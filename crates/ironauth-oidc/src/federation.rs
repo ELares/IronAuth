@@ -1466,12 +1466,17 @@ pub(crate) async fn finalize_federated_login(finalize: FinalizeLogin<'_>) -> Res
         // The safe default: provision the separate federated identity exactly as issue #77
         // does today, keyed on the verified, issuer-namespaced `(issuer, sub)` composite.
         LinkDispatch::Provision => {
+            // THE OIDC NAMESPACE: the issuer-namespaced `(issuer, sub)` composite, and a
+            // per-connector login handle that keeps a federated account from colliding with a
+            // local password account sharing the upstream email. Both are built here rather
+            // than inside the provisioner, because the SAML caller must build different ones.
+            let external_id = federated_external_id(issuer, &identity.subject);
+            let handle = format!("federated:{connector_slug}:{}", identity.subject);
             match provision_federated_user(
                 state,
                 scope,
-                connector_slug,
-                issuer,
-                identity,
+                &external_id,
+                &handle,
                 &trait_doc,
                 schema_version,
                 org_connection_id,
@@ -2006,9 +2011,14 @@ impl TraitSchemaView for StoreTraitSchema<'_> {
 }
 
 /// Provision or look up the LOCAL user for a verified federated identity (issue #75), keyed on
-/// the upstream ISSUER + `sub` via the external-id link (issue #75, HIGH-1: the namespaced key
-/// closes the cross-connector `sub`-collision takeover), and carrying the DECLARATIVE
-/// claim-mapped traits (PR C).
+/// the caller-supplied `external_id` (issue #75, HIGH-1: the namespaced key closes the
+/// cross-connector `sub`-collision takeover), and carrying the DECLARATIVE claim-mapped traits.
+///
+/// IT NO LONGER TAKES THE `VerifiedUpstreamIdentity`. It read exactly two things from it, both
+/// `subject`, and both to build values the caller now supplies -- so the struct was passed in,
+/// carried an email, an `amr`, an `acr`, an `auth_time` and a full claims map, and none of them
+/// reached a write. The SAML caller was filling those fields with computed values that went
+/// nowhere; removing the parameter is what made that visible rather than arguable.
 ///
 /// The identity KEY stays the verified, issuer-namespaced `(issuer, sub)` composite, NEVER the
 /// mapped subject. A first login creates the user with the mapped traits (or a minimal identity
@@ -2026,16 +2036,19 @@ impl TraitSchemaView for StoreTraitSchema<'_> {
 pub(crate) async fn provision_federated_user(
     state: &OidcState,
     scope: Scope,
-    connector_slug: &str,
-    issuer: &str,
-    identity: &VerifiedUpstreamIdentity,
+    external_id: &str,
+    handle: &str,
     trait_doc: &TraitDocument,
     schema_version: Option<i32>,
     org_connection_id: Option<&str>,
 ) -> Result<UserId, StoreError> {
-    // The federated external-id is namespaced by the upstream ISSUER, because a `sub` is
-    // unique only within one issuer (see `federated_external_id`).
-    let external_id = federated_external_id(issuer, &identity.subject);
+    // THE IDENTITY KEY AND THE LOGIN HANDLE ARE THE CALLER'S, and an earlier version built both
+    // here from an `issuer` and a `connector_slug`. Two federation protocols reach this function
+    // and they must NOT share a namespace: an OIDC connector is identified by its issuer, and a
+    // SAML connection by its own id -- because a SAML `idp_entity_id` is unique only per
+    // ORGANIZATION and is commonly an issuer-shaped URL, so deriving one key from both would let
+    // a connection resolve users it has no anchor for. Each caller states its namespace, and
+    // `federated_external_id` / `saml_signin::saml_external_id` are where the two shapes live.
     // The mapped traits as a JSON string, when the mapping produced any (a trait-free mapping
     // provisions a minimal identity, exactly as PR B did). Serializing a JSON object never
     // fails; a fault is surfaced rather than silently persisting an empty document.
@@ -2049,7 +2062,7 @@ pub(crate) async fn provision_federated_user(
         .store()
         .scoped(scope)
         .users()
-        .by_external_id(&external_id)
+        .by_external_id(external_id)
         .await?
     {
         // Returning login: refresh the mapped traits (fully re-validated against the active
@@ -2093,9 +2106,6 @@ pub(crate) async fn provision_federated_user(
         stamp_org_binding(state, scope, &existing.id, org_connection_id).await?;
         return Ok(existing.id);
     }
-    // A namespaced, per-connector login handle keeps a federated account from colliding with
-    // a local password account that happens to share the upstream email.
-    let handle = format!("federated:{connector_slug}:{}", identity.subject);
     let user_id = UserId::generate(state.env(), &scope);
     let now_micros = epoch_micros(state.now());
     let actor = interaction::user_actor(&user_id);
@@ -2109,10 +2119,10 @@ pub(crate) async fn provision_federated_user(
             state.env(),
             NewAdminUser {
                 id: Some(&user_id),
-                identifier: &handle,
+                identifier: handle,
                 password_hash: None,
                 claims_json: None,
-                external_id: Some(&external_id),
+                external_id: Some(external_id),
                 state: UserState::Active,
                 foreign_password_hash: None,
                 foreign_password_algo: None,

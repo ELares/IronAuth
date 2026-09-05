@@ -85,6 +85,17 @@ pub struct Consumed {
     /// location that is not one. "Was this solicited" is answered by `accepted.in_response_to`,
     /// which is the field for that question.
     pub relay_state: Option<String>,
+    /// The browser binding recorded when the request was issued, for the TRANSPORT to compare
+    /// against the cookie it holds (issue #139).
+    ///
+    /// [`None`] FOR TWO REASONS AND A CALLER MUST TREAT THEM ALIKE: an unsolicited response,
+    /// which answers no request and so has no row to carry one, and a request issued by a build
+    /// before migration 0200 added the column. Neither can be checked, and neither is a pass:
+    /// what makes the absence safe is that unsolicited responses are refused unless a connection
+    /// opted in, and that a pre-0200 request drains inside its own five-minute TTL.
+    ///
+    /// IT IS A DIGEST, so holding it is not holding the secret that satisfies it.
+    pub browser_binding_sha256: Option<Vec<u8>>,
 }
 
 /// Why an assertion was not consumed.
@@ -485,7 +496,7 @@ pub async fn consume(
     let (accepted, statement) = examine(acs, response)?;
     let now_micros = acs.now_unix_secs.saturating_mul(1_000_000);
 
-    let relay_state = match &accepted.in_response_to {
+    let spent = match &accepted.in_response_to {
         Some(request_id) => {
             // TWO DIFFERENT ANSWERS THAT ARE EASY TO SWAP, and swapping them is a real defect
             // in both directions -- so they are written out rather than funnelled through `?`:
@@ -502,7 +513,7 @@ pub async fn consume(
                 .consume_request(&acs.connection.id, request_id, now_micros)
                 .await
             {
-                Ok(relay_state) => relay_state.filter(|value| !value.is_empty()),
+                Ok(spent) => Some(spent),
                 Err(StoreError::NotFound) => return Err(AcsError::UnknownRequest),
                 Err(other) => return Err(AcsError::Store(other)),
             }
@@ -511,6 +522,15 @@ pub async fn consume(
         // unless the connection opted in.
         None => None,
     };
+    let relay_state = spent
+        .as_ref()
+        .and_then(|spent| spent.relay_state.clone())
+        .filter(|value| !value.is_empty());
+    // THE BINDING COMES BACK FROM THE SAME SPEND, because the spend can only happen once: a
+    // second read would be of a row this one has already marked consumed. The comparison is the
+    // TRANSPORT's, not this module's -- the value it is compared against is in a cookie, and
+    // this module touches no HTTP.
+    let browser_binding_sha256 = spent.and_then(|spent| spent.browser_binding_sha256);
 
     // REMEMBERED UNTIL `expires_at_unix_secs`, which is the earliest of the assertion's own
     // expiry, the confirmation's, this connection's ceiling, and the skew that admitted it. A
@@ -544,5 +564,6 @@ pub async fn consume(
         accepted,
         statement,
         relay_state,
+        browser_binding_sha256,
     })
 }

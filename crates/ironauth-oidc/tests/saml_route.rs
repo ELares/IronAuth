@@ -323,6 +323,15 @@ async fn a_signed_response_is_accepted_and_signs_somebody_in() {
     );
 }
 
+/// The nonce the solicited fixtures put in their binding cookie.
+const BINDING_NONCE: &str = "test-binding-nonce";
+
+/// SHA-256 of a binding nonce, which is what the request row stores.
+fn binding_digest(nonce: &str) -> Vec<u8> {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(nonce.as_bytes()).to_vec()
+}
+
 #[tokio::test]
 async fn only_the_recorded_relay_state_becomes_a_redirect_and_never_the_posted_one() {
     // THE SOLICITED PATH, which no test in the first version of this file reached -- every
@@ -347,6 +356,10 @@ async fn only_the_recorded_relay_state_becomes_a_redirect_and_never_the_posted_o
             &wired.connection,
             "_req_solicited",
             Some("/authorize?client_id=cli_recorded&scope=openid"),
+            // A REAL BINDING, and the POST below carries the cookie that satisfies it. Issuing
+            // with `None` would leave the binding check on its nothing-to-compare arm, so this
+            // test would pass on a build whose check was deleted.
+            Some(&binding_digest(BINDING_NONCE)),
             now,
             now + 300_000_000,
         )
@@ -364,7 +377,7 @@ async fn only_the_recorded_relay_state_becomes_a_redirect_and_never_the_posted_o
         .post_form(
             &wired.path,
             &form(&response, Some("https://evil.example/steal")),
-            None,
+            Some(&format!("__Host-ironauth_saml_bind={BINDING_NONCE}")),
         )
         .await;
 

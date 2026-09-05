@@ -368,6 +368,7 @@ async fn a_solicited_response_is_accepted_and_spends_its_request_exactly_once() 
             &fixture.connection.id,
             "_req_first",
             Some("/dashboard"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -417,6 +418,7 @@ async fn a_solicited_response_is_accepted_and_spends_its_request_exactly_once() 
             &fixture.connection.id,
             "_req_reissued",
             Some("/settings"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -444,6 +446,7 @@ async fn the_same_assertion_is_admitted_once_even_on_two_requests() {
             .issue_request(
                 &fixture.connection.id,
                 request,
+                None,
                 None,
                 request_window().0,
                 request_window().1,
@@ -480,6 +483,7 @@ async fn a_refused_response_does_not_spend_the_request_it_names() {
             &fixture.connection.id,
             "_req_victim",
             Some("/dashboard"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -562,6 +566,7 @@ async fn a_response_for_another_service_provider_is_refused_on_its_audience() {
             &fixture.connection.id,
             "_req_audience",
             Some("/dashboard"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -744,6 +749,7 @@ async fn an_unreadable_attribute_statement_is_refused_and_spends_nothing() {
             &fixture.connection.id,
             "_req_attributes",
             Some("/reports"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -801,6 +807,7 @@ async fn a_nameid_in_another_format_than_the_connection_expects_is_refused() {
             &fixture.connection.id,
             "_req_format",
             Some("/reports"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -952,6 +959,7 @@ async fn a_connection_requiring_encryption_refuses_a_cleartext_assertion() {
             &fixture.connection.id,
             "_req_encrypted",
             Some("/reports"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -980,7 +988,7 @@ async fn a_connection_requiring_encryption_refuses_a_cleartext_assertion() {
         .consume_request(&fixture.connection.id, "_req_encrypted", now_store_micros())
         .await
         .expect("the refused response spent the request it named");
-    assert_eq!(outstanding.as_deref(), Some("/reports"));
+    assert_eq!(outstanding.relay_state.as_deref(), Some("/reports"));
 }
 
 #[tokio::test]
@@ -1000,6 +1008,7 @@ async fn an_encrypted_attribute_is_refused_rather_than_silently_dropped() {
             &fixture.connection.id,
             "_req_encrypted_attribute",
             Some("/inbox"),
+            None,
             request_window().0,
             request_window().1,
         )
@@ -1149,6 +1158,7 @@ async fn an_expired_request_is_unknown_at_the_clock_the_endpoint_reports() {
             &fixture.connection.id,
             "_req_lapsed",
             Some("/dashboard"),
+            None,
             now_store_micros() - 600_000_000,
             now_store_micros() - 300_000_000,
         )
@@ -1169,6 +1179,7 @@ async fn an_expired_request_is_unknown_at_the_clock_the_endpoint_reports() {
             &fixture.connection.id,
             "_req_live",
             Some("/dashboard"),
+            None,
             request_window().0,
             request_window().1,
         )

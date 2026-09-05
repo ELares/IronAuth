@@ -78,11 +78,20 @@
 //! THE OUTSTANDING REQUEST IS HALF OF THAT DEFENCE and an earlier version of this sentence
 //! called it the whole of it. The row proves a response answers a request this deployment issued
 //! and has not spent; it does not prove the browser presenting it is the one the request was
-//! issued to, and the start endpoint is unauthenticated, so an attacker can mint their own. The
-//! other half is a BROWSER BINDING -- a cookie carrying the request id or its digest, set when
-//! the request is issued and matched here -- which lands with sign-in, and which must be
-//! `SameSite=None; Secure`, because THIS endpoint is the cross-site POST and a `Lax` cookie
-//! would simply not arrive.
+//! issued to, and the start endpoint is unauthenticated, so an attacker can mint their own.
+//!
+//! THE OTHER HALF IS THE BROWSER BINDING, AND IT IS HERE NOW. Two earlier versions of this
+//! paragraph said it "lands with sign-in"; sign-in landed without it, so an attacker could
+//! auto-submit a genuine assertion for their OWN account into a victim's browser and the victim
+//! would be signed into the attacker's account. `saml_start` now sets a `SameSite=None; Secure;
+//! HttpOnly` `__Host-` cookie carrying a nonce and records its SHA-256 on the request row, and
+//! [`binding_matches`] below compares them. `SameSite=None` is what makes the cookie ARRIVE on
+//! this cross-site POST; a `Lax` one would refuse every genuine login and stop nothing.
+//!
+//! IT DOES NOT COVER AN UNSOLICITED RESPONSE, which answers no request and so has no row to
+//! carry a digest. That is inherent rather than an omission -- there is no earlier moment at
+//! which this deployment met that browser -- and it is why unsolicited responses are off by
+//! default and why #139 asks for the risk to be documented where an operator turns them on.
 
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
@@ -132,9 +141,11 @@ pub struct AcsForm {
     /// whatever the last party to touch it wanted; it is where a service provider puts the URL
     /// to return to, which makes honouring the posted one an open redirect with extra steps.
     /// [`consume`] reads the `RelayState` this deployment RECORDED when it issued the request,
-    /// and when a redirect exists that is the only value it will be built from. NOTHING
-    /// REDIRECTS ON THIS BUILD -- there is no `Location` on any path -- so today this field is
-    /// discarded and no value at all reaches a browser.
+    /// and that is the ONLY value a `Location` is ever built from. TWO EARLIER VERSIONS OF THIS
+    /// PARAGRAPH said "nothing redirects on this build -- there is no `Location` on any path",
+    /// which was true of the build they were written for and false the moment sign-in landed in
+    /// the same commit. An accepted response now answers 303 with a `Location`; this field is
+    /// still read and thrown away, and that is the property worth stating.
     #[serde(rename = "RelayState")]
     _relay_state: Option<String>,
 }
@@ -235,10 +246,88 @@ pub async fn acs_post(
         Err(error) => return refused_by(&error),
     };
 
-    // AND NOW SOMEBODY IS SIGNED IN, which is what the four paragraphs above were waiting for.
-    // The transport half ends here: which connection, which bytes, and whether they verified are
-    // this module's questions, and who the `NameID` names locally is `saml_signin`'s.
+    // THE BROWSER BINDING, CHECKED BEFORE ANYBODY IS SIGNED IN. The request is already spent by
+    // this point and deliberately stays spent: a response presented in the wrong browser has
+    // burned the sign-in it was answering, which is the correct outcome for a single-use
+    // request and denies an attacker a retry.
+    if !binding_matches(&headers, consumed.browser_binding_sha256.as_deref()) {
+        tracing::warn!(
+            target: "ironauth.saml",
+            connection = %connection.id,
+            "a SAML response was presented in a browser other than the one its sign-in started in",
+        );
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "this response does not belong to a sign-in started in this browser",
+        );
+    }
+
+    // AND NOW SOMEBODY IS SIGNED IN, which is what the paragraphs above were waiting for. The
+    // transport half ends here: which connection, which bytes, whether they verified and whether
+    // they came back to the browser that started are this module's questions, and who the
+    // `NameID` names locally is `saml_signin`'s.
     crate::saml_signin::sign_in(&state, scope, &connection, &consumed, &headers).await
+}
+
+/// Whether the request's recorded binding matches the cookie this POST carried.
+///
+/// # A missing digest is not a failure, and that is the one subtle part
+///
+/// `expected` is [`None`] for exactly two shapes, and neither can be checked: an UNSOLICITED
+/// response, which answers no request and so has no row to have recorded one, and a request
+/// issued before migration 0200 added the column, which drains inside its own five-minute TTL.
+/// Refusing those would break every opted-in unsolicited connection and every login in flight
+/// across a deploy, so [`None`] passes.
+///
+/// WHAT KEEPS THAT FROM BEING THE BYPASS IT LOOKS LIKE is that a caller cannot reach this arm by
+/// choice. `expected` comes from the row the response's own `InResponseTo` just spent, so a
+/// solicited response gets that row's digest or gets refused as `UnknownRequest` before this is
+/// called; there is no input that turns a bound request into an unbound one. The reachable
+/// no-binding case is a connection whose operator opted into unsolicited responses, which is the
+/// documented trade #139 asks for.
+///
+/// # Constant time, because the comparison is against a secret's digest
+///
+/// A digest comparison that returns early leaks a prefix, and the value being probed is the one
+/// thing standing between a captured assertion and a forced sign-in.
+fn binding_matches(headers: &axum::http::HeaderMap, expected: Option<&[u8]>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    let Some(nonce) = cookie_value(headers, crate::saml_start::BINDING_COOKIE) else {
+        return false;
+    };
+    let actual = {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(nonce.as_bytes())
+    };
+    if actual.len() != expected.len() {
+        return false;
+    }
+    actual
+        .iter()
+        .zip(expected)
+        .fold(0_u8, |differences, (left, right)| {
+            differences | (left ^ right)
+        })
+        == 0
+}
+
+/// The value of `name` in this request's `Cookie` header.
+///
+/// SPLIT ON `;` AND THEN ONCE ON `=`, because a cookie VALUE may contain `=` (base64url does not
+/// pad, but a future value might) while a NAME may not. Whitespace around a pair is what the
+/// header grammar puts between them.
+fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|header| header.split(';'))
+        .find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().to_owned())
+        })
 }
 
 /// The no-store headers every response THIS HANDLER BUILDS carries.
