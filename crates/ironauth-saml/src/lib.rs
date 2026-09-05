@@ -208,7 +208,9 @@
 #![forbid(unsafe_code)]
 
 mod c14n;
+pub mod conditions;
 mod encrypted;
+mod instant;
 mod parse;
 mod tree;
 mod verify;
@@ -225,10 +227,12 @@ pub const ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 
 /// The SAML 2.0 protocol namespace, which `Response` and `AuthnRequest` are in.
 pub const PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+pub use conditions::{Accepted, ConditionError, Expectations, check};
 pub use encrypted::{
     DecryptError, KeyTransport, KeyTransportAlg, OaepDigest, OaepMgf, OaepParameters,
     decrypt_and_verify,
 };
+pub use instant::parse_utc;
 pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.
@@ -419,21 +423,47 @@ pub mod test_util {
         key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
         id: &str,
     ) -> String {
-        // `xmlns:ds` sits on the `Signature`, so `SignedInfo` INHERITS it -- which exercises the
-        // inherited-scope path the canonicalizer got wrong, rather than sidestepping it.
+        signed_response_with(
+            key,
+            id,
+            &[
+                "<saml:Issuer>urn:idp</saml:Issuer>",
+                "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
+            ]
+            .concat(),
+        )
+    }
+
+    /// [`signed_response`] with the assertion's children supplied by the caller.
+    ///
+    /// # Why the conditions corpus needs this
+    ///
+    /// A condition check is about values INSIDE the signed assertion -- the audience, the two
+    /// time bounds, the correlation, the recipient -- so a corpus for it has to vary those values
+    /// while the signature stays genuinely valid over each variant. Composing the children here
+    /// and signing whatever results is what makes "the audience is wrong" a document that really
+    /// verifies rather than one that fails for being unsigned, which is the same argument
+    /// [`signed_response`] makes about the wrapping corpus.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_response_with(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        id: &str,
+        children: &str,
+    ) -> String {
         let assertion = [
             r#"<saml:Assertion ID=""#,
             id,
-            r#""><saml:Issuer>urn:idp</saml:Issuer>"#,
-            "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
+            r#"">"#,
+            children,
             "</saml:Assertion>",
         ]
         .concat();
         let unsigned = wrap(&assertion);
-        // The digest is over the assertion with its signature removed, and there is none yet:
-        // the enveloped transform makes those the same thing.
         let digest = digest_of(&unsigned, "saml:Assertion");
-
         let signed_info = [
             "<ds:SignedInfo>",
             r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
@@ -450,14 +480,12 @@ pub mod test_util {
             "</ds:DigestValue></ds:Reference></ds:SignedInfo>",
         ]
         .concat();
-        // Canonicalise SignedInfo in the place it will sit, so its inherited `ds` resolves.
         let staged = wrap(&with_signature(&assertion, &signed_info, ""));
         let message = canonicalize(&staged, "ds:SignedInfo").expect("the staged SignedInfo parses");
         let value = base64(&key.sign(message.as_bytes()));
         wrap(&with_signature(&assertion, &signed_info, &value))
     }
 
-    /// Put an assertion inside a response.
     fn wrap(assertion: &str) -> String {
         [
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,

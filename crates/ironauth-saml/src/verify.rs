@@ -183,6 +183,49 @@ impl VerifiedAssertion {
         scoped.children(namespace, local).len()
     }
 
+    /// An ATTRIBUTE of the descendant in `namespace` with local name `local`, if there is
+    /// EXACTLY ONE such descendant.
+    ///
+    /// # Why this exists beside [`Self::text_of`], and why SAML needs it
+    ///
+    /// Every condition a service provider has to enforce lives in an attribute of a descendant,
+    /// not in text and not on the assertion element: `Conditions/@NotBefore` and
+    /// `@NotOnOrAfter`, `SubjectConfirmationData/@Recipient`, `@InResponseTo` and its own
+    /// `@NotOnOrAfter`, `AudienceRestriction` alone being the exception. [`Self::attribute`]
+    /// reads the SIGNED ELEMENT's own attributes and [`Self::text_of`] reads a descendant's TEXT,
+    /// so between them a caller could read none of the values that decide whether an assertion is
+    /// usable -- and would have had to reach for the raw document to get them, which is exactly
+    /// the reach this type exists to prevent.
+    ///
+    /// # The same exactly-one rule, for the same reason
+    ///
+    /// Two `Conditions` elements inside one signed assertion verify like any other document. A
+    /// reader that took the first would be choosing which half of a contradiction to believe, and
+    /// two readers choosing differently is the defect class this crate is about -- so an
+    /// ambiguous read answers `None` and the caller decides.
+    ///
+    /// # NOT A NAMESPACE DECLARATION
+    ///
+    /// The same refusal [`Self::attribute`] makes, and for the same reason: exclusive
+    /// canonicalization emits only the declarations a subtree visibly USES, so an unused
+    /// `xmlns:evil` is never digested and returning it would hand a caller undigested
+    /// attacker-controlled bytes it believes were signed.
+    #[must_use]
+    pub fn attribute_of(&self, namespace: &str, local: &str, attribute: &str) -> Option<&str> {
+        if attribute == "xmlns" || attribute.starts_with("xmlns:") {
+            return None;
+        }
+        let found = collect(&self.signed, &self.inherited, namespace, local);
+        let [single] = found.as_slice() else {
+            return None;
+        };
+        single
+            .attributes
+            .iter()
+            .find(|candidate| candidate.name == attribute)
+            .map(|candidate| candidate.value.as_str())
+    }
+
     /// The text of the descendant in `namespace` with local name `local`, if there is EXACTLY
     /// ONE.
     ///
