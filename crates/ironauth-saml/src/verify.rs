@@ -145,6 +145,28 @@ impl VerifiedAssertion {
         &self.signed.name
     }
 
+    /// Whether the signed element is `namespace`:`local`, RESOLVED rather than string-matched.
+    ///
+    /// [`Self::name`] hands back the QUALIFIED name, prefix and all, and a caller that tested it
+    /// was testing a spelling. `name().ends_with("Assertion")` -- which is what the condition
+    /// layer did -- is wrong on TWO axes at once, and each admits a different document:
+    ///
+    /// - THE LOCAL NAME. It answers true for `evil:NotAnAssertion`, because the suffix is a
+    ///   suffix of that name too.
+    /// - THE NAMESPACE. It never looks at one, so `evil:Assertion` bound to `urn:evil` answers
+    ///   true as readily as the real thing.
+    ///
+    /// (It also answers TRUE, correctly, for the unprefixed `Assertion` an identity provider
+    /// writes under a default `xmlns` -- so the suffix test is not simply "too strict". It is
+    /// answering a different question from the one the caller meant.)
+    ///
+    /// This crate's own wrapping defence was once a rule about prefix spelling and it was a
+    /// bypass; the same mistake one layer up is the same bypass.
+    #[must_use]
+    pub fn is(&self, namespace: &str, local: &str) -> bool {
+        Scoped::new(&self.signed, self.inherited.clone()).is(namespace, local)
+    }
+
     /// An attribute of the signed element.
     ///
     /// NOT A NAMESPACE DECLARATION. Canonicalization emits only the declarations a subtree
@@ -183,6 +205,61 @@ impl VerifiedAssertion {
         scoped.children(namespace, local).len()
     }
 
+    /// Every element in `namespace` with local name `local` anywhere under the signature, each
+    /// as something a caller can read further values out of.
+    ///
+    /// # Why a caller needs the PARENT and not just the name
+    ///
+    /// [`Self::text_of`] searches every descendant, and for SAML that is the wrong question more often than it is the right one, because SAML reuses element names
+    /// under different parents with DIFFERENT MEANINGS:
+    ///
+    /// - `saml:Audience` is a child of `AudienceRestriction` ("this assertion is addressed to
+    ///   you") AND of `ProxyRestriction` ("somebody else may re-assert this to you"). A reader
+    ///   that took either would accept an assertion addressed to nobody.
+    /// - `saml:NameID` is the Subject's ("who this is") AND the `SubjectConfirmation`'s ("who may
+    ///   present this"). A reader that took either could sign in the confirming party.
+    ///
+    /// So a caller resolves the PARENT it means, and reads within it. The scope travels with the
+    /// element, which is what makes reading inside one safe: the same rule the internal
+    /// scope-carrying type exists for.
+    ///
+    /// EVERY match is returned rather than the unique one, because "exactly one" is not always
+    /// the rule: SAML permits several `AudienceRestriction` elements and requires the service
+    /// provider to satisfy all of them.
+    #[must_use]
+    pub fn elements(&self, namespace: &str, local: &str) -> Vec<SignedElement<'_>> {
+        collect_scoped(&self.signed, &self.inherited, namespace, local)
+            .into_iter()
+            .map(|scoped| SignedElement { scoped })
+            .collect()
+    }
+
+    /// The DIRECT CHILDREN of the signed element that are `namespace`:`local`.
+    ///
+    /// # Why a caller almost always wants THIS rather than [`Self::elements`]
+    ///
+    /// SAML puts an assertion's own `Issuer`, `Subject`, `Conditions` and statements at the top
+    /// level, and it ALSO permits whole nested assertions and arbitrary elements deeper down:
+    /// `saml:Advice` carries advisory assertions, and `saml:AttributeValue` is `xs:anyType`, so
+    /// an attribute's value may legitimately contain a `saml:Subject`, a `saml:Conditions` or a
+    /// `saml:Issuer` of its own. Those are somebody else's, and they are inside the signature
+    /// just as much as the real ones.
+    ///
+    /// A descendant search therefore finds elements that were never meant to answer the
+    /// question. It is also not even ordered the way a reader expects: the walk uses a stack, so
+    /// the first match returned is the LAST in document order.
+    ///
+    /// So the rule is: the values that decide who this is and whether it is valid are read as
+    /// DIRECT CHILDREN, and "exactly one" is enforced by the caller on the result.
+    #[must_use]
+    pub fn children(&self, namespace: &str, local: &str) -> Vec<SignedElement<'_>> {
+        Scoped::new(&self.signed, self.inherited.clone())
+            .children(namespace, local)
+            .into_iter()
+            .map(|scoped| SignedElement { scoped })
+            .collect()
+    }
+
     /// The text of the descendant in `namespace` with local name `local`, if there is EXACTLY
     /// ONE.
     ///
@@ -202,6 +279,204 @@ impl VerifiedAssertion {
             _ => None,
         }
     }
+}
+
+/// One element inside a verified signature, which a caller can read further values out of.
+///
+/// # Everything reachable from here was digested
+///
+/// Every constructor of this type -- [`VerifiedAssertion::elements`],
+/// [`VerifiedAssertion::children`], and [`Self::children`] on an element already inside one --
+/// walks only the subtree the signature covered, and each hands back another value of this same
+/// type. So the guarantee is closed under reading further: a value read through this was signed,
+/// and the namespace scope its ancestors put in force travels with it, so a qualified name
+/// resolves the way the document meant.
+///
+/// NOT DERIVED for `Debug`, for the reason [`VerifiedAssertion`] gives: the derived one would
+/// print every attribute of the retained element, namespace declarations included, and those are
+/// exactly the bytes exclusive canonicalization does not digest.
+#[derive(Clone)]
+pub struct SignedElement<'a> {
+    scoped: Scoped<'a>,
+}
+
+impl core::fmt::Debug for SignedElement<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SignedElement")
+            .field("name", &self.scoped.element.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> SignedElement<'a> {
+    /// An attribute of THIS element.
+    ///
+    /// NOT A NAMESPACE DECLARATION, for the reason [`VerifiedAssertion::attribute`] gives.
+    #[must_use]
+    pub fn attribute(&self, name: &str) -> Option<&str> {
+        if name == "xmlns" || name.starts_with("xmlns:") {
+            return None;
+        }
+        self.scoped
+            .element
+            .attributes
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .map(|candidate| candidate.value.as_str())
+    }
+
+    /// The COLLAPSED text of every DIRECT CHILD in `namespace` with local name `local`, in
+    /// document order.
+    ///
+    /// DIRECT children, which is the whole point of this type: a descendant search would find the
+    /// same names under a different parent, which in SAML means something else.
+    ///
+    /// COLLAPSED for the reason [`Self::text_collapsed`] gives: the one list of direct-child text
+    /// SAML asks a service provider to compare -- an `AudienceRestriction`'s `Audience` children
+    /// -- is a list of `xsd:anyURI`, and comparing those raw refuses a pretty-printed document
+    /// that says exactly the same thing.
+    #[must_use]
+    pub fn child_texts(&self, namespace: &str, local: &str) -> Vec<Option<String>> {
+        self.scoped
+            .children(namespace, local)
+            .into_iter()
+            .map(|scoped| SignedElement { scoped }.text_collapsed())
+            .collect()
+    }
+
+    /// The text of this element.
+    #[must_use]
+    pub fn text(&self) -> String {
+        text_content(self.scoped.element)
+    }
+
+    /// The RESOLVED `(namespace, local name)` of every direct child element, in document order.
+    ///
+    /// # For refusing what is not understood
+    ///
+    /// SAML Core 2.5 requires a service provider that cannot evaluate a `Condition` to treat the
+    /// assertion as invalid, and a check written as an allowlist needs to see what is actually
+    /// there.
+    ///
+    /// EACH NAME IS RESOLVED, NOT SPELLED. An earlier version answered LOCAL names only, on the
+    /// reasoning that the caller had already resolved the parent -- which does not follow: the
+    /// parent's namespace says nothing about its children's. An allowlist over local names
+    /// admits `evil:OneTimeUse` bound to `urn:evil` as something this server understands, which
+    /// is the identical bypass [`VerifiedAssertion::is`] exists to prevent one level up. The
+    /// namespace is the empty string for a child in no namespace at all.
+    #[must_use]
+    pub fn element_children(&self) -> Vec<(String, String)> {
+        let scope = self.scoped.scope();
+        self.scoped
+            .element
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                RichNode::Element(nested) => {
+                    let inner = scope_within(nested, &scope);
+                    let namespace = resolve(&nested.name, &inner).unwrap_or_default();
+                    Some((namespace, local_name(&nested.name).to_owned()))
+                }
+                RichNode::Text(_) | RichNode::ProcessingInstruction(_) => None,
+            })
+            .collect()
+    }
+
+    /// This element's text, refused outright if it has ELEMENT CHILDREN.
+    ///
+    /// # Simple content cannot contain elements, and concatenating across them invents a value
+    ///
+    /// `saml:Audience` and `saml:Issuer` are `xsd:anyURI` and `saml:NameID` is `xsd:string`. All
+    /// three are SIMPLE content: the schema forbids element children entirely. [`Self::text`]
+    /// concatenates the text of every descendant, so
+    ///
+    /// ```xml
+    /// <saml:Audience>https://sp.example<saml:Audience>/tenant</saml:Audience></saml:Audience>
+    /// ```
+    ///
+    /// reads as `https://sp.example/tenant` here while a schema-validating reader rejects the
+    /// document and a `firstChild.nodeValue` reader sees `https://sp.example`. Two readers
+    /// picking differently is the defect class this crate exists for, and for the audience it is
+    /// CVE-2026-9093 itself: the element's own text names one relying party and this crate reads
+    /// another.
+    ///
+    /// So the answer is `None` rather than a spliced string, and every caller treats that as the
+    /// refusal it is. This mirrors what the signature side already does with `has_element_child`
+    /// inside `ds:Transform`.
+    #[must_use]
+    pub fn text_simple(&self) -> Option<String> {
+        if self
+            .scoped
+            .element
+            .children
+            .iter()
+            .any(|child| matches!(child, RichNode::Element(_)))
+        {
+            return None;
+        }
+        Some(self.text())
+    }
+
+    /// This element's text with XSD `whiteSpace="collapse"` applied, refused if it has ELEMENT
+    /// CHILDREN for the reason [`Self::text_simple`] gives.
+    ///
+    /// # Why raw text is the wrong thing to compare for `saml:Audience` and `saml:Issuer`
+    ///
+    /// Both are `xsd:anyURI`, and XML Schema Part 2 gives `anyURI` the `collapse` whiteSpace
+    /// facet: leading and trailing whitespace is stripped and internal runs become one space
+    /// BEFORE any comparison, so
+    ///
+    /// ```xml
+    /// <saml:Audience>
+    ///   https://sp.example/metadata
+    /// </saml:Audience>
+    /// ```
+    ///
+    /// is the same value as the flush one, and an identity provider that pretty-prints its
+    /// assertions is not sending a different audience. Comparing raw text refuses a conformant
+    /// document -- and does it with "the assertion is addressed to a different service provider",
+    /// which sends an operator looking for a misconfiguration that is not there.
+    ///
+    /// NOT FOR `saml:NameID`, whose content is `xsd:string` and preserves whitespace: collapsing
+    /// there would map two distinct names onto one account.
+    #[must_use]
+    pub fn text_collapsed(&self) -> Option<String> {
+        self.text_simple().as_deref().map(collapse)
+    }
+
+    /// The DIRECT CHILDREN in `namespace` with local name `local`, to read further into.
+    #[must_use]
+    pub fn children(&self, namespace: &str, local: &str) -> Vec<SignedElement<'a>> {
+        self.scoped
+            .children(namespace, local)
+            .into_iter()
+            .map(|scoped| SignedElement { scoped })
+            .collect()
+    }
+}
+
+/// [`collect`], keeping the scope each match was found under.
+fn collect_scoped<'a>(
+    root: &'a RichElement,
+    inherited: &[Binding],
+    namespace: &str,
+    local: &str,
+) -> Vec<Scoped<'a>> {
+    let mut found = Vec::new();
+    let mut pending = vec![Scoped::new(root, inherited.to_vec())];
+    while let Some(scoped) = pending.pop() {
+        if scoped.is(namespace, local) {
+            found.push(scoped.clone());
+        }
+        let inner = scoped.scope();
+        for child in &scoped.element.children {
+            if let RichNode::Element(nested) = child {
+                pending.push(Scoped::new(nested, inner.clone()));
+            }
+        }
+    }
+    found
 }
 
 /// Verify `bytes` against `anchors`, returning the element the signature covers.
@@ -706,6 +981,19 @@ fn resolve(name: &str, scope: &[Binding]) -> Option<String> {
         .find(|binding| binding.prefix == prefix)
         .map(|binding| binding.uri.clone())
         .filter(|uri| !uri.is_empty())
+}
+
+/// XSD `whiteSpace="collapse"`, over the four characters the specification names.
+///
+/// NOT `str::split_whitespace`, which splits on the whole Unicode whitespace property -- so a
+/// NO-BREAK SPACE or an IDEOGRAPHIC SPACE inside a URI would be collapsed away and two values
+/// XSD says are DIFFERENT would compare equal. XML Schema Part 2 names exactly `#x9`, `#xA`,
+/// `#xD` and `#x20`, and everything else, whitespace-looking or not, is a character of the value.
+fn collapse(text: &str) -> String {
+    text.split(['\t', '\n', '\r', ' '])
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Every descendant (and the root itself) whose qualified name matches.

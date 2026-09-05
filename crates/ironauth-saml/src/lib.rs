@@ -208,7 +208,9 @@
 #![forbid(unsafe_code)]
 
 mod c14n;
+pub mod conditions;
 mod encrypted;
+mod instant;
 mod parse;
 mod tree;
 mod verify;
@@ -225,11 +227,13 @@ pub const ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 
 /// The SAML 2.0 protocol namespace, which `Response` and `AuthnRequest` are in.
 pub const PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+pub use conditions::{Accepted, ConditionError, Expectations, check};
 pub use encrypted::{
     DecryptError, KeyTransport, KeyTransportAlg, OaepDigest, OaepMgf, OaepParameters,
     decrypt_and_verify,
 };
-pub use verify::{TrustAnchor, VerifiedAssertion, VerifyError, verify};
+pub use instant::parse_utc;
+pub use verify::{SignedElement, TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.
 ///
@@ -419,21 +423,79 @@ pub mod test_util {
         key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
         id: &str,
     ) -> String {
-        // `xmlns:ds` sits on the `Signature`, so `SignedInfo` INHERITS it -- which exercises the
-        // inherited-scope path the canonicalizer got wrong, rather than sidestepping it.
-        let assertion = [
-            r#"<saml:Assertion ID=""#,
+        signed_response_with(
+            key,
             id,
-            r#""><saml:Issuer>urn:idp</saml:Issuer>"#,
-            "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
-            "</saml:Assertion>",
+            &[
+                "<saml:Issuer>urn:idp</saml:Issuer>",
+                "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
+            ]
+            .concat(),
+        )
+    }
+
+    /// [`signed_response`] with the assertion's children supplied by the caller.
+    ///
+    /// # Why the conditions corpus needs this
+    ///
+    /// A condition check is about values INSIDE the signed assertion -- the audience, the two
+    /// time bounds, the correlation, the recipient -- so a corpus for it has to vary those values
+    /// while the signature stays genuinely valid over each variant. Composing the children here
+    /// and signing whatever results is what makes "the audience is wrong" a document that really
+    /// verifies rather than one that fails for being unsigned, which is the same argument
+    /// [`signed_response`] makes about the wrapping corpus.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_response_with(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        id: &str,
+        children: &str,
+    ) -> String {
+        signed_element_with(key, "saml:Assertion", "", id, children)
+    }
+
+    /// [`signed_response_with`], for a root element that is NOT a `saml:Assertion`.
+    ///
+    /// `qualified` is written into the document verbatim and `declarations` is spliced into its
+    /// start tag, so a caller can sign an element in a namespace of its own invention.
+    ///
+    /// # Why a caller needs this
+    ///
+    /// `verify` takes the element to read as an ARGUMENT, so what it hands back is not
+    /// necessarily an assertion, and a condition check that tested the element's QUALIFIED name
+    /// -- `name().ends_with("Assertion")`, which is what an earlier version did -- answers true
+    /// for `evil:NotAnAssertion` in a namespace nobody trusts. That bypass is only testable if a
+    /// fixture can sign such an element, and signing an assertion in a loop cannot express it.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_element_with(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        qualified: &str,
+        declarations: &str,
+        id: &str,
+        children: &str,
+    ) -> String {
+        let assertion = [
+            "<",
+            qualified,
+            declarations,
+            r#" ID=""#,
+            id,
+            r#"">"#,
+            children,
+            "</",
+            qualified,
+            ">",
         ]
         .concat();
         let unsigned = wrap(&assertion);
-        // The digest is over the assertion with its signature removed, and there is none yet:
-        // the enveloped transform makes those the same thing.
-        let digest = digest_of(&unsigned, "saml:Assertion");
-
+        let digest = digest_of(&unsigned, qualified);
         let signed_info = [
             "<ds:SignedInfo>",
             r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
@@ -450,14 +512,12 @@ pub mod test_util {
             "</ds:DigestValue></ds:Reference></ds:SignedInfo>",
         ]
         .concat();
-        // Canonicalise SignedInfo in the place it will sit, so its inherited `ds` resolves.
         let staged = wrap(&with_signature(&assertion, &signed_info, ""));
         let message = canonicalize(&staged, "ds:SignedInfo").expect("the staged SignedInfo parses");
         let value = base64(&key.sign(message.as_bytes()));
         wrap(&with_signature(&assertion, &signed_info, &value))
     }
 
-    /// Put an assertion inside a response.
     fn wrap(assertion: &str) -> String {
         [
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
@@ -469,12 +529,25 @@ pub mod test_util {
     }
 
     /// Splice a signature into an assertion, immediately after its issuer.
+    ///
+    /// AN ASSERTION WITH NO ISSUER IS SIGNED AS THE FIRST CHILD INSTEAD, rather than refused
+    /// here. A document that names no author is exactly what a caller has to be able to compose,
+    /// because it is exactly what an attacker can send -- and a fixture builder that cannot
+    /// express it would make that case untestable.
     fn with_signature(assertion: &str, signed_info: &str, value: &str) -> String {
         let signature = format!(
             r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info}<ds:SignatureValue>{value}</ds:SignatureValue></ds:Signature>"#
         );
         let marker = "</saml:Issuer>";
-        let at = assertion.find(marker).expect("the issuer is there") + marker.len();
+        let at = match assertion.find(marker) {
+            Some(at) => at + marker.len(),
+            None => {
+                assertion
+                    .find('>')
+                    .expect("the assertion's own start tag is there")
+                    + 1
+            }
+        };
         format!("{}{signature}{}", &assertion[..at], &assertion[at..])
     }
 
