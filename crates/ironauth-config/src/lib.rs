@@ -5697,7 +5697,7 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
 ///
 /// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
 /// merely large, which is the distinction that decides what belongs in this function.
-/// Refuse a scim_push section that would run the worker without pausing.
+/// Refuse a `scim_push` section that would run the worker without pausing.
 fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
     if scim_push.enabled && scim_push.interval_secs == 0 {
         return Err(ConfigError::Invalid {
