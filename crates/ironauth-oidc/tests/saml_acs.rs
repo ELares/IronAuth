@@ -351,7 +351,12 @@ fn signed(key: &XmlTestKey, assertion_id: &str, in_response_to: Option<&'static 
 }
 
 #[tokio::test]
-async fn a_solicited_response_signs_somebody_in_and_spends_its_request_exactly_once() {
+async fn a_solicited_response_is_accepted_and_spends_its_request_exactly_once() {
+    // NOT "SIGNS SOMEBODY IN", WHICH IS WHAT THIS TEST USED TO BE CALLED. Nothing here mints a
+    // session: `consume` hands back the accepted `NameID`, assertion id and `InResponseTo`, and
+    // `saml_route`'s own module doc spends four paragraphs on why signing anybody in is the work
+    // that comes next rather than something this ships. The old name asserted a behaviour no
+    // line below it measured.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let fixture = fixture(&db, &env, false).await;

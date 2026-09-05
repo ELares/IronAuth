@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! IronAuth's ONE ASN.1 DER reader.
+//! IronAuth's ONE ASN.1 DER reader, and the encoder that writes what it reads.
 //!
 //! # Why it is a crate and not a module
 //!
@@ -23,7 +23,8 @@
 //!
 //! # What it is
 //!
-//! A READER only: it never allocates a parse tree, it borrows from the input, and every
+//! THE READER is the larger half and the one with the security argument: it never allocates a
+//! parse tree, it borrows from the input, and every
 //! malformed length or truncation is a clean [`DerError`], never a panic. It reads exactly the
 //! DER structures a certificate and an SPKI need -- nested TLV triples, tagged fields, integers,
 //! OIDs, bit and octet strings, and the two X.509 time forms.
@@ -33,6 +34,8 @@
 //! about ceremony parsing over `ciborium`. It supports definite-length DER, single- and
 //! multi-byte lengths, and the universal tags X.509 needs. An indefinite length, a constructed
 //! primitive, or an unknown high-tag-number form is rejected rather than guessed.
+
+pub mod write;
 
 /// A DER parse failure. One opaque reason set: the caller collapses every X.509
 /// or MDS3 failure to a single non-enumerating outcome, so this carries no wire
@@ -224,21 +227,27 @@ fn split_at_checked(slice: &[u8], mid: usize) -> Result<(&[u8], &[u8]), DerError
 
 /// Read a DER `OBJECT IDENTIFIER`'s contents into its dotted arc components.
 ///
-/// The first byte encodes the first two arcs as `40*a + b`; the rest are
-/// base-128 with the high bit as a continuation flag. Returns the arcs so a
-/// caller can compare against a known OID without a string round-trip.
+/// Every component is a base-128 SUBIDENTIFIER with the high bit as a continuation flag, and the
+/// FIRST subidentifier carries the first TWO arcs packed as `40*a + b` (X.690 8.19.4). Returns the
+/// arcs so a caller can compare against a known OID without a string round-trip.
+///
+/// THE FIRST SUBIDENTIFIER IS BASE-128 LIKE THE REST, which an earlier version of this function
+/// did not do: it read one byte and answered `first / 40, first % 40`. Two things were wrong with
+/// that. A first subidentifier of 128 or more is spread over several bytes, and reading one of
+/// them decoded a DIFFERENT OID than every conformant parser -- `81 34 03` is `2.100.3`, and the
+/// old reader answered `3.9.52.3`. And `first / 40` can answer 3 through 6, which is not a legal
+/// first arc at all: X.690 8.19.4 fixes the first arc at 0, 1 or 2, and the last of those absorbs
+/// everything from 80 upward, so the split is a three-way test rather than a division.
 ///
 /// # Errors
 ///
-/// [`DerError::BadValue`] on an empty OID or a truncated final arc.
+/// [`DerError::BadValue`] on an empty OID, a truncated final subidentifier, a non-minimal
+/// subidentifier, or one that does not fit a `u64`.
 pub fn oid_arcs(contents: &[u8]) -> Result<Vec<u64>, DerError> {
-    let (&first, rest) = contents.split_first().ok_or(DerError::BadValue)?;
-    let mut arcs = Vec::new();
-    arcs.push(u64::from(first / 40));
-    arcs.push(u64::from(first % 40));
+    let mut subidentifiers = Vec::new();
     let mut value: u64 = 0;
     let mut pending = false;
-    for &b in rest {
+    for &b in contents {
         // A LEADING CONTINUATION BYTE OF 0x80 IS A NON-MINIMAL ARC: seven zero bits in front of
         // the number, which X.690 8.19.2 forbids and which is a SECOND encoding of one value.
         // OpenSSL compares an OBJECT IDENTIFIER by its ENCODED BYTES, so it reads such an OID as
@@ -260,15 +269,25 @@ pub fn oid_arcs(contents: &[u8]) -> Result<Vec<u64>, DerError> {
             .and_then(|shifted| shifted.checked_add(u64::from(b & 0x7F)))
             .ok_or(DerError::BadValue)?;
         if b & 0x80 == 0 {
-            arcs.push(value);
+            subidentifiers.push(value);
             value = 0;
             pending = false;
         }
     }
     if pending {
-        // A final arc whose last byte still had the continuation bit set.
+        // A final subidentifier whose last byte still had the continuation bit set.
         return Err(DerError::BadValue);
     }
+    // X.690 8.19.4: THE FIRST SUBIDENTIFIER IS 40*arc1 + arc2, and arc1 is 0, 1 or 2. The top
+    // range is open -- arc1 of 2 admits any arc2, so everything from 80 upward belongs to it --
+    // which is why this is a three-way test and not a division by 40.
+    let (&first, rest) = subidentifiers.split_first().ok_or(DerError::BadValue)?;
+    let mut arcs = match first {
+        0..=39 => vec![0, first],
+        40..=79 => vec![1, first - 40],
+        _ => vec![2, first - 80],
+    };
+    arcs.extend_from_slice(rest);
     Ok(arcs)
 }
 
@@ -411,6 +430,26 @@ mod tests {
             oid_arcs(&contents).unwrap(),
             vec![1, 2, 840, 10045, 4, 3, 2]
         );
+    }
+
+    #[test]
+    fn the_first_subidentifier_is_base_128_and_splits_three_ways() {
+        // THE THREE-WAY SPLIT, at each boundary. 39 is the last arc2 under arc1 0; 40 and 79
+        // bracket arc1 1; 80 opens arc1 2, which is then unbounded.
+        assert_eq!(oid_arcs(&[39]).unwrap(), vec![0, 39]);
+        assert_eq!(oid_arcs(&[40]).unwrap(), vec![1, 0]);
+        assert_eq!(oid_arcs(&[79]).unwrap(), vec![1, 39]);
+        assert_eq!(oid_arcs(&[80]).unwrap(), vec![2, 0]);
+
+        // A FIRST SUBIDENTIFIER OVER 127, spread over two bytes. `81 34` is 180, which is
+        // 2.100 -- and the reader this replaced answered 3.9 for it, an arc1 that X.690 does not
+        // allow to exist. Every conformant parser reads these bytes as 2.100.3.
+        assert_eq!(oid_arcs(&[0x81, 0x34, 0x03]).unwrap(), vec![2, 100, 3]);
+
+        // AND A NON-MINIMAL FIRST SUBIDENTIFIER IS REFUSED, which the old reader could not do
+        // either: it consumed the first byte before the minimality check could see it, so
+        // `80 15` was read as an OID instead of rejected as a second encoding of one.
+        assert!(oid_arcs(&[0x80, 0x15]).is_err());
     }
 
     #[test]

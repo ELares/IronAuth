@@ -213,6 +213,7 @@ mod c14n;
 pub mod conditions;
 mod encrypted;
 mod instant;
+pub mod metadata;
 mod parse;
 mod tree;
 mod verify;
@@ -238,6 +239,7 @@ pub use encrypted::{
     decrypt_and_verify,
 };
 pub use instant::parse_utc;
+pub use metadata::{Descriptor, MetadataError, entity_descriptor};
 pub use verify::{SignedElement, TrustAnchor, VerifiedAssertion, VerifyError, verify};
 
 /// Test-only access to the canonicalizer.

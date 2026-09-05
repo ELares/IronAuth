@@ -110,9 +110,20 @@ pub async fn start_get(
         Ok(None) => return not_found(),
         Err(_) => return server_error(),
     };
-    let signing_key = match signing_key_for(&read, &connection_id).await {
-        Ok(key) => key,
-        Err(response) => return response,
+    let (signing_key, _stored) = match signing_key_for(&read, &connection_id).await {
+        Ok(loaded) => loaded,
+        // THE OPERATOR'S NEXT STEP IS PROVISIONING A KEY and re-uploading their metadata, which
+        // is a different action from anything else on this page.
+        Err(KeyUnavailable::NotProvisioned) => {
+            return refused(
+                StatusCode::CONFLICT,
+                "this connection has no signing key yet; provision one and upload the updated \
+                 metadata to your identity provider",
+            );
+        }
+        // NOT THE CALLER'S FAULT AND NOTHING THEY CAN DO, so it is a 500 rather than an
+        // explanation.
+        Err(KeyUnavailable::Unusable) => return server_error(),
     };
 
     // THE RETURN LOCATION IS VALIDATED BEFORE IT IS RECORDED, not when it is used. That does not
@@ -249,29 +260,41 @@ pub async fn start_get(
         .into_response()
 }
 
-/// Load the key this connection signs with, or the response explaining why it cannot.
+/// Why a connection's signing key could not be loaded.
+///
+/// AN OUTCOME RATHER THAN A RENDERED PAGE, WHICH IS A CORRECTION. An earlier version returned the
+/// `Response` itself, and its doc argued that keeping every sentence in one place was the point.
+/// The sentences were written for the START route, so once the metadata route shared this step a
+/// failed metadata fetch answered "Sign-in unavailable" and advised re-uploading the metadata the
+/// operator was at that moment trying to fetch. The shared step decides WHICH outcome; each route
+/// says what that outcome means where it is.
+pub(crate) enum KeyUnavailable {
+    /// No key is provisioned for this connection. The operator can act on this.
+    NotProvisioned,
+    /// The key could not be produced: the read failed, or the row named an algorithm this build
+    /// does not know, or its material did not load. THREE CAUSES, NOT THE TWO AN EARLIER VERSION
+    /// of this doc listed -- it omitted the store read, which is the one that is not the
+    /// operator's doing at all. They collapse to one variant because they collapse to one
+    /// answer: there is nothing the caller can do about any of them, and saying which would
+    /// describe this deployment's internals to an unauthenticated fetch.
+    Unusable,
+}
+
+/// Load the key this connection signs with, or why it cannot be.
 ///
 /// SPLIT OUT BECAUSE IT IS THE ONE STEP WITH THREE OUTCOMES -- a key, a connection that has none
-/// yet, and a row this build cannot load -- and each is a different thing to tell an operator.
-/// Returning the `Response` rather than an error type keeps every one of those sentences in one
-/// place instead of spreading them across a `From` impl.
-async fn signing_key_for(
+/// yet, and a row this build cannot load -- and because both routes that need a key need the same
+/// three.
+pub(crate) async fn signing_key_for(
     read: &ironauth_store::ScopedStore<'_>,
     connection_id: &SamlConnectionId,
-) -> Result<SigningKey, Response> {
+) -> Result<(SigningKey, ironauth_store::SamlSpKey), KeyUnavailable> {
     let key = match read.saml_connections().active_sp_key(connection_id).await {
         Ok(Some(key)) => key,
         // A CONNECTION WITH NO KEY CANNOT START A FLOW, and says so rather than sending an
-        // unsigned request. The operator's next step is provisioning one and re-uploading their
-        // metadata, which is a different action from anything else on this page.
-        Ok(None) => {
-            return Err(refused(
-                StatusCode::CONFLICT,
-                "this connection has no signing key yet; provision one and upload the updated \
-                 metadata to your identity provider",
-            ));
-        }
-        Err(_) => return Err(server_error()),
+        // unsigned request.
+        Ok(None) => return Err(KeyUnavailable::NotProvisioned),
+        Err(_) => return Err(KeyUnavailable::Unusable),
     };
     // THE ALGORITHM COMES FROM THE ROW, and an earlier version hardcoded `Rs256` here while
     // `redirect` derived `SigAlg` from the key -- which made "SigAlg comes from the key" a
@@ -279,20 +302,20 @@ async fn signing_key_for(
     // is the operator-visible fact; this is where it becomes the key's.
     let Some(algorithm) = jws_algorithm_for(&key.algorithm) else {
         // A ROW NAMING AN ALGORITHM THIS BUILD CANNOT LOAD. The column's CHECK admits one value
-        // today, so this is schema drift rather than configuration, and there is nothing the
-        // caller can do about it.
-        return Err(server_error());
+        // today, so this is schema drift rather than configuration.
+        return Err(KeyUnavailable::Unusable);
     };
     let Ok(signing_key) =
         SigningKey::rsa_from_pkcs1_der(Some(key.id.to_string()), algorithm, key.material.expose())
     else {
-        // THE STORED KEY DID NOT LOAD, which is a row this deployment wrote and cannot use. It
-        // is not the caller's fault and there is nothing they can do, so it is a 500 rather than
-        // an explanation.
-        return Err(server_error());
+        // THE STORED KEY DID NOT LOAD, which is a row this deployment wrote and cannot use.
+        return Err(KeyUnavailable::Unusable);
     };
 
-    Ok(signing_key)
+    // THE ROW COMES BACK WITH THE KEY, so a caller needing a fact about the key -- its creation
+    // instant, its id -- reads no second time. Two reads are two answers to "which key does this
+    // connection sign with", and a rotation between them publishes a mismatched pair.
+    Ok((signing_key, key))
 }
 
 /// The absolute URL to send the browser to.

@@ -446,6 +446,7 @@ fn excluded() -> BTreeMap<&'static str, &'static str> {
         "/t/{tenant_id}/e/{environment_id}/otp/sms/send",
         "/t/{tenant_id}/e/{environment_id}/pages.css",
         "/t/{tenant_id}/e/{environment_id}/saml/acs/{connection}",
+        "/t/{tenant_id}/e/{environment_id}/saml/metadata/{connection}",
         "/t/{tenant_id}/e/{environment_id}/saml/start/{connection}",
     ] {
         excluded.insert(
