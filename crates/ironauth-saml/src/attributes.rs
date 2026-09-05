@@ -15,8 +15,9 @@
 //! relying party, and a service provider that refused every assertion carrying an attribute it
 //! had no mapping for would break on the day somebody edited a profile schema.
 //!
-//! So this reads what is there, refuses what is AMBIGUOUS or UNREADABLE, and leaves what to do
-//! with the rest to the mapping.
+//! So this reads what is there, refuses only what is AMBIGUOUS -- two claims about one
+//! attribute, or an attribute nothing can key on -- and reports what it could not read
+//! ALONGSIDE what it could, leaving the decision to the mapping.
 //!
 //! # And why it answers Rust rather than JSON
 //!
@@ -35,6 +36,13 @@ use crate::verify::VerifiedAssertion;
 
 /// The SAML 2.0 assertion namespace.
 const ASSERTION: &str = crate::ASSERTION_NS;
+
+/// The `NameFormat` an absent one MEANS, per SAML Core 2.7.3.1.
+///
+/// Used for COMPARING two attributes, never for filling in [`Attribute::name_format`]: a caller
+/// that wants to know whether the provider said it can still tell, and one that wants the
+/// effective value can apply this itself.
+const UNSPECIFIED: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified";
 
 /// One `saml:Attribute` an identity provider sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +85,7 @@ pub enum Value {
     /// was cleared would get `""` written into their profile instead of the next source's value,
     /// or instead of nothing.
     Empty,
-    /// A value carrying ELEMENT children, with their local names in document order.
+    /// A value carrying ELEMENT children, each as its RESOLVED `(namespace, local name)`.
     ///
     /// `AttributeValue` is `xs:anyType`, so a conformant assertion may put a whole XML subtree
     /// in one. `saml:NameID` inside an `AttributeValue` is the case with published
@@ -89,7 +97,13 @@ pub enum Value {
     /// reported instead: the child names let a caller log what it declined to map, and decide
     /// whether the attribute is one it should be handling at all, rather than being handed
     /// either a fiction or a silence.
-    Structured(Vec<String>),
+    ///
+    /// WITH THE NAMESPACE, because a local name is not an identity. An earlier version answered
+    /// local names alone, so a caller deciding "is this a `NameID` I should read?" would have
+    /// been making the allowlist-on-spelling decision this crate removed from its own condition
+    /// layer -- `evil:NameID` and `saml:NameID` are different elements and a bare `"NameID"`
+    /// cannot tell them apart. The namespace is the empty string for a child in none.
+    Structured(Vec<(String, String)>),
 }
 
 /// Why an `AttributeStatement` could not be read.
@@ -98,9 +112,16 @@ pub enum Unreadable {
     /// The element handed in is not a `saml:Assertion`.
     ///
     /// [`crate::verify`] takes the element to read as an ARGUMENT and hands back whatever was
-    /// signed, so a caller may hold a verified `samlp:Response` -- which is the ONLY value
-    /// obtainable from the Response-only-signed profile Okta and ADFS emit. Its direct children
-    /// hold no `AttributeStatement`, so without this guard the answer was an empty list.
+    /// signed, so a caller may hold a verified `samlp:Response`. Its direct children hold no
+    /// `AttributeStatement`, so without this guard the answer was an empty list.
+    ///
+    /// NOT ATTRIBUTED TO A VENDOR, and an earlier version of this sentence was: it claimed Okta
+    /// and ADFS emit a Response-only-signed profile, which `crate::test_util::sign_response`'s
+    /// own doc contradicts -- they sign the Response AND the assertion, which is why that helper
+    /// exists. Response-only signing is a real configuration and the only shape where a
+    /// Response is the ONLY verified element available, but the guard does not need it: a
+    /// caller holding the wrong element is enough, and that needs no provider to behave in any
+    /// particular way.
     ///
     /// AND AN EMPTY LIST IS A REAL ANSWER HERE, which is what makes the silence dangerous: this
     /// module documents "no attributes" as "the identity provider sent none", so a mapping that
@@ -130,17 +151,6 @@ pub enum Unreadable {
         /// The `NameFormat` both carried, if any.
         name_format: Option<String>,
     },
-    /// The statement carries a `saml:EncryptedAttribute`.
-    ///
-    /// It is the SIBLING of `saml:Attribute` in an `AttributeStatement`, and this module reads
-    /// only the plaintext one. Reporting it rather than skipping it is the point: an encrypted
-    /// attribute silently dropped is an attribute an operator configured, that the identity
-    /// provider sent, and that simply never arrives -- and if it carries a `Name` this assertion
-    /// ALSO sends in the clear, the duplicate rule above never sees the pair.
-    ///
-    /// This is a refusal rather than a decryption because decrypting needs the connection's
-    /// private key, which is the ACS endpoint's to hold, not this function's.
-    EncryptedAttribute,
 }
 
 impl core::fmt::Display for Unreadable {
@@ -159,14 +169,32 @@ impl core::fmt::Display for Unreadable {
                 ),
                 None => write!(f, "the assertion says two different things about {name:?}"),
             },
-            Self::EncryptedAttribute => f.write_str(
-                "the assertion carries an encrypted attribute, which this server does not decrypt",
-            ),
         }
     }
 }
 
 impl core::error::Error for Unreadable {}
+
+/// What an assertion's `AttributeStatement`s said, and what they said that this cannot read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Statement {
+    /// The plaintext attributes, in document order.
+    pub attributes: Vec<Attribute>,
+    /// How many `saml:EncryptedAttribute` elements were present and not decrypted.
+    ///
+    /// A COUNT RATHER THAN A REFUSAL, and rather than nothing. Refusing the whole assertion for
+    /// one encrypted attribute contradicts this module's opening rule -- an attribute a caller
+    /// cannot use is not a reason to refuse anybody -- and skipping them silently means an
+    /// attribute an operator configured, that the provider sent, never arrives with nothing
+    /// said. So the readable attributes come back AND this comes back, and the caller decides:
+    /// a deployment mapping none of the encrypted names carries on, one mapping a name it can no
+    /// longer see stops.
+    ///
+    /// A COUNT rather than the names, because the `Name` is INSIDE the ciphertext -- an
+    /// `EncryptedAttribute` carries an `xenc:EncryptedData` and nothing this layer can read. A
+    /// field promising names would be one that could never be filled.
+    pub encrypted: usize,
+}
 
 /// Every attribute in the assertion's `AttributeStatement`s, in document order.
 ///
@@ -186,7 +214,7 @@ impl core::error::Error for Unreadable {}
 /// # Errors
 ///
 /// [`Unreadable`].
-pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Unreadable> {
+pub fn attributes(assertion: &VerifiedAssertion) -> Result<Statement, Unreadable> {
     // IT MUST BE AN ASSERTION, resolved rather than spelled, and [`crate::check`] guards its own
     // input with the identical line for the identical reason: `verify` takes the element to read
     // as an argument, so what arrives here is not necessarily an assertion -- and answering an
@@ -196,7 +224,7 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Unrea
         return Err(Unreadable::NotAnAssertion);
     }
 
-    let mut out: Vec<Attribute> = Vec::new();
+    let mut out = Statement::default();
     // DIRECT CHILDREN, at both levels. `AttributeValue` is `xs:anyType`, so an assertion may
     // legitimately carry a whole `AttributeStatement` inside one -- and it is inside this
     // signature just as much as the real one, so a descendant search would collect somebody
@@ -208,26 +236,33 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Unrea
     // build is a guard nobody will keep.)
     for statement in assertion.children(ASSERTION, "AttributeStatement") {
         // AN ENCRYPTED ATTRIBUTE IS THE SIBLING OF A PLAINTEXT ONE and this reads only the
-        // second, so the presence of one has to be reported rather than stepped over.
-        if !statement
-            .children(ASSERTION, "EncryptedAttribute")
-            .is_empty()
-        {
-            return Err(Unreadable::EncryptedAttribute);
-        }
+        // second, so the presence of one is COUNTED rather than stepped over -- and counted
+        // rather than refused, because refusing would discard every attribute this assertion
+        // does carry in the clear.
+        out.encrypted += statement.children(ASSERTION, "EncryptedAttribute").len();
         for attribute in statement.children(ASSERTION, "Attribute") {
+            // TRIMMED FOR THE CHECK, NOT FOR THE VALUE. `Name=" "` is present and non-empty,
+            // so a check on emptiness alone admits it -- and a mapping keyed on a space is no
+            // more usable than one keyed on the empty string. The value handed back stays
+            // untrimmed, because a Name is compared as a string and this crate does not get to
+            // decide two providers' names are the same.
             let name = attribute.attribute("Name").unwrap_or_default();
-            if name.is_empty() {
+            if name.trim().is_empty() {
                 return Err(Unreadable::NamelessAttribute);
             }
             let name_format = attribute.attribute("NameFormat").map(ToOwned::to_owned);
             // ACROSS THE WHOLE ASSERTION, not per statement: an identity provider assembling a
             // response from two sources emits two statements, and that is exactly where a
             // collision arrives.
-            if out
-                .iter()
-                .any(|seen| seen.name == name && seen.name_format == name_format)
-            {
+            // COMPARED ON THE EFFECTIVE FORMAT, not the surface spelling. SAML Core 2.7.3.1
+            // says an absent `NameFormat` MEANS `unspecified` -- which this file states in
+            // [`Attribute::name_format`]'s own doc -- so comparing `Option<String>` made one
+            // attribute sent twice into two attributes, and adding the optional attribute to
+            // the second element turned a refusal into a silent choice between two values.
+            let effective = name_format.as_deref().unwrap_or(UNSPECIFIED);
+            if out.attributes.iter().any(|seen| {
+                seen.name == name && seen.name_format.as_deref().unwrap_or(UNSPECIFIED) == effective
+            }) {
                 return Err(Unreadable::Duplicate {
                     name: name.to_owned(),
                     name_format,
@@ -238,7 +273,7 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Unrea
                 .iter()
                 .map(value_of)
                 .collect();
-            out.push(Attribute {
+            out.attributes.push(Attribute {
                 name: name.to_owned(),
                 name_format,
                 values,
@@ -252,7 +287,7 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Vec<Attribute>, Unrea
 fn value_of(value: &crate::verify::SignedElement<'_>) -> Value {
     let children = value.element_children();
     if !children.is_empty() {
-        return Value::Structured(children.into_iter().map(|(_, local)| local).collect());
+        return Value::Structured(children);
     }
     match value.text_simple() {
         Some(text) if !text.is_empty() => Value::Text(text),

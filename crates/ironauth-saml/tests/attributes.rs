@@ -25,7 +25,7 @@
 
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_saml::{
-    ASSERTION_NS, Attribute, Limits, PROTOCOL_NS, TrustAnchor, Unreadable, Value, attributes,
+    ASSERTION_NS, Limits, PROTOCOL_NS, Statement, TrustAnchor, Unreadable, Value, attributes,
     verify,
 };
 
@@ -33,9 +33,10 @@ const EMAIL: &str = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/email
 const GROUPS: &str = "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups";
 const BASIC: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:basic";
 const URI_FORMAT: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:uri";
+const UNSPECIFIED: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified";
 
 /// Sign these assertion children, verify the ASSERTION, and read the attributes.
-fn read(children: &str) -> Result<Vec<Attribute>, Unreadable> {
+fn read(children: &str) -> Result<Statement, Unreadable> {
     let key = XmlTestKey::generate();
     let document = ironauth_saml::test_util::signed_response_with(&key, "_assertion", children);
     let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
@@ -81,22 +82,29 @@ fn an_ordinary_statement_reads_in_document_order_with_its_formats() {
     ))))
     .expect("an ordinary statement");
 
-    assert_eq!(found.len(), 2, "an attribute was dropped or invented");
-    assert_eq!(found[0].name, EMAIL, "document order was not preserved");
-    assert_eq!(found[0].name_format.as_deref(), Some(BASIC));
     assert_eq!(
-        found[0].values,
+        found.attributes.len(),
+        2,
+        "an attribute was dropped or invented"
+    );
+    assert_eq!(
+        found.attributes[0].name, EMAIL,
+        "document order was not preserved"
+    );
+    assert_eq!(found.attributes[0].name_format.as_deref(), Some(BASIC));
+    assert_eq!(
+        found.attributes[0].values,
         vec![Value::Text("ada@globex.example".to_owned())]
     );
 
-    assert_eq!(found[1].name, GROUPS);
+    assert_eq!(found.attributes[1].name, GROUPS);
     assert_eq!(
-        found[1].name_format, None,
+        found.attributes[1].name_format, None,
         "an absent NameFormat was defaulted, so 'the provider said unspecified' and 'the \
          provider said nothing' became the same answer"
     );
     assert_eq!(
-        found[1].values,
+        found.attributes[1].values,
         vec![
             Value::Text("engineering".to_owned()),
             Value::Text("oncall".to_owned())
@@ -120,9 +128,16 @@ fn several_statements_are_one_list_in_document_order() {
         statement(&attribute(GROUPS, None, &["engineering"]))
     )))
     .expect("two statements");
-    assert_eq!(two.len(), 2, "a second AttributeStatement was ignored");
     assert_eq!(
-        (two[0].name.as_str(), two[1].name.as_str()),
+        two.attributes.len(),
+        2,
+        "a second AttributeStatement was ignored"
+    );
+    assert_eq!(
+        (
+            two.attributes[0].name.as_str(),
+            two.attributes[1].name.as_str()
+        ),
         (EMAIL, GROUPS),
         "the statements were collected out of document order"
     );
@@ -133,7 +148,7 @@ fn several_statements_are_one_list_in_document_order() {
         "<saml:AuthnStatement AuthnInstant=\"2026-01-01T00:00:00Z\"/>",
     ))
     .expect("an assertion with no attributes at all");
-    assert!(none.is_empty(), "an empty list was not empty");
+    assert!(none.attributes.is_empty(), "an empty list was not empty");
 }
 
 #[test]
@@ -146,8 +161,8 @@ fn an_attribute_with_no_values_is_not_the_same_as_an_absent_attribute() {
         "<saml:Attribute Name=\"{GROUPS}\"/>"
     ))))
     .expect("an attribute with no values");
-    assert_eq!(found.len(), 1, "an empty attribute was dropped");
-    assert!(found[0].values.is_empty());
+    assert_eq!(found.attributes.len(), 1, "an empty attribute was dropped");
+    assert!(found.attributes[0].values.is_empty());
 }
 
 #[test]
@@ -168,7 +183,7 @@ fn an_empty_value_is_not_the_empty_string() {
     ))))
     .expect("empty values are not a refusal");
     assert_eq!(
-        found[0].values,
+        found.attributes[0].values,
         vec![
             Value::Empty,
             Value::Empty,
@@ -186,7 +201,10 @@ fn an_empty_value_is_not_the_empty_string() {
          </saml:Attribute>"
     ))))
     .expect("a whitespace value");
-    assert_eq!(spaced[0].values, vec![Value::Text(" ".to_owned())]);
+    assert_eq!(
+        spaced.attributes[0].values,
+        vec![Value::Text(" ".to_owned())]
+    );
 }
 
 #[test]
@@ -201,7 +219,11 @@ fn the_same_name_under_one_format_is_a_contradiction_and_under_two_is_two_attrib
         attribute(EMAIL, Some(URI_FORMAT), &["ada@globex.example"])
     ))))
     .expect("one name in two formats is two attributes");
-    assert_eq!(two_formats.len(), 2, "a conformant pair was refused");
+    assert_eq!(
+        two_formats.attributes.len(),
+        2,
+        "a conformant pair was refused"
+    );
 
     // UNDER ONE FORMAT IT IS A SECOND CLAIM. Taking either is choosing which half of a
     // contradiction to believe, and somebody who can append chooses for the reader. The two
@@ -219,6 +241,33 @@ fn the_same_name_under_one_format_is_a_contradiction_and_under_two_is_two_attrib
         }),
         "an assertion claiming two emails in one format had one of them believed"
     );
+
+    // ABSENT AND EXPLICIT `unspecified` ARE ONE ATTRIBUTE, which is where the round-1 fix moved
+    // the defect rather than removing it. Round 1 keyed the duplicate on `Name` alone and would
+    // have caught this pair; adding `NameFormat` to the key as an `Option<String>` made the
+    // surface spelling the identity, so ONE OPTIONAL ATTRIBUTE whose value SAML defines as the
+    // default turns a refusal into a silent choice between two emails.
+    assert_eq!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, None, &["ada@globex.example"]),
+            attribute(EMAIL, Some(UNSPECIFIED), &["attacker@evil.example"])
+        )))),
+        Err(Unreadable::Duplicate {
+            name: EMAIL.to_owned(),
+            name_format: Some(UNSPECIFIED.to_owned()),
+        }),
+        "an absent NameFormat and an explicit `unspecified` were read as two attributes"
+    );
+    // AND THE OTHER ORDER, so the rule is about the pair and not about which came first.
+    assert!(matches!(
+        read(&body(&statement(&format!(
+            "{}{}",
+            attribute(EMAIL, Some(UNSPECIFIED), &["ada@globex.example"]),
+            attribute(EMAIL, None, &["attacker@evil.example"])
+        )))),
+        Err(Unreadable::Duplicate { .. })
+    ));
 
     // AND WITH NO FORMAT ON EITHER, which is the shape most providers send.
     assert_eq!(
@@ -278,7 +327,11 @@ fn the_duplicate_rule_reaches_past_the_attribute_next_to_it() {
         attribute(&format!(" {EMAIL}"), None, &["padded"])
     ))))
     .expect("three names that differ");
-    assert_eq!(nearly.len(), 3, "two distinct names were folded into one");
+    assert_eq!(
+        nearly.attributes.len(),
+        3,
+        "two distinct names were folded into one"
+    );
 }
 
 #[test]
@@ -306,33 +359,54 @@ fn an_attribute_with_no_usable_name_is_refused_rather_than_dropped() {
 }
 
 #[test]
-fn an_encrypted_attribute_is_reported_rather_than_stepped_over() {
+fn an_encrypted_attribute_is_counted_beside_what_was_read_and_not_instead_of_it() {
     // `saml:EncryptedAttribute` IS THE SIBLING OF `saml:Attribute` in an `AttributeStatement`,
     // and this module reads only the second. Skipping it silently means an attribute an operator
-    // configured, that the provider sent, and that never arrives -- and if it carries a `Name`
-    // the assertion ALSO sends in the clear, the duplicate rule never sees the pair.
+    // configured, that the provider sent, never arrives with nothing said.
+    //
+    // BUT REFUSING THE WHOLE ASSERTION FOR ONE contradicts this module's opening rule -- an
+    // attribute a caller cannot use is not a reason to refuse anybody -- and an earlier version
+    // did exactly that, discarding every attribute the assertion carried in the clear. So both
+    // halves come back and the caller decides.
+    let mixed = read(&body(&statement(&format!(
+        "{}<saml:EncryptedAttribute><xenc:EncryptedData \
+         xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\"/></saml:EncryptedAttribute>\
+         <saml:EncryptedAttribute/>",
+        attribute(EMAIL, None, &["ada@globex.example"])
+    ))))
+    .expect("an encrypted attribute is not a refusal");
     assert_eq!(
-        read(&body(&statement(&format!(
-            "{}<saml:EncryptedAttribute><xenc:EncryptedData \
-             xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\"/></saml:EncryptedAttribute>",
-            attribute(EMAIL, None, &["ada@globex.example"])
-        )))),
-        Err(Unreadable::EncryptedAttribute),
-        "an encrypted attribute was silently dropped"
+        mixed.encrypted, 2,
+        "the encrypted attributes were not counted, or were counted once for the statement"
+    );
+    assert_eq!(
+        mixed.attributes.len(),
+        1,
+        "the readable attribute was discarded because an unreadable one sat beside it"
+    );
+    assert_eq!(
+        mixed.attributes[0].values,
+        vec![Value::Text("ada@globex.example".to_owned())]
     );
 
-    // THE CONTROL: the same statement without it reads, so the refusal is about the encrypted
-    // element and not about anything else in the fixture.
-    assert_eq!(
-        read(&body(&statement(&attribute(
-            EMAIL,
-            None,
-            &["ada@globex.example"]
-        ))))
-        .expect("the control")
-        .len(),
-        1
-    );
+    // A STATEMENT CARRYING ONLY ENCRYPTED ATTRIBUTES is the case that separates "counted" from
+    // "counted only when something else was read": nothing pins the count if every fixture also
+    // carries a plaintext attribute.
+    let only = read(&body(&statement("<saml:EncryptedAttribute/>")))
+        .expect("a statement of only encrypted attributes");
+    assert_eq!(only.encrypted, 1);
+    assert!(only.attributes.is_empty());
+
+    // AND THE CONTROL: no encrypted element means a count of zero, so the field is not simply
+    // always non-zero.
+    let clear = read(&body(&statement(&attribute(
+        EMAIL,
+        None,
+        &["ada@globex.example"],
+    ))))
+    .expect("the control");
+    assert_eq!(clear.encrypted, 0);
+    assert_eq!(clear.attributes.len(), 1);
 }
 
 #[test]
@@ -354,10 +428,13 @@ fn a_value_carrying_elements_reports_its_shape_and_is_not_flattened() {
     ))))
     .expect("a structured value is not a refusal");
     assert_eq!(
-        found[0].values,
+        found.attributes[0].values,
         vec![
             Value::Text("engineering".to_owned()),
-            Value::Structured(vec!["NameID".to_owned(), "SubjectConfirmation".to_owned()])
+            Value::Structured(vec![
+                (ASSERTION_NS.to_owned(), "NameID".to_owned()),
+                (ASSERTION_NS.to_owned(), "SubjectConfirmation".to_owned()),
+            ])
         ],
         "a structured value was flattened, dropped so the text values shifted, or reported \
          without the shape a caller has to act on"
@@ -382,15 +459,22 @@ fn an_attribute_statement_inside_a_value_belongs_to_whoever_wrote_it() {
     ))))
     .expect("a nested statement is not this assertion's problem");
 
-    assert_eq!(found.len(), 2, "a nested AttributeStatement was collected");
     assert_eq!(
-        found[0].values,
+        found.attributes.len(),
+        2,
+        "a nested AttributeStatement was collected"
+    );
+    assert_eq!(
+        found.attributes[0].values,
         vec![Value::Text("ada@globex.example".to_owned())],
         "the nested email displaced the real one"
     );
     assert_eq!(
-        found[1].values,
-        vec![Value::Structured(vec!["AttributeStatement".to_owned()])],
+        found.attributes[1].values,
+        vec![Value::Structured(vec![(
+            ASSERTION_NS.to_owned(),
+            "AttributeStatement".to_owned(),
+        )])],
         "the nested statement was read as text rather than left alone"
     );
 }
@@ -408,7 +492,7 @@ fn an_element_in_a_foreign_namespace_is_not_this_assertions_attribute() {
     )))
     .expect("a foreign element beside a real attribute");
     assert_eq!(
-        found.len(),
+        found.attributes.len(),
         1,
         "an element merely NAMED Attribute became one of this assertion's attributes"
     );
@@ -423,7 +507,7 @@ fn an_element_in_a_foreign_namespace_is_not_this_assertions_attribute() {
     ))))
     .expect("a foreign value beside a real one");
     assert_eq!(
-        inner[0].values,
+        inner.attributes[0].values,
         vec![Value::Text("ada@globex.example".to_owned())],
         "a foreign AttributeValue became one of this attribute's values"
     );
@@ -436,7 +520,7 @@ fn an_element_in_a_foreign_namespace_is_not_this_assertions_attribute() {
     )))
     .expect("a foreign statement");
     assert!(
-        wrapped.is_empty(),
+        wrapped.attributes.is_empty(),
         "an attribute inside a foreign AttributeStatement was collected"
     );
 
@@ -448,7 +532,7 @@ fn an_element_in_a_foreign_namespace_is_not_this_assertions_attribute() {
         attribute(EMAIL, None, &["ada@globex.example"])
     )))
     .expect("a foreign EncryptedAttribute is not this assertion's");
-    assert_eq!(foreign_encrypted.len(), 1);
+    assert_eq!(foreign_encrypted.attributes.len(), 1);
 }
 
 #[test]
@@ -496,9 +580,80 @@ fn a_verified_response_is_not_an_assertion_and_answering_nothing_would_be_worse(
     )
     .expect("the assertion is signed too");
     let found = attributes(&assertion).expect("the assertion reads");
-    assert_eq!(found.len(), 1);
+    assert_eq!(found.attributes.len(), 1);
     assert_eq!(
-        found[0].values,
+        found.attributes[0].values,
         vec![Value::Text("ada@globex.example".to_owned())]
     );
+}
+
+#[test]
+fn the_assertion_guard_resolves_the_name_rather_than_reading_its_spelling() {
+    // THE ONLY FIXTURE FOR THIS GUARD WAS A `samlp:Response`, which fails a suffix test, a
+    // local-name test and a namespace test alike -- so the guard's own "resolved rather than
+    // spelled" claim was unmeasured, and weakening it to any of the three left the suite green.
+    //
+    // `evil:Assertion` in a namespace nobody trusts has the RIGHT local name and the wrong
+    // identity, so only a resolved check refuses it.
+    let key = XmlTestKey::generate();
+    let document = ironauth_saml::test_util::signed_element_with(
+        &key,
+        "evil:Assertion",
+        r#" xmlns:evil="urn:evil""#,
+        "_assertion",
+        &body(&statement(&attribute(
+            EMAIL,
+            None,
+            &["attacker@evil.example"],
+        ))),
+    );
+    let anchors = [TrustAnchor::EcdsaP256(key.public_point())];
+    let signed = verify(
+        document.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        "urn:evil",
+        "Assertion",
+    )
+    .expect("the fixture must verify, or this test measures nothing");
+    assert_eq!(
+        signed.name(),
+        "evil:Assertion",
+        "the fixture no longer expresses the case: its LOCAL name must be Assertion"
+    );
+    assert_eq!(
+        attributes(&signed),
+        Err(Unreadable::NotAnAssertion),
+        "an element whose local name is Assertion, in a namespace nobody trusts, was read as one"
+    );
+}
+
+#[test]
+fn a_name_that_is_only_whitespace_is_not_a_name_and_the_one_returned_is_untouched() {
+    // `Name=" "` IS PRESENT AND NON-EMPTY, so a check on emptiness alone admits it -- and a
+    // mapping keyed on a space is no more usable than one keyed on the empty string, which is
+    // what the guard's own doc says it exists to catch.
+    for blank in [" ", "\t", "\n  "] {
+        assert_eq!(
+            read(&body(&statement(&format!(
+                "<saml:Attribute Name=\"{blank}\">\
+                 <saml:AttributeValue>x</saml:AttributeValue></saml:Attribute>"
+            )))),
+            Err(Unreadable::NamelessAttribute),
+            "a Name of only whitespace ({blank:?}) was accepted"
+        );
+    }
+
+    // AND A NAME WITH SURROUNDING WHITESPACE IS RETURNED UNTOUCHED. The check trims; the VALUE
+    // does not. A `Name` is compared as a string, so trimming it here would be this crate
+    // deciding two providers' attribute names are the same -- and an earlier version of the
+    // case/whitespace test asserted only the COUNT, so folding at the push site survived it.
+    let padded = format!(" {EMAIL} ");
+    let found = read(&body(&statement(&attribute(&padded, None, &["value"]))))
+        .expect("a padded name is a name");
+    assert_eq!(
+        found.attributes[0].name, padded,
+        "the Name was trimmed on its way out, so two distinct attributes would collide"
+    );
+    assert_ne!(found.attributes[0].name, EMAIL);
 }
