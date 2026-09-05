@@ -50,8 +50,8 @@ const UNSPECIFIED_NAMEID: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:unsp
 /// XSD's `collapse` whiteSpace facet: the four characters it treats as whitespace, folded to
 /// single spaces with the ends trimmed.
 ///
-/// EXACTLY FOUR, not `char::is_whitespace`. XSD 1.0 Part 2 3.1 names `#x9`, `#xA`, `#xD` and
-/// `#x20` and no others, so folding a NO-BREAK SPACE or an ideographic space would make this
+/// EXACTLY FOUR, not `char::is_whitespace`. XSD's `whiteSpace` facet folds the whitespace of
+/// XML 1.0's `S` production, which is `#x20 | #x9 | #xD | #xA` and nothing else, so folding a NO-BREAK SPACE or an ideographic space would make this
 /// reader treat as one value a pair a schema-aware reader sees as two. `ironauth-saml` makes the
 /// same choice in two places, for the same reason.
 fn collapse(text: &str) -> String {
@@ -95,8 +95,10 @@ pub struct Consumed {
 /// names a different fix.
 ///
 /// WHAT THEY DO CARRY: a variant past [`Self::Signature`] may quote the document, and several
-/// do -- this enum's own `found`, and the `found` inside the wrapped [`ConditionError`] and
-/// [`Unreadable`] variants. An earlier version of this sentence said none of them did, which
+/// do -- this enum's own `found`, the `found` inside several [`ConditionError`] variants, and
+/// [`Unreadable::Duplicate`]'s `name` and `name_format`, which are document text under different
+/// names. Anyone auditing which fields can carry identity-provider strings should read that as
+/// "any field on any variant past `Signature`", not as a list of fields called `found`. An earlier version of this sentence said none of them did, which
 /// was false through the wrapped types before round 1 and false at this enum's own level after
 /// it. Quoting is SAFE HERE and deliberately not in those crates, because reaching any variant
 /// past `Signature` requires a signature by a certificate the operator pinned: the document is
@@ -120,15 +122,23 @@ pub enum AcsError {
     /// told that -- rather than "the signature did not verify", which sends them to look at
     /// their identity provider.
     NoTrustAnchor,
-    /// Certificates are pinned, and not one of them is usable at this moment.
+    /// Certificates are pinned, and not one of them could be turned into a key.
     ///
-    /// SEPARATE FROM [`Self::NoTrustAnchor`] BECAUSE THE FIX DIFFERS. "Pin a certificate" and
-    /// "the ones you pinned have expired, or are of a kind this build cannot verify with" send
-    /// an operator to two different places, and an expiry is the one they will hit years after
-    /// setup with nothing else changed. Collapsing them would tell somebody staring at three
-    /// pinned rows that they have none.
+    /// SEPARATE FROM [`Self::NoTrustAnchor`] BECAUSE THE FIX DIFFERS: "pin a certificate" and
+    /// "the rows you have are not usable" send an operator to two different places, and telling
+    /// somebody staring at three pinned rows that they have none is the wrong sentence.
+    ///
+    /// WHAT CAN ACTUALLY PRODUCE IT is narrower than an earlier version of this doc said. It
+    /// claimed an expiry -- "the one they will hit years after setup" -- and a key kind this
+    /// build cannot verify with. Neither reaches here: [`anchors`] does not read the validity
+    /// columns, deliberately and for the reason written there, and every [`SamlKeyKind`] maps to
+    /// a [`TrustAnchor`] (a kind the store cannot parse fails the whole read instead). The one
+    /// producer is an `rsa` row whose exponent is absent, which migration 0197's CHECK forbids.
+    /// So in practice this names SCHEMA DRIFT -- a row the database should not be holding -- and
+    /// it exists because the alternative to answering it is a panic in an endpoint anybody can
+    /// post to.
     AllCertificatesUnusable {
-        /// How many are pinned, all of them unusable.
+        /// How many are pinned, none of them usable.
         pinned: usize,
     },
     /// The signature did not verify, or the document was not one this server will read.
@@ -182,8 +192,8 @@ impl core::fmt::Display for AcsError {
             Self::NoTrustAnchor => f.write_str("the connection has no pinned certificate at all"),
             Self::AllCertificatesUnusable { pinned } => write!(
                 f,
-                "all {pinned} of the connection's pinned certificates are outside their validity \
-                 window or of a kind this server cannot verify with"
+                "none of the connection's {pinned} pinned certificates could be read as a key, \
+                 which means a stored row this server should not be holding"
             ),
             Self::Signature(error) => write!(f, "the response did not verify: {error}"),
             Self::Condition(error) => write!(f, "the assertion was refused: {error}"),
@@ -238,10 +248,13 @@ impl From<StoreError> for AcsError {
 /// your three certificates is unusable" into "nobody can sign in", which is the wrong blast
 /// radius for a configuration problem.
 ///
-/// An empty result is [`AcsError::NoTrustAnchor`] at the call site -- so "skipped" and "fatal"
-/// are the SAME OUTCOME when the unusable certificate is the only one, and a test with a
-/// one-element list cannot tell them apart. What "skipped" buys is the multi-certificate case,
-/// which is what a rollover is made of.
+/// AN EMPTY RESULT IS TWO DIFFERENT ANSWERS at the call site: [`AcsError::NoTrustAnchor`] when
+/// nothing is pinned, and [`AcsError::AllCertificatesUnusable`] when rows exist and none of them
+/// became a key. An earlier version of this paragraph said the empty result was always the first
+/// and that a one-element list could not tell "skipped" from "fatal" apart; both stopped being
+/// true when the variants were split, and a one-element list is exactly what tells them apart
+/// now. What SKIPPING still buys is the multi-certificate case -- one bad row among three must
+/// not lock the connection out, which is what a rollover is made of.
 ///
 /// EXPIRY IS NOT CHECKED HERE, and a later round of review tried to add the check before
 /// reading this paragraph, so it is worth stating what holds it up. What is pinned on a
@@ -303,8 +316,8 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
     let anchors = anchors(acs.certificates);
     if anchors.is_empty() {
         // WHICH EMPTINESS THIS IS decides what the operator does next, so the two are not one
-        // error. Nothing pinned is a setup step; everything pinned being unusable is an expiry
-        // or a key kind, and is what a connection that worked for a year turns into.
+        // error. Nothing pinned is a setup step; rows that exist and cannot be read is a stored
+        // row the schema should have refused, and those are different conversations.
         return Err(if acs.certificates.is_empty() {
             AcsError::NoTrustAnchor
         } else {
@@ -312,9 +325,6 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
                 pinned: acs.certificates.len(),
             }
         });
-    }
-    if anchors.is_empty() {
-        return Err(AcsError::NoTrustAnchor);
     }
     let assertion = verify(response, acs.limits, &anchors, ASSERTION_NS, "Assertion")
         .map_err(AcsError::Signature)?;
@@ -389,7 +399,15 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
             .as_deref()
             .unwrap_or(UNSPECIFIED_NAMEID),
     );
-    if found_format != expected_format {
+    // A COLUMN THAT COLLAPSES TO NOTHING CONFIGURES NOTHING, and collapsing both sides is what
+    // opened that: migration 0196 only asks that `nameid_format` be non-empty, so a single space
+    // -- a paste artefact -- is storable, and it collapses to `""`. A document carrying
+    // `Format=""` or `Format="   "` collapses to `""` as well, so the two would compare equal and
+    // a check whose job is to stop a transient `NameID` being keyed as a persistent one would be
+    // vacuous on that connection. The raw comparison this replaced refused that pair by accident;
+    // this refuses it on purpose, and fails closed rather than inventing a default the operator
+    // did not choose.
+    if expected_format.is_empty() || found_format != expected_format {
         // THE FORMAT IS PART OF THE IDENTITY, not decoration. `transient` names somebody for one
         // session and `persistent` names them forever; accepting a transient `NameID` where a
         // connection was configured for a persistent one keys an account to a value that will
@@ -444,11 +462,17 @@ pub fn examine(acs: &Acs<'_>, response: &[u8]) -> Result<(Accepted, Statement), 
 /// 2. THE ASSERTION ID. `admit_assertion` is an `INSERT ... ON CONFLICT DO NOTHING`, so the same
 ///    assertion presented twice inserts once and the second is [`AcsError::Replayed`].
 ///
-/// THE REQUEST IS SPENT BEFORE THE ASSERTION IS ADMITTED, and that order matters for the
-/// unsolicited path more than the solicited one: an unsolicited response has no request, so the
-/// assertion id is the ONLY thing standing between it and unlimited replay. Admitting it last
-/// means a solicited response that loses the request race never consumes a replay slot it did
-/// not use.
+/// THE REQUEST IS SPENT BEFORE THE ASSERTION IS ADMITTED, and that is a SOLICITED-PATH property.
+/// An earlier version of this paragraph ranked it the other way round -- "matters for the
+/// unsolicited path more" -- and then refuted itself in the next clause: an unsolicited response
+/// has no request, so only one write happens and one write has no order. What the order buys is
+/// entirely here: a solicited response that loses the race for its request never consumes a
+/// replay slot it did not use, so the same assertion presented against a legitimately re-issued
+/// request is still admissible rather than permanently burnt.
+///
+/// WHAT THE UNSOLICITED PATH RELIES ON is the other half of the same pair: with no request to
+/// spend, the assertion id is the ONLY thing standing between a captured response and unlimited
+/// replay. That is why the connection has to opt in before this path exists at all.
 ///
 /// # Errors
 ///
@@ -491,6 +515,15 @@ pub async fn consume(
     // REMEMBERED UNTIL `expires_at_unix_secs`, which is the earliest of the assertion's own
     // expiry, the confirmation's, this connection's ceiling, and the skew that admitted it. A
     // cache told to forget it sooner would forget it while it could still be presented.
+    //
+    // NOT YET MEASURABLE FROM OUTSIDE, and worth saying rather than leaving the paragraph above
+    // reading like a tested property. Nothing reads this column: 0198 ships the table without a
+    // sweep, so `admit_assertion` conflicts on the primary key whatever the expiry says, and
+    // replacing the value with `i64::MAX` or with `seen_at + 1` changes no test's answer. The
+    // only thing that catches a wrong value today is the table's own `CHECK (expires_at >
+    // seen_at)`. The sweep is what turns this into a real bound, and the test that pins it
+    // belongs with the sweep -- filed here rather than asserted, because a comment claiming a
+    // measured property is worse than one admitting an unmeasured one.
     replay
         .admit_assertion(
             &acs.connection.id,

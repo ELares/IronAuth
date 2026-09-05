@@ -42,6 +42,17 @@ ironauth-oidc/mds3_sync
 # reason stopped being true, and it failed at the FIRST step of the lane, so nothing after
 # it ran.
 
+# `ironauth-oidc/saml_acs` is the SAML assertion consumer service: verify a response against
+# the connection's pinned certificates, check every condition, then spend the outstanding
+# request and admit the assertion id, in that order. It has a full integration suite against
+# a real database and no production caller, because the HTTP POST-binding route -- the form
+# parsing, the connection lookup by ACS URL, and the redirect to RelayState -- is the next
+# piece of #139 and lands with the JIT provisioning that consumes what this returns. Its own
+# module doc says the same thing, which is what makes this an entry rather than an argument.
+# The suite does not count as a caller and should not: this scan looks for a production path,
+# and a test reaching a module proves it compiles, not that a request can arrive.
+ironauth-oidc/saml_acs
+
 ALLOWLIST
 }
 

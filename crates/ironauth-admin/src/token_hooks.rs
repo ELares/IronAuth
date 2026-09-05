@@ -211,7 +211,13 @@ pub(crate) async fn precompile(
 
 /// Without the hook runtime there is nothing to precompile with, so every deploy stores no
 /// artifact and every dispatch compiles. That is the pre-criterion-4 behaviour, unchanged.
+///
+/// ASYNC WITH NOTHING TO AWAIT, deliberately: the `wasm-hooks` half awaits a blocking-pool join
+/// handle, and both halves have to present one signature to the single call site. Dropping the
+/// keyword here would make the feature flag change the shape of the API rather than only its
+/// behaviour.
 #[cfg(not(feature = "wasm-hooks"))]
+#[allow(clippy::unused_async, reason = "the cfg'd sibling awaits; the signatures must match")]
 pub(crate) async fn precompile(
     _state: &AdminState,
     _component: &[u8],

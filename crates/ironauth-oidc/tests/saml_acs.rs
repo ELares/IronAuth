@@ -118,6 +118,9 @@ struct Settings {
     require_encrypted_assertion: bool,
     sp_entity_id: &'static str,
     acs_url: &'static str,
+    idp_entity_id: &'static str,
+    clock_skew_secs: i32,
+    max_assertion_age_secs: i32,
 }
 
 impl Default for Settings {
@@ -128,6 +131,9 @@ impl Default for Settings {
             require_encrypted_assertion: false,
             sp_entity_id: AUDIENCE,
             acs_url: ACS_URL,
+            idp_entity_id: ISSUER,
+            clock_skew_secs: 30,
+            max_assertion_age_secs: 300,
         }
     }
 }
@@ -162,13 +168,13 @@ async fn fixture_with(db: &TestDatabase, env: &Env, settings: Settings) -> Fixtu
                 id: &id,
                 organization_id: &organization,
                 display_name: "Okta",
-                idp_entity_id: ISSUER,
+                idp_entity_id: settings.idp_entity_id,
                 idp_sso_url: "https://idp.example/sso",
                 sp_entity_id: settings.sp_entity_id,
                 acs_url: settings.acs_url,
                 allow_unsolicited: settings.allow_unsolicited,
-                clock_skew_secs: 30,
-                max_assertion_age_secs: 300,
+                clock_skew_secs: settings.clock_skew_secs,
+                max_assertion_age_secs: settings.max_assertion_age_secs,
                 nameid_format: settings.nameid_format,
                 attribute_mapping: &json!({}),
                 require_encrypted_assertion: settings.require_encrypted_assertion,
@@ -244,6 +250,7 @@ async fn fixture_with(db: &TestDatabase, env: &Env, settings: Settings) -> Fixtu
 ///
 /// Every field here is substituted BEFORE signing, so a refusal past `verify` is reachable.
 struct Body {
+    issuer: &'static str,
     audience: &'static str,
     recipient: &'static str,
     /// [`None`] writes NO `Format` attribute, which SAML Core 2.2.2 says MEANS `unspecified`.
@@ -251,6 +258,8 @@ struct Body {
     /// `false` omits the whole `saml:Subject`, which `check` cannot read.
     subject: bool,
     not_on_or_after: &'static str,
+    /// The `Conditions` `NotBefore`, which with `not_on_or_after` bounds the assertion.
+    not_before: &'static str,
     in_response_to: Option<&'static str>,
     /// A second `Attribute` with the same `Name`, which the attribute reader refuses.
     duplicate_attribute: bool,
@@ -262,11 +271,13 @@ impl Default for Body {
     /// A body every check accepts. Each test changes exactly one field.
     fn default() -> Self {
         Self {
+            issuer: ISSUER,
             audience: AUDIENCE,
             recipient: ACS_URL,
             name_id_format: Some(NAMEID_FORMAT),
             subject: true,
             not_on_or_after: "2026-01-01T00:02:00Z",
+            not_before: "2025-12-31T23:58:00Z",
             in_response_to: None,
             duplicate_attribute: false,
             encrypted_attribute: false,
@@ -315,14 +326,14 @@ fn signed_body(key: &XmlTestKey, assertion_id: &str, body: &Body) -> String {
         String::new()
     };
     let children = format!(
-        "<saml:Issuer>{ISSUER}</saml:Issuer>{subject}\
-         <saml:Conditions NotBefore=\"2025-12-31T23:58:00Z\" NotOnOrAfter=\"{}\">\
+        "<saml:Issuer>{}</saml:Issuer>{subject}\
+         <saml:Conditions NotBefore=\"{}\" NotOnOrAfter=\"{}\">\
          <saml:AudienceRestriction><saml:Audience>{}</saml:Audience>\
          </saml:AudienceRestriction></saml:Conditions>\
          <saml:AttributeStatement><saml:Attribute Name=\"{EMAIL_CLAIM}\">\
          <saml:AttributeValue>ada@globex.example</saml:AttributeValue></saml:Attribute>\
          {duplicate}{encrypted}</saml:AttributeStatement>",
-        body.not_on_or_after, body.audience,
+        body.issuer, body.not_before, body.not_on_or_after, body.audience,
     );
     ironauth_saml::test_util::signed_response_with(key, assertion_id, &children)
 }
@@ -1065,11 +1076,11 @@ async fn the_values_compared_come_from_the_connection_row_and_not_from_a_constan
     // indistinguishable -- and the audience test's comment claimed to prove the first. Two
     // connections in one deployment, with different columns, is what tells them apart: under a
     // constant, one connection's documents would validate against the other's settings.
-    let db = TestDatabase::start().await;
-    let env = Env::system();
     const OTHER_AUDIENCE: &str = "https://tenant-two.example/saml/metadata";
     const OTHER_ACS: &str = "https://tenant-two.example/saml/acs";
 
+    let db = TestDatabase::start().await;
+    let env = Env::system();
     let second = fixture_with(
         &db,
         &env,
@@ -1162,4 +1173,346 @@ async fn an_expired_request_is_unknown_at_the_clock_the_endpoint_reports() {
     consume(&replay, &fixture.acs(), live.as_bytes())
         .await
         .expect("a request inside its window is spendable");
+}
+
+#[tokio::test]
+async fn refusing_an_unsolicited_response_does_not_burn_its_assertion_id() {
+    // THE FOURTH STATELESS CHECK, and the one round 2 left unmeasured while fixing the other
+    // three. Its own comment says "NOTHING IS SPENT EITHER WAY", and nothing measured that:
+    // moving the refusal to after `admit_assertion` left all sixteen tests green.
+    //
+    // WHAT A MIS-ORDERED BUILD COSTS: an unsolicited response has no request to spend, so the
+    // state at risk is the ASSERTION ID. Anybody who captured one identity-provider-signed
+    // response could post it at a connection that refuses unsolicited responses and permanently
+    // burn that id -- so on the day the operator turns the switch on, the real sign-in it
+    // belongs to is refused as a replay, and the replay table fills with rows for responses
+    // nobody was ever signed in by.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let strict = fixture(&db, &env, false).await;
+    let replay = db.store().scoped(strict.scope).saml_replay();
+
+    let response = signed(&strict.key, "_assertion_refused_then_allowed", None);
+    let refused = consume(&replay, &strict.acs(), response.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(AcsError::UnsolicitedRefused)),
+        "an unsolicited response was accepted by default: {refused:?}"
+    );
+
+    // THE OPERATOR FLIPS THE SWITCH, which is the same row with one column changed, and the
+    // SAME document is presented again. It must sign somebody in. A build that admitted the
+    // assertion before refusing answers `Replayed` here.
+    let mut opted_in = strict.connection.clone();
+    opted_in.allow_unsolicited = true;
+    let permissive = Acs {
+        connection: &opted_in,
+        certificates: &strict.certificates,
+        now_unix_secs: NOW,
+        limits: &strict.limits,
+    };
+    let consumed = consume(&replay, &permissive, response.as_bytes())
+        .await
+        .expect("the refusal burnt the assertion id it never admitted");
+    assert_eq!(
+        consumed.accepted.assertion_id,
+        "_assertion_refused_then_allowed"
+    );
+
+    // AND THE REPLAY CACHE IS STILL DOING ITS JOB on the path that now has no request to lean
+    // on, so the check above did not simply disable it.
+    let again = consume(&replay, &permissive, response.as_bytes()).await;
+    assert!(
+        matches!(again, Err(AcsError::Replayed)),
+        "an unsolicited response was consumable twice: {again:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_issuer_compared_is_the_connections_own_and_not_a_constant() {
+    // THE THIRD ROW-SOURCED VALUE. Round 2's provenance test varied `sp_entity_id` and
+    // `acs_url` and left `idp_entity_id` carrying the module constant on every connection, so
+    // the issuer comparison -- which migration 0196 calls what stops a response signed by one
+    // connection's legitimately pinned key being replayed into another -- was indistinguishable
+    // from a literal, and was never exercised with a mismatch at all.
+    const OTHER_ISSUER: &str = "urn:idp:tenant-two";
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let second = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            idp_entity_id: OTHER_ISSUER,
+            ..Settings::default()
+        },
+    )
+    .await;
+    let replay = db.store().scoped(second.scope).saml_replay();
+
+    let from_its_own_idp = signed_body(
+        &second.key,
+        "_assertion_second_issuer",
+        &Body {
+            issuer: OTHER_ISSUER,
+            ..Body::default()
+        },
+    );
+    consume(&replay, &second.acs(), from_its_own_idp.as_bytes())
+        .await
+        .expect("a response from this connection's own identity provider");
+
+    // AND THE OTHER CONNECTION'S ISSUER IS REFUSED HERE, signed by the key THIS connection
+    // pins -- so the refusal is the issuer and not the signature.
+    let from_elsewhere = signed(&second.key, "_assertion_other_issuer", None);
+    let refused = consume(&replay, &second.acs(), from_elsewhere.as_bytes()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(AcsError::Condition(ConditionError::WrongIssuer { .. }))
+        ),
+        "a response naming another connection's issuer was consumed: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_clock_skew_comes_from_the_connections_own_column() {
+    // #139'S CRITERION 3 HAS THREE PARTS -- audience, timestamps, unknown request -- and the
+    // timestamp third was proven only inside `ironauth-saml`. At the endpoint,
+    // `clock_skew_secs` and `max_assertion_age_secs` were read from the row and handed to
+    // `check` with no test varying either, so a literal would have done. One test per column,
+    // because a fixture that trips two bounds at once measures whichever check runs first.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+
+    // A LAPSED ASSERTION, on a connection whose skew is too small to cover the gap.
+    let tight = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            clock_skew_secs: 30,
+            ..Settings::default()
+        },
+    )
+    .await;
+    let replay = db.store().scoped(tight.scope).saml_replay();
+    // ONE MINUTE WIDE AND ONE MINUTE PAST, so the ONLY thing that can decide it is the skew.
+    // A first attempt used a nine-minute window, which exceeded the connection's 300-second
+    // age ceiling as well -- so the forgiving connection refused it as `TooLongLived` and the
+    // fixture would have measured whichever check ran first rather than the one it named.
+    let lapsed = signed_body(
+        &tight.key,
+        "_assertion_lapsed_window",
+        &Body {
+            not_before: "2025-12-31T23:58:00Z",
+            not_on_or_after: "2025-12-31T23:59:00Z",
+            ..Body::default()
+        },
+    );
+    let refused = consume(&replay, &tight.acs(), lapsed.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(AcsError::Condition(ConditionError::Expired))),
+        "an assertion outside its window was consumed: {refused:?}"
+    );
+
+    // THE SAME DOCUMENT ON A CONNECTION WHOSE SKEW COVERS THE GAP is admitted, which is what
+    // makes this the column and not a constant: 60 seconds of skew reaches back across the
+    // one-minute gap, 30 does not.
+    let forgiving = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            clock_skew_secs: 120,
+            ..Settings::default()
+        },
+    )
+    .await;
+    let forgiving_replay = db.store().scoped(forgiving.scope).saml_replay();
+    let same_window = signed_body(
+        &forgiving.key,
+        "_assertion_within_skew",
+        &Body {
+            not_before: "2025-12-31T23:58:00Z",
+            not_on_or_after: "2025-12-31T23:59:00Z",
+            ..Body::default()
+        },
+    );
+    consume(&forgiving_replay, &forgiving.acs(), same_window.as_bytes())
+        .await
+        .expect("a connection configured for more skew admits the same assertion");
+}
+
+#[tokio::test]
+async fn the_assertion_ceiling_comes_from_the_connections_own_column() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    // `max_assertion_age_secs` CAPS HOW LONG an identity provider may make an assertion valid
+    // for, which is the ceiling that makes the replay cache's job finite -- an assertion the
+    // provider marks good for a year is one the cache must remember for a year.
+    let short = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            max_assertion_age_secs: 60,
+            ..Settings::default()
+        },
+    )
+    .await;
+    let short_replay = db.store().scoped(short.scope).saml_replay();
+    // TWO MINUTES WIDE: over this connection's sixty-second ceiling and UNDER the fixture
+    // default of 300. A first attempt used a two-hour window, which exceeds both -- so
+    // replacing the column with the default literal left the suite green, and the test measured
+    // nothing about where the number came from.
+    let long_lived = signed_body(
+        &short.key,
+        "_assertion_long_lived",
+        &Body {
+            not_before: "2026-01-01T00:00:00Z",
+            not_on_or_after: "2026-01-01T00:02:00Z",
+            ..Body::default()
+        },
+    );
+    let refused = consume(&short_replay, &short.acs(), long_lived.as_bytes()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(AcsError::Condition(ConditionError::TooLongLived))
+        ),
+        "an assertion valid for two minutes passed a sixty-second ceiling: {refused:?}"
+    );
+
+    // AND THE SAME TWO MINUTES IS FINE ON A CONNECTION CONFIGURED FOR MORE, which is the half
+    // that makes the ceiling the row's and not the endpoint's.
+    let roomy = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            max_assertion_age_secs: 600,
+            ..Settings::default()
+        },
+    )
+    .await;
+    let roomy_replay = db.store().scoped(roomy.scope).saml_replay();
+    let same_length = signed_body(
+        &roomy.key,
+        "_assertion_two_minutes",
+        &Body {
+            not_before: "2026-01-01T00:00:00Z",
+            not_on_or_after: "2026-01-01T00:02:00Z",
+            ..Body::default()
+        },
+    );
+    consume(&roomy_replay, &roomy.acs(), same_length.as_bytes())
+        .await
+        .expect("a connection configured for a longer ceiling admits the same assertion");
+}
+
+#[tokio::test]
+async fn a_padded_nameid_format_column_is_the_same_format() {
+    // THE OTHER HALF OF "COLLAPSED ON BOTH SIDES". Round 2 pinned the document side and left
+    // the column side unexercised, which is the half that locks a deployment out: migration
+    // 0196 asks only that `nameid_format` be non-empty, and a value pasted out of identity
+    // provider metadata with a trailing newline is storable. With the expectation uncollapsed,
+    // every conformant assertion on that connection is refused and nobody can sign in.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let padded = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            nameid_format: "  urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\n",
+            ..Settings::default()
+        },
+    )
+    .await;
+    let replay = db.store().scoped(padded.scope).saml_replay();
+
+    let flush = signed(&padded.key, "_assertion_flush_format", None);
+    consume(&replay, &padded.acs(), flush.as_bytes())
+        .await
+        .expect("a padded column is the same format as the flush spelling");
+}
+
+#[tokio::test]
+async fn a_column_that_collapses_to_nothing_admits_nothing() {
+    // THE DEGENERATE INPUT THE BOTH-SIDES COLLAPSE OPENED. `nameid_format` need only be
+    // non-empty, so a single space is storable, and it collapses to "". An assertion carrying
+    // `Format=""` collapses to "" as well, so the pair would compare EQUAL and the check whose
+    // job is to stop a transient NameID being keyed as a persistent one would be vacuous on
+    // that connection. The raw comparison this replaced refused the pair by accident; the
+    // guard refuses it on purpose.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let blank = fixture_with(
+        &db,
+        &env,
+        Settings {
+            allow_unsolicited: true,
+            nameid_format: " ",
+            ..Settings::default()
+        },
+    )
+    .await;
+    let replay = db.store().scoped(blank.scope).saml_replay();
+
+    let empty_format = signed_body(
+        &blank.key,
+        "_assertion_empty_format",
+        &Body {
+            name_id_format: Some(""),
+            ..Body::default()
+        },
+    );
+    let refused = consume(&replay, &blank.acs(), empty_format.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(AcsError::WrongNameIdFormat { .. })),
+        "a whitespace-only column matched a Format that names nothing: {refused:?}"
+    );
+
+    // AND NOTHING ELSE MATCHES IT EITHER: the connection is misconfigured, and this fails
+    // closed rather than inventing a default its operator did not choose.
+    let ordinary = signed(&blank.key, "_assertion_ordinary_format", None);
+    let refused = consume(&replay, &blank.acs(), ordinary.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(AcsError::WrongNameIdFormat { .. })),
+        "a whitespace-only column admitted a document: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_unusable_certificate_among_two_does_not_lock_the_connection_out() {
+    // WHAT SKIPPING BUYS, which `anchors`'s doc argues for and no test measured: making an
+    // unmappable row fatal instead of skipped would turn "one of your certificates is a bad
+    // row" into "nobody on this connection can sign in", and the suite only ever handed it
+    // one-element lists, where skipped and fatal are the same answer.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(&db, &env, true).await;
+    let replay = db.store().scoped(fixture.scope).saml_replay();
+
+    // THE GOOD PIN SECOND, because `certificates()` is newest-first and a row that cannot be
+    // read must not stop the reader reaching what comes after it.
+    let mut mixed = fixture.certificates.clone();
+    let mut broken = mixed[0].clone();
+    broken.key_kind = SamlKeyKind::Rsa;
+    broken.rsa_exponent = None;
+    mixed.insert(0, broken);
+    assert_eq!(mixed.len(), 2);
+
+    let acs = Acs {
+        connection: &fixture.connection,
+        certificates: &mixed,
+        now_unix_secs: NOW,
+        limits: &Limits::default(),
+    };
+    let response = signed(&fixture.key, "_assertion_past_a_bad_row", None);
+    let consumed = consume(&replay, &acs, response.as_bytes())
+        .await
+        .expect("one unreadable row locked out a connection with a good pin beside it");
+    assert_eq!(consumed.accepted.assertion_id, "_assertion_past_a_bad_row");
 }
