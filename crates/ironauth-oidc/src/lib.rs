@@ -180,6 +180,7 @@ mod risk_signals;
 pub mod routing;
 pub mod saml_acs;
 pub mod saml_route;
+pub mod saml_start;
 mod scope_claims;
 mod sector;
 mod session;
@@ -480,6 +481,14 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/saml/acs/{connection}",
             post(saml_route::acs_post),
+        )
+        // STARTING THE FLOW (issue #139). A GET because it is a navigation: the browser arrives
+        // from a link and leaves with a Location. It issues the outstanding request the ACS
+        // above correlates against, which is what makes the strong defence reachable at all --
+        // without it the only mode is IdP-initiated, which #139 requires be off by default.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/saml/start/{connection}",
+            get(saml_start::start_get),
         )
         .route("/token", post(token::token))
         // The agent vault exchange (issue #132): an agent trades its IronAuth token for the

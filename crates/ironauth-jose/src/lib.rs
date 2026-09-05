@@ -200,6 +200,7 @@ pub use policy::{
 };
 pub use redact::{Redacted, wipe};
 pub use rotation::{KeySet, RotationError, RotationParams, includes_downgrade_key};
+pub use sign::{DetachedError, sign_detached, verify_detached};
 pub use signing_key::{
     SigningKey, SigningKeyError, generate_ecdsa_p256_pkcs8_der, generate_rsa_pkcs1_der,
 };

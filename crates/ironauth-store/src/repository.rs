@@ -97,13 +97,13 @@ use crate::id::{
     PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
     RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
     RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, ScimConnectionId,
-    ScimEnterpriseId, ScimExternalIdId, ScimPushConnectionId, ScimPushLinkId, ScopeStepUpPolicyId,
-    ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId, SignupFormId, SignupQuarantineId,
-    SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId, TotpCredentialId, TraitMigrationJobId,
-    TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId, UpstreamTokenId, UserId,
-    UserIdentifierId, VariableId, WebauthnChallengeId, WebauthnCredentialId,
-    WebhookDeliveryAttemptId, WebhookEndpointId,
+    RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, SamlSpKeyId,
+    ScimConnectionId, ScimEnterpriseId, ScimExternalIdId, ScimPushConnectionId, ScimPushLinkId,
+    ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
+    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
+    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
+    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -75695,6 +75695,113 @@ impl SamlConnectionRepo<'_> {
             .map(|row| saml_certificate_from_row(row, self.scope))
             .collect()
     }
+
+    /// The key this connection signs its own `AuthnRequest`s with, if one has been provisioned.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure. A connection with no key yet is
+    /// [`None`] rather than an error: provisioning is a separate operator action, and "not yet"
+    /// is a state the caller has to render rather than a fault.
+    pub async fn active_sp_key(
+        &self,
+        connection_id: &SamlConnectionId,
+    ) -> Result<Option<SamlSpKey>, StoreError> {
+        if connection_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // `retired_at IS NULL` IS THE WHOLE SELECTOR, and the partial unique index in 0199 is
+        // what makes it single-valued. No `ORDER BY` and no `LIMIT`: ordering would be a way of
+        // choosing between rows that must not both exist, and choosing quietly is how a
+        // deployment ends up signing with one key while publishing another.
+        let row = sqlx::query(
+            "SELECT id, algorithm, key_material, \
+             (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM saml_sp_signing_keys \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND retired_at IS NULL",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(connection_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else { return Ok(None) };
+        let id: String = row.get("id");
+        let id = SamlSpKeyId::parse_in_scope(&id, &self.scope).map_err(|_| {
+            StoreError::Database(sqlx::Error::Decode("unreadable SAML SP key id".into()))
+        })?;
+        Ok(Some(SamlSpKey {
+            id,
+            connection_id: *connection_id,
+            algorithm: row.get("algorithm"),
+            material: SamlSpKeyMaterial(row.get("key_material")),
+            created_at_unix_micros: row.get("created_us"),
+        }))
+    }
+}
+
+/// A SAML SP signing key to mint (issue #139).
+pub struct NewSamlSpKey<'a> {
+    /// The `sps_` identifier to give it.
+    pub id: &'a SamlSpKeyId,
+    /// The connection it will sign for.
+    pub connection_id: &'a SamlConnectionId,
+    /// The XML-Signature algorithm fragment. The column admits `rsa-sha256` and nothing else.
+    pub algorithm: &'a str,
+    /// The private key, in PKCS#1 DER.
+    pub key_material: &'a [u8],
+    /// When it was minted, from the caller's clock seam.
+    pub created_at_unix_micros: i64,
+}
+
+/// The key this deployment signs its own SAML messages with, on one connection (issue #139).
+pub struct SamlSpKey {
+    /// The `sps_` identifier.
+    pub id: SamlSpKeyId,
+    /// The connection it signs for.
+    pub connection_id: SamlConnectionId,
+    /// The XML-Signature algorithm fragment, which is also what goes on the wire as `SigAlg`.
+    pub algorithm: String,
+    /// The private key.
+    pub material: SamlSpKeyMaterial,
+    /// When it was minted, in microseconds since the epoch.
+    pub created_at_unix_micros: i64,
+}
+
+impl core::fmt::Debug for SamlSpKey {
+    /// NEVER RENDERS THE MATERIAL, which is why this is hand-written. A derived `Debug` on a
+    /// struct holding a private key puts that key into the first error message anybody formats.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SamlSpKey")
+            .field("id", &self.id)
+            .field("connection_id", &self.connection_id)
+            .field("algorithm", &self.algorithm)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A SAML SP private key, in PKCS#1 DER.
+///
+/// AN OPAQUE NEWTYPE FOR THE SAME REASON `SigningKeyMaterial` IS ONE: the bytes have to leave the
+/// store to be signed with, and a bare `Vec<u8>` in a struct is a `Debug` away from a log line.
+/// [`Self::expose`] is deliberately the only way out and deliberately named.
+pub struct SamlSpKeyMaterial(Vec<u8>);
+
+impl SamlSpKeyMaterial {
+    /// The raw DER, for loading a signing key.
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for SamlSpKeyMaterial {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SamlSpKeyMaterial(<redacted>)")
+    }
 }
 
 /// The one-time-use state that makes a SAML response unrepeatable (issue #139).
@@ -76300,6 +76407,96 @@ impl ActingSamlConnectionRepo<'_> {
                     return Err(StoreError::NotFound);
                 }
                 insert_idempotency(tx, idempotency).await?;
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(&connection_detail),
+        )
+        .await
+    }
+
+    /// Mint the key this connection will sign its own `AuthnRequest`s with.
+    ///
+    /// # One live key, and the rotation that is not here
+    ///
+    /// 0199's partial unique index permits exactly one row per connection with `retired_at IS
+    /// NULL`, so calling this twice is [`StoreError::Conflict`] rather than a second live key.
+    /// Rotation -- retire the incumbent and mint a successor in ONE transaction, so the metadata
+    /// document publishes both across the changeover -- is the operation #141 owns, and is
+    /// deliberately not half-built here: a `provision` that quietly retired whatever it found
+    /// would make an accidental second call an outage for every request signed with the key an
+    /// identity provider had already been given.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connection is not visible in this scope,
+    /// [`StoreError::Conflict`] if it already has a live key, [`StoreError::Database`] otherwise.
+    pub async fn provision_sp_key(
+        &self,
+        env: &Env,
+        spec: NewSamlSpKey<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        let NewSamlSpKey {
+            id,
+            connection_id,
+            algorithm,
+            key_material,
+            created_at_unix_micros,
+        } = spec;
+        if id.scope() != self.scope || connection_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        let connection_text = connection_id.to_string();
+        let key_material = key_material.to_vec();
+        let algorithm = algorithm.to_owned();
+        let connection_detail = connection_text.clone();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SamlSpKeyProvisioned,
+                target: &id,
+            },
+            async |tx| {
+                // THE PARENT IS CHECKED IN THE STATEMENT for the reason `pin_certificate` gives:
+                // the foreign key proves the connection exists and not that it is visible here,
+                // because referential integrity bypasses row-level security. Without the
+                // `SELECT`, a key could be minted against another scope's connection -- and the
+                // metadata that publishes it would then be published there.
+                let inserted = sqlx::query(
+                    "INSERT INTO saml_sp_signing_keys \
+                     (id, tenant_id, environment_id, connection_id, algorithm, key_material, \
+                      created_at) \
+                     SELECT $1, $2, $3, $4, $5, $6, \
+                            TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+                     WHERE EXISTS (SELECT 1 FROM saml_connections \
+                                   WHERE tenant_id = $2 AND environment_id = $3 AND id = $4)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&connection_text)
+                .bind(&algorithm)
+                .bind(&key_material)
+                .bind(created_at_unix_micros)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
+                if inserted.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
                 enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
