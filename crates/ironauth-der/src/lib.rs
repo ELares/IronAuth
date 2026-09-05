@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! IronAuth's ONE ASN.1 DER reader.
+//! IronAuth's ONE ASN.1 DER reader, and the encoder that writes what it reads.
 //!
 //! # Why it is a crate and not a module
 //!
@@ -23,7 +23,8 @@
 //!
 //! # What it is
 //!
-//! A READER only: it never allocates a parse tree, it borrows from the input, and every
+//! THE READER is the larger half and the one with the security argument: it never allocates a
+//! parse tree, it borrows from the input, and every
 //! malformed length or truncation is a clean [`DerError`], never a panic. It reads exactly the
 //! DER structures a certificate and an SPKI need -- nested TLV triples, tagged fields, integers,
 //! OIDs, bit and octet strings, and the two X.509 time forms.
@@ -33,6 +34,8 @@
 //! about ceremony parsing over `ciborium`. It supports definite-length DER, single- and
 //! multi-byte lengths, and the universal tags X.509 needs. An indefinite length, a constructed
 //! primitive, or an unknown high-tag-number form is rejected rather than guessed.
+
+pub mod write;
 
 /// A DER parse failure. One opaque reason set: the caller collapses every X.509
 /// or MDS3 failure to a single non-enumerating outcome, so this carries no wire

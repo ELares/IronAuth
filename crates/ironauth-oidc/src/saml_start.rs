@@ -255,7 +255,7 @@ pub async fn start_get(
 /// yet, and a row this build cannot load -- and each is a different thing to tell an operator.
 /// Returning the `Response` rather than an error type keeps every one of those sentences in one
 /// place instead of spreading them across a `From` impl.
-async fn signing_key_for(
+pub(crate) async fn signing_key_for(
     read: &ironauth_store::ScopedStore<'_>,
     connection_id: &SamlConnectionId,
 ) -> Result<SigningKey, Response> {

@@ -344,6 +344,25 @@ impl SigningKey {
     }
 
     /// The public projection of this key as normalized components.
+    /// The `RSAPublicKey` DER of an RSA key: `SEQUENCE { modulus INTEGER, exponent INTEGER }`.
+    ///
+    /// EXACTLY WHAT A `SubjectPublicKeyInfo` WRAPS, which is why this is the shape returned
+    /// rather than a `(n, e)` pair. A caller building a certificate puts these bytes straight
+    /// into the SPKI's `BIT STRING`; handing back components would mean re-encoding two integers
+    /// somewhere else, and the encoding of an RSA modulus -- minimal, with a sign byte when the
+    /// top bit is set -- is precisely the thing worth having in one place.
+    ///
+    /// [`None`] for a key that is not RSA, because no other algorithm this crate holds has an
+    /// `RSAPublicKey`. A caller wanting a general SPKI needs a general answer, and there is no
+    /// caller for one.
+    #[must_use]
+    pub fn rsa_public_key_der(&self) -> Option<&[u8]> {
+        match &self.inner {
+            KeyInner::Rsa(key) => Some(key.public().as_ref()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn public_components(&self) -> Result<PublicComponents, SigningKeyError> {
         match &self.inner {
             KeyInner::Ed25519(key) => Ok(PublicComponents::Okp {

@@ -1535,6 +1535,13 @@ path = "tests/native_sso_flow.rs"
 # STARTING A SAML SIGN-IN (issue #139): that the AuthnRequest is signed with the connection's own
 # key, recorded before the browser is sent, and answerable at an ACS that refuses unsolicited
 # responses. Needs a database.
+# THE SP METADATA DOCUMENT over the real router (issue #139): that the published certificate
+# verifies a request this deployment signed, and that each connection publishes its own.
+[[test]]
+name = "saml_metadata"
+required-features = ["testing"]
+path = "tests/saml_metadata.rs"
+
 [[test]]
 name = "saml_start"
 required-features = ["testing"]

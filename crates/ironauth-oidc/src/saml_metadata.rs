@@ -1,0 +1,153 @@
+//! Serving the SP metadata document an operator uploads to their identity provider (issue #139).
+//!
+//! # Why this endpoint exists at all
+//!
+//! `AuthnRequest` issuance signs every request with a key provisioned per connection, and nothing
+//! published the public half -- so an identity provider configured to VERIFY those signatures had
+//! nothing to verify against, and the only providers that worked were the ones that did not
+//! check. The metadata document is how the far side gets the key, and how an operator gets the
+//! two strings they would otherwise transcribe: the entity id this deployment presents to them
+//! and the URL their responses go to.
+//!
+//! # It is public, and that is the point
+//!
+//! No authentication, and the document names a certificate, an entity id and an ACS URL. All
+//! three are PUBLIC BY CONSTRUCTION: a certificate carries a public key, the entity id is what
+//! this deployment announces in every request it sends, and the ACS URL is where an identity
+//! provider posts -- it is in the `Recipient` of every assertion. Metadata is meant to be
+//! fetched; every SAML deployment in the world serves one over plain HTTPS.
+//!
+//! WHAT IT DOES NOT REVEAL is which connections exist: the id is in the path, so a caller learns
+//! only about a connection whose id they already had. An unknown id, a malformed one and one from
+//! another scope answer identically.
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse as _, Response};
+use ironauth_saml::metadata::{self, Descriptor};
+use ironauth_store::SamlConnectionId;
+
+use crate::saml_start::signing_key_for;
+use crate::state::OidcState;
+use crate::wellknown::parse_scope;
+
+/// How long the published certificate is valid for.
+///
+/// FIVE YEARS FROM THE KEY'S OWN CREATION, not from now. The document is regenerated on every
+/// request, and a validity window anchored to the REQUEST would move every time it was fetched --
+/// so two operators fetching on different days would upload certificates that differ, and an
+/// identity provider comparing them would see a rotation that never happened. Anchoring to the
+/// key means the same key always produces the same certificate.
+///
+/// THE LENGTH IS NOT A SECURITY BOUND, and it is worth saying so: `anchors` on the inbound side
+/// deliberately ignores certificate expiry, and most identity providers do the same for a
+/// metadata signing certificate, because what is trusted is the key an operator uploaded rather
+/// than a chain. Five years is long enough not to be a surprise and short enough that a provider
+/// which DOES enforce it prompts a rotation before the key is ancient.
+const CERTIFICATE_VALIDITY_SECS: i64 = 5 * 365 * 24 * 60 * 60;
+
+/// `GET /t/{tenant}/e/{environment}/saml/metadata/{connection}`: the SP metadata document.
+pub async fn metadata_get(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id, connection)): Path<(String, String, String)>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return not_found();
+    };
+    let Ok(connection_id) = SamlConnectionId::parse_in_scope(&connection, &scope) else {
+        return not_found();
+    };
+
+    let read = state.store().scoped(scope);
+    let connection = match read.saml_connections().find_active(&connection_id).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return not_found(),
+        Err(_) => return server_error(),
+    };
+    // THE SAME LOADER THE SIGNING PATH USES, which is what makes the published key the signing
+    // key rather than a second answer to the same question. A separate read here could drift --
+    // a different ordering, a different view of "active" -- and the failure would be a metadata
+    // document that verifies nothing, diagnosed as a signature problem.
+    let key = match signing_key_for(&read, &connection_id).await {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let Ok(Some(stored)) = read.saml_connections().active_sp_key(&connection_id).await else {
+        return server_error();
+    };
+
+    let not_before = stored.created_at_unix_micros / 1_000_000;
+    let document = match metadata::entity_descriptor(&Descriptor {
+        entity_id: &connection.sp_entity_id,
+        assertion_consumer_service_url: &connection.acs_url,
+        name_id_format: &connection.nameid_format,
+        key: &key,
+        not_before_unix_secs: not_before,
+        not_after_unix_secs: not_before + CERTIFICATE_VALIDITY_SECS,
+    }) {
+        Ok(document) => document,
+        Err(error) => {
+            tracing::warn!(
+                target: "ironauth.saml",
+                reason = %error,
+                "a SAML connection could not be turned into a metadata document",
+            );
+            return refused(
+                StatusCode::CONFLICT,
+                "this connection's configuration cannot be expressed as SAML metadata",
+            );
+        }
+    };
+
+    // `application/samlmetadata+xml` IS THE REGISTERED TYPE (OASIS Metadata 4.1), and it is what
+    // makes a browser offer to save the document rather than try to render it -- which is what an
+    // operator wants, because the next step is uploading the file. A provider fetching it
+    // programmatically accepts either.
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/samlmetadata+xml"),
+            ),
+            // CACHEABLE, briefly, unlike everything else in this crate. The document changes only
+            // when the connection or its key does, it contains no secret, and an identity
+            // provider that refreshes metadata on a schedule should not be re-signing a
+            // certificate on every poll. Five minutes is short enough that a rotation propagates
+            // within one refresh cycle of every provider that honours it.
+            (
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("public, max-age=300"),
+            ),
+        ],
+        document,
+    )
+        .into_response()
+}
+
+/// An outcome page carrying `reason`, which is always a sentence written in this file.
+fn refused(status: StatusCode, reason: &'static str) -> Response {
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Metadata unavailable</title>\
+         <p>This connection's metadata could not be produced.</p><p>{reason}</p>"
+    );
+    (
+        status,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::response::Html(body),
+    )
+        .into_response()
+}
+
+/// A uniform not-found for an unreadable scope, an unparsable id, or a connection not serving.
+fn not_found() -> Response {
+    refused(StatusCode::NOT_FOUND, "no SAML connection is served here")
+}
+
+/// A generic failure that never says what broke.
+fn server_error() -> Response {
+    refused(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "this metadata could not be produced; try again",
+    )
+}

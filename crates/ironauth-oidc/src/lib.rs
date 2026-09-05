@@ -179,6 +179,7 @@ mod risk;
 mod risk_signals;
 pub mod routing;
 pub mod saml_acs;
+pub mod saml_metadata;
 pub mod saml_route;
 pub mod saml_start;
 mod scope_claims;
@@ -489,6 +490,13 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/saml/start/{connection}",
             get(saml_start::start_get),
+        )
+        // THE SP METADATA DOCUMENT (issue #139), which is how an identity provider gets the key
+        // that verifies the requests the route above signs. Public and cacheable: everything in
+        // it is announced in every message this deployment sends anyway.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/saml/metadata/{connection}",
+            get(saml_metadata::metadata_get),
         )
         .route("/token", post(token::token))
         // The agent vault exchange (issue #132): an agent trades its IronAuth token for the
