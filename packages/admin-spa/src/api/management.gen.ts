@@ -7872,6 +7872,10 @@ export interface components {
              *     all lapsed and a perfectly healthy one whose token never expires BOTH publish no
              *     `soonest_token_expiry_unix_ms`. One of those needs an operator today.
              *
+             *     TRUE for a connection whose tokens have all lapsed, one past its own expiry, and one whose
+             *     organization was deleted or disabled: `authenticate` refuses each, so nothing a customer
+             *     presents will work.
+             *
              *     FALSE for a revoked connection, which stopped working because somebody made it stop.
              */
             no_live_token: boolean;
@@ -7903,9 +7907,11 @@ export interface components {
              *     against a lead time it also had to fetch would get it wrong in a different way per
              *     client, and the whole point is that the deployment decides when to warn.
              *
-             *     FALSE when the lead time is zero (the operator turned warnings off), when no LIVE token
-             *     has a horizon, when the horizon is beyond the lead, and when the connection is already
-             *     revoked -- a revoked connection is not going to stop working, it has stopped.
+             *     FALSE when the lead time is zero (the operator turned warnings off), when no live token
+             *     has a horizon, when the horizon is beyond the lead, and whenever the connection counts NO
+             *     live credential -- revoked, lapsed, or in an organization that was deleted or disabled. A
+             *     countdown is about something that still works; those have already stopped, and
+             *     `no_live_token` beside `revoked_at_unix_ms` is what says so.
              */
             token_expiring_soon: boolean;
         };

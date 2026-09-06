@@ -35047,7 +35047,7 @@
           },
           "no_live_token": {
             "type": "boolean",
-            "description": "Whether this connection has NO live token at all, so provisioning has already stopped.\n\nA DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would\notherwise be indistinguishable through an absent horizon: a connection whose tokens have\nall lapsed and a perfectly healthy one whose token never expires BOTH publish no\n`soonest_token_expiry_unix_ms`. One of those needs an operator today.\n\nFALSE for a revoked connection, which stopped working because somebody made it stop."
+            "description": "Whether this connection has NO live token at all, so provisioning has already stopped.\n\nA DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would\notherwise be indistinguishable through an absent horizon: a connection whose tokens have\nall lapsed and a perfectly healthy one whose token never expires BOTH publish no\n`soonest_token_expiry_unix_ms`. One of those needs an operator today.\n\nTRUE for a connection whose tokens have all lapsed, one past its own expiry, and one whose\norganization was deleted or disabled: `authenticate` refuses each, so nothing a customer\npresents will work.\n\nFALSE for a revoked connection, which stopped working because somebody made it stop."
           },
           "provider": {
             "type": "string",
@@ -35071,7 +35071,7 @@
           },
           "token_expiring_soon": {
             "type": "boolean",
-            "description": "Whether that horizon falls inside the configured warning lead time.\n\n#140 asks for \"expiry warnings at the configured lead time\". This is that warning,\ncomputed here rather than left to the caller: a client that had to compare two timestamps\nagainst a lead time it also had to fetch would get it wrong in a different way per\nclient, and the whole point is that the deployment decides when to warn.\n\nFALSE when the lead time is zero (the operator turned warnings off), when no LIVE token\nhas a horizon, when the horizon is beyond the lead, and when the connection is already\nrevoked -- a revoked connection is not going to stop working, it has stopped."
+            "description": "Whether that horizon falls inside the configured warning lead time.\n\n#140 asks for \"expiry warnings at the configured lead time\". This is that warning,\ncomputed here rather than left to the caller: a client that had to compare two timestamps\nagainst a lead time it also had to fetch would get it wrong in a different way per\nclient, and the whole point is that the deployment decides when to warn.\n\nFALSE when the lead time is zero (the operator turned warnings off), when no live token\nhas a horizon, when the horizon is beyond the lead, and whenever the connection counts NO\nlive credential -- revoked, lapsed, or in an organization that was deleted or disabled. A\ncountdown is about something that still works; those have already stopped, and\n`no_live_token` beside `revoked_at_unix_ms` is what says so."
           }
         }
       },

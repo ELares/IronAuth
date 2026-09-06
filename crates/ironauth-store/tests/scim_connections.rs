@@ -2219,12 +2219,41 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
     let organization = seed_org(&db, &env, scope, "Globex").await;
 
     let at = now_micros(&env);
-    // The subject: rotated twice, so it holds two superseded tokens with DIFFERENT horizons
-    // plus a fresh one with none.
-    let subject = connect(&db, &env, scope, &organization, "multi-1").await;
-    rotate(&db, &env, scope, &subject, "multi-2", 7200, at)
+    // THE SUBJECT'S TWO HORIZONS MUST DIFFER, and two rotations alone cannot produce that:
+    // `LEAST` collapses every superseded token onto the newest rotation's value, so
+    // MIN == MAX over the set and flipping the aggregate changes nothing. Two earlier versions
+    // of this test had exactly that shape and a mutation run confirmed both survived MAX.
+    //
+    // A CREATE-TIME EXPIRY is what separates them. The connection's first token carries
+    // `at+100s`, which `LEAST` keeps through a rotation asking for an hour, so the live set is
+    // {at+100s, at+3601s, NULL} and the two aggregates disagree.
+    let subject = ScimConnectionId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &subject,
+                organization_id: &organization,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest("multi-1"),
+                // FAR ENOUGH OUT that the connection's own horizon is not the minimum: this test
+                // is about the TOKEN aggregate, and a connection expiry inside the window would
+                // answer for it.
+                expires_at_unix_micros: Some(at + 90 * 24 * 60 * 60 * 1_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("create with a horizon");
+    // Give the first token a SHORT horizon of its own.
+    rotate(&db, &env, scope, &subject, "multi-2", 100, at)
         .await
         .expect("first rotation");
+    // And ask for a much longer one, which `LEAST` must NOT apply to the first token.
     rotate(&db, &env, scope, &subject, "multi-3", 3600, at + 1_000_000)
         .await
         .expect("second rotation");
@@ -2245,13 +2274,14 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
         .expect("list");
     let subject_row = listed.iter().find(|c| c.id == subject).expect("listed");
 
-    // Both of the subject's superseded tokens were pulled in to the SECOND rotation's horizon by
-    // `LEAST`, so the soonest is that one -- and it is later than the sibling's, which is what
-    // makes the correlation observable.
+    // THE FIRST TOKEN'S OWN `at+100s` IS THE MINIMUM. `LEAST` kept it through the second
+    // rotation's hour-long window, so the live set holds two DIFFERENT horizons and this
+    // assertion fails against MAX, which would answer `at+1s+3600s`.
     assert_eq!(
         subject_row.soonest_token_expiry_unix_micros,
-        Some(at + 1_000_000 + 3600 * 1_000_000),
-        "the horizon is not the soonest of this connection's own live tokens"
+        Some(at + 100 * 1_000_000),
+        "the horizon is not the SOONEST of this connection's live tokens; MAX and MIN cannot be \
+         told apart by this fixture unless two of them differ"
     );
     assert_eq!(subject_row.live_token_count, 3);
 
@@ -2264,5 +2294,233 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
     assert_ne!(
         subject_row.soonest_token_expiry_unix_micros, sibling_row.soonest_token_expiry_unix_micros,
         "two connections report one horizon, so the subquery is not correlated per connection"
+    );
+}
+
+#[tokio::test]
+async fn a_rotated_connection_still_warns_about_its_own_expiry() {
+    // THE SILENCE THE FIRST FIX CREATED. `authenticate` requires the CONNECTION to be live as
+    // well as the token, and a rotation mints its fresh token with NO horizon. So a connection
+    // created with a ninety-day expiry and rotated on day thirty had no live TOKEN horizon at
+    // all once the overlap passed -- reported none, reported one live token, and then stopped
+    // working on day ninety with nothing having warned.
+    //
+    // Reading only half of what the authenticator reads is what produced it: the round-1 fix
+    // removed the dead timestamp that had been keeping the row visible for the wrong reason, and
+    // left nothing in its place.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    let at = now_micros(&env);
+    let horizon = at + 90 * 24 * 60 * 60 * 1_000_000;
+    let id = ScimConnectionId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &id,
+                organization_id: &organization,
+                display_name: "Pilot",
+                provider: "okta",
+                token_digest: &digest("pilot-a"),
+                expires_at_unix_micros: Some(horizon),
+            },
+            None,
+        )
+        .await
+        .expect("create a connection with a horizon");
+    rotate(&db, &env, scope, &id, "pilot-b", 3600, at)
+        .await
+        .expect("rotate");
+
+    let read = db.store().scoped(scope);
+    // PAST THE OVERLAP: the superseded token is gone and the fresh one has no horizon of its
+    // own, so the only thing that can still stop this connection is its OWN expiry.
+    let after = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at + 7200 * 1_000_000)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("listed");
+    assert_eq!(
+        after.soonest_token_expiry_unix_micros,
+        Some(horizon),
+        "a rotated connection reports no horizon at all, so it will stop working on its own \
+         expiry with nothing having warned"
+    );
+    assert_eq!(
+        after.live_token_count, 1,
+        "the fresh token is usable before the horizon"
+    );
+
+    // AND PAST ITS OWN EXPIRY it authenticates nothing, however many token rows are live.
+    let dead = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, horizon + 1_000_000)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("listed");
+    assert_eq!(
+        dead.live_token_count, 0,
+        "a connection past its own expiry counts a token live, so the listing reports healthy \
+         while every provisioning request is refused"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_connection_with_no_token_rows_is_not_reported_broken() {
+    // THE FALLBACK POPULATION, which counting ROWS gets exactly backwards. A connection created
+    // by a binary that predates migration 0205 has no token rows and authenticates through the
+    // fallback on `scim_connections.token_digest` -- it provisions perfectly. Counting rows
+    // reported it as having zero live credentials, i.e. "provisioning has stopped", on every
+    // listing, for the whole population the fallback exists to serve.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "legacy-listed").await;
+
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(connection.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+    // IT AUTHENTICATES, which is the premise: this is not a broken connection.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("legacy-listed"), at)
+            .await
+            .expect("read")
+            .is_some()
+    );
+    let listed = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == connection)
+        .expect("listed");
+    assert_eq!(
+        listed.live_token_count, 1,
+        "a legacy connection that authenticates fine is reported as having no usable \
+         credential, so an operator is told provisioning has stopped when it has not"
+    );
+}
+
+/// One connection's live-credential count, as the listing reports it right now.
+async fn live_count(
+    db: &TestDatabase,
+    scope: Scope,
+    organization: &OrganizationId,
+    id: &ScimConnectionId,
+    at: i64,
+) -> i64 {
+    db.store()
+        .scoped(scope)
+        .scim_connections()
+        .list_for_organization(organization, 50, None, at)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| &c.id == id)
+        .expect("listed")
+        .live_token_count
+}
+
+/// A revoked connection, and one whose organization was disabled, each count zero live
+/// credentials.
+///
+/// # Why one test for two conditions
+///
+/// Because the assertion each makes is the same one and the control they need is the same
+/// control: the SAME connection, counted as live first, then counted as zero after exactly one
+/// thing changed. Split apart, each would repeat that setup to assert one number.
+///
+/// The count claims that something a customer can present will authenticate. `authenticate`
+/// refuses a revoked connection and refuses one whose organization is soft-deleted or disabled,
+/// and neither was visible to a count that looked only at token rows: an operator scanning the
+/// listing for the broken connections would have seen these two reported healthy, having stopped
+/// provisioning.
+#[tokio::test]
+async fn a_connection_that_cannot_authenticate_counts_no_live_credential() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Initech").await;
+    let revoked = connect(&db, &env, scope, &organization, "count-revoked").await;
+    let disabled = connect(&db, &env, scope, &organization, "count-disabled").await;
+
+    let at = now_micros(&env);
+
+    // THE CONTROL. Both are live and counted, so the two zeroes below are the change and not
+    // the state this fixture starts in.
+    assert_eq!(live_count(&db, scope, &organization, &revoked, at).await, 1, "the control: revoked-to-be");
+    assert_eq!(live_count(&db, scope, &organization, &disabled, at).await, 1, "the control: disabled-to-be");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &revoked, at)
+        .await
+        .expect("revoke");
+
+    let after = now_micros(&env);
+    assert_eq!(
+        live_count(&db, scope, &organization, &revoked, after).await,
+        0,
+        "a REVOKED connection is counted as having a usable credential; authenticate refuses \
+         it, so an operator is told provisioning works when it has stopped"
+    );
+    // And the other connection in the same organization is untouched, so the zero above is
+    // about the revoked row rather than about the listing having gone blank.
+    assert_eq!(
+        live_count(&db, scope, &organization, &disabled, after).await,
+        1,
+        "revoking one connection must not zero the count of its neighbour"
+    );
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .set_state(
+            &env,
+            &organization,
+            ironauth_store::OrganizationState::Disabled,
+            None,
+        )
+        .await
+        .expect("disable the organization");
+
+    let after = now_micros(&env);
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("count-disabled"), after)
+            .await
+            .expect("authenticate")
+            .is_none(),
+        "the premise: a disabled organization provisions nothing"
+    );
+    assert_eq!(
+        live_count(&db, scope, &organization, &disabled, after).await,
+        0,
+        "a connection in a DISABLED organization is counted as having a usable credential; \
+         authenticate refuses it, so the listing contradicts the surface it describes"
     );
 }

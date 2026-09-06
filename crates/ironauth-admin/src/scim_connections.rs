@@ -86,9 +86,11 @@ pub struct ScimConnectionView {
     /// against a lead time it also had to fetch would get it wrong in a different way per
     /// client, and the whole point is that the deployment decides when to warn.
     ///
-    /// FALSE when the lead time is zero (the operator turned warnings off), when no LIVE token
-    /// has a horizon, when the horizon is beyond the lead, and when the connection is already
-    /// revoked -- a revoked connection is not going to stop working, it has stopped.
+    /// FALSE when the lead time is zero (the operator turned warnings off), when no live token
+    /// has a horizon, when the horizon is beyond the lead, and whenever the connection counts NO
+    /// live credential -- revoked, lapsed, or in an organization that was deleted or disabled. A
+    /// countdown is about something that still works; those have already stopped, and
+    /// `no_live_token` beside `revoked_at_unix_ms` is what says so.
     pub token_expiring_soon: bool,
     /// Whether this connection has NO live token at all, so provisioning has already stopped.
     ///
@@ -96,6 +98,10 @@ pub struct ScimConnectionView {
     /// otherwise be indistinguishable through an absent horizon: a connection whose tokens have
     /// all lapsed and a perfectly healthy one whose token never expires BOTH publish no
     /// `soonest_token_expiry_unix_ms`. One of those needs an operator today.
+    ///
+    /// TRUE for a connection whose tokens have all lapsed, one past its own expiry, and one whose
+    /// organization was deleted or disabled: `authenticate` refuses each, so nothing a customer
+    /// presents will work.
     ///
     /// FALSE for a revoked connection, which stopped working because somebody made it stop.
     pub no_live_token: bool,
@@ -477,10 +483,19 @@ fn view(
     warning_lead_secs: u64,
 ) -> ScimConnectionView {
     let soonest = connection.soonest_token_expiry_unix_micros;
-    // A REVOKED CONNECTION REPORTS NEITHER SIGNAL. Both answer questions about a credential an
-    // operator still depends on, and this one they deliberately switched off: warning that it is
-    // about to stop working, or announcing that it has, is noise on the one row whose state is
-    // already explained by `revoked_at_unix_ms`.
+    // THE COUNTDOWN IS ABOUT A CREDENTIAL THAT STILL WORKS. Without this a connection that
+    // cannot authenticate at all reported BOTH signals at once -- "provisioning has stopped"
+    // beside "it is about to stop" -- because the horizon is read off the token rows and they
+    // outlive whatever killed the connection. A lapsed connection, and one whose organization
+    // was disabled, each showed a live countdown on a credential nothing would accept.
+    //
+    // It also subsumes revocation, which is why there is no `!revoked` here: a revoked
+    // connection counts no live credential, so the warning is already off. Writing both would
+    // be a guard that cannot fail, of which this file has had several.
+    let live = connection.live_token_count > 0;
+    // AND `no_live_token` STILL EXCEPTS REVOCATION, which the count cannot express: a revoked
+    // connection genuinely has no usable credential, but announcing that is noise on the one row
+    // whose state `revoked_at_unix_ms` already explains. The operator switched this one off.
     let revoked = connection.revoked;
     ScimConnectionView {
         id: connection.id.to_string(),
@@ -489,8 +504,8 @@ fn view(
         expires_at_unix_ms: connection.expires_at_unix_micros.map(micros_to_millis),
         revoked_at_unix_ms: connection.revoked_at_unix_micros.map(micros_to_millis),
         soonest_token_expiry_unix_ms: soonest.map(micros_to_millis),
-        token_expiring_soon: !revoked && expiring_soon(soonest, now_micros, warning_lead_secs),
-        no_live_token: !revoked && connection.live_token_count == 0,
+        token_expiring_soon: live && expiring_soon(soonest, now_micros, warning_lead_secs),
+        no_live_token: !revoked && !live,
     }
 }
 
@@ -1055,7 +1070,30 @@ fn rotated_payload(
 
 #[cfg(test)]
 mod rotation_tests {
-    use super::{expiring_soon, rotated_payload};
+    use super::{expiring_soon, rotated_payload, view};
+    use ironauth_env::Env;
+    use ironauth_store::{
+        EnvironmentId, OrganizationId, Scope, ScimConnection, ScimConnectionId, TenantId,
+    };
+
+    /// A connection carrying exactly the four fields the view reads, with everything else at a
+    /// value that makes no difference to it.
+    fn connection(revoked: bool, live_token_count: i64, soonest: Option<i64>) -> ScimConnection {
+        let env = Env::system();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        ScimConnection {
+            id: ScimConnectionId::generate(&env, &scope),
+            organization_id: OrganizationId::generate(&env, &scope),
+            display_name: "acme".to_owned(),
+            provider: "okta".to_owned(),
+            expires_at_unix_micros: None,
+            revoked_at_unix_micros: revoked.then_some(1_699_000_000_000_000),
+            revoked,
+            live_token_count,
+            soonest_token_expiry_unix_micros: soonest,
+            created_at_unix_micros: 1_698_000_000_000_000,
+        }
+    }
 
     const DAY: i64 = 24 * 60 * 60 * 1_000_000;
 
@@ -1107,10 +1145,88 @@ mod rotation_tests {
         );
     }
 
+    /// The two derived signals, each driven against the input that distinguishes it.
+    ///
+    /// # Why these are unit tests and not HTTP ones
+    ///
+    /// Because the distinguishing states are unreachable through the API. Revoking a connection
+    /// does not touch its token rows, so a revoked connection reached over HTTP has whatever
+    /// count the store computes for it, and a test there cannot hold the count fixed while
+    /// flipping `revoked`. Here both are inputs.
+    ///
+    /// Every assertion below has its control: the same fields with one value changed, asserted
+    /// to come out the other way. Without them a view that never reported either signal would
+    /// satisfy the negative half of each pair.
+    #[test]
+    fn the_countdown_is_about_a_credential_that_still_works() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 14 * 24 * 60 * 60;
+        let imminent = Some(now + DAY);
+
+        // THE CONTROL: a live credential with an imminent horizon warns.
+        assert!(
+            view(&connection(false, 1, imminent), now, lead).token_expiring_soon,
+            "the control: a live connection with an imminent horizon must warn"
+        );
+
+        // AND NOTHING LIVE SILENCES IT, however near the horizon on the dead rows. The store
+        // reads the horizon off token rows, which outlive whatever killed the connection: a
+        // lapsed connection, and one whose organization was disabled, each arrive here with a
+        // future horizon and a zero count. Reporting both signals told an operator that
+        // provisioning had stopped AND was about to.
+        let dead = view(&connection(false, 0, imminent), now, lead);
+        assert!(
+            !dead.token_expiring_soon,
+            "a connection with no usable credential is counting down to the moment it breaks, \
+             which has already happened"
+        );
+        assert!(
+            dead.no_live_token,
+            "and the signal that IS true of it must still fire, or the row goes quiet entirely"
+        );
+        // The timestamp itself survives: the suppression is of the derived flag, not of the
+        // fact under it.
+        assert_eq!(
+            dead.soonest_token_expiry_unix_ms,
+            imminent.map(super::micros_to_millis),
+            "suppressing the countdown must not blank the horizon it was derived from"
+        );
+    }
+
+    /// Revocation is the one broken state the listing does not announce.
+    #[test]
+    fn a_revoked_connection_does_not_report_a_lost_credential() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 14 * 24 * 60 * 60;
+
+        // THE CONTROL: the same zero count on an UNREVOKED connection does report it. Only
+        // `revoked` differs between the two, so this is the guard and not the count.
+        assert!(
+            view(&connection(false, 0, None), now, lead).no_live_token,
+            "the control: a connection that lost its credentials must say so"
+        );
+        assert!(
+            !view(&connection(true, 0, None), now, lead).no_live_token,
+            "a revoked connection is reported as having lost its credentials, which is noise on \
+             the one row whose state revoked_at already explains"
+        );
+    }
+
     /// A zero lead time turns the warning off, and no horizon means nothing to warn about.
+    ///
+    /// THE ZERO CASE IS DRIVEN AT EXACTLY `now`, which is the only input that distinguishes the
+    /// early return from the arithmetic. For any horizon strictly in the future, the comparison
+    /// against a zero lead is already false, so deleting the branch would leave such an
+    /// assertion green. A horizon of exactly `now` satisfies the comparison and is refused only
+    /// by the branch itself.
     #[test]
     fn a_zero_lead_or_no_horizon_never_warns() {
         let now = 1_700_000_000_000_000_i64;
+        assert!(
+            !expiring_soon(Some(now), now, 0),
+            "the operator disabled warnings and got one anyway: a horizon of exactly now \
+             satisfies the comparison, so only the zero branch can refuse it"
+        );
         assert!(
             !expiring_soon(Some(now + 1), now, 0),
             "the operator disabled warnings and got one anyway"

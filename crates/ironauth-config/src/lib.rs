@@ -9790,6 +9790,53 @@ mod tests {
     }
 
     #[test]
+    fn a_scim_warning_lead_beyond_a_year_is_refused() {
+        // The bound whose violation makes a SIGNAL uninformative rather than a control
+        // unreachable: a lead longer than any plausible token life marks every connection
+        // expiring, and a flag that is always true is one an operator learns to ignore.
+        // Nothing observed this refusal, so deleting the entire block left the suite green.
+        let err = Config::from_toml_str(
+            &format!(
+                "[scim]\ntoken_expiry_warning_secs = {}\n",
+                SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS + 1
+            ),
+            "<inline>",
+        )
+        .expect_err("a lead beyond a year is refused");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("scim.token_expiry_warning_secs"),
+            "the refusal must name the key an operator has to edit, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS.to_string()),
+            "the refusal must name the bound it is enforcing, got: {rendered}"
+        );
+
+        // The boundary itself is legal, so the refusal is a bound rather than a section that
+        // rejects long leads generally.
+        let at_the_bound = Config::from_toml_str(
+            &format!("[scim]\ntoken_expiry_warning_secs = {SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS}\n"),
+            "<inline>",
+        )
+        .expect("the bound itself is a legal lead")
+        .config;
+        assert_eq!(
+            at_the_bound.scim.token_expiry_warning_secs,
+            SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS
+        );
+
+        // AND ZERO IS LEGAL, which is the documented way to turn the warning off. It is
+        // asserted here because it is the one input that would break if this bound were ever
+        // rewritten as a range with a lower end -- a deployment whose tokens never expire has
+        // nothing to warn about.
+        let disabled = Config::from_toml_str("[scim]\ntoken_expiry_warning_secs = 0\n", "<inline>")
+            .expect("zero turns the warning off rather than being refused")
+            .config;
+        assert_eq!(disabled.scim.token_expiry_warning_secs, 0);
+    }
+
+    #[test]
     fn a_scim_page_that_can_never_be_filled_is_refused() {
         // Zero: a page that returns nothing while reporting itself configured.
         let err = Config::from_toml_str("[scim]\nmax_results = 0\n", "<inline>")

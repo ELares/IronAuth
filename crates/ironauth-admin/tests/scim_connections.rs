@@ -1184,3 +1184,74 @@ async fn the_warning_honours_the_configured_lead_rather_than_a_hardcoded_one() {
         );
     }
 }
+
+/// A revoked connection surfaces neither signal THROUGH THE API.
+///
+/// # What it proves, end to end
+///
+/// The store counts no live credential for a revoked connection -- `authenticate` refuses one,
+/// so nothing it holds can be presented -- and the view then has to decide what to say about a
+/// row with a zero count. It says nothing, because `revoked_at_unix_ms` already explains this
+/// one: the operator switched it off.
+///
+/// That makes the guard observable from here, which it was not before the count learned about
+/// revocation: deleting `!revoked &&` turns this test red. It is driven at the unit level too,
+/// in `scim_connections::rotation_tests::a_revoked_connection_does_not_report_a_lost_credential`,
+/// where the count can be held fixed while only `revoked` moves; this one is the end-to-end
+/// shape, and it is what would notice the two layers disagreeing.
+#[tokio::test]
+async fn the_listing_suppresses_both_signals_for_a_revoked_connection() {
+    // A ONE-SECOND LEAD, so the warning is off for anything but an imminent horizon, and the
+    // revoked row's suppression is therefore about the revocation rather than about the lead.
+    let h = Harness::start_with_scim_warning_lead(50, 1).await;
+    let (tenant, environment) = h.create_tenant("acme", "s-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "s-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    let body = serde_json::json!({ "display_name": "doomed", "provider": "okta" }).to_string();
+    let (status, _, created) = h.post(&base, "s-seed", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "seed: {created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let item_for = |listed: &str, id: &str| -> Value {
+        serde_json::from_str::<Value>(listed).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"].as_str() == Some(id))
+            .cloned()
+            .expect("listed")
+    };
+
+    // BEFORE THE REVOKE it is healthy: one live token, no horizon, no warning. This is the
+    // control that stops the assertions below passing against a listing that reports nothing.
+    let (_, _, listed) = h.get(&base).await;
+    let before = item_for(&listed, &id);
+    assert_eq!(before["no_live_token"].as_bool(), Some(false), "{before}");
+    assert_eq!(before["token_expiring_soon"].as_bool(), Some(false), "{before}");
+
+    let (status, _, body) = h.delete(&format!("{base}/{id}")).await;
+    assert!(status.is_success(), "revoke answered {status}: {body}");
+
+    let (_, _, listed) = h.get(&base).await;
+    let after = item_for(&listed, &id);
+    assert!(
+        after["revoked_at_unix_ms"].as_i64().is_some(),
+        "the revoked connection does not report its revocation: {after}"
+    );
+    assert_eq!(
+        after["no_live_token"].as_bool(),
+        Some(false),
+        "a REVOKED connection is reported as having lost its credentials, which is noise on the \
+         one row whose state revoked_at already explains: {after}"
+    );
+    assert_eq!(
+        after["token_expiring_soon"].as_bool(),
+        Some(false),
+        "a REVOKED connection is reported as about to stop working, which it has already done \
+         and by an operator's own hand: {after}"
+    );
+}

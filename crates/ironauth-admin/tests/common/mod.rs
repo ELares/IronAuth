@@ -235,17 +235,11 @@ impl Harness {
             txt: None,
         }
     }
-    /// Start a fresh database and router with an explicit organization group nesting
-    /// bound (issue #97), so a test can drive the depth refusal with a handful of
-    /// groups instead of the shipped default's nine.
-    ///
-    /// This bounds tree DEPTH only. It caps nothing that is counted: the number of
-    /// groups an organization may hold is uncapped by covenant, at every depth level.
-    /// A harness whose SCIM token expiry warning lead is `warning_lead_secs`.
+    /// A harness whose SCIM token expiry warning lead is `warning_lead_secs` (issue #140).
     ///
     /// Exists so a test can drive a NON-default lead. Without one, every test would use the
-    /// shipped fourteen days and would pass equally against a handler that ignored configuration
-    /// and hardcoded it -- which is exactly what the configured-lead test refuses.
+    /// shipped fourteen days and would pass equally against a handler that ignored
+    /// configuration and hardcoded it -- which is exactly what the configured-lead test refuses.
     pub async fn start_with_scim_warning_lead(
         default_page_size: u32,
         warning_lead_secs: u64,
@@ -258,6 +252,12 @@ impl Harness {
         .await
     }
 
+    /// Start a fresh database and router with an explicit organization group nesting
+    /// bound (issue #97), so a test can drive the depth refusal with a handful of
+    /// groups instead of the shipped default's nine.
+    ///
+    /// This bounds tree DEPTH only. It caps nothing that is counted: the number of
+    /// groups an organization may hold is uncapped by covenant, at every depth level.
     pub async fn start_with_group_depth(default_page_size: u32, max_group_depth: u32) -> Self {
         Self::build(
             default_page_size,
