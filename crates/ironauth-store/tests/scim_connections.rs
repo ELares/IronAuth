@@ -227,7 +227,7 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org, 100, None)
+        .list_for_organization(&org, 100, None, now_micros(&env))
         .await
         .expect("list");
     assert_eq!(listed.len(), 1, "the revoked connection is still listed");
@@ -251,7 +251,7 @@ async fn revoking_stops_authentication_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org, 100, None)
+        .list_for_organization(&org, 100, None, now_micros(&env))
         .await
         .expect("list");
     assert_eq!(
@@ -305,7 +305,7 @@ async fn an_expired_token_stops_authenticating_without_being_revoked() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org, 100, None)
+        .list_for_organization(&org, 100, None, now_micros(&env))
         .await
         .expect("list");
     assert!(!listed[0].revoked, "expired is not revoked");
@@ -327,7 +327,7 @@ async fn the_listing_is_per_organization_and_not_per_environment() {
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org_a, 100, None)
+        .list_for_organization(&org_a, 100, None, now_micros(&env))
         .await
         .expect("list");
     assert_eq!(listed.len(), 1);
@@ -439,7 +439,7 @@ async fn every_scope_guard_refuses_a_foreign_id() {
         .store()
         .scoped(scope_a)
         .scim_connections()
-        .list_for_organization(&org_b, 100, None)
+        .list_for_organization(&org_b, 100, None, now_micros(&env))
         .await;
     assert!(matches!(outcome, Err(ironauth_store::StoreError::NotFound)));
 
@@ -2000,4 +2000,269 @@ async fn the_token_tables_grants_and_one_way_policy_are_enforced() {
             "the app role is refused by the grant rather than by something else: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_listing_reports_the_soonest_live_token_horizon() {
+    // WHAT AN OPERATOR NEEDS WARNING ABOUT is the moment provisioning could STOP, and after a
+    // rotation that is the SUPERSEDED token's horizon rather than the connection's own or the
+    // fresh token's (which usually has none). Reporting the connection's `expires_at` would say
+    // nothing about a rotation; reporting the latest would say the opposite of the truth.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "soonest-a").await;
+
+    let at = now_micros(&env);
+    // BEFORE ANY ROTATION there is no horizon: one token, no expiry.
+    let listed = db
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at)
+        .await
+        .expect("list");
+    assert_eq!(
+        listed
+            .iter()
+            .find(|c| c.id == connection)
+            .and_then(|c| c.soonest_token_expiry_unix_micros),
+        None,
+        "a connection nobody has rotated reports a token horizon"
+    );
+
+    rotate(&db, &env, scope, &connection, "soonest-b", 600, at)
+        .await
+        .expect("rotate");
+
+    let listed = db
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at)
+        .await
+        .expect("list");
+    let reported = listed
+        .iter()
+        .find(|c| c.id == connection)
+        .and_then(|c| c.soonest_token_expiry_unix_micros)
+        .expect("a rotated connection has a token horizon");
+    assert_eq!(
+        reported,
+        at + 600 * 1_000_000,
+        "the listing does not report the superseded token's horizon"
+    );
+
+    // A REVOKED TOKEN IS EXCLUDED. It is already not working, so warning about when it would
+    // have lapsed points an operator at a deadline with no effect -- and, worse, hides the next
+    // real one behind it.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke_token(&env, &connection, &digest("soonest-a"), at + 1_000_000)
+        .await
+        .expect("revoke the superseded token");
+    let listed = db
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at)
+        .await
+        .expect("list");
+    assert_eq!(
+        listed
+            .iter()
+            .find(|c| c.id == connection)
+            .and_then(|c| c.soonest_token_expiry_unix_micros),
+        None,
+        "a REVOKED token's horizon is still reported, so the listing warns about a deadline \
+         that cannot arrive"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_rotation_stops_warning_once_the_overlap_has_passed() {
+    // THE DEFECT THE FIRST VERSION SHIPPED. The horizon was a MIN over non-REVOKED tokens with
+    // no lower bound, and a rotation supersedes a token WITHOUT revoking it. Nothing sweeps the
+    // row and no route exposes per-token revocation, so the superseded token's already-past
+    // timestamp became a permanent floor: every connection anybody had ever rotated reported
+    // itself expiring forever, and any genuine future horizon was hidden behind the dead one.
+    //
+    // On the shipped fourteen-day default that was every rotated connection in the deployment --
+    // precisely the always-on warning the configuration cap exists to prevent, produced by the
+    // feature's own headline operation.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "settled-a").await;
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &connection, "settled-b", 600, at)
+        .await
+        .expect("rotate");
+
+    let read = db.store().scoped(scope);
+    // DURING the overlap the horizon is the superseded token's, which is the warning working.
+    let during = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at + 1_000_000)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == connection)
+        .expect("listed");
+    assert_eq!(
+        during.soonest_token_expiry_unix_micros,
+        Some(at + 600 * 1_000_000)
+    );
+    assert_eq!(
+        during.live_token_count, 2,
+        "both tokens are live inside the window"
+    );
+
+    // AFTER it, the cutover is complete and provisioning is healthy on the fresh token. There is
+    // nothing to warn about, and the dead row must not answer.
+    let after = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at + 601 * 1_000_000)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == connection)
+        .expect("listed");
+    assert_eq!(
+        after.soonest_token_expiry_unix_micros, None,
+        "a completed rotation still reports the superseded token's dead horizon, so this \
+         connection warns forever and its next real deadline is hidden behind it"
+    );
+    assert_eq!(
+        after.live_token_count, 1,
+        "the fresh token is not counted live after the overlap"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_whose_every_token_has_lapsed_reports_no_live_token() {
+    // THE OTHER HALF, and the reason the count is a separate field. A connection whose tokens
+    // have ALL lapsed publishes no horizon -- and so does a perfectly healthy one whose token
+    // never expires. Through the horizon alone those two are indistinguishable, and one of them
+    // needs an operator today.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    let at = now_micros(&env);
+    let id = ScimConnectionId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &id,
+                organization_id: &organization,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest("lapses-soon"),
+                expires_at_unix_micros: Some(at + 60_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("create");
+
+    let read = db.store().scoped(scope);
+    let live = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("listed");
+    assert_eq!(
+        live.live_token_count, 1,
+        "the token is live before its expiry"
+    );
+
+    let lapsed = read
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at + 61_000_000)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("listed");
+    assert_eq!(
+        lapsed.live_token_count, 0,
+        "a connection whose only token has lapsed still counts it live, so nothing distinguishes \
+         broken provisioning from a healthy connection that never expires"
+    );
+    assert_eq!(lapsed.soonest_token_expiry_unix_micros, None);
+}
+
+#[tokio::test]
+async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection() {
+    // MIN RATHER THAN MAX, and CORRELATED to this connection. The first version of the store
+    // test had at most one token with a horizon at every assertion, so flipping the aggregate to
+    // MAX -- or dropping the correlation and reporting the environment's earliest -- left the
+    // suite green. Two live horizons on ONE connection, and a SIBLING with an earlier one, is
+    // the state that tells all three implementations apart.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    let at = now_micros(&env);
+    // The subject: rotated twice, so it holds two superseded tokens with DIFFERENT horizons
+    // plus a fresh one with none.
+    let subject = connect(&db, &env, scope, &organization, "multi-1").await;
+    rotate(&db, &env, scope, &subject, "multi-2", 7200, at)
+        .await
+        .expect("first rotation");
+    rotate(&db, &env, scope, &subject, "multi-3", 3600, at + 1_000_000)
+        .await
+        .expect("second rotation");
+
+    // A SIBLING with an earlier horizon than either of the subject's. If the subquery were not
+    // correlated, the subject would report this one.
+    let sibling = connect(&db, &env, scope, &organization, "sibling-1").await;
+    rotate(&db, &env, scope, &sibling, "sibling-2", 60, at)
+        .await
+        .expect("sibling rotation");
+
+    let listed = db
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .list_for_organization(&organization, 50, None, at + 2_000_000)
+        .await
+        .expect("list");
+    let subject_row = listed.iter().find(|c| c.id == subject).expect("listed");
+
+    // Both of the subject's superseded tokens were pulled in to the SECOND rotation's horizon by
+    // `LEAST`, so the soonest is that one -- and it is later than the sibling's, which is what
+    // makes the correlation observable.
+    assert_eq!(
+        subject_row.soonest_token_expiry_unix_micros,
+        Some(at + 1_000_000 + 3600 * 1_000_000),
+        "the horizon is not the soonest of this connection's own live tokens"
+    );
+    assert_eq!(subject_row.live_token_count, 3);
+
+    let sibling_row = listed.iter().find(|c| c.id == sibling).expect("listed");
+    assert_eq!(
+        sibling_row.soonest_token_expiry_unix_micros,
+        Some(at + 60 * 1_000_000),
+        "the sibling's own earlier horizon is not reported against the sibling"
+    );
+    assert_ne!(
+        subject_row.soonest_token_expiry_unix_micros, sibling_row.soonest_token_expiry_unix_micros,
+        "two connections report one horizon, so the subquery is not correlated per connection"
+    );
 }

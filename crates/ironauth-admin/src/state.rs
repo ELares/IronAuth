@@ -200,6 +200,12 @@ struct Inner {
     // behaves like a default deployment. Bounds tree DEPTH only; nothing counted is
     // capped.
     max_group_depth: u32,
+    // How long before a SCIM token lapses the listing calls it expiring, in seconds (issue
+    // #140). Installed by the boot path from `scim.token_expiry_warning_secs`, which is where
+    // the setting lives; zero disables the warning. A BUILDER rather than an `AdminConfig`
+    // field for the reason `max_group_depth` gives: duplicating it under `[admin]` would give
+    // one setting two operator-visible names that could disagree.
+    scim_token_expiry_warning_secs: u64,
 
     // The AuthZEN batch bound (issue #100), installed on the boot path from
     // `organizations.max_authzen_batch` and read by the batch evaluation handler.
@@ -373,6 +379,10 @@ impl AdminState {
                 migration_hook: None,
                 federation: None,
                 max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+                // The shipped default, so a state built directly (a test, say) warns on the
+                // same horizon a default deployment does rather than never warning.
+                scim_token_expiry_warning_secs: ironauth_config::ScimConfig::default()
+                    .token_expiry_warning_secs,
                 max_authzen_batch,
                 usage_fold_limit: None,
                 outbox_visibility_timeout_secs: ironauth_config::OutboxConfig::default()
@@ -763,6 +773,30 @@ impl AdminState {
                 max_group_depth.min(ironauth_config::ORGANIZATIONS_MAX_GROUP_DEPTH_CEILING);
         }
         self
+    }
+
+    /// Install the SCIM token expiry warning lead time (issue #140).
+    ///
+    /// The boot path is the only caller and passes `scim.token_expiry_warning_secs` straight
+    /// from the loaded config, for the reason [`Self::with_max_group_depth`] gives: the setting
+    /// lives in `[scim]`, and a second name for it under `[admin]` would be two knobs that can
+    /// disagree about one thing.
+    ///
+    /// ZERO DISABLES THE WARNING, which config load permits deliberately: a deployment whose
+    /// tokens never expire has nothing to warn about, and a flag that is always false is better
+    /// than one that is always true.
+    #[must_use]
+    pub fn with_scim_token_expiry_warning_secs(mut self, secs: u64) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.scim_token_expiry_warning_secs = secs;
+        }
+        self
+    }
+
+    /// The configured SCIM token expiry warning lead time (issue #140), in seconds.
+    #[must_use]
+    pub fn scim_token_expiry_warning_secs(&self) -> u64 {
+        self.inner.scim_token_expiry_warning_secs
     }
 
     /// The configured organization group nesting bound (issue #97), passed to every

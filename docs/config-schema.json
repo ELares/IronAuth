@@ -2498,6 +2498,13 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "token_expiry_warning_secs": {
+          "default": 1209600,
+          "description": "How long before a SCIM token lapses the listing starts calling it expiring, in seconds.\n\n#140 asks for expiry warnings \"at the configured lead time\", and CONFIGURED is the\noperative word: the right lead depends on how long a customer's change process takes.\nA vendor whose customers are enterprises with change-advisory boards needs weeks; one\nselling to startups needs days. A hardcoded value would be wrong for one of them, and\nthe failure is silent -- provisioning simply stops on a date nobody was watching.\n\nFOURTEEN DAYS BY DEFAULT, which is long enough for a fortnightly change window to come\nround once and short enough that the warning still means something when it appears.\n\nZERO DISABLES IT, and disabling is a real choice: a deployment whose tokens never expire\nhas nothing to warn about, and a warning that is always absent is better than one that is\nalways present.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -3297,7 +3304,8 @@
       "default": {
         "enabled": false,
         "max_results": 200,
-        "max_scan": 1000
+        "max_scan": 1000,
+        "token_expiry_warning_secs": 1209600
       },
       "description": "Inbound SCIM 2.0 provisioning (issue #135). OFF by default, so the default\nboot mounts nothing under `/scim/v2` and every such path is a uniform 404."
     },

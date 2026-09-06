@@ -7864,6 +7864,17 @@ export interface components {
             expires_at_unix_ms?: number | null;
             /** @description The non-secret `scim_` handle. Every other operation names the connection by this. */
             id: string;
+            /**
+             * @description Whether this connection has NO live token at all, so provisioning has already stopped.
+             *
+             *     A DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would
+             *     otherwise be indistinguishable through an absent horizon: a connection whose tokens have
+             *     all lapsed and a perfectly healthy one whose token never expires BOTH publish no
+             *     `soonest_token_expiry_unix_ms`. One of those needs an operator today.
+             *
+             *     FALSE for a revoked connection, which stopped working because somebody made it stop.
+             */
+            no_live_token: boolean;
             /** @description Which vendor this connection is for: `okta`, `entra` or `generic`. */
             provider: string;
             /**
@@ -7871,6 +7882,32 @@ export interface components {
              * @description Revocation time in milliseconds since the epoch, absent while the connection is live.
              */
             revoked_at_unix_ms?: number | null;
+            /**
+             * Format: int64
+             * @description When the SOONEST live token of this connection lapses, in milliseconds since the epoch.
+             *
+             *     DIFFERENT FROM `expires_at_unix_ms`, which is the CONNECTION's horizon and bounds every
+             *     token it has. After a rotation a connection holds two tokens: the superseded one lapsing
+             *     at the end of the overlap and the fresh one usually with no horizon. This is the earliest
+             *     moment a token a customer might still be presenting stops working, which is what an
+             *     operator needs to see.
+             *
+             *     Absent when no live token has a horizon at all.
+             */
+            soonest_token_expiry_unix_ms?: number | null;
+            /**
+             * @description Whether that horizon falls inside the configured warning lead time.
+             *
+             *     #140 asks for "expiry warnings at the configured lead time". This is that warning,
+             *     computed here rather than left to the caller: a client that had to compare two timestamps
+             *     against a lead time it also had to fetch would get it wrong in a different way per
+             *     client, and the whole point is that the deployment decides when to warn.
+             *
+             *     FALSE when the lead time is zero (the operator turned warnings off), when no LIVE token
+             *     has a horizon, when the horizon is beyond the lead, and when the connection is already
+             *     revoked -- a revoked connection is not going to stop working, it has stopped.
+             */
+            token_expiring_soon: boolean;
         };
         /**
          * @description The 201 of a create.

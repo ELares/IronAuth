@@ -75259,6 +75259,40 @@ pub struct ScimConnection {
     pub revoked_at_unix_micros: Option<i64>,
     /// Whether it has been revoked.
     pub revoked: bool,
+    /// How many tokens of this connection are LIVE right now.
+    ///
+    /// ZERO IS THE BROKEN STATE: every token has lapsed or been revoked, so nothing a customer
+    /// can present will authenticate and provisioning has stopped. It is a different fact from
+    /// the horizon below and needs its own field, because a connection with no live token has no
+    /// horizon at all -- and an operator reading only the horizon would see an absent value,
+    /// which is also what a perfectly healthy never-expiring connection shows.
+    pub live_token_count: i64,
+    /// When the SOONEST live token of this connection lapses, if any of them has a horizon.
+    ///
+    /// # Why the soonest, and why it is not the connection's own expiry
+    ///
+    /// The connection's `expires_at` bounds every token it has. This is a different question:
+    /// after a rotation a connection holds two tokens, the superseded one lapsing at the end of
+    /// the overlap and the fresh one usually with no horizon at all. What an operator needs
+    /// warning about is the moment provisioning could STOP, and that is when the earliest token
+    /// a customer might still be presenting dies.
+    ///
+    /// SOONEST rather than latest, because a warning has to fire before the first thing that can
+    /// break, not after the last. `None` means no live token has a horizon at all, which is the
+    /// ordinary state of a connection nobody gave an expiry.
+    ///
+    /// TOKENS THAT ARE NOT WORKING ARE EXCLUDED, and that is BOTH the revoked ones and the ones
+    /// that have already lapsed. The first version of this excluded only the revoked, and the
+    /// consequence was that every rotated connection warned FOREVER: a rotation supersedes a
+    /// token with an expiry and never revokes it, nothing sweeps the row, and no route exposes
+    /// per-token revocation -- so the dead timestamp became a permanent floor for the minimum
+    /// and hid every real horizon behind it. On the shipped default that was every connection
+    /// anybody had ever rotated, which is exactly the always-on warning the configuration cap
+    /// exists to prevent.
+    ///
+    /// A lapsed token is not a HORIZON, it is a token that is gone. That it has gone is reported
+    /// by `live_token_count` above.
+    pub soonest_token_expiry_unix_micros: Option<i64>,
     /// Creation time, which is the listing's sort key and therefore its cursor position.
     pub created_at_unix_micros: i64,
 }
@@ -78676,6 +78710,16 @@ impl ScimConnectionRepo<'_> {
             expires_at_unix_micros: row.get("expires_us"),
             revoked_at_unix_micros: row.get("revoked_us"),
             revoked: false,
+            // NOT ANSWERED ON THE AUTHENTICATION PATH. A request that reached here presented a
+            // token that authenticated, so at least one is live; the exact count is an operator
+            // question the LISTING answers.
+            live_token_count: 1,
+            // NOT ANSWERED ON THE AUTHENTICATION PATH. This read resolves ONE token to its
+            // connection; the soonest horizon across a connection's tokens is an operator
+            // question the LISTING answers, and computing it here would add a second read to
+            // the hot path of every provisioning request to produce something no caller of
+            // `authenticate` looks at.
+            soonest_token_expiry_unix_micros: None,
             created_at_unix_micros: row.get("created_us"),
         }))
     }
@@ -78739,6 +78783,7 @@ impl ScimConnectionRepo<'_> {
         organization_id: &OrganizationId,
         limit: i64,
         after: Option<&CursorPosition>,
+        now_micros: i64,
     ) -> Result<Vec<ScimConnection>, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -78746,16 +78791,31 @@ impl ScimConnectionRepo<'_> {
         let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, organization_id, display_name, provider, \
-                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
-                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
-                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
-                    (revoked_at IS NOT NULL) AS revoked \
-             FROM scim_connections \
-             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
-             AND ($4::bigint IS NULL OR (created_at, id) > \
+            "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                    (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
+                    (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us, \
+                    (c.revoked_at IS NOT NULL) AS revoked, \
+                    (SELECT (EXTRACT(EPOCH FROM MIN(t.expires_at)) * 1000000)::bigint \
+                     FROM scim_connection_tokens t \
+                     WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                       AND t.environment_id = c.environment_id \
+                       AND t.revoked_at IS NULL \
+                       AND t.expires_at > TIMESTAMPTZ 'epoch' \
+                                          + ($7::bigint * INTERVAL '1 microsecond')) \
+                        AS soonest_token_us, \
+                    (SELECT count(*) FROM scim_connection_tokens t \
+                     WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                       AND t.environment_id = c.environment_id \
+                       AND t.revoked_at IS NULL \
+                       AND (t.expires_at IS NULL OR t.expires_at > TIMESTAMPTZ 'epoch' \
+                                                    + ($7::bigint * INTERVAL '1 microsecond'))) \
+                        AS live_tokens \
+             FROM scim_connections c \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.organization_id = $3 \
+             AND ($4::bigint IS NULL OR (c.created_at, c.id) > \
                   (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
-             ORDER BY created_at, id LIMIT $6",
+             ORDER BY c.created_at, c.id LIMIT $6",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -78763,6 +78823,7 @@ impl ScimConnectionRepo<'_> {
         .bind(after_micros)
         .bind(after_id)
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .bind(now_micros)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -78782,6 +78843,8 @@ impl ScimConnectionRepo<'_> {
                     expires_at_unix_micros: row.get("expires_us"),
                     revoked_at_unix_micros: row.get("revoked_us"),
                     revoked: row.get("revoked"),
+                    soonest_token_expiry_unix_micros: row.get("soonest_token_us"),
+                    live_token_count: row.get("live_tokens"),
                     created_at_unix_micros: row.get("created_us"),
                 })
             })

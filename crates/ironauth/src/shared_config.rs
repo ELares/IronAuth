@@ -596,9 +596,15 @@ mod tests {
             "scim",
             Reach::OnePlaneOrNoState,
             "read by `assemble_planes` (issue #135), which decides whether the surface mounts at \
-             all, and by `build_scim_plane`, which sizes its page and scan bounds. ONE \
-             plane holds it: the SCIM state on the public plane. The management plane never \
-             sees it, and there is deliberately no `scim.uniqueness` key -- the mode SCIM \
+             all, and by `build_scim_plane`, which sizes its page and scan bounds. BOTH panes \
+             read the section now, and each takes a DIFFERENT key from it: the public plane \
+             takes the page and scan bounds, and the management plane takes ONLY \
+             `token_expiry_warning_secs` (issue #140), which sizes the expiry warning on the \
+             connection listing. That is why this stays plane-local rather than becoming a \
+             shared input: no single value has to reach both planes and agree, so there is \
+             nothing for them to disagree about. An earlier version of this note said the \
+             management plane never sees the section, which stopped being true when the \
+             warning landed. There is deliberately no `scim.uniqueness` key -- the mode SCIM \
              needs is a SHARED value, taken from `[identifiers]` through the single \
              `uniqueness_mode` match, because two identity doors handed different modes by \
              configuration would disagree about what the same person is.",

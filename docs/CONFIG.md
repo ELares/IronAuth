@@ -323,6 +323,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `scim.enabled` | boolean | `false` | Whether to serve the SCIM 2.0 surface on the public plane. Off by default. |
 | `scim.max_results` | integer | `200` | The most resources one page of a list response may carry. |
 | `scim.max_scan` | integer | `1000` | The most organization members or groups one list request may examine. |
+| `scim.token_expiry_warning_secs` | integer | `1209600` | How long before a SCIM token lapses the listing starts calling it expiring, in seconds. |
 | `scim_push` | table | see fields | OUTBOUND SCIM provisioning (issue #137): whether THIS process runs the push worker, and how often. |
 | `scim_push.enabled` | boolean | `false` | Whether THIS process runs the outbound worker. Off by default. |
 | `scim_push.interval_secs` | integer | `30` | How long between ticks, in seconds. |
