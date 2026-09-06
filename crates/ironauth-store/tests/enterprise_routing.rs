@@ -42,8 +42,45 @@ fn caps() -> ConnectorCapabilities<'static> {
     }
 }
 
+/// Create a SAML connection owned by `organization`.
+async fn seed_saml_connection(
+    db: &TestDatabase,
+    env: &Env,
+    scope: ironauth_store::Scope,
+    organization: &OrganizationId,
+) -> SamlConnectionId {
+    let connection = SamlConnectionId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .saml_connections()
+        .create(
+            env,
+            NewSamlConnection {
+                id: &connection,
+                organization_id: organization,
+                display_name: "Okta",
+                idp_entity_id: "urn:idp",
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/sp",
+                acs_url: "https://ironauth.example/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+    connection
+}
+
 #[tokio::test]
-async fn a_saml_binding_is_resolved_within_its_connections_own_organization() {
+async fn a_binding_cannot_name_another_organizations_saml_connection() {
     // THE READ THE SAML SIGN-IN PATH STAMPS FROM. It re-derives the routed `ocn_` binding from
     // the connection, and an earlier version matched on `(tenant, environment,
     // saml_connection_id, enabled)` alone -- while claiming "at most one, by the partial unique
@@ -70,38 +107,42 @@ async fn a_saml_binding_is_resolved_within_its_connections_own_organization() {
     }
 
     // THE CONNECTION BELONGS TO `owner`, by its own NOT NULL column.
-    let connection = SamlConnectionId::generate(&env, &scope);
-    control
+    let connection = seed_saml_connection(&db, &env, scope, &owner).await;
+
+    // A BINDING IN THE STRANGER'S ORGANIZATION IS REFUSED, which is what makes the read below
+    // well-posed rather than merely answered. Two attempts to cope with the pairing in the READ
+    // each broke: resolving by connection alone stamped whichever organization's binding the
+    // planner yielded, and constraining to the connection's owner then dropped the overlay of
+    // the binding the ROUTING RULE had actually matched. Migration 0202 refuses the pairing
+    // where it is written instead.
+    let refused = control
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
-        .saml_connections()
+        .org_connections()
         .create(
             &env,
-            NewSamlConnection {
-                id: &connection,
-                organization_id: &owner,
-                display_name: "Okta",
-                idp_entity_id: "urn:idp",
-                idp_sso_url: "https://idp.example/sso",
-                sp_entity_id: "https://ironauth.example/saml/sp",
-                acs_url: "https://ironauth.example/acs",
-                allow_unsolicited: false,
-                clock_skew_secs: 30,
-                max_assertion_age_secs: 300,
-                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-                attribute_mapping: &serde_json::json!({}),
-                require_encrypted_assertion: false,
+            &OrgConnectionId::generate(&env, &scope),
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &stranger,
+                upstream: OrgConnectionUpstream::Saml(&connection),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
             },
-            None,
-            None,
         )
-        .await
-        .expect("create the SAML connection");
+        .await;
+    assert!(
+        refused.is_err(),
+        "a binding named a SAML connection owned by another organization: {refused:?}"
+    );
 
-    // TWO BINDINGS NAMING IT, in two organizations. Nothing forbids the second: `create` checks
-    // only that each id is in scope, and the unique index is per organization.
+    // AND THE OWNER'S OWN BINDING IS ACCEPTED, so the refusal above is the pairing and not the
+    // call shape.
     let mut ids = Vec::new();
-    for organization in [&owner, &stranger] {
+    for organization in [&owner] {
         let ocn_id = OrgConnectionId::generate(&env, &scope);
         control
             .scoped(scope)
@@ -125,33 +166,30 @@ async fn a_saml_binding_is_resolved_within_its_connections_own_organization() {
             .expect("create the binding");
         ids.push(ocn_id);
     }
-    assert_ne!(
-        ids[0], ids[1],
-        "the fixture wrote one binding, so it cannot see the crossing"
-    );
-
-    // BOTH DIRECTIONS, WHICH IS WHAT MAKES THIS ORDER-INDEPENDENT. Asserting only that the
-    // OWNER's query returns the owner's binding does not discriminate: with the organization
-    // predicate deleted the query matches both rows and `fetch_optional` keeps whichever the
-    // planner yields, which for this fixture is the row inserted first -- the owner's. So that
-    // assertion passed against the mutant it was written to catch.
-    //
-    // Asking for EACH organization and requiring its OWN binding cannot both hold for a query
-    // that ignores the argument: the two ids differ, so one side fails whatever the row order.
+    // THE READ FINDS THE OWNER'S BINDING, which is now the only one that can exist for this
+    // connection -- so the organization predicate and the constraint agree by construction
+    // rather than one of them compensating for the other's absence.
     let scoped = db.store().scoped(scope);
-    for (organization, expected) in [(&owner, &ids[0]), (&stranger, &ids[1])] {
-        let resolved = scoped
+    let resolved = scoped
+        .org_connections()
+        .for_saml_connection(&connection, &owner)
+        .await
+        .expect("read")
+        .expect("the owner's binding");
+    assert_eq!(resolved.id, ids[0]);
+    assert_eq!(resolved.organization_id, owner.to_string());
+
+    // AND ASKING AS THE STRANGER FINDS NOTHING, which is the half that would have been a wrong
+    // ANSWER rather than an absence if the pairing were writable.
+    assert!(
+        scoped
             .org_connections()
-            .for_saml_connection(&connection, organization)
+            .for_saml_connection(&connection, &stranger)
             .await
             .expect("read")
-            .expect("a binding for this organization");
-        assert_eq!(
-            resolved.id, *expected,
-            "the read ignored the organization and returned another one's binding"
-        );
-        assert_eq!(resolved.organization_id, organization.to_string());
-    }
+            .is_none(),
+        "a connection resolved a binding in an organization that does not own it"
+    );
 }
 
 /// Seed an organization, a connector, and a binding between them; return the binding id.

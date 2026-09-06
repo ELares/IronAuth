@@ -37582,8 +37582,10 @@ impl RoutingRuleRepo<'_> {
 /// Which upstream an organization binding routes to (issue #139).
 ///
 /// A SUM RATHER THAN TWO OPTIONS, because the schema says exactly one is set and a caller
-/// holding two `Option`s can express three states the database will refuse. This makes the
-/// impossible ones unwritable rather than merely rejected.
+/// holding two `Option`s can express four states while `num_nonnulls(...) = 1` accepts two --
+/// so two of them are writes the database refuses. An earlier version of this sentence said
+/// three, which cannot be reconciled with a two-variant enum by anybody checking. The sum makes
+/// the refused pair unwritable rather than merely rejected.
 #[derive(Debug, Clone, Copy)]
 pub enum OrgConnectionUpstream<'a> {
     /// A `cnr_` OIDC or OAuth 2.0 connector.
@@ -37665,9 +37667,12 @@ impl ActingOrgConnectionRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id, organization, or connector is out of scope;
-    /// [`StoreError::Conflict`] if a binding for the same (organization, connector)
-    /// already exists in this scope; [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::NotFound`] if the id, the organization, or the upstream is out of scope;
+    /// [`StoreError::Conflict`] if a binding for the same (organization, upstream) already
+    /// exists in this scope, OR -- for a SAML upstream -- if the connection belongs to a
+    /// DIFFERENT organization than the binding, which migration 0202 refuses structurally
+    /// because such a pairing has no meaning and every reader of it would have to guess which
+    /// organization the binding is really about; [`StoreError::Database`] otherwise.
     pub async fn create(
         &self,
         env: &Env,

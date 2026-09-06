@@ -1638,6 +1638,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0201_org_connections_saml_target.sql"),
         },
+        Migration {
+            version: 202,
+            name: "org_connections_saml_same_organization",
+            // EXPAND. A superkey and a composite foreign key. It can refuse only a pairing no
+            // shipped surface can write, so it validates against every deployed database
+            // instantly and constrains nothing that exists.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0202_org_connections_saml_same_organization.sql"),
+        },
     ]
 }
 
