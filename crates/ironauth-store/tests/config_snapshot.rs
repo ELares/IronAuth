@@ -265,6 +265,43 @@ async fn export_is_deterministic_secret_free_and_classification_bound() {
     );
 }
 
+/// Create a SAML connection owned by `organization`.
+async fn seed_saml_connection(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+) -> SamlConnectionId {
+    let connection = SamlConnectionId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .saml_connections()
+        .create(
+            env,
+            NewSamlConnection {
+                id: &connection,
+                organization_id: organization,
+                display_name: "Okta",
+                idp_entity_id: "urn:idp",
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/sp",
+                acs_url: "https://ironauth.example/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+    connection
+}
+
 #[tokio::test]
 async fn an_environment_holding_a_saml_binding_exports_a_snapshot_that_validates() {
     // THE EXPORTER AND ITS OWN VALIDATOR HAVE TO AGREE. When a binding could only name a
@@ -286,34 +323,7 @@ async fn an_environment_holding_a_saml_binding_exports_a_snapshot_that_validates
         .await
         .expect("create organization");
 
-    let connection = SamlConnectionId::generate(&env, &scope);
-    let acting = control
-        .scoped(scope)
-        .acting(db.test_actor(&env), CorrelationId::generate(&env));
-    acting
-        .saml_connections()
-        .create(
-            &env,
-            NewSamlConnection {
-                id: &connection,
-                organization_id: &organization,
-                display_name: "Okta",
-                idp_entity_id: "urn:idp",
-                idp_sso_url: "https://idp.example/sso",
-                sp_entity_id: "https://ironauth.example/saml/sp",
-                acs_url: "https://ironauth.example/acs",
-                allow_unsolicited: false,
-                clock_skew_secs: 30,
-                max_assertion_age_secs: 300,
-                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-                attribute_mapping: &serde_json::json!({}),
-                require_encrypted_assertion: false,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("create the SAML connection");
+    let connection = seed_saml_connection(&db, &env, scope, &organization).await;
 
     control
         .scoped(scope)
@@ -353,6 +363,40 @@ async fn an_environment_holding_a_saml_binding_exports_a_snapshot_that_validates
     );
     validate_document(&bytes)
         .expect("an environment with a SAML binding exports a snapshot its own validator accepts");
+
+    // AND THE RULE IS A RULE, NOT AN ABSENCE. Accepting the exported document only proves the
+    // OLD requirement (connector_id always) is gone -- a validator with NO upstream check at all
+    // would pass it too. What the replacement says is EXACTLY ONE, so both of the shapes it
+    // forbids have to be refused.
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let element = document
+        .pointer_mut("/resources/org_connection/0")
+        .expect("the org_connection element")
+        .as_object_mut()
+        .expect("an object");
+
+    element.insert(
+        "connector_id".to_owned(),
+        serde_json::Value::String("cnr_also".to_owned()),
+    );
+    let both = serde_json::to_vec(&document).expect("json");
+    assert!(
+        validate_document(&both).is_err(),
+        "a binding naming BOTH a connector and a SAML connection was accepted"
+    );
+
+    let element = document
+        .pointer_mut("/resources/org_connection/0")
+        .expect("the org_connection element")
+        .as_object_mut()
+        .expect("an object");
+    element.remove("connector_id");
+    element.remove("saml_connection_id");
+    let neither = serde_json::to_vec(&document).expect("json");
+    assert!(
+        validate_document(&neither).is_err(),
+        "a binding naming NEITHER upstream was accepted"
+    );
 }
 
 #[tokio::test]

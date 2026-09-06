@@ -419,7 +419,12 @@ async fn seed_rule(harness: &Harness, selector: RoutingSelector<'_>, ocn_id: &Or
 
 /// A URL-encoded `POST /login` form body for `identifier` returning to a local authorize.
 fn login_form(harness: &Harness, identifier: &str) -> String {
-    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    // TWO PARAMETERS, NOT ONE. A single-parameter resume contains no `&`, so a redirect that
+    // failed to percent-encode it is indistinguishable from one that did: everything still
+    // arrives. The second parameter is what makes an unencoded resume observably truncated --
+    // the START endpoint parses `&scope=openid` as its OWN query and the recorded RelayState
+    // loses it.
+    let return_to = format!("/authorize?client_id={}&scope=openid", harness.client_id());
     format!(
         "identifier={}&password=irrelevant&return_to={}",
         encode(identifier),
@@ -965,9 +970,9 @@ async fn a_domain_rule_can_route_to_a_saml_connection() {
     // reaches the recorded RelayState.
     let encoded = param(&location, "return_to");
     assert!(
-        encoded.contains("%2F") && encoded.contains("%3F"),
-        "the resume target was not percent-encoded, so a multi-parameter one would be truncated: \
-         {location}"
+        encoded.contains("%26scope%3Dopenid"),
+        "the resume target's second parameter was not encoded into it, so the start endpoint \
+         will parse it as its own query and the recorded RelayState will lose it: {location}"
     );
     // AND NO ROUTING TOKEN, which would authenticate a pairing that does not exist here: the
     // connection names its own organization, so there is no second value a browser could swap.
@@ -995,6 +1000,35 @@ async fn saml_routing_does_not_need_the_oidc_federation_runtime() {
     assert!(
         location.contains(&format!("/saml/start/{connection}")),
         "SAML routing was gated behind the OIDC federation runtime: {location}"
+    );
+}
+
+#[tokio::test]
+async fn a_connector_route_still_needs_the_federation_runtime() {
+    // THE OTHER HALF OF MOVING THE GATE. Round 1 moved `state.federation()` off the top of the
+    // function and onto the CONNECTOR branch, and pinned only that SAML no longer needs it --
+    // so deleting the relocated check entirely would have left the suite green while routing
+    // users to a `/federation/{slug}/authorize` that answers a uniform not-found, stranding
+    // them instead of falling back to the local prompt.
+    let harness = Harness::start().await;
+    let ocn_id = seed_binding(&harness, "acme").await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+
+    let response = post_login(
+        router_without_federation(&harness),
+        &harness,
+        &format!("ada@{ROUTED_DOMAIN}"),
+    )
+    .await;
+    let routed = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|location| location.contains("/federation/"));
+    assert!(
+        !routed,
+        "a connector route was taken with no federation runtime installed, so the user is sent \
+         to an endpoint that answers not-found"
     );
 }
 

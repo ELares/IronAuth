@@ -2166,7 +2166,14 @@ pub(crate) async fn provision_federated_user(
 }
 
 /// STAMP the routed org connection on a JIT-provisioned federated user (issue #77), when
-/// the login was routed to an organization. A NULL (non-routed) binding is a no-op; a
+/// the login was routed to an organization.
+///
+/// TWO CALLERS NOW, AND THEY LEARN THE BINDING DIFFERENTLY. The federated callback re-derives it
+/// from the CONSUMED CORRELATION ROW, so the browser never chose it. The SAML consumer
+/// (`saml_signin`, issue #139) re-derives it from the CONNECTION the response was posted to,
+/// which the browser also did not choose -- a SAML flow crosses the browser twice, so a carried
+/// value would be attacker-chosen. Both therefore satisfy this function's requirement that the
+/// id be server-derived; neither is a plaintext parameter. A NULL (non-routed) binding is a no-op; a
 /// malformed stored id is likewise skipped (the callback already re-derived it from the
 /// consumed correlation row, so it is a well-formed `ocn_` string). The stamp is bound to
 /// the SAME (new or returning) user the (issuer, sub) identity key resolved, so it never

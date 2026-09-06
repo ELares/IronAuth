@@ -69,9 +69,15 @@
 //! # What this does not do
 //!
 //! It does not consult `account_linking`, for the reason above. It does not capture upstream
-//! tokens: there are none, because SAML returns an assertion rather than a token grant. It does
+//! tokens: there are none, because SAML returns an assertion rather than a token grant.
+//!
+//! IT DOES APPLY THE BROKER OVERLAY NOW, and this paragraph used to say the opposite: "it does
 //! not apply the broker overlay, which reads an `ocn_` org connection this connection has no row
-//! in -- discovery routing is the change that gives SAML one.
+//! in -- discovery routing is the change that gives SAML one". Discovery routing landed, gave it
+//! one, and the sentence stayed -- so the module kept describing the gap while shipping the fix
+//! for it. What the overlay needs is the routed binding stamped on the user, and
+//! [`routed_binding`] re-derives it from the connection rather than trusting anything the
+//! browser carried across two hops.
 
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -377,7 +383,10 @@ async fn routed_binding(
         .store()
         .scoped(scope)
         .org_connections()
-        .for_saml_connection(&connection.id)
+        // THE CONNECTION'S OWN ORGANIZATION, not just the connection. A binding in ANOTHER
+        // organization may name this connection -- nothing forbids it -- and stamping the user
+        // with that one applies a policy the routed organization never set.
+        .for_saml_connection(&connection.id, &connection.organization_id)
         .await?
         .map(|binding| binding.id.to_string()))
 }

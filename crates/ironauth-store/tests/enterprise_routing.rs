@@ -18,8 +18,8 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
-    NewRoutingRule, OrgConnectionId, OrgConnectionUpstream, OrganizationId, RoutingRuleId,
-    RoutingSelector, Scope, StoreError, export_snapshot,
+    NewRoutingRule, NewSamlConnection, OrgConnectionId, OrgConnectionUpstream, OrganizationId,
+    RoutingRuleId, RoutingSelector, SamlConnectionId, Scope, StoreError, export_snapshot,
 };
 
 const CONNECTOR_SLUG: &str = "acme-oidc";
@@ -39,6 +39,118 @@ fn caps() -> ConnectorCapabilities<'static> {
         groups: false,
         logout_propagation: false,
         email_verified_trust: "untrusted",
+    }
+}
+
+#[tokio::test]
+async fn a_saml_binding_is_resolved_within_its_connections_own_organization() {
+    // THE READ THE SAML SIGN-IN PATH STAMPS FROM. It re-derives the routed `ocn_` binding from
+    // the connection, and an earlier version matched on `(tenant, environment,
+    // saml_connection_id, enabled)` alone -- while claiming "at most one, by the partial unique
+    // index migration 0201 adds". That index is keyed PER ORGANIZATION, and nothing ties
+    // `org_connections.saml_connection_id` to the connection's owner, so a second organization
+    // could bind the same connection and the read matched both rows. Whichever the planner
+    // yielded first was stamped on the user, so a policy from an organization they are not a
+    // member of applied and the routed organization's did not.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let owner = OrganizationId::generate(&env, &scope);
+    let stranger = OrganizationId::generate(&env, &scope);
+    for (id, name) in [(&owner, "Globex"), (&stranger, "Initech")] {
+        control
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .organizations(scope)
+            .create(&env, id, 1_000_000, name, None)
+            .await
+            .expect("create organization");
+    }
+
+    // THE CONNECTION BELONGS TO `owner`, by its own NOT NULL column.
+    let connection = SamlConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .saml_connections()
+        .create(
+            &env,
+            NewSamlConnection {
+                id: &connection,
+                organization_id: &owner,
+                display_name: "Okta",
+                idp_entity_id: "urn:idp",
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/sp",
+                acs_url: "https://ironauth.example/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+
+    // TWO BINDINGS NAMING IT, in two organizations. Nothing forbids the second: `create` checks
+    // only that each id is in scope, and the unique index is per organization.
+    let mut ids = Vec::new();
+    for organization in [&owner, &stranger] {
+        let ocn_id = OrgConnectionId::generate(&env, &scope);
+        control
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .org_connections()
+            .create(
+                &env,
+                &ocn_id,
+                1_000_000,
+                NewOrgConnection {
+                    organization_id: organization,
+                    upstream: OrgConnectionUpstream::Saml(&connection),
+                    overlay_min_acr: None,
+                    max_age_secs: None,
+                    overlay_min_class: None,
+                    capture_upstream_tokens: false,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("create the binding");
+        ids.push(ocn_id);
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "the fixture wrote one binding, so it cannot see the crossing"
+    );
+
+    // BOTH DIRECTIONS, WHICH IS WHAT MAKES THIS ORDER-INDEPENDENT. Asserting only that the
+    // OWNER's query returns the owner's binding does not discriminate: with the organization
+    // predicate deleted the query matches both rows and `fetch_optional` keeps whichever the
+    // planner yields, which for this fixture is the row inserted first -- the owner's. So that
+    // assertion passed against the mutant it was written to catch.
+    //
+    // Asking for EACH organization and requiring its OWN binding cannot both hold for a query
+    // that ignores the argument: the two ids differ, so one side fails whatever the row order.
+    let scoped = db.store().scoped(scope);
+    for (organization, expected) in [(&owner, &ids[0]), (&stranger, &ids[1])] {
+        let resolved = scoped
+            .org_connections()
+            .for_saml_connection(&connection, organization)
+            .await
+            .expect("read")
+            .expect("a binding for this organization");
+        assert_eq!(
+            resolved.id, *expected,
+            "the read ignored the organization and returned another one's binding"
+        );
+        assert_eq!(resolved.organization_id, organization.to_string());
     }
 }
 

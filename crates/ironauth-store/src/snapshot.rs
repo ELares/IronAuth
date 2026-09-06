@@ -838,8 +838,11 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // reason as the resources above.
     connector.sort_by(|a, b| a.connector_slug.cmp(&b.connector_slug));
 
-    // Organization-to-connector bindings (issue #77): secret-free per-environment
-    // config. Ordered by the stable (organization_id, connector_id) natural key.
+    // Organization-to-upstream bindings (issue #77, extended to SAML by issue #139):
+    // secret-free per-environment config. Ordered by the stable (organization_id, upstream)
+    // natural key, where upstream is whichever of connector_id / saml_connection_id is set --
+    // an earlier version of this comment named connector_id alone, which stopped being the key
+    // when a binding could name a connection instead.
     let mut org_connection: Vec<OrgConnectionSnapshot> = scoped
         .org_connections()
         .list_all()
@@ -2019,7 +2022,6 @@ fn validate_secret_field(
     }
 }
 
-/// Require a non-empty string field `field` on `object`, else push a violation.
 /// The field's value when it is a non-empty string, or [`None`] when it is absent, null, empty or
 /// not a string.
 ///
@@ -2036,6 +2038,7 @@ fn nonempty_str<'a>(
         .filter(|value| !value.is_empty())
 }
 
+/// Require a non-empty string field `field` on `object`, else push a violation.
 fn require_nonempty_string(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,

@@ -37359,7 +37359,18 @@ impl OrgConnectionRepo<'_> {
     /// enforced -- an operator sets an MFA floor on the binding that routes their people, and no
     /// ceremony ever runs.
     ///
-    /// AT MOST ONE, by the partial unique index migration 0201 adds.
+    /// THE ORGANIZATION IS PART OF THE QUERY, and an earlier version left it out while claiming
+    /// "at most one, by the partial unique index migration 0201 adds". That index is keyed on
+    /// `(tenant, environment, ORGANIZATION, saml_connection_id)`, so it is unique PER
+    /// ORGANIZATION -- nothing stops a second organization binding the same connection, because
+    /// no constraint ties `org_connections.saml_connection_id` to the connection's owner. The
+    /// read then matched both rows, `fetch_optional` kept whichever the planner yielded first,
+    /// and the user was stamped with a binding belonging to an organization they are not a
+    /// member of: its overlay applied and the routed organization's did not. That is the exact
+    /// defect this function was added to close, reachable through the function itself.
+    ///
+    /// Constraining to the connection's OWN organization makes the index's guarantee the query's
+    /// guarantee, so at most one row can match.
     ///
     /// # Errors
     ///
@@ -37367,19 +37378,21 @@ impl OrgConnectionRepo<'_> {
     pub async fn for_saml_connection(
         &self,
         saml_connection_id: &SamlConnectionId,
+        organization_id: &OrganizationId,
     ) -> Result<Option<OrgConnectionRecord>, StoreError> {
-        if saml_connection_id.scope() != self.scope {
+        if saml_connection_id.scope() != self.scope || organization_id.scope() != self.scope {
             return Ok(None);
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let row = sqlx::query(&format!(
             "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
              WHERE tenant_id = $1 AND environment_id = $2 AND saml_connection_id = $3 \
-             AND enabled"
+             AND organization_id = $4 AND enabled"
         ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(saml_connection_id.to_string())
+        .bind(organization_id.to_string())
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
