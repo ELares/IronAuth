@@ -58,7 +58,7 @@ repository.workspace = true
 # crate depends on across the range also holds: `regex::Regex::new` appears exactly once in
 # `cel-0.11.6/src/functions.rs`, so `matches` is still the only regex entry point the
 # `UNPRICEABLE_FUNCTIONS` denylist has to cover.
-cel = { version = "=0.11.6", features = ["json"] }
+cel = { version = "=0.14.4", features = ["json"] }
 # The wire form on this crate's own boundary. Bindings arrive as `serde_json::Value` and
 # results leave as one, so a caller never needs `cel` in its manifest and `cel::Program`
 # never escapes -- which is what makes the cost budget unavoidable rather than optional.
