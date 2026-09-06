@@ -426,14 +426,14 @@ pub async fn home_get(
 
 /// `GET /t/{tenant_id}/e/{environment_id}/portal/s/{intent}`: one configuration surface.
 ///
-/// # What this is for in this slice
+/// # What this is for
 ///
-/// The surfaces themselves -- the SSO connection editor, the SCIM token panel, domain
-/// verification -- land in later slices of #140. What lands here is the FENCE they will sit
-/// behind, with a caller, because a fence shipped without one is a control nothing consults and
-/// this project has shipped that shape repeatedly. It renders a placeholder; what it proves is
-/// that a session opened for one intent is refused at another, which is an acceptance criterion
-/// of #140 and is verifiable now rather than promised.
+/// The SCIM panel is here now (see `scim_surface` below). The others -- the SSO connection
+/// editor and domain verification -- land in later slices of #140. What landed FIRST is the
+/// FENCE they all sit behind, with a caller, because a fence shipped without one is a control
+/// nothing consults and this project has shipped that shape repeatedly. An intent with no panel
+/// yet renders a placeholder; what the fence proves either way is that a session opened for one
+/// intent is refused at another, which is an acceptance criterion of #140.
 pub async fn surface_get(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, intent)): Path<(String, String, String)>,
@@ -482,6 +482,13 @@ pub async fn surface_get(
 /// this plane as a declared cross-plane value for exactly that reason. A copy of the rule here
 /// would let one connection be "expiring" in the vendor's console and "healthy" in their
 /// customer's portal, with nobody positioned to see both.
+///
+/// # It says nothing it cannot stand behind
+///
+/// The provisioning base URL is printed only when this deployment actually serves `/scim/v2`.
+/// With the surface off it is a uniform 404, and nothing stops a `scim` portal link being minted
+/// on such a deployment, so the page says the surface is unavailable rather than handing over an
+/// address that answers nothing.
 ///
 /// # It reads and does not write
 ///
@@ -547,17 +554,32 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
         );
     }
 
+    // THE URL IS PRINTED ONLY WHERE IT IS SERVED. With `scim.enabled` off, `/scim/v2` is a
+    // uniform 404 on this deployment, and nothing stops a portal link with the `scim` intent
+    // being minted anyway -- link minting never consults the flag. A page that printed the URL
+    // regardless would send an IT admin to configure their identity provider against an endpoint
+    // that answers nothing, and the failure would surface days later as "provisioning never
+    // started" with the portal's own instructions as evidence that it should have.
+    let endpoint = if state.scim_surface_enabled() {
+        format!(
+            "<h2>Where your provisioning client connects</h2><p><code>{base}/scim/v2</code></p>",
+            base = escape_html(state.issuer_base()),
+        )
+    } else {
+        "<h2>Where your provisioning client connects</h2>\
+         <p>This deployment does not serve inbound provisioning. Ask your vendor to enable it.</p>"
+            .to_owned()
+    };
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Provisioning</title>\
          <h1>Provisioning</h1>\
          <p>Organization: {organization}</p>\
-         <h2>Where your provisioning client connects</h2>\
-         <p><code>{base}/scim/v2</code></p>\
+         {endpoint}\
          <h2>Your connections</h2>\
          <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th></tr></thead>\
          <tbody>{rows}</tbody></table>",
         organization = escape_html(&session.organization().to_string()),
-        base = escape_html(state.issuer_base()),
+        endpoint = endpoint,
         rows = rows,
     );
     crate::pages::secure_html(StatusCode::OK, body)

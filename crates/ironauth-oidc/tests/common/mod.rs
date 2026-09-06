@@ -684,6 +684,23 @@ impl Harness {
         Self::start_store_backed().await.with_scim_warning_lead(secs)
     }
 
+    /// A store-backed harness whose inbound SCIM surface is MOUNTED or not (issue #135's
+    /// `scim.enabled`), so a test can drive what the portal says about a provisioning URL this
+    /// deployment does not serve.
+    ///
+    /// The shipped default is OFF, and `OidcState` defaults to OFF for the same reason, so a
+    /// test that wanted the ON behaviour had to say so -- which is why the page's endpoint
+    /// assertions run on a harness built through here rather than on a plain store-backed one.
+    pub async fn start_store_backed_with_scim_surface(enabled: bool) -> Self {
+        let harness = Self::start_store_backed().await;
+        let state = harness.state.clone().with_scim_surface_enabled(enabled);
+        Self {
+            router: oidc_router(state.clone()),
+            state,
+            ..harness
+        }
+    }
+
     fn with_scim_warning_lead(mut self, secs: u64) -> Self {
         // THE ROUTER IS REBUILT, matching `with_hook_runtime` below: the router captures the
         // state it was built from, so installing on the state afterwards without rebuilding

@@ -172,9 +172,22 @@ const PROBES: &[SharedValueProbe] = &[
              max_results = 37\n\
              max_scan = 512\n\
              token_expiry_warning_secs = 259200\n",
-        // THE ONE KEY, not the whole section. `[scim]` carries the surface's page and scan bounds
-        // too, and those reach the SCIM plane rather than these two; serializing the section
-        // would compare values neither state holds.
+        // THE INSTALLED KEYS, not the whole section, and the difference costs something worth
+        // naming. The two sibling probes serialize their section on both sides, so a key ADDED to
+        // `OrganizationsConfig` or `TokenClaimsConfig` is compared automatically. `[scim]` cannot
+        // work that way: it carries the surface's page and scan bounds, which reach the SCIM
+        // plane rather than these two, so serializing the section would compare values neither
+        // state holds and fail on every run.
+        //
+        // WHAT THAT COSTS: a key added to `[scim]` and installed on both planes is NOT covered
+        // here until somebody adds it below. The compiler does not help either, because
+        // `install_scim` receives the whole section and may read any field of it. This object is
+        // therefore the list of `[scim]` keys that cross the plane boundary, and it has to be
+        // maintained as one -- which is the honest scope of this probe rather than the
+        // section-growth property the two above it have.
+        // The data plane additionally takes `enabled`, which the management plane does not, so
+        // it is not a CROSS-plane value and is not compared here; `install_scim`'s two impls say
+        // which plane takes what.
         expected: |fixture| json!({ "lead": fixture.config.scim.token_expiry_warning_secs }),
         on_oidc: |state| json!({ "lead": state.scim_token_expiry_warning_secs() }),
         on_admin: |state| json!({ "lead": state.scim_token_expiry_warning_secs() }),

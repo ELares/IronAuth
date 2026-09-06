@@ -394,6 +394,15 @@ pub struct OidcState {
     // management plane through `AdminState::with_scim_token_expiry_warning_secs`, which is why
     // it is a DECLARED shared value rather than two boot lines.
     scim_token_expiry_warning_secs: u64,
+    // Whether the inbound SCIM surface is MOUNTED on this deployment (issue #135's
+    // `scim.enabled`), installed from the same `[scim]` section as the lead above.
+    //
+    // The portal reads it to decide whether to hand a customer's IT admin a provisioning base
+    // URL at all: with the surface off, `/scim/v2` is a uniform 404, and a page that printed the
+    // URL anyway would send them to configure their identity provider against an endpoint that
+    // answers nothing. Nothing about a portal link prevents that pairing -- link minting never
+    // consults this flag -- so the page has to.
+    scim_surface_enabled: bool,
     // The deployment-wide token claim budget (issue #98), installed by the boot path from
     // the TOP-LEVEL `[token_claims]` config section. Kept OUTSIDE `Inner` and set through
     // the builder for the SAME top-level-config reason as the diagnostics knobs and the
@@ -1068,6 +1077,7 @@ impl OidcState {
             max_group_depth: ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
             scim_token_expiry_warning_secs: ironauth_config::ScimConfig::default()
                 .token_expiry_warning_secs,
+            scim_surface_enabled: ironauth_config::ScimConfig::default().enabled,
             token_claims: TokenClaimsConfig::default(),
             quota: None,
             migration_hook: None,
@@ -1709,6 +1719,25 @@ impl OidcState {
     #[must_use]
     pub fn scim_token_expiry_warning_secs(&self) -> u64 {
         self.scim_token_expiry_warning_secs
+    }
+
+    /// Install whether the inbound SCIM surface is mounted (issue #135's `scim.enabled`).
+    ///
+    /// Installed from the same `[scim]` section as the lead, by the same boot install, so the
+    /// portal cannot be told the surface is on while the router leaves it off.
+    #[must_use]
+    pub fn with_scim_surface_enabled(mut self, enabled: bool) -> Self {
+        self.scim_surface_enabled = enabled;
+        self
+    }
+
+    /// Whether this deployment mounts the inbound SCIM surface.
+    ///
+    /// Defaults to the shipped `[scim]` default, which is OFF: a state built directly has no
+    /// SCIM router in front of it either, so the two agree.
+    #[must_use]
+    pub fn scim_surface_enabled(&self) -> bool {
+        self.scim_surface_enabled
     }
 
     /// Install the deployment-wide token claim budget (issue #98).

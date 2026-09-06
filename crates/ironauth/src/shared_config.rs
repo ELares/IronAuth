@@ -480,7 +480,12 @@ impl SharedPlaneState for OidcState {
     }
 
     fn install_scim(self, section: &ScimConfig) -> Self {
+        // TWO KEYS ON THIS PLANE, from the one section and the one install. The portal reads the
+        // lead to warn, and reads `enabled` to know whether the provisioning URL it would print
+        // is served at all. Taking them from the same section in the same call is what stops the
+        // page believing the surface is mounted while the router left it off.
         self.with_scim_token_expiry_warning_secs(section.token_expiry_warning_secs)
+            .with_scim_surface_enabled(section.enabled)
     }
 
     fn install_signup_quarantine_enabled(self, input: &bool) -> Self {
@@ -527,6 +532,9 @@ impl SharedPlaneState for AdminState {
     }
 
     fn install_scim(self, section: &ScimConfig) -> Self {
+        // ONE KEY ON THIS PLANE. `scim.enabled` decides whether the inbound surface mounts, and
+        // the management API's connection routes mount either way -- an operator manages
+        // connections whether or not this node serves the surface.
         self.with_scim_token_expiry_warning_secs(section.token_expiry_warning_secs)
     }
 
@@ -620,10 +628,12 @@ mod tests {
              about.\n\n\
              IT WAS UNCLASSIFIED UNTIL NOW, which made \
              `every_config_key_is_either_a_declared_shared_section_or_classified_plane_local` \
-             RED on main from the day `[scim_push]` was added -- the check does exactly what it \
-             promises and nothing was running it. It is not in the local gate, and this \
-             repository's main branch requires no CI check, so the guard sat failing where \
-             nobody looked.",
+             RED on main from the day `[scim_push]` was added. The check does exactly what it \
+             promises; what failed is that nothing ran it. `scripts/gate.sh` DOES run it, inside \
+             `cargo test --workspace --all-features`, so this is not a hole in the gate -- it is \
+             what a red gate looks like when the gate is not being run, on a branch whose \
+             protection requires no CI check either. A guard nobody executes is a guard that \
+             reports nothing, however exactly it is written.",
         ),
         (
             "messaging",
