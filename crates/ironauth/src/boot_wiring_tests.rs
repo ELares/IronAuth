@@ -81,28 +81,6 @@ const PUBLIC_URL: &str = "https://boot-wiring.invalid";
 /// apply is a no-op and cannot mask a divergence.
 const JWKS_CACHE_MAX_AGE_SECS: u64 = 900;
 
-/// The SCIM page bound this harness configures, deliberately AWAY from the 200 default.
-///
-/// A fixture written at the defaults cannot distinguish a plane built from the config from one
-/// built from `ScimLimits::default()`, which is the exact non-observation this harness exists
-/// to prevent.
-const SCIM_MAX_RESULTS: u32 = 37;
-/// The SCIM scan bound this harness configures, likewise away from the 1000 default and below
-/// it, so it is also a legal value under `validate_scim`.
-const SCIM_MAX_SCAN: u32 = 512;
-
-/// The SCIM token expiry warning lead this harness configures, in seconds (issue #140).
-///
-/// Three days, away from the fourteen-day default for the reason the two bounds above are away
-/// from theirs, and below `SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS` so the config validates.
-///
-/// It reaches ONE plane -- the management listing computes the warning and the data plane
-/// authenticates tokens without ever asking how close one is to lapsing -- so it is not a
-/// shared value and carries no cross-plane probe. What it needs, and what nothing had, is a
-/// reader of the boot line itself: deleting the install left every suite in this workspace
-/// green.
-const SCIM_TOKEN_EXPIRY_WARNING_SECS: u64 = 3 * 24 * 60 * 60;
-
 /// The address of the object behind an `Arc`, which is what an identity contract means:
 /// the two planes hold the SAME object, not an equal one.
 fn address<T>(handle: &Arc<T>) -> usize {
@@ -173,6 +151,33 @@ const PROBES: &[SharedValueProbe] = &[
         on_admin: |state| {
             serde_json::to_value(state.token_claims()).expect("the section serializes")
         },
+        oidc_object: None,
+        admin_object: None,
+    },
+    SharedValueProbe {
+        name: "scim",
+        // THE WHOLE SECTION, because a declared config section's probe must drive its own
+        // section through TOML -- `every_declared_shared_value_has_a_probe` enforces that, and it
+        // is why `harness_config` no longer opens `[scim]` itself: two `[scim]` tables in one
+        // document is a duplicate TOML refuses, and the harness config would fail to PARSE rather
+        // than fail this probe.
+        //
+        // Every value away from its shipped default: the surface is on rather than off, the page
+        // and scan bounds are away from 200 and 1000 (and the scan bound stays under the store's
+        // list cap, so `validate_scim` accepts it), and the lead is three days rather than
+        // fourteen. The lead is what these two planes hold; the bounds reach the SCIM plane and
+        // are driven here because the section arrives as a whole.
+        non_default_toml: "[scim]\n\
+             enabled = true\n\
+             max_results = 37\n\
+             max_scan = 512\n\
+             token_expiry_warning_secs = 259200\n",
+        // THE ONE KEY, not the whole section. `[scim]` carries the surface's page and scan bounds
+        // too, and those reach the SCIM plane rather than these two; serializing the section
+        // would compare values neither state holds.
+        expected: |fixture| json!({ "lead": fixture.config.scim.token_expiry_warning_secs }),
+        on_oidc: |state| json!({ "lead": state.scim_token_expiry_warning_secs() }),
+        on_admin: |state| json!({ "lead": state.scim_token_expiry_warning_secs() }),
         oidc_object: None,
         admin_object: None,
     },
@@ -319,9 +324,6 @@ fn harness_config(db: &TestDatabase, ladder: LadderIntent) -> Config {
          [oidc.lazy_migration]\nenabled = true\n\
          endpoint = \"https://legacy.invalid/verify\"\n\
          [oidc.federation]\nenabled = true\n\
-         [scim]\nenabled = true\n\
-         max_results = {SCIM_MAX_RESULTS}\nmax_scan = {SCIM_MAX_SCAN}\n\
-         token_expiry_warning_secs = {SCIM_TOKEN_EXPIRY_WARNING_SECS}\n\
          [identifiers]\nuniqueness = \"org_scoped\"\n\
          [features]\n",
         app = db.app_url(),
@@ -775,59 +777,21 @@ async fn the_scim_surface_assembles_with_the_configured_limits() {
 
     assert_eq!(
         state.limits().max_results,
-        SCIM_MAX_RESULTS as usize,
+        fixture.config.scim.max_results as usize,
         "the advertised page bound must be the configured one"
     );
     assert_eq!(
         state.limits().max_scan,
-        SCIM_MAX_SCAN as usize,
+        fixture.config.scim.max_scan as usize,
         "the scan bound must be the configured one"
     );
     // And the fixture values really are distinguishable from the crate defaults, or the two
-    // assertions above would hold against a plane that read no config at all.
+    // assertions above would hold against a plane that read no config at all. Read off the
+    // FIXTURE rather than a constant written here: the section is driven from the `scim` probe's
+    // TOML now, and a constant beside these assertions could stop matching it silently.
     let unconfigured = ironauth_scim::ScimLimits::default();
-    assert_ne!(unconfigured.max_results, SCIM_MAX_RESULTS as usize);
-    assert_ne!(unconfigured.max_scan, SCIM_MAX_SCAN as usize);
-}
-
-#[tokio::test]
-async fn the_management_plane_holds_the_configured_scim_warning_lead() {
-    // THE BOOT LINE ITSELF, which nothing read. `main.rs` installs
-    // `scim.token_expiry_warning_secs` onto the management state, and deleting that install
-    // left every suite in this workspace green: the admin crate's own tests build the state
-    // through `with_scim_token_expiry_warning_secs` directly, so they observe the BUILDER and
-    // never the boot path that calls it. That is the shape `serve_retention_boot.rs` recorded
-    // for this repository, one layer up.
-    let db = TestDatabase::start().await;
-    let env = Env::system();
-    let fixture = fixture(
-        &db,
-        &env,
-        LadderIntent {
-            signup_quarantine: true,
-            advanced_recovery: true,
-        },
-    );
-    let planes = boot_both_planes(&fixture).await;
-
-    assert_eq!(
-        planes.admin.scim_token_expiry_warning_secs(),
-        SCIM_TOKEN_EXPIRY_WARNING_SECS,
-        "the management plane must warn on the lead the operator configured under [scim]"
-    );
-
-    // AND THE FIXTURE VALUE IS DISTINGUISHABLE FROM WHAT AN UNINSTALLED STATE REPORTS, which
-    // is the whole difficulty here: `AdminState`'s own default for this field IS
-    // `ScimConfig::default().token_expiry_warning_secs`, so a harness written at the default
-    // would assert exactly what a plane that read no config at all reports. The baseline is
-    // built rather than written down, for the reason `unwired_planes` documents.
-    let unwired = unwired_planes(&db, &env).await;
-    assert_ne!(
-        unwired.admin.scim_token_expiry_warning_secs(),
-        SCIM_TOKEN_EXPIRY_WARNING_SECS,
-        "the harness lead has drifted onto the shipped default, so the assertion above would \
-         hold against a boot path that installed nothing"
-    );
+    assert_ne!(unconfigured.max_results, fixture.config.scim.max_results as usize);
+    assert_ne!(unconfigured.max_scan, fixture.config.scim.max_scan as usize);
 }
 
 #[tokio::test]

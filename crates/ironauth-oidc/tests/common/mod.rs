@@ -672,6 +672,31 @@ impl Harness {
         .with_hook_runtime(runtime)
     }
 
+    /// A store-backed harness whose SCIM token expiry warning lead is `secs` (issue #140).
+    ///
+    /// STORE-BACKED, because the portal's provisioning page reads real connection rows. And a
+    /// NON-DEFAULT lead, because without one every test runs at the shipped fourteen days and
+    /// would pass equally against a page that ignored the state and hardcoded it. The same lead
+    /// reaches this plane and the management plane as one declared cross-plane value, so that a
+    /// connection cannot read "expiring" in the vendor's console and "healthy" in their
+    /// customer's portal; this is what checks that the page is on the receiving end of it.
+    pub async fn start_store_backed_with_scim_warning_lead(secs: u64) -> Self {
+        Self::start_store_backed().await.with_scim_warning_lead(secs)
+    }
+
+    fn with_scim_warning_lead(mut self, secs: u64) -> Self {
+        // THE ROUTER IS REBUILT, matching `with_hook_runtime` below: the router captures the
+        // state it was built from, so installing on the state afterwards without rebuilding
+        // leaves every request served by the state as it was.
+        let state = self
+            .state
+            .clone()
+            .with_scim_token_expiry_warning_secs(secs);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+        self
+    }
+
     /// Install a hook runtime on an already-built harness (issue #114 criterion 6).
     #[cfg(feature = "wasm-hooks")]
     #[must_use]

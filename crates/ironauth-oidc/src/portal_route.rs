@@ -36,6 +36,8 @@ use ironauth_store::{
 };
 use serde::Deserialize;
 
+use std::fmt::Write as _;
+
 use crate::interaction;
 use crate::pages::escape_html;
 use crate::state::OidcState;
@@ -449,6 +451,12 @@ pub async fn surface_get(
     if let Err(refusal) = session.require_intent(&intent) {
         return refusal.into_response();
     }
+    if intent == "scim" {
+        return scim_surface(&state, &session).await;
+    }
+    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER. `sso` and `domain-verification` land in
+    // later slices of #140, and the fence above has already refused an intent this session does
+    // not carry, so what reaches here is a surface this deployment serves and has not built yet.
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>{intent}</title>\
          <h1>{intent}</h1>\
@@ -458,6 +466,110 @@ pub async fn surface_get(
     );
     crate::pages::secure_html(StatusCode::OK, body)
 }
+
+/// The SCIM configuration surface: what this organization's provisioning credentials are doing.
+///
+/// # What an IT admin came here to find out
+///
+/// Whether provisioning is working, and if it is going to stop, when. Those are two different
+/// questions and the page answers them separately, because a connection with no working
+/// credential and one whose credential never expires publish the same absent deadline and only
+/// one of them needs somebody today.
+///
+/// THE ANSWERS ARE THE ROW'S OWN. `ScimConnection::no_live_credential` and
+/// `stops_provisioning_soon` are what the management API's listing reports to the vendor's
+/// operator, and this page calls the same two methods with the same lead time -- which reaches
+/// this plane as a declared cross-plane value for exactly that reason. A copy of the rule here
+/// would let one connection be "expiring" in the vendor's console and "healthy" in their
+/// customer's portal, with nobody positioned to see both.
+///
+/// # It reads and does not write
+///
+/// Rotation is not offered, and its absence is deliberate rather than unfinished: this plane
+/// authenticates as the data-plane role, which holds `SELECT` and nothing else on both SCIM
+/// tables. Migration 0205 argues the case -- a provisioning credential that could mint another
+/// provisioning credential is an escalation with no operator in the loop -- so offering rotation
+/// from here is a grant decision, not a page.
+async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
+    let now = epoch_micros(state.env().clock().now_utc());
+    let read = state
+        .store()
+        .scoped(session.scope())
+        .scim_connections()
+        // ONE MORE THAN THE PAGE SHOWS, so a longer list can be REPORTED as longer rather than
+        // silently cut. A page titled "your connections" that quietly drops some is worse than
+        // one that admits its bound.
+        .list_for_organization(session.organization(), PORTAL_LIST_LIMIT + 1, None, now)
+        .await;
+    // THE ORGANIZATION IS THE SESSION'S, so a failure here is not an addressing mistake a holder
+    // could have made; it is this deployment failing to read its own row.
+    let Ok(connections) = read else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let lead = state.scim_token_expiry_warning_secs();
+    let truncated = connections.len() > usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
+    let shown = connections
+        .iter()
+        .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX));
+    let mut rows = String::new();
+    for connection in shown {
+        let status = if connection.revoked {
+            "Revoked".to_owned()
+        } else if connection.no_live_credential() {
+            "Provisioning has stopped: no working token".to_owned()
+        } else if let Some(deadline) = connection.provisioning_stops_at_unix_micros {
+            let when = crate::saml_start::rfc3339_utc(deadline / 1_000_000);
+            if connection.stops_provisioning_soon(now, lead) {
+                format!("Stops working {when}")
+            } else {
+                format!("Active until {when}")
+            }
+        } else {
+            "Active".to_owned()
+        };
+        let _ = write!(
+            rows,
+            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td></tr>",
+            name = escape_html(&connection.display_name),
+            provider = escape_html(&connection.provider),
+            status = escape_html(&status),
+        );
+    }
+    if connections.is_empty() {
+        rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
+    }
+    if truncated {
+        let _ = write!(
+            rows,
+            "<tr><td colspan=\"3\">Showing the first {PORTAL_LIST_LIMIT}. \
+             Ask your vendor for the rest.</td></tr>"
+        );
+    }
+
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Provisioning</title>\
+         <h1>Provisioning</h1>\
+         <p>Organization: {organization}</p>\
+         <h2>Where your provisioning client connects</h2>\
+         <p><code>{base}/scim/v2</code></p>\
+         <h2>Your connections</h2>\
+         <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th></tr></thead>\
+         <tbody>{rows}</tbody></table>",
+        organization = escape_html(&session.organization().to_string()),
+        base = escape_html(state.issuer_base()),
+        rows = rows,
+    );
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// How many connections one portal page renders.
+///
+/// An organization has a handful of provisioning connections, not a page of them, and this
+/// surface has no pagination controls. The read asks for one MORE than this, so a longer list is
+/// reported as truncated instead of quietly losing rows: a page an admin reads as "these are my
+/// connections" must not be missing the one they came to look at without saying so.
+const PORTAL_LIST_LIMIT: i64 = 100;
 
 /// Where a freshly opened session lands.
 fn portal_home(scope: &Scope) -> String {

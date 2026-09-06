@@ -78949,6 +78949,182 @@ fn live_token_count(row: &sqlx::postgres::PgRow) -> i64 {
     }
 }
 
+impl ScimConnection {
+    /// Whether this connection is close enough to losing its last credential to warn about
+    /// (issue #140).
+    ///
+    /// # Why this lives beside the row rather than in whoever renders it
+    ///
+    /// Two surfaces ask it. The management API answers it for an operator, and the self-service
+    /// portal answers it for the customer's own IT admin, and those two run on DIFFERENT PLANES
+    /// in different crates. Written twice they would drift, and the drift would be invisible:
+    /// one lead time producing two answers about one connection, each defensible on its own
+    /// page. The lead itself is a declared cross-plane value for the same reason.
+    ///
+    /// FALSE WHEN NOTHING IS LIVE, because a countdown is about something that still works. That
+    /// case is [`Self::no_live_credential`], and the deadline this reads is already absent there
+    /// -- the listing publishes none once its count reaches zero -- so this is defence in depth
+    /// rather than the thing that decides, and deleting it changes no answer a listing produces.
+    ///
+    /// A ZERO LEAD is the operator turning warnings off, so nothing is ever expiring.
+    #[must_use]
+    pub fn stops_provisioning_soon(&self, now_micros: i64, lead_secs: u64) -> bool {
+        if lead_secs == 0 || self.live_token_count == 0 {
+            return false;
+        }
+        let Some(deadline) = self.provisioning_stops_at_unix_micros else {
+            return false;
+        };
+        // SATURATING, because a lead time of a year in microseconds is comfortably inside i64
+        // but the addition is still arithmetic on a caller-supplied clock, and a wrap would
+        // silently invert the comparison.
+        let lead_micros = i64::try_from(lead_secs)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000_000);
+        deadline <= now_micros.saturating_add(lead_micros)
+    }
+
+    /// Whether provisioning through this connection has ALREADY stopped (issue #140).
+    ///
+    /// A DIFFERENT FACT FROM THE WARNING, and it needs to be asked separately because the two
+    /// are indistinguishable through an absent deadline: a connection whose credentials are all
+    /// gone and a perfectly healthy one whose token never expires both publish none. One of them
+    /// needs somebody today.
+    ///
+    /// FALSE FOR A REVOKED CONNECTION, which also has no usable credential -- but that one
+    /// stopped working because somebody made it stop, and `revoked_at` already says so. This
+    /// reports the connections whose state nothing else explains.
+    #[must_use]
+    pub fn no_live_credential(&self) -> bool {
+        !self.revoked && self.live_token_count == 0
+    }
+}
+
+#[cfg(test)]
+mod scim_connection_signal_tests {
+    use super::{OrganizationId, ScimConnection, ScimConnectionId};
+    use ironauth_env::Env;
+
+    use crate::Scope;
+    use crate::id::{EnvironmentId, TenantId};
+
+    const DAY: i64 = 24 * 60 * 60 * 1_000_000;
+
+    /// A connection carrying exactly the three fields the two signals read, with everything else
+    /// at a value that makes no difference to them.
+    fn connection(revoked: bool, live_token_count: i64, deadline: Option<i64>) -> ScimConnection {
+        let env = Env::system();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        ScimConnection {
+            id: ScimConnectionId::generate(&env, &scope),
+            organization_id: OrganizationId::generate(&env, &scope),
+            display_name: "acme".to_owned(),
+            provider: "okta".to_owned(),
+            expires_at_unix_micros: None,
+            revoked_at_unix_micros: revoked.then_some(1_699_000_000_000_000),
+            revoked,
+            live_token_count,
+            provisioning_stops_at_unix_micros: deadline,
+            created_at_unix_micros: 1_698_000_000_000_000,
+        }
+    }
+
+    /// The warning fires inside the lead time and not outside it.
+    ///
+    /// Both directions in one test because either alone is satisfied by a constant: a predicate
+    /// that always answered `true` would pass an inside-the-window assertion, and one that
+    /// always answered `false` would pass an outside-it assertion.
+    #[test]
+    fn the_warning_fires_inside_the_lead_time_and_not_outside_it() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 14 * 24 * 60 * 60;
+        assert!(
+            connection(false, 1, Some(now + 13 * DAY)).stops_provisioning_soon(now, lead),
+            "a token lapsing inside the lead time is not reported as expiring"
+        );
+        assert!(
+            !connection(false, 1, Some(now + 15 * DAY)).stops_provisioning_soon(now, lead),
+            "a token lapsing beyond the lead time is reported as expiring, so the warning is \
+             always on and says nothing"
+        );
+    }
+    /// A zero lead time turns the warning off, and no horizon means nothing to warn about.
+    ///
+    /// THE ZERO CASE IS DRIVEN AT EXACTLY `now`, which is the only input that distinguishes the
+    /// early return from the arithmetic. For any horizon strictly in the future, the comparison
+    /// against a zero lead is already false, so deleting the branch would leave such an
+    /// assertion green. A horizon of exactly `now` satisfies the comparison and is refused only
+    /// by the branch itself.
+    #[test]
+    fn a_zero_lead_or_no_horizon_never_warns() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(
+            !connection(false, 1, Some(now)).stops_provisioning_soon(now, 0),
+            "the operator disabled warnings and got one anyway: a horizon of exactly now \
+             satisfies the comparison, so only the zero branch can refuse it"
+        );
+        assert!(
+            !connection(false, 1, Some(now + 1)).stops_provisioning_soon(now, 0),
+            "the operator disabled warnings and got one anyway"
+        );
+        assert!(
+            !connection(false, 1, None).stops_provisioning_soon(now, 14 * 24 * 60 * 60),
+            "a connection whose tokens have no horizon was reported as expiring"
+        );
+    }
+    /// A PAST deadline answers "warn" rather than going quiet, defensively.
+    ///
+    /// # This is not a behaviour the listing can reach, and saying otherwise was wrong
+    ///
+    /// An earlier version of this test claimed it kept the column from looking healthy at the
+    /// moment provisioning breaks. That was true of the round-one design and is false now, twice
+    /// over: the store filters both arms of the deadline on `> now`, so this function is never
+    /// handed a past timestamp from a listing, and `view` suppresses the warning entirely once
+    /// the connection counts no live credential. A connection whose tokens have all lapsed is
+    /// reported by `no_live_token`, not by a countdown -- which is what
+    /// `a_connection_whose_live_credentials_are_all_gone_reports_no_live_token` in the store
+    /// suite asserts.
+    ///
+    /// What remains worth pinning is the DIRECTION this function fails in for an input it should
+    /// never see: if the store's filter were ever relaxed, a past deadline must produce a warning
+    /// rather than silence. A range check requiring the deadline to be in the future would give
+    /// silence, and silence is indistinguishable from healthy.
+    #[test]
+    fn a_past_deadline_warns_rather_than_going_quiet() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(
+            connection(false, 1, Some(now - DAY)).stops_provisioning_soon(now, 14 * 24 * 60 * 60),
+            "a deadline in the past answered quiet; the store does not produce this input, and \
+             if it ever did, quiet would be indistinguishable from healthy"
+        );
+    }
+    /// The boundary belongs to the warning.
+    ///
+    /// A token lapsing EXACTLY at the lead time is inside it. The alternative leaves a
+    /// one-microsecond window in which the operator is not told, and the cost of being early is
+    /// nothing while the cost of being late is provisioning stopping unannounced.
+    #[test]
+    fn a_token_lapsing_exactly_at_the_lead_time_is_warned_about() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 7 * 24 * 60 * 60;
+        assert!(connection(false, 1, Some(now + 7 * DAY)).stops_provisioning_soon(now, lead));
+        assert!(!connection(false, 1, Some(now + 7 * DAY + 1)).stops_provisioning_soon(now, lead));
+    }
+    /// An enormous lead time does not wrap into `false`.
+    ///
+    /// The lead arrives as a `u64` of seconds from configuration and is multiplied by a million.
+    /// Config load caps it at a year, but this function is the one that must not invert its
+    /// comparison if that cap ever moves or a caller passes something else.
+    #[test]
+    fn an_enormous_lead_saturates_rather_than_wrapping() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(
+            connection(false, 1, Some(now + 365 * DAY)).stops_provisioning_soon(now, u64::MAX),
+            "a huge lead time wrapped and inverted the comparison"
+        );
+    }
+}
+
 /// The WRITE side of the inbound SCIM connections, for this scope and actor (issue #135).
 pub struct ActingScimConnectionRepo<'a> {
     store: &'a Store,

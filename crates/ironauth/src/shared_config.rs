@@ -88,7 +88,7 @@ use std::sync::Arc;
 
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, Config, FeatureRegistry, OrganizationsConfig,
+    ADVANCED_RECOVERY_FEATURE, Config, FeatureRegistry, OrganizationsConfig, ScimConfig,
     SIGNUP_QUARANTINE_FEATURE, TokenClaimsConfig,
 };
 use ironauth_env::Env;
@@ -370,6 +370,16 @@ shared_plane_inputs! {
         // API reports the approach warning against it.
         token_claims: TokenClaimsConfig
             => install_token_claims via with_token_claims,
+        // The SCIM token expiry warning lead (issue #140): the management API computes the
+        // warning on its connection listing and the self-service PORTAL, which runs on the data
+        // plane, renders the same warning on the customer's own connections. One lead time with
+        // two answers is exactly what this file exists to prevent -- an operator reading
+        // "expiring" in the console while their customer's portal reads "healthy" would be a
+        // disagreement nobody could see. It was plane-local until the portal surface landed,
+        // classified in `PLANE_LOCAL_KEYS` with a note recording that both planes read the
+        // section for DIFFERENT keys; that note is gone because one key now reaches both.
+        scim: ScimConfig
+            => install_scim via with_scim_token_expiry_warning_secs,
     }
     from_boot {
         // The experimental signup fraud review queue (issue #82, PR 2), resolved
@@ -469,6 +479,10 @@ impl SharedPlaneState for OidcState {
         self.with_token_claims(section)
     }
 
+    fn install_scim(self, section: &ScimConfig) -> Self {
+        self.with_scim_token_expiry_warning_secs(section.token_expiry_warning_secs)
+    }
+
     fn install_signup_quarantine_enabled(self, input: &bool) -> Self {
         self.with_signup_quarantine_enabled(*input)
     }
@@ -510,6 +524,10 @@ impl SharedPlaneState for AdminState {
 
     fn install_token_claims(self, section: &TokenClaimsConfig) -> Self {
         self.with_token_claims(section)
+    }
+
+    fn install_scim(self, section: &ScimConfig) -> Self {
+        self.with_scim_token_expiry_warning_secs(section.token_expiry_warning_secs)
     }
 
     fn install_signup_quarantine_enabled(self, input: &bool) -> Self {
@@ -593,21 +611,19 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
-            "scim",
+            "scim_push",
             Reach::OnePlaneOrNoState,
-            "read by `assemble_planes` (issue #135), which decides whether the surface mounts at \
-             all, and by `build_scim_plane`, which sizes its page and scan bounds. BOTH planes \
-             read the section now, and each takes a DIFFERENT key from it: the public plane \
-             takes the page and scan bounds, and the management plane takes ONLY \
-             `token_expiry_warning_secs` (issue #140), which sizes the expiry warning on the \
-             connection listing. That is why this stays plane-local rather than becoming a \
-             shared input: no single value has to reach both planes and agree, so there is \
-             nothing for them to disagree about. An earlier version of this note said the \
-             management plane never sees the section, which stopped being true when the \
-             warning landed. There is deliberately no `scim.uniqueness` key -- the mode SCIM \
-             needs is a SHARED value, taken from `[identifiers]` through the single \
-             `uniqueness_mode` match, because two identity doors handed different modes by \
-             configuration would disagree about what the same person is.",
+            "consumed once at boot by `scim_push_inputs` (issue #137) to build the outbound push \
+             scheduler, a background task that answers no request. Neither plane's state holds \
+             it: the scheduler owns its own interval and reads the connections it pushes through \
+             its own store handle, so there is no per-request value for a plane to disagree \
+             about.\n\n\
+             IT WAS UNCLASSIFIED UNTIL NOW, which made \
+             `every_config_key_is_either_a_declared_shared_section_or_classified_plane_local` \
+             RED on main from the day `[scim_push]` was added -- the check does exactly what it \
+             promises and nothing was running it. It is not in the local gate, and this \
+             repository's main branch requires no CI check, so the guard sat failing where \
+             nobody looked.",
         ),
         (
             "messaging",

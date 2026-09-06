@@ -38,6 +38,12 @@ async fn get(harness: &Harness, path: &str) -> (axum::http::StatusCode, String) 
 /// more. Seeding through `harness.store()` fails with a permission error, and that failure is
 /// the grant working.
 async fn wire(harness: &Harness, intent: &str, token: &str) -> (String, PortalLinkId) {
+    let organization = seed_org(harness, "Globex").await;
+    wire_in(harness, intent, token, &organization).await
+}
+
+/// One organization, created through the CONTROL plane as the product does.
+async fn seed_org(harness: &Harness, name: &str) -> OrganizationId {
     let env = Env::system();
     let scope = harness.scope();
     let organization = OrganizationId::generate(&env, &scope);
@@ -50,10 +56,22 @@ async fn wire(harness: &Harness, intent: &str, token: &str) -> (String, PortalLi
             CorrelationId::generate(&env),
         )
         .organizations(scope)
-        .create(&env, &organization, 1_000_000, "Globex", None)
+        .create(&env, &organization, 1_000_000, name, None)
         .await
         .expect("create organization");
+    organization
+}
 
+/// A link for an organization the caller already holds, so a test can put TWO organizations in
+/// one environment and check that a session for one cannot see the other.
+async fn wire_in(
+    harness: &Harness,
+    intent: &str,
+    token: &str,
+    organization: &OrganizationId,
+) -> (String, PortalLinkId) {
+    let env = Env::system();
+    let scope = harness.scope();
     let id = PortalLinkId::generate(&env, &scope);
     harness
         .db()
@@ -68,7 +86,7 @@ async fn wire(harness: &Harness, intent: &str, token: &str) -> (String, PortalLi
             &env,
             NewPortalLink {
                 id: &id,
-                organization_id: &organization,
+                organization_id: organization,
                 intent,
                 token_digest: &digest(token),
             },
@@ -550,5 +568,325 @@ async fn a_cross_site_finish_is_refused() {
     assert_eq!(
         status, 200,
         "the refused cross-site finish revoked the session anyway"
+    );
+}
+
+/// Open a session for a link minted against `organization`.
+async fn open_session_in(
+    harness: &Harness,
+    intent: &str,
+    token: &str,
+    organization: &OrganizationId,
+) -> String {
+    let (path, _) = wire_in(harness, intent, token, organization).await;
+    let (status, headers, body) = harness.post_form(&path, &format!("t={token}"), None).await;
+    assert_eq!(status, 303, "opening a session: {body}");
+    headers
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| cookie.split(';').next())
+        .expect("a session cookie is set")
+        .to_owned()
+}
+
+/// Create a SCIM connection in `organization` through the CONTROL plane, as the vendor does.
+async fn connect(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    token: &str,
+    expires_at_unix_micros: Option<i64>,
+) -> ironauth_store::ScimConnectionId {
+    let env = Env::system();
+    let scope = harness.scope();
+    let id = ironauth_store::ScimConnectionId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .create(
+            &env,
+            ironauth_store::NewScimConnection {
+                id: &id,
+                organization_id: organization,
+                display_name,
+                provider: "okta",
+                token_digest: &hex_digest(token),
+                expires_at_unix_micros,
+            },
+            None,
+        )
+        .await
+        .expect("create the connection");
+    id
+}
+
+/// The harness clock in epoch microseconds, which is the unit every deadline here is in.
+fn now_micros(harness: &Harness) -> i64 {
+    i64::try_from(
+        harness
+            .env()
+            .clock()
+            .now_utc()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_micros(),
+    )
+    .expect("a microsecond count inside i64")
+}
+
+/// SHA-256 of a bearer value as hex, which is what the SCIM token column holds.
+///
+/// Written the way `ironauth-store`'s own SCIM tests write it, appending to one buffer rather
+/// than collecting a `format!` per byte.
+fn hex_digest(token: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(token.as_bytes()) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The provisioning page shows THIS organization's connections and no others.
+///
+/// # Issue #140 criterion 3, on the first surface that can express it
+///
+/// "A portal session for org A cannot read or mutate any org B state". Until this page existed
+/// there was nothing for that to mean: the portal rendered its own intent and organization id and
+/// read no organization-scoped data at all, so the criterion's ORG dimension had no surface to be
+/// tested against. Its SCOPE dimension is covered elsewhere in this file, by the link that cannot
+/// be redeemed in another environment and the cookie that is inert in one.
+///
+/// TWO ORGANIZATIONS IN ONE ENVIRONMENT, which is the arrangement that can actually fail. A
+/// session confined by scope alone would pass a cross-environment test and still hand one
+/// customer another customer's provisioning connections, because both live under the same tenant
+/// and environment and differ only by the organization on the session row.
+#[tokio::test]
+async fn a_portal_session_sees_only_its_own_organizations_connections() {
+    let harness = Harness::start_store_backed().await;
+    let mine = seed_org(&harness, "Acme").await;
+    let theirs = seed_org(&harness, "Globex").await;
+    connect(&harness, &mine, "acme-okta", "tok-acme", None).await;
+    connect(&harness, &theirs, "globex-entra", "tok-globex", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-p1", &mine).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+
+    assert_eq!(status, 200, "the provisioning page: {body}");
+    // THE CONTROL: the page really is listing connections, so the absence below is a fence
+    // rather than a page that lists nothing at all.
+    assert!(
+        body.contains("acme-okta"),
+        "the session's own connection is missing from its provisioning page: {body}"
+    );
+    assert!(
+        !body.contains("globex-entra"),
+        "one customer's portal listed ANOTHER customer's provisioning connection: {body}"
+    );
+
+    // AND THE COPY-PASTE VALUE AN ADMIN CAME FOR: the base URL their provisioning client
+    // connects to. Asserted as a DEPLOYMENT-wide absolute URL, because the SCIM surface is
+    // mounted unscoped -- `mount_public(scim_router(..))` serves `/scim/v2/...` and the bearer
+    // token is what carries the tenant and environment. A page that helpfully rendered the
+    // per-environment issuer instead would hand the admin a URL that 404s, and it would look
+    // more correct rather than less.
+    assert!(
+        body.contains("/scim/v2"),
+        "the provisioning base URL is missing, which is the value the page exists to hand over: \
+         {body}"
+    );
+    let advertised = body
+        .split("<code>")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .expect("the base URL is rendered in a code element");
+    assert!(
+        advertised.starts_with("http"),
+        "the advertised base is not an absolute URL, so it cannot be pasted anywhere: \
+         {advertised}"
+    );
+    assert!(
+        !advertised.contains("/t/"),
+        "the advertised base is scoped to a tenant path, but the SCIM surface is mounted \
+         unscoped -- pasting this into a provisioning client would 404: {advertised}"
+    );
+}
+
+/// Each connection's row says which of the four things it is.
+///
+/// # The four states, and why the page has to keep them apart
+///
+/// An absent deadline is published by a healthy connection whose token never expires AND by one
+/// that has already stopped working, so a page that rendered only deadlines would show those two
+/// identically while only one of them needs the admin today. A revoked connection also has no
+/// usable credential, but somebody made it that way and its row says so instead.
+///
+/// # The lead is the configured one, and the fixture is what proves it
+///
+/// The harness installs THIRTY days. A connection lapsing in twenty is inside that and OUTSIDE
+/// the shipped fourteen-day default, so it warns only if the page read the lead off the state.
+/// A page that hardcoded the default renders it "Active until" and turns this red. That is the
+/// whole reason the harness has the knob: at the default, every fixture would pass against a
+/// hardcoded page.
+#[tokio::test]
+async fn each_connection_row_reports_which_of_the_four_states_it_is_in() {
+    let harness = Harness::start_store_backed_with_scim_warning_lead(30 * 24 * 60 * 60).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    let day = 24 * 60 * 60 * 1_000_000_i64;
+    let writes = || {
+        harness.db().control_store().scoped(harness.scope()).acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+    };
+
+    connect(&harness, &org, "never-expires", "tok-a", None).await;
+    connect(&harness, &org, "lapses-in-twenty-days", "tok-b", Some(now + 20 * day)).await;
+
+    let revoked = connect(&harness, &org, "switched-off", "tok-c", Some(now + 40 * day)).await;
+    writes()
+        .scim_connections()
+        .revoke(&env, &revoked, now)
+        .await
+        .expect("revoke the connection");
+
+    // THE BROKEN ONE, built the only way the API can build it: rotate so the original token is
+    // superseded to the end of a short overlap, then revoke the fresh token outright. The
+    // CONNECTION stays live -- its own expiry is forty days out -- so what the page reports is
+    // the loss of its credentials rather than the connection lapsing.
+    let broken = connect(&harness, &org, "credentials-gone", "tok-d", Some(now + 40 * day)).await;
+    writes()
+        .scim_connections()
+        .rotate_token(&env, &broken, &hex_digest("tok-d2"), 60, now)
+        .await
+        .expect("rotate");
+    writes()
+        .scim_connections()
+        .revoke_token(&env, &broken, &hex_digest("tok-d2"), now)
+        .await
+        .expect("revoke the fresh token");
+    // PAST THE OVERLAP, or the superseded token is still live and this connection reads as
+    // "stops working in sixty seconds" rather than as broken. The rotation is what makes the
+    // original token lapse and the revocation is what removes its replacement; neither has
+    // happened yet on a clock that has not moved.
+    harness
+        .clock()
+        .advance(std::time::Duration::from_secs(120));
+
+    let cookie = open_session_in(&harness, "scim", "tok-p2", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // PER ROW, not per page: asserting that the page contains "Stops working" somewhere would be
+    // satisfied by any one of the four rows carrying it, including the wrong one.
+    let row = |name: &str| -> String {
+        let cell = format!("<td>{name}</td>");
+        let at = body
+            .find(&cell)
+            .unwrap_or_else(|| panic!("no row for {name}: {body}"));
+        let rest = &body[at..];
+        let end = rest.find("</tr>").unwrap_or(rest.len());
+        rest[..end].to_owned()
+    };
+
+    assert!(
+        row("never-expires").contains("Active") && !row("never-expires").contains("until"),
+        "a connection with no deadline is not plainly active: {}",
+        row("never-expires")
+    );
+    assert!(
+        row("lapses-in-twenty-days").contains("Stops working"),
+        "a connection lapsing twenty days out, under a THIRTY-day configured lead, is not \
+         reported as stopping -- the page is reading a lead it was not given: {}",
+        row("lapses-in-twenty-days")
+    );
+    assert!(
+        row("switched-off").contains("Revoked"),
+        "a revoked connection is not reported as revoked: {}",
+        row("switched-off")
+    );
+    assert!(
+        !row("switched-off").contains("no working token"),
+        "a REVOKED connection is reported as broken, which is noise on the one row whose state \
+         the revocation already explains: {}",
+        row("switched-off")
+    );
+    assert!(
+        row("credentials-gone").contains("no working token"),
+        "a connection whose credentials are all gone is not reported as stopped, so an admin \
+         reads it as healthy while provisioning is down: {}",
+        row("credentials-gone")
+    );
+    // AND THE FORTY-DAY CONNECTION IS NOT WARNED ABOUT, which is the other side of the lead:
+    // outside thirty days, so a page warning on everything would fail here.
+    assert!(
+        !row("credentials-gone").contains("Stops working"),
+        "a connection with nothing live is counting down to a moment that has passed: {}",
+        row("credentials-gone")
+    );
+}
+
+/// A longer list than the page shows is REPORTED as longer, not silently cut.
+///
+/// # The branch this drives, and why it needed driving
+///
+/// The page renders at most a hundred connections and reads a hundred and one, so it can tell
+/// "this is all of them" from "there are more". Without a fixture that crosses the bound, the
+/// whole reporting branch is unreachable and deleting it leaves every other test green -- and
+/// what ships is a page titled "your connections" that is missing some of them with no sign.
+///
+/// A HUNDRED AND ONE CONNECTIONS is deliberate rather than round: it is the smallest fixture
+/// that crosses the bound, so the test fails loudly if the bound moves rather than quietly
+/// ceasing to drive the branch.
+#[tokio::test]
+async fn a_list_longer_than_the_page_says_so() {
+    let harness = Harness::start_store_backed().await;
+    let org = seed_org(&harness, "Acme").await;
+    for index in 0..101 {
+        connect(&harness, &org, &format!("conn-{index:03}"), &format!("tok-{index}"), None).await;
+    }
+
+    let cookie = open_session_in(&harness, "scim", "tok-many", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    assert!(
+        body.contains("Showing the first"),
+        "a list longer than the page renders was cut with no notice, so an admin reads a partial \
+         list as a complete one"
+    );
+    // AND THE HUNDRED-AND-FIRST IS THE ONE MISSING, not a hundred of them: the page shows what
+    // it can and says what it cannot, rather than truncating to some smaller number.
+    let rendered = body.matches("<td>conn-").count();
+    assert_eq!(
+        rendered, 100,
+        "the page rendered {rendered} connection rows rather than the hundred it bounds itself to"
     );
 }

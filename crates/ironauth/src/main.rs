@@ -885,16 +885,6 @@ async fn build_admin_state(
             // count live work as ready, and a longer one would count lapsed work as in
             // flight.
             let state = state.with_outbox_visibility_timeout(config.outbox.visibility_timeout_secs);
-            // The SCIM token expiry warning lead time (issue #140). Installed HERE for the
-            // reason `[identifiers]` and `[outbox]` are: it reaches ONE plane. The connection
-            // listing is a management read, and the data plane authenticates tokens without
-            // ever asking how close one is to lapsing.
-            //
-            // It is the SAME `[scim]` section the data plane's own limits come from, read once
-            // here rather than duplicated under `[admin]`, so one setting cannot acquire two
-            // operator-visible names that disagree.
-            let state =
-                state.with_scim_token_expiry_warning_secs(config.scim.token_expiry_warning_secs);
             // Share the data-plane issuer registry (issue #93) so the compatibility wizard
             // can resolve an environment's actually signable ID-token algorithms and write
             // the per-client column through the data plane (the only role that can).
