@@ -2644,6 +2644,33 @@
       "type": "scim_connection.revoked"
     },
     {
+      "domain": "scim_connection",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "overlap_seconds": {
+            "type": "integer"
+          },
+          "scim_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scim_connection_id",
+          "organization_id",
+          "overlap_seconds"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "scim_connection.token_rotated"
+    },
+    {
       "domain": "scim_push_connection",
       "payload_schema": {
         "additionalProperties": false,

@@ -93,6 +93,327 @@ pub struct CreateScimConnectionRequest {
     pub expires_at_unix_ms: Option<i64>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate",
+    operation_id = "rotateScimConnectionToken",
+    tag = "scim",
+    request_body = RotateScimTokenRequest,
+    params(
+        ("Idempotency-Key" = String, Header, description = "Required. Replaying a POST under one key returns the stored answer, which omits the token"),
+        ("tenant_id" = String, Path, description = "Tenant identifier"),
+        ("environment_id" = String, Path, description = "Environment identifier"),
+        ("organization_id" = String, Path, description = "Organization identifier"),
+        ("connection_id" = String, Path, description = "The scim_ handle"),
+    ),
+    responses(
+        (status = 200, description = "Rotated; the new token appears here and nowhere else", body = ScimTokenRotated),
+        (status = 400, description = "An out-of-range overlap, or a missing Idempotency-Key", body = crate::error::ErrorBody),
+        (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorBody),
+        (status = 403, description = "The credential may not write credentials for this organization", body = crate::error::ErrorBody),
+        (status = 404, description = "No such live connection in this organization; a revoked or expired one answers the same", body = crate::error::ErrorBody),
+        (status = 409, description = "The organization is disabled, so a credential minted for it could not authenticate", body = crate::error::ErrorBody),
+        (status = 409, description = "A concurrent request is already rotating under this Idempotency-Key; retry", body = crate::error::ErrorBody),
+        (status = 422, description = "Idempotency-Key reused with a different request", body = crate::error::ErrorBody),
+    ),
+    security(("bearer_auth" = []))
+)]
+/// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate`
+// THE DOC COMMENT IS THE PATH AND NOTHING ELSE, matching every neighbour on this surface, and
+// the rest of this note is a PLAIN comment rather than a doc one on purpose. utoipa publishes
+// whatever doc comment sits on this function as the operation's summary and description, so an
+// earlier version's `# Errors` section reached the committed contract and the generated clients
+// as a heading followed by internal Rust type names, and the explanation of why that was wrong
+// would have followed it there. What a customer reads must not be the crate's own vocabulary.
+//
+// The refusals, for a reader of this file: `BadRequest` for an out-of-range overlap; `NotFound`
+// when no live connection of this organization has that handle, which is also the answer for a
+// handle from another tenant and for a revoked or expired connection; `Conflict` when the
+// organization is disabled; `Internal` on a persistence fault. All of them are published in the
+// `responses(..)` block above, which is where a caller should be reading them.
+#[allow(clippy::missing_errors_doc)]
+pub async fn rotate_scim_connection_token(
+    State(state): State<AdminState>,
+    principal: Principal,
+    Path((tenant_id, environment_id, organization_id, connection_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_credentials`. A
+    // rotation MINTS a provisioning credential, which is the same authority the create grants,
+    // so it takes the same permission rather than a lesser one.
+    principal.require_permission(ManagementPermission::WriteCredentials)?;
+    crate::sudo::require_fresh_privilege(&state, scope, actor).await?;
+
+    // REQUIRED, like the create's. A retried rotation is not harmlessly idempotent: without the
+    // key it mints a third token and re-supersedes the second, shortening the life of the one
+    // the customer may have just pasted into their identity provider.
+    let idem_key = idempotency::required_key(&headers)?;
+    let fingerprint = idempotency::fingerprint("POST", uri.path(), &body);
+    let credential_ref = principal.credential_ref();
+    if let Some(replay) =
+        idempotency::replay_if_stored(&state, &credential_ref, &idem_key, &fingerprint).await?
+    {
+        return Ok(replay);
+    }
+
+    // LIVE, unlike the revoke beside it, and the difference is the direction of the act. A
+    // revoke DESTROYS a capability and must keep working in a soft-deleted environment; a
+    // rotation MINTS one, and minting a working credential inside an environment an operator
+    // believes is decommissioned is the thing a soft delete exists to stop.
+    let org_id = resolve_live_org(
+        &state,
+        &principal,
+        scope,
+        &organization_id,
+        EnvironmentAccess::Write,
+    )
+    .await?;
+
+    require_active_organization(&state, scope, &org_id).await?;
+
+    let request: RotateScimTokenRequest = crate::input::parse_json(&body)?;
+    let overlap = request.overlap_seconds.unwrap_or(DEFAULT_OVERLAP_SECS);
+    if !(0..=MAX_OVERLAP_SECS).contains(&overlap) {
+        return Err(ApiError::BadRequest(format!(
+            "overlap_seconds must be between 0 and {MAX_OVERLAP_SECS}"
+        )));
+    }
+
+    // PARSED IN SCOPE, so a handle minted in another tenant is the uniform not-found.
+    let id =
+        ScimConnectionId::parse_in_scope(&connection_id, &scope).map_err(|_| ApiError::NotFound)?;
+    // AND CHECKED AGAINST THIS ORGANIZATION, for the reason the revoke gives: the store's
+    // rotation is scope-fenced but not organization-fenced, so without this an operator holding
+    // write-credentials on one organization could rotate another organization's connection in
+    // the same environment -- which is a denial of service against a sibling's identity
+    // provider AND hands the caller a working credential for it.
+    let belongs = state
+        .store()
+        .scoped(scope)
+        .scim_connections()
+        .exists_in_organization(&org_id, &id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if !belongs {
+        return Err(ApiError::NotFound);
+    }
+
+    // MINTED THROUGH THE SCIM CRATE, not reimplemented here, for the reason the create gives:
+    // two copies of the credential format would agree until somebody changed one.
+    let mut secret = [0_u8; 32];
+    state.env().entropy().fill_bytes(&mut secret);
+    let token = ironauth_scim::server::mint_token(
+        &id,
+        &base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, secret),
+    );
+    let digest = ironauth_scim::server::digest_of(&token);
+
+    let stored = ScimTokenRotated {
+        id: id.to_string(),
+        token: None,
+        previous_token_expires_at_unix_ms: None,
+        token_already_issued: true,
+    };
+    let stored_body = serde_json::to_string(&stored).map_err(|_| ApiError::Internal)?;
+
+    let now_micros = state.now_unix_micros();
+    // THE EVENT CARRIES WHAT THE OPERATOR ASKED FOR, not the resulting expiry. The producer
+    // builds its envelope before the write, and the write applies `LEAST(existing, now +
+    // overlap)`, so a computed horizon is wrong whenever a token was already lapsing sooner. The
+    // precise instant comes back FROM the write and goes in the 200 below.
+    let pending = rotated_event(&state, scope, &id, &org_id, overlap);
+    match state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        // ATTRIBUTED TO THE ORGANIZATION, as every organization-scoped write on this surface is.
+        // `audit_log.organization_id` is what a per-organization log stream selects on, and this
+        // is the row saying that organization's provisioning credential was replaced.
+        .in_organization(org_id)
+        .scim_connections()
+        .rotate_token_with_event(
+            state.env(),
+            ironauth_store::RotateScimToken {
+                id: &id,
+                new_token_digest: &digest,
+                overlap_secs: overlap,
+                now_micros,
+            },
+            // The body STORED for replay carries NO token, and the flag says so rather than
+            // returning a body that looks like a rotation with a field missing.
+            // `idempotency_keys.response_body` is plaintext retained 24 hours; storing the real
+            // body would put a live provisioning credential there, which is the recoverable copy
+            // migration 0183 exists to prevent.
+            Some(IdempotencyWrite {
+                credential_ref: &credential_ref,
+                key: &idem_key,
+                request_fingerprint: &fingerprint,
+                response_status: 200,
+                response_body: &stored_body,
+            }),
+            pending
+                .as_ref()
+                .map(crate::events::PendingEvent::domain_event)
+                .as_ref(),
+        )
+        .await
+    {
+        Ok(superseded_expires_micros) => {
+            let rotated = ScimTokenRotated {
+                id: id.to_string(),
+                token: Some(token),
+                // READ BACK FROM THE WRITE. `LEAST` means this is not always `now + overlap`,
+                // and reporting the arithmetic instead of the result was a number that lied
+                // exactly when the clause did its job.
+                //
+                // ABSENT WHEN THE ROTATION SUPERSEDED NOTHING and when every superseded token
+                // has no horizon at all, which cannot happen here (the rotation writes one) but
+                // is the honest shape for a value the store may not have.
+                previous_token_expires_at_unix_ms: superseded_expires_micros.map(|us| us / 1000),
+                token_already_issued: false,
+            };
+            let body = serde_json::to_string(&rotated).map_err(|_| ApiError::Internal)?;
+            Ok(crate::response::json(StatusCode::OK, body))
+        }
+        Err(error) => Err(rotation_failure(&error)),
+    }
+}
+
+/// Map a rotation's store failure to what the caller is told.
+///
+/// EXTRACTED so the handler fits the crate's function-length lint, and so each arm is a named
+/// case rather than a fall-through. The first version had only the not-found arm and a catch-all,
+/// which sent the idempotency race -- the very thing the key was added to make safe -- to a 500
+/// that a retrying client would then retry.
+fn rotation_failure(error: &ironauth_store::StoreError) -> ApiError {
+    match error {
+        // A REVOKED OR EXPIRED CONNECTION IS THE UNIFORM NOT-FOUND, same as an absent one: a
+        // rotation must not be a way to tell which handles exist but are switched off.
+        ironauth_store::StoreError::NotFound => ApiError::NotFound,
+        // THE IDEMPOTENCY RACE THE KEY EXISTS TO CLOSE: two requests under one key arriving
+        // together, which is precisely what an SDK's retry-on-timeout produces.
+        ironauth_store::StoreError::IdempotencyConflict => ApiError::IdempotencyKeyConflict,
+        // A UNIQUE VIOLATION ON THE NEW DIGEST. Unreachable while this handler mints it from the
+        // entropy seam, and named rather than left to fall into an opaque 500.
+        ironauth_store::StoreError::Conflict => {
+            ApiError::Conflict("token_exists: a token with this digest already exists".to_owned())
+        }
+        // EVERYTHING ELSE IS THE SERVER'S, so the sweep that looks for a 500 can see it.
+        _ => ApiError::Internal,
+    }
+}
+
+/// Refuse an organization that is present but DISABLED.
+///
+/// THE SAME CHECK THE CREATE CARRIES, extracted so both doors share one definition rather than
+/// two copies that can drift. `resolve_live_org` fences on `deleted_at` and says nothing about
+/// `state`, while `ScimConnectionRepo::authenticate` requires `o.state = 'active'` -- so minting
+/// into a disabled organization answers success with a credential that is dead on arrival.
+///
+/// THE ROTATION LACKED IT AND THE CREATE HAD IT, which is this project's recurring shape: a
+/// control installed on one door and claimed for the surface. On the rotation it was worse than
+/// on the create, because a rotation also SUPERSEDES the working token: re-enabling the
+/// organization would find the old credential already lapsed.
+///
+/// # Errors
+///
+/// [`ApiError::Conflict`] when the organization is disabled.
+async fn require_active_organization(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    org_id: &ironauth_store::OrganizationId,
+) -> Result<(), ApiError> {
+    let organization = state
+        .store()
+        .management()
+        .organizations(scope)
+        .get(org_id)
+        .await?;
+    if organization.state == ironauth_store::OrganizationState::Active {
+        return Ok(());
+    }
+    Err(ApiError::Conflict(
+        "organization_disabled: a disabled organization cannot mint a provisioning \
+         credential, because the credential would not authenticate"
+            .to_owned(),
+    ))
+}
+
+/// The default overlap between a rotation and the old token's death, in seconds.
+///
+/// TWENTY-FOUR HOURS. The window has to cover a human noticing a ticket, opening their identity
+/// provider's admin console, and pasting a value -- across a weekend, a holiday, or an on-call
+/// handover. Minutes would make the default a trap for exactly the customers least able to
+/// react, and the failure it produces is silent: provisioning stops, and nobody learns until
+/// somebody who left still has access.
+const DEFAULT_OVERLAP_SECS: i64 = 86_400;
+
+/// The longest overlap a caller may ask for, in seconds.
+///
+/// SEVEN DAYS. An overlap is a period in which a credential the operator has decided to replace
+/// still works, so it is a window of exposure as well as a grace period. A week is long enough
+/// for any handover and short enough that a leaked token is not a standing key.
+const MAX_OVERLAP_SECS: i64 = 604_800;
+
+/// The default overlap must be one the handler would accept.
+///
+/// A COMPILE-TIME ASSERTION, so a default outside the range fails the build rather than every
+/// request that omitted `overlap_seconds` -- which is the common case and the one an integration
+/// test that always sends the field would never reach.
+const _: () = assert!(
+    DEFAULT_OVERLAP_SECS >= 0 && DEFAULT_OVERLAP_SECS <= MAX_OVERLAP_SECS,
+    "the default SCIM rotation overlap is outside the range the handler accepts"
+);
+
+/// A rotation request.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RotateScimTokenRequest {
+    /// How long the superseded token keeps working, in seconds. Defaults to 24 hours; 7 days is
+    /// the maximum.
+    #[serde(default)]
+    pub overlap_seconds: Option<i64>,
+}
+
+/// The 200 of a rotation: the ONLY response that carries the new token.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScimTokenRotated {
+    /// The `scim_` handle, unchanged. A rotation is not a new connection: everything keyed on
+    /// this id survives it.
+    pub id: String,
+    /// The new bearer token. RETURNED ONCE, like the create's: the store keeps only a digest.
+    ///
+    /// OPTIONAL AND OMITTED ON A REPLAY, rather than an empty string. The create's field is
+    /// shaped this way and the first version of this one was not: a replay body carrying
+    /// `"token": ""` publishes a field that LOOKS like a credential of length zero, and a client
+    /// checking `if (body.token)` and one checking `if ("token" in body)` disagree about it.
+    /// Absent means absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// When the superseded token stops working, in milliseconds since the epoch.
+    ///
+    /// READ BACK FROM THE WRITE, not computed here: the rotation applies
+    /// `LEAST(existing, now + overlap)`, so a token that already lapsed sooner keeps its own
+    /// horizon and the requested overlap is an upper bound rather than the answer.
+    ///
+    /// Absent if the rotation superseded no token that has a horizon at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_token_expires_at_unix_ms: Option<i64>,
+    /// Whether the token was already issued on an earlier identical request.
+    ///
+    /// A replay cannot return the token -- nothing stores it -- so it says so rather than
+    /// returning a body that looks like a rotation with a missing field. Same shape, and same
+    /// reason, as the create's.
+    pub token_already_issued: bool,
+}
+
 /// The 201 of a create: the ONLY response that carries the token.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ScimConnectionCreated {
@@ -340,19 +661,7 @@ pub async fn create_scim_connection(
     // Refused rather than allowed-and-dormant because the alternative reads the same to the
     // operator as a broken credential, and there is nothing at the point of failure that could
     // tell them which it was.
-    let organization = state
-        .store()
-        .management()
-        .organizations(scope)
-        .get(&org_id)
-        .await?;
-    if organization.state != ironauth_store::OrganizationState::Active {
-        return Err(ApiError::Conflict(
-            "organization_disabled: a disabled organization cannot mint a provisioning \
-             credential, because the credential would not authenticate"
-                .to_owned(),
-        ));
-    }
+    require_active_organization(&state, scope, &org_id).await?;
 
     // MINTED THROUGH THE SCIM CRATE, not reimplemented here. `mint_token` and `digest_of` are
     // the format the verifier uses, so a second copy of `{scim_id}.{secret}` in this crate
@@ -609,4 +918,73 @@ fn revoked_event(
         subject,
         envelope,
     })
+}
+
+/// The `scim_connection.token_rotated` envelope.
+///
+/// Returns `None` when the type is unregistered, which is the only reason
+/// `event_catalog::envelope` declines; the payload is not validated there, so
+/// `the_rotation_envelope_satisfies_its_registered_schema` is where the two are compared.
+fn rotated_event(
+    state: &AdminState,
+    scope: ironauth_store::Scope,
+    id: &ScimConnectionId,
+    organization_id: &ironauth_store::OrganizationId,
+    overlap_seconds: i64,
+) -> Option<crate::events::PendingEvent> {
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "scim_connection.token_rotated",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        state.now_unix_micros() / 1000,
+        &rotated_payload(&subject, &organization_id.to_string(), overlap_seconds),
+    )?;
+    Some(crate::events::PendingEvent {
+        id: event_id,
+        subject,
+        envelope,
+    })
+}
+
+/// The `scim_connection.token_rotated` payload, separated so a test can reach it.
+fn rotated_payload(
+    scim_connection_id: &str,
+    organization_id: &str,
+    overlap_seconds: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "scim_connection_id": scim_connection_id,
+        "organization_id": organization_id,
+        "overlap_seconds": overlap_seconds,
+    })
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::rotated_payload;
+
+    /// The envelope this producer mints satisfies the schema the fan-out enforces.
+    ///
+    /// THE ONLY PLACE THE TWO ARE COMPARED. `event_catalog::envelope` answers `None` for an
+    /// unregistered TYPE and never reads the payload, so a mismatch is committed with the
+    /// rotation and then refused by the fan-out forever: not a dropped event but a stuck one.
+    #[test]
+    fn the_rotation_envelope_satisfies_its_registered_schema() {
+        let payload = rotated_payload("scim_x", "org_x", 86_400);
+        let envelope = ironauth_store::event_catalog::envelope(
+            "evt_x",
+            "scim_connection.token_rotated",
+            "ten_x",
+            "env_x",
+            1_700_000_000_000,
+            &payload,
+        )
+        .expect("scim_connection.token_rotated is registered");
+        ironauth_store::event_catalog::validate_event(&envelope).unwrap_or_else(|error| {
+            panic!("the rotation envelope is refused by the fan-out's own validation: {error:?}")
+        });
+    }
 }

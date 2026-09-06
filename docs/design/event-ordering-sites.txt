@@ -96,6 +96,7 @@ crates/ironauth-store/src/repository.rs:revoke_secret:2
 crates/ironauth-store/src/repository.rs:revoke_with_event:4
 crates/ironauth-store/src/repository.rs:rotate_inner:1
 crates/ironauth-store/src/repository.rs:rotate_secret_with_event:1
+crates/ironauth-store/src/repository.rs:rotate_token_with_event:1
 crates/ironauth-store/src/repository.rs:rotate_with_event:1
 crates/ironauth-store/src/repository.rs:set:1
 crates/ironauth-store/src/repository.rs:set_active:2

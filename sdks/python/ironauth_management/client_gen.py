@@ -1011,6 +1011,10 @@ class Client:
         """rotateOrganizationApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/api-keys/{urllib.parse.quote(key_id)}/rotate", query, None)
 
+    def rotate_scim_connection_token(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-connections/{urllib.parse.quote(connection_id)}/rotate", query, body)
+
     def rotate_service_account_api_key(self, tenant_id: str, environment_id: str, service_account_id: str, key_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """rotateServiceAccountApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/service-accounts/{urllib.parse.quote(service_account_id)}/api-keys/{urllib.parse.quote(key_id)}/rotate", query, None)

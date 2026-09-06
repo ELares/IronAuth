@@ -325,6 +325,7 @@ fn operation_ids_are_the_stable_set() {
             "revokeUserSessions",
             "rollbackTokenHook",
             "rotateOrganizationApiKey",
+            "rotateScimConnectionToken",
             "rotateServiceAccountApiKey",
             "rotateUserPersonalAccessToken",
             "rotateWebhookEndpointSecret",
@@ -765,6 +766,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/service-account-memberships",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/password-hashing/probe",
@@ -926,7 +928,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        288,
+        289,
         "the documented route count is pinned"
     );
 

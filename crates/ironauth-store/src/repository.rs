@@ -78500,6 +78500,22 @@ fn truncate_on_char_boundary(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+/// One token rotation (issue #140).
+///
+/// A STRUCT RATHER THAN FOUR MORE PARAMETERS, which is the shape `NewScimConnection` and
+/// `RefreshRedeem` already take here: the call site names each value, so an id and a digest of
+/// the same type cannot be swapped silently.
+pub struct RotateScimToken<'a> {
+    /// The connection whose token is being replaced. Its id does not change.
+    pub id: &'a ScimConnectionId,
+    /// SHA-256 hex of the new bearer token. Never the token.
+    pub new_token_digest: &'a str,
+    /// How long every superseded token keeps working.
+    pub overlap_secs: i64,
+    /// The caller's clock.
+    pub now_micros: i64,
+}
+
 /// The inbound SCIM connections for one scope, read only (issue #135).
 pub struct ScimConnectionRepo<'a> {
     store: &'a Store,
@@ -78529,6 +78545,31 @@ impl ScimConnectionRepo<'_> {
     ///   nothing for a route that never consults one. It is a precondition for the
     ///   authenticated path being safe, not a fix for an unauthenticated one.
     ///
+    /// # The old column is a FALLBACK, and only when the connection has no token rows at all
+    ///
+    /// During a rolling upgrade an OLD binary can still create connections, and it writes only
+    /// `scim_connections.token_digest` -- it has never heard of `scim_connection_tokens`. A read
+    /// that consulted the new table alone would refuse that connection's token forever, because
+    /// nothing backfills a row created after the migration ran. The customer's provisioning
+    /// would simply never work, and the cause would be invisible.
+    ///
+    /// So the old column answers, guarded by `NOT EXISTS`: only when the connection has NO token
+    /// rows whatsoever. That guard is what stops the fallback becoming the bug it exists beside.
+    /// Once a rotation has happened the connection HAS token rows, so the original digest in the
+    /// old column stops being consulted here -- otherwise a superseded token would authenticate
+    /// forever on new binaries too, which is strictly worse than the un-upgraded replica
+    /// problem migration 0205 documents.
+    ///
+    /// It disappears with the column, in the contract phase.
+    ///
+    /// THE TOKEN IS A SEPARATE ROW NOW (issue #140, migration 0205), and the three liveness
+    /// checks below are three different questions that used to be one. A TOKEN may lapse while
+    /// its connection stays live -- that is what a rotation's overlap window is -- and a
+    /// CONNECTION may be revoked while a token of it has no horizon of its own, which must kill
+    /// every token it has. Checking only the token would keep a revoked connection provisioning;
+    /// checking only the connection would make the overlap unbounded. Both, plus the
+    /// organization.
+    ///
     /// AND THE ORGANIZATION MUST STILL BE LIVE. The join is not decoration: without it a
     /// credential kept provisioning into an organization that had been soft-deleted or
     /// disabled, and `list_for_organization` went on reporting it healthy, so an operator who
@@ -78550,9 +78591,14 @@ impl ScimConnectionRepo<'_> {
                     (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
                     (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
                     (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us \
-             FROM scim_connections c \
+             FROM scim_connection_tokens t \
+             JOIN scim_connections c ON c.id = t.connection_id \
+                 AND c.tenant_id = t.tenant_id AND c.environment_id = t.environment_id \
              JOIN organizations o ON o.id = c.organization_id \
-             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.token_digest = $3 \
+             WHERE t.tenant_id = $1 AND t.environment_id = $2 AND t.token_digest = $3 \
+               AND t.revoked_at IS NULL \
+               AND (t.expires_at IS NULL OR t.expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
                AND c.revoked_at IS NULL \
                AND (c.expires_at IS NULL OR c.expires_at > \
                     TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
@@ -78565,6 +78611,56 @@ impl ScimConnectionRepo<'_> {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
+        // THE LEGACY FALLBACK, AS A SECOND POINT LOOKUP rather than an `OR` in the first.
+        //
+        // Folding it into one statement made this a SCAN: the planner cannot use the primary key
+        // on `scim_connections.token_digest` when that column sits inside an `OR` beside a
+        // join-derived one, so every SCIM request read every connection in the environment. This
+        // query runs on every provisioning request from every customer's identity provider, so
+        // that is the wrong place to lose an index. Two probes, and the second only when the
+        // first misses.
+        //
+        // WHY IT EXISTS: a binary that predates migration 0205 writes only
+        // `scim_connections.token_digest`, and nothing backfills a connection it creates AFTER
+        // the migration ran. Without this, that customer's provisioning would never work and the
+        // cause would be invisible.
+        //
+        // `NOT EXISTS` IS WHAT KEEPS IT FROM BEING A HOLE: it answers only for a connection with
+        // no token rows AT ALL. Once one exists -- because the connection was created by a new
+        // binary, or because a rotation ADOPTED the legacy digest -- the old column is never
+        // consulted again, so a superseded token cannot come back through this door.
+        let row = if let Some(row) = row {
+            Some(row)
+        } else {
+            {
+                let mut tx = begin_scoped(self.store, self.scope).await?;
+                let legacy = sqlx::query(
+                    "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                            (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
+                            (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
+                            (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us \
+                     FROM scim_connections c \
+                     JOIN organizations o ON o.id = c.organization_id \
+                     WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.token_digest = $3 \
+                       AND c.revoked_at IS NULL \
+                       AND (c.expires_at IS NULL OR c.expires_at > \
+                            TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond')) \
+                       AND o.deleted_at IS NULL AND o.state = 'active' \
+                       AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                                       WHERE t.connection_id = c.id \
+                                         AND t.tenant_id = c.tenant_id \
+                                         AND t.environment_id = c.environment_id)",
+                )
+                .bind(self.scope.tenant().to_string())
+                .bind(self.scope.environment().to_string())
+                .bind(token_digest)
+                .bind(now_micros)
+                .fetch_optional(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                legacy
+            }
+        };
         let Some(row) = row else { return Ok(None) };
         let stored_id: String = row.get("id");
         Ok(Some(ScimConnection {
@@ -78801,6 +78897,43 @@ impl ActingScimConnectionRepo<'_> {
                         error.into()
                     }
                 })?;
+                // THE TOKEN ROW, in the same statement group as the connection (issue #140,
+                // migration 0205). The connection's own `token_digest` column is written too and
+                // stays the connection's ORIGINAL token, so an old binary that has not learned
+                // about `scim_connection_tokens` keeps authenticating against it.
+                //
+                // THAT IS THE DANGEROUS DIRECTION, NOT THE SAFE ONE, and an earlier version of
+                // this comment said the opposite. No rotation writes `scim_connections
+                // .token_digest`, so an un-upgraded replica goes on honouring a SUPERSEDED
+                // token until it is upgraded. FINISH THE ROLLOUT BEFORE ROTATING: until every
+                // replica serving SCIM reads `scim_connection_tokens`, a rotation is not a
+                // revocation, and neither is `revoke_token` -- an old replica reads neither
+                // table. Only revoking the CONNECTION contains a leak mid-rollout.
+                //
+                // Migration 0205 carries the full account and why it is documented rather than
+                // coded away.
+                sqlx::query(
+                    "INSERT INTO scim_connection_tokens \
+                     (token_digest, connection_id, tenant_id, environment_id, expires_at) \
+                     VALUES ($1, $2, $3, $4, \
+                             CASE WHEN $5::bigint IS NULL THEN NULL \
+                                  ELSE TIMESTAMPTZ 'epoch' \
+                                       + ($5::bigint * INTERVAL '1 microsecond') END)",
+                )
+                .bind(&token_digest)
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(expires_at_unix_micros)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        error.into()
+                    }
+                })?;
                 // IN THE SAME TRANSACTION as the row. A record written afterwards would leave
                 // a window in which the connection exists and the retry that created it can
                 // still mint a second one.
@@ -78955,6 +79088,299 @@ impl ActingScimConnectionRepo<'_> {
         tx.commit().await?;
         Ok(true)
     }
+
+    /// Mint a second live token for `id`, and give every other live token of it an expiry.
+    ///
+    /// # The overlap is the product, not a convenience
+    ///
+    /// The token lives in an identity provider's configuration that a customer's IT admin edits
+    /// by hand. If the old one died the moment the new one was minted, provisioning would be
+    /// down from the mint until the paste -- an interval nobody controls, on a system whose
+    /// failure mode is employees not being deprovisioned. So the superseded token keeps working
+    /// for `overlap_secs` and then FAILS CLOSED, which is #140's requirement in its own words.
+    ///
+    /// EVERY OTHER LIVE TOKEN, not just the newest, and the plural matters: two rotations inside
+    /// one window would otherwise leave the first token live with nothing to supersede it. The
+    /// statement supersedes by connection rather than by naming a digest, so a caller cannot get
+    /// this wrong and cannot be asked to name a verifier it has no reason to know.
+    ///
+    /// A TOKEN THAT ALREADY LAPSES SOONER KEEPS ITS HORIZON. `LEAST` is what does that: a
+    /// rotation must not EXTEND the life of a token that was already expiring, which is what a
+    /// bare assignment would do and which would make a rotation a way to keep an old credential
+    /// alive.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if no live connection of this scope has that id, so a rotation
+    /// cannot resurrect a revoked connection by minting it a fresh token.
+    /// [`StoreError::Conflict`] if the new digest is already stored. [`StoreError::Database`]
+    /// on a persistence fault.
+    pub async fn rotate_token(
+        &self,
+        env: &Env,
+        id: &ScimConnectionId,
+        new_token_digest: &str,
+        overlap_secs: i64,
+        now_micros: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        self.rotate_token_with_event(
+            env,
+            RotateScimToken {
+                id,
+                new_token_digest,
+                overlap_secs,
+                now_micros,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::rotate_token`], additionally announcing `scim_connection.token_rotated`.
+    ///
+    /// IN THE SAME TRANSACTION as the rotation, so a receiver is never told a token was replaced
+    /// before it was, and never told at all if the write rolls back. A consumer watching
+    /// provisioning credentials needs this one: the connection's id does not change, so a
+    /// rotation is invisible on every other signal they have.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rotate_token`].
+    pub async fn rotate_token_with_event(
+        &self,
+        env: &Env,
+        rotation: RotateScimToken<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<Option<i64>, StoreError> {
+        let RotateScimToken {
+            id,
+            new_token_digest,
+            overlap_secs,
+            now_micros,
+        } = rotation;
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+
+        // THE CONNECTION MUST BE LIVE. Without this a rotation would mint a working token for a
+        // connection an operator had revoked -- an un-revocation through a door the one-way
+        // policy on `scim_connections` was written to close, reached by adding a row to a
+        // different table instead of clearing a column on that one.
+        let live: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM scim_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND revoked_at IS NULL \
+               AND (expires_at IS NULL OR expires_at > \
+                    TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond'))",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Err(StoreError::NotFound);
+        }
+
+        // ADOPT THE LEGACY DIGEST FIRST, if this connection has no token rows at all.
+        //
+        // Such a connection was created by a binary that predates migration 0205 and writes only
+        // `scim_connections.token_digest`; `authenticate`'s fallback is what keeps it working.
+        // That fallback is guarded by `NOT EXISTS`, so the MOMENT the mint below inserts the
+        // first token row it stops answering -- and the legacy token would die at the instant of
+        // the rotation rather than at the end of the overlap. Zero window, on exactly the
+        // population the fallback exists for, and the customer's identity provider is still
+        // configured with the token that just stopped working.
+        //
+        // Copying the digest in as a real row makes the supersede below give it the same horizon
+        // every other superseded token gets. It preserves the connection's own `expires_at` so
+        // adoption cannot EXTEND a token that was already lapsing.
+        //
+        // INSERT rather than an UPDATE of `scim_connections`: 0205 grants table-level INSERT on
+        // this table, and the one-way policy is `FOR UPDATE` only, so this needs no new
+        // privilege. Rewriting `scim_connections.token_digest` would need `GRANT UPDATE
+        // (token_digest)`, which 0183 withholds because it is how a known credential gets
+        // installed.
+        sqlx::query(
+            "INSERT INTO scim_connection_tokens \
+             (token_digest, connection_id, tenant_id, environment_id, expires_at) \
+             SELECT c.token_digest, c.id, c.tenant_id, c.environment_id, c.expires_at \
+             FROM scim_connections c \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.id = $3 \
+               AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                               WHERE t.connection_id = c.id \
+                                 AND t.tenant_id = c.tenant_id \
+                                 AND t.environment_id = c.environment_id)",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        // SUPERSEDE FIRST, then mint. The order is what makes the new token exempt: doing it the
+        // other way would give the token this rotation just created the same expiry as the ones
+        // it replaces, so the rotation would produce two tokens that both die at the end of the
+        // window and provisioning would stop entirely.
+        let superseded: Vec<(Option<i64>,)> = sqlx::query_as(
+            "UPDATE scim_connection_tokens \
+             SET expires_at = LEAST( \
+                     COALESCE(expires_at, 'infinity'::timestamptz), \
+                     TIMESTAMPTZ 'epoch' + (($4::bigint + $5::bigint * 1000000) \
+                                            * INTERVAL '1 microsecond')) \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND revoked_at IS NULL \
+             RETURNING (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_micros)
+        .bind(overlap_secs)
+        .fetch_all(&mut *tx)
+        .await?;
+        // THE LATEST HORIZON ANY SUPERSEDED TOKEN ACTUALLY GOT, read back rather than assumed.
+        // The caller reports this to an operator and puts it on the event, and `LEAST` means it
+        // is NOT always `now + overlap`: a token that already lapsed sooner keeps its own
+        // horizon. Computing it in the handler produced a number that was simply wrong whenever
+        // LEAST did its job, which is the case the whole clause exists for.
+        //
+        // THE LATEST rather than the earliest, because what the caller is answering is "when may
+        // I stop worrying about the old credentials", and that is when the last of them dies.
+        let superseded_expires_micros = superseded.iter().filter_map(|(us,)| *us).max();
+
+        sqlx::query(
+            "INSERT INTO scim_connection_tokens \
+             (token_digest, connection_id, tenant_id, environment_id) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(new_token_digest)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+
+        // AUDITED, with the window rather than either digest. What an operator reading a
+        // provisioning trail needs is WHEN the superseded token stops working, and neither
+        // token's id tells them that.
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ScimConnectionTokenRotated,
+            target: id,
+        };
+        let detail = format!("overlap_secs={overlap_secs}");
+        insert_audit_row(&mut tx, &spec, Some(detail.as_str())).await?;
+        // IN THE SAME TRANSACTION as the rotation. A record written afterwards leaves a window in
+        // which the tokens have moved and the retry that moved them can do it again -- and a
+        // second rotation is not idempotent in any useful sense: it mints a third token and
+        // re-supersedes the second, shortening the life of the one the customer has just pasted
+        // in. That is the failure this key exists to prevent, and it is worse here than on the
+        // create, where a retry merely mints a spare.
+        insert_idempotency(&mut tx, idempotency).await?;
+        enqueue_domain_event(&mut tx, env, scope, event).await?;
+        tx.commit().await?;
+        Ok(superseded_expires_micros)
+    }
+
+    /// Revoke ONE token of `id`, leaving its siblings alone.
+    ///
+    /// # Why per token and not per connection
+    ///
+    /// Revoking the CONNECTION kills every token it has, which is the right answer when the
+    /// connection should stop provisioning. This is the other case: a single token LEAKED, and
+    /// the overlap window that normally protects a cutover is now the problem -- the leaked
+    /// credential is live for up to a week by design. Killing it alone leaves provisioning up on
+    /// the token the customer has already pasted in.
+    ///
+    /// Without this method `scim_connection_tokens.revoked_at` had no writer at all, which made
+    /// its column-scoped grant, its RESTRICTIVE one-way policy and `authenticate`'s
+    /// `t.revoked_at IS NULL` conjunct four pieces of machinery nothing could reach.
+    ///
+    /// IDEMPOTENT. Revoking an already-revoked token keeps the `revoked_at` it earned, because
+    /// rewriting it would destroy the record of when the credential actually stopped -- the same
+    /// rule `tear_down_connection_bindings` follows for its own soft delete.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the token does not belong to that connection in this scope,
+    /// so a caller cannot revoke another connection's token by naming its digest.
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn revoke_token(
+        &self,
+        env: &Env,
+        id: &ScimConnectionId,
+        token_digest: &str,
+        now_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        // THE CONNECTION IS IN THE `WHERE`, not checked beforehand: a digest is unguessable, but
+        // unguessable is not an authorization check, and naming the connection makes the
+        // statement refuse a token of a different one rather than trusting the caller paired
+        // them correctly.
+        let result = sqlx::query(
+            "UPDATE scim_connection_tokens \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 microsecond') \
+             WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+               AND token_digest = $4 AND revoked_at IS NULL",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(token_digest)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        // ZERO ROWS IS NOT AN ERROR WHEN THE TOKEN IS ALREADY REVOKED, and IS one when it never
+        // belonged here. The two are told apart by asking, rather than by guessing from the
+        // count -- which cannot distinguish them.
+        if result.rows_affected() == 0 {
+            let known: Option<(String,)> = sqlx::query_as(
+                "SELECT token_digest FROM scim_connection_tokens \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 \
+                   AND token_digest = $4",
+            )
+            .bind(scope.tenant().to_string())
+            .bind(scope.environment().to_string())
+            .bind(id.to_string())
+            .bind(token_digest)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if known.is_none() {
+                return Err(StoreError::NotFound);
+            }
+        }
+        let spec = AuditedWrite {
+            store: self.store,
+            scope,
+            acting: &self.acting,
+            env,
+            action: Action::ScimConnectionTokenRevoked,
+            target: id,
+        };
+        insert_audit_row(&mut tx, &spec, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Soft-delete every live group binding `connection` pushed, announcing each affected group,
@@ -79105,9 +79531,18 @@ pub enum EnterpriseWrite {
 ///
 /// Per organization, not per person and not per connection. Not per PERSON because traits are
 /// environment wide and a review measured one organization's token reading and overwriting
-/// another's. Not per CONNECTION because `scim_connections` cannot rotate a token in place, so
-/// a rotation is a new row with a new id and every attribute the old connection wrote would be
-/// stranded -- also measured. An employee number is a fact the ORGANIZATION holds.
+/// another's. Not per CONNECTION because an employee number is a fact the ORGANIZATION holds,
+/// and because a person may be provisioned through more than one connection over time.
+///
+/// A SECOND REASON USED TO BE LISTED HERE and is no longer true: that `scim_connections` cannot
+/// rotate a token in place, so a rotation is a new connection with a new id that strands every
+/// attribute the old one wrote. Issue #140 moved tokens into `scim_connection_tokens`, so a
+/// rotation now keeps the connection's id and strands nothing. The reason is struck rather than
+/// quietly deleted because the change that made it false cited this very sentence as evidence
+/// that keying on the connection had been measured and rejected -- a reader arriving at that
+/// argument should find it retracted here rather than still standing.
+///
+/// The organization key is right on its own terms and does not depend on the retracted half.
 pub struct ScimEnterpriseRepo<'a> {
     store: &'a Store,
     scope: Scope,

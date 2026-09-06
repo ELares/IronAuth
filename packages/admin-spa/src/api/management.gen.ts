@@ -2437,6 +2437,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate` */
+        post: operations["rotateScimConnectionToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections": {
         parameters: {
             query?: never;
@@ -7758,6 +7775,15 @@ export interface components {
              */
             version: number;
         };
+        /** @description A rotation request. */
+        RotateScimTokenRequest: {
+            /**
+             * Format: int64
+             * @description How long the superseded token keeps working, in seconds. Defaults to 24 hours; 7 days is
+             *     the maximum.
+             */
+            overlap_seconds?: number | null;
+        };
         /** @description A page of routing rules. */
         RoutingRuleListView: {
             /** @description Every rule in this environment, by evaluation priority. */
@@ -8021,6 +8047,43 @@ export interface components {
             resource_type: string;
             /** @description IronAuth's own id for the subject. */
             subject_id: string;
+        };
+        /** @description The 200 of a rotation: the ONLY response that carries the new token. */
+        ScimTokenRotated: {
+            /**
+             * @description The `scim_` handle, unchanged. A rotation is not a new connection: everything keyed on
+             *     this id survives it.
+             */
+            id: string;
+            /**
+             * Format: int64
+             * @description When the superseded token stops working, in milliseconds since the epoch.
+             *
+             *     READ BACK FROM THE WRITE, not computed here: the rotation applies
+             *     `LEAST(existing, now + overlap)`, so a token that already lapsed sooner keeps its own
+             *     horizon and the requested overlap is an upper bound rather than the answer.
+             *
+             *     Absent if the rotation superseded no token that has a horizon at all.
+             */
+            previous_token_expires_at_unix_ms?: number | null;
+            /**
+             * @description The new bearer token. RETURNED ONCE, like the create's: the store keeps only a digest.
+             *
+             *     OPTIONAL AND OMITTED ON A REPLAY, rather than an empty string. The create's field is
+             *     shaped this way and the first version of this one was not: a replay body carrying
+             *     `"token": ""` publishes a field that LOOKS like a credential of length zero, and a client
+             *     checking `if (body.token)` and one checking `if ("token" in body)` disagree about it.
+             *     Absent means absent.
+             */
+            token?: string | null;
+            /**
+             * @description Whether the token was already issued on an earlier identical request.
+             *
+             *     A replay cannot return the token -- nothing stores it -- so it says so rather than
+             *     returning a body that looks like a rotation with a missing field. Same shape, and same
+             *     reason, as the create's.
+             */
+            token_already_issued: boolean;
         };
         /** @description One page of environment secret metadata. */
         SecretList: {
@@ -21697,6 +21760,96 @@ export interface operations {
             };
             /** @description No such connection in this organization */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rotateScimConnectionToken: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replaying a POST under one key returns the stored answer, which omits the token */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description The scim_ handle */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RotateScimTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Rotated; the new token appears here and nowhere else */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScimTokenRotated"];
+                };
+            };
+            /** @description An out-of-range overlap, or a missing Idempotency-Key */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid management credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The credential may not write credentials for this organization */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such live connection in this organization; a revoked or expired one answers the same */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A concurrent request is already rotating under this Idempotency-Key; retry */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Idempotency-Key reused with a different request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

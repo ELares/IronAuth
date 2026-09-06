@@ -2693,6 +2693,14 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{org_base}/scim-connections"),
         ),
+        // The rotation (issue #140), driven BEFORE the revoke below, because a rotation of a
+        // revoked connection is the uniform not-found and this sweep is about the LIVE answer.
+        Case::json(
+            "scim_connections.rotateScimConnectionToken",
+            "POST",
+            format!("{org_base}/scim-connections/{scim_connection}/rotate"),
+            &serde_json::json!({}),
+        ),
         Case::empty(
             "scim_connections.revokeScimConnection",
             "DELETE",

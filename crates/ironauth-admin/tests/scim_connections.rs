@@ -987,3 +987,52 @@ async fn a_serving_state_this_surface_cannot_read_fences_and_reports_it_as_unava
         "the token must provision again once the state is readable"
     );
 }
+
+/// A DISABLED organization cannot ROTATE either, and the rotation's stake is higher.
+///
+/// The create's refusal is tested above; this is the OTHER door, and it was untested while its
+/// check existed -- exactly the shape both were added to close. A rotation into a disabled
+/// organization is worse than a mint into one: it answers 200 with a token dead on arrival AND
+/// supersedes the working credential, so re-enabling the organization finds the old one already
+/// lapsed. The create merely produces a useless extra row.
+///
+/// Both directions, because a route that refused every rotation would pass the refusal alone.
+#[tokio::test]
+async fn a_disabled_organization_cannot_rotate_a_token_that_would_not_authenticate() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "r-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "r-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+
+    let request = serde_json::json!({ "display_name": "live one", "provider": "okta" }).to_string();
+    let (status, _, created) = h.post(&base, "r-seed", &request).await;
+    assert_eq!(status, StatusCode::CREATED, "seed: {created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let rotate = format!("{base}/{id}/rotate");
+
+    // IT ROTATES WHILE THE ORGANIZATION IS ACTIVE, so the refusal below is the state rather than
+    // the route being unreachable.
+    let (status, _, rotated) = h.post(&rotate, "r-first", "{}").await;
+    assert_eq!(status, StatusCode::OK, "rotate while active: {rotated}");
+
+    let (status, _, body) = h
+        .post(&format!("{orgs}/{org}/disable"), "r-off", "{}")
+        .await;
+    assert!(status.is_success(), "disable answered {status}: {body}");
+
+    let (status, _, refused) = h.post(&rotate, "r-disabled", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a disabled organization rotated a token that cannot authenticate, and superseded the \
+         working one doing it: {refused}"
+    );
+    assert!(
+        refused.contains("organization_disabled"),
+        "the refusal must name the reason: {refused}"
+    );
+}

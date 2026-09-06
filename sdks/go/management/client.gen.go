@@ -1751,6 +1751,13 @@ func (c *Client) RotateOrganizationApiKey(tenant_id string, environment_id strin
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/api-keys/" + escape(key_id) + "/rotate", query, nil)
 }
 
+// RotateScimConnectionToken performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate.
+//
+// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate`.
+func (c *Client) RotateScimConnectionToken(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-connections/" + escape(connection_id) + "/rotate", query, body)
+}
+
 // RotateServiceAccountApiKey performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/service-accounts/{service_account_id}/api-keys/{key_id}/rotate.
 //
 // rotateServiceAccountApiKey.

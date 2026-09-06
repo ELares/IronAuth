@@ -447,6 +447,14 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "revokeScimConnection",
         ManagementPermission::WriteCredentials,
     ),
+    // A ROTATION MINTS a provisioning credential (issue #140), which is the same authority the
+    // create grants, so it takes the same permission rather than a lesser one. Classifying it
+    // as a config write would let a `write_config` credential hand itself a token that writes
+    // an organization's entire user population.
+    (
+        "rotateScimConnectionToken",
+        ManagementPermission::WriteCredentials,
+    ),
     // The OUTBOUND provisioning surface (issue #137), and it is `WriteConfig` rather than the
     // `WriteCredentials` its inbound neighbour above carries. The difference is what the row
     // holds: an inbound connection IS a credential, minted and revoked here, while an outbound
@@ -879,6 +887,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     "createScimConnection",
     "listScimConnections",
     "revokeScimConnection",
+    // Proven in `rotating_a_scim_token_requires_write_credentials`, which is its OWN test rather
+    // than part of the block above: that one drives the mint, the revoke and the listing and
+    // never touches the rotation, so listing the rotation under its citation would have credited
+    // a test that does not exercise it. This one drives a `write_config` credential into the
+    // rotation, asserts the refusal NAMES write_credentials, and then drives a
+    // `write_credentials` credential through to a 200 carrying a token -- so the pin cannot be
+    // satisfied by a handler that refuses everybody.
+    "rotateScimConnectionToken",
     // Proven in `a_read_only_credential_can_list_scim_push_connections_and_cannot_change_one`,
     // which drives create, pause and delete with a read-only credential and asserts each
     // refusal NAMES write_config, then drives the LISTING with a `write_config` credential so
@@ -1016,12 +1032,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        227,
+        228,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        83,
+        84,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
