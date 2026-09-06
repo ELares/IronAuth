@@ -332,7 +332,7 @@ rustls-native-certs = "0.8"
 # The lockfile also holds `time` at 0.3.41; rcgen pulls it in and 0.3.47 onward declare
 # 1.88. `scripts/msrv-audit.sh` fails the gate if either drifts forward, so this comment
 # explains a constraint the tooling already enforces rather than being its only guard.
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 bytes = "1"
 
 # Observability: structured logs and Prometheus metrics.
