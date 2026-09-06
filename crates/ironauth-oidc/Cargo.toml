@@ -1552,6 +1552,13 @@ name = "saml_start"
 required-features = ["testing"]
 path = "tests/saml_start.rs"
 
+# Redeeming a self-service portal link over the real router (issue #140). Its own target because
+# what it drives is the GET/POST split, which only exists at the route.
+[[test]]
+name = "portal_route"
+required-features = ["testing"]
+path = "tests/portal_route.rs"
+
 [[test]]
 name = "saml_route"
 required-features = ["testing"]

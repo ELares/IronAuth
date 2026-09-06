@@ -93,7 +93,7 @@ use crate::id::{
     MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId, OperatorId,
     OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
     OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PortalLinkId, PowChallengeId, ProjectGrantId,
+    OutboxMessageId, PermissionId, PortalLinkId, PortalSessionId, PowChallengeId, ProjectGrantId,
     ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
@@ -243,6 +243,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn portal_links(&self) -> PortalLinkRepo<'a> {
         PortalLinkRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The self-service portal sessions for this scope (issue #140).
+    ///
+    /// ON THE DATA PLANE, like the links beside it and for the same reason: a session exists
+    /// because a browser redeemed a link, and every request it authenticates arrives there.
+    #[must_use]
+    pub fn portal_sessions(&self) -> PortalSessionRepo<'a> {
+        PortalSessionRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -76143,6 +76155,13 @@ impl ActingPortalLinkRepo<'_> {
                 // that does not exist here would mint an authority pointing at nothing, and the
                 // redemption would answer the same uniform not-found as a forged link -- so the
                 // vendor would learn only at the customer's expense.
+                //
+                // AND IT MUST BE ACTIVE, not merely undeleted. A disabled organization is one an
+                // operator has switched off; a link minting configuration authority over it is
+                // an authority over something nobody should be configuring, and it would be
+                // redeemed into a session the next request refuses. The redemption and
+                // `PortalSessionRepo::authenticate` require both conjuncts, so this must too:
+                // the earliest door has no business being the most permissive.
                 let inserted = sqlx::query(
                     "INSERT INTO portal_links \
                      (id, tenant_id, environment_id, organization_id, intent, token_digest, \
@@ -76152,7 +76171,7 @@ impl ActingPortalLinkRepo<'_> {
                             TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval \
                      WHERE EXISTS (SELECT 1 FROM organizations \
                                    WHERE tenant_id = $2 AND environment_id = $3 AND id = $4 \
-                                     AND deleted_at IS NULL)",
+                                     AND deleted_at IS NULL AND state = 'active')",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -76181,6 +76200,152 @@ impl ActingPortalLinkRepo<'_> {
             Some(&detail),
         )
         .await
+    }
+}
+
+/// A portal session to open (issue #140).
+pub struct NewPortalSession<'a> {
+    /// The `pss_` handle.
+    pub id: &'a PortalSessionId,
+    /// SHA-256 of the cookie value. NEVER the value.
+    pub token_digest: &'a [u8],
+    /// When the session stops authenticating.
+    pub expires_at_unix_micros: i64,
+}
+
+/// What a live portal session authorises.
+///
+/// ITS WHOLE AUTHORITY, and deliberately nothing else. #140 requires that a session cannot
+/// reach another organization's state or a surface outside its intent, so those two values are
+/// what a handler gets and there is no accessor for anything wider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedPortalSession {
+    /// The session row's own handle, for attributing audit rows.
+    pub id: PortalSessionId,
+    /// The ONE organization this session may act for.
+    pub organization_id: OrganizationId,
+    /// The ONE surface it may reach.
+    pub intent: String,
+}
+
+/// The self-service portal sessions for a scope (issue #140).
+pub struct PortalSessionRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PortalSessionRepo<'_> {
+    /// Resolve a cookie value's digest to the session it authenticates, if it is still live.
+    ///
+    /// # What "live" means here, and why each clause is in the statement
+    ///
+    /// Not expired, not revoked, and belonging to this scope. All three are in the `WHERE`
+    /// rather than checked afterwards, so a session that fails any of them is indistinguishable
+    /// from a cookie that never named a session at all -- the same uniform answer the link
+    /// redemption gives, and for the same reason.
+    ///
+    /// THE DIGEST IS THE LOOKUP KEY. There is no id in the cookie: presenting the value IS the
+    /// claim, so a row is found by what the holder proves rather than by what they assert and a
+    /// wrong value finds nothing rather than finding a row to then compare against.
+    ///
+    /// # And the organization must still be live, checked HERE rather than once at redemption
+    ///
+    /// The join is the fence, and putting it only on the redeeming door was the defect. A
+    /// session lasts thirty minutes and a link may be minted for up to an hour, so an
+    /// organization can be soft-deleted or disabled at any point inside a window that a
+    /// mint-time or redeem-time check cannot see the end of. Without this, an admin who
+    /// redeemed while the organization was live kept a working portal session over an
+    /// organization an operator believes is gone, and nothing in the product could cut it
+    /// short.
+    ///
+    /// IT ALSO RETIRES A RACE RATHER THAN NARROWING ONE. The redemption's own liveness check is
+    /// check-then-act under READ COMMITTED: the conditional UPDATE locks the `portal_links` row,
+    /// not the `organizations` row, so a delete committing between that SELECT and the session
+    /// INSERT is admitted. A comment here once claimed otherwise. Re-reading on EVERY request is
+    /// what actually closes it: the widest a stale session can now be used is the gap between
+    /// two requests, and the next one refuses.
+    ///
+    /// `state = 'active'` AS WELL AS `deleted_at IS NULL`, matching
+    /// [`ScimConnectionRepo::authenticate`], which is the same shape -- a digest-keyed
+    /// credential belonging to one organization -- and whose doc records what its absence cost:
+    /// a credential that kept provisioning into an organization that had been soft-deleted or
+    /// DISABLED. A disabled organization is one an operator has switched off; serving its
+    /// configuration surface is the same mistake as serving a deleted one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no live session of this scope matches the digest.
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn authenticate(
+        &self,
+        token_digest: &[u8],
+        now_unix_micros: i64,
+    ) -> Result<AuthenticatedPortalSession, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT s.id, s.organization_id, s.intent FROM portal_sessions s \
+             JOIN organizations o ON o.id = s.organization_id \
+                 AND o.tenant_id = s.tenant_id AND o.environment_id = s.environment_id \
+             WHERE s.tenant_id = $1 AND s.environment_id = $2 AND s.token_digest = $3 \
+               AND s.revoked_at IS NULL \
+               AND s.expires_at > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+               AND o.deleted_at IS NULL AND o.state = 'active'",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(token_digest)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let id: String = row.get("id");
+        let organization_id: String = row.get("organization_id");
+        Ok(AuthenticatedPortalSession {
+            // PARSED IN SCOPE ON THE WAY OUT, both of them. A row holding a foreign id fails the
+            // read rather than handing a handler a boundary it would then trust.
+            id: PortalSessionId::parse_in_scope(&id, &scope).map_err(|_| StoreError::NotFound)?,
+            organization_id: OrganizationId::parse_in_scope(&organization_id, &scope)
+                .map_err(|_| StoreError::NotFound)?,
+            intent: row.get("intent"),
+        })
+    }
+
+    /// End a session, so its cookie stops authenticating.
+    ///
+    /// IDEMPOTENT AND UNCONDITIONAL ON THE CURRENT STATE beyond "not already revoked": revoking
+    /// a session twice is not an error, and an expired session may still be revoked so an
+    /// operator ending one does not have to reason about whether it has already lapsed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn revoke(
+        &self,
+        id: &PortalSessionId,
+        now_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        sqlx::query(
+            "UPDATE portal_sessions \
+             SET revoked_at = TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND revoked_at IS NULL",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(now_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -76247,6 +76412,143 @@ impl PortalLinkRepo<'_> {
             organization_id: OrganizationId::parse_in_scope(&organization_id, &self.scope)
                 .map_err(|_| StoreError::NotFound)?,
             intent: row.get("intent"),
+        })
+    }
+
+    /// Redeem a link and OPEN THE SESSION it authorises, in one transaction.
+    ///
+    /// # Why this is not the two calls it looks like
+    ///
+    /// [`Self::redeem`] answers what a link authorises and stamps it consumed. Opening the
+    /// session is a second write, and doing it in a second transaction leaves a window in which
+    /// the link is spent and no session exists: the admin followed a single-use link, it worked,
+    /// and they are looking at a login page that will refuse the link they were sent. There is no
+    /// recovery from that state on their side -- the link is gone -- so the vendor mints another
+    /// and the customer's onboarding acquires a support ticket, which is the one thing #140 is
+    /// for eliminating.
+    ///
+    /// So the consume and the insert commit together. Either the link is spent and the session
+    /// exists, or neither happened and the link is still redeemable.
+    ///
+    /// THE SESSION'S AUTHORITY IS COPIED FROM THE ROW THE UPDATE RETURNED, never from anything
+    /// the caller passed: the organization and the intent come out of `portal_links` inside this
+    /// transaction. A handler cannot widen a session by asking for a different organization,
+    /// because it has no way to say which one it wants.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::redeem`]. [`StoreError::Conflict`] if a session already exists for the link,
+    /// which the unique constraint refuses -- unreachable while the conditional UPDATE above is
+    /// the only writer of `consumed_at`, and kept because "unreachable" is a property of today's
+    /// callers rather than of the schema.
+    pub async fn redeem_into_session(
+        &self,
+        link_id: &PortalLinkId,
+        token_digest: &[u8],
+        session: NewPortalSession<'_>,
+        now_unix_micros: i64,
+    ) -> Result<RedeemedPortalLink, StoreError> {
+        if link_id.scope() != self.scope || session.id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "UPDATE portal_links \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND token_digest = $4 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+              RETURNING organization_id, intent",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(link_id.to_string())
+        .bind(token_digest)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let organization_id: String = row.get("organization_id");
+        let intent: String = row.get("intent");
+
+        // THE ORGANIZATION IS STILL LIVE, CHECKED HERE AND NOT ONLY AT MINT TIME. The mint
+        // refuses an absent or soft-deleted organization, but a link may be redeemable for an
+        // hour and an organization can be deleted inside that window: a vendor mints a link,
+        // deletes the organization ten minutes later, and the admin -- who already has the link
+        // in a ticket -- opens a session over something an operator believes is gone. Every
+        // surface behind that session would then be operating on a deleted organization.
+        //
+        // IN THE SAME TRANSACTION as the consume, which is worth having and is NOT what closes
+        // the race. An earlier version of this comment claimed the UPDATE above locks the row
+        // this SELECT reads. It does not: it locks the `portal_links` row. Under READ COMMITTED
+        // a concurrent `organizations` delete can commit between this SELECT and the INSERT
+        // below, and this check will not see it.
+        //
+        // WHAT CLOSES IT IS `PortalSessionRepo::authenticate`, which re-reads liveness on every
+        // request. This check remains because it is still worth refusing at the door -- a
+        // redemption that opened a session the very next request would refuse spends the
+        // admin's single-use link for nothing -- but it is a courtesy, not the fence.
+        //
+        // BOTH CONJUNCTS, MATCHING `authenticate` EXACTLY, and the reason is the sentence above
+        // it. When this read carried only `deleted_at IS NULL` while `authenticate` required
+        // `state = 'active'` too, a DISABLED organization was the one input on which the two
+        // doors disagreed: the redemption succeeded, stamped `consumed_at`, opened the session,
+        // and the 303 the handler itself issues was then refused. The admin was left holding a
+        // spent single-use link and a dead page -- precisely the state this courtesy exists to
+        // prevent, produced by the courtesy being weaker than the fence it anticipates. Two
+        // doors checking liveness must check the SAME liveness.
+        let live: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM organizations \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+               AND deleted_at IS NULL AND state = 'active'",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&organization_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            // THE SAME UNIFORM NOT-FOUND, and the consume rolls back with it: the link is not
+            // spent on an organization that is gone, so an operator who restores the
+            // organization has not also destroyed the admin's link.
+            return Err(StoreError::NotFound);
+        }
+
+        sqlx::query(
+            "INSERT INTO portal_sessions \
+             (id, tenant_id, environment_id, portal_link_id, organization_id, intent, \
+              token_digest, created_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                     TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval, \
+                     TIMESTAMPTZ 'epoch' + ($9::text || ' microseconds')::interval)",
+        )
+        .bind(session.id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(link_id.to_string())
+        .bind(&organization_id)
+        .bind(&intent)
+        .bind(session.token_digest)
+        .bind(now_unix_micros)
+        .bind(session.expires_at_unix_micros)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+        tx.commit().await?;
+
+        Ok(RedeemedPortalLink {
+            organization_id: OrganizationId::parse_in_scope(&organization_id, &scope)
+                .map_err(|_| StoreError::NotFound)?,
+            intent,
         })
     }
 }

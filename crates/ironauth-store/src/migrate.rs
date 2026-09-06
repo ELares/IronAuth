@@ -1658,6 +1658,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0203_portal_links.sql"),
         },
+        Migration {
+            version: 204,
+            name: "portal_sessions",
+            // EXPAND. A new table plus the two data-plane routes that write and read it, in the
+            // same change. It references `portal_links`, which 0203 created one migration ago.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0204_portal_sessions.sql"),
+        },
     ]
 }
 

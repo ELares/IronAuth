@@ -448,6 +448,16 @@ fn excluded() -> BTreeMap<&'static str, &'static str> {
         "/t/{tenant_id}/e/{environment_id}/saml/acs/{connection}",
         "/t/{tenant_id}/e/{environment_id}/saml/metadata/{connection}",
         "/t/{tenant_id}/e/{environment_id}/saml/start/{connection}",
+        // The portal session surfaces (issue #140). Both resolve the session cookie first, and
+        // that resolution is a SELECT keyed on the cookie's DIGEST under row-level security, so
+        // a scope that never existed and one holding no matching session are the same read
+        // returning no row and the same uniform not-found.
+        "/t/{tenant_id}/e/{environment_id}/portal",
+        "/t/{tenant_id}/e/{environment_id}/portal/s/{intent}",
+        // Ending a portal session (issue #140). Its first store contact is the same
+        // digest-keyed session read the two above make, and it refuses before the revoking
+        // UPDATE if that read finds nothing -- which is what a ghost scope always produces.
+        "/t/{tenant_id}/e/{environment_id}/portal/finish",
     ] {
         excluded.insert(
             path,
@@ -455,6 +465,20 @@ fn excluded() -> BTreeMap<&'static str, &'static str> {
              security already makes uniform between an absent scope and an empty one",
         );
     }
+    excluded.insert(
+        "/t/{tenant_id}/e/{environment_id}/portal/{link_id}",
+        "write first, and uniform because the write matches nothing (issue #140). The GET \
+         half touches no store at all: it renders a confirmation page without looking the \
+         link up, deliberately, so it cannot be an oracle for whether a link is live. The \
+         POST half writes, so \"read first\" is the wrong reason for it. An earlier version \
+         of this entry claimed a prober naming a ghost scope cannot hold an id that parses \
+         there; that is FALSE, because a scoped id encodes the scope's own bytes and anyone \
+         can construct one for any (tenant, environment) pair they can name. The honest \
+         reason is that the conditional UPDATE it reaches is keyed on the scope columns \
+         under forced row-level security, so against a ghost scope it matches no row -- \
+         exactly as it matches no row for a live scope holding no such link -- and both \
+         answer the same uniform not-found",
+    );
     for path in [
         "/t/{tenant_id}/e/{environment_id}/flow/{journey}",
         "/t/{tenant_id}/e/{environment_id}/flow/api/{journey}",

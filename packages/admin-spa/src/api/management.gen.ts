@@ -7282,10 +7282,9 @@ export interface components {
              * @description The path to hand the IT admin, token included, joined to whatever origin the vendor
              *     publishes for this deployment.
              *
-             *     NOT YET SERVED. The redeeming route lands in the next slice of #140; until it does,
-             *     following this path reaches a 404. It is stated here rather than left to be discovered
-             *     because the alternative is a vendor emailing a customer's IT admin a link that looks
-             *     correct and goes nowhere, which is the one artifact that customer sees first.
+             *     FOLLOW IT AND IT WORKS. It did not when this endpoint first shipped, which the field's
+             *     own description said at the time; the redeeming routes landed in the next slice and this
+             *     sentence changed with them rather than a release later.
              *
              *     RETURNED ONCE. The store keeps only a digest, so this response is the only place the
              *     token ever exists outside the caller.
@@ -22572,7 +22571,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The minted link; the token appears here and nowhere else. The returned url_path is not served until the portal session slice of issue #140 lands */
+            /** @description The minted link; the token appears here and nowhere else */
             201: {
                 headers: {
                     [name: string]: unknown;
