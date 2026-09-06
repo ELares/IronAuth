@@ -35024,7 +35024,9 @@
         "required": [
           "id",
           "display_name",
-          "provider"
+          "provider",
+          "token_expiring_soon",
+          "no_live_token"
         ],
         "properties": {
           "display_name": {
@@ -35043,9 +35045,21 @@
             "type": "string",
             "description": "The non-secret `scim_` handle. Every other operation names the connection by this."
           },
+          "no_live_token": {
+            "type": "boolean",
+            "description": "Whether this connection has NO live token at all, so provisioning has already stopped.\n\nA DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would\notherwise be indistinguishable through an absent horizon: a connection whose tokens have\nall lapsed and a perfectly healthy one whose token never expires BOTH publish no\n`provisioning_stops_at_unix_ms`. One of those needs an operator today.\n\nTRUE for a connection whose live tokens have all lapsed or been revoked, one past its own\nexpiry, and one whose organization has been DISABLED: `authenticate` refuses each, so\nnothing a customer presents will work. A soft-deleted organization is not in that list\nbecause this route answers 404 for one before any row is rendered.\n\nFALSE for a revoked connection, which stopped working because somebody made it stop."
+          },
           "provider": {
             "type": "string",
             "description": "Which vendor this connection is for: `okta`, `entra` or `generic`."
+          },
+          "provisioning_stops_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this connection stops provisioning, in milliseconds since the epoch.\n\nTHE EARLIEST OF TWO DEADLINES, because either one ends provisioning and an operator needs\nwhichever comes first: the soonest horizon among the connection's live tokens, and the\nconnection's own `expires_at_unix_ms`. After a rotation a connection holds two tokens, the\nsuperseded one lapsing at the end of the overlap and the fresh one usually with no horizon\nat all -- so a listing that reported only token horizons would say nothing about a\nconnection three days from its own expiry.\n\nIT MAY THEREFORE EQUAL `expires_at_unix_ms`, and when it does the remedy is different:\nrotating mints a token with no horizon and never touches the connection's own expiry --\nnothing does, since `revoke` is the only write this API makes to that row -- so the\nwarning would come back unchanged. That connection has to be replaced rather than rotated.\n\nAbsent only when neither the connection nor any live token has a future horizon."
           },
           "revoked_at_unix_ms": {
             "type": [
@@ -35054,6 +35068,10 @@
             ],
             "format": "int64",
             "description": "Revocation time in milliseconds since the epoch, absent while the connection is live."
+          },
+          "token_expiring_soon": {
+            "type": "boolean",
+            "description": "Whether that horizon falls inside the configured warning lead time.\n\n#140 asks for \"expiry warnings at the configured lead time\". This is that warning,\ncomputed here rather than left to the caller: a client that had to compare two timestamps\nagainst a lead time it also had to fetch would get it wrong in a different way per\nclient, and the whole point is that the deployment decides when to warn.\n\nFALSE when the lead time is zero (the operator turned warnings off), when there is no\ndeadline of either kind, when the deadline is beyond the lead, and whenever the connection\ncounts NO live credential -- revoked, lapsed, or in an organization that was disabled. A\ncountdown is about something that still works; those have already stopped, and\n`no_live_token` beside `revoked_at_unix_ms` is what says so."
           }
         }
       },

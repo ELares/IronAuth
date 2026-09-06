@@ -68,6 +68,50 @@ pub struct ScimConnectionView {
     /// Revocation time in milliseconds since the epoch, absent while the connection is live.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at_unix_ms: Option<i64>,
+    /// When this connection stops provisioning, in milliseconds since the epoch.
+    ///
+    /// THE EARLIEST OF TWO DEADLINES, because either one ends provisioning and an operator needs
+    /// whichever comes first: the soonest horizon among the connection's live tokens, and the
+    /// connection's own `expires_at_unix_ms`. After a rotation a connection holds two tokens, the
+    /// superseded one lapsing at the end of the overlap and the fresh one usually with no horizon
+    /// at all -- so a listing that reported only token horizons would say nothing about a
+    /// connection three days from its own expiry.
+    ///
+    /// IT MAY THEREFORE EQUAL `expires_at_unix_ms`, and when it does the remedy is different:
+    /// rotating mints a token with no horizon and never touches the connection's own expiry --
+    /// nothing does, since `revoke` is the only write this API makes to that row -- so the
+    /// warning would come back unchanged. That connection has to be replaced rather than rotated.
+    ///
+    /// Absent only when neither the connection nor any live token has a future horizon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning_stops_at_unix_ms: Option<i64>,
+    /// Whether that horizon falls inside the configured warning lead time.
+    ///
+    /// #140 asks for "expiry warnings at the configured lead time". This is that warning,
+    /// computed here rather than left to the caller: a client that had to compare two timestamps
+    /// against a lead time it also had to fetch would get it wrong in a different way per
+    /// client, and the whole point is that the deployment decides when to warn.
+    ///
+    /// FALSE when the lead time is zero (the operator turned warnings off), when there is no
+    /// deadline of either kind, when the deadline is beyond the lead, and whenever the connection
+    /// counts NO live credential -- revoked, lapsed, or in an organization that was disabled. A
+    /// countdown is about something that still works; those have already stopped, and
+    /// `no_live_token` beside `revoked_at_unix_ms` is what says so.
+    pub token_expiring_soon: bool,
+    /// Whether this connection has NO live token at all, so provisioning has already stopped.
+    ///
+    /// A DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would
+    /// otherwise be indistinguishable through an absent horizon: a connection whose tokens have
+    /// all lapsed and a perfectly healthy one whose token never expires BOTH publish no
+    /// `provisioning_stops_at_unix_ms`. One of those needs an operator today.
+    ///
+    /// TRUE for a connection whose live tokens have all lapsed or been revoked, one past its own
+    /// expiry, and one whose organization has been DISABLED: `authenticate` refuses each, so
+    /// nothing a customer presents will work. A soft-deleted organization is not in that list
+    /// because this route answers 404 for one before any row is rendered.
+    ///
+    /// FALSE for a revoked connection, which stopped working because somebody made it stop.
+    pub no_live_token: bool,
 }
 
 /// A page of connections.
@@ -440,14 +484,78 @@ pub(crate) fn micros_to_millis(micros: i64) -> i64 {
     micros / 1_000
 }
 
-fn view(connection: &ironauth_store::ScimConnection) -> ScimConnectionView {
+fn view(
+    connection: &ironauth_store::ScimConnection,
+    now_micros: i64,
+    warning_lead_secs: u64,
+) -> ScimConnectionView {
+    let soonest = connection.provisioning_stops_at_unix_micros;
+    // THE COUNTDOWN IS ABOUT A CREDENTIAL THAT STILL WORKS. Without this a connection that
+    // cannot authenticate at all reported BOTH signals at once -- "provisioning has stopped"
+    // beside "it is about to stop" -- because the deadline is read off rows that outlive
+    // whatever killed the connection.
+    //
+    // ON THE COUNTDOWN IT IS NOW DEFENCE IN DEPTH RATHER THAN THE THING THAT DECIDES, and that
+    // is worth stating plainly because a guard whose absence changes no reachable answer is
+    // usually a guard that should go. `list_for_organization` publishes NO deadline at all once
+    // its own count reaches zero -- the two are computed from one row in one place precisely so
+    // they cannot disagree -- so for every row this handler can actually receive, `soonest` is
+    // already `None` here. `a_connection_whose_live_credentials_are_all_gone_reports_no_live_token`
+    // in the store suite is what pins that, and deleting `live &&` leaves the admin suite green.
+    //
+    // It stays because the invariant it depends on lives in ANOTHER CRATE, and `ScimConnection`
+    // is a public struct whose fields permit the contradiction. The unit test that drives it
+    // builds that combination by hand, and says so.
+    //
+    // On `no_live_token` below it is not defensive: it is the answer.
+    let live = connection.live_token_count > 0;
+    // AND `no_live_token` STILL EXCEPTS REVOCATION, which the count cannot express: a revoked
+    // connection genuinely has no usable credential, but announcing that is noise on the one row
+    // whose state `revoked_at_unix_ms` already explains. The operator switched this one off.
+    let revoked = connection.revoked;
     ScimConnectionView {
         id: connection.id.to_string(),
         display_name: connection.display_name.clone(),
         provider: connection.provider.clone(),
         expires_at_unix_ms: connection.expires_at_unix_micros.map(micros_to_millis),
         revoked_at_unix_ms: connection.revoked_at_unix_micros.map(micros_to_millis),
+        provisioning_stops_at_unix_ms: soonest.map(micros_to_millis),
+        token_expiring_soon: live && expiring_soon(soonest, now_micros, warning_lead_secs),
+        no_live_token: !revoked && !live,
     }
+}
+
+/// Whether `soonest` falls inside the warning lead time from `now`.
+///
+/// # What it is given, which is what makes it simple
+///
+/// `soonest` is the earliest horizon among the connection's LIVE tokens -- the store excludes
+/// both revoked and already-lapsed rows -- so this never sees a past timestamp and has no
+/// already-lapsed case to reason about.
+///
+/// AN EARLIER VERSION DID, and answered `true` for a past expiry on the theory that a warning
+/// must not go quiet at the moment provisioning breaks. The theory was right and the design was
+/// wrong: because a rotation supersedes a token WITHOUT revoking it and nothing sweeps the row,
+/// every rotated connection then warned forever and hid its real next horizon behind a dead
+/// one. "Provisioning has already stopped" is a different fact, and it is reported by
+/// `no_live_token` rather than smuggled into a countdown.
+///
+/// A ZERO LEAD is the operator turning warnings off, so nothing is ever expiring. No horizon at
+/// all is the ordinary state of a connection whose token does not expire.
+fn expiring_soon(soonest_micros: Option<i64>, now_micros: i64, lead_secs: u64) -> bool {
+    if lead_secs == 0 {
+        return false;
+    }
+    let Some(soonest) = soonest_micros else {
+        return false;
+    };
+    // SATURATING, because a lead time of a year in microseconds is comfortably inside i64 but
+    // the addition is still arithmetic on a caller-supplied clock, and a wrap would silently
+    // invert the comparison.
+    let lead_micros = i64::try_from(lead_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    soonest <= now_micros.saturating_add(lead_micros)
 }
 
 /// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`
@@ -497,14 +605,28 @@ pub async fn list_scim_connections(
         .store()
         .scoped(scope)
         .scim_connections()
-        .list_for_organization(&org_id, page.fetch_limit(), page.after())
+        .list_for_organization(
+            &org_id,
+            page.fetch_limit(),
+            page.after(),
+            state.now_unix_micros(),
+        )
         .await
         .map_err(|_| ApiError::Internal)?;
     let (connections, next_cursor) = page.finish(connections, |connection| {
         (connection.created_at_unix_micros, connection.id.to_string())
     });
     let body = serde_json::to_string(&ScimConnectionListView {
-        items: connections.iter().map(view).collect(),
+        items: connections
+            .iter()
+            .map(|connection| {
+                view(
+                    connection,
+                    state.now_unix_micros(),
+                    state.scim_token_expiry_warning_secs(),
+                )
+            })
+            .collect(),
         next_cursor,
     })
     .map_err(|_| ApiError::Internal)?;
@@ -964,7 +1086,198 @@ fn rotated_payload(
 
 #[cfg(test)]
 mod rotation_tests {
-    use super::rotated_payload;
+    use super::{expiring_soon, rotated_payload, view};
+    use ironauth_env::Env;
+    use ironauth_store::{
+        EnvironmentId, OrganizationId, Scope, ScimConnection, ScimConnectionId, TenantId,
+    };
+
+    /// A connection carrying exactly the four fields the view reads, with everything else at a
+    /// value that makes no difference to it.
+    fn connection(revoked: bool, live_token_count: i64, soonest: Option<i64>) -> ScimConnection {
+        let env = Env::system();
+        let scope = Scope::new(TenantId::generate(&env), EnvironmentId::generate(&env));
+        ScimConnection {
+            id: ScimConnectionId::generate(&env, &scope),
+            organization_id: OrganizationId::generate(&env, &scope),
+            display_name: "acme".to_owned(),
+            provider: "okta".to_owned(),
+            expires_at_unix_micros: None,
+            revoked_at_unix_micros: revoked.then_some(1_699_000_000_000_000),
+            revoked,
+            live_token_count,
+            provisioning_stops_at_unix_micros: soonest,
+            created_at_unix_micros: 1_698_000_000_000_000,
+        }
+    }
+
+    const DAY: i64 = 24 * 60 * 60 * 1_000_000;
+
+    /// The warning fires inside the lead time and not outside it.
+    ///
+    /// Both directions in one test because either alone is satisfied by a constant: a predicate
+    /// that always answered `true` would pass an inside-the-window assertion, and one that
+    /// always answered `false` would pass an outside-it assertion.
+    #[test]
+    fn the_warning_fires_inside_the_lead_time_and_not_outside_it() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 14 * 24 * 60 * 60;
+        assert!(
+            expiring_soon(Some(now + 13 * DAY), now, lead),
+            "a token lapsing inside the lead time is not reported as expiring"
+        );
+        assert!(
+            !expiring_soon(Some(now + 15 * DAY), now, lead),
+            "a token lapsing beyond the lead time is reported as expiring, so the warning is \
+             always on and says nothing"
+        );
+    }
+
+    /// The boundary belongs to the warning.
+    ///
+    /// A token lapsing EXACTLY at the lead time is inside it. The alternative leaves a
+    /// one-microsecond window in which the operator is not told, and the cost of being early is
+    /// nothing while the cost of being late is provisioning stopping unannounced.
+    #[test]
+    fn a_token_lapsing_exactly_at_the_lead_time_is_warned_about() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 7 * 24 * 60 * 60;
+        assert!(expiring_soon(Some(now + 7 * DAY), now, lead));
+        assert!(!expiring_soon(Some(now + 7 * DAY + 1), now, lead));
+    }
+
+    /// A PAST deadline answers "warn" rather than going quiet, defensively.
+    ///
+    /// # This is not a behaviour the listing can reach, and saying otherwise was wrong
+    ///
+    /// An earlier version of this test claimed it kept the column from looking healthy at the
+    /// moment provisioning breaks. That was true of the round-one design and is false now, twice
+    /// over: the store filters both arms of the deadline on `> now`, so this function is never
+    /// handed a past timestamp from a listing, and `view` suppresses the warning entirely once
+    /// the connection counts no live credential. A connection whose tokens have all lapsed is
+    /// reported by `no_live_token`, not by a countdown -- which is what
+    /// `a_connection_whose_live_credentials_are_all_gone_reports_no_live_token` in the store
+    /// suite asserts.
+    ///
+    /// What remains worth pinning is the DIRECTION this function fails in for an input it should
+    /// never see: if the store's filter were ever relaxed, a past deadline must produce a warning
+    /// rather than silence. A range check requiring the deadline to be in the future would give
+    /// silence, and silence is indistinguishable from healthy.
+    #[test]
+    fn a_past_deadline_warns_rather_than_going_quiet() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(
+            expiring_soon(Some(now - DAY), now, 14 * 24 * 60 * 60),
+            "a deadline in the past answered quiet; the store does not produce this input, and \
+             if it ever did, quiet would be indistinguishable from healthy"
+        );
+    }
+
+    /// The two derived signals, each driven against the input that distinguishes it.
+    ///
+    /// # Why these are unit tests and not HTTP ones
+    ///
+    /// Because the distinguishing states are unreachable through the API. Revoking a connection
+    /// does not touch its token rows, so a revoked connection reached over HTTP has whatever
+    /// count the store computes for it, and a test there cannot hold the count fixed while
+    /// flipping `revoked`. Here both are inputs.
+    ///
+    /// Every assertion below has its control: the same fields with one value changed, asserted
+    /// to come out the other way. Without them a view that never reported either signal would
+    /// satisfy the negative half of each pair.
+    #[test]
+    fn the_countdown_is_about_a_credential_that_still_works() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 14 * 24 * 60 * 60;
+        let imminent = Some(now + DAY);
+
+        // THE CONTROL: a live credential with an imminent horizon warns.
+        assert!(
+            view(&connection(false, 1, imminent), now, lead).token_expiring_soon,
+            "the control: a live connection with an imminent horizon must warn"
+        );
+
+        // AND NOTHING LIVE SILENCES IT, however near the horizon on the dead rows. The store
+        // reads the horizon off token rows, which outlive whatever killed the connection: a
+        // lapsed connection, and one whose organization was disabled, each arrive here with a
+        // future horizon and a zero count. Reporting both signals told an operator that
+        // provisioning had stopped AND was about to.
+        let dead = view(&connection(false, 0, imminent), now, lead);
+        assert!(
+            !dead.token_expiring_soon,
+            "a connection with no usable credential is counting down to the moment it breaks, \
+             which has already happened"
+        );
+        assert!(
+            dead.no_live_token,
+            "and the signal that IS true of it must still fire, or the row goes quiet entirely"
+        );
+        // The timestamp itself survives: the suppression is of the derived flag, not of the
+        // fact under it.
+        assert_eq!(
+            dead.provisioning_stops_at_unix_ms,
+            imminent.map(super::micros_to_millis),
+            "suppressing the countdown must not blank the horizon it was derived from"
+        );
+    }
+
+    /// Revocation is the one broken state the listing does not announce.
+    #[test]
+    fn a_revoked_connection_does_not_report_a_lost_credential() {
+        let now = 1_700_000_000_000_000_i64;
+        let lead = 14 * 24 * 60 * 60;
+
+        // THE CONTROL: the same zero count on an UNREVOKED connection does report it. Only
+        // `revoked` differs between the two, so this is the guard and not the count.
+        assert!(
+            view(&connection(false, 0, None), now, lead).no_live_token,
+            "the control: a connection that lost its credentials must say so"
+        );
+        assert!(
+            !view(&connection(true, 0, None), now, lead).no_live_token,
+            "a revoked connection is reported as having lost its credentials, which is noise on \
+             the one row whose state revoked_at already explains"
+        );
+    }
+
+    /// A zero lead time turns the warning off, and no horizon means nothing to warn about.
+    ///
+    /// THE ZERO CASE IS DRIVEN AT EXACTLY `now`, which is the only input that distinguishes the
+    /// early return from the arithmetic. For any horizon strictly in the future, the comparison
+    /// against a zero lead is already false, so deleting the branch would leave such an
+    /// assertion green. A horizon of exactly `now` satisfies the comparison and is refused only
+    /// by the branch itself.
+    #[test]
+    fn a_zero_lead_or_no_horizon_never_warns() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(
+            !expiring_soon(Some(now), now, 0),
+            "the operator disabled warnings and got one anyway: a horizon of exactly now \
+             satisfies the comparison, so only the zero branch can refuse it"
+        );
+        assert!(
+            !expiring_soon(Some(now + 1), now, 0),
+            "the operator disabled warnings and got one anyway"
+        );
+        assert!(
+            !expiring_soon(None, now, 14 * 24 * 60 * 60),
+            "a connection whose tokens have no horizon was reported as expiring"
+        );
+    }
+
+    /// An enormous lead time does not wrap into `false`.
+    ///
+    /// The lead arrives as a `u64` of seconds from configuration and is multiplied by a million.
+    /// Config load caps it at a year, but this function is the one that must not invert its
+    /// comparison if that cap ever moves or a caller passes something else.
+    #[test]
+    fn an_enormous_lead_saturates_rather_than_wrapping() {
+        let now = 1_700_000_000_000_000_i64;
+        assert!(
+            expiring_soon(Some(now + 365 * DAY), now, u64::MAX),
+            "a huge lead time wrapped and inverted the comparison"
+        );
+    }
 
     /// The envelope this producer mints satisfies the schema the fan-out enforces.
     ///

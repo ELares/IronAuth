@@ -344,7 +344,7 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
             db.store()
                 .scoped(caller)
                 .scim_connections()
-                .list_for_organization(organization, 100, None)
+                .list_for_organization(organization, 100, None, now_micros(&env))
                 .await
                 .unwrap_or_default()
                 .is_empty(),
@@ -527,7 +527,7 @@ async fn no_scim_repository_operation_resolves_a_foreign_identifier() {
         !db.store()
             .scoped(caller)
             .scim_connections()
-            .list_for_organization(&local.organization, 100, None)
+            .list_for_organization(&local.organization, 100, None, now_micros(&env))
             .await
             .expect("read")
             .is_empty(),

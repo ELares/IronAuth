@@ -235,6 +235,23 @@ impl Harness {
             txt: None,
         }
     }
+    /// A harness whose SCIM token expiry warning lead is `warning_lead_secs` (issue #140).
+    ///
+    /// Exists so a test can drive a NON-default lead. Without one, every test would use the
+    /// shipped fourteen days and would pass equally against a handler that ignored
+    /// configuration and hardcoded it -- which is exactly what the configured-lead test refuses.
+    pub async fn start_with_scim_warning_lead(
+        default_page_size: u32,
+        warning_lead_secs: u64,
+    ) -> Self {
+        Self::build(
+            default_page_size,
+            ironauth_config::ORGANIZATIONS_DEFAULT_MAX_GROUP_DEPTH,
+            warning_lead_secs,
+        )
+        .await
+    }
+
     /// Start a fresh database and router with an explicit organization group nesting
     /// bound (issue #97), so a test can drive the depth refusal with a handful of
     /// groups instead of the shipped default's nine.
@@ -242,6 +259,23 @@ impl Harness {
     /// This bounds tree DEPTH only. It caps nothing that is counted: the number of
     /// groups an organization may hold is uncapped by covenant, at every depth level.
     pub async fn start_with_group_depth(default_page_size: u32, max_group_depth: u32) -> Self {
+        Self::build(
+            default_page_size,
+            max_group_depth,
+            ironauth_config::ScimConfig::default().token_expiry_warning_secs,
+        )
+        .await
+    }
+
+    /// The one body both `start_with_*` entry points share.
+    ///
+    /// ONE CONSTRUCTION SITE, so a state field added later is installed for every harness rather
+    /// than only the one whose entry point somebody remembered.
+    async fn build(
+        default_page_size: u32,
+        max_group_depth: u32,
+        scim_warning_lead_secs: u64,
+    ) -> Self {
         let mut db = TestDatabase::start().await;
         // Seed under the operator this API actually acts as (issue #185). Left to
         // itself each seed mints a FRESH operator, so every seeded tenant would be
@@ -255,7 +289,8 @@ impl Harness {
         };
         let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
             .expect("admin state builds")
-            .with_max_group_depth(max_group_depth);
+            .with_max_group_depth(max_group_depth)
+            .with_scim_token_expiry_warning_secs(scim_warning_lead_secs);
         let router = management_router(install_hook_runtime(state));
         Self {
             db,

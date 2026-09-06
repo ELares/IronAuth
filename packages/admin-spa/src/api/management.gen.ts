@@ -7864,13 +7864,63 @@ export interface components {
             expires_at_unix_ms?: number | null;
             /** @description The non-secret `scim_` handle. Every other operation names the connection by this. */
             id: string;
+            /**
+             * @description Whether this connection has NO live token at all, so provisioning has already stopped.
+             *
+             *     A DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would
+             *     otherwise be indistinguishable through an absent horizon: a connection whose tokens have
+             *     all lapsed and a perfectly healthy one whose token never expires BOTH publish no
+             *     `provisioning_stops_at_unix_ms`. One of those needs an operator today.
+             *
+             *     TRUE for a connection whose live tokens have all lapsed or been revoked, one past its own
+             *     expiry, and one whose organization has been DISABLED: `authenticate` refuses each, so
+             *     nothing a customer presents will work. A soft-deleted organization is not in that list
+             *     because this route answers 404 for one before any row is rendered.
+             *
+             *     FALSE for a revoked connection, which stopped working because somebody made it stop.
+             */
+            no_live_token: boolean;
             /** @description Which vendor this connection is for: `okta`, `entra` or `generic`. */
             provider: string;
+            /**
+             * Format: int64
+             * @description When this connection stops provisioning, in milliseconds since the epoch.
+             *
+             *     THE EARLIEST OF TWO DEADLINES, because either one ends provisioning and an operator needs
+             *     whichever comes first: the soonest horizon among the connection's live tokens, and the
+             *     connection's own `expires_at_unix_ms`. After a rotation a connection holds two tokens, the
+             *     superseded one lapsing at the end of the overlap and the fresh one usually with no horizon
+             *     at all -- so a listing that reported only token horizons would say nothing about a
+             *     connection three days from its own expiry.
+             *
+             *     IT MAY THEREFORE EQUAL `expires_at_unix_ms`, and when it does the remedy is different:
+             *     rotating mints a token with no horizon and never touches the connection's own expiry --
+             *     nothing does, since `revoke` is the only write this API makes to that row -- so the
+             *     warning would come back unchanged. That connection has to be replaced rather than rotated.
+             *
+             *     Absent only when neither the connection nor any live token has a future horizon.
+             */
+            provisioning_stops_at_unix_ms?: number | null;
             /**
              * Format: int64
              * @description Revocation time in milliseconds since the epoch, absent while the connection is live.
              */
             revoked_at_unix_ms?: number | null;
+            /**
+             * @description Whether that horizon falls inside the configured warning lead time.
+             *
+             *     #140 asks for "expiry warnings at the configured lead time". This is that warning,
+             *     computed here rather than left to the caller: a client that had to compare two timestamps
+             *     against a lead time it also had to fetch would get it wrong in a different way per
+             *     client, and the whole point is that the deployment decides when to warn.
+             *
+             *     FALSE when the lead time is zero (the operator turned warnings off), when there is no
+             *     deadline of either kind, when the deadline is beyond the lead, and whenever the connection
+             *     counts NO live credential -- revoked, lapsed, or in an organization that was disabled. A
+             *     countdown is about something that still works; those have already stopped, and
+             *     `no_live_token` beside `revoked_at_unix_ms` is what says so.
+             */
+            token_expiring_soon: boolean;
         };
         /**
          * @description The 201 of a create.

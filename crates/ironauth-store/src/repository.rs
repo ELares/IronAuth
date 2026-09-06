@@ -75259,6 +75259,75 @@ pub struct ScimConnection {
     pub revoked_at_unix_micros: Option<i64>,
     /// Whether it has been revoked.
     pub revoked: bool,
+    /// How many tokens of this connection are LIVE right now.
+    ///
+    /// ZERO IS THE BROKEN STATE: nothing a customer can present will authenticate, so
+    /// provisioning has stopped. It is a different fact from the horizon below and needs its own
+    /// field, because a connection with no usable credential has no horizon at all -- and an
+    /// operator reading only the horizon would see an absent value, which is also what a
+    /// perfectly healthy never-expiring connection shows.
+    ///
+    /// # It counts what AUTHENTICATES, which is not the same as counting rows
+    ///
+    /// `authenticate` refuses on more than the token: the connection must be unrevoked and
+    /// unlapsed, and its ORGANIZATION must be neither soft-deleted nor disabled. Every one of
+    /// those zeroes this, because the number's whole claim is that something a customer can
+    /// present will work. Counting rows alone reported a connection healthy in each of those
+    /// states after provisioning had already stopped.
+    ///
+    /// And a connection with NO token rows is the legacy population: created by a binary that
+    /// predates migration 0205, it authenticates through the fallback on
+    /// `scim_connections.token_digest` and provisions perfectly. Counting rows reported it as
+    /// broken. It has one usable credential, and that is what this says.
+    pub live_token_count: i64,
+    /// When this connection stops provisioning, if anything about it has a deadline.
+    ///
+    /// # The soonest of TWO deadlines, either of which ends provisioning
+    ///
+    /// The connection's own `expires_at` and the horizons of its live tokens. Both are read
+    /// because `authenticate` reads both, and an operator needs whichever arrives first: after a
+    /// rotation a connection holds the superseded token lapsing at the end of the overlap and a
+    /// fresh one usually with no horizon at all, so token horizons alone say nothing about a
+    /// connection three days from its own expiry.
+    ///
+    /// SOONEST rather than latest, because a warning has to fire before the first thing that can
+    /// break, not after the last. `None` means neither the connection nor any live token has a
+    /// future deadline, which is the ordinary state of a connection nobody gave an expiry.
+    ///
+    /// THE TWO DEADLINES ARE NOT INTERCHANGEABLE TO WHOEVER ACTS ON THEM. A token horizon is
+    /// cleared by rotating; the connection's own expiry is not, because nothing in this store
+    /// updates `scim_connections.expires_at` -- `revoke` is the only writer of that row -- so a
+    /// connection warning on its own expiry has to be replaced. The field publishing one number
+    /// for both is deliberate (the operator wants the earliest date provisioning stops), and it
+    /// is why the API-side documentation of this value says which remedy applies.
+    ///
+    /// # The CONNECTION's own expiry is folded in, and leaving it out was silent
+    ///
+    /// `authenticate` requires `c.expires_at > now` as well as the token's. A rotation mints its
+    /// fresh token with NO horizon, so a connection created with a ninety-day expiry and rotated
+    /// on day thirty had no live token horizon at all from the end of the overlap onwards -- and
+    /// reported none, and then stopped working on day ninety with nothing having warned. That is
+    /// the "provisioning stops on a date nobody was watching" this field exists to prevent,
+    /// produced by reading only half of what the authenticator reads.
+    ///
+    /// IT IS BOUNDED THE SAME WAY THE TOKENS ARE: a connection whose own expiry has already
+    /// PASSED contributes nothing here, for the reason a lapsed token contributes nothing. A
+    /// past timestamp in a field documented as a horizon makes the warning permanently true,
+    /// which is the defect this whole field was reshaped to remove. That the connection has
+    /// stopped working is `live_token_count == 0`.
+    ///
+    /// TOKENS THAT ARE NOT WORKING ARE EXCLUDED, and that is BOTH the revoked ones and the ones
+    /// that have already lapsed. The first version of this excluded only the revoked, and the
+    /// consequence was that every rotated connection warned FOREVER: a rotation supersedes a
+    /// token with an expiry and never revokes it, nothing sweeps the row, and no route exposes
+    /// per-token revocation -- so the dead timestamp became a permanent floor for the minimum
+    /// and hid every real horizon behind it. On the shipped default that was every connection
+    /// anybody had ever rotated, which is exactly the always-on warning the configuration cap
+    /// exists to prevent.
+    ///
+    /// A lapsed token is not a HORIZON, it is a token that is gone. That it has gone is reported
+    /// by `live_token_count` above.
+    pub provisioning_stops_at_unix_micros: Option<i64>,
     /// Creation time, which is the listing's sort key and therefore its cursor position.
     pub created_at_unix_micros: i64,
 }
@@ -78676,6 +78745,16 @@ impl ScimConnectionRepo<'_> {
             expires_at_unix_micros: row.get("expires_us"),
             revoked_at_unix_micros: row.get("revoked_us"),
             revoked: false,
+            // NOT ANSWERED ON THE AUTHENTICATION PATH. A request that reached here presented a
+            // token that authenticated, so at least one is live; the exact count is an operator
+            // question the LISTING answers.
+            live_token_count: 1,
+            // NOT ANSWERED ON THE AUTHENTICATION PATH. This read resolves ONE token to its
+            // connection; the soonest horizon across a connection's tokens is an operator
+            // question the LISTING answers, and computing it here would add a second read to
+            // the hot path of every provisioning request to produce something no caller of
+            // `authenticate` looks at.
+            provisioning_stops_at_unix_micros: None,
             created_at_unix_micros: row.get("created_us"),
         }))
     }
@@ -78739,6 +78818,7 @@ impl ScimConnectionRepo<'_> {
         organization_id: &OrganizationId,
         limit: i64,
         after: Option<&CursorPosition>,
+        now_micros: i64,
     ) -> Result<Vec<ScimConnection>, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -78746,16 +78826,44 @@ impl ScimConnectionRepo<'_> {
         let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, organization_id, display_name, provider, \
-                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
-                    (EXTRACT(EPOCH FROM expires_at) * 1000000)::bigint AS expires_us, \
-                    (EXTRACT(EPOCH FROM revoked_at) * 1000000)::bigint AS revoked_us, \
-                    (revoked_at IS NOT NULL) AS revoked \
-             FROM scim_connections \
-             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
-             AND ($4::bigint IS NULL OR (created_at, id) > \
+            "SELECT c.id, c.organization_id, c.display_name, c.provider, \
+                    (EXTRACT(EPOCH FROM c.created_at) * 1000000)::bigint AS created_us, \
+                    (EXTRACT(EPOCH FROM c.expires_at) * 1000000)::bigint AS expires_us, \
+                    (EXTRACT(EPOCH FROM c.revoked_at) * 1000000)::bigint AS revoked_us, \
+                    (c.revoked_at IS NOT NULL) AS revoked, \
+                    (EXTRACT(EPOCH FROM LEAST( \
+                        CASE WHEN c.expires_at > TIMESTAMPTZ 'epoch' \
+                                                 + ($7::bigint * INTERVAL '1 microsecond') \
+                             THEN c.expires_at END, \
+                        (SELECT MIN(t.expires_at) FROM scim_connection_tokens t \
+                         WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                           AND t.environment_id = c.environment_id \
+                           AND t.revoked_at IS NULL \
+                           AND t.expires_at > TIMESTAMPTZ 'epoch' \
+                                              + ($7::bigint * INTERVAL '1 microsecond')))) \
+                     * 1000000)::bigint AS provisioning_stops_us, \
+                    (SELECT count(*) FROM scim_connection_tokens t \
+                     WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                       AND t.environment_id = c.environment_id \
+                       AND t.revoked_at IS NULL \
+                       AND (t.expires_at IS NULL OR t.expires_at > TIMESTAMPTZ 'epoch' \
+                                                    + ($7::bigint * INTERVAL '1 microsecond'))) \
+                        AS live_tokens \
+                    , (c.expires_at IS NOT NULL AND c.expires_at <= TIMESTAMPTZ 'epoch' \
+                                                    + ($7::bigint * INTERVAL '1 microsecond')) \
+                        AS connection_lapsed \
+                    , EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                              WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                                AND t.environment_id = c.environment_id) AS has_token_rows \
+                    , (SELECT (o.deleted_at IS NULL AND o.state = 'active') \
+                       FROM organizations o \
+                       WHERE o.id = $3 AND o.tenant_id = $1 AND o.environment_id = $2) \
+                        AS org_active \
+             FROM scim_connections c \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.organization_id = $3 \
+             AND ($4::bigint IS NULL OR (c.created_at, c.id) > \
                   (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
-             ORDER BY created_at, id LIMIT $6",
+             ORDER BY c.created_at, c.id LIMIT $6",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -78763,6 +78871,7 @@ impl ScimConnectionRepo<'_> {
         .bind(after_micros)
         .bind(after_id)
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .bind(now_micros)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -78782,10 +78891,61 @@ impl ScimConnectionRepo<'_> {
                     expires_at_unix_micros: row.get("expires_us"),
                     revoked_at_unix_micros: row.get("revoked_us"),
                     revoked: row.get("revoked"),
+                    provisioning_stops_at_unix_micros: {
+                        // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
+                        // one. The connection's own expiry is folded into this column, so a
+                        // connection whose tokens have all lapsed or been revoked -- and one
+                        // whose organization was disabled -- would otherwise publish the date
+                        // provisioning WILL stop while `live_token_count` beside it says it
+                        // already has. Two fields derived from one row and contradicting each
+                        // other is the defect this listing has now produced twice.
+                        if live_token_count(&row) == 0 {
+                            None
+                        } else {
+                            row.get("provisioning_stops_us")
+                        }
+                    },
+                    live_token_count: live_token_count(&row),
                     created_at_unix_micros: row.get("created_us"),
                 })
             })
             .collect()
+    }
+}
+
+/// How many credentials of one listed connection would actually authenticate.
+///
+/// EVERY CONDITION `authenticate` REFUSES ON ZEROES THIS, not just the token-level ones, because
+/// the number claims that something a customer can present will work. `authenticate` requires the
+/// CONNECTION to be unrevoked and unlapsed and its ORGANIZATION to be live, and a count that saw
+/// only the token rows reported a healthy connection in every one of those states after
+/// provisioning had already stopped.
+///
+/// The three are read as separate columns rather than folded into one SQL predicate so that a
+/// fixture can drive them one at a time; a single combined boolean is satisfied by whichever
+/// disjunct a test happened to set.
+///
+/// AND A CONNECTION WITH NO TOKEN ROWS AT ALL authenticates through the legacy fallback -- it was
+/// created by a binary that predates migration 0205 -- so it has ONE usable credential, not none.
+/// Counting rows would report that population as broken while it provisions perfectly. The
+/// fallback's own `NOT EXISTS` has no liveness filter either, so this asks the same question it
+/// does: any row at all, live or not.
+///
+/// It is a free function rather than an inline block because the deadline beside it reads the
+/// same number, and two copies of this decision could disagree about one row.
+fn live_token_count(row: &sqlx::postgres::PgRow) -> i64 {
+    let lapsed: bool = row.get("connection_lapsed");
+    let revoked_now: bool = row.get("revoked");
+    // NULL when the organization is gone, which is not alive.
+    let org_active: Option<bool> = row.get("org_active");
+    let has_rows: bool = row.get("has_token_rows");
+    let counted: i64 = row.get("live_tokens");
+    if lapsed || revoked_now || org_active != Some(true) {
+        0
+    } else if has_rows {
+        counted
+    } else {
+        1
     }
 }
 

@@ -1036,3 +1036,245 @@ async fn a_disabled_organization_cannot_rotate_a_token_that_would_not_authentica
         "the refusal must name the reason: {refused}"
     );
 }
+
+/// The listing warns about a token lapsing inside the configured lead, and not otherwise.
+///
+/// #140's criterion 5 asks for "expiry warnings at the configured lead time". The predicate is
+/// unit-tested in both directions; what only the route can show is that the warning reaches the
+/// WIRE, computed against the deployment's configured lead rather than left to a client that
+/// would have to fetch the lead and the timestamps and compare them itself -- differently per
+/// client, which is the thing a configured warning exists to avoid.
+///
+/// Both directions here too, because a listing that reported every connection as expiring would
+/// satisfy the positive assertion alone.
+#[tokio::test]
+async fn the_listing_warns_about_a_token_lapsing_inside_the_configured_lead() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "w-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "w-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    // QUIET: never rotated, no expiry. Nothing to warn about, which is the ordinary state.
+    let quiet = serde_json::json!({ "display_name": "quiet", "provider": "okta" }).to_string();
+    let (status, _, created) = h.post(&base, "w-quiet", &quiet).await;
+    assert_eq!(status, StatusCode::CREATED, "seed quiet: {created}");
+    let quiet_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // LOUD: rotated with a one-hour overlap, so its superseded token lapses far inside the
+    // shipped fourteen-day lead.
+    let loud = serde_json::json!({ "display_name": "loud", "provider": "okta" }).to_string();
+    let (status, _, created) = h.post(&base, "w-loud", &loud).await;
+    assert_eq!(status, StatusCode::CREATED, "seed loud: {created}");
+    let loud_id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, _, rotated) = h
+        .post(
+            &format!("{base}/{loud_id}/rotate"),
+            "w-rotate",
+            &serde_json::json!({ "overlap_seconds": 3600 }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "rotate loud: {rotated}");
+
+    let (status, _, listed) = h.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "list: {listed}");
+    let items = serde_json::from_str::<Value>(&listed).expect("json")["items"]
+        .as_array()
+        .expect("items")
+        .clone();
+
+    let find = |id: &str| {
+        items
+            .iter()
+            .find(|item| item["id"].as_str() == Some(id))
+            .cloned()
+            .expect("the connection is listed")
+    };
+
+    let quiet_item = find(&quiet_id);
+    assert_eq!(
+        quiet_item["token_expiring_soon"].as_bool(),
+        Some(false),
+        "a connection nobody rotated is reported as expiring, so the warning is always on: \
+         {quiet_item}"
+    );
+    assert!(
+        quiet_item.get("provisioning_stops_at_unix_ms").is_none(),
+        "a connection whose tokens have no horizon published one: {quiet_item}"
+    );
+
+    let loud_item = find(&loud_id);
+    assert_eq!(
+        loud_item["token_expiring_soon"].as_bool(),
+        Some(true),
+        "a token lapsing in an hour is not reported as expiring, so an operator learns their \
+         customer's provisioning is about to stop by it stopping: {loud_item}"
+    );
+    assert!(
+        loud_item["provisioning_stops_at_unix_ms"].as_i64().is_some(),
+        "the warning fired without publishing WHEN, which is what an operator acts on: \
+         {loud_item}"
+    );
+}
+
+/// A deployment that set the lead to zero gets no warnings, and one that set it short gets one.
+///
+/// # What this covers that the default-lead test cannot
+///
+/// The other router test uses the harness's shipped default, so it proves the DEFAULT works. It
+/// would pass just as well against a handler that ignored configuration entirely and hardcoded
+/// fourteen days -- and against one where the boot wiring never called the builder. This drives
+/// two NON-default leads through `with_scim_token_expiry_warning_secs`, which is the only thing
+/// that makes the knob observable.
+#[tokio::test]
+async fn the_warning_honours_the_configured_lead_rather_than_a_hardcoded_one() {
+    for (lead_secs, expected, why) in [
+        (
+            0_u64,
+            false,
+            "a deployment that disabled warnings got one anyway, so the zero branch is not              consulted",
+        ),
+        (
+            60_u64,
+            false,
+            "a token lapsing in an hour was reported as expiring against a ONE MINUTE lead, so              the configured value is ignored and something else decides",
+        ),
+    ] {
+        let h = Harness::start_with_scim_warning_lead(50, lead_secs).await;
+        let (tenant, environment) = h.create_tenant("acme", "c-tenant").await;
+        let org = create_org(&h, &tenant, &environment, "c-org").await;
+        let base = connections_path(&tenant, &environment, &org);
+
+        let body = serde_json::json!({ "display_name": "subject", "provider": "okta" }).to_string();
+        let (status, _, created) = h.post(&base, "c-seed", &body).await;
+        assert_eq!(status, StatusCode::CREATED, "seed: {created}");
+        let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        // An hour-long overlap: inside the shipped fourteen-day default, outside a one-minute
+        // lead, and irrelevant when warnings are off.
+        let (status, _, rotated) = h
+            .post(
+                &format!("{base}/{id}/rotate"),
+                "c-rotate",
+                &serde_json::json!({ "overlap_seconds": 3600 }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "rotate: {rotated}");
+
+        let (status, _, listed) = h.get(&base).await;
+        assert_eq!(status, StatusCode::OK, "list: {listed}");
+        let item = serde_json::from_str::<Value>(&listed).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"].as_str() == Some(&id))
+            .cloned()
+            .expect("listed");
+        assert_eq!(
+            item["token_expiring_soon"].as_bool(),
+            Some(expected),
+            "{why}: {item}"
+        );
+    }
+}
+
+/// A revoked connection surfaces neither signal THROUGH THE API.
+///
+/// # What it proves, end to end
+///
+/// The store counts no live credential for a revoked connection -- `authenticate` refuses one,
+/// so nothing it holds can be presented -- and the view then has to decide what to say about a
+/// row with a zero count. It says nothing, because `revoked_at_unix_ms` already explains this
+/// one: the operator switched it off.
+///
+/// That makes the guard observable from here, which it was not before the count learned about
+/// revocation: deleting `!revoked &&` turns this test red. It is driven at the unit level too,
+/// in `scim_connections::rotation_tests::a_revoked_connection_does_not_report_a_lost_credential`,
+/// where the count can be held fixed while only `revoked` moves; this one is the end-to-end
+/// shape, and it is what would notice the two layers disagreeing.
+#[tokio::test]
+async fn the_listing_suppresses_both_signals_for_a_revoked_connection() {
+    // A THIRTY-DAY LEAD AND A DEADLINE ONE DAY OUT, so the subject is genuinely WARNING before
+    // the revocation. An earlier version of this test seeded a connection with no expiry at all:
+    // its deadline was absent, `token_expiring_soon` was false on both reads, and the assertion
+    // below held whether or not `view` consulted the live count. The suppression it names was
+    // unobserved, which is the shape this suite exists to catch.
+    let h = Harness::start_with_scim_warning_lead(50, 30 * 24 * 60 * 60).await;
+    let (tenant, environment) = h.create_tenant("acme", "s-tenant").await;
+    let org = create_org(&h, &tenant, &environment, "s-org").await;
+    let base = connections_path(&tenant, &environment, &org);
+
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a millisecond count inside i64");
+    let body = serde_json::json!({
+        "display_name": "doomed",
+        "provider": "okta",
+        "expires_at_unix_ms": now_ms + 24 * 60 * 60 * 1000,
+    })
+    .to_string();
+    let (status, _, created) = h.post(&base, "s-seed", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "seed: {created}");
+    let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let item_for = |listed: &str, id: &str| -> Value {
+        serde_json::from_str::<Value>(listed).expect("json")["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"].as_str() == Some(id))
+            .cloned()
+            .expect("listed")
+    };
+
+    // BEFORE THE REVOKE it holds a live credential and is WARNING about the deadline one day
+    // out. Both are the controls that make the two assertions after the revoke a change of
+    // answer rather than a listing that reports nothing either way.
+    let (_, _, listed) = h.get(&base).await;
+    let before = item_for(&listed, &id);
+    assert_eq!(before["no_live_token"].as_bool(), Some(false), "{before}");
+    assert_eq!(
+        before["token_expiring_soon"].as_bool(),
+        Some(true),
+        "the control: a live connection one day from its deadline, under a thirty-day lead, must \
+         warn -- without this the suppression below is unobservable: {before}"
+    );
+
+    let (status, _, body) = h.delete(&format!("{base}/{id}")).await;
+    assert!(status.is_success(), "revoke answered {status}: {body}");
+
+    let (_, _, listed) = h.get(&base).await;
+    let after = item_for(&listed, &id);
+    assert!(
+        after["revoked_at_unix_ms"].as_i64().is_some(),
+        "the revoked connection does not report its revocation: {after}"
+    );
+    assert_eq!(
+        after["no_live_token"].as_bool(),
+        Some(false),
+        "a REVOKED connection is reported as having lost its credentials, which is noise on the \
+         one row whose state revoked_at already explains: {after}"
+    );
+    assert_eq!(
+        after["token_expiring_soon"].as_bool(),
+        Some(false),
+        "a REVOKED connection is reported as about to stop working, which it has already done \
+         and by an operator's own hand. The STORE is what produces this: it publishes no \
+         deadline once nothing is live, so `view`'s own `live &&` gate is not what this \
+         observes -- deleting that gate leaves this assertion green: {after}"
+    );
+}

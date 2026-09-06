@@ -859,6 +859,22 @@ pub struct ScimConfig {
     /// Must not exceed the store's own list cap: above that the refusal becomes unreachable
     /// and the truncation happens anyway, which is a measured defect rather than a theory.
     pub max_scan: u32,
+
+    /// How long before a SCIM token lapses the listing starts calling it expiring, in seconds.
+    ///
+    /// #140 asks for expiry warnings "at the configured lead time", and CONFIGURED is the
+    /// operative word: the right lead depends on how long a customer's change process takes.
+    /// A vendor whose customers are enterprises with change-advisory boards needs weeks; one
+    /// selling to startups needs days. A hardcoded value would be wrong for one of them, and
+    /// the failure is silent -- provisioning simply stops on a date nobody was watching.
+    ///
+    /// FOURTEEN DAYS BY DEFAULT, which is long enough for a fortnightly change window to come
+    /// round once and short enough that the warning still means something when it appears.
+    ///
+    /// ZERO DISABLES IT, and disabling is a real choice: a deployment whose tokens never expire
+    /// has nothing to warn about, and a warning that is always absent is better than one that is
+    /// always present.
+    pub token_expiry_warning_secs: u64,
 }
 
 /// The outbound SCIM push worker (issue #137).
@@ -912,6 +928,7 @@ impl Default for ScimConfig {
             // `ironauth` crate asserts the two agree, because this crate cannot see that one.
             max_results: 200,
             max_scan: 1000,
+            token_expiry_warning_secs: 14 * 24 * 60 * 60,
         }
     }
 }
@@ -5710,6 +5727,13 @@ fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The longest SCIM token expiry warning lead an operator may configure, in seconds.
+///
+/// ONE YEAR. The knob exists so a deployment can match the warning to its customers' change
+/// process; a lead beyond any plausible token life marks every connection permanently expiring,
+/// which is a warning that carries no information and teaches an operator to ignore the column.
+pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
+
 /// Refuse a scim section whose page bounds cannot be satisfied.
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
@@ -5720,6 +5744,21 @@ fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
                  rows, so a larger bound can never be reached and the surface silently \
                  truncates instead of refusing",
                 scim.max_scan
+            ),
+        });
+    }
+    // A LEAD TIME LONGER THAN A YEAR is refused. The knob exists so an operator can match the
+    // warning to their customers' change process; a value beyond any plausible token life makes
+    // every connection permanently "expiring", which is a warning that carries no information
+    // and trains an operator to ignore the column. Refused rather than clamped, because a
+    // clamped value silently means something other than what was written.
+    if scim.token_expiry_warning_secs > SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS {
+        return Err(ConfigError::Invalid {
+            message: format!(
+                "scim.token_expiry_warning_secs ({}) must not exceed one year \
+                 ({SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS}): a lead time beyond any plausible token life \
+                 marks every connection expiring, which is a warning that says nothing",
+                scim.token_expiry_warning_secs
             ),
         });
     }
@@ -9748,6 +9787,53 @@ mod tests {
             "<inline>",
         )
         .expect("the cap itself is a legal bound");
+    }
+
+    #[test]
+    fn a_scim_warning_lead_beyond_a_year_is_refused() {
+        // The bound whose violation makes a SIGNAL uninformative rather than a control
+        // unreachable: a lead longer than any plausible token life marks every connection
+        // expiring, and a flag that is always true is one an operator learns to ignore.
+        // Nothing observed this refusal, so deleting the entire block left the suite green.
+        let err = Config::from_toml_str(
+            &format!(
+                "[scim]\ntoken_expiry_warning_secs = {}\n",
+                SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS + 1
+            ),
+            "<inline>",
+        )
+        .expect_err("a lead beyond a year is refused");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("scim.token_expiry_warning_secs"),
+            "the refusal must name the key an operator has to edit, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS.to_string()),
+            "the refusal must name the bound it is enforcing, got: {rendered}"
+        );
+
+        // The boundary itself is legal, so the refusal is a bound rather than a section that
+        // rejects long leads generally.
+        let at_the_bound = Config::from_toml_str(
+            &format!("[scim]\ntoken_expiry_warning_secs = {SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS}\n"),
+            "<inline>",
+        )
+        .expect("the bound itself is a legal lead")
+        .config;
+        assert_eq!(
+            at_the_bound.scim.token_expiry_warning_secs,
+            SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS
+        );
+
+        // AND ZERO IS LEGAL, which is the documented way to turn the warning off. It is
+        // asserted here because it is the one input that would break if this bound were ever
+        // rewritten as a range with a lower end -- a deployment whose tokens never expire has
+        // nothing to warn about.
+        let disabled = Config::from_toml_str("[scim]\ntoken_expiry_warning_secs = 0\n", "<inline>")
+            .expect("zero turns the warning off rather than being refused")
+            .config;
+        assert_eq!(disabled.scim.token_expiry_warning_secs, 0);
     }
 
     #[test]
