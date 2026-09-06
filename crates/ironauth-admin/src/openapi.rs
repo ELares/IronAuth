@@ -304,6 +304,7 @@ use crate::views::{
         crate::scim_connections::list_scim_connections,
         crate::scim_connections::create_scim_connection,
         crate::scim_connections::revoke_scim_connection,
+        crate::scim_connections::rotate_scim_connection_token,
         crate::scim_push_connections::list_scim_push_connections,
         crate::scim_push_connections::list_scim_push_resources,
         crate::scim_push_connections::create_scim_push_connection,

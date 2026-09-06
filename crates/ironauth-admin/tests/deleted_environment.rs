@@ -971,6 +971,18 @@ impl Fixture {
                 intent: Intent::Write,
                 live: StatusCode::CREATED,
             },
+            // The rotation (issue #140). It MINTS a credential, so unlike the revoke below it
+            // must be refused at a soft-deleted environment: minting a working provisioning
+            // token inside something an operator believes is decommissioned is the act a soft
+            // delete exists to stop, where DISARMING one must keep working.
+            Case {
+                label: "scim_connections.rotateScimConnectionToken",
+                method: "POST",
+                path: format!("{base}/scim-connections/{scim_connection}/rotate"),
+                body: Some("{}".to_owned()),
+                intent: Intent::Write,
+                live: StatusCode::OK,
+            },
             Case {
                 label: "scim_connections.revokeScimConnection",
                 method: "DELETE",
@@ -2153,6 +2165,7 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
         spare_user,
         spare_permission,
         member_user,
+        scim_connection,
         ..
     } = fixture;
     let spare_role_ref = serde_json::json!({ "role_id": spare_role }).to_string();
@@ -2200,6 +2213,16 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             "scim_connections.createScimConnection",
             format!("{base}/scim-connections"),
             serde_json::json!({ "display_name": "Replay Okta", "provider": "okta" }).to_string(),
+        ),
+        // The SCIM token ROTATION (issue #140), driven for the same reason and against the
+        // connection the fixture already seeds. It became keyed in the change that added it,
+        // and a keyed route that reaches the surface without reaching the replay fence is a
+        // retried credential mint -- worse here than on a create, because a second rotation
+        // re-supersedes the token the customer may have just pasted in.
+        (
+            "scim_connections.rotateScimConnectionToken",
+            format!("{base}/scim-connections/{scim_connection}/rotate"),
+            serde_json::json!({}).to_string(),
         ),
         // The OUTBOUND create (issue #137), keyed for the same reason and driven for the same
         // reason: it needs nothing beyond the organization at `base`. The doc block below
@@ -2258,8 +2281,12 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
 #[test]
 fn the_keyed_write_list_is_measured_against_the_contract() {
     const ORGANIZATION_PREFIX_LOCAL: &str = ORGANIZATION_PREFIX;
-    // MEASURED, not chosen: the contract records 15 and this list drives 9. Both halves come
-    // out of the assertion below, so neither is a number anybody typed from memory.
+    // MEASURED, NOT CHOSEN -- and the two figures this line used to quote are gone rather than
+    // updated. They said 15 and 9 while the real ones were 17 and 11, having been true when
+    // written and stale ever since; the sentence claimed both came "out of the assertion below",
+    // which is exactly the thing that made nobody check them. The assertion below prints both
+    // when it fails, which is where a reader should get them and the only place they cannot be
+    // stale.
     const UNDRIVEN: usize = 6;
     let doc: Value = serde_json::from_str(COMMITTED_SPEC).expect("the committed spec parses");
     let mut keyed: BTreeSet<String> = BTreeSet::new();
@@ -2327,11 +2354,29 @@ fn the_keyed_write_list_is_measured_against_the_contract() {
     );
 }
 
-/// The one keyed create whose replay is NOT its original response.
+/// The keyed writes whose replay is NOT their original response, because the original carried a
+/// CREDENTIAL that the stored body must not.
 ///
-/// Named once, here, rather than spelled at each of the three places that branch on it: a
-/// string repeated at three sites is three places for it to stop matching the route.
-const SECRET_BEARING_CREATE: &str = "scim_connections.createScimConnection";
+/// Named once, here, rather than spelled at each of the places that branch on them: a string
+/// repeated at several sites is several places for it to stop matching the route.
+///
+/// A LIST RATHER THAN ONE STRING since #140. It was a single constant while exactly one keyed
+/// write handed back a secret, and the rotation is the second: it mints a token on an existing
+/// connection, so its first response carries a credential and its replay must not. A constant
+/// that names one member of a growing class is a place the second member is simply not handled.
+const SECRET_BEARING_WRITES: &[&str] = &[
+    "scim_connections.createScimConnection",
+    "scim_connections.rotateScimConnectionToken",
+];
+
+/// The keyed writes whose FIRST response is 200 rather than 201.
+///
+/// This sweep assumed every keyed write is a CREATE, which was true until #140 added one that is
+/// not: a rotation replaces a token on a connection that already exists and creates no resource
+/// at a new URL, so answering 201 would be a lie about what happened. The assumption was
+/// invisible while it held, which is why it is named here rather than left as a bare
+/// `StatusCode::CREATED` in the loop.
+const FIRST_RESPONSE_IS_OK: &[&str] = &["scim_connections.rotateScimConnectionToken"];
 
 /// A [`Fixture`] with placeholder ids, for the database-free checks.
 ///
@@ -2393,18 +2438,22 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
 
     // Each keyed write once, while the environment is LIVE. The response it stores is
     // what the replay after the delete has to reproduce, byte for byte -- with the one
-    // documented exception named at `SECRET_BEARING_CREATE`, whose stored body deliberately
-    // differs from the response it first gave.
+    // documented exceptions named at `SECRET_BEARING_WRITES`, whose stored bodies deliberately
+    // differ from the responses they first gave.
     let mut stored: Vec<(String, String)> = Vec::new();
     for (index, (label, path, body)) in writes.iter().enumerate() {
         let key = format!("k-replay-{index}");
         let (status, _, response) = h.post(path, &key, body).await;
+        let first_expected = if FIRST_RESPONSE_IS_OK.contains(label) {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        };
         assert_eq!(
-            status,
-            StatusCode::CREATED,
+            status, first_expected,
             "{label} at a LIVE environment: {response}"
         );
-        if *label == SECRET_BEARING_CREATE {
+        if SECRET_BEARING_WRITES.contains(label) {
             // The FIRST response carries the credential exactly once; the replay below must
             // not. Storing the first response here would make the "no token" assertion after
             // the delete compare against a body that had one, so the stored value is what the
@@ -2433,7 +2482,9 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
         // The SAME key and the same body: a genuine replay of a request that already
         // succeeded, which must still answer with what it answered the first time.
         let (status, _, response) = h.post(path, key, body).await;
-        let expected = if *label == SECRET_BEARING_CREATE {
+        // EVERY SECRET-BEARING WRITE REPLAYS 200, whatever its first response was: a replay
+        // returns the STORED answer rather than repeating the act.
+        let expected = if SECRET_BEARING_WRITES.contains(label) {
             StatusCode::OK
         } else {
             StatusCode::CREATED
@@ -2444,7 +2495,7 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
              soft-deleted and got {status} instead of the response it already gave; the \
              environment precondition has been hoisted above the replay: {response}"
         );
-        if *label == SECRET_BEARING_CREATE {
+        if SECRET_BEARING_WRITES.contains(label) {
             // THE ONE ROUTE WHOSE REPLAY IS DELIBERATELY NOT THE ORIGINAL RESPONSE, and the
             // exemption is pinned rather than merely skipped.
             //
@@ -2602,7 +2653,7 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 39;
+    const WRITES: usize = 40;
     const READS: usize = 18;
 
     let cases = replay_fixture_cases();

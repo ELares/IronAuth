@@ -1333,6 +1333,23 @@ pub enum Action {
     /// An inbound SCIM connection was REVOKED (issue #135). The row targets the `scim_`
     /// handle. The row is retained rather than deleted, so this action stays resolvable.
     ScimConnectionRevoked,
+    /// An inbound SCIM connection's token was ROTATED (issue #140). The row targets the `scim_`
+    /// handle, never a digest, and the detail carries the overlap window in seconds: what an
+    /// operator reading a provisioning trail needs is WHEN the superseded token stops working,
+    /// and that is the one fact neither token's own id can tell them.
+    ///
+    /// SEPARATE FROM `ScimConnectionCreated`, because a rotation is not a new connection: the
+    /// id, the organization, the provider and everything keyed on them survive it. Reporting a
+    /// rotation as a creation would tell a SIEM correlating provisioning credentials that a new
+    /// one appeared and the old one is still live, which is the opposite of what happened.
+    ScimConnectionTokenRotated,
+    /// ONE of a SCIM connection's tokens was revoked (issue #140), leaving its siblings alive.
+    /// The row targets the `scim_` handle, never a digest.
+    ///
+    /// SEPARATE FROM `ScimConnectionRevoked`, which kills the connection and everything it has.
+    /// A reader who could not tell them apart would read a leaked-token containment as the
+    /// connection being torn down, and go looking for provisioning that had in fact continued.
+    ScimConnectionTokenRevoked,
     /// The group bindings a revoked SCIM connection had pushed were TORN DOWN (issue #136,
     /// criterion 6). The row targets the `scim_` handle, in the same transaction as the revoke.
     ///
@@ -1912,6 +1929,8 @@ impl Action {
             Action::ApiKeyCreated => "api_key.created",
             Action::ScimConnectionCreated => "scim_connection.created",
             Action::ScimConnectionRevoked => "scim_connection.revoked",
+            Action::ScimConnectionTokenRotated => "scim_connection.token_rotated",
+            Action::ScimConnectionTokenRevoked => "scim_connection.token_revoked",
             Action::ScimConnectionBindingsRevoked => "scim_connection.bindings.revoke",
             Action::ScimPushConnectionCreated => "scim_push_connection.created",
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",

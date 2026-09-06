@@ -1666,6 +1666,19 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0204_portal_sessions.sql"),
         },
+        Migration {
+            version: 205,
+            name: "scim_connection_tokens",
+            // EXPAND. A new table plus a backfill of every existing digest. The column it moves
+            // the token out of STAYS, so an old binary keeps authenticating the ORIGINAL token
+            // and never learns that a rotation superseded it -- which means a rotation does not
+            // contain a leak until the rollout finishes. An earlier version of this line called
+            // that "merely does not know about one a rotation minted", which describes the
+            // dangerous behaviour as the harmless one. The column's removal is a contract-phase
+            // change for a later release, and it is what closes the window.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0205_scim_connection_tokens.sql"),
+        },
     ]
 }
 

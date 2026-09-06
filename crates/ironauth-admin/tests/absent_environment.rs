@@ -1535,6 +1535,15 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/organizations/{org}/scim-connections"),
             body: Some("{\"display_name\":\"absent\",\"provider\":\"okta\"}".to_owned()),
         },
+        // The rotation (issue #140). A WRITE that mints a credential, so an absent environment
+        // must refuse it before anything is minted -- and refuse it as the same uniform
+        // not-found, so a caller cannot learn from the response whether an environment exists.
+        Case {
+            label: "scim_connections.rotateScimConnectionToken",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/scim-connections/scim_absent/rotate"),
+            body: Some("{}".to_owned()),
+        },
         Case {
             label: "scim_connections.revokeScimConnection",
             method: "DELETE",

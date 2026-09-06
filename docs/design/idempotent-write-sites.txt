@@ -56,6 +56,7 @@ crates/ironauth-admin/src/locales.rs:resolve_scope:0
 crates/ironauth-admin/src/log_shipper.rs:observe:0
 crates/ironauth-admin/src/log_streams.rs:create_log_stream:0
 crates/ironauth-admin/src/log_streams.rs:replay_log_stream_dead_letters:0
+crates/ironauth-admin/src/log_streams.rs:require_stream_in_reach:0
 crates/ironauth-admin/src/memberships.rs:create_membership:1
 crates/ironauth-admin/src/memberships.rs:create_service_account_membership:1
 crates/ironauth-admin/src/messages.rs:resend_message:1
@@ -86,6 +87,8 @@ crates/ironauth-admin/src/recovery_approvals.rs:decide:2
 crates/ironauth-admin/src/recovery_approvals.rs:resolve_scope:0
 crates/ironauth-admin/src/routing_rules.rs:create_routing_rule:1
 crates/ironauth-admin/src/scim_connections.rs:create_scim_connection:1
+crates/ironauth-admin/src/scim_connections.rs:require_active_organization:0
+crates/ironauth-admin/src/scim_connections.rs:rotate_scim_connection_token:1
 crates/ironauth-admin/src/scim_push_connections.rs:create_scim_push_connection:1
 crates/ironauth-admin/src/secrets.rs:set_secret:2
 crates/ironauth-admin/src/service_account_keys.rs:create_service_account_api_key:1

@@ -262,6 +262,88 @@ async fn a_locale_write_is_sudo_gated() {
 ///
 /// One test for both handlers: the challenged half has to be measured against the SAME
 /// connection the elevated half then revokes, or "the refused mint stored nothing" and
+/// A SCIM token ROTATION is sudo-gated (issue #140).
+///
+/// ITS OWN TEST, because adding it to the mint-or-revoke case above pushed that past the crate's
+/// function-length lint, and because the subject differs: a rotation is the one act on this
+/// surface that MINTS a credential and DESTROYS one in the same request. An ungated rotation
+/// hands a stolen management credential a provisioning token and takes the customer's away.
+#[tokio::test]
+async fn a_scim_token_rotation_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+    let orgs = organizations_path(&tenant, &env);
+
+    let (status, _, elevated) = harness.post(&elevate, "e-seed", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate to seed: {elevated}");
+    let (status, _, created) = harness
+        .post(
+            &orgs,
+            "r-org",
+            &serde_json::json!({ "display_name": "Globex" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {created}");
+    let org = id_of(&created);
+    let base = format!("{orgs}/{org}/scim-connections");
+    let (status, _, seeded) = harness
+        .post(
+            &base,
+            "r-seed",
+            "{\"display_name\":\"seed\",\"provider\":\"okta\"}",
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed connection: {seeded}");
+    let seeded_id = id_of(&seeded);
+    let rotate = format!("{base}/{seeded_id}/rotate");
+
+    // LAPSED rather than never taken, so this measures a STALE elevation.
+    clock.advance(Duration::from_secs(601));
+
+    let (status, _, challenge) = harness.post(&rotate, "r-stale", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale SCIM token rotation is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the rotation challenge carries the RFC 9470 error: {challenge}"
+    );
+
+    // NOTHING LANDED, which the status alone cannot show: the assertions above pass just as well
+    // against a handler that answered 401 and rotated anyway, and a rotation that half-applied
+    // has SUPERSEDED the working token -- the customer's provisioning is down while the operator
+    // was told they were refused.
+    //
+    // WHAT THIS SEES is the connection inventory and its revocation flag. It cannot see
+    // `scim_connection_tokens`; the store suite owns token state. What it establishes here is
+    // that the refusal did not disturb the connection.
+    let (status, _, listed) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "reads are unaffected: {listed}");
+    assert_eq!(
+        item_count(&listed),
+        1,
+        "the refused rotation changed the inventory: {listed}"
+    );
+    assert!(
+        !listed.contains("revoked_at_unix_ms"),
+        "the refused rotation revoked the connection: {listed}"
+    );
+
+    // AND IT SUCCEEDS ONCE ELEVATED, so the challenge is the sudo gate rather than the route
+    // being unreachable.
+    let (status, _, elevated) = harness.post(&elevate, "r1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, rotated) = harness.post(&rotate, "r-fresh", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated SCIM token rotation succeeds: {rotated}"
+    );
+}
+
 /// "the refused revoke changed nothing" are two claims about two different fixtures.
 #[tokio::test]
 async fn a_scim_connection_mint_or_revoke_is_sudo_gated() {
@@ -326,8 +408,15 @@ async fn a_scim_connection_mint_or_revoke_is_sudo_gated() {
     );
 
     // Nothing landed: still exactly the seeded connection, still unrevoked. Without this
-    // the two assertions above would also pass against a handler that answered 401 and
+    // the assertions above would also pass against a handler that answered 401 and
     // then wrote anyway.
+    //
+    // WHAT IT COVERS AND WHAT IT DOES NOT, stated because a reader should not over-read it: it
+    // sees the connection INVENTORY and the revocation flag, so a refused mint that created a
+    // row and a refused revoke that revoked one both fail here. It cannot see
+    // `scim_connection_tokens`, so a refused ROTATION that superseded the working token anyway
+    // would slip past. The store suite's rotation tests own token state; what this file owns is
+    // that each of the three routes is challenged and that the elevated call then succeeds.
     let (status, _, listed) = harness.get(&base).await;
     assert_eq!(status, StatusCode::OK, "reads are unaffected: {listed}");
     assert_eq!(item_count(&listed), 1, "the refused mint landed: {listed}");

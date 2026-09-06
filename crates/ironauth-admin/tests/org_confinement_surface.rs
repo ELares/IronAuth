@@ -99,7 +99,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 57;
+const ORG_ADDRESSED_OPERATIONS: usize = 58;
 
 /// Operations that name their organization in the REQUEST BODY rather than the path.
 ///

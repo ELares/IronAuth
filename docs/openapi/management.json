@@ -17933,6 +17933,149 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate": {
+      "post": {
+        "tags": [
+          "scim"
+        ],
+        "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate`",
+        "operationId": "rotateScimConnectionToken",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replaying a POST under one key returns the stored answer, which omits the token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connection_id",
+            "in": "path",
+            "description": "The scim_ handle",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateScimTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Rotated; the new token appears here and nowhere else",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScimTokenRotated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An out-of-range overlap, or a missing Idempotency-Key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid management credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The credential may not write credentials for this organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such live connection in this organization; a revoked or expired one answers the same",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request is already rotating under this Idempotency-Key; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency-Key reused with a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections": {
       "get": {
         "tags": [
@@ -34724,6 +34867,20 @@
           }
         }
       },
+      "RotateScimTokenRequest": {
+        "type": "object",
+        "description": "A rotation request.",
+        "properties": {
+          "overlap_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long the superseded token keeps working, in seconds. Defaults to 24 hours; 7 days is\nthe maximum."
+          }
+        }
+      },
       "RoutingRuleListView": {
         "type": "object",
         "description": "A page of routing rules.",
@@ -35140,6 +35297,39 @@
           "subject_id": {
             "type": "string",
             "description": "IronAuth's own id for the subject."
+          }
+        }
+      },
+      "ScimTokenRotated": {
+        "type": "object",
+        "description": "The 200 of a rotation: the ONLY response that carries the new token.",
+        "required": [
+          "id",
+          "token_already_issued"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The `scim_` handle, unchanged. A rotation is not a new connection: everything keyed on\nthis id survives it."
+          },
+          "previous_token_expires_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the superseded token stops working, in milliseconds since the epoch.\n\nREAD BACK FROM THE WRITE, not computed here: the rotation applies\n`LEAST(existing, now + overlap)`, so a token that already lapsed sooner keeps its own\nhorizon and the requested overlap is an upper bound rather than the answer.\n\nAbsent if the rotation superseded no token that has a horizon at all."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The new bearer token. RETURNED ONCE, like the create's: the store keeps only a digest.\n\nOPTIONAL AND OMITTED ON A REPLAY, rather than an empty string. The create's field is\nshaped this way and the first version of this one was not: a replay body carrying\n`\"token\": \"\"` publishes a field that LOOKS like a credential of length zero, and a client\nchecking `if (body.token)` and one checking `if (\"token\" in body)` disagree about it.\nAbsent means absent."
+          },
+          "token_already_issued": {
+            "type": "boolean",
+            "description": "Whether the token was already issued on an earlier identical request.\n\nA replay cannot return the token -- nothing stores it -- so it says so rather than\nreturning a body that looks like a rotation with a missing field. Same shape, and same\nreason, as the create's."
           }
         }
       },

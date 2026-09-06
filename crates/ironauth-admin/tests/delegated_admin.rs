@@ -1228,6 +1228,107 @@ async fn a_confined_credential_cannot_mint_a_portal_link_for_a_sibling_organizat
     );
 }
 
+/// Rotating a SCIM token requires `write_credentials`, and the refusal names it.
+///
+/// # Why it is not a config write
+///
+/// A rotation MINTS a provisioning credential -- the same authority the create grants, over an
+/// organization's entire user population. Classifying it as a config write would let the weaker
+/// grant hand itself a token that writes every user and group in the organization, which is the
+/// escalation `management_permissions.rs` records but cannot catch: that file asserts SOME
+/// permission is demanded and separately RECORDS which one was intended, and nothing there
+/// compares the two. Naming the specific permission is what this file is for.
+#[tokio::test]
+async fn rotating_a_scim_token_requires_write_credentials() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "rt-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "rt-mint").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "rt-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let base = format!("{orgs}/{org}/scim-connections");
+    let (status, _, body) = h
+        .post(
+            &base,
+            "rt-seed",
+            &serde_json::json!({ "display_name": "seed", "provider": "okta" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed connection: {body}");
+    let connection = serde_json::from_str::<Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let rotate = format!("{base}/{connection}/rotate");
+
+    // `write_config` IS NOT ENOUGH, which is the pin. A handler demanding the lesser grant would
+    // answer 200 here, and one demanding a different write would name that one instead.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&rotate, &secret, "rt-denied", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a write_config credential rotated a SCIM token, which mints a credential that writes \
+         the organization's entire user population: {body}"
+    );
+    assert!(
+        body.contains("management.write_credentials"),
+        "the refusal does not name write_credentials, so the handler may be demanding a \
+         different permission than the classification records: {body}"
+    );
+
+    // AND THE READ IT HOLDS STILL WORKS, so the refusal is a narrowing rather than the
+    // credential being locked out of the surface entirely.
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the credential was refused the listing it holds: {body}"
+    );
+
+    // AND `write_credentials` SUCCEEDS, so the pin is not satisfied by a handler that refuses
+    // everybody.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_credentials"],
+    )
+    .await;
+    let (status, _, body) = h.post_as(&rotate, &secret, "rt-allowed", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a write_credentials credential was refused the rotation: {body}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&body).expect("json")["token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "the rotation returned no token, so nothing was actually minted: {body}"
+    );
+}
+
 /// A read-only credential may LIST SCIM connections and may not mint or revoke one.
 ///
 /// The same argument as the api-keys test below, on the surface that mints the strongest

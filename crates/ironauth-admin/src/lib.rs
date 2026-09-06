@@ -602,6 +602,13 @@ pub fn management_router(state: AdminState) -> Router {
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}",
             delete(scim_connections::revoke_scim_connection),
         )
+        // ROTATION WITH AN OVERLAP (issue #140). Its own path segment rather than a PATCH on the
+        // connection: it mints a credential and returns it once, which is a different act from
+        // amending a row and deserves a route a reader can tell apart from one.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections/{connection_id}/rotate",
+            post(scim_connections::rotate_scim_connection_token),
+        )
         // AND THE OUTBOUND MIRROR (issue #137). Where the routes above mint a credential that
         // lets somebody write INTO an organization, these point IronAuth at somebody else's SCIM
         // server. Nothing here returns a secret: the connection NAMES an environment secret, so

@@ -116,6 +116,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "revokeOrganizationApiKey",
     "revokeScimConnection",
     "rotateOrganizationApiKey",
+    "rotateScimConnectionToken",
     "setAgentState",
     "setScimPushConnectionActive",
     "setOrgDefaultRole",
@@ -218,6 +219,10 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "revokeScimConnection",
+        include_str!("../src/scim_connections.rs"),
+    ),
+    (
+        "rotateScimConnectionToken",
         include_str!("../src/scim_connections.rs"),
     ),
     (

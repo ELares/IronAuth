@@ -2854,6 +2854,39 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // A SCIM connection's TOKEN was rotated (issue #140). The connection's id does not
+        // change, which is the whole point of the feature and also why this event has to exist:
+        // a rotation is invisible on every other signal a consumer has, so one watching
+        // provisioning credentials would see nothing at all.
+        //
+        // THE OVERLAP THE OPERATOR ASKED FOR, and NOT the resulting expiry, which is the field
+        // this entry first carried and could not honestly populate. The producer builds its
+        // envelope BEFORE the write, and the write applies `LEAST(existing, now + overlap)`: a
+        // token that already lapsed sooner keeps its own horizon, so the computed figure was
+        // simply wrong in exactly the case that clause exists for. A field nothing can populate
+        // is worse than no field, which is the rule `recovery.decided` states for its own
+        // omission.
+        //
+        // A receiver that needs the precise instant reads it from the rotation's 200, which is
+        // the one place it is known; what this event carries is what the operator DID.
+        //
+        // NO TOKEN AND NO DIGEST, for the reason `scim_connection.created` gives: the digest
+        // verifies exactly as well as the token does, so putting it on the wire that announces
+        // a new credential exists would BE the leak.
+        "scim_connection.token_rotated",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "scim_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "overlap_seconds": {"type": "integer"}
+            },
+            "required": ["scim_connection_id", "organization_id", "overlap_seconds"]
+        }"#,
+    ),
+    (
         // Emitted at most ONCE per connection. Revocation is idempotent -- a retried revoke
         // changes nothing and audits nothing -- and the event inherits that, so a receiver
         // counting revocations never sees two because a client retried.

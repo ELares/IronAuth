@@ -1217,3 +1217,787 @@ async fn a_cross_scope_bind_is_refused_by_the_guard_before_any_write() {
         .await
         .expect("all three in scope");
 }
+
+/// Rotate a connection's token, superseding the live ones after `overlap_secs`.
+async fn rotate(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    id: &ScimConnectionId,
+    new_token: &str,
+    overlap_secs: i64,
+    at_micros: i64,
+) -> Result<Option<i64>, ironauth_store::StoreError> {
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .scim_connections()
+        .rotate_token(env, id, &digest(new_token), overlap_secs, at_micros)
+        .await
+}
+
+#[tokio::test]
+async fn both_tokens_authenticate_during_the_overlap_and_the_old_one_then_fails_closed() {
+    // ISSUE #140, ACCEPTANCE CRITERION 5, VERBATIM: "SCIM token rotation provides an overlap
+    // window during which both tokens authenticate, then the old token fails closed".
+    //
+    // The window exists because the token lives in an identity provider's configuration that a
+    // human edits by hand. Killing the old one at the moment the new one is minted takes
+    // provisioning down from the mint until the paste, on a schedule nobody controls.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "old-token").await;
+
+    let at = now_micros(&env);
+    let overlap = 3600_i64;
+    rotate(&db, &env, scope, &connection, "new-token", overlap, at)
+        .await
+        .expect("rotate");
+
+    // DURING THE WINDOW, BOTH WORK, and both resolve to the SAME connection: a rotation that
+    // produced a second connection would satisfy "both authenticate" and strand everything keyed
+    // on the first one, which is the shape this table exists to replace.
+    let read = db.store().scoped(scope);
+    let old = read
+        .scim_connections()
+        .authenticate(&digest("old-token"), at + 1_000_000)
+        .await
+        .expect("read")
+        .expect("the superseded token still authenticates inside the window");
+    let new = read
+        .scim_connections()
+        .authenticate(&digest("new-token"), at + 1_000_000)
+        .await
+        .expect("read")
+        .expect("the new token authenticates");
+    assert_eq!(old.id, connection);
+    assert_eq!(new.id, connection);
+    assert_eq!(old.organization_id, new.organization_id);
+
+    // AND AFTER IT, THE OLD ONE FAILS CLOSED while the new one keeps working. Asserting only the
+    // first half would pass against a rotation that killed both.
+    let after = at + overlap * 1_000_000 + 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("old-token"), after)
+            .await
+            .expect("read")
+            .is_none(),
+        "the superseded token still authenticates after the overlap window"
+    );
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("new-token"), after)
+            .await
+            .expect("read")
+            .is_some(),
+        "the rotation expired the token it had just minted, so provisioning stops entirely"
+    );
+}
+
+#[tokio::test]
+async fn a_second_rotation_inside_the_window_supersedes_every_live_token() {
+    // THE PLURAL IN "every other live token". An admin who rotates twice in an afternoon would
+    // otherwise leave the FIRST token live with nothing to supersede it, because the second
+    // rotation would only look at the token it replaced. The statement supersedes by
+    // CONNECTION, which is also why a caller is never asked to name a digest it has no reason
+    // to know.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "token-1").await;
+
+    // A LONG FIRST WINDOW AND A SHORT SECOND ONE, and the ORDER is the whole test.
+    //
+    // `LEAST` means superseding a token that ALREADY has a horizon can only move it EARLIER. So
+    // a fixture whose SECOND window is the longer one cannot distinguish the real statement from
+    // one narrowed to "tokens with no horizon yet": `LEAST` keeps the first rotation's horizon
+    // either way. A previous version of this test had exactly that shape, and a mutation run
+    // confirmed it passed against the implementation it is named to refuse.
+    //
+    // Long then short separates them. The real statement pulls token-1 in from `at+7200s` to
+    // `at+1s+600s`; the narrowed one leaves it out at `at+7200s`.
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &connection, "token-2", 7200, at)
+        .await
+        .expect("first rotation");
+    rotate(
+        &db,
+        &env,
+        scope,
+        &connection,
+        "token-3",
+        600,
+        at + 1_000_000,
+    )
+    .await
+    .expect("second rotation");
+
+    let read = db.store().scoped(scope);
+    // PAST THE SECOND ROTATION'S SHORT WINDOW, and far inside the first's long one.
+    let after = at + 602 * 1_000_000;
+    // TOKEN-1 IS DEAD, and this is the assertion the narrowed implementation fails. It carried
+    // the FIRST rotation's `at+7200s`; only a supersede that reached a token which ALREADY had a
+    // horizon can have pulled it in to the second rotation's `at+1s+600s`.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("token-1"), after)
+            .await
+            .expect("read")
+            .is_none(),
+        "token-1 still authenticates past the SECOND rotation's window, so that rotation \
+         superseded only tokens with no horizon yet and left an older credential alive for the \
+         first rotation's much longer window"
+    );
+    // TOKEN-2 IS DEAD TOO: it had no horizon when the second rotation ran, so both the real and
+    // the narrowed statement reach it. It keeps the pair honest rather than discriminating.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("token-2"), after)
+            .await
+            .expect("read")
+            .is_none(),
+        "token-2 still authenticates past the window the second rotation gave it"
+    );
+    // AND THE NEWEST IS ALIVE, so the two assertions above are not satisfied by everything dying
+    // at once.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("token-3"), after)
+            .await
+            .expect("read")
+            .is_some(),
+        "the newest token does not authenticate"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_token_stops_authenticating_while_its_siblings_keep_working() {
+    // `scim_connection_tokens.revoked_at` HAS A WRITER NOW, and this is what it is for: a LEAK,
+    // where the overlap is the problem rather than the point. Without a writer the column, its
+    // one-way policy, its grant and `authenticate`'s `t.revoked_at IS NULL` conjunct were all
+    // unreachable -- four pieces of machinery nothing could exercise, and deleting any of them
+    // left the suite green.
+    //
+    // PER TOKEN, not per connection: revoking the connection kills everything, which is the
+    // blunt instrument. This kills one leaked credential and leaves provisioning up on the
+    // others, which is the whole reason tokens are rows.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "leaked-token").await;
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &connection, "good-token", 3600, at)
+        .await
+        .expect("rotate");
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke_token(&env, &connection, &digest("leaked-token"), at + 1_000_000)
+        .await
+        .expect("revoke the leaked token");
+
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("leaked-token"), at + 2_000_000)
+            .await
+            .expect("read")
+            .is_none(),
+        "a revoked token still authenticates inside its overlap window"
+    );
+    // AND THE SIBLING IS UNTOUCHED, so revoking one token is not a way to take provisioning
+    // down: that is what revoking the CONNECTION is for, and the two must stay distinguishable.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("good-token"), at + 2_000_000)
+            .await
+            .expect("read")
+            .is_some(),
+        "revoking one token killed its sibling"
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_never_extends_a_token_that_was_already_expiring() {
+    // THIS TEST DOES NOT MEASURE `LEAST`, and its name overpromises. It gives the CONNECTION an
+    // expiry, which `authenticate` checks independently of the token's, so the connection's
+    // horizon kills the token first and every assertion here passes with `LEAST` deleted
+    // entirely. What it DOES pin is that a connection-level expiry is honoured through a
+    // rotation, which is worth having and is all it can claim.
+    //
+    // `LEAST` ITSELF IS MEASURED BY `a_second_rotation_does_not_push_out_the_first_rotations_horizon`,
+    // which builds the only state that distinguishes it: a TOKEN lapsing sooner than the
+    // requested window while its CONNECTION does not. That needs two rotations, and this fixture
+    // cannot produce it.
+    // `LEAST`, AND WHY. A bare assignment would push a token that was already lapsing OUT to the
+    // end of the new window, so rotating would be a way to KEEP an old credential alive -- the
+    // opposite of what a rotation is for, and reachable by anybody who can rotate.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    let at = now_micros(&env);
+    // A connection whose token expires in sixty seconds.
+    let id = ScimConnectionId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &id,
+                organization_id: &organization,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest("expiring-token"),
+                expires_at_unix_micros: Some(at + 60_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("create the connection");
+
+    // Rotate with a window an hour long, far beyond the token's own sixty seconds.
+    rotate(&db, &env, scope, &id, "fresh-token", 3600, at)
+        .await
+        .expect("rotate");
+
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("expiring-token"), at + 61_000_000)
+            .await
+            .expect("read")
+            .is_none(),
+        "the rotation EXTENDED a token that was already expiring, so rotating is a way to keep \
+         an old credential alive"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_connection_cannot_be_revived_by_rotating_it() {
+    // AN UN-REVOCATION THROUGH A DIFFERENT DOOR. `scim_connections` carries a RESTRICTIVE policy
+    // making revocation one way, and it guards that table's `revoked_at` column. Minting a fresh
+    // token row for a revoked connection would walk around it entirely -- the connection stays
+    // revoked and a working credential exists for it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "doomed-token").await;
+
+    let at = now_micros(&env);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &connection, at)
+        .await
+        .expect("revoke the connection");
+
+    let refused = rotate(
+        &db,
+        &env,
+        scope,
+        &connection,
+        "revival-token",
+        600,
+        at + 1_000_000,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ironauth_store::StoreError::NotFound)),
+        "a revoked connection was rotated back into service: {refused:?}"
+    );
+    // THE ROW ITSELF, counted directly, and the first version of this test could not do it. It
+    // asserted that the revival token does not AUTHENTICATE -- which is true whether or not the
+    // rotation inserted it, because `authenticate` independently refuses a revoked connection.
+    // Deleting the pre-check from `rotate_token_with_event` therefore left the assertion green
+    // while the un-revocation-through-another-door it names actually happened.
+    //
+    // What distinguishes them is whether the ROW exists, so that is what this reads.
+    let rows: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM scim_connection_tokens WHERE token_digest = $1")
+            .bind(digest("revival-token"))
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("count the revival token");
+    assert_eq!(
+        rows.0, 0,
+        "the refused rotation inserted a token row for a REVOKED connection, which is the \
+         un-revocation the one-way policy on `scim_connections` exists to prevent, reached by \
+         writing a different table"
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_connection_kills_every_token_it_has() {
+    // THE CONNECTION-LEVEL CHECK IN `authenticate`, which the token-level one cannot replace. A
+    // token minted by a rotation has no horizon of its own, so if only the token's own liveness
+    // were consulted, revoking the connection would leave the newest token working.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "first-token").await;
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &connection, "second-token", 3600, at)
+        .await
+        .expect("rotate");
+    // BOTH WORK FIRST, so the refusals below are the revocation rather than the rotation having
+    // gone wrong.
+    let read = db.store().scoped(scope);
+    for token in ["first-token", "second-token"] {
+        assert!(
+            read.scim_connections()
+                .authenticate(&digest(token), at + 1_000_000)
+                .await
+                .expect("read")
+                .is_some()
+        );
+    }
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &connection, at + 2_000_000)
+        .await
+        .expect("revoke");
+
+    for token in ["first-token", "second-token"] {
+        assert!(
+            read.scim_connections()
+                .authenticate(&digest(token), at + 3_000_000)
+                .await
+                .expect("read")
+                .is_none(),
+            "{token} still authenticates after its connection was revoked"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_rotation_does_not_push_out_the_first_rotations_horizon() {
+    // `LEAST`, MEASURED ON THE TOKEN'S OWN HORIZON. The connection here never expires, so
+    // nothing but the supersede statement can kill a token, and the first rotation's short
+    // window is the value a bare assignment would overwrite.
+    //
+    // Deleting `LEAST(COALESCE(expires_at,'infinity'), ...)` from the supersede makes this fail:
+    // token-1 would be pushed from at+60s out to at+3600s, so a rotation would EXTEND a
+    // credential the operator had already decided to replace -- reachable by anybody who can
+    // rotate, and the exact inversion of what rotating is for.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "token-a").await;
+
+    let at = now_micros(&env);
+    // SIXTY SECONDS: token-a is superseded with a short horizon.
+    rotate(&db, &env, scope, &connection, "token-b", 60, at)
+        .await
+        .expect("first rotation");
+    // AN HOUR: a bare assignment would move token-a's horizon from at+60s to at+3600s.
+    rotate(
+        &db,
+        &env,
+        scope,
+        &connection,
+        "token-c",
+        3600,
+        at + 1_000_000,
+    )
+    .await
+    .expect("second rotation");
+
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("token-a"), at + 61_000_000)
+            .await
+            .expect("read")
+            .is_none(),
+        "the second rotation EXTENDED the first rotation's superseded token, so rotating is a \
+         way to keep an old credential alive"
+    );
+    // AND token-b KEEPS the horizon the second rotation gave it, so the assertion above is
+    // about `LEAST` rather than about everything dying at once.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("token-b"), at + 61_000_000)
+            .await
+            .expect("read")
+            .is_some(),
+        "the token superseded by the SECOND rotation died at the first rotation's horizon"
+    );
+}
+
+#[tokio::test]
+async fn the_rotation_reports_the_horizon_it_actually_wrote() {
+    // THE 200 IS READ BACK FROM THE WRITE. It used to be the handler's own arithmetic,
+    // `now + overlap`, which is wrong exactly when `LEAST` does its job: a token already lapsing
+    // sooner keeps its horizon, and the response claimed a later one. A consumer scheduling a
+    // reminder from that number would fire it after provisioning had already broken.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "token-p").await;
+
+    let at = now_micros(&env);
+    // THE ONLY SHAPE THAT DISTINGUISHES READ-BACK FROM ARITHMETIC. The supersede runs BEFORE the
+    // mint, so a token minted by a previous rotation always has `expires_at IS NULL` and always
+    // receives exactly `now + overlap` -- which means any fixture built only from rotations
+    // reports the arithmetic and cannot tell the two implementations apart. The first version of
+    // this test was exactly that, and asserted `now + overlap` under a name claiming otherwise.
+    //
+    // A connection created WITH an expiry gives its token a horizon that `LEAST` keeps, so the
+    // reported value is below `now + overlap` and only a read-back can produce it.
+    let short = ScimConnectionId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &short,
+                organization_id: &organization,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest("short-token"),
+                expires_at_unix_micros: Some(at + 60_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("create a connection whose token lapses in a minute");
+
+    let reported = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .rotate_token(&env, &short, &digest("long-token"), 3600, at + 1_000_000)
+        .await
+        .expect("rotate with an hour-long window")
+        .expect("a horizon was written");
+
+    assert_eq!(
+        reported,
+        at + 60_000_000,
+        "the reported horizon is `now + overlap` rather than what LEAST wrote, so the response \
+         and the event promise a customer an hour of overlap they do not have"
+    );
+    // AND IT IS NOT `now + overlap`, stated separately so the failure names the defect rather
+    // than a mismatched integer.
+    assert_ne!(
+        reported,
+        at + 1_000_000 + 3600 * 1_000_000,
+        "the reported horizon is exactly the handler arithmetic this read-back replaced"
+    );
+    let _ = &connection;
+}
+
+#[tokio::test]
+async fn a_connection_written_by_an_old_binary_still_authenticates() {
+    // THE ROLLING-UPGRADE HOLE THE FALLBACK CLOSES. An old binary creating a connection writes
+    // only `scim_connections.token_digest`; it has never heard of `scim_connection_tokens`. A
+    // read that consulted the new table alone would refuse that connection's token FOREVER,
+    // because nothing backfills a row created after the migration ran, and the customer's
+    // provisioning would never work with no visible cause.
+    //
+    // Simulated by deleting the token row the new create writes, which is exactly the state an
+    // old binary leaves behind.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "legacy-token").await;
+
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(connection.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("legacy-token"), at)
+            .await
+            .expect("read")
+            .is_some(),
+        "a connection created by an un-upgraded binary cannot authenticate at all, so its \
+         customer's provisioning is permanently broken by the migration"
+    );
+}
+
+#[tokio::test]
+async fn the_old_column_stops_answering_once_the_connection_has_token_rows() {
+    // THE GUARD ON THE FALLBACK, which is the half that keeps it from being a hole. Once a
+    // rotation has happened the connection HAS token rows, so `scim_connections.token_digest` --
+    // which still holds the ORIGINAL digest and which no rotation rewrites -- must stop being
+    // consulted. Without the `NOT EXISTS`, the first token would authenticate forever on new
+    // binaries, which is strictly worse than the un-upgraded-replica window 0205 documents.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "original-token").await;
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &connection, "replacement-token", 60, at)
+        .await
+        .expect("rotate");
+
+    let read = db.store().scoped(scope);
+    // Past the overlap: the original token is dead in the token table, and the old column still
+    // holds its digest.
+    let after = at + 61 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("original-token"), after)
+            .await
+            .expect("read")
+            .is_none(),
+        "the superseded token authenticated through the legacy column, so a rotation never \
+         expires anything on an upgraded binary either"
+    );
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("replacement-token"), after)
+            .await
+            .expect("read")
+            .is_some(),
+        "the replacement token does not authenticate"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_connection_cannot_be_rotated() {
+    // THE PRE-CHECK'S EXPIRY HALF, which nothing drove. `authenticate` refuses a connection past
+    // its own `expires_at`, so rotating one hands back a token that can never work -- and spends
+    // the operator's belief that they have just fixed provisioning. Worse, the rotation also
+    // supersedes whatever was there, so the state after is strictly worse than before.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    let at = now_micros(&env);
+    let id = ScimConnectionId::generate(&env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &id,
+                organization_id: &organization,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest("short-lived"),
+                expires_at_unix_micros: Some(at + 60_000_000),
+            },
+            None,
+        )
+        .await
+        .expect("create the connection");
+
+    // IT ROTATES WHILE LIVE, so the refusal below is the expiry rather than the connection
+    // being unrotatable for some other reason.
+    assert!(
+        rotate(&db, &env, scope, &id, "in-time", 60, at + 1_000_000)
+            .await
+            .is_ok()
+    );
+
+    let refused = rotate(&db, &env, scope, &id, "too-late", 60, at + 61_000_000).await;
+    assert!(
+        matches!(refused, Err(ironauth_store::StoreError::NotFound)),
+        "an EXPIRED connection was rotated, handing back a token that can never authenticate \
+         while superseding whatever was still there: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn rotating_a_legacy_connection_still_gives_the_old_token_its_overlap() {
+    // THE ZERO-OVERLAP DEFECT THE `NOT EXISTS` FALLBACK CREATED. That guard answers only while a
+    // connection has NO token rows, so the moment a rotation minted the first one the legacy
+    // digest stopped being consulted -- and the old token died at the INSTANT of the rotation
+    // rather than at the end of the window. On exactly the population the fallback exists for,
+    // with the customer's identity provider still configured with the token that just stopped
+    // working: the outage the overlap exists to prevent, caused by the fix for a different one.
+    //
+    // The rotation now ADOPTS the legacy digest as a real row first, so the supersede gives it
+    // the same horizon every other superseded token gets.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &organization, "legacy-live").await;
+
+    // The state an old binary leaves: the connection row only.
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(connection.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &connection, "fresh-after-legacy", 600, at)
+        .await
+        .expect("rotate a legacy connection");
+
+    let read = db.store().scoped(scope);
+    // INSIDE THE WINDOW BOTH WORK, which is the whole point of an overlap and what the defect
+    // removed entirely for this population.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("legacy-live"), at + 1_000_000)
+            .await
+            .expect("read")
+            .is_some(),
+        "the legacy token died at the instant of the rotation, so the customer's provisioning \
+         broke the moment an operator rotated and stayed broken until somebody re-pasted"
+    );
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("fresh-after-legacy"), at + 1_000_000)
+            .await
+            .expect("read")
+            .is_some(),
+        "the new token does not authenticate"
+    );
+
+    // AND AFTER THE WINDOW THE LEGACY ONE FAILS CLOSED, so adoption preserved the overlap
+    // without making the old digest immortal.
+    let after = at + 601 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("legacy-live"), after)
+            .await
+            .expect("read")
+            .is_none(),
+        "the adopted legacy token never expires, so a rotation cannot retire it at all"
+    );
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("fresh-after-legacy"), after)
+            .await
+            .expect("read")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn the_token_tables_grants_and_one_way_policy_are_enforced() {
+    // THE NEW CREDENTIAL TABLE'S GUARDS, PINNED. `scim_connections` has all three of these
+    // driven; migration 0205 makes the identical three claims for `scim_connection_tokens` and
+    // the change that added it pinned none of them. A grant nothing drives is a grant somebody
+    // widens without noticing, and this table now holds the verifier.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &org, "grant-probe").await;
+
+    // THE CONTROL ROLE MAY NOT RE-POINT A TOKEN OR SWAP ITS VERIFIER. Both are the escalation
+    // 0183 records for the table this one copies: a token moved to another connection is a
+    // credential for an organization nobody granted, and a swapped digest is a known credential
+    // installed by the role that mints them.
+    for (column, value) in [
+        ("connection_id", "'scim_somewhere_else'"),
+        ("token_digest", &format!("'{}'", "0".repeat(64))[..]),
+    ] {
+        let outcome = as_control(
+            &db,
+            scope,
+            &format!(
+                "UPDATE scim_connection_tokens SET {column} = {value} \
+                 WHERE connection_id = '{id}'"
+            ),
+        )
+        .await;
+        let error = outcome.expect_err(&format!("{column} must not be updatable"));
+        assert!(
+            error.to_string().contains("permission denied"),
+            "{column} is refused by the column grant, not by something else: {error}"
+        );
+    }
+
+    // SUPERSEDING IS PERMITTED, so the refusals above are the narrowing rather than a role that
+    // can do nothing to this table.
+    let affected = as_control(
+        &db,
+        scope,
+        &format!(
+            "UPDATE scim_connection_tokens SET expires_at = now() + interval '1 hour' \
+             WHERE connection_id = '{id}'"
+        ),
+    )
+    .await
+    .expect("superseding is a permitted update");
+    assert_eq!(affected, 1);
+
+    // REVOCATION IS ONE WAY. `USING (revoked_at IS NULL)` is what carries it: an already-revoked
+    // row is invisible to an UPDATE and cannot be cleared. The WITH CHECK does NOT carry it --
+    // `SET revoked_at = NULL, expires_at = ...` satisfies it -- which is why this drives the
+    // USING half specifically.
+    let revoked = as_control(
+        &db,
+        scope,
+        &format!(
+            "UPDATE scim_connection_tokens SET revoked_at = now() WHERE connection_id = '{id}'"
+        ),
+    )
+    .await
+    .expect("revocation is permitted");
+    assert_eq!(revoked, 1);
+    let un_revoked = as_control(
+        &db,
+        scope,
+        &format!(
+            "UPDATE scim_connection_tokens SET revoked_at = NULL, expires_at = now() \
+             WHERE connection_id = '{id}'"
+        ),
+    )
+    .await
+    .expect("an un-revocation is refused by the policy rather than erroring");
+    assert_eq!(
+        un_revoked, 0,
+        "a revoked token was un-revoked, so the one-way policy admits the row it must hide"
+    );
+
+    // AND THE DATA PLANE MAY NOT WRITE AT ALL. A provisioning credential that could mint another
+    // would be a privilege escalation with no operator in the loop.
+    for statement in [
+        "INSERT INTO scim_connection_tokens (token_digest, connection_id, tenant_id, \
+         environment_id) VALUES (repeat('a', 64), 'scim_x', 'ten_x', 'env_x')",
+        "UPDATE scim_connection_tokens SET revoked_at = now()",
+        "DELETE FROM scim_connection_tokens",
+    ] {
+        let outcome = as_app(&db, scope, statement).await;
+        let error = outcome.expect_err("the data plane must not write to this table");
+        assert!(
+            error.to_string().contains("permission denied"),
+            "the app role is refused by the grant rather than by something else: {error}"
+        );
+    }
+}
