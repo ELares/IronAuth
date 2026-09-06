@@ -75280,19 +75280,26 @@ pub struct ScimConnection {
     /// `scim_connections.token_digest` and provisions perfectly. Counting rows reported it as
     /// broken. It has one usable credential, and that is what this says.
     pub live_token_count: i64,
-    /// When the SOONEST live token of this connection lapses, if any of them has a horizon.
+    /// When this connection stops provisioning, if anything about it has a deadline.
     ///
-    /// # Why the soonest, and why it is not the connection's own expiry
+    /// # The soonest of TWO deadlines, either of which ends provisioning
     ///
-    /// The connection's `expires_at` bounds every token it has. This is a different question:
-    /// after a rotation a connection holds two tokens, the superseded one lapsing at the end of
-    /// the overlap and the fresh one usually with no horizon at all. What an operator needs
-    /// warning about is the moment provisioning could STOP, and that is when the earliest token
-    /// a customer might still be presenting dies.
+    /// The connection's own `expires_at` and the horizons of its live tokens. Both are read
+    /// because `authenticate` reads both, and an operator needs whichever arrives first: after a
+    /// rotation a connection holds the superseded token lapsing at the end of the overlap and a
+    /// fresh one usually with no horizon at all, so token horizons alone say nothing about a
+    /// connection three days from its own expiry.
     ///
     /// SOONEST rather than latest, because a warning has to fire before the first thing that can
-    /// break, not after the last. `None` means nothing has a horizon at all, which is the
-    /// ordinary state of a connection nobody gave an expiry.
+    /// break, not after the last. `None` means neither the connection nor any live token has a
+    /// future deadline, which is the ordinary state of a connection nobody gave an expiry.
+    ///
+    /// THE TWO DEADLINES ARE NOT INTERCHANGEABLE TO WHOEVER ACTS ON THEM. A token horizon is
+    /// cleared by rotating; the connection's own expiry is not, because nothing in this store
+    /// updates `scim_connections.expires_at` -- `revoke` is the only writer of that row -- so a
+    /// connection warning on its own expiry has to be replaced. The field publishing one number
+    /// for both is deliberate (the operator wants the earliest date provisioning stops), and it
+    /// is why the API-side documentation of this value says which remedy applies.
     ///
     /// # The CONNECTION's own expiry is folded in, and leaving it out was silent
     ///
@@ -75320,7 +75327,7 @@ pub struct ScimConnection {
     ///
     /// A lapsed token is not a HORIZON, it is a token that is gone. That it has gone is reported
     /// by `live_token_count` above.
-    pub soonest_token_expiry_unix_micros: Option<i64>,
+    pub provisioning_stops_at_unix_micros: Option<i64>,
     /// Creation time, which is the listing's sort key and therefore its cursor position.
     pub created_at_unix_micros: i64,
 }
@@ -78747,7 +78754,7 @@ impl ScimConnectionRepo<'_> {
             // question the LISTING answers, and computing it here would add a second read to
             // the hot path of every provisioning request to produce something no caller of
             // `authenticate` looks at.
-            soonest_token_expiry_unix_micros: None,
+            provisioning_stops_at_unix_micros: None,
             created_at_unix_micros: row.get("created_us"),
         }))
     }
@@ -78834,7 +78841,7 @@ impl ScimConnectionRepo<'_> {
                            AND t.revoked_at IS NULL \
                            AND t.expires_at > TIMESTAMPTZ 'epoch' \
                                               + ($7::bigint * INTERVAL '1 microsecond')))) \
-                     * 1000000)::bigint AS soonest_token_us, \
+                     * 1000000)::bigint AS provisioning_stops_us, \
                     (SELECT count(*) FROM scim_connection_tokens t \
                      WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
                        AND t.environment_id = c.environment_id \
@@ -78884,44 +78891,61 @@ impl ScimConnectionRepo<'_> {
                     expires_at_unix_micros: row.get("expires_us"),
                     revoked_at_unix_micros: row.get("revoked_us"),
                     revoked: row.get("revoked"),
-                    soonest_token_expiry_unix_micros: row.get("soonest_token_us"),
-                    live_token_count: {
-                        // EVERY CONDITION `authenticate` REFUSES ON ZEROES THIS, not just the
-                        // token-level ones, because the number claims that something a customer
-                        // can present will work. `authenticate` requires the CONNECTION to be
-                        // unrevoked and unlapsed and its ORGANIZATION to be live, and a count
-                        // that saw only the token rows reported a healthy connection in every
-                        // one of those states after provisioning had already stopped.
-                        //
-                        // The three are read as separate columns rather than folded into one
-                        // SQL predicate so that a fixture can drive them one at a time; a single
-                        // combined boolean is satisfied by whichever disjunct a test happened to
-                        // set.
-                        //
-                        // AND A CONNECTION WITH NO TOKEN ROWS AT ALL authenticates through the
-                        // legacy fallback -- it was created by a binary that predates migration
-                        // 0205 -- so it has ONE usable credential, not none. Counting rows would
-                        // report that population as broken while it provisions perfectly. The
-                        // fallback's own `NOT EXISTS` has no liveness filter either, so this
-                        // asks the same question it does: any row at all, live or not.
-                        let lapsed: bool = row.get("connection_lapsed");
-                        let revoked_now: bool = row.get("revoked");
-                        // NULL when the organization is gone, which is not alive.
-                        let org_active: Option<bool> = row.get("org_active");
-                        let has_rows: bool = row.get("has_token_rows");
-                        let counted: i64 = row.get("live_tokens");
-                        if lapsed || revoked_now || org_active != Some(true) {
-                            0
-                        } else if has_rows {
-                            counted
+                    provisioning_stops_at_unix_micros: {
+                        // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
+                        // one. The connection's own expiry is folded into this column, so a
+                        // connection whose tokens have all lapsed or been revoked -- and one
+                        // whose organization was disabled -- would otherwise publish the date
+                        // provisioning WILL stop while `live_token_count` beside it says it
+                        // already has. Two fields derived from one row and contradicting each
+                        // other is the defect this listing has now produced twice.
+                        if live_token_count(&row) == 0 {
+                            None
                         } else {
-                            1
+                            row.get("provisioning_stops_us")
                         }
                     },
+                    live_token_count: live_token_count(&row),
                     created_at_unix_micros: row.get("created_us"),
                 })
             })
             .collect()
+    }
+}
+
+/// How many credentials of one listed connection would actually authenticate.
+///
+/// EVERY CONDITION `authenticate` REFUSES ON ZEROES THIS, not just the token-level ones, because
+/// the number claims that something a customer can present will work. `authenticate` requires the
+/// CONNECTION to be unrevoked and unlapsed and its ORGANIZATION to be live, and a count that saw
+/// only the token rows reported a healthy connection in every one of those states after
+/// provisioning had already stopped.
+///
+/// The three are read as separate columns rather than folded into one SQL predicate so that a
+/// fixture can drive them one at a time; a single combined boolean is satisfied by whichever
+/// disjunct a test happened to set.
+///
+/// AND A CONNECTION WITH NO TOKEN ROWS AT ALL authenticates through the legacy fallback -- it was
+/// created by a binary that predates migration 0205 -- so it has ONE usable credential, not none.
+/// Counting rows would report that population as broken while it provisions perfectly. The
+/// fallback's own `NOT EXISTS` has no liveness filter either, so this asks the same question it
+/// does: any row at all, live or not.
+///
+/// It is a free function rather than an inline block because the deadline beside it reads the
+/// same number, and two copies of this decision could disagree about one row.
+fn live_token_count(row: &sqlx::postgres::PgRow) -> i64 {
+    let lapsed: bool = row.get("connection_lapsed");
+    let revoked_now: bool = row.get("revoked");
+    // NULL when the organization is gone, which is not alive.
+    let org_active: Option<bool> = row.get("org_active");
+    let has_rows: bool = row.get("has_token_rows");
+    let counted: i64 = row.get("live_tokens");
+    if lapsed || revoked_now || org_active != Some(true) {
+        0
+    } else if has_rows {
+        counted
+    } else {
+        1
     }
 }
 

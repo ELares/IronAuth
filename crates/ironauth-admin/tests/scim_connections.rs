@@ -1104,7 +1104,7 @@ async fn the_listing_warns_about_a_token_lapsing_inside_the_configured_lead() {
          {quiet_item}"
     );
     assert!(
-        quiet_item.get("soonest_token_expiry_unix_ms").is_none(),
+        quiet_item.get("provisioning_stops_at_unix_ms").is_none(),
         "a connection whose tokens have no horizon published one: {quiet_item}"
     );
 
@@ -1116,7 +1116,7 @@ async fn the_listing_warns_about_a_token_lapsing_inside_the_configured_lead() {
          customer's provisioning is about to stop by it stopping: {loud_item}"
     );
     assert!(
-        loud_item["soonest_token_expiry_unix_ms"].as_i64().is_some(),
+        loud_item["provisioning_stops_at_unix_ms"].as_i64().is_some(),
         "the warning fired without publishing WHEN, which is what an operator acts on: \
          {loud_item}"
     );
@@ -1201,14 +1201,29 @@ async fn the_warning_honours_the_configured_lead_rather_than_a_hardcoded_one() {
 /// shape, and it is what would notice the two layers disagreeing.
 #[tokio::test]
 async fn the_listing_suppresses_both_signals_for_a_revoked_connection() {
-    // A ONE-SECOND LEAD, so the warning is off for anything but an imminent horizon, and the
-    // revoked row's suppression is therefore about the revocation rather than about the lead.
-    let h = Harness::start_with_scim_warning_lead(50, 1).await;
+    // A THIRTY-DAY LEAD AND A DEADLINE ONE DAY OUT, so the subject is genuinely WARNING before
+    // the revocation. An earlier version of this test seeded a connection with no expiry at all:
+    // its deadline was absent, `token_expiring_soon` was false on both reads, and the assertion
+    // below held whether or not `view` consulted the live count. The suppression it names was
+    // unobserved, which is the shape this suite exists to catch.
+    let h = Harness::start_with_scim_warning_lead(50, 30 * 24 * 60 * 60).await;
     let (tenant, environment) = h.create_tenant("acme", "s-tenant").await;
     let org = create_org(&h, &tenant, &environment, "s-org").await;
     let base = connections_path(&tenant, &environment, &org);
 
-    let body = serde_json::json!({ "display_name": "doomed", "provider": "okta" }).to_string();
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a millisecond count inside i64");
+    let body = serde_json::json!({
+        "display_name": "doomed",
+        "provider": "okta",
+        "expires_at_unix_ms": now_ms + 24 * 60 * 60 * 1000,
+    })
+    .to_string();
     let (status, _, created) = h.post(&base, "s-seed", &body).await;
     assert_eq!(status, StatusCode::CREATED, "seed: {created}");
     let id = serde_json::from_str::<Value>(&created).expect("json")["id"]
@@ -1226,12 +1241,18 @@ async fn the_listing_suppresses_both_signals_for_a_revoked_connection() {
             .expect("listed")
     };
 
-    // BEFORE THE REVOKE it is healthy: one live token, no horizon, no warning. This is the
-    // control that stops the assertions below passing against a listing that reports nothing.
+    // BEFORE THE REVOKE it holds a live credential and is WARNING about the deadline one day
+    // out. Both are the controls that make the two assertions after the revoke a change of
+    // answer rather than a listing that reports nothing either way.
     let (_, _, listed) = h.get(&base).await;
     let before = item_for(&listed, &id);
     assert_eq!(before["no_live_token"].as_bool(), Some(false), "{before}");
-    assert_eq!(before["token_expiring_soon"].as_bool(), Some(false), "{before}");
+    assert_eq!(
+        before["token_expiring_soon"].as_bool(),
+        Some(true),
+        "the control: a live connection one day from its deadline, under a thirty-day lead, must \
+         warn -- without this the suppression below is unobservable: {before}"
+    );
 
     let (status, _, body) = h.delete(&format!("{base}/{id}")).await;
     assert!(status.is_success(), "revoke answered {status}: {body}");
@@ -1252,6 +1273,8 @@ async fn the_listing_suppresses_both_signals_for_a_revoked_connection() {
         after["token_expiring_soon"].as_bool(),
         Some(false),
         "a REVOKED connection is reported as about to stop working, which it has already done \
-         and by an operator's own hand: {after}"
+         and by an operator's own hand. The STORE is what produces this: it publishes no \
+         deadline once nothing is live, so `view`'s own `live &&` gate is not what this \
+         observes -- deleting that gate leaves this assertion green: {after}"
     );
 }

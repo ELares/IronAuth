@@ -2027,7 +2027,7 @@ async fn the_listing_reports_the_soonest_live_token_horizon() {
         listed
             .iter()
             .find(|c| c.id == connection)
-            .and_then(|c| c.soonest_token_expiry_unix_micros),
+            .and_then(|c| c.provisioning_stops_at_unix_micros),
         None,
         "a connection nobody has rotated reports a token horizon"
     );
@@ -2046,7 +2046,7 @@ async fn the_listing_reports_the_soonest_live_token_horizon() {
     let reported = listed
         .iter()
         .find(|c| c.id == connection)
-        .and_then(|c| c.soonest_token_expiry_unix_micros)
+        .and_then(|c| c.provisioning_stops_at_unix_micros)
         .expect("a rotated connection has a token horizon");
     assert_eq!(
         reported,
@@ -2075,7 +2075,7 @@ async fn the_listing_reports_the_soonest_live_token_horizon() {
         listed
             .iter()
             .find(|c| c.id == connection)
-            .and_then(|c| c.soonest_token_expiry_unix_micros),
+            .and_then(|c| c.provisioning_stops_at_unix_micros),
         None,
         "a REVOKED token's horizon is still reported, so the listing warns about a deadline \
          that cannot arrive"
@@ -2115,7 +2115,7 @@ async fn a_completed_rotation_stops_warning_once_the_overlap_has_passed() {
         .find(|c| c.id == connection)
         .expect("listed");
     assert_eq!(
-        during.soonest_token_expiry_unix_micros,
+        during.provisioning_stops_at_unix_micros,
         Some(at + 600 * 1_000_000)
     );
     assert_eq!(
@@ -2134,7 +2134,7 @@ async fn a_completed_rotation_stops_warning_once_the_overlap_has_passed() {
         .find(|c| c.id == connection)
         .expect("listed");
     assert_eq!(
-        after.soonest_token_expiry_unix_micros, None,
+        after.provisioning_stops_at_unix_micros, None,
         "a completed rotation still reports the superseded token's dead horizon, so this \
          connection warns forever and its next real deadline is hidden behind it"
     );
@@ -2145,11 +2145,25 @@ async fn a_completed_rotation_stops_warning_once_the_overlap_has_passed() {
 }
 
 #[tokio::test]
-async fn a_connection_whose_every_token_has_lapsed_reports_no_live_token() {
-    // THE OTHER HALF, and the reason the count is a separate field. A connection whose tokens
-    // have ALL lapsed publishes no horizon -- and so does a perfectly healthy one whose token
-    // never expires. Through the horizon alone those two are indistinguishable, and one of them
-    // needs an operator today.
+async fn a_connection_whose_live_credentials_are_all_gone_reports_no_live_token() {
+    // THE OTHER HALF, and the reason the count is a separate field. A connection with nothing
+    // live publishes no deadline -- and so does a perfectly healthy one whose token never
+    // expires. Through the deadline alone those two are indistinguishable, and one of them needs
+    // an operator today.
+    //
+    // # The connection stays LIVE throughout, which an earlier version of this test did not
+    //
+    // It created the connection with a sixty-second expiry, and `create` writes that value onto
+    // the connection AND its first token -- so at the assertion the CONNECTION was lapsed, the
+    // `lapsed` short-circuit answered before either token filter was read, and the test proved
+    // the branch beside the one it names. Both token filters could be deleted and it stayed
+    // green.
+    //
+    // Here the connection expires in ninety days and is live at every assertion. What removes
+    // its credentials is the two TOKEN filters, one each: a rotation supersedes the original
+    // token to the end of a sixty-second overlap (the `expires_at` filter), and the fresh token
+    // it minted is then revoked outright (the `revoked_at` filter). Deleting either one leaves a
+    // credential counted and turns this red.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -2157,9 +2171,11 @@ async fn a_connection_whose_every_token_has_lapsed_reports_no_live_token() {
 
     let at = now_micros(&env);
     let id = ScimConnectionId::generate(&env, &scope);
-    db.control_store()
+    let writes = db
+        .control_store()
         .scoped(scope)
-        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    writes
         .scim_connections()
         .create(
             &env,
@@ -2168,42 +2184,60 @@ async fn a_connection_whose_every_token_has_lapsed_reports_no_live_token() {
                 organization_id: &organization,
                 display_name: "Okta production",
                 provider: "okta",
-                token_digest: &digest("lapses-soon"),
-                expires_at_unix_micros: Some(at + 60_000_000),
+                token_digest: &digest("all-gone-1"),
+                expires_at_unix_micros: Some(at + 90 * 24 * 60 * 60 * 1_000_000),
             },
             None,
         )
         .await
         .expect("create");
-
-    let read = db.store().scoped(scope);
-    let live = read
+    writes
         .scim_connections()
-        .list_for_organization(&organization, 50, None, at)
+        .rotate_token(&env, &id, &digest("all-gone-2"), 60, at)
         .await
-        .expect("list")
-        .into_iter()
-        .find(|c| c.id == id)
-        .expect("listed");
+        .expect("rotate");
+
+    // CONTROL ONE: both tokens live during the overlap.
     assert_eq!(
-        live.live_token_count, 1,
-        "the token is live before its expiry"
+        listed(&db, scope, &organization, &id, at + 1)
+            .await
+            .live_token_count,
+        2
+    );
+    // CONTROL TWO: past the overlap the superseded token is gone and the fresh one carries it.
+    // This is what makes the zero below the REVOCATION rather than the lapse.
+    let after_overlap = listed(&db, scope, &organization, &id, at + 61_000_000).await;
+    assert_eq!(
+        after_overlap.live_token_count, 1,
+        "the fresh token must still be live once the superseded one lapses"
     );
 
-    let lapsed = read
+    writes
         .scim_connections()
-        .list_for_organization(&organization, 50, None, at + 61_000_000)
+        .revoke_token(&env, &id, &digest("all-gone-2"), at + 61_000_000)
         .await
-        .expect("list")
-        .into_iter()
-        .find(|c| c.id == id)
-        .expect("listed");
+        .expect("revoke the fresh token");
+
+    let gone = listed(&db, scope, &organization, &id, at + 62_000_000).await;
     assert_eq!(
-        lapsed.live_token_count, 0,
-        "a connection whose only token has lapsed still counts it live, so nothing distinguishes \
-         broken provisioning from a healthy connection that never expires"
+        gone.live_token_count, 0,
+        "one token lapsed and the other revoked, and the connection still counts a usable \
+         credential -- so nothing distinguishes broken provisioning from a healthy connection \
+         whose token never expires"
     );
-    assert_eq!(lapsed.soonest_token_expiry_unix_micros, None);
+    assert_eq!(
+        gone.provisioning_stops_at_unix_micros, None,
+        "a connection with nothing live published the date provisioning WILL stop, ninety days \
+         out, while the count beside it said it already had"
+    );
+    // And the connection itself is untouched: its own expiry is still in the future, so the
+    // zero above is about its credentials rather than about the connection having lapsed.
+    assert_eq!(
+        gone.expires_at_unix_micros,
+        Some(at + 90 * 24 * 60 * 60 * 1_000_000),
+        "the connection must still be live, or the token filters are not what produced the zero"
+    );
+    assert!(!gone.revoked, "and unrevoked");
 }
 
 #[tokio::test]
@@ -2219,14 +2253,21 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
     let organization = seed_org(&db, &env, scope, "Globex").await;
 
     let at = now_micros(&env);
-    // THE SUBJECT'S TWO HORIZONS MUST DIFFER, and two rotations alone cannot produce that:
-    // `LEAST` collapses every superseded token onto the newest rotation's value, so
-    // MIN == MAX over the set and flipping the aggregate changes nothing. Two earlier versions
-    // of this test had exactly that shape and a mutation run confirmed both survived MAX.
+    // THE SUBJECT'S TWO HORIZONS MUST DIFFER, or flipping the aggregate to MAX changes nothing.
+    // Two earlier versions of this test had at most one horizon at every assertion and a
+    // mutation run confirmed both survived MAX.
     //
-    // A CREATE-TIME EXPIRY is what separates them. The connection's first token carries
-    // `at+100s`, which `LEAST` keeps through a rotation asking for an hour, so the live set is
-    // {at+100s, at+3601s, NULL} and the two aggregates disagree.
+    // TWO ROTATIONS WITH DIFFERENT OVERLAPS is what separates them, and the order matters:
+    // supersession is `LEAST(existing, now + overlap)`, which only ever LOWERS. The short
+    // overlap therefore has to come FIRST -- rotation one pulls the original token to `at+100s`,
+    // rotation two asks for an hour and `LEAST` keeps `at+100s` while its own fresh predecessor
+    // takes `at+3601s`. The live set is {at+100s, at+3601s, NULL}, so MIN and MAX disagree.
+    // Long-then-short would collapse both onto the shorter value and prove nothing.
+    //
+    // An earlier version of this comment credited the CREATE-TIME EXPIRY below for the
+    // separation. It does not: re-derive the fixture with that expiry set to `None` and the live
+    // set is unchanged. What it is actually for is stated at its own site -- keeping the
+    // connection's own horizon out of the `LEAST` fold so this measures the token aggregate.
     let subject = ScimConnectionId::generate(&env, &scope);
     db.control_store()
         .scoped(scope)
@@ -2278,7 +2319,7 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
     // rotation's hour-long window, so the live set holds two DIFFERENT horizons and this
     // assertion fails against MAX, which would answer `at+1s+3600s`.
     assert_eq!(
-        subject_row.soonest_token_expiry_unix_micros,
+        subject_row.provisioning_stops_at_unix_micros,
         Some(at + 100 * 1_000_000),
         "the horizon is not the SOONEST of this connection's live tokens; MAX and MIN cannot be \
          told apart by this fixture unless two of them differ"
@@ -2287,12 +2328,12 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
 
     let sibling_row = listed.iter().find(|c| c.id == sibling).expect("listed");
     assert_eq!(
-        sibling_row.soonest_token_expiry_unix_micros,
+        sibling_row.provisioning_stops_at_unix_micros,
         Some(at + 60 * 1_000_000),
         "the sibling's own earlier horizon is not reported against the sibling"
     );
     assert_ne!(
-        subject_row.soonest_token_expiry_unix_micros, sibling_row.soonest_token_expiry_unix_micros,
+        subject_row.provisioning_stops_at_unix_micros, sibling_row.provisioning_stops_at_unix_micros,
         "two connections report one horizon, so the subquery is not correlated per connection"
     );
 }
@@ -2350,7 +2391,7 @@ async fn a_rotated_connection_still_warns_about_its_own_expiry() {
         .find(|c| c.id == id)
         .expect("listed");
     assert_eq!(
-        after.soonest_token_expiry_unix_micros,
+        after.provisioning_stops_at_unix_micros,
         Some(horizon),
         "a rotated connection reports no horizon at all, so it will stop working on its own \
          expiry with nothing having warned"
@@ -2420,14 +2461,14 @@ async fn a_legacy_connection_with_no_token_rows_is_not_reported_broken() {
     );
 }
 
-/// One connection's live-credential count, as the listing reports it right now.
-async fn live_count(
+/// One connection's row, as the listing reports it at `at`.
+async fn listed(
     db: &TestDatabase,
     scope: Scope,
     organization: &OrganizationId,
     id: &ScimConnectionId,
     at: i64,
-) -> i64 {
+) -> ironauth_store::ScimConnection {
     db.store()
         .scoped(scope)
         .scim_connections()
@@ -2437,7 +2478,17 @@ async fn live_count(
         .into_iter()
         .find(|c| &c.id == id)
         .expect("listed")
-        .live_token_count
+}
+
+/// One connection's live-credential count, as the listing reports it right now.
+async fn live_count(
+    db: &TestDatabase,
+    scope: Scope,
+    organization: &OrganizationId,
+    id: &ScimConnectionId,
+    at: i64,
+) -> i64 {
+    listed(db, scope, organization, id, at).await.live_token_count
 }
 
 /// A revoked connection, and one whose organization was disabled, each count zero live

@@ -596,7 +596,7 @@ mod tests {
             "scim",
             Reach::OnePlaneOrNoState,
             "read by `assemble_planes` (issue #135), which decides whether the surface mounts at \
-             all, and by `build_scim_plane`, which sizes its page and scan bounds. BOTH panes \
+             all, and by `build_scim_plane`, which sizes its page and scan bounds. BOTH planes \
              read the section now, and each takes a DIFFERENT key from it: the public plane \
              takes the page and scan bounds, and the management plane takes ONLY \
              `token_expiry_warning_secs` (issue #140), which sizes the expiry warning on the \
