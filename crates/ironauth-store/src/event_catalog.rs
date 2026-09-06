@@ -885,6 +885,36 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // write; the producer builds its envelope BEFORE the call and cannot know it. A field
         // nothing can populate is worse than no field: a consumer would read its absence as
         // "not completed" rather than "not stated".
+        // A PORTAL LINK was minted (issue #140), which is this deployment handing somebody
+        // OUTSIDE it the authority to configure one organization. That is the event a consumer
+        // watching "who was given administrative reach into my tenant" cannot reconstruct from
+        // anything else: the redemption happens in a browser the management API never sees, and
+        // by then the grant is already made.
+        //
+        // THE ORGANIZATION AND THE INTENT, because those two ARE the resulting session's
+        // boundaries and a receiver deciding whether to alert needs both -- an `sso` link and a
+        // `domain-verification` link are very different amounts of authority. The EXPIRY too:
+        // the window in which the grant can still be taken up is the window a responder has.
+        //
+        // NO TOKEN AND NO DIGEST. The digest verifies exactly as well as the token does, so
+        // putting either on the stream that announces the link exists would BE the leak -- the
+        // same reason `api_key.created` and `scim_connection.created` carry neither. Every
+        // receiver of this event would otherwise hold the credential it is warning them about.
+        "portal_link.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "portal_link_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "intent": {"type": "string", "minLength": 1},
+                "expires_at_unix_ms": {"type": "integer"}
+            },
+            "required": ["portal_link_id", "organization_id", "intent", "expires_at_unix_ms"]
+        }"#,
+    ),
+    (
         // A PROJECT GRANT lets a client act for an organization, so a consumer mirroring
         // delegated authority acts on it. Both ends and the organization: the grant alone does
         // not say WHO may act for WHOM.

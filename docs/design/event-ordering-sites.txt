@@ -69,7 +69,7 @@ crates/ironauth-store/src/repository.rs:issue_with_event:1
 crates/ironauth-store/src/repository.rs:lift_with_event:1
 crates/ironauth-store/src/repository.rs:link_external_id_with_event:1
 crates/ironauth-store/src/repository.rs:meter_token_issued:1
-crates/ironauth-store/src/repository.rs:mint_with_event:1
+crates/ironauth-store/src/repository.rs:mint_with_event:2
 crates/ironauth-store/src/repository.rs:pin_certificate:1
 crates/ironauth-store/src/repository.rs:pin_with_event:1
 crates/ironauth-store/src/repository.rs:provision_sp_key:1

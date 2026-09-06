@@ -1636,6 +1636,15 @@ pub enum Action {
     /// mapped to an org connection through the management API. The row targets the
     /// `rrl_` rule; the `detail` records the rule kind.
     RoutingRuleCreate,
+    /// A self-service portal entry link was MINTED (issue #140): a vendor asked for a
+    /// short-lived, single-use URL to hand a customer's IT admin. The row targets the
+    /// `plk_` link; the `detail` records the organization and the intent, which are the
+    /// only two things the resulting portal session may act within.
+    ///
+    /// THE MINT IS AUDITED, NOT THE REDEMPTION ALONE, because the mint is where a
+    /// management principal decided that somebody outside this deployment may configure
+    /// an organization. Who redeemed it and what they then changed are separate rows.
+    PortalLinkMint,
     /// A domain rule's ownership verification outcome was recorded (issue #96): the
     /// transition to `verified` is what makes the rule route at all, so it is audited
     /// separately from the create that only claimed the domain.
@@ -1967,6 +1976,7 @@ impl Action {
             Action::UpstreamTokenGrantCreate => "upstream_token_grant.create",
             Action::FedcmAssertionIssue => "fedcm.assertion.issue",
             Action::RoutingRuleCreate => "routing_rule.create",
+            Action::PortalLinkMint => "portal_link.mint",
             Action::RoutingRuleDomainVerification => "routing_rule.domain_verification",
         }
     }

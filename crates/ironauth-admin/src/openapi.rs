@@ -293,6 +293,7 @@ use crate::views::{
         crate::org_group_members::add_org_group_member,
         crate::org_group_members::list_org_group_members,
         crate::org_group_members::remove_org_group_member,
+        crate::portal_links::create_portal_link,
         crate::routing_rules::create_routing_rule,
         crate::routing_rules::verify_routing_rule_domain,
         crate::routing_rules::list_routing_rules,

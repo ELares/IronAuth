@@ -423,6 +423,9 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     ),
     // Enterprise inbound routing (issue #96): routing decides WHERE a login is sent,
     // which is environment configuration rather than organization membership.
+    // Minting a portal link hands CONFIGURATION authority for one organization to somebody
+    // outside this deployment (issue #140), so it is a config write rather than a read.
+    ("createPortalLink", ManagementPermission::WriteConfig),
     ("createRoutingRule", ManagementPermission::WriteConfig),
     ("verifyRoutingRuleDomain", ManagementPermission::WriteConfig),
     ("listRoutingRules", ManagementPermission::Read),
@@ -747,6 +750,12 @@ const PERMISSION_PROVEN: &[&str] = &[
     // revoking are write_organizations, listing is read, and each is driven in BOTH
     // directions -- an agent acts with a person's authority, so who may create one and who
     // may only look is the distinction that matters most here.
+    // The portal link surface (issue #140), proven by
+    // `minting_a_portal_link_requires_write_config` in `delegated_admin.rs`: a credential
+    // holding only `management.read` is refused, and the refusal names the permission it
+    // lacked. Proven the moment the operation shipped, because the classification alone is not
+    // enforcement -- it records an intention nothing compares against the call.
+    "createPortalLink",
     "registerAgent",
     "setAgentState",
     "listAgents",
@@ -972,31 +981,31 @@ const PERMISSION_PROVEN: &[&str] = &[
 ///
 /// Classification is NOT proof, and the size of that gap is counted so it cannot hide.
 ///
-/// 218 operations declare a required permission and 74 have that permission proven. The other
-/// 144 are not known to be wrong; they are UNCHECKED, which is a different thing and worth a
-/// number rather than a shrug.
+/// An operation that DECLARES a required permission is not thereby known to enforce the
+/// permission it declares. The operations with an end-to-end proof are the ones named in
+/// `PERMISSION_PROVEN`; the rest are not known to be wrong, they are UNCHECKED, which is a
+/// different thing and worth measuring rather than shrugging at.
 ///
-/// ALL THREE NUMBERS ARE PINNED BELOW, and that is a repair rather than a flourish. This
-/// paragraph read "148 ... and 4" while the assertion underneath pinned 166, because only the
-/// first number had a test and the sentence beside it was maintained by hand. It was wrong at
-/// merge-base of the PR that introduced it (147 and 3 against an actual 165 and 21), so it
-/// had drifted twice without anything going red. A sentence that carries a count needs the count asserted, or
-/// the next reader budgets against a figure nobody has checked since it was typed.
+/// # This paragraph no longer states the numbers, and that is the fix
+///
+/// It used to, and it was wrong every time anybody looked. It read "148 and 4" while the
+/// assertion underneath pinned 166. It was already wrong at the merge-base of the PR that
+/// introduced it (147 and 3 against an actual 165 and 21). The arithmetic identity beside it
+/// read "166 minus 22", then "171 minus 27", then "210 minus 66", then "218 minus 74", then
+/// "225 minus 81" -- five stalenesses in a sentence whose own next clause explained that this
+/// is the hazard, and which ended by instructing the reader to update it by hand.
+///
+/// An instruction to keep prose in step with a constant is not a mechanism; it is the same
+/// hope that failed five times. The sizes are pinned EXACTLY by the two `assert_eq!`s in the
+/// test below, which is where a reader should look for them and the only place they can be
+/// read without being stale. Writing them here again buys nothing that those assertions do
+/// not already give, and costs the sixth wrong sentence.
 ///
 /// This pin may only improve: `PERMISSION_PROVEN` may grow, and the ratio may not get worse
-/// without somebody editing this assertion and noticing what they are doing.
-///
-/// WITH BOTH SIZES PINNED EXACTLY, the `unproven <= 144` ratchet below can no longer fail on
-/// its own: 225 minus 81 is always 144. (It read "166 minus 22", then "171 minus 27", then
-/// "210 minus 66", then "218 minus 74" -- each of them stale, and the last of them stale in a doc paragraph that
-/// says in the same breath that this is the hazard, while
-/// the pins above it moved twice without it, which is the hazard of writing an arithmetic
-/// identity beside the numbers it derives from rather than deriving it. Both operands are
-/// pinned by the two `assert_eq!`s in the test below; if you change either, change this
-/// sentence too.) That is deliberate rather than an oversight. The
-/// ratchet's job was to catch a drift nothing else measured, and two exact pins catch it
-/// earlier and name which set moved. What the ratchet still carries is its message, which is
-/// the instruction for the person who just made one of those pins fail.
+/// without somebody editing the assertion and noticing what they are doing. With both sizes
+/// pinned exactly, the `unproven` ratchet below can no longer fail on its own -- the two exact
+/// pins catch a drift earlier and name which set moved. What the ratchet still carries is its
+/// message, which is the instruction for the person who just made one of those pins fail.
 #[test]
 fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     for operation in PERMISSION_PROVEN {
@@ -1007,12 +1016,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        226,
+        227,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        82,
+        83,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -1028,6 +1037,11 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     // Listed the moment the module existed: a file NOT enumerated here is one this gate never
     // reads, so its classification comments and its gate calls could disagree silently.
     ("agents.rs", include_str!("../src/agents.rs")),
+    // The self-service portal's link surface (issue #140). Listed the moment it existed, for
+    // the reason the neighbours state: a file absent here is one this gate never reads, so a
+    // mutation deleting its `require_permission` call would SURVIVE while the classification
+    // above still looked like enforcement.
+    ("portal_links.rs", include_str!("../src/portal_links.rs")),
     // The outbound provisioning module (issue #137). Listed the moment it existed: a file NOT
     // enumerated here is one this gate never reads, so a mutation deleting a
     // `require_permission` call inside it SURVIVES, and the classification above would look

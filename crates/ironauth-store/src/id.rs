@@ -1242,6 +1242,17 @@ impl ScopedKind for ScimConnectionKind {
     const PREFIX: &'static str = "scim";
 }
 
+/// Marker for a self-service portal entry link (`plk_`, issue #140).
+///
+/// The non-secret HANDLE of the link, never its bearer value. The value exists only in the URL
+/// handed to the vendor and is stored as a digest, so an identifier that appears in a log, an
+/// audit row or an error page grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortalLinkKind;
+impl ScopedKind for PortalLinkKind {
+    const PREFIX: &'static str = "plk";
+}
+
 /// Marker for an OUTBOUND SCIM connection (`spc_`, issue #137).
 ///
 /// The mirror of [`ScimConnectionKind`], and the direction is the whole difference: inbound, an
@@ -2179,6 +2190,9 @@ pub type ScimPushLinkId = ScopedId<ScimPushLinkKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
+
+/// A self-service portal entry link identifier (`plk_`, issue #140).
+pub type PortalLinkId = ScopedId<PortalLinkKind>;
 /// An OUTBOUND SCIM connection identifier (`spc_...`), issue #137.
 pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
 /// An inbound SAML connection identifier (`smc_...`), issue #139. The trust decision, never a key.

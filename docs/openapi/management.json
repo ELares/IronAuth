@@ -11017,7 +11017,7 @@
             }
           },
           "403": {
-            "description": "Wrong plane or scope",
+            "description": "Wrong plane or scope, or a credential confined to one organization asked for a stream with no organization_id (which would carry the whole environment)",
             "content": {
               "application/json": {
                 "schema": {
@@ -11027,7 +11027,7 @@
             }
           },
           "404": {
-            "description": "The environment is absent or deleted",
+            "description": "The environment is absent or deleted, or the named organization is not a live row of this scope (which includes an organization the credential is confined away from, and an id this scope cannot parse)",
             "content": {
               "application/json": {
                 "schema": {
@@ -19219,6 +19219,103 @@
           },
           "404": {
             "description": "Not found (absent, deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/portal-links": {
+      "post": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links`: mint a link.",
+        "description": "# Errors\n\n[`ApiError::BadRequest`] for an unknown intent or an out-of-range TTL;\n[`ApiError::NotFound`] when the environment or the organization is not a live row of this\nscope, which is also the answer for an organization id this scope cannot parse -- the\nuniform not-found is what stops a caller enumerating which organizations exist here;\n[`ApiError::Internal`] on a persistence fault.",
+        "operationId": "createPortalLink",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "The tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "The environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePortalLinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The minted link; the token appears here and nowhere else. The returned url_path is not served until the portal session slice of issue #140 lands",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalLinkView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown intent or an out-of-range TTL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The environment or the organization is not a live row of this scope, or the organization id is malformed or unreadable in this scope",
             "content": {
               "application/json": {
                 "schema": {
@@ -30078,7 +30175,7 @@
               "string",
               "null"
             ],
-            "description": "Scope the stream to one organization. Absent means environment-wide."
+            "description": "Scope the stream to one organization. Absent means environment-wide.\n\nA CREDENTIAL CONFINED TO ONE ORGANIZATION MUST NAME IT. The stream ships that\norganization's rows and no other, so a confined credential may name the organization it\nis confined to and nothing else; absent means the whole environment, which is strictly\nmore than such a credential may see and is refused rather than quietly narrowed. An\norganization that is not a live row of this scope answers the uniform not-found."
           },
           "signing_secret_name": {
             "type": [
@@ -30239,6 +30336,32 @@
             "type": "string",
             "description": "The IMMUTABLE namespaced stable name, unique among the environment's LIVE\npermissions. Must match `^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9][a-z0-9_-]*)+$` and\nbe at most 63 characters, so it carries two or more dot-separated segments;\nit is never trimmed or case folded, so a non-canonical value is refused\nrather than silently rewritten.",
             "example": "billing.invoice.read"
+          }
+        }
+      },
+      "CreatePortalLinkRequest": {
+        "type": "object",
+        "description": "A portal link to mint.",
+        "required": [
+          "organization_id",
+          "intent"
+        ],
+        "properties": {
+          "intent": {
+            "type": "string",
+            "description": "What the session may configure: `sso`, `scim`, `domain-verification`, or `log-streams`.\nA session cannot navigate outside the intent it was opened with."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The `org_` organization the resulting portal session may configure. The session can see\nno other organization's state."
+          },
+          "ttl_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long the link stays redeemable, in seconds. Defaults to five minutes; an hour is the\nmaximum."
           }
         }
       },
@@ -33758,6 +33881,40 @@
           "truncated": {
             "type": "boolean",
             "description": "True when the result hit the limit and older matching traces were left out."
+          }
+        }
+      },
+      "PortalLinkView": {
+        "type": "object",
+        "description": "A freshly minted portal link.",
+        "required": [
+          "id",
+          "url_path",
+          "organization_id",
+          "intent",
+          "expires_at_unix_ms"
+        ],
+        "properties": {
+          "expires_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the link stops being redeemable, in milliseconds since the epoch."
+          },
+          "id": {
+            "type": "string",
+            "description": "The `plk_` handle. Not secret: it appears in audit rows and logs, and holding it grants\nnothing without the token."
+          },
+          "intent": {
+            "type": "string",
+            "description": "The intent the session will be bound to."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization the session will be bound to."
+          },
+          "url_path": {
+            "type": "string",
+            "description": "The path to hand the IT admin, token included, joined to whatever origin the vendor\npublishes for this deployment.\n\nNOT YET SERVED. The redeeming route lands in the next slice of #140; until it does,\nfollowing this path reaches a 404. It is stated here rather than left to be discovered\nbecause the alternative is a vendor emailing a customer's IT admin a link that looks\ncorrect and goes nowhere, which is the one artifact that customer sees first.\n\nRETURNED ONCE. The store keeps only a digest, so this response is the only place the\ntoken ever exists outside the caller."
           }
         }
       },

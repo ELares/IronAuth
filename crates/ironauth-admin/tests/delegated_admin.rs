@@ -799,6 +799,390 @@ async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_wid
     );
 }
 
+/// A confined credential cannot point a LOG STREAM at a sibling organization's rows.
+///
+/// # The one this PR did not go looking for
+///
+/// `createLogStream` takes `organization_id` in its request body and, until this change,
+/// passed it to the store untouched. That column is not decorative: `log_shipper.rs` hands it
+/// to `rows_after`, so it selects WHICH organization's audit and authentication rows the
+/// stream ships. A credential confined to organization A could name organization B and point
+/// the sink at an endpoint it controls, and B's rows would be delivered to it. The confinement
+/// was decoration on that path, and the endpoint has been shipped for some time.
+///
+/// It was found by DERIVING the body-addressed set from the committed contract instead of
+/// listing it by hand. The hand-written list closed the hole for the operation somebody had
+/// already found; the derivation named this one on its first run.
+///
+/// A STREAM WITH NO ORGANIZATION IS REFUSED OUTRIGHT for a confined credential, which the
+/// third case pins: an absent organization means the whole environment, which is strictly more
+/// than a confined credential may see. It is refused rather than silently narrowed to the
+/// credential's own organization, because a stream that quietly ships less than the operator
+/// asked for is a gap an audit pipeline cannot detect.
+#[tokio::test]
+async fn a_confined_credential_cannot_ship_a_sibling_organizations_rows() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "ls-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let orgs = format!("{base}/organizations");
+    let streams = format!("{base}/log-streams");
+
+    let mut ids = Vec::new();
+    for (n, name) in ["Mine", "Theirs"].into_iter().enumerate() {
+        let (status, _, created) = h
+            .post(
+                &orgs,
+                &format!("ls-org-{n}"),
+                &serde_json::json!({ "display_name": name }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed {name}: {created}");
+        ids.push(
+            serde_json::from_str::<Value>(&created).expect("json")["id"]
+                .as_str()
+                .expect("id")
+                .to_owned(),
+        );
+    }
+    let (mine, theirs) = (&ids[0], &ids[1]);
+
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ls-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    confine(&h, &tenant, &environment, &key_id, mine).await;
+
+    let stream_body = |organization: &str| {
+        serde_json::json!({
+            "source": "admin_action",
+            "sink_type": "http",
+            "sink_config": { "url": "https://sink.example/ingest" },
+            "organization_id": organization,
+        })
+        .to_string()
+    };
+
+    // ITS OWN ORGANIZATION WORKS, so the refusal below is the confinement rather than the
+    // endpoint being unreachable for this credential at all.
+    let (status, _, body) = h
+        .post_as(&streams, &secret, "ls-mine", &stream_body(mine))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a confined credential was refused a stream for its OWN organization, so the refusal \
+         below cannot be attributed to the confinement: {body}"
+    );
+
+    // THE SIBLING IS REFUSED, as the uniform not-found.
+    let (status, _, body) = h
+        .post_as(&streams, &secret, "ls-theirs", &stream_body(theirs))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a credential confined to one organization created a log stream carrying a SIBLING's \
+         audit and authentication rows, shipped to a sink of its choosing: {body}"
+    );
+
+    // AND NO STREAM ROW EXISTS FOR THE SIBLING. The status alone would pass against a handler
+    // that wrote the row and then failed on the way to the response, and the row is what the
+    // shipper reads.
+    let shipped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM log_streams WHERE organization_id = $1")
+            .bind(theirs)
+            .fetch_one(h.db().owner_pool())
+            .await
+            .expect("count the sibling's streams");
+    assert_eq!(
+        shipped, 0,
+        "the sibling's stream answered not-found but LEFT A ROW BEHIND, so the shipper will \
+         deliver that organization's rows regardless of the refusal"
+    );
+
+    // AN ENVIRONMENT-WIDE STREAM IS REFUSED for a confined credential: absent means every
+    // organization, which includes the sibling this credential was fenced away from.
+    let (status, _, body) = h
+        .post_as(
+            &streams,
+            &secret,
+            "ls-wide",
+            &serde_json::json!({
+                "source": "admin_action",
+                "sink_type": "http",
+                "sink_config": { "url": "https://sink.example/ingest" },
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a confined credential created an environment-wide log stream, which ships every \
+         organization's rows including the ones it is fenced away from: {body}"
+    );
+
+    // THE SIBLING'S STREAM EXISTS, created by the unconfined operator. Everything below is
+    // about what the CONFINED credential can do to a stream it did not create, which is the
+    // half a create-only fence leaves entirely open.
+    let (status, _, created) = h.post(&streams, "ls-op-theirs", &stream_body(theirs)).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "operator seeds theirs: {created}"
+    );
+    let sibling_stream = serde_json::from_str::<Value>(&created).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // THE LISTING IS NARROWED. Unnarrowed it hands over the sibling's stream id -- which is
+    // what the delete and replay below are addressed by -- and the sibling's organization id,
+    // which is the enumeration every other refusal in this crate answers 404 to prevent.
+    let (status, _, body) = h.get_as(&streams, &secret).await;
+    assert_eq!(status, StatusCode::OK, "the confined listing: {body}");
+    assert!(
+        !body.contains(&sibling_stream),
+        "the listing handed a confined credential a SIBLING organization's stream id: {body}"
+    );
+    assert!(
+        !body.contains(theirs),
+        "the listing handed a confined credential a SIBLING organization's id, which is the \
+         enumeration the uniform not-found exists to prevent: {body}"
+    );
+    // AND IT STILL SHOWS ITS OWN, so the narrowing is a filter rather than an empty answer
+    // that would satisfy both assertions above for the wrong reason.
+    assert!(
+        body.contains(mine),
+        "the narrowed listing dropped the credential's OWN organization's stream too, so the \
+         two assertions above are satisfied by an empty page: {body}"
+    );
+
+    // THE DELETE IS REFUSED. This is the quieter half of the bypass: nothing arrives at the
+    // sibling's SIEM afterwards, and the organization whose stream it was is not the one that
+    // would notice.
+    let (status, _, body) = h
+        .delete_as(&format!("{streams}/{sibling_stream}"), &secret)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a confined credential DELETED a sibling organization's log stream, stopping that \
+         organization's audit and authentication events reaching its SIEM: {body}"
+    );
+
+    // AND THE ROW SURVIVED. A 404 that deleted the row anyway would satisfy the status
+    // assertion and be the whole defect.
+    let survived: i64 = sqlx::query_scalar("SELECT count(*) FROM log_streams WHERE id = $1")
+        .bind(&sibling_stream)
+        .fetch_one(h.db().owner_pool())
+        .await
+        .expect("count the sibling's stream");
+    assert_eq!(
+        survived, 1,
+        "the delete answered not-found and removed the row anyway"
+    );
+
+    // THE REPLAY IS REFUSED on the same stream, for the same reason.
+    let (status, _, body) = h
+        .post_as(
+            &format!("{streams}/{sibling_stream}/dead-letters/replay"),
+            &secret,
+            "ls-replay",
+            "",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a confined credential commanded a SIBLING organization's shipper to replay: {body}"
+    );
+}
+
+/// A read-granted credential may not mint a portal link, and the refusal NAMES `write_config`.
+///
+/// The permission pin for this surface, and only that. The confinement half is the test below
+/// it: which permission a credential holds and WHICH ORGANIZATION it may spend it on are two
+/// dimensions, and this endpoint was shipped with the first and without the second.
+#[tokio::test]
+async fn minting_a_portal_link_requires_write_config() {
+    // THE PERMISSION PIN FOR THE PORTAL LINK SURFACE, and only that. `management_permissions.rs`
+    // asserts that SOME permission is demanded and separately RECORDS which one was intended;
+    // nothing there compares the two, so downgrading the handler to `Read` satisfies every pin
+    // in that file. Naming the specific permission is what this file is for.
+    //
+    // WHY IT MATTERS MORE HERE THAN ON AN ORDINARY CONFIG WRITE: the artifact this endpoint
+    // returns is a bearer token that lets somebody OUTSIDE this deployment configure an
+    // organization. A read-granted credential that could mint one would turn the weakest
+    // management grant into the ability to hand out configuration authority.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pl-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "pl-mint").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "pl-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    // The READ it holds still works, which is what makes the refusal below a narrowing rather
+    // than a credential locked out of the environment entirely.
+    let (status, _, body) = h.get_as(&orgs, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the organization listing it holds: {body}"
+    );
+
+    let (status, _, body) = h
+        .post_as(
+            &format!("/v1/tenants/{tenant}/environments/{environment}/portal-links"),
+            &secret,
+            "pl-denied",
+            &serde_json::json!({ "organization_id": org, "intent": "sso" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential minted a portal link: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config, so the handler may be demanding a different \
+         permission than the classification records: {body}"
+    );
+}
+
+/// A credential confined to one organization cannot mint a portal link for a SIBLING.
+///
+/// # Why this test exists, stated plainly because its absence was the defect
+///
+/// Round one of this PR found `createPortalLink` reading its organization out of the request
+/// BODY and resolving it with a bare parse. A parse proves an id belongs to this (tenant,
+/// environment); it says nothing about WHICH organization inside that environment a credential
+/// may act for. So a credential confined to organization A could mint a link handing
+/// configuration authority over organization B to somebody outside the deployment, and the
+/// audit row recorded the grant as A's own.
+///
+/// The fix routed the handler through `resolve_live_org`. What HELD that fix was a text scan:
+/// `org_confinement_surface.rs` checks that the handler's source mentions `resolve_live_org(`.
+/// That is a structural pin and it cannot express reachability -- it is satisfied by the token
+/// appearing anywhere in the body, so `let _ = resolve_live_org(..).await;` followed by a bare
+/// parse restores the entire bypass with the whole suite green. Every other test that drives
+/// this route uses the operator token, for which `require_organization` returns `Ok` without
+/// looking at anything.
+///
+/// So the strongest available proof of the fix was a `contains`. This is the behavioural half:
+/// it spends a REAL confined credential at the route and reads the refusal.
+#[tokio::test]
+async fn a_confined_credential_cannot_mint_a_portal_link_for_a_sibling_organization() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "pc-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let orgs = format!("{base}/organizations");
+    let portal_links = format!("{base}/portal-links");
+
+    // TWO REAL ORGANIZATIONS, so the sibling's refusal is about the CONFINEMENT rather than
+    // about the sibling not existing. Both are live rows of this environment.
+    let mut ids = Vec::new();
+    for (n, name) in ["Mine", "Theirs"].into_iter().enumerate() {
+        let (status, _, created) = h
+            .post(
+                &orgs,
+                &format!("pc-org-{n}"),
+                &serde_json::json!({ "display_name": name }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed {name}: {created}");
+        ids.push(
+            serde_json::from_str::<Value>(&created).expect("json")["id"]
+                .as_str()
+                .expect("id")
+                .to_owned(),
+        );
+    }
+    let (mine, theirs) = (&ids[0], &ids[1]);
+
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "pc-mint").await;
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    confine(&h, &tenant, &environment, &key_id, mine).await;
+
+    // ITS OWN ORGANIZATION WORKS. Without this the refusal below would be satisfied by a
+    // credential locked out of the endpoint entirely -- by the permission, by the confinement
+    // parse, by anything -- and would prove nothing about WHICH organization it may name.
+    let (status, _, body) = h
+        .post_as(
+            &portal_links,
+            &secret,
+            "pc-mine",
+            &serde_json::json!({ "organization_id": mine, "intent": "sso" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a confined credential was refused a portal link for its OWN organization, so the \
+         refusal below cannot be attributed to the confinement: {body}"
+    );
+
+    // THE SIBLING IS REFUSED, and refused as the uniform not-found rather than a 403: a 403
+    // would confirm the sibling EXISTS, letting a confined credential enumerate the
+    // environment's organizations by comparing statuses.
+    let (status, _, body) = h
+        .post_as(
+            &portal_links,
+            &secret,
+            "pc-theirs",
+            &serde_json::json!({ "organization_id": theirs, "intent": "sso" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a credential confined to one organization minted a portal link handing configuration \
+         authority over a SIBLING to somebody outside this deployment: {body}"
+    );
+
+    // AND NO ROW WAS WRITTEN. The status alone would pass against a handler that inserted the
+    // link and then failed on its way to the response; the authority is the ROW, so the
+    // absence of the row is the property that matters. Counted for the sibling specifically,
+    // because the successful mint above wrote one for `mine`.
+    let minted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM portal_links WHERE organization_id = $1")
+            .bind(theirs)
+            .fetch_one(h.db().owner_pool())
+            .await
+            .expect("count the sibling's portal links");
+    assert_eq!(
+        minted, 0,
+        "the sibling's mint answered not-found but LEFT A LINK BEHIND, so the refusal is \
+         cosmetic and the token in that response is redeemable"
+    );
+}
+
 /// A read-only credential may LIST SCIM connections and may not mint or revoke one.
 ///
 /// The same argument as the api-keys test below, on the surface that mints the strongest
@@ -808,6 +1192,12 @@ async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_wid
 /// The refusal-body assertions are what make this verify the SPECIFIC permission rather than
 /// merely some permission. A handler demanding `Read` would answer 201 here, and one demanding
 /// the wrong write permission would name that one instead.
+///
+/// IT SAT ABOVE THE PORTAL-LINK TEST FOR ONE COMMIT, because that test was inserted between
+/// this block and the function it describes. Three sentences about SCIM connections then
+/// documented a test that lists no SCIM connection and mints no token, and the pin they
+/// describe was left anonymous -- so an audit of which permission pins exist would have
+/// counted this one against the wrong surface.
 #[tokio::test]
 async fn a_read_only_credential_can_list_scim_connections_and_cannot_mint_or_kill_one() {
     // THE PIN FOR THE SCIM CONNECTION SURFACE'S PERMISSIONS, and only those. A reviewer

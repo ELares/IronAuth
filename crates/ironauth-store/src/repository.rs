@@ -93,11 +93,11 @@ use crate::id::{
     MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId, OperatorId,
     OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
     OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PowChallengeId, ProjectGrantId, ProjectGrantRoleId,
-    PushedRequestId, RecoveryApprovalId, RecoveryCodeId, RecoveryContactConfirmationId,
-    RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId, RefreshFamilyId,
-    RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId, RiskLoginGeoId,
-    RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, SamlSpKeyId,
+    OutboxMessageId, PermissionId, PortalLinkId, PowChallengeId, ProjectGrantId,
+    ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
+    RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
+    RiskLoginGeoId, RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, SamlSpKeyId,
     ScimConnectionId, ScimEnterpriseId, ScimExternalIdId, ScimPushConnectionId, ScimPushLinkId,
     ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
     SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
@@ -231,6 +231,18 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn saml_replay(&self) -> SamlReplayRepo<'a> {
         SamlReplayRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The self-service portal entry links for this scope (issue #140).
+    ///
+    /// ON THE DATA PLANE because redeeming one is what a customer's IT admin does in a browser,
+    /// and it is the only write the data plane makes here.
+    #[must_use]
+    pub fn portal_links(&self) -> PortalLinkRepo<'a> {
+        PortalLinkRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1692,6 +1704,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ActingScimConnectionRepo<'a> {
         ActingScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of the self-service portal entry links (issue #140).
+    #[must_use]
+    pub fn portal_links(&self) -> ActingPortalLinkRepo<'a> {
+        ActingPortalLinkRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -46561,6 +46583,22 @@ async fn stream_exists_in_tx(
     Ok(found.is_some())
 }
 
+/// Whose rows a log stream carries.
+///
+/// THREE CASES, NOT TWO, and the third is the one that matters: a stream that does not exist
+/// must not be reported as one belonging to no organization, because "belongs to no
+/// organization" is a real state with real reach (the whole environment) and an absent row is
+/// not reachable by anybody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogStreamOwnership {
+    /// No stream with that id in this scope.
+    Absent,
+    /// A stream carrying the WHOLE environment's rows.
+    Environment,
+    /// A stream carrying exactly one organization's rows.
+    Organization(String),
+}
+
 impl LogStreamRepo<'_> {
     /// Record a dead-lettered batch RANGE for `stream_id`, returning its id.
     ///
@@ -46877,6 +46915,44 @@ impl LogStreamRepo<'_> {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Which organization a stream belongs to, if it exists at all.
+    ///
+    /// THE READ A CONFINEMENT CHECK NEEDS AND NOTHING MORE. Every other operation on a stream
+    /// is addressed by id alone, so the only way to ask "may this credential act on it" is to
+    /// look up whose it is first. It answers the three cases separately -- absent, environment
+    /// wide, one organization -- because collapsing any two of them is how a caller ends up
+    /// treating a stream that does not exist as one nobody owns, which is exactly the reading
+    /// that would let a confined credential act on it.
+    ///
+    /// UNFILTERED BY `active`, unlike the listing beside it: a deactivated stream is still a
+    /// row somebody owns, and a fence that could not see it would leave the one shape an
+    /// attacker would reach for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a persistence fault.
+    pub async fn organization_of(&self, stream_id: &str) -> Result<LogStreamOwnership, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let row = sqlx::query(
+            "SELECT organization_id FROM log_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+        )
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(stream_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(match row {
+            None => LogStreamOwnership::Absent,
+            Some(row) => match row.get::<Option<String>, _>("organization_id") {
+                None => LogStreamOwnership::Environment,
+                Some(organization) => LogStreamOwnership::Organization(organization),
+            },
+        })
     }
 
     /// Every ACTIVE stream in this scope.
@@ -75962,6 +76038,216 @@ impl SamlSpKeyMaterial {
 impl core::fmt::Debug for SamlSpKeyMaterial {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("SamlSpKeyMaterial(<redacted>)")
+    }
+}
+/// What a redeemed portal link authorises (issue #140).
+///
+/// THE TWO BOUNDARIES THE PORTAL HAS, and they are values the SERVER looked up rather than
+/// values the browser presented. #140 requires that an `sso` link cannot reach SCIM or
+/// domain-verification surfaces and that a session for org A cannot touch org B; both are
+/// decided here, from the row, so widening either needs a write no portal user has a path to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemedPortalLink {
+    /// The one organization a session opened from this link may see.
+    pub organization_id: OrganizationId,
+    /// The one surface it may reach.
+    pub intent: String,
+}
+
+/// Everything the portal-link mint needs, bundled so the repository method stays within the
+/// readable-argument-count lint (issue #52).
+#[derive(Debug, Clone, Copy)]
+pub struct NewPortalLink<'a> {
+    /// The `plk_` identifier to give it.
+    pub id: &'a PortalLinkId,
+    /// The ONE organization a session opened from this link may see.
+    pub organization_id: &'a OrganizationId,
+    /// The ONE surface it may reach. The column's CHECK pins the accepted set.
+    pub intent: &'a str,
+    /// SHA-256 of the bearer value that will be in the URL. The value itself is never stored.
+    pub token_digest: &'a [u8],
+}
+
+/// The WRITE side of the self-service portal entry links (issue #140).
+pub struct ActingPortalLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingPortalLinkRepo<'_> {
+    /// Mint a portal link.
+    ///
+    /// AUDITED, because this is where a management principal decides that somebody outside this
+    /// deployment may configure an organization. The detail records the organization and the
+    /// intent -- the two boundaries the resulting session has -- and never the token.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or the organization is out of scope, or the
+    /// organization does not exist here; [`StoreError::Conflict`] if the id is already taken;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn mint(
+        &self,
+        env: &Env,
+        spec: NewPortalLink<'_>,
+        created_at_micros: i64,
+        expires_at_micros: i64,
+    ) -> Result<(), StoreError> {
+        self.mint_with_event(env, spec, created_at_micros, expires_at_micros, None)
+            .await
+    }
+
+    /// Mint a portal link and announce it on the event stream.
+    ///
+    /// IN THE SAME TRANSACTION AS THE ROW, which is the whole reason the event is a parameter
+    /// here rather than a second call the handler makes afterwards. A link that exists and was
+    /// never announced is exactly the state an integrator watching the stream cannot detect: the
+    /// authority is live, somebody outside the deployment holds it, and no receiver was told.
+    ///
+    /// THE TOKEN IS NOT ON THE WIRE, and neither is its digest. The digest verifies precisely as
+    /// well as the token does, so putting it on the stream that announces the link exists would
+    /// hand every receiver the credential -- the same reason `api_key.created` carries neither.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mint`].
+    pub async fn mint_with_event(
+        &self,
+        env: &Env,
+        spec: NewPortalLink<'_>,
+        created_at_micros: i64,
+        expires_at_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if spec.id.scope() != self.scope || spec.organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let id = *spec.id;
+        let scope = self.scope;
+        let organization_id = spec.organization_id.to_string();
+        let intent = spec.intent.to_owned();
+        let digest = spec.token_digest.to_vec();
+        let detail = format!("organization={organization_id} intent={intent}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::PortalLinkMint,
+                target: &id,
+            },
+            async move |tx| {
+                // THE ORGANIZATION IS CHECKED IN THE STATEMENT. A link naming an organization
+                // that does not exist here would mint an authority pointing at nothing, and the
+                // redemption would answer the same uniform not-found as a forged link -- so the
+                // vendor would learn only at the customer's expense.
+                let inserted = sqlx::query(
+                    "INSERT INTO portal_links \
+                     (id, tenant_id, environment_id, organization_id, intent, token_digest, \
+                      created_at, expires_at) \
+                     SELECT $1, $2, $3, $4, $5, $6, \
+                            TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                            TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval \
+                     WHERE EXISTS (SELECT 1 FROM organizations \
+                                   WHERE tenant_id = $2 AND environment_id = $3 AND id = $4 \
+                                     AND deleted_at IS NULL)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&intent)
+                .bind(&digest)
+                .bind(created_at_micros)
+                .bind(expires_at_micros)
+                .execute(&mut **tx)
+                .await;
+                match inserted {
+                    Ok(result) if result.rows_affected() == 0 => return Err(StoreError::NotFound),
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
+                }
+                // ONLY ON THE ARM THAT ACTUALLY INSERTED. The two refusals above return before
+                // reaching this, so a mint that named a missing organization or lost an id race
+                // announces nothing -- an event for a link that does not exist would have every
+                // receiver reacting to an authority nobody holds.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+}
+
+/// The self-service portal entry links for a scope (issue #140).
+pub struct PortalLinkRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl PortalLinkRepo<'_> {
+    /// Redeem a link exactly once, answering what it authorises.
+    ///
+    /// # One statement, because two would be a race
+    ///
+    /// The check and the consumption are one conditional UPDATE: `WHERE consumed_at IS NULL AND
+    /// expires_at > now AND token_digest = $`. Two requests presenting one link therefore produce
+    /// exactly one winner, and the loser cannot tell that from a link that never existed -- which
+    /// is what "single-use" has to mean under concurrency. A read-then-write would admit both,
+    /// and the window is exactly the one an attacker replaying a captured link is aiming at.
+    ///
+    /// THE DIGEST IS IN THE `WHERE` CLAUSE rather than compared afterwards, so a caller holding
+    /// the id but not the token consumes nothing: a wrong token leaves the row untouched and
+    /// answers exactly as an unknown id does.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no live unconsumed link of that id and token belongs to this
+    /// scope: unknown, expired, already used, or the wrong token. The four are deliberately
+    /// indistinguishable -- telling them apart would tell somebody replaying a captured link
+    /// whether their first attempt worked. [`StoreError::Database`] otherwise.
+    pub async fn redeem(
+        &self,
+        id: &PortalLinkId,
+        token_digest: &[u8],
+        now_unix_micros: i64,
+    ) -> Result<RedeemedPortalLink, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(
+            "UPDATE portal_links \
+             SET consumed_at = TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND token_digest = $4 \
+               AND consumed_at IS NULL \
+               AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
+             RETURNING organization_id, intent",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(token_digest)
+        .bind(now_unix_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let organization_id: String = row.get("organization_id");
+        Ok(RedeemedPortalLink {
+            // PARSED IN SCOPE ON THE WAY OUT, so a row that somehow held a foreign organization
+            // fails the read rather than handing a handler a boundary it would then trust.
+            organization_id: OrganizationId::parse_in_scope(&organization_id, &self.scope)
+                .map_err(|_| StoreError::NotFound)?,
+            intent: row.get("intent"),
+        })
     }
 }
 

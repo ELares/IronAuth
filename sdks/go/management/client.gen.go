@@ -302,6 +302,13 @@ func (c *Client) CreatePermission(tenant_id string, environment_id string, query
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/permissions", query, body)
 }
 
+// CreatePortalLink performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links.
+//
+// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links`: mint a link.
+func (c *Client) CreatePortalLink(tenant_id string, environment_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/portal-links", query, body)
+}
+
 // CreateProjectGrant performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants.
 //
 // createProjectGrant.
@@ -1329,6 +1336,13 @@ func (c *Client) ListScimConnections(tenant_id string, environment_id string, or
 // `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`.
 func (c *Client) ListScimPushConnections(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-push-connections", query, nil)
+}
+
+// ListScimPushResources performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources.
+//
+// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources`.
+func (c *Client) ListScimPushResources(tenant_id string, environment_id string, organization_id string, connection_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/scim-push-connections/" + escape(connection_id) + "/resources", query, nil)
 }
 
 // ListSecrets performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets.
