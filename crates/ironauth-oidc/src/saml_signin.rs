@@ -69,9 +69,15 @@
 //! # What this does not do
 //!
 //! It does not consult `account_linking`, for the reason above. It does not capture upstream
-//! tokens: there are none, because SAML returns an assertion rather than a token grant. It does
+//! tokens: there are none, because SAML returns an assertion rather than a token grant.
+//!
+//! IT DOES APPLY THE BROKER OVERLAY NOW, and this paragraph used to say the opposite: "it does
 //! not apply the broker overlay, which reads an `ocn_` org connection this connection has no row
-//! in -- discovery routing is the change that gives SAML one.
+//! in -- discovery routing is the change that gives SAML one". Discovery routing landed, gave it
+//! one, and the sentence stayed -- so the module kept describing the gap while shipping the fix
+//! for it. What the overlay needs is the routed binding stamped on the user, and
+//! [`routed_binding`] re-derives it from the connection rather than trusting anything the
+//! browser carried across two hops.
 
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -236,6 +242,10 @@ pub(crate) async fn sign_in(
     //
     // THE KEY AND THE HANDLE ARE BUILT HERE, not inside the shared provisioner, because they are
     // the one thing the two federation protocols must NOT share. See [`saml_external_id`].
+    let Ok(org_connection) = routed_binding(state, scope, connection).await else {
+        return server_error();
+    };
+
     let external_id = saml_external_id(&connection.id.to_string(), &consumed.accepted.name_id);
     let handle = format!("saml:{}:{}", connection.id, consumed.accepted.name_id);
 
@@ -273,10 +283,20 @@ pub(crate) async fn sign_in(
         &handle,
         &trait_doc,
         schema_version,
-        // NO `ocn_` ORG CONNECTION. That column stamps the routed org connection a federated
-        // login came through, and a SAML connection has no such row today. The organization is
-        // recorded below, from the column the SAML connection carries.
-        None,
+        // THE ROUTED `ocn_` BINDING, RE-DERIVED FROM THE CONNECTION rather than carried. An
+        // earlier version passed `None` here with a comment saying a SAML connection had no such
+        // row -- true when it was written, and false from the change that let a routing rule
+        // name one. The consequence was not cosmetic: the binding carries the broker overlay
+        // columns, they are enforced from the USER'S stamped `org_connection`, and an unstamped
+        // user makes `requirement_for_session_org` return an empty requirement. So an operator
+        // could set `overlay_min_acr = mfa` on the very binding that routed the login and no
+        // MFA ceremony would ever run -- while the identical binding with a CONNECTOR upstream
+        // enforced it.
+        //
+        // RE-DERIVED, NOT CARRIED, because a SAML flow crosses the browser twice and anything it
+        // carries is attacker-chosen. The connection belongs to one organization by its own row,
+        // so the binding is discoverable from it.
+        org_connection.as_deref(),
     )
     .await
     {
@@ -347,6 +367,28 @@ pub(crate) async fn sign_in(
     }
 
     interaction::redirect_setting_cookie(consumed.relay_state.as_deref().unwrap_or("/"), &cookies)
+}
+
+/// The enabled org binding whose upstream is this connection, as a stamping id.
+///
+/// A STORE FAULT IS NOT "NO BINDING", which is why this answers `Result` rather than `Option`:
+/// failing open would silently drop a broker overlay the operator configured, and an unenforced
+/// MFA floor that looks like a working login is the defect the read exists to close.
+async fn routed_binding(
+    state: &OidcState,
+    scope: Scope,
+    connection: &SamlConnection,
+) -> Result<Option<String>, StoreError> {
+    Ok(state
+        .store()
+        .scoped(scope)
+        .org_connections()
+        // THE CONNECTION'S OWN ORGANIZATION, not just the connection. A binding in ANOTHER
+        // organization may name this connection -- nothing forbids it -- and stamping the user
+        // with that one applies a policy the routed organization never set.
+        .for_saml_connection(&connection.id, &connection.organization_id)
+        .await?
+        .map(|binding| binding.id.to_string()))
 }
 
 /// Who a provisioning CONFLICT actually names, or [`None`] if nobody who may sign in.

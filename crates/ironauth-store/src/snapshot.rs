@@ -264,9 +264,14 @@ pub struct ConnectorSnapshot {
 pub struct OrgConnectionSnapshot {
     /// The organization this binding belongs to.
     pub organization_id: String,
-    /// The connector describing the organization's upstream. Part of the stable
-    /// natural key the export orders by.
-    pub connector_id: String,
+    /// The connector describing the organization's upstream, absent when the upstream is a
+    /// SAML connection instead (issue #139). Part of the stable natural key the export orders by.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub connector_id: Option<String>,
+    /// The SAML connection describing the organization's upstream, absent when the upstream is a
+    /// connector. Exactly one of the two is present.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub saml_connection_id: Option<String>,
     /// The broker overlay minimum acr, if set (a later PR enforces it).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub overlay_min_acr: Option<String>,
@@ -833,8 +838,11 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
     // reason as the resources above.
     connector.sort_by(|a, b| a.connector_slug.cmp(&b.connector_slug));
 
-    // Organization-to-connector bindings (issue #77): secret-free per-environment
-    // config. Ordered by the stable (organization_id, connector_id) natural key.
+    // Organization-to-upstream bindings (issue #77, extended to SAML by issue #139):
+    // secret-free per-environment config. Ordered by the stable (organization_id, upstream)
+    // natural key, where upstream is whichever of connector_id / saml_connection_id is set --
+    // an earlier version of this comment named connector_id alone, which stopped being the key
+    // when a binding could name a connection instead.
     let mut org_connection: Vec<OrgConnectionSnapshot> = scoped
         .org_connections()
         .list_all()
@@ -843,6 +851,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         .map(|record| OrgConnectionSnapshot {
             organization_id: record.organization_id,
             connector_id: record.connector_id,
+            saml_connection_id: record.saml_connection_id,
             overlay_min_acr: record.overlay_min_acr,
             max_age_secs: record.max_age_secs,
             overlay_min_class: record.overlay_min_class,
@@ -850,9 +859,17 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             enabled: record.enabled,
         })
         .collect();
+    // THE UPSTREAM IS ONE KEY COMPONENT WHICHEVER SHAPE IT TAKES, so the sort reads whichever
+    // of the two is set rather than defaulting the absent one to "" -- which would make every
+    // SAML binding sort as though it had no upstream and order them among themselves by nothing.
     org_connection.sort_by(|a, b| {
-        (a.organization_id.as_str(), a.connector_id.as_str())
-            .cmp(&(b.organization_id.as_str(), b.connector_id.as_str()))
+        let upstream = |row: &OrgConnectionSnapshot| {
+            row.connector_id
+                .clone()
+                .or_else(|| row.saml_connection_id.clone())
+                .unwrap_or_default()
+        };
+        (a.organization_id.clone(), upstream(a)).cmp(&(b.organization_id.clone(), upstream(b)))
     });
 
     // Routing rules (issue #77): the user selector travels as an OPAQUE base64 blind
@@ -1295,9 +1312,10 @@ const CONNECTOR_KEYS: [&str; 3] = ["connector_slug", "definition", "enabled"];
 
 /// Every key a snapshot `org_connection` element may carry (issue #77). No secret
 /// slot: a binding holds no secret material.
-const ORG_CONNECTION_KEYS: [&str; 7] = [
+const ORG_CONNECTION_KEYS: [&str; 8] = [
     "organization_id",
     "connector_id",
+    "saml_connection_id",
     "overlay_min_acr",
     "max_age_secs",
     "overlay_min_class",
@@ -1573,7 +1591,20 @@ fn validate_resource(
         ResourceType::OrgConnection => {
             reject_unknown_keys(object, &ORG_CONNECTION_KEYS, None, path, violations);
             require_nonempty_string(object, "organization_id", path, violations);
-            require_nonempty_string(object, "connector_id", path, violations);
+            // EXACTLY ONE UPSTREAM, WHICH IS WHAT THE TABLE'S OWN CHECK SAYS (migration 0201).
+            // Requiring `connector_id` unconditionally -- as this did while a binding could only
+            // name a connector -- turned every SAML binding into a violation the moment the
+            // exporter learned to emit one, so a single SAML customer in an environment made its
+            // OWN snapshot unimportable and blocked promotion for everything else in it.
+            let connector = nonempty_str(object, "connector_id");
+            let saml = nonempty_str(object, "saml_connection_id");
+            if connector.is_some() == saml.is_some() {
+                violations.push(SnapshotViolation::new(
+                    format!("{path}/connector_id"),
+                    "exactly one of connector_id and saml_connection_id must be a non-empty \
+                     string",
+                ));
+            }
         }
         ResourceType::RoutingRule => {
             reject_unknown_keys(object, &ROUTING_RULE_KEYS, None, path, violations);
@@ -1989,6 +2020,22 @@ fn validate_secret_field(
             "a secret reference must carry a non-empty \"reference\" string",
         )),
     }
+}
+
+/// The field's value when it is a non-empty string, or [`None`] when it is absent, null, empty or
+/// not a string.
+///
+/// FOR A FIELD WHOSE PRESENCE IS CONDITIONAL, where `require_nonempty_string` cannot be used
+/// because absence is not itself a violation -- the violation is the COMBINATION, and only the
+/// caller knows which combinations are legal.
+fn nonempty_str<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a str> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 /// Require a non-empty string field `field` on `object`, else push a violation.

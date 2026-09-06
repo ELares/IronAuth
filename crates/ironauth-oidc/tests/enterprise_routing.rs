@@ -133,6 +133,15 @@ fn router(harness: &Harness, runtime: &Arc<FederationRuntime>) -> Router {
     oidc_router(harness.state().clone().with_federation(Arc::clone(runtime)))
 }
 
+/// The router a DEFAULT deployment serves: no federation runtime installed.
+///
+/// `oidc.federation.enabled` is false unless an operator turns it on, and `with_federation` is
+/// the only setter -- so this is what most deployments actually run, and it is the shape SAML
+/// routing must work under.
+fn router_without_federation(harness: &Harness) -> Router {
+    oidc_router(harness.state().clone())
+}
+
 /// Seed a connector at `slug` pointing at the mock upstream, an organization, and a
 /// binding between them (with NO broker overlay); return the binding id.
 async fn seed_binding(harness: &Harness, slug: &str) -> OrgConnectionId {
@@ -202,7 +211,7 @@ async fn seed_binding_with_overlay(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr,
                 max_age_secs,
                 overlay_min_class,
@@ -276,7 +285,7 @@ async fn seed_capture_binding(harness: &Harness, slug: &str) -> OrgConnectionId 
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -410,7 +419,12 @@ async fn seed_rule(harness: &Harness, selector: RoutingSelector<'_>, ocn_id: &Or
 
 /// A URL-encoded `POST /login` form body for `identifier` returning to a local authorize.
 fn login_form(harness: &Harness, identifier: &str) -> String {
-    let return_to = format!("/authorize?client_id={}", harness.client_id());
+    // TWO PARAMETERS, NOT ONE. A single-parameter resume contains no `&`, so a redirect that
+    // failed to percent-encode it is indistinguishable from one that did: everything still
+    // arrives. The second parameter is what makes an unencoded resume observably truncated --
+    // the START endpoint parses `&scope=openid` as its OWN query and the recorded RelayState
+    // loses it.
+    let return_to = format!("/authorize?client_id={}&scope=openid", harness.client_id());
     format!(
         "identifier={}&password=irrelevant&return_to={}",
         encode(identifier),
@@ -778,7 +792,7 @@ async fn per_app_and_per_user_rules_override_a_domain_rule() {
                 1_000_000,
                 NewOrgConnection {
                     organization_id: &org,
-                    connector_id: &connector,
+                    upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector),
                     overlay_min_acr: None,
                     max_age_secs: None,
                     overlay_min_class: None,
@@ -829,6 +843,220 @@ async fn per_app_and_per_user_rules_override_a_domain_rule() {
         location(&user_routed).contains("/federation/override/authorize"),
         "the user rule overrides the app and domain rules: {}",
         location(&user_routed)
+    );
+}
+
+/// Seed a SAML connection and an org binding that routes to it (issue #139, criterion 5).
+///
+/// THE ORGANIZATION IS THE CONNECTION'S OWN, which is the coupling that makes a SAML binding
+/// safe without a routing token: an OIDC binding pairs an organization with a connector and the
+/// pair travels in the redirect, so it needs a MAC; a SAML connection carries its organization
+/// in its own row, so there is no pair to swap.
+async fn seed_saml_binding(harness: &Harness, active: bool) -> (OrgConnectionId, String) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let organization = ironauth_store::OrganizationId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &organization, 1_000_000, "Globex", None)
+        .await
+        .expect("create organization");
+
+    let connection = ironauth_store::SamlConnectionId::generate(&env, &scope);
+    let acting = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env));
+    acting
+        .saml_connections()
+        .create(
+            &env,
+            ironauth_store::NewSamlConnection {
+                id: &connection,
+                organization_id: &organization,
+                display_name: "Okta",
+                idp_entity_id: "urn:idp",
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/sp",
+                acs_url: "https://ironauth.example/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+    if !active {
+        acting
+            .saml_connections()
+            .set_active(&env, &connection, false, None)
+            .await
+            .expect("disable the connection");
+    }
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &organization,
+                upstream: ironauth_store::OrgConnectionUpstream::Saml(&connection),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create the SAML org binding");
+    (ocn_id, connection.to_string())
+}
+
+#[tokio::test]
+async fn a_domain_rule_can_route_to_a_saml_connection() {
+    // #139 CRITERION 5: "SAML connections participate in domain-based discovery routing
+    // identically to OIDC connections". Identically means the SELECTOR side -- the same rules,
+    // the same precedence, the same verified-domain gate, resolved through the same binding.
+    // What differs is only where the browser is sent, because a SAML flow begins with an
+    // AuthnRequest this deployment signs rather than an authorization request it brokers.
+    //
+    // Before this change a SAML customer could be signed in but never ROUTED: typing their email
+    // found no rule that could name their connection, so the operator's only option was to hand
+    // every user a deep link.
+    let harness = Harness::start().await;
+    let (ocn_id, connection) = seed_saml_binding(&harness, true).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let runtime = build_runtime(([127, 0, 0, 1], 1).into());
+
+    let response = post_login(
+        router(&harness, &runtime),
+        &harness,
+        &format!("ada@{ROUTED_DOMAIN}"),
+    )
+    .await;
+    let location = location(&response);
+
+    // THE SAML START ENDPOINT FOR THAT CONNECTION, not the federation authorize leg.
+    assert!(
+        location.contains(&format!("/saml/start/{connection}")),
+        "a domain rule naming a SAML connection did not route to it: {location}"
+    );
+    assert!(
+        !location.contains("/federation/"),
+        "a SAML route went through the OIDC broker: {location}"
+    );
+    // AND IT CARRIES THE RESUME TARGET, PERCENT-ENCODED. A non-empty check is satisfied by an
+    // UNencoded value too, and the fixture's resume has a single parameter -- so dropping the
+    // encoding entirely left this green. What an unencoded resume costs is the rest of itself:
+    // the second parameter onward is parsed as part of the START endpoint's own query and never
+    // reaches the recorded RelayState.
+    let encoded = param(&location, "return_to");
+    assert!(
+        encoded.contains("%26scope%3Dopenid"),
+        "the resume target's second parameter was not encoded into it, so the start endpoint \
+         will parse it as its own query and the recorded RelayState will lose it: {location}"
+    );
+    // AND NO ROUTING TOKEN, which would authenticate a pairing that does not exist here: the
+    // connection names its own organization, so there is no second value a browser could swap.
+    assert!(
+        !location.contains("routing="),
+        "a SAML route minted a connector routing token: {location}"
+    );
+}
+
+#[tokio::test]
+async fn saml_routing_does_not_need_the_oidc_federation_runtime() {
+    // THE GATE WAS IN THE WRONG PLACE. An earlier version checked `state.federation()` before
+    // either branch, so SAML routing was silently off on every deployment that had not enabled
+    // OIDC federation -- which is the default, and which has nothing to do with SAML: the SAML
+    // routes are mounted unconditionally and need no runtime at all. The symptom was not an
+    // error anybody could see; the login simply fell through to the local prompt.
+    let harness = Harness::start().await;
+    let (ocn_id, connection) = seed_saml_binding(&harness, true).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+
+    // THE ROUTER WITHOUT A FEDERATION RUNTIME, which is what a default deployment serves.
+    let router = router_without_federation(&harness);
+    let response = post_login(router, &harness, &format!("ada@{ROUTED_DOMAIN}")).await;
+    let location = location(&response);
+    assert!(
+        location.contains(&format!("/saml/start/{connection}")),
+        "SAML routing was gated behind the OIDC federation runtime: {location}"
+    );
+}
+
+#[tokio::test]
+async fn a_connector_route_still_needs_the_federation_runtime() {
+    // THE OTHER HALF OF MOVING THE GATE. Round 1 moved `state.federation()` off the top of the
+    // function and onto the CONNECTOR branch, and pinned only that SAML no longer needs it --
+    // so deleting the relocated check entirely would have left the suite green while routing
+    // users to a `/federation/{slug}/authorize` that answers a uniform not-found, stranding
+    // them instead of falling back to the local prompt.
+    let harness = Harness::start().await;
+    let ocn_id = seed_binding(&harness, "acme").await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+
+    let response = post_login(
+        router_without_federation(&harness),
+        &harness,
+        &format!("ada@{ROUTED_DOMAIN}"),
+    )
+    .await;
+    let routed = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|location| location.contains("/federation/"));
+    assert!(
+        !routed,
+        "a connector route was taken with no federation runtime installed, so the user is sent \
+         to an endpoint that answers not-found"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_saml_connection_falls_back_to_the_local_prompt() {
+    // A DISABLED CONNECTION IS NOT A ROUTE, exactly as a disabled connector is not. The check
+    // is `find_active`, so an operator switching a connection off returns their users to the
+    // local prompt rather than sending them to an endpoint that will turn them away -- which
+    // is an availability property, not a policy one, and the same one the OIDC branch has.
+    let harness = Harness::start().await;
+    let (ocn_id, connection) = seed_saml_binding(&harness, false).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let runtime = build_runtime(([127, 0, 0, 1], 1).into());
+
+    let response = post_login(
+        router(&harness, &runtime),
+        &harness,
+        &format!("ada@{ROUTED_DOMAIN}"),
+    )
+    .await;
+    let routed = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|location| location.contains(&format!("/saml/start/{connection}")));
+    assert!(
+        !routed,
+        "a disabled SAML connection still routed a login to itself"
     );
 }
 
@@ -918,7 +1146,7 @@ async fn seed_connector_and_binding(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -958,7 +1186,7 @@ async fn seed_extra_binding(harness: &Harness, connector_id: &ConnectorId) -> Or
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -1721,7 +1949,7 @@ async fn seed_github_binding_with_overlay(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class,

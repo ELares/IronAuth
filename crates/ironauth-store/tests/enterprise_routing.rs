@@ -18,8 +18,8 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
-    NewRoutingRule, OrgConnectionId, OrganizationId, RoutingRuleId, RoutingSelector, Scope,
-    StoreError, export_snapshot,
+    NewRoutingRule, NewSamlConnection, OrgConnectionId, OrgConnectionUpstream, OrganizationId,
+    RoutingRuleId, RoutingSelector, SamlConnectionId, Scope, StoreError, export_snapshot,
 };
 
 const CONNECTOR_SLUG: &str = "acme-oidc";
@@ -40,6 +40,156 @@ fn caps() -> ConnectorCapabilities<'static> {
         logout_propagation: false,
         email_verified_trust: "untrusted",
     }
+}
+
+/// Create a SAML connection owned by `organization`.
+async fn seed_saml_connection(
+    db: &TestDatabase,
+    env: &Env,
+    scope: ironauth_store::Scope,
+    organization: &OrganizationId,
+) -> SamlConnectionId {
+    let connection = SamlConnectionId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .saml_connections()
+        .create(
+            env,
+            NewSamlConnection {
+                id: &connection,
+                organization_id: organization,
+                display_name: "Okta",
+                idp_entity_id: "urn:idp",
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/sp",
+                acs_url: "https://ironauth.example/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+    connection
+}
+
+#[tokio::test]
+async fn a_binding_cannot_name_another_organizations_saml_connection() {
+    // THE READ THE SAML SIGN-IN PATH STAMPS FROM. It re-derives the routed `ocn_` binding from
+    // the connection, and an earlier version matched on `(tenant, environment,
+    // saml_connection_id, enabled)` alone -- while claiming "at most one, by the partial unique
+    // index migration 0201 adds". That index is keyed PER ORGANIZATION, and nothing ties
+    // `org_connections.saml_connection_id` to the connection's owner, so a second organization
+    // could bind the same connection and the read matched both rows. Whichever the planner
+    // yielded first was stamped on the user, so a policy from an organization they are not a
+    // member of applied and the routed organization's did not.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let control = db.control_store();
+
+    let owner = OrganizationId::generate(&env, &scope);
+    let stranger = OrganizationId::generate(&env, &scope);
+    for (id, name) in [(&owner, "Globex"), (&stranger, "Initech")] {
+        control
+            .management()
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .organizations(scope)
+            .create(&env, id, 1_000_000, name, None)
+            .await
+            .expect("create organization");
+    }
+
+    // THE CONNECTION BELONGS TO `owner`, by its own NOT NULL column.
+    let connection = seed_saml_connection(&db, &env, scope, &owner).await;
+
+    // A BINDING IN THE STRANGER'S ORGANIZATION IS REFUSED, which is what makes the read below
+    // well-posed rather than merely answered. Two attempts to cope with the pairing in the READ
+    // each broke: resolving by connection alone stamped whichever organization's binding the
+    // planner yielded, and constraining to the connection's owner then dropped the overlay of
+    // the binding the ROUTING RULE had actually matched. Migration 0202 refuses the pairing
+    // where it is written instead.
+    let refused = control
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &OrgConnectionId::generate(&env, &scope),
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &stranger,
+                upstream: OrgConnectionUpstream::Saml(&connection),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a binding named a SAML connection owned by another organization: {refused:?}"
+    );
+
+    // AND THE OWNER'S OWN BINDING IS ACCEPTED, so the refusal above is the pairing and not the
+    // call shape.
+    let mut ids = Vec::new();
+    for organization in [&owner] {
+        let ocn_id = OrgConnectionId::generate(&env, &scope);
+        control
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .org_connections()
+            .create(
+                &env,
+                &ocn_id,
+                1_000_000,
+                NewOrgConnection {
+                    organization_id: organization,
+                    upstream: OrgConnectionUpstream::Saml(&connection),
+                    overlay_min_acr: None,
+                    max_age_secs: None,
+                    overlay_min_class: None,
+                    capture_upstream_tokens: false,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("create the binding");
+        ids.push(ocn_id);
+    }
+    // THE READ FINDS THE OWNER'S BINDING, which is now the only one that can exist for this
+    // connection -- so the organization predicate and the constraint agree by construction
+    // rather than one of them compensating for the other's absence.
+    let scoped = db.store().scoped(scope);
+    let resolved = scoped
+        .org_connections()
+        .for_saml_connection(&connection, &owner)
+        .await
+        .expect("read")
+        .expect("the owner's binding");
+    assert_eq!(resolved.id, ids[0]);
+    assert_eq!(resolved.organization_id, owner.to_string());
+
+    // AND ASKING AS THE STRANGER FINDS NOTHING, which is the half that would have been a wrong
+    // ANSWER rather than an absence if the pairing were writable.
+    assert!(
+        scoped
+            .org_connections()
+            .for_saml_connection(&connection, &stranger)
+            .await
+            .expect("read")
+            .is_none(),
+        "a connection resolved a binding in an organization that does not own it"
+    );
 }
 
 /// Seed an organization, a connector, and a binding between them; return the binding id.
@@ -90,7 +240,7 @@ async fn seed_binding(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -267,7 +417,7 @@ async fn a_second_domain_mapping_is_rejected_by_the_per_scope_unique_index() {
                 1_000_000,
                 NewOrgConnection {
                     organization_id: &org_b,
-                    connector_id: &connector_b,
+                    upstream: OrgConnectionUpstream::Connector(&connector_b),
                     overlay_min_acr: None,
                     max_age_secs: None,
                     overlay_min_class: None,
@@ -525,7 +675,7 @@ async fn the_broker_overlay_columns_round_trip_through_a_binding()
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: Some("urn:ironauth:acr:mfa"),
                 max_age_secs: Some(3_600),
                 overlay_min_class: Some("passkey"),
@@ -561,7 +711,7 @@ async fn the_broker_overlay_columns_round_trip_through_a_binding()
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: Some("not_a_rung"),

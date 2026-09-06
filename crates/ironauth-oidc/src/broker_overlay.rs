@@ -19,11 +19,19 @@
 //! the session subject's STAMPED org connection ([`requirement_for_session_org`]). That
 //! gate re-runs on every authorization request and is the SINGLE non-bypassable choke
 //! point, so a user cannot skip a federation-callback redirect and reach `/authorize`
-//! directly at the unranked federated `acr`. The stamped `org_connection_id` was written
-//! by PR 1 FROM the consumed, single-use correlation row (never a browser value), so the
-//! overlay source is server-authenticated. The federation callback ALSO composes and
+//! directly at the unranked federated `acr`. The federation callback ALSO composes and
 //! evaluates the overlay right after establishing the session, to send the user STRAIGHT
 //! to the required ceremony (a better path than bouncing through `/authorize` first).
+//!
+//! # Two writers of the stamp this trusts, and why both are server-authenticated
+//!
+//! The overlay is only as trustworthy as `users.org_connection_id`, and this paragraph named ONE
+//! writer until issue #139 added a second. The FEDERATION CALLBACK writes it from the consumed,
+//! single-use correlation row. The SAML ASSERTION CONSUMER writes it from the org binding it
+//! re-derives from the CONNECTION the response was posted to -- a SAML flow crosses the browser
+//! twice, so a carried value would be attacker-chosen, and the read is constrained to the
+//! connection's own organization so another organization's binding cannot supply the policy.
+//! Neither is a browser value, which is the property this module depends on.
 //!
 //! # Honesty
 //!
@@ -436,7 +444,8 @@ mod tests {
         OrgConnectionRecord {
             id: OrgConnectionId::generate(&env, &scope),
             organization_id: "org_x".to_owned(),
-            connector_id: "cnr_x".to_owned(),
+            connector_id: Some("cnr_x".to_owned()),
+            saml_connection_id: None,
             overlay_min_acr: overlay_min_acr.map(str::to_owned),
             max_age_secs,
             overlay_min_class: overlay_min_class.map(str::to_owned),

@@ -89,7 +89,7 @@ async fn seed_connection(h: &Harness, tenant: &str, environment: &str) -> String
             1_000_000,
             NewOrgConnection {
                 organization_id: &org,
-                connector_id: &connector,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,

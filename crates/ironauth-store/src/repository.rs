@@ -36996,8 +36996,16 @@ pub struct OrgConnectionRecord {
     pub id: OrgConnectionId,
     /// The `org_` organization this binding belongs to.
     pub organization_id: String,
-    /// The `cnr_` connector describing the organization's upstream.
-    pub connector_id: String,
+    /// The `cnr_` connector describing the organization's upstream, or [`None`] when this
+    /// binding's upstream is a SAML connection instead.
+    ///
+    /// EXACTLY ONE OF THIS AND [`Self::saml_connection_id`] IS SET, enforced by the schema
+    /// (`org_connections_one_upstream`, migration 0201) rather than by convention -- so a reader
+    /// matching on the pair has two arms and no third to guess at.
+    pub connector_id: Option<String>,
+    /// The `smc_` SAML connection describing the organization's upstream, or [`None`] when this
+    /// binding names a connector (issue #139).
+    pub saml_connection_id: Option<String>,
     /// The broker overlay minimum acr (a later PR enforces it), or [`None`].
     pub overlay_min_acr: Option<String>,
     /// The broker overlay maximum authentication age in seconds, or [`None`].
@@ -37053,7 +37061,8 @@ pub struct RoutingRuleRecord {
 }
 
 /// The columns an org-connection read projects (issue #77). No secret column exists.
-const ORG_CONNECTION_READ_COLUMNS: &str = "id, organization_id, connector_id, overlay_min_acr, \
+const ORG_CONNECTION_READ_COLUMNS: &str = "id, organization_id, connector_id, \
+     saml_connection_id, overlay_min_acr, \
      max_age_secs, overlay_min_class, capture_upstream_tokens, enabled, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
      (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
@@ -37076,6 +37085,7 @@ fn org_connection_record_from_row(
         id,
         organization_id: row.get("organization_id"),
         connector_id: row.get("connector_id"),
+        saml_connection_id: row.get("saml_connection_id"),
         overlay_min_acr: row.get("overlay_min_acr"),
         // The column is `integer` (INT4); widen to i64 for the record so the enforcement
         // path composes it as an age window without a narrowing cast at every read site.
@@ -37332,6 +37342,65 @@ impl OrgConnectionRepo<'_> {
         }
     }
 
+    /// The ENABLED binding whose upstream is this SAML connection, or [`None`].
+    ///
+    /// # Why the sign-in path re-derives this rather than carrying it
+    ///
+    /// A SAML flow crosses the browser twice -- out to the identity provider, back to the
+    /// assertion consumer -- and anything the browser carries is a value an attacker chooses.
+    /// The OIDC branch solves that with a keyed MAC over the routed `ocn_`; the SAML branch does
+    /// not need one, because a connection belongs to exactly one organization by its own row and
+    /// the binding that routes to it is discoverable FROM the connection. So the consumer looks
+    /// it up here instead of trusting a parameter.
+    ///
+    /// WHAT IT IS FOR: the binding carries the broker overlay columns (`overlay_min_acr`,
+    /// `overlay_min_class`, `max_age_secs`), and those are enforced from the USER's stamped
+    /// `org_connection`. Without this read the columns are accepted on write and silently never
+    /// enforced -- an operator sets an MFA floor on the binding that routes their people, and no
+    /// ceremony ever runs.
+    ///
+    /// THE ORGANIZATION IS PART OF THE QUERY, and an earlier version left it out while claiming
+    /// "at most one, by the partial unique index migration 0201 adds". That index is keyed on
+    /// `(tenant, environment, ORGANIZATION, saml_connection_id)`, so it is unique PER
+    /// ORGANIZATION -- nothing stops a second organization binding the same connection, because
+    /// no constraint ties `org_connections.saml_connection_id` to the connection's owner. The
+    /// read then matched both rows, `fetch_optional` kept whichever the planner yielded first,
+    /// and the user was stamped with a binding belonging to an organization they are not a
+    /// member of: its overlay applied and the routed organization's did not. That is the exact
+    /// defect this function was added to close, reachable through the function itself.
+    ///
+    /// Constraining to the connection's OWN organization makes the index's guarantee the query's
+    /// guarantee, so at most one row can match.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn for_saml_connection(
+        &self,
+        saml_connection_id: &SamlConnectionId,
+        organization_id: &OrganizationId,
+    ) -> Result<Option<OrgConnectionRecord>, StoreError> {
+        if saml_connection_id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND saml_connection_id = $3 \
+             AND organization_id = $4 AND enabled"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(saml_connection_id.to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| org_connection_record_from_row(row, self.scope))
+            .transpose()
+    }
+
     /// Every binding in the scope, ordered by the stable `(created_at, id)` key, for
     /// the config-snapshot export (issue #77). Scope-bound.
     ///
@@ -37510,14 +37579,30 @@ impl RoutingRuleRepo<'_> {
     }
 }
 
-/// A new organization-to-connector binding (issue #77). The broker overlay policy
-/// columns ship NULLABLE and unset in PR 1; a later PR fills and enforces them.
+/// Which upstream an organization binding routes to (issue #139).
+///
+/// A SUM RATHER THAN TWO OPTIONS, because the schema says exactly one is set and a caller
+/// holding two `Option`s can express four states while `num_nonnulls(...) = 1` accepts two --
+/// so two of them are writes the database refuses. An earlier version of this sentence said
+/// three, which cannot be reconciled with a two-variant enum by anybody checking. The sum makes
+/// the refused pair unwritable rather than merely rejected.
+#[derive(Debug, Clone, Copy)]
+pub enum OrgConnectionUpstream<'a> {
+    /// A `cnr_` OIDC or OAuth 2.0 connector.
+    Connector(&'a ConnectorId),
+    /// A `smc_` SAML connection.
+    Saml(&'a SamlConnectionId),
+}
+
+/// A new organization-to-an-upstream binding (issue #77, extended to SAML by issue #139),
+/// bundled so the repository method stays within the readable-argument-count lint (issue #52).
+/// The broker overlay policy columns ship NULLABLE.
 #[derive(Debug, Clone, Copy)]
 pub struct NewOrgConnection<'a> {
     /// The organization this binding belongs to (validated in scope on write).
     pub organization_id: &'a OrganizationId,
-    /// The connector describing the organization's upstream (validated in scope).
-    pub connector_id: &'a ConnectorId,
+    /// The upstream this binding routes to: a connector, or a SAML connection (issue #139).
+    pub upstream: OrgConnectionUpstream<'a>,
     /// The broker overlay minimum `acr` this binding layers on top of the upstream
     /// (issue #77 PR 2), or [`None`] for no `acr` floor. Persisted verbatim; the
     /// federation callback and the authorization step-up gate canonicalize and enforce
@@ -37582,9 +37667,12 @@ impl ActingOrgConnectionRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id, organization, or connector is out of scope;
-    /// [`StoreError::Conflict`] if a binding for the same (organization, connector)
-    /// already exists in this scope; [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::NotFound`] if the id, the organization, or the upstream is out of scope;
+    /// [`StoreError::Conflict`] if a binding for the same (organization, upstream) already
+    /// exists in this scope, OR -- for a SAML upstream -- if the connection belongs to a
+    /// DIFFERENT organization than the binding, which migration 0202 refuses structurally
+    /// because such a pairing has no meaning and every reader of it would have to guess which
+    /// organization the binding is really about; [`StoreError::Database`] otherwise.
     pub async fn create(
         &self,
         env: &Env,
@@ -37592,22 +37680,38 @@ impl ActingOrgConnectionRepo<'_> {
         created_at_micros: i64,
         params: NewOrgConnection<'_>,
     ) -> Result<(), StoreError> {
+        let upstream_in_scope = match params.upstream {
+            OrgConnectionUpstream::Connector(connector) => connector.scope() == self.scope,
+            OrgConnectionUpstream::Saml(connection) => connection.scope() == self.scope,
+        };
         if id.scope() != self.scope
             || params.organization_id.scope() != self.scope
-            || params.connector_id.scope() != self.scope
+            || !upstream_in_scope
         {
             return Err(StoreError::NotFound);
         }
         let id = *id;
         let scope = self.scope;
         let organization_id = params.organization_id.to_string();
-        let connector_id = params.connector_id.to_string();
+        // EXACTLY ONE IS BOUND AND THE OTHER IS NULL, which is what the schema's
+        // `org_connections_one_upstream` CHECK requires. Deriving both from one enum means the
+        // pair cannot drift out of that shape between here and the statement.
+        let (connector_id, saml_connection_id) = match params.upstream {
+            OrgConnectionUpstream::Connector(connector) => (Some(connector.to_string()), None),
+            OrgConnectionUpstream::Saml(connection) => (None, Some(connection.to_string())),
+        };
         let overlay_min_acr = params.overlay_min_acr.map(str::to_owned);
         let max_age_secs = params.max_age_secs;
         let overlay_min_class = params.overlay_min_class.map(str::to_owned);
         let capture = params.capture_upstream_tokens;
         let enabled = params.enabled;
-        let detail = format!("organization={organization_id} connector={connector_id}");
+        let detail = match (&connector_id, &saml_connection_id) {
+            (Some(connector), _) => format!("organization={organization_id} connector={connector}"),
+            (_, Some(connection)) => format!("organization={organization_id} saml={connection}"),
+            // UNREACHABLE BY CONSTRUCTION: the match above binds exactly one. Written as a
+            // sentence rather than a panic, because an audit detail is not worth aborting over.
+            (None, None) => format!("organization={organization_id}"),
+        };
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,
@@ -37621,17 +37725,18 @@ impl ActingOrgConnectionRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO org_connections \
                      (id, tenant_id, environment_id, organization_id, connector_id, \
-                      overlay_min_acr, max_age_secs, overlay_min_class, \
+                      saml_connection_id, overlay_min_acr, max_age_secs, overlay_min_class, \
                       capture_upstream_tokens, enabled, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&organization_id)
-                .bind(&connector_id)
+                .bind(connector_id.as_deref())
+                .bind(saml_connection_id.as_deref())
                 .bind(overlay_min_acr.as_deref())
                 .bind(max_age_secs)
                 .bind(overlay_min_class.as_deref())

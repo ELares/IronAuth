@@ -416,26 +416,31 @@ pub(crate) fn passkey_nonce(state: &OidcState) -> String {
 }
 
 /// Route a submitted login identifier to its organization's upstream provider (issue
-/// #77), returning the 302 to `federation/{slug}/authorize` when a routing rule matches,
-/// or [`None`] to fall through to the ordinary LOCAL login (fail-safe to local).
+/// #77), returning the 302 to the matched upstream when a routing rule matches, or [`None`] to
+/// fall through to the ordinary LOCAL login (fail-safe to local).
 ///
-/// The pure precedence decision (per-user > per-app > per-domain) lives in
-/// [`crate::routing`]; this function is the I/O side: it reads the three candidate rules
-/// through the scope's row-level-security-forced repositories, resolves the winner, and
-/// loads its org connection and connector to build the redirect. Any store error, an
-/// absent federation runtime, a disabled binding or connector, or no match yields
-/// [`None`] so the caller keeps serving the local prompt. The routed `ocn_` id is
-/// threaded to the authorize leg, which writes it into the correlation row; the browser
-/// therefore never chooses the organization the callback provisions against.
+/// # Two upstreams, and only one of them needs the federation runtime
+///
+/// A matched binding names either a `cnr_` connector, whose redirect goes to
+/// `federation/{slug}/authorize`, or a `smc_` SAML connection (issue #139), whose redirect goes
+/// to `saml/start/{connection}`. AN EARLIER VERSION OF THIS FUNCTION CHECKED
+/// `state.federation()` FIRST, before either branch, and that silently disabled SAML routing on
+/// every deployment that had not turned OIDC federation on -- which is the default, and which
+/// has nothing to do with SAML: the SAML routes are mounted unconditionally and need no runtime.
+/// The check now sits on the branch that needs it.
+///
+/// The pure precedence decision (per-user > per-app > per-domain) lives in [`crate::routing`];
+/// this function is the I/O side. Any store error, a disabled binding, a disabled connector or
+/// connection, an absent federation runtime on the CONNECTOR branch, or no match yields [`None`]
+/// so the caller keeps serving the local prompt. On the connector branch the routed `ocn_` id is
+/// threaded to the authorize leg, which writes it into the correlation row; on the SAML branch
+/// the browser carries no `ocn_` at all and the assertion consumer re-derives it from the
+/// connection, so neither lets the browser choose the organization.
 async fn federation_route_redirect(
     state: &OidcState,
     resume: &crate::interaction::ResumeTarget,
     identifier: &str,
 ) -> Option<Response> {
-    // Only route when the federation runtime is installed; otherwise the authorize
-    // endpoint is a uniform not-found and routing would strand the user.
-    state.federation()?;
-
     let scope = resume.scope;
     let scoped = state.store().scoped(scope);
     let rules = scoped.routing_rules();
@@ -457,7 +462,7 @@ async fn federation_route_redirect(
     let candidates = crate::routing::RouteCandidates { user, app, domain };
     let matched = crate::routing::resolve_route(&candidates)?;
 
-    // Resolve the matched org connection and its connector to build the redirect. A
+    // Resolve the matched org connection and its upstream to build the redirect. A
     // disabled binding or connector is treated as no route (fail-safe to local).
     let org_connections = scoped.org_connections();
     let ocn_id = org_connections.parse_id(&matched.org_connection_id).ok()?;
@@ -465,7 +470,22 @@ async fn federation_route_redirect(
     if !binding.enabled {
         return None;
     }
-    let connector_id = scoped.connectors().parse_id(&binding.connector_id).ok()?;
+
+    // A SAML BINDING TAKES THE OTHER BRANCH, and everything below this point is the OIDC one.
+    // #139 asks for SAML connections to route "identically to OIDC connections", and identically
+    // means the SELECTOR side: the same rules, the same precedence, the same verified-domain
+    // gate, resolved through the same binding. What differs is only where the browser is sent,
+    // because a SAML flow begins with an `AuthnRequest` this deployment signs rather than an
+    // authorization request it brokers.
+    if let Some(saml_connection_id) = binding.saml_connection_id.as_deref() {
+        return saml_route_redirect(state, scope, saml_connection_id, &resume.return_to).await;
+    }
+
+    // ONLY THE CONNECTOR BRANCH NEEDS THE FEDERATION RUNTIME: without it the authorize endpoint
+    // is a uniform not-found and routing there would strand the user. The SAML branch above
+    // returned already, because its endpoints are mounted unconditionally.
+    state.federation()?;
+    let connector_id = scoped.connectors().parse_id(&binding.connector_id?).ok()?;
     let connector = scoped.connectors().get(&connector_id).await.ok()?;
     if !connector.enabled {
         return None;
@@ -493,6 +513,49 @@ async fn federation_route_redirect(
         crate::util::percent_encode_query(&connector.slug),
         crate::util::percent_encode_query(&resume.return_to),
         crate::util::percent_encode_query(&token),
+    );
+    Some(interaction::redirect(&location))
+}
+
+/// The redirect that routes a login to a SAML connection (issue #139, criterion 5).
+///
+/// # Why there is no routing token here
+///
+/// The OIDC branch mints a keyed MAC binding the org connection to a connector, because its
+/// redirect names a CONNECTOR and the org connection travels beside it -- so without the MAC a
+/// browser could pair one connector with a sibling organization's binding. This redirect names
+/// the SAML CONNECTION ITSELF, and a connection belongs to exactly one organization by its own
+/// row, so there is no second value to swap: the start endpoint reads the connection, and the
+/// organization the sign-in provisions into comes from that row rather than from anything the
+/// browser carried. A token here would authenticate a pairing that does not exist.
+///
+/// # The connection is checked before the browser is sent
+///
+/// `find_active` refuses a connection that is absent, out of scope or switched off, and this
+/// answers [`None`] for all three -- so a disabled connection falls back to the local prompt
+/// exactly as a disabled connector does, rather than sending somebody to an endpoint that will
+/// turn them away.
+async fn saml_route_redirect(
+    state: &OidcState,
+    scope: Scope,
+    saml_connection_id: &str,
+    return_to: &str,
+) -> Option<Response> {
+    let scoped = state.store().scoped(scope);
+    let connection_id =
+        ironauth_store::SamlConnectionId::parse_in_scope(saml_connection_id, &scope).ok()?;
+    let connection = scoped
+        .saml_connections()
+        .find_active(&connection_id)
+        .await
+        .ok()??;
+
+    let location = format!(
+        "/t/{}/e/{}/saml/start/{}?return_to={}",
+        scope.tenant(),
+        scope.environment(),
+        connection.id,
+        crate::util::percent_encode_query(return_to),
     );
     Some(interaction::redirect(&location))
 }
