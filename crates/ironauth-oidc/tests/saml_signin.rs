@@ -325,6 +325,9 @@ fn rfc3339(seconds: i64) -> String {
 /// The nonce the solicited fixtures put in their binding cookie.
 const BINDING_NONCE: &str = "test-binding-nonce";
 
+/// A second, DIFFERENT nonce, so a test with two flows in one browser can tell them apart.
+const SECOND_NONCE: &str = "test-binding-nonce-two";
+
 /// SHA-256 of a binding nonce, which is what the request row stores.
 fn binding_digest(nonce: &str) -> Vec<u8> {
     use sha2::{Digest as _, Sha256};
@@ -342,6 +345,24 @@ async fn signed_solicited(
     request_id: &str,
     bound: bool,
 ) -> String {
+    signed_solicited_with(
+        harness,
+        wired,
+        assertion_id,
+        request_id,
+        bound.then_some(BINDING_NONCE),
+    )
+    .await
+}
+
+/// [`signed_solicited`] with the binding nonce chosen by the caller ([`None`] for unbound).
+async fn signed_solicited_with(
+    harness: &Harness,
+    wired: &Wired,
+    assertion_id: &str,
+    request_id: &str,
+    nonce: Option<&str>,
+) -> String {
     let env = harness.env().clone();
     let now = now_micros(&env);
     harness
@@ -352,7 +373,7 @@ async fn signed_solicited(
             &wired.connection,
             request_id,
             Some("/dashboard"),
-            bound.then(|| binding_digest(BINDING_NONCE)).as_deref(),
+            nonce.map(binding_digest).as_deref(),
             now,
             now + 300_000_000,
         )
@@ -934,11 +955,16 @@ async fn trait_emails(harness: &Harness) -> Vec<String> {
 
 #[tokio::test]
 async fn a_fenced_account_is_refused_and_joins_no_organization() {
-    // THE ORDER OF THE WRITES, MEASURED. `establish_session` carries the account-lifecycle fence
-    // and is the ONLY such check on this path, because the identity provider decided who the
-    // human is. An earlier version joined the person to the organization BEFORE calling it, so
-    // an unauthenticated cross-site POST wrote an org membership for an account this deployment
-    // refuses to authenticate -- and it kept doing so on every attempt.
+    // A FENCED ACCOUNT IS REFUSED AND NOTHING IS WRITTEN FOR IT. This test was named for the
+    // ORDER of two writes -- membership after `establish_session` -- and that is no longer what
+    // it reaches: round 2 added a lifecycle read BEFORE provisioning, so a fenced account is
+    // turned away earlier and never gets to the membership code at all.
+    //
+    // NO STATE PASSES ONE CHECK AND FAILS THE OTHER, because both use `can_authenticate()`, so
+    // the ordering below the earlier read is not observable from here and this test cannot
+    // pretend to measure it. What it measures is the property that matters to an operator:
+    // whatever the route, a person this deployment refuses to authenticate gains nothing. The
+    // ordering remains correct as defence in depth if the earlier read is ever narrowed.
     //
     // THE SECOND MEMBERSHIP IS THE ONE THAT MATTERS. The first login is genuine and creates
     // both. The operator then disables the account and removes the membership; a further
@@ -1114,7 +1140,7 @@ async fn the_jit_membership_reaches_the_event_feed() {
 }
 
 #[tokio::test]
-async fn a_deeply_dotted_attribute_name_signs_nobody_in_and_does_not_abort_the_process() {
+async fn a_deeply_dotted_attribute_name_does_not_abort_the_process() {
     // A DENIAL OF SERVICE ON THE WHOLE DEPLOYMENT, introduced by the dotted-path fix that made
     // realistic attribute names addressable. Nothing upstream bounds an `Attribute` `Name`:
     // `max_name_bytes` applies to the XML attribute KEY (`Name`, four bytes), not its value. So
@@ -1124,7 +1150,13 @@ async fn a_deeply_dotted_attribute_name_signs_nobody_in_and_does_not_abort_the_p
     // every tenant. A stack overflow is not a panic: nothing catches it.
     //
     // THE TEST SURVIVING IS THE ASSERTION. If the bound is removed this does not fail, it takes
-    // the test binary down with it.
+    // the test binary down with it -- verified by removing it: the suite prints "fatal runtime
+    // error: stack overflow, aborting" and dies on signal 6.
+    //
+    // IT NO LONGER ASSERTS A REFUSAL. The first version of the bound refused the whole sign-in,
+    // and that turned out to lock out every Shibboleth deployment, so an unplaceable name now
+    // SKIPS the attribute. The person is signed in without it, which is what the assertions
+    // below say.
     let harness = Harness::start_store_backed().await;
     let wired = wire(&harness, ISSUER, &json!({})).await;
 
@@ -1136,9 +1168,90 @@ async fn a_deeply_dotted_attribute_name_signs_nobody_in_and_does_not_abort_the_p
     let response =
         signed_with_statement(&wired, harness.env(), ISSUER, "_deep1", SUBJECT, &statement);
     let (status, headers, body) = post(&harness, &wired, &response).await;
-    assert!(status.is_server_error(), "{status}");
-    assert!(set_cookie(&headers).is_empty(), "{body}");
-    assert!(users(&harness, harness.scope()).await.is_empty(), "{body}");
+    assert_eq!(status, 303, "{body}");
+    assert!(
+        set_cookie(&headers)
+            .iter()
+            .any(|cookie| cookie.contains("ironauth_session")),
+        "{body}"
+    );
+    // AND THE NAME REACHED NOTHING: the connection maps no traits, so the only observable is
+    // that one person exists and the process is still here to say so.
+    assert_eq!(users(&harness, harness.scope()).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_shibboleth_edu_person_attribute_signs_in_and_maps() {
+    // THE BOUND THAT LOCKED OUT AN ENTIRE FEDERATION. Round 2 capped the dotted path at TEN
+    // segments and justified it as "above every real name", miscounting its own example --
+    // `urn:oid:0.9.2342.19200300.100.1.3` is SEVEN, not six. The eduPerson arc is ELEVEN:
+    // `urn:oid:1.3.6.1.4.1.5923.1.1.1.6` is eduPersonPrincipalName, the default release of every
+    // InCommon and eduGAIN identity provider. At ten, any IdP releasing one refused EVERY login
+    // on that connection, permanently, with the request and assertion id already burned.
+    //
+    // THE NAME IS REAL AND SO IS THE MAPPING: this maps a trait THROUGH that name, so a build
+    // that skipped the attribute rather than placing it fails here too.
+    let harness = Harness::start_store_backed().await;
+    seed_trait_schema(&harness).await;
+    let wired = wire(
+        &harness,
+        ISSUER,
+        &json!({
+            "traits": {
+                "email": {"source": ["urn:oid:1.3.6.1.4.1.5923.1.1.1.6"], "required": false}
+            }
+        }),
+    )
+    .await;
+
+    let response = signed(
+        &wired,
+        harness.env(),
+        ISSUER,
+        "_edu1",
+        "uid=ada,ou=people",
+        &[("urn:oid:1.3.6.1.4.1.5923.1.1.1.6", "ada@globex.example")],
+    );
+    let (status, _, body) = post(&harness, &wired, &response).await;
+    assert_eq!(
+        status, 303,
+        "an eduPerson attribute name refused the sign-in: {body}"
+    );
+    assert_eq!(trait_emails(&harness).await, vec!["ada@globex.example"]);
+}
+
+#[tokio::test]
+async fn an_unmappable_deep_name_beside_a_mapped_one_does_not_refuse_the_sign_in() {
+    // A NAME TOO DEEP TO PLACE SKIPS THE ATTRIBUTE, NOT THE SIGN-IN. Round 2's bound refused the
+    // whole response, so an identity provider that added one exotic attribute locked out every
+    // user -- and the refusal was reported to the operator as a duplicate claim name, a
+    // diagnosis that was false and prescribed a repair that did not exist.
+    let harness = Harness::start_store_backed().await;
+    seed_trait_schema(&harness).await;
+    let wired = wire(
+        &harness,
+        ISSUER,
+        &json!({"traits": {"email": {"source": ["email"], "required": false}}}),
+    )
+    .await;
+
+    let deep = "a.".repeat(200) + "b";
+    let response = signed(
+        &wired,
+        harness.env(),
+        ISSUER,
+        "_skip1",
+        "uid=ada,ou=people",
+        &[("email", "ada@globex.example"), (&deep, "ignored")],
+    );
+    let (status, _, body) = post(&harness, &wired, &response).await;
+    assert_eq!(
+        status, 303,
+        "one deep name refused the whole sign-in: {body}"
+    );
+    // AND THE MAPPED ATTRIBUTE BESIDE IT STILL ARRIVED, which is what "skip the attribute"
+    // has to mean: dropping the claims object instead would leave the trait unset.
+    assert_eq!(trait_emails(&harness).await, vec!["ada@globex.example"]);
 }
 
 #[tokio::test]
@@ -1187,10 +1300,14 @@ async fn two_flows_in_one_browser_do_not_destroy_each_other() {
     // TWO FLOWS, in the order a browser would hold them: the second is the one whose cookie a
     // single-slot scheme would keep.
     let first = signed_solicited(&harness, &wired, "_two1", "_req_two1", true).await;
-    let second = signed_solicited(&harness, &wired, "_two2", "_req_two2", true).await;
+    let second =
+        signed_solicited_with(&harness, &wired, "_two2", "_req_two2", Some(SECOND_NONCE)).await;
+    // TWO DIFFERENT NONCES, one per flow. An earlier version put the SAME nonce in both cookies,
+    // which made the test pass on a build that ignored the request id and took whichever cookie
+    // it found first -- the very selection this exists to measure.
     let jar = format!(
         "__Host-ironauth_saml_bind__req_two1={BINDING_NONCE}; \
-         __Host-ironauth_saml_bind__req_two2={BINDING_NONCE}"
+         __Host-ironauth_saml_bind__req_two2={SECOND_NONCE}"
     );
 
     for (assertion, response) in [("_two2", &second), ("_two1", &first)] {

@@ -2104,9 +2104,13 @@ pub(crate) async fn provision_federated_user(
                 )
                 .await?;
         }
-        // Refresh the org binding on the returning identity (issue #77): the identity
-        // KEY stays the verified (issuer, sub) composite, so a returning login updates
-        // the stamp in place without ever creating a second user.
+        // Refresh the org binding on the returning identity (issue #77): the identity KEY is
+        // the caller's `external_id` and does not change between logins, so a returning login
+        // updates the stamp in place without ever creating a second user. THIS COMMENT SAID
+        // "the verified (issuer, sub) composite" and the retraction that corrected the same
+        // claim in the doc above missed it -- which is what a retraction applied by file rather
+        // than by claim leaves behind. It is the OIDC caller's shape; the SAML caller namespaces
+        // by connection.
         stamp_org_binding(state, scope, &existing.id, org_connection_id).await?;
         return Ok(existing.id);
     }

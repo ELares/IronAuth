@@ -49563,6 +49563,48 @@ impl OrgMembershipRepo<'_> {
             .transpose()
     }
 
+    /// The membership id this `(organization, user)` pair would OCCUPY, live or tombstoned.
+    ///
+    /// # Why a caller needs the id of a row it cannot use
+    ///
+    /// [`ActingOrgMembershipRepo::create`] arbitrates on `(organization_id, user_id)` and REVIVES
+    /// a soft-deleted row in place, keeping its ORIGINAL id -- so a caller that mints a fresh id,
+    /// builds a domain event naming it, and then calls `create` publishes an envelope for a row
+    /// that does not exist. The SAML just-in-time membership hit exactly that: an operator
+    /// removes somebody, their identity provider signs them in again, the row is revived under
+    /// its old id, and `organization.member_added` named a new one no consumer could resolve.
+    ///
+    /// So this answers what `create` WILL use, letting the caller mint the event correctly. It is
+    /// deliberately NOT a liveness check -- it returns tombstoned rows, which is the whole point
+    /// -- and [`Self::for_user_in_org`] remains the read for "is this person a member".
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn occupied_membership_id(
+        &self,
+        org_id: &OrganizationId,
+        user_id: &UserId,
+    ) -> Result<Option<OrgMembershipId>, StoreError> {
+        if org_id.scope() != self.scope || user_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND user_id = $4 AND owner_kind = 'user'",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|id| OrgMembershipId::parse_in_scope(&id, &self.scope).ok()))
+    }
+
     /// The organization's live member USER IDS, ordered by user id, for an outbound enumeration.
     ///
     /// Ordered by `user_id` rather than by `(created_at, id)`, and returning the USER id rather

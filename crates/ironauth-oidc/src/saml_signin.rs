@@ -162,8 +162,22 @@ pub fn saml_external_id(connection_id: &str, name_id: &str) -> String {
 /// ONE VARIANT, CARRYING THE NAME THAT COLLIDED, because every case is the same operator-visible
 /// fault: two things want one key. See [`claims_from_assertion`] for why that is refused rather
 /// than resolved.
+///
+/// A NAME TOO DEEP TO PLACE IS NOT ONE OF THESE, and an earlier version reused this type for it
+/// -- so an assertion carrying one exotic attribute was reported to the operator as "carries two
+/// values for one claim name", a diagnosis that was false and prescribed a repair that did not
+/// exist. That case is [`Skipped::Yes`] now: the attribute is dropped and the sign-in proceeds.
 struct ClaimsConflict {
     name: String,
+}
+
+/// Whether an attribute reached the claims object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skipped {
+    /// It was placed.
+    No,
+    /// Its name was too deep to place. Not a fault: see [`insert_at_path`].
+    Yes,
 }
 
 /// Sign in the person a consumed assertion names, provisioning them on first sight.
@@ -194,10 +208,15 @@ pub(crate) async fn sign_in(
     let claims = match claims_from_assertion(consumed) {
         Ok(claims) => claims,
         Err(conflict) => {
+            // THE NAME IS TRUNCATED, because it is chosen by the identity provider and bounded
+            // only by the body cap: echoing it whole lets a signed assertion write a third of a
+            // megabyte into the log on every attempt, which is a cheap way to fill a disk.
+            let mut name = conflict.name;
+            name.truncate(128);
             tracing::warn!(
                 target: "ironauth.saml",
                 connection = %connection.id,
-                name = %conflict.name,
+                name = %name,
                 "a SAML assertion carries two values for one claim name, so which one a mapping \
                  would read is not decidable",
             );
@@ -270,6 +289,11 @@ pub(crate) async fn sign_in(
             );
             return server_error();
         }
+        // A DELETED ACCOUNT LANDS HERE AND NOT ON THE FENCE. See [`resolve_conflict`].
+        Err(StoreError::Conflict) => match resolve_conflict(state, scope, &external_id).await {
+            Some(user_id) => user_id,
+            None => return refused_account(),
+        },
         Err(_) => return server_error(),
     };
 
@@ -279,14 +303,19 @@ pub(crate) async fn sign_in(
     // account and a session here, exactly as on the federated callback: this path runs no
     // `can_authenticate` pre-check of its own, because the identity provider, not this server,
     // decided who the human is.
-    // SESSION ROTATION AND THE FOREIGN-SUBJECT CASCADE ARE INERT HERE, and that is a property of
-    // the transport rather than a choice. `establish_session` rotates or revokes a PRIOR session
-    // by reading its cookie, and the session cookie is `SameSite=Lax` -- so it is not sent on
-    // this cross-site POST at all, and the function sees a browser with no session whatever the
-    // jar holds. The consequence is that a SAML sign-in ADDS a session rather than replacing
-    // one. Recorded rather than fixed: making the session cookie readable here would mean
-    // `SameSite=None` on the session itself, which is a far larger weakening than the one it
-    // would buy back.
+    // SESSION ROTATION AND THE FOREIGN-SUBJECT CASCADE ARE USUALLY INERT HERE, and that is a
+    // property of the transport rather than a choice. `establish_session` rotates or revokes a
+    // PRIOR session by reading its cookie, and the session cookie is `SameSite=Lax` BY DEFAULT --
+    // so it is not sent on this cross-site POST, and the function sees a browser with no session
+    // whatever the jar holds. A SAML sign-in therefore ADDS a session rather than replacing one.
+    //
+    // "BY DEFAULT" IS LOAD-BEARING AND AN EARLIER VERSION OMITTED IT, stating the `Lax` shape as
+    // a fact when it is a configuration: `oidc.session_partitioned_cookie` already ships the CHIPS
+    // shape, `SameSite=None; Partitioned`, and under it the session cookie IS sent here and
+    // rotation works. So the behaviour differs between two supported configurations, which is
+    // worth a reader knowing -- the paragraph that called rotation unfixable was describing one
+    // of them. Neither is fixed here: making rotation unconditional would mean `SameSite=None` on
+    // every deployment's session, a far larger weakening than it buys back.
     let cookies = match interaction::establish_session(
         state,
         scope,
@@ -318,6 +347,34 @@ pub(crate) async fn sign_in(
     }
 
     interaction::redirect_setting_cookie(consumed.relay_state.as_deref().unwrap_or("/"), &cookies)
+}
+
+/// Who a provisioning CONFLICT actually names, or [`None`] if nobody who may sign in.
+///
+/// # Two different things collide the same way
+///
+/// A DELETED ACCOUNT. Deleting a user is a SOFT delete that keeps the row and its blind indexes,
+/// so the lifecycle read before provisioning -- which filters `deleted_at IS NULL` -- reports the
+/// person as ABSENT, provisioning tries to create them, and the insert collides with the
+/// tombstone's unique index. An earlier version answered that with a 500 forever, telling an
+/// operator a database was broken when what had happened was their own deletion.
+///
+/// A LOST CREATE RACE. Two first logins for one person arrive together and one insert wins; the
+/// loser must carry on with the row the winner made, not be turned away.
+///
+/// They are told apart by looking again: if the person is now readable and may authenticate,
+/// this was the race. A store fault answers `None`, which fails closed.
+async fn resolve_conflict(state: &OidcState, scope: Scope, external_id: &str) -> Option<UserId> {
+    match state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_external_id(external_id)
+        .await
+    {
+        Ok(Some(existing)) if existing.state.can_authenticate() => Some(existing.id),
+        _ => None,
+    }
 }
 
 /// Evaluate the connection's attribute mapping against the assertion's claims.
@@ -504,7 +561,7 @@ fn insert_at_path(
     root: &mut Map<String, JsonValue>,
     name: &str,
     value: JsonValue,
-) -> Result<(), ClaimsConflict> {
+) -> Result<Skipped, ClaimsConflict> {
     let conflict = || ClaimsConflict {
         name: name.to_owned(),
     };
@@ -525,13 +582,25 @@ fn insert_at_path(
     // signature does not make a document friendly, and this is the first place in the sign-in
     // path that builds an unbounded recursive structure from one.
     //
-    // TEN IS ABOVE EVERY REAL NAME. The dotted names this exists to serve are OID URNs and
-    // schema URIs -- `urn:oid:0.9.2342.19200300.100.1.3` is six segments, Entra's
-    // `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` is three -- so a name
-    // past this is not a mapping target anybody wrote.
-    const MAX_SEGMENTS: usize = 10;
+    // SIXTY-FOUR, AND THE FIRST VERSION OF THIS BOUND WAS TEN, WHICH LOCKED OUT SHIBBOLETH. Its
+    // comment claimed ten was "above every real name" and miscounted its own example:
+    // `urn:oid:0.9.2342.19200300.100.1.3` is SEVEN segments, not six. The arc it did not check
+    // is the eduPerson family -- `urn:oid:1.3.6.1.4.1.5923.1.1.1.6` and its siblings are ELEVEN
+    // -- which is the default attribute release of every InCommon and eduGAIN identity provider.
+    // At ten, releasing any one of them refused every login on that connection forever.
+    //
+    // THE BOUND IS ABOUT STACK DEPTH AND NOTHING ELSE, so it belongs nowhere near the length of
+    // a plausible name: the drop that aborts the process needs tens of thousands of levels, and
+    // sixty-four is three levels of magnitude below that while being six times the longest
+    // vocabulary anybody ships.
+    const MAX_SEGMENTS: usize = 64;
     if name.split('.').count() > MAX_SEGMENTS {
-        return Err(conflict());
+        // THE ATTRIBUTE IS SKIPPED, NOT THE SIGN-IN, and the first version refused the whole
+        // response. A name this long is not a mapping target, so dropping it costs nothing --
+        // and refusing over it means an identity provider that adds one exotic attribute locks
+        // out every user, with the request and assertion id already burned so there is nothing
+        // to retry. This matches the arm above that skips an attribute with no usable values.
+        return Ok(Skipped::Yes);
     }
 
     let mut segments = name.split('.').peekable();
@@ -542,7 +611,7 @@ fn insert_at_path(
                 return Err(conflict());
             }
             current.insert(segment.to_owned(), value);
-            return Ok(());
+            return Ok(Skipped::No);
         }
         let next = current
             .entry(segment.to_owned())
@@ -553,7 +622,11 @@ fn insert_at_path(
             _ => return Err(conflict()),
         }
     }
-    Ok(())
+    // UNREACHABLE FOR ANY NAME: `split` yields at least one segment, and the final one returns
+    // above. Written as a value rather than an `unreachable!` because a panic here would be a
+    // way to abort the process from an attacker-chosen string, which is the class of defect the
+    // bound above exists to close.
+    Ok(Skipped::No)
 }
 
 /// Record the person as a member of the connection's organization, if they are not already.
@@ -586,7 +659,19 @@ async fn ensure_membership(
     user_id: &UserId,
 ) -> Result<(), StoreError> {
     let scoped = state.store().scoped(scope);
-    let membership_id = OrgMembershipId::generate(state.env(), &scope);
+    // THE ID A REVIVE WILL REUSE, and an earlier version minted a fresh one unconditionally.
+    // `create` arbitrates on `(organization_id, user_id)` and revives a soft-deleted row IN
+    // PLACE, keeping its original id -- so on the re-join this module's own doc calls normal (an
+    // operator removes somebody, their directory signs them back in) the envelope named a
+    // membership that does not exist, and a consumer resolving it found nothing.
+    let membership_id = match scoped
+        .org_memberships()
+        .occupied_membership_id(&connection.organization_id, user_id)
+        .await?
+    {
+        Some(existing) => existing,
+        None => OrgMembershipId::generate(state.env(), &scope),
+    };
     let subject = membership_id.to_string();
     let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
     let envelope = ironauth_store::event_catalog::envelope(
@@ -643,6 +728,12 @@ async fn ensure_membership(
 /// IT NAMES NO LIFECYCLE STATE: waitlisted, blocked, disabled and deleted are one answer, so
 /// this is not an oracle. What it is not is a 500, which would report a server fault for a
 /// deliberate administrative decision.
+///
+/// DELETED REACHES IT BY A DIFFERENT ROUTE THAN THE OTHERS, and an earlier version of this
+/// sentence listed it as though it came through the same door. A deletion is a soft delete, so
+/// the lifecycle read filters the person out as absent and provisioning collides with the
+/// tombstone instead; that conflict is mapped here. The answer is the same, which is what the
+/// sentence promised.
 fn refused_account() -> Response {
     page(
         axum::http::StatusCode::FORBIDDEN,

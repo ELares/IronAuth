@@ -26,14 +26,18 @@
 //! choke point through which hostile SAML XML enters, and its dependency list is part of the
 //! argument. A JSON library here would be a second parser reachable from the same bytes.
 //!
-//! # A DOTTED attribute Name cannot yet be ADDRESSED by that mapper, and this says so
+//! # A DOTTED attribute Name IS addressable now, and this used to say it was not
 //!
 //! `claim_mapping::resolve_path` splits a mapping path on `.`, and a SAML attribute `Name` is
 //! often a URI full of them: ADFS and Entra send
 //! `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`, which the resolver
-//! reads as three segments -- a key called `http://schemas`, then `xmlsoap`, then
-//! `org/ws/2005/05/identity/claims/emailaddress`. There is no key by any of those names, so that
-//! attribute is unreachable.
+//! reads as three segments. This section used to end "so that attribute is unreachable" and
+//! defer the fix to whoever built the consumer. THE CONSUMER SHIPPED AND FIXED IT:
+//! `ironauth_oidc::saml_signin` places each attribute at the path its own `Name` splits into, so
+//! the name an operator writes is the name that resolves. The paragraphs below are kept because
+//! their reasoning about WHERE the limit is -- the dot, not SAML, and not every URI -- is what
+//! made that fix the right shape, and because the resolver-side alternative they reject is still
+//! the wrong answer.
 //!
 //! THE LIMIT IS THE DOT, NOT SAML. An earlier version of this sentence said "no real SAML
 //! attribute is addressable", which is false and was worth catching, because it is the kind of
@@ -308,6 +312,10 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Statement, Unreadable
     }
 
     let mut out = Statement::default();
+    // THE (name, effective format) PAIRS ALREADY ACCEPTED. See the duplicate check below for why
+    // this is a set and not a scan over `out.attributes`.
+    let mut seen_keys: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     // DIRECT CHILDREN, at both levels. `AttributeValue` is `xs:anyType`, so an assertion may
     // legitimately carry a whole `AttributeStatement` inside one -- and it is inside this
     // signature just as much as the real one, so a descendant search would collect somebody
@@ -346,11 +354,16 @@ pub fn attributes(assertion: &VerifiedAssertion) -> Result<Statement, Unreadable
             // that type the `collapse` whiteSpace facet -- so ` urn:...:unspecified ` and the
             // flush spelling are one value to every schema-aware reader. Comparing them raw
             // re-opens the hole this rule was written to close, one space at a time.
+            //
+            // A SET RATHER THAN A SCAN, and the scan it replaces was quadratic with a heap
+            // allocation per comparison: for each new attribute it walked every accepted one and
+            // called `collapse` on its format, allocating a `String` each time. An assertion may
+            // carry thousands of attributes sharing one `Name` with distinct short formats -- all
+            // inside the element, byte and encoded-body caps -- so the work was O(n^2) with an
+            // allocation per step, on a path reached before any store write and, since sign-in
+            // landed, before any authentication. Each key is now collapsed once and hashed.
             let effective = collapse(name_format.as_deref().unwrap_or(UNSPECIFIED));
-            if out.attributes.iter().any(|seen| {
-                seen.name == name
-                    && collapse(seen.name_format.as_deref().unwrap_or(UNSPECIFIED)) == effective
-            }) {
+            if !seen_keys.insert((name.to_owned(), effective)) {
                 return Err(Unreadable::Duplicate {
                     name: name.to_owned(),
                     name_format,
