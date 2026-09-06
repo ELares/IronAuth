@@ -1545,6 +1545,16 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "GET",
             format!("{base}/flow-targets"),
         ),
+        // The portal link mint (issue #140). At the ENVIRONMENT base rather than under
+        // `org_base`, because its organization travels in the body -- which is the same
+        // property that hid it from two organization sweeps until their denominators
+        // learned to look for it.
+        Case::json(
+            "portal_links.createPortalLink",
+            "POST",
+            format!("{base}/portal-links"),
+            &serde_json::json!({"organization_id": organization, "intent": "sso"}),
+        ),
         Case::json(
             "flow_targets.createFlowTarget",
             "POST",

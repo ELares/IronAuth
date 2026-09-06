@@ -1647,6 +1647,17 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0202_org_connections_saml_same_organization.sql"),
         },
+        Migration {
+            version: 203,
+            name: "portal_links",
+            // EXPAND. A new table with its MINT in the same change and nothing else: the
+            // redeeming reader, the confirmation GET and the consuming POST all land with the
+            // portal session. An earlier version of this line promised the reader and both
+            // routes, which would have told a reviewer using these annotations that the
+            // redemption path had been written and looked at.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0203_portal_links.sql"),
+        },
     ]
 }
 

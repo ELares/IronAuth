@@ -1472,6 +1472,17 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
         // Project grants (issue #102). The environment fence must answer BEFORE the
         // confinement fence these handlers add: an absent environment is not a place to
         // report that a credential is confined.
+        // The self-service portal's entry link (issue #140). Minting one is a WRITE against an
+        // environment, so it owes the same uniform not-found as every other: a caller must not
+        // learn from the response whether an environment exists.
+        Case {
+            label: "portal_links.createPortalLink",
+            method: "POST",
+            path: format!("{base}/portal-links"),
+            body: Some(
+                "{\"organization_id\":\"org_absent\",\"intent\":\"sso\"}".to_owned(),
+            ),
+        },
         // Enterprise inbound routing (issue #96).
         Case {
             label: "routing_rules.verifyRoutingRuleDomain",

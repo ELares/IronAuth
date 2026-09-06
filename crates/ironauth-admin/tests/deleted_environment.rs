@@ -159,21 +159,50 @@ struct DocumentedOperation {
     template: String,
 }
 
-/// Every operation the committed contract publishes under the organization prefix: the
-/// inventory this sweep must cover in full, reads included.
+/// Operations that name their organization in the REQUEST BODY rather than the path.
+///
+/// SHARED WITH the two organization sweeps in this directory, whose denominators had the
+/// identical blind spot; see the module for the whole account.
+#[path = "common/body_addressed.rs"]
+mod body_addressed;
+use body_addressed::body_addressed_operations;
+
+/// Every operation the committed contract addresses to an ORGANIZATION: the inventory this
+/// sweep must cover in full, reads included.
+///
+/// IT IS NO LONGER THE ORGANIZATION-PREFIX SET, and the sentence that said so survived one
+/// commit past being true. An operation belongs here if its documented path names an
+/// organization OR its request body does, because those are the same authority question
+/// wearing two shapes -- and a sweep that answered only the first left `createPortalLink`
+/// outside the inventory it claims to cover in full.
 fn documented_organization_operations() -> Vec<DocumentedOperation> {
     let doc: Value = serde_json::from_str(COMMITTED_SPEC).expect("the committed spec parses");
     let mut operations = Vec::new();
+    // Resolved ONCE: the derivation parses the whole document, and this loop is per-operation.
+    let body_addressed = body_addressed_operations();
     for (template, entries) in doc["paths"].as_object().expect("paths") {
-        if !template.starts_with(ORGANIZATION_PREFIX) {
-            continue;
-        }
         for (method, entry) in entries.as_object().expect("operations") {
+            let operation_id = entry["operationId"]
+                .as_str()
+                .expect("every operation carries an id")
+                .to_owned();
+            // AN ORGANIZATION OPERATION IS ONE ADDRESSED TO AN ORGANIZATION, and until
+            // `createPortalLink` arrived that was the same thing as a path under the
+            // organization prefix. It names its organization in the BODY, so the prefix test
+            // alone answered "not an organization operation" -- and this sweep would have
+            // rejected the case for it rather than drive it, which is the visible half of a
+            // blind spot whose invisible half shipped a confinement bypass in the sibling
+            // sweep that asked the same question.
+            //
+            // Membership is DERIVED from this same document on every run, so there is no
+            // entry to go stale: an operation that stops taking an organization in its body
+            // leaves the set the moment the contract says so.
+            let body_addressed = body_addressed.contains(&operation_id);
+            if !template.starts_with(ORGANIZATION_PREFIX) && !body_addressed {
+                continue;
+            }
             operations.push(DocumentedOperation {
-                operation_id: entry["operationId"]
-                    .as_str()
-                    .expect("every operation carries an id")
-                    .to_owned(),
+                operation_id,
                 method: method.to_uppercase(),
                 template: template.clone(),
             });
@@ -284,6 +313,25 @@ async fn seed_row(h: &Harness, path: &str, key: &str, body: &str, what: &str) ->
 /// Seeding the relations is what makes every write case discriminating.
 struct Fixture {
     base: String,
+    /// The downstream id of a push LINK seeded straight through the store.
+    ///
+    /// `listScimPushResources` reads `scim_push_links`, and nothing in the management API
+    /// writes one: links are recorded by the push worker as it converges a subject. So the
+    /// operation sat in the committed contract with no case driving it, and this sweep's
+    /// coverage assertion was red for it -- not because the read is untestable, but because
+    /// an HONEST case needs a row and every other case here seeds through the API.
+    ///
+    /// It is seeded through the store instead, while the environment is LIVE, exactly as the
+    /// clients and the project grant beside it already are. A hollow case naming no rows
+    /// would satisfy the count and violate what `Intent::Read` is for.
+    scim_push_resource: String,
+    /// The ENVIRONMENT base, without an organization on it.
+    ///
+    /// Every case in this sweep hung off `base` until `createPortalLink` arrived, because
+    /// every operation in it named its organization in the path. That one names it in the
+    /// BODY, so its path stops at the environment -- and a sweep that could only build
+    /// organization-scoped paths would have had to leave the write out rather than say why.
+    env_base: String,
     org: String,
     /// Seeded ALREADY assigned to the group, to the membership, mapped to `permission`,
     /// and designated as the organization's default: the target of every withdrawal.
@@ -393,6 +441,7 @@ impl Fixture {
         )
         .await;
         let base = format!("{env_base}/organizations/{org}");
+        // Kept for the one case whose path stops at the environment; see the field.
 
         // The rows that hang off the ORGANIZATION: two roles, two groups, two
         // memberships. Paired throughout, because every pair is one row a case AMENDS
@@ -458,9 +507,13 @@ impl Fixture {
         .await;
 
         let scim_push_connection = Self::seed_scim_push_connection(h, &base, key).await;
+        let scim_push_resource =
+            Self::seed_scim_push_link(h, tenant, environment, &scim_push_connection, key).await;
 
         let fixture = Self {
             base,
+            scim_push_resource,
+            env_base,
             org,
             role,
             spare_role,
@@ -517,6 +570,49 @@ impl Fixture {
             "scim push connection",
         )
         .await
+    }
+
+    /// Record a push LINK against `connection` and return the downstream id it carries.
+    ///
+    /// THROUGH THE STORE, because no management route writes one: the push worker records a
+    /// link as it converges a subject downstream. That is why `listScimPushResources` had no
+    /// case here for as long as it did -- the read is perfectly testable, it just cannot be
+    /// SET UP through the surface every other case in this file seeds through.
+    ///
+    /// Written while the environment is LIVE, which is what makes the deleted pass mean
+    /// something: the row exists before the delete, so a listing that answers an empty page
+    /// afterwards is a decommissioned environment losing its audit trail rather than a
+    /// listing that never had anything to show.
+    async fn seed_scim_push_link(
+        h: &Harness,
+        tenant: &str,
+        environment: &str,
+        connection: &str,
+        key: &str,
+    ) -> String {
+        let scope = Scope::new(
+            TenantId::parse(tenant).expect("tenant id"),
+            EnvironmentId::parse(environment).expect("environment id"),
+        );
+        let sys = Env::system();
+        let connection_id =
+            ironauth_store::ScimPushConnectionId::parse_in_scope(connection, &scope)
+                .expect("the seeded push connection id parses");
+        let downstream = format!("dwn-{key}");
+        h.store()
+            .scoped(scope)
+            .scim_push_links()
+            .upsert(ironauth_store::NewScimPushLink {
+                id: &ironauth_store::ScimPushLinkId::generate(&sys, &scope),
+                connection_id: &connection_id,
+                resource_type: ironauth_store::ScimPushResourceType::User,
+                subject_id: &format!("usr-{key}"),
+                downstream_id: &downstream,
+                external_id: &format!("ext-{key}"),
+            })
+            .await
+            .expect("seed a push link");
+        downstream
     }
 
     /// Split out from [`Fixture::seed`] only because the two together exceed the crate's
@@ -807,10 +903,64 @@ impl Fixture {
     fn scim_connection_cases(&self) -> Vec<Case> {
         let Self {
             base,
+            env_base,
+            org,
             scim_connection,
+            scim_push_connection,
+            scim_push_resource,
             ..
         } = self;
         vec![
+            // The log stream create (issue #137's shipper, fenced by this change). Its
+            // organization is a body field too, which is how it stayed outside this sweep's
+            // denominator until the body-addressed set was derived rather than listed.
+            Case {
+                label: "log_streams.createLogStream",
+                method: "POST",
+                path: format!("{env_base}/log-streams"),
+                body: Some(
+                    serde_json::json!({
+                        "source": "admin_action",
+                        "sink_type": "http",
+                        "sink_config": { "url": "https://sink.example/ingest" },
+                        "organization_id": org,
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            // The portal link mint (issue #140). The SECOND of the two cases here whose path
+            // stops at the ENVIRONMENT, the other being the log stream create directly above;
+            // an earlier version of this comment called it the only one, which stopped being
+            // true in the same commit that added the other. Its organization is in the body,
+            // which is the property the case is here to hold: a soft-deleted environment must
+            // refuse the write before anything reads the body, and the organization it names
+            // is a live one, so a pass cannot be the organization answering not-found on the
+            // environment's behalf.
+            Case {
+                label: "portal_links.createPortalLink",
+                method: "POST",
+                path: format!("{env_base}/portal-links"),
+                body: Some(format!(
+                    "{{\"organization_id\":\"{org}\",\"intent\":\"sso\"}}"
+                )),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            // The outbound push RESOURCE listing (issue #137). Documented since that slice
+            // shipped and driven by nothing until now, which left this sweep's own coverage
+            // assertion red -- the surface published an operation the sweep could not claim to
+            // cover. It names the seeded link, so a decommissioned environment answering an
+            // empty page fails here rather than passing on a 200.
+            Case {
+                label: "scim_push_connections.listScimPushResources",
+                method: "GET",
+                path: format!("{base}/scim-push-connections/{scim_push_connection}/resources"),
+                body: None,
+                intent: Intent::Read(vec![scim_push_resource.clone()]),
+                live: StatusCode::OK,
+            },
             Case {
                 label: "scim_connections.createScimConnection",
                 method: "POST",
@@ -1499,6 +1649,8 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
     // the first thing to fail.
     let fixture = Fixture {
         base: "/v1/tenants/ten_x/environments/env_x/organizations/org_x".to_owned(),
+        scim_push_resource: "dwn-x".to_owned(),
+        env_base: "/v1/tenants/ten_x/environments/env_x".to_owned(),
         org: "org_x".to_owned(),
         role: "rol_x".to_owned(),
         spare_role: "rol_y".to_owned(),
@@ -2188,6 +2340,8 @@ const SECRET_BEARING_CREATE: &str = "scim_connections.createScimConnection";
 fn replay_fixture() -> Fixture {
     Fixture {
         base: "/v1/tenants/ten_x/environments/env_x/organizations/org_x".to_owned(),
+        scim_push_resource: "dwn-x".to_owned(),
+        env_base: "/v1/tenants/ten_x/environments/env_x".to_owned(),
         org: "org_x".to_owned(),
         role: "rol_x".to_owned(),
         spare_role: "rol_y".to_owned(),
@@ -2448,8 +2602,8 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 37;
-    const READS: usize = 17;
+    const WRITES: usize = 39;
+    const READS: usize = 18;
 
     let cases = replay_fixture_cases();
     let writes = cases

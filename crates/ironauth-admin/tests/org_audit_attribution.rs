@@ -98,6 +98,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrgGroup",
     "createOrgRole",
     "createOrganizationApiKey",
+    "createPortalLink",
     "createProjectGrant",
     "createScimConnection",
     "createScimPushConnection",
@@ -145,7 +146,22 @@ const ORG_ATTRIBUTED: &[&str] = &[
 /// because a disabled or deleted organization is not one `resolve_live_org` returns. That
 /// was wrong. All four resolve through it exactly as the others do; they simply bind the
 /// result to `id`, which is why a scan keyed on `org_id` missed them.
-const UNATTRIBUTED_CEILING: usize = 0;
+/// RAISED 0 -> 1 WHEN THE DENOMINATOR GREW, and the distinction matters: nothing regressed.
+///
+/// This counter used to ask only whether a documented PATH named an organization. Widening it
+/// to operations whose organization arrives in the request BODY brought `createLogStream` into
+/// view for the first time, and it attributes nothing -- so the number rose because the
+/// question got bigger, not because a write lost its attribution.
+///
+/// WHY IT IS NOT FIXED IN THE SAME CHANGE. `createLogStream` does not write an audit row at
+/// all. `log_streams()` exists only on the unaudited `ScopedStore`; there is no acting path to
+/// attach an actor or an organization to, so closing this means giving the log-stream
+/// subsystem an audited write path, which is a different change in a different area. Raising
+/// the ceiling is the honest record of a gap that was always there and is now measured.
+///
+/// It may still only rise THROUGH THIS CONSTANT, so a newly added organization-scoped write
+/// that forgets `.in_organization(..)` fails here exactly as before.
+const UNATTRIBUTED_CEILING: usize = 1;
 
 /// Where each attributed operation's handler lives, so the claim can be CHECKED.
 ///
@@ -271,9 +287,22 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
         "withdrawProjectGrant",
         include_str!("../src/project_grants.rs"),
     ),
+    // The portal link mint (issue #140). The one operation here whose organization arrives
+    // in the request BODY, which is exactly why it was invisible to this sweep until the
+    // denominator below learned to look for it.
+    ("createPortalLink", include_str!("../src/portal_links.rs")),
 ];
 
-/// Every operation whose documented path is scoped to an organization.
+/// Operations that name their organization in the REQUEST BODY rather than the path.
+///
+/// SHARED WITH `org_confinement_surface.rs`, whose denominator had the identical blind
+/// spot and whose version of it shipped a confinement bypass; see the module.
+#[path = "common/body_addressed.rs"]
+mod body_addressed;
+use body_addressed::body_addressed_operations;
+
+/// Every operation whose documented surface is scoped to an organization, by path or by
+/// request body.
 fn org_scoped_operations() -> BTreeSet<String> {
     let spec: serde_json::Value =
         serde_json::from_str(include_str!("../../../docs/openapi/management.json"))
@@ -296,6 +325,34 @@ fn org_scoped_operations() -> BTreeSet<String> {
             if let Some(id) = operation.get("operationId").and_then(|id| id.as_str()) {
                 found.insert(id.to_string());
             }
+        }
+    }
+
+    // THE WRITES WHOSE ORGANIZATION IS IN THE BODY, which the path filter above cannot
+    // see and therefore silently excused. `createPortalLink` hands configuration
+    // authority over one organization to somebody outside the deployment, so it is the
+    // last write that should be missing from that organization's own log stream -- and it
+    // was, because the sweep measuring the gap did not count it as organization-scoped.
+    //
+    // Each is resolved against the document rather than trusted, so a renamed or removed
+    // operation fails here instead of quietly narrowing the denominator the way the
+    // original path filter did.
+    for id in body_addressed_operations() {
+        // WRITES ONLY, for the reason the path filter above gives: a read produces no audit
+        // row, so it has nothing to attribute. The derivation does not know that -- it reads
+        // request schemas, and a GET carrying a body would qualify -- so the method filter is
+        // applied here rather than assumed.
+        let is_write = paths.values().any(|item| {
+            item.as_object().is_some_and(|methods| {
+                methods.iter().any(|(method, operation)| {
+                    !method.eq_ignore_ascii_case("get")
+                        && operation.get("operationId").and_then(|v| v.as_str())
+                            == Some(id.as_str())
+                })
+            })
+        });
+        if is_write {
+            found.insert(id);
         }
     }
     found

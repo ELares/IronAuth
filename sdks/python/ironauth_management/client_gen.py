@@ -183,6 +183,10 @@ class Client:
         """Define a permission in an environment. POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/permissions", query, body)
 
+    def create_portal_link(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links`: mint a link. POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/portal-links", query, body)
+
     def create_project_grant(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """createProjectGrant. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/project-grants."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/project-grants", query, body)
@@ -770,6 +774,10 @@ class Client:
     def list_scim_push_connections(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections", query, None)
+
+    def list_scim_push_resources(self, tenant_id: str, environment_id: str, organization_id: str, connection_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections/{connection_id}/resources."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/scim-push-connections/{urllib.parse.quote(connection_id)}/resources", query, None)
 
     def list_secrets(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List the secrets of an environment (metadata only, cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/secrets."""

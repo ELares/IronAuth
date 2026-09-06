@@ -164,8 +164,22 @@ pub async fn list_log_streams(
         .log_streams()
         .list_active()
         .await?;
+    // NARROWED FOR A CONFINED CREDENTIAL, which it was not. Each row carries its
+    // `organization_id` on the wire, so an unnarrowed listing handed a credential confined to
+    // one organization both the ids of every sibling's stream -- the ids the delete and replay
+    // above are addressed by -- and the organization ids themselves, which is the enumeration
+    // the uniform not-found exists to prevent everywhere else in this crate. An
+    // environment-wide stream is excluded too: it carries every organization's rows.
+    let confined = principal.confined_organization().map(ToString::to_string);
     let view = LogStreamList {
-        items: streams.into_iter().map(into_view).collect(),
+        items: streams
+            .into_iter()
+            .filter(|stream| match &confined {
+                None => true,
+                Some(organization) => stream.organization_id.as_ref() == Some(organization),
+            })
+            .map(into_view)
+            .collect(),
     };
     let body_string = serde_json::to_string(&view).map_err(|_| ApiError::Internal)?;
     Ok(json(StatusCode::OK, body_string))
@@ -348,6 +362,12 @@ pub struct CreateLogStreamRequest {
     #[serde(default)]
     pub event_type_filter: Option<Vec<String>>,
     /// Scope the stream to one organization. Absent means environment-wide.
+    ///
+    /// A CREDENTIAL CONFINED TO ONE ORGANIZATION MUST NAME IT. The stream ships that
+    /// organization's rows and no other, so a confined credential may name the organization it
+    /// is confined to and nothing else; absent means the whole environment, which is strictly
+    /// more than such a credential may see and is refused rather than quietly narrowed. An
+    /// organization that is not a live row of this scope answers the uniform not-found.
     #[serde(default)]
     pub organization_id: Option<String>,
 }
@@ -357,6 +377,26 @@ pub struct CreateLogStreamRequest {
 pub struct LogStreamCreated {
     /// The `lgs_` identifier.
     pub id: String,
+}
+
+/// Refuse a credential confined to one organization.
+///
+/// AN ENVIRONMENT-WIDE STREAM HAS NO ORGANIZATION BOUNDARY TO CHECK, so there is nothing for
+/// the confinement to be compared against and the only safe answer is to refuse. This is the
+/// same shape `personal_access_tokens::require_unconfined` takes, and for the same reason: a
+/// credential must never end up carrying MORE authority than its row claims.
+fn require_unconfined(principal: &Principal) -> Result<(), ApiError> {
+    if principal.confined_organization().is_none() {
+        return Ok(());
+    }
+    Err(ApiError::WrongScope {
+        expected: "an unconfined management credential".to_owned(),
+        actual: "credential confined to one organization".to_owned(),
+        message: "a stream with no organization ships the WHOLE environment's rows, which is \
+                  strictly more than a credential confined to one organization may see; name \
+                  that organization on the stream instead"
+            .to_owned(),
+    })
 }
 
 /// Configure a SIEM log stream.
@@ -377,8 +417,8 @@ pub struct LogStreamCreated {
         (status = 201, description = "The configured stream", body = LogStreamCreated),
         (status = 400, description = "Malformed request, or an unknown source or sink type", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential, or fresh privilege required", body = ErrorBody),
-        (status = 403, description = "Wrong plane or scope", body = ErrorBody),
-        (status = 404, description = "The environment is absent or deleted", body = ErrorBody),
+        (status = 403, description = "Wrong plane or scope, or a credential confined to one organization asked for a stream with no organization_id (which would carry the whole environment)", body = ErrorBody),
+        (status = 404, description = "The environment is absent or deleted, or the named organization is not a live row of this scope (which includes an organization the credential is confined away from, and an id this scope cannot parse)", body = ErrorBody),
         (status = 422, description = "Idempotency-Key reused with a different request", body = ErrorBody)
     )
 )]
@@ -405,6 +445,40 @@ pub async fn create_log_stream(
     let sink_type = SinkType::from_wire(&request.sink_type).ok_or_else(|| {
         ApiError::BadRequest("sink_type must be http, s3, datadog, or splunk_hec".to_owned())
     })?;
+    // THE ORGANIZATION IS FENCED, and until this line it was not. `organization_id` selects
+    // WHICH organization's rows the shipper reads -- `log_shipper.rs` passes it into
+    // `rows_after` so the isolation is a property of the QUERY -- and it arrives in the request
+    // BODY, so it never met the confinement fence every organization-addressed route in this
+    // crate goes through. A credential confined to organization A could name organization B
+    // here and point the sink at an endpoint it controls, and B's audit and authentication
+    // events would be shipped to it. The confinement was decoration on this path.
+    //
+    // FOUND BY THE DERIVATION THIS CHANGE ADDS rather than by reading the handler. The portal
+    // link's identical defect was a hand-written list away from being the only one anybody
+    // knew about; deriving the body-addressed set from the committed contract named this one
+    // on the first run.
+    //
+    // AN ABSENT ORGANIZATION IS THE WHOLE ENVIRONMENT, which is strictly MORE than any
+    // confined credential may see, so it is refused rather than silently narrowed to the
+    // credential's own organization. Narrowing would answer 201 for a stream that carries
+    // less than the operator asked for, and a stream that quietly drops rows is the failure
+    // an audit pipeline cannot detect.
+    let organization_id = if let Some(organization) = request.organization_id.as_deref() {
+        Some(
+            crate::org_context::resolve_live_org(
+                &state,
+                &principal,
+                scope,
+                organization,
+                crate::org_context::EnvironmentAccess::Write,
+            )
+            .await?
+            .to_string(),
+        )
+    } else {
+        require_unconfined(&principal)?;
+        None
+    };
     let sink_config = request.sink_config.unwrap_or_else(|| serde_json::json!({}));
     // A credential must be NAMED, never inlined. Refusing here keeps the one rule the
     // whole design rests on at the boundary: this table never holds a secret.
@@ -444,7 +518,7 @@ pub async fn create_log_stream(
                 credential_secret_name: request.credential_secret_name.as_deref(),
                 signing_secret_name: request.signing_secret_name.as_deref(),
                 event_type_filter: request.event_type_filter,
-                organization_id: request.organization_id.as_deref(),
+                organization_id: organization_id.as_deref(),
             },
             Some(ironauth_store::IdempotencyWrite {
                 credential_ref: &credential_ref,
@@ -460,6 +534,52 @@ pub async fn create_log_stream(
         )
         .await?;
     Ok(json(StatusCode::CREATED, body_string))
+}
+
+/// Refuse a credential confined to an organization the stream does not belong to.
+///
+/// # Why every stream operation needs this and not just the create
+///
+/// A stream is addressed by ID ALONE on every operation except its creation: delete, the dead
+/// letter listing and the replay all take `stream_id` from the path and nothing else. The id is
+/// unguessable, but unguessable is not an authorization check -- and the LISTING hands out every
+/// id in the environment, so it is not even unguessable in practice.
+///
+/// Fencing only the create is therefore worth very little on its own. It stops a confined
+/// credential from pointing a NEW stream at a sibling's rows and leaves it free to delete the
+/// sibling's existing one, which stops that organization's audit and authentication events
+/// reaching its SIEM. That is a quieter failure than the one the create fence closes: nothing
+/// arrives, and the organization whose stream it was is not the one that would notice.
+///
+/// AN ENVIRONMENT-WIDE STREAM IS OUT OF REACH TOO. It carries every organization's rows, so a
+/// credential confined to one has no claim on it in either direction.
+///
+/// THE UNIFORM NOT-FOUND, so a confined credential cannot learn which stream ids exist in the
+/// environment by comparing a 403 against a 404.
+async fn require_stream_in_reach(
+    state: &AdminState,
+    principal: &Principal,
+    scope: ironauth_store::Scope,
+    stream_id: &str,
+) -> Result<(), ApiError> {
+    let Some(confined) = principal.confined_organization() else {
+        return Ok(());
+    };
+    let ownership = state
+        .store()
+        .scoped(scope)
+        .log_streams()
+        .organization_of(stream_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    match ownership {
+        ironauth_store::LogStreamOwnership::Organization(organization)
+            if organization == confined.to_string() =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::NotFound),
+    }
 }
 
 /// Remove a SIEM log stream.
@@ -491,6 +611,12 @@ pub async fn delete_log_stream(
     principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
+
+    // THE CONFINEMENT, which this path did not check. The delete is addressed by id alone, so
+    // without it a credential confined to organization A could remove organization B's stream
+    // and stop B's audit and authentication events reaching B's SIEM -- and the id it needed is
+    // handed out by the listing beside this.
+    require_stream_in_reach(&state, &principal, scope, &stream_id).await?;
 
     // No Idempotency-Key: removing an absent stream is a no-op success, so DELETE is
     // idempotent on its own.
@@ -652,6 +778,13 @@ pub async fn replay_log_stream_dead_letters(
     principal.require_permission(ManagementPermission::WriteConfig)?;
     crate::sudo::require_fresh_privilege(&state, scope, principal.actor()).await?;
     require_live_environment(&state, &scope).await?;
+
+    // THE CONFINEMENT, for the same reason the delete needs it: the stream is named by id and
+    // nothing here asked whose it is. A replay re-delivers a sibling organization's set-aside
+    // batches to that organization's own sink, so it is tampering and cost rather than
+    // disclosure -- but a credential fenced out of an organization has no business commanding
+    // its shipper either.
+    require_stream_in_reach(&state, &principal, scope, &stream_id).await?;
 
     let key = idempotency::required_key(&headers)?;
     // Fingerprinted over the path alone, because this command HAS no body: unlike the

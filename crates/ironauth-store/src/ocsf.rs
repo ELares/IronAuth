@@ -307,6 +307,11 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "message_template",
     "migration_run",
     "org_connection",
+    // A PORTAL LINK is authority to CONFIGURE an organization, handed to somebody outside this
+    // deployment (issue #140). Entity management for the same reason `org_connection` is: it
+    // decides what a later session may change, rather than being a change to an account or an
+    // access grant itself.
+    "portal_link",
     "resource_server",
     "routing_rule",
     "signing_key",

@@ -2591,6 +2591,32 @@ export interface paths {
         patch: operations["updatePermission"];
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/portal-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /v1/tenants/{tenant_id}/environments/{environment_id}/portal-links`: mint a link.
+         * @description # Errors
+         *
+         *     [`ApiError::BadRequest`] for an unknown intent or an out-of-range TTL;
+         *     [`ApiError::NotFound`] when the environment or the organization is not a live row of this
+         *     scope, which is also the answer for an organization id this scope cannot parse -- the
+         *     uniform not-found is what stops a caller enumerating which organizations exist here;
+         *     [`ApiError::Internal`] on a persistence fault.
+         */
+        post: operations["createPortalLink"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/queues": {
         parameters: {
             query?: never;
@@ -4917,7 +4943,15 @@ export interface components {
             description?: string | null;
             /** @description Ship only these action wire strings. Absent means all; empty ships none. */
             event_type_filter?: string[] | null;
-            /** @description Scope the stream to one organization. Absent means environment-wide. */
+            /**
+             * @description Scope the stream to one organization. Absent means environment-wide.
+             *
+             *     A CREDENTIAL CONFINED TO ONE ORGANIZATION MUST NAME IT. The stream ships that
+             *     organization's rows and no other, so a confined credential may name the organization it
+             *     is confined to and nothing else; absent means the whole environment, which is strictly
+             *     more than such a credential may see and is refused rather than quietly narrowed. An
+             *     organization that is not a live row of this scope answers the uniform not-found.
+             */
             organization_id?: string | null;
             /**
              * @description The NAME of the environment secret to SIGN batches with. Absent ships unsigned.
@@ -5020,6 +5054,25 @@ export interface components {
              * @example billing.invoice.read
              */
             slug: string;
+        };
+        /** @description A portal link to mint. */
+        CreatePortalLinkRequest: {
+            /**
+             * @description What the session may configure: `sso`, `scim`, `domain-verification`, or `log-streams`.
+             *     A session cannot navigate outside the intent it was opened with.
+             */
+            intent: string;
+            /**
+             * @description The `org_` organization the resulting portal session may configure. The session can see
+             *     no other organization's state.
+             */
+            organization_id: string;
+            /**
+             * Format: int64
+             * @description How long the link stays redeemable, in seconds. Defaults to five minutes; an hour is the
+             *     maximum.
+             */
+            ttl_seconds?: number | null;
         };
         /** @description A project grant to create. */
         CreateProjectGrantRequest: {
@@ -7208,6 +7261,36 @@ export interface components {
             items: components["schemas"]["PolicyTraceView"][];
             /** @description True when the result hit the limit and older matching traces were left out. */
             truncated: boolean;
+        };
+        /** @description A freshly minted portal link. */
+        PortalLinkView: {
+            /**
+             * Format: int64
+             * @description When the link stops being redeemable, in milliseconds since the epoch.
+             */
+            expires_at_unix_ms: number;
+            /**
+             * @description The `plk_` handle. Not secret: it appears in audit rows and logs, and holding it grants
+             *     nothing without the token.
+             */
+            id: string;
+            /** @description The intent the session will be bound to. */
+            intent: string;
+            /** @description The organization the session will be bound to. */
+            organization_id: string;
+            /**
+             * @description The path to hand the IT admin, token included, joined to whatever origin the vendor
+             *     publishes for this deployment.
+             *
+             *     NOT YET SERVED. The redeeming route lands in the next slice of #140; until it does,
+             *     following this path reaches a 404. It is stated here rather than left to be discovered
+             *     because the alternative is a vendor emailing a customer's IT admin a link that looks
+             *     correct and goes nowhere, which is the one artifact that customer sees first.
+             *
+             *     RETURNED ONCE. The store keeps only a digest, so this response is the only place the
+             *     token ever exists outside the caller.
+             */
+            url_path: string;
         };
         /** @description A page of project grants. */
         ProjectGrantListView: {
@@ -17208,7 +17291,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description Wrong plane or scope */
+            /** @description Wrong plane or scope, or a credential confined to one organization asked for a stream with no organization_id (which would carry the whole environment) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -17217,7 +17300,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description The environment is absent or deleted */
+            /** @description The environment is absent or deleted, or the named organization is not a live row of this scope (which includes an organization the credential is confined away from, and an id this scope cannot parse) */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -22461,6 +22544,71 @@ export interface operations {
                 };
             };
             /** @description Not found (absent, deleted, malformed, or another scope's). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createPortalLink: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The tenant identifier */
+                tenant_id: string;
+                /** @description The environment identifier */
+                environment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePortalLinkRequest"];
+            };
+        };
+        responses: {
+            /** @description The minted link; the token appears here and nowhere else. The returned url_path is not served until the portal session slice of issue #140 lands */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortalLinkView"];
+                };
+            };
+            /** @description An unknown intent or an out-of-range TTL */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Missing or invalid credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The environment or the organization is not a live row of this scope, or the organization id is malformed or unreadable in this scope */
             404: {
                 headers: {
                     [name: string]: unknown;

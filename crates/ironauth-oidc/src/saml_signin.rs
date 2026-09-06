@@ -152,7 +152,7 @@ fn collapse(text: &str) -> String {
 /// a SAML connection whose entity id was set to an existing connector's issuer -- is already
 /// impossible; the prefix is what keeps it impossible if a later change ever reintroduces an
 /// issuer-shaped component, and it costs nothing. THE LENGTHS ARE INTERLEAVED for a reason that
-/// applies today: without them the key is a concatenation two different (connection, NameID)
+/// applies today: without them the key is a concatenation two different `(connection, NameID)`
 /// pairs can produce, and a `NameID` is operator-visible text an identity provider chooses.
 #[must_use]
 pub fn saml_external_id(connection_id: &str, name_id: &str) -> String {
@@ -583,6 +583,15 @@ fn claims_from_assertion(consumed: &Consumed) -> Result<Map<String, JsonValue>, 
     Ok(claims)
 }
 
+/// The deepest dotted path this will build.
+///
+/// THE BOUND IS ABOUT STACK DEPTH AND NOTHING ELSE, so it belongs nowhere near the length of a
+/// plausible name: the drop that aborts the process needs tens of thousands of levels, and
+/// sixty-four is three orders of magnitude below that while being six times the longest
+/// vocabulary anybody ships. It sits here rather than inside the function because an item
+/// declared after statements is confusing -- it exists from the top of the scope regardless.
+const MAX_SEGMENTS: usize = 64;
+
 /// Insert `value` at the shared mapper's DOTTED PATH for `name`, or name the key that collided.
 ///
 /// # Why this is not a flat insert
@@ -631,11 +640,6 @@ fn insert_at_path(
     // -- which is the default attribute release of every InCommon and eduGAIN identity provider.
     // At ten, releasing any one of them refused every login on that connection forever.
     //
-    // THE BOUND IS ABOUT STACK DEPTH AND NOTHING ELSE, so it belongs nowhere near the length of
-    // a plausible name: the drop that aborts the process needs tens of thousands of levels, and
-    // sixty-four is three levels of magnitude below that while being six times the longest
-    // vocabulary anybody ships.
-    const MAX_SEGMENTS: usize = 64;
     if name.split('.').count() > MAX_SEGMENTS {
         // THE ATTRIBUTE IS SKIPPED, NOT THE SIGN-IN, and the first version refused the whole
         // response. A name this long is not a mapping target, so dropping it costs nothing --

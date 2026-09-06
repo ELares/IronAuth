@@ -120,6 +120,7 @@ mod pagination;
 mod password_hashing;
 mod permissions;
 mod personal_access_tokens;
+pub mod portal_links;
 mod postures;
 mod project_grants;
 mod promotion;
@@ -682,6 +683,13 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/users/{user_id}/personal-access-tokens/{key_id}/rotate",
             post(personal_access_tokens::rotate_user_personal_access_token),
+        )
+        // The self-service admin portal's entry link (issue #140). Minting one hands
+        // configuration authority for ONE organization and ONE intent to somebody outside
+        // this deployment, which is why it is a write rather than a read.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/portal-links",
+            post(portal_links::create_portal_link),
         )
         // Enterprise inbound routing (issue #96). The store and the data plane have
         // shipped since migration 0059; this is the first time an operator can reach it.

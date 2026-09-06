@@ -2425,6 +2425,38 @@
       "type": "permission.updated"
     },
     {
+      "domain": "portal_link",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at_unix_ms": {
+            "type": "integer"
+          },
+          "intent": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "portal_link_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "portal_link_id",
+          "organization_id",
+          "intent",
+          "expires_at_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "portal_link.created"
+    },
+    {
       "domain": "project_grant",
       "payload_schema": {
         "additionalProperties": false,

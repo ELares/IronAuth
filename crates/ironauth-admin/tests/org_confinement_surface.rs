@@ -50,6 +50,12 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/scim_push_connections.rs"),
     ),
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
+    // Added because the DERIVED body-addressed set named `createLogStream` and this scan could
+    // not see it. It was not merely unscanned: it took `organization_id` from its request body
+    // and passed it to the store with no fence, and that column decides which organization's
+    // rows the shipper reads. This is the second module in this list added after the scan was
+    // measured rather than before, and the first whose omission was hiding a live bypass.
+    ("log_streams.rs", include_str!("../src/log_streams.rs")),
     ("memberships.rs", include_str!("../src/memberships.rs")),
     (
         "org_effective_roles.rs",
@@ -70,6 +76,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ),
     ("org_roles.rs", include_str!("../src/org_roles.rs")),
     ("organizations.rs", include_str!("../src/organizations.rs")),
+    ("portal_links.rs", include_str!("../src/portal_links.rs")),
     (
         "project_grants.rs",
         include_str!("../src/project_grants.rs"),
@@ -92,11 +99,27 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 55;
+const ORG_ADDRESSED_OPERATIONS: usize = 57;
 
-/// The path segment that makes an operation organization-addressed.
+/// Operations that name their organization in the REQUEST BODY rather than the path.
+///
+/// SHARED WITH `org_audit_attribution.rs`, because its denominator had the identical
+/// blind spot: both sweeps asked only whether the documented path carried an
+/// organization, and both therefore left `createPortalLink` outside the set they were
+/// about. Writing the list down twice would reproduce the defect the day the two copies
+/// disagree; see the module for the whole account.
+#[path = "common/body_addressed.rs"]
+mod body_addressed;
+use body_addressed::body_addressed_operations;
+
+/// Whether an operation is organization-addressed, by path or by body.
 fn org_addressed(attr: &str) -> bool {
-    attr.contains("organizations/{organization_id}")
+    if attr.contains("organizations/{organization_id}") {
+        return true;
+    }
+    body_addressed_operations()
+        .iter()
+        .any(|id| attr.contains(&format!("operation_id = \"{id}\"")))
 }
 
 /// The body of `fn name` in `source`, from its signature to the next top-level close.
@@ -232,6 +255,25 @@ fn the_scan_reads_every_operation_the_committed_contract_publishes() {
                     .to_owned(),
             );
         }
+    }
+
+    // THE BODY-ADDRESSED OPERATIONS ARE PART OF THE PUBLISHED SET TOO, because their paths do
+    // not carry an organization and the prefix filter above cannot see them.
+    //
+    // NO CHECK ACCOMPANIES THEM, and that is deliberate rather than an omission. While the set
+    // was a hand-written list, resolving each entry against the document was a real check: an
+    // entry naming an operation this deployment does not publish was a drift the assertion
+    // caught. The derivation reads THE SAME DOCUMENT, so every id it returns is in the
+    // published set by construction -- an assertion here would be a set against a superset of
+    // itself, which cannot fail and which clippy names outright. It was written anyway on the
+    // way to deriving the set, and two doc blocks went on citing it as the reason the set
+    // cannot drift. A check that cannot fail is worse than none: it is the appearance of one.
+    //
+    // What DOES check these is the `unscanned` assertion below -- a derived operation whose
+    // file is missing from `ADMIN_SOURCES` fails there, which is exactly how `createLogStream`
+    // was found.
+    for id in body_addressed_operations() {
+        published.insert(id);
     }
 
     let scanned: BTreeSet<String> = org_operations()
