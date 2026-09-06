@@ -16,5 +16,6 @@
 3	crates/ironauth-oidc/src/login.rs
 1	crates/ironauth-oidc/src/magic_link.rs
 1	crates/ironauth-oidc/src/register.rs
+1	crates/ironauth-oidc/src/saml_signin.rs
 1	crates/ironauth-oidc/src/sms_otp.rs
 2	crates/ironauth-oidc/src/webauthn.rs

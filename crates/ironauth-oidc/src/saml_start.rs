@@ -22,15 +22,22 @@
 //! and a connection with no key cannot start a flow -- it is told so, rather than falling back to
 //! an unsigned request nobody asked for.
 //!
-//! # What the outstanding request does NOT prove
+//! # What the outstanding request does not prove on its own, and the cookie that closes it
 //!
-//! It proves a response answers a request THIS DEPLOYMENT issued and has not spent. It does not
-//! prove the browser presenting the response is the one the request was issued to, because this
-//! endpoint is unauthenticated and sets no cookie: anybody can mint a request, answer it at the
-//! identity provider as themselves, and auto-submit the result into somebody else's browser.
-//! Closing that needs a browser binding, it lands with sign-in -- which is when a session first
-//! depends on it -- and the cookie must be `SameSite=None; Secure`, because the response comes
-//! back on a cross-site POST and a `Lax` one would not be sent.
+//! The row proves a response answers a request THIS DEPLOYMENT issued and has not spent. It does
+//! NOT prove the browser presenting the response is the one the request was issued to: this
+//! endpoint is unauthenticated, so anybody can mint a request, answer it at the identity
+//! provider as themselves, capture the response, and auto-submit it into somebody else's
+//! browser. Before sign-in that bought nothing, because the assertion consumer minted no
+//! session; it does now, and the result would be a victim signed into the ATTACKER'S account.
+//!
+//! SO THIS ENDPOINT SETS A BINDING COOKIE, whose SHA-256 goes on the request row and which the
+//! assertion consumer compares. `SameSite=None; Secure` is load-bearing rather than a
+//! relaxation: the response arrives on a cross-site POST from the identity provider, and a `Lax`
+//! cookie is simply not sent on one -- so a `Lax` binding would refuse every real login while
+//! stopping nothing. What keeps that safe is that the cookie is not an authenticator: it carries
+//! a nonce that means nothing except beside the one request whose digest it matches, it is
+//! `HttpOnly`, and it dies with the request's own five-minute TTL.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -56,6 +63,27 @@ use crate::wellknown::parse_scope;
 /// bound a document somebody ELSE wrote and so have to accommodate their clock; this bounds one
 /// we wrote and hold the other end of, where there is nothing to accommodate.
 const REQUEST_TTL_SECS: i64 = 300;
+
+/// The browser-binding cookie's name for one outstanding request (issue #139).
+///
+/// ONE COOKIE PER FLOW, NOT ONE PER HOST, and an earlier version used a single fixed name.
+/// `__Host-` forbids a `Domain` and pins `Path=/`, so a fixed name is exactly ONE storage slot
+/// per host: a second sign-in started anywhere on the deployment -- another tab, another
+/// connection, another tenant -- overwrote the first flow's nonce. The first response then
+/// arrived, spent its outstanding request and burned its assertion id in the store BEFORE the
+/// transport compared cookies, and was refused with both already consumed. The user could not
+/// retry: their request was gone. Two tabs is not an attack, it is Tuesday.
+///
+/// THE REQUEST ID IS IN THE NAME rather than the value, so the consumer can ask for the ONE
+/// cookie belonging to the request the response names instead of guessing among several. Each
+/// carries the request's own five-minute `Max-Age`, so the jar drains by itself.
+///
+/// SHARED WITH THE ASSERTION CONSUMER, which is the only other reader, so the two cannot drift
+/// into setting one name and checking another -- a divergence that would refuse every solicited
+/// login and read, from the outside, exactly like a broken identity provider.
+pub(crate) fn binding_cookie_name(request_id: &str) -> String {
+    format!("__Host-ironauth_saml_bind_{request_id}")
+}
 
 /// The largest `RelayState` migration 0198's column will hold.
 ///
@@ -232,12 +260,18 @@ pub async fn start_get(
     // network: an `AuthnRequest` the identity provider answers and this deployment never wrote
     // down is a response the ACS refuses as `UnknownRequest`. Nothing between here and the
     // response can fail.
+    // THE BINDING NONCE IS MINTED BEFORE THE ROW IS WRITTEN, so a row can never exist with a
+    // digest whose nonce was never sent: the cookie and the column are set from one value in one
+    // response, and a failure to write the row returns before either reaches the browser.
+    let (nonce, digest) = mint_binding(&state);
+
     if read
         .saml_replay()
         .issue_request(
             &connection_id,
             &request_id,
             return_to.as_deref(),
+            Some(&digest),
             now_micros,
             now_micros + REQUEST_TTL_SECS * 1_000_000,
         )
@@ -247,6 +281,14 @@ pub async fn start_get(
         return server_error();
     }
 
+    started(location, &request_id, &nonce)
+}
+
+/// The redirect that starts a flow: the identity provider's URL and the binding cookie.
+///
+/// SPLIT OUT SO `start_get` STAYS READABLE, and because the three headers are one decision --
+/// where the browser goes, that the answer is never cached, and the binding it must carry back.
+fn started(location: axum::http::HeaderValue, request_id: &str, nonce: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [
@@ -255,9 +297,57 @@ pub async fn start_get(
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("no-store"),
             ),
+            (
+                axum::http::header::SET_COOKIE,
+                binding_cookie(request_id, nonce)
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        axum::http::HeaderValue::from_static("__Host-ironauth_saml_bind_x=")
+                    }),
+            ),
         ],
     )
         .into_response()
+}
+
+/// A fresh binding nonce and the digest that goes on the request row.
+///
+/// 32 BYTES FROM THE ENTROPY SEAM, which is the same source every other unguessable value in
+/// this crate comes from, and base64url so the value is cookie-safe without escaping.
+fn mint_binding(state: &OidcState) -> (String, Vec<u8>) {
+    let mut nonce_bytes = [0_u8; 32];
+    state.env().entropy().fill_bytes(&mut nonce_bytes);
+    let nonce = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes)
+    };
+    let digest = {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(nonce.as_bytes()).to_vec()
+    };
+    (nonce, digest)
+}
+
+/// The browser-binding cookie carrying `nonce`.
+///
+/// EVERY ATTRIBUTE IS DOING SOMETHING.
+///
+/// `__Host-` fixes the cookie to this exact origin with `Path=/` and no `Domain`, so a sibling
+/// subdomain -- a customer-controlled one, in a deployment that has any -- cannot write a
+/// binding this deployment would then accept.
+///
+/// `SameSite=None` is what makes it ARRIVE. The identity provider's auto-submitting form is a
+/// cross-site POST, and a `Lax` cookie is not sent on one; a `Lax` binding would refuse every
+/// genuine login and stop nothing. `Secure` is mandatory alongside it and is required by
+/// `__Host-` anyway.
+///
+/// `HttpOnly` keeps script from reading the nonce, and `Max-Age` matches the request's own TTL
+/// so a cookie cannot outlive the row it is the key to.
+fn binding_cookie(request_id: &str, nonce: &str) -> String {
+    format!(
+        "{}={nonce}; Path=/; Max-Age={REQUEST_TTL_SECS}; Secure; HttpOnly; SameSite=None",
+        binding_cookie_name(request_id)
+    )
 }
 
 /// Why a connection's signing key could not be loaded.

@@ -1543,6 +1543,11 @@ required-features = ["testing"]
 path = "tests/saml_metadata.rs"
 
 [[test]]
+name = "saml_signin"
+required-features = ["testing"]
+path = "tests/saml_signin.rs"
+
+[[test]]
 name = "saml_start"
 required-features = ["testing"]
 path = "tests/saml_start.rs"

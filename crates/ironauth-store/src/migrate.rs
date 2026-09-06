@@ -1620,6 +1620,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0199_saml_sp_signing_keys.sql"),
         },
+        Migration {
+            version: 200,
+            name: "saml_browser_binding",
+            // EXPAND. One nullable column on an existing table: an old reader ignores it and an
+            // old writer leaves it NULL, which is the shape the consumer already has to handle
+            // for an unsolicited response.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0200_saml_browser_binding.sql"),
+        },
     ]
 }
 

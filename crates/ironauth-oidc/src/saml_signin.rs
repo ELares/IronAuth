@@ -1,0 +1,766 @@
+//! Turning a consumed SAML assertion into a local session (issue #139).
+//!
+//! # The four reasons the last change refused to do this, and what answers each
+//!
+//! [`crate::saml_route`]'s module doc records why an earlier version of the assertion consumer
+//! was taken apart rather than kept. Each objection is a constraint on this module, so each is
+//! answered here rather than left for a reader to reconstruct.
+//!
+//! 1. IT CROSSED ORGANIZATIONS. The identifier seam resolves per ENVIRONMENT, so any identity
+//!    provider with a key pinned anywhere in the environment could mint a session for any
+//!    account in it. NOTHING HERE RESOLVES AN IDENTIFIER: the local user is keyed on
+//!    [`saml_external_id`], which namespaces the `NameID` by the CONNECTION.
+//!
+//!    THE CONNECTION, NOT ITS `idp_entity_id`, and an earlier version of this module used the
+//!    entity id and was wrong. Migration 0196 makes `idp_entity_id` unique per `(tenant,
+//!    environment, ORGANIZATION)` and its own comment explains why: "a customer with two
+//!    organizations in this environment signs both into their ONE identity provider tenant, so
+//!    both connections carry the same `idp_entity_id`". Two connections in different
+//!    organizations may therefore share that string while pinning DIFFERENT certificates, and
+//!    keying on it collapsed them to one local user -- so whoever held the second connection's
+//!    key could sign in as the first organization's people. The connection id is unique per
+//!    scope and IS the trust boundary: one connection is one set of pinned certificates in one
+//!    organization.
+//! 2. IT BYPASSED THE CRATE'S ANTI-TAKEOVER GATE. `account_linking` decides whether an upstream
+//!    identity may be MERGED into an existing local account, and answers `AutoLink` from exactly
+//!    one arm. This module never asks, because it never merges: it takes the branch the
+//!    federated callback calls the safe default, provisioning a separate identity keyed on the
+//!    composite. Offering the link is a decision an operator has not been given a surface for.
+//! 3. THE POPULATION IT NAMED COULD NOT USE IT. Requiring a VERIFIED local identifier would sign
+//!    in none of the accounts this exists to serve, because the SCIM inbound server in this same
+//!    milestone deliberately writes `verified: false`. Nothing here requires one: a first
+//!    assertion CREATES the person.
+//! 4. ITS ONLY REACHABLE MODE WAS THE ONE #139 REQUIRES OFF. That objection is spent: the start
+//!    endpoint issues real `AuthnRequest`s, so a solicited response is the ordinary case.
+//!
+//! # The order of the writes is load-bearing
+//!
+//! THE LIFECYCLE FENCE COMES BEFORE THE ORGANIZATION MEMBERSHIP, and an earlier version had it
+//! the other way. `establish_session` is where a blocked, disabled or waitlisted account is
+//! refused -- the identity provider, not this server, decided who the human is. Joining somebody
+//! to an organization before that check runs means an unauthenticated cross-site POST writes an
+//! org membership for an account this deployment refuses to authenticate. The membership is
+//! therefore written AFTER the session is minted.
+//!
+//! THE IDENTITY WRITE STILL COMES FIRST, AND IT HAS TO. `establish_session` is given a USER ID,
+//! so the user must exist before it can be asked about them -- which means a returning person's
+//! mapped traits are refreshed before the fence is consulted. An earlier version of this
+//! paragraph said "nothing lands for a person who is not admitted" and that was false of exactly
+//! that write. What closes it is a lifecycle read of its own, before provisioning, for an
+//! account that already exists; the fence below remains authoritative. A FIRST login is not
+//! covered and cannot be: a person with no row has no state to fence on, and the row created is
+//! `Active` by construction.
+//!
+//! A LIVE IDENTITY PROVIDER ACCOUNT RE-JOINS THE ORGANIZATION on its next login, because that is
+//! what just-in-time provisioning means: the directory is the source of truth for who belongs.
+//! An operator who wants somebody out removes them upstream, disables the local account, or
+//! disables the connection -- and each of those is enforced before this line is reached.
+//!
+//! # The mapper is the shared one, and that is a criterion rather than a preference
+//!
+//! #139 requires attribute mapping and `NameID` handling to "round-trip through the shared JIT
+//! mapper with per-connection config". The mapper is
+//! [`ironauth_connector::claim_mapping::evaluate`] -- the same function, not a parallel one --
+//! and the per-connection config is the `attribute_mapping` column. What this module supplies is
+//! the ADAPTER: a SAML assertion is a list of `Attribute` elements and a `NameID`, and the
+//! evaluator reads a JSON claims object, so [`claims_from_assertion`] is where one becomes the
+//! other. Everything downstream of that call is the OIDC path verbatim.
+//!
+//! # What this does not do
+//!
+//! It does not consult `account_linking`, for the reason above. It does not capture upstream
+//! tokens: there are none, because SAML returns an assertion rather than a token grant. It does
+//! not apply the broker overlay, which reads an `ocn_` org connection this connection has no row
+//! in -- discovery routing is the change that gives SAML one.
+
+use axum::http::HeaderMap;
+use axum::response::Response;
+use ironauth_connector::ClaimMapping;
+use ironauth_connector::claim_mapping::{ClaimSources, TraitDocument, TraitSchemaView, evaluate};
+use ironauth_saml::attributes::Value as AttributeValue;
+use ironauth_store::{
+    CorrelationId, NewMembership, OrgMembershipId, SamlConnection, Scope, StoreError, TraitSchema,
+    UserId,
+};
+use serde_json::{Map, Value as JsonValue};
+
+use crate::authn::AuthenticationEvent;
+use crate::federation::{StoreTraitSchema, provision_federated_user};
+use crate::interaction;
+use crate::saml_acs::Consumed;
+use crate::state::OidcState;
+use crate::util::epoch_micros;
+
+/// The claim name the `NameID` arrives under.
+///
+/// `sub`, BECAUSE THAT IS WHAT THE SHARED MAPPER'S DEFAULT SUBJECT RULE READS. The evaluator
+/// resolves its subject from `sub` unless a mapping names another field, so putting the `NameID`
+/// anywhere else would make every connection that does not override the rule fail to resolve a
+/// subject at all.
+const SUBJECT_CLAIM: &str = "sub";
+
+/// The claim name the `NameID`'s `Format` arrives under, when the assertion carried one.
+const NAMEID_FORMAT_CLAIM: &str = "nameid_format";
+
+/// The `NameID` formats that name a DIFFERENT string on every login.
+///
+/// REFUSED, BECAUSE AN IDENTITY KEY THAT CHANGES IS NOT AN IDENTITY. SAML Core 8.3.8 says a
+/// `transient` identifier has no meaning beyond the session it was issued for, and a conformant
+/// identity provider mints a fresh opaque value each time. Keyed on that, every login provisions
+/// a NEW local user and a NEW organization membership, so a person signing in daily accumulates
+/// an account a day and an operator's member list fills with strangers who are all one person.
+///
+/// THE REFUSAL IS HERE RATHER THAN AT THE ASSERTION, deliberately: `saml_acs` compares the
+/// document's `Format` to the connection's column and is right to admit a transient one, because
+/// the assertion IS well formed. What cannot be done with it is name somebody durably, and that
+/// is this module's question. The connection's column also travels outward -- the metadata
+/// document advertises it and every `AuthnRequest` carries it as `NameIDPolicy` -- so a
+/// connection configured this way is asking its provider for exactly what it cannot use.
+const UNUSABLE_NAMEID_FORMATS: [&str; 1] = ["urn:oasis:names:tc:SAML:2.0:nameid-format:transient"];
+
+/// XSD `collapse` on a column value, matching what the assertion consumer already applies.
+///
+/// THE TWO SIDES HAVE TO NORMALIZE THE SAME WAY OR THE GUARD IS BYPASSABLE. `saml_acs` collapses
+/// BOTH the connection's `nameid_format` column and the document's `Format` before comparing
+/// them, because XML 1.0 attribute-value normalization means a padded column and a flush
+/// document say the same thing -- and it has a test pinning exactly that. An earlier version of
+/// the transient refusal below compared the column RAW, so a column holding the transient URI
+/// with one trailing space was admitted by the ACS as transient and then sailed past the check
+/// that exists to stop it, provisioning a new person and a new organization membership on every
+/// login.
+fn collapse(text: &str) -> String {
+    text.split(['\u{9}', '\u{a}', '\u{d}', ' '])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The local identity key for a `NameID` on a connection.
+///
+/// NAMESPACED BY THE CONNECTION, which is the trust boundary: one connection is one set of
+/// pinned certificates belonging to one organization. See objection 1 in the module doc for what
+/// namespacing by `idp_entity_id` did instead.
+///
+/// A DISTINCT PREFIX FROM THE OIDC ONE, so the two namespaces can never meet. This module no
+/// longer keys on `idp_entity_id` at all, so the collision that argument was written against --
+/// a SAML connection whose entity id was set to an existing connector's issuer -- is already
+/// impossible; the prefix is what keeps it impossible if a later change ever reintroduces an
+/// issuer-shaped component, and it costs nothing. THE LENGTHS ARE INTERLEAVED for a reason that
+/// applies today: without them the key is a concatenation two different (connection, NameID)
+/// pairs can produce, and a `NameID` is operator-visible text an identity provider chooses.
+#[must_use]
+pub fn saml_external_id(connection_id: &str, name_id: &str) -> String {
+    format!(
+        "saml:v1:{}:{connection_id}:{}:{name_id}",
+        connection_id.len(),
+        name_id.len()
+    )
+}
+
+/// Why an assertion could not be turned into a claims object.
+///
+/// ONE VARIANT, CARRYING THE NAME THAT COLLIDED, because every case is the same operator-visible
+/// fault: two things want one key. See [`claims_from_assertion`] for why that is refused rather
+/// than resolved.
+///
+/// A NAME TOO DEEP TO PLACE IS NOT ONE OF THESE, and an earlier version reused this type for it
+/// -- so an assertion carrying one exotic attribute was reported to the operator as "carries two
+/// values for one claim name", a diagnosis that was false and prescribed a repair that did not
+/// exist. That case is [`Skipped::Yes`] now: the attribute is dropped and the sign-in proceeds.
+struct ClaimsConflict {
+    name: String,
+}
+
+/// Whether an attribute reached the claims object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skipped {
+    /// It was placed.
+    No,
+    /// Its name was too deep to place. Not a fault: see [`insert_at_path`].
+    Yes,
+}
+
+/// Sign in the person a consumed assertion names, provisioning them on first sight.
+///
+/// The response is a redirect carrying the session cookies, to the `RelayState` the START
+/// endpoint recorded when it issued the request -- never to a location the POST carried, which
+/// is an attacker-controlled parameter and an open redirect with extra steps.
+pub(crate) async fn sign_in(
+    state: &OidcState,
+    scope: Scope,
+    connection: &SamlConnection,
+    consumed: &Consumed,
+    headers: &HeaderMap,
+) -> Response {
+    // A FORMAT THAT NAMES A DIFFERENT STRING EVERY TIME cannot key an account. Refused before
+    // anything is written, because the first write is what would create the duplicate.
+    if UNUSABLE_NAMEID_FORMATS.contains(&collapse(&connection.nameid_format).as_str()) {
+        tracing::warn!(
+            target: "ironauth.saml",
+            connection = %connection.id,
+            format = %connection.nameid_format,
+            "a SAML connection asks its identity provider for a NameID format that cannot \
+             identify anybody across logins",
+        );
+        return server_error();
+    }
+
+    let claims = match claims_from_assertion(consumed) {
+        Ok(claims) => claims,
+        Err(conflict) => {
+            // THE NAME IS TRUNCATED, because it is chosen by the identity provider and bounded
+            // only by the body cap: echoing it whole lets a signed assertion write a third of a
+            // megabyte into the log on every attempt, which is a cheap way to fill a disk.
+            let mut name = conflict.name;
+            name.truncate(128);
+            tracing::warn!(
+                target: "ironauth.saml",
+                connection = %connection.id,
+                name = %name,
+                "a SAML assertion carries two values for one claim name, so which one a mapping \
+                 would read is not decidable",
+            );
+            return server_error();
+        }
+    };
+    let (trait_doc, schema_version) = match map_traits(state, scope, connection, &claims).await {
+        Ok(mapped) => mapped,
+        Err(response) => return response,
+    };
+
+    // NO `VerifiedUpstreamIdentity`. An earlier version built one, filling `email` from the
+    // mapped document and writing paragraphs justifying an empty `amr`, `acr` and `auth_time`.
+    // None of it reached a write: the shared provisioner read the struct exactly twice, both
+    // `subject`, to build the two values this now passes directly. The struct is gone from its
+    // signature, so the dead fields cannot come back unnoticed.
+    //
+    // THE KEY AND THE HANDLE ARE BUILT HERE, not inside the shared provisioner, because they are
+    // the one thing the two federation protocols must NOT share. See [`saml_external_id`].
+    let external_id = saml_external_id(&connection.id.to_string(), &consumed.accepted.name_id);
+    let handle = format!("saml:{}:{}", connection.id, consumed.accepted.name_id);
+
+    // THE LIFECYCLE IS CHECKED BEFORE THE IDENTITY IS WRITTEN, for an account that already
+    // exists. `establish_session` is the authoritative fence and still runs below -- this does
+    // not replace it -- but it runs AFTER provisioning, and provisioning REWRITES a returning
+    // person's mapped traits. Without this, an unauthenticated cross-site POST could refresh a
+    // blocked or disabled person's stored identity from whatever their identity provider now
+    // says, on a sign-in this deployment then refuses. An earlier version of the module doc
+    // claimed "nothing lands for a person who is not admitted" while that write landed.
+    //
+    // IT CANNOT COVER A FIRST LOGIN, and saying so is the point: a person who does not exist yet
+    // has no state to be fenced on, and the row this creates is `Active` by construction. So the
+    // uncovered case is an account this deployment has never seen, which is the case JIT exists
+    // to serve.
+    //
+    // A STORE FAULT FAILS CLOSED, because the alternative is provisioning past a fence that
+    // could not be read.
+    match state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_external_id(&external_id)
+        .await
+    {
+        Ok(Some(existing)) if !existing.state.can_authenticate() => return refused_account(),
+        Ok(_) => {}
+        Err(_) => return server_error(),
+    }
+
+    let user_id = match provision_federated_user(
+        state,
+        scope,
+        &external_id,
+        &handle,
+        &trait_doc,
+        schema_version,
+        // NO `ocn_` ORG CONNECTION. That column stamps the routed org connection a federated
+        // login came through, and a SAML connection has no such row today. The organization is
+        // recorded below, from the column the SAML connection carries.
+        None,
+    )
+    .await
+    {
+        Ok(user_id) => user_id,
+        Err(StoreError::TraitsInvalid(_)) => {
+            tracing::warn!(
+                target: "ironauth.saml",
+                connection = %connection.id,
+                "a SAML attribute mapping targets a trait an end user may not write",
+            );
+            return server_error();
+        }
+        // A DELETED ACCOUNT LANDS HERE AND NOT ON THE FENCE. See [`resolve_conflict`].
+        Err(StoreError::Conflict) => match resolve_conflict(state, scope, &external_id).await {
+            Some(user_id) => user_id,
+            None => return refused_account(),
+        },
+        Err(_) => return server_error(),
+    };
+
+    let event = AuthenticationEvent::federated(epoch_micros(state.now()), &[], None);
+    let actor = interaction::user_actor(&user_id);
+    // THE CENTRAL LIFECYCLE FENCE IS THE ONLY THING between a blocked, disabled or waitlisted
+    // account and a session here, exactly as on the federated callback: this path runs no
+    // `can_authenticate` pre-check of its own, because the identity provider, not this server,
+    // decided who the human is.
+    // SESSION ROTATION AND THE FOREIGN-SUBJECT CASCADE ARE USUALLY INERT HERE, and that is a
+    // property of the transport rather than a choice. `establish_session` rotates or revokes a
+    // PRIOR session by reading its cookie, and the session cookie is `SameSite=Lax` BY DEFAULT --
+    // so it is not sent on this cross-site POST, and the function sees a browser with no session
+    // whatever the jar holds. A SAML sign-in therefore ADDS a session rather than replacing one.
+    //
+    // "BY DEFAULT" IS LOAD-BEARING AND AN EARLIER VERSION OMITTED IT, stating the `Lax` shape as
+    // a fact when it is a configuration: `oidc.session_partitioned_cookie` already ships the CHIPS
+    // shape, `SameSite=None; Partitioned`, and under it the session cookie IS sent here and
+    // rotation works. So the behaviour differs between two supported configurations, which is
+    // worth a reader knowing -- the paragraph that called rotation unfixable was describing one
+    // of them. Neither is fixed here: making rotation unconditional would mean `SameSite=None` on
+    // every deployment's session, a far larger weakening than it buys back.
+    let cookies = match interaction::establish_session(
+        state,
+        scope,
+        &user_id.to_string(),
+        &event,
+        actor,
+        headers,
+    )
+    .await
+    {
+        Ok(cookies) => cookies,
+        // A REFUSED ACCOUNT AND A BROKEN DATABASE ARE DIFFERENT ANSWERS, and an earlier version
+        // collapsed them into one 500 under a "not an account-state oracle" heading. That
+        // reversed the decision the federated callback makes on the same fence: it answers an
+        // ordinary refusal page for a fenced account and a 500 only for a fault. Reporting a
+        // server fault for a deliberate administrative state sends an operator hunting a bug.
+        // Neither page names a lifecycle state, so neither is an oracle; what differs is which
+        // of them is true.
+        Err(interaction::EstablishSessionError::NotAuthenticatable) => return refused_account(),
+        Err(interaction::EstablishSessionError::Store) => return server_error(),
+    };
+
+    // AFTER THE FENCE. See "the order of the writes is load-bearing" in the module doc.
+    if ensure_membership(state, scope, connection, &user_id)
+        .await
+        .is_err()
+    {
+        return server_error();
+    }
+
+    interaction::redirect_setting_cookie(consumed.relay_state.as_deref().unwrap_or("/"), &cookies)
+}
+
+/// Who a provisioning CONFLICT actually names, or [`None`] if nobody who may sign in.
+///
+/// # Two different things collide the same way
+///
+/// A DELETED ACCOUNT. Deleting a user is a SOFT delete that keeps the row and its blind indexes,
+/// so the lifecycle read before provisioning -- which filters `deleted_at IS NULL` -- reports the
+/// person as ABSENT, provisioning tries to create them, and the insert collides with the
+/// tombstone's unique index. An earlier version answered that with a 500 forever, telling an
+/// operator a database was broken when what had happened was their own deletion.
+///
+/// A LOST CREATE RACE. Two first logins for one person arrive together and one insert wins; the
+/// loser must carry on with the row the winner made, not be turned away.
+///
+/// They are told apart by looking again: if the person is now readable and may authenticate,
+/// this was the race. A store fault answers `None`, which fails closed.
+async fn resolve_conflict(state: &OidcState, scope: Scope, external_id: &str) -> Option<UserId> {
+    match state
+        .store()
+        .scoped(scope)
+        .users()
+        .by_external_id(external_id)
+        .await
+    {
+        Ok(Some(existing)) if existing.state.can_authenticate() => Some(existing.id),
+        _ => None,
+    }
+}
+
+/// Evaluate the connection's attribute mapping against the assertion's claims.
+///
+/// SPLIT OUT BECAUSE IT IS THE HALF WITH NO SIDE EFFECTS: everything here reads configuration
+/// and computes a document, and nothing it does is visible if the sign-in later fails. Returning
+/// the rendered failure rather than an error type keeps all four of its distinct faults -- an
+/// unreadable schema, a schema that will not compile, a column that is not a mapping, and a
+/// mapping that does not evaluate -- answering with the one page they all deserve, while each
+/// still logs the sentence that tells the operator which it was.
+///
+/// The second element is the active schema VERSION, which provisioning stamps on the identity so
+/// a later reader knows which schema the stored traits were validated against.
+async fn map_traits(
+    state: &OidcState,
+    scope: Scope,
+    connection: &SamlConnection,
+    claims: &Map<String, JsonValue>,
+) -> Result<(TraitDocument, Option<i32>), Response> {
+    // THE ACTIVE TRAIT SCHEMA, compiled once, exactly as the federated callback does. A schema
+    // that will not compile is a server-side fault rather than a login the person can fix, so it
+    // fails closed WITHOUT provisioning: half-provisioning on a bad schema would leave an
+    // account that no later login can complete.
+    let Ok(active_schema) = state.store().scoped(scope).trait_schemas().active().await else {
+        return Err(server_error());
+    };
+    let compiled = match active_schema
+        .as_ref()
+        .map(|version| TraitSchema::compile(&version.schema_json))
+    {
+        Some(Ok(schema)) => Some(schema),
+        Some(Err(_)) => return Err(server_error()),
+        None => None,
+    };
+    let schema_view = compiled.as_ref().map(StoreTraitSchema);
+    let schema_arg: Option<&dyn TraitSchemaView> = schema_view
+        .as_ref()
+        .map(|view| view as &dyn TraitSchemaView);
+
+    // THE COLUMN IS JSON AND THE EVALUATOR TAKES A PARSED SHAPE, so the parse is here and its
+    // failure is an operator fault rather than a person's. `ClaimMapping` is
+    // `deny_unknown_fields` and `default`, so `{}` is a valid mapping meaning "map nothing",
+    // which is what a connection an operator has configured no attributes on arrives with --
+    // and which provisions a minimal identity rather than refusing the login.
+    //
+    // IT WOULD BE BETTER REFUSED AT CONFIG TIME, which is the posture
+    // `connectors::refuse_admin_only_claim_mapping` already takes on the OIDC side for the
+    // neighbouring fault. There is no SAML connection-config surface to put it on yet: #140 owns
+    // it. Until then a malformed column breaks the END USER for something only the operator can
+    // fix, and saying so here is better than a comment implying the gate exists.
+    let mapping: ClaimMapping = match serde_json::from_value(connection.attribute_mapping.clone()) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            tracing::warn!(
+                target: "ironauth.saml",
+                connection = %connection.id,
+                reason = %error,
+                "a SAML connection's attribute_mapping column is not a claim mapping",
+            );
+            return Err(server_error());
+        }
+    };
+    let trait_doc: TraitDocument = match evaluate(
+        &mapping,
+        &ironauth_connector::Quirks::default(),
+        ClaimSources {
+            id_token: claims,
+            // NO SECOND SOURCE, AND THAT IS NOT A GAP. `userinfo` exists because an OIDC
+            // connector may fetch claims from a second endpoint after the token exchange. A SAML
+            // assertion is one document: everything the provider is willing to say arrives in
+            // it, so a second source would have nothing to hold.
+            userinfo: None,
+        },
+        schema_arg,
+        None,
+    ) {
+        Ok(document) => document,
+        // A MAPPING FAULT IS THE OPERATOR'S, NOT THE PERSON'S, and there is nothing the person
+        // signing in can do about it -- so it is a server error to them and a log line naming
+        // the connection for whoever configured it.
+        Err(error) => {
+            tracing::warn!(
+                target: "ironauth.saml",
+                connection = %connection.id,
+                reason = %error,
+                "a SAML connection's attribute mapping could not be evaluated",
+            );
+            return Err(server_error());
+        }
+    };
+
+    Ok((
+        trait_doc,
+        active_schema.as_ref().map(|version| version.version),
+    ))
+}
+
+/// The assertion as the shared mapper's claims object, or the name that two values wanted.
+///
+/// # Why a `Vec<Value>` becomes a scalar sometimes and an array other times
+///
+/// SAML gives every attribute a LIST of values, and almost every real attribute has exactly one.
+/// A mapping that reads `email` wants the string, not `["ada@globex.example"]`, and every
+/// connector mapping in this codebase is written against OIDC claims where a single value is a
+/// scalar. Collapsing a one-element list is what makes one mapping language serve both.
+///
+/// # Why a collision is a refusal and not a choice
+///
+/// Three different things can want one key: the `NameID` and an attribute literally named `sub`;
+/// two `Attribute` elements sharing a `Name` (SAML admits them as distinct when their
+/// `NameFormat` differs, and the claims object has nowhere to put the format); and an attribute
+/// named `a` beside one named `a.b`, which the dotted path below cannot hold at once.
+///
+/// AN EARLIER VERSION PICKED THE FIRST ONE SILENTLY and justified it as avoiding a value that
+/// "depends on an ordering the identity provider chooses". It does not avoid that: first-wins
+/// and last-wins BOTH select by the order the provider chose, so the justification did not
+/// distinguish the rule it defended from the one it rejected. What it did do was hand a mapping
+/// author a value they did not ask for -- an operator who maps `email` and gets the `NameID`, or
+/// the wrong one of two `email` attributes, sees a login that works and an identity that is
+/// subtly the wrong person's.
+///
+/// So a collision refuses the whole sign-in. It is deterministic, it names the key in the log,
+/// and the operator's fix -- remap, or ask their provider to stop sending the duplicate -- is
+/// one they can only make if they are told.
+fn claims_from_assertion(consumed: &Consumed) -> Result<Map<String, JsonValue>, ClaimsConflict> {
+    let mut claims = Map::new();
+    claims.insert(
+        SUBJECT_CLAIM.to_owned(),
+        JsonValue::String(consumed.accepted.name_id.clone()),
+    );
+    if let Some(format) = consumed.accepted.name_id_format.as_ref() {
+        claims.insert(
+            NAMEID_FORMAT_CLAIM.to_owned(),
+            JsonValue::String(format.clone()),
+        );
+    }
+
+    for attribute in &consumed.statement.attributes {
+        let mut values = attribute.values.iter().filter_map(|value| match value {
+            AttributeValue::Text(text) => Some(JsonValue::String(text.clone())),
+            // A NON-TEXT VALUE IS SKIPPED RATHER THAN STRINGIFIED. Its Rust spelling is not
+            // something a mapping can be written against, and rendering it would put a debug
+            // form into somebody's identity traits.
+            _ => None,
+        });
+        let mapped = match (values.next(), values.next()) {
+            // AN ATTRIBUTE WITH NO USABLE VALUES IS NOT INSERTED. SAML says an empty `Attribute`
+            // means "not populated for this person", and an earlier version inserted JSON `null`
+            // to preserve that against "the provider sent nothing". The shared evaluator's
+            // `resolve_rule` skips a resolved `null` exactly as it skips an absent key, so the
+            // distinction reached no consumer -- and a key present with a null value would still
+            // COLLIDE with a later attribute of the same name, refusing a sign-in over a value
+            // nothing could read.
+            (None, _) => continue,
+            (Some(single), None) => single,
+            (Some(first), Some(second)) => {
+                let mut all = vec![first, second];
+                all.extend(values);
+                JsonValue::Array(all)
+            }
+        };
+        insert_at_path(&mut claims, &attribute.name, mapped)?;
+    }
+    Ok(claims)
+}
+
+/// Insert `value` at the shared mapper's DOTTED PATH for `name`, or name the key that collided.
+///
+/// # Why this is not a flat insert
+///
+/// The shared evaluator resolves a rule's `source` with `resolve_path`, which SPLITS ON `.` and
+/// descends. A flat insert therefore makes every SAML attribute whose `Name` contains a dot
+/// unaddressable -- and a dotted `Name` is not an edge case in SAML, it is the norm: LDAP-derived
+/// attributes arrive as `urn:oid:0.9.2342.19200300.100.1.3`, and Entra sends
+/// `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`, whose hostname has two.
+/// An operator writing the attribute name they see in their identity provider would get a
+/// mapping that silently resolves nothing, and a REQUIRED trait would fail every login with no
+/// hint that the name was the problem.
+///
+/// Placing each attribute at the path its own `Name` splits into makes the name the operator
+/// writes the name that resolves, for dotted and undotted alike -- an undotted name is a
+/// one-segment path, so this is a flat insert for the ordinary case.
+fn insert_at_path(
+    root: &mut Map<String, JsonValue>,
+    name: &str,
+    value: JsonValue,
+) -> Result<Skipped, ClaimsConflict> {
+    let conflict = || ClaimsConflict {
+        name: name.to_owned(),
+    };
+
+    // THE SEGMENT COUNT IS BOUNDED, AND THE BOUND IS NOT A TIDINESS RULE. An `Attribute`'s
+    // `Name` is chosen by the identity provider and nothing upstream bounds its LENGTH:
+    // `max_name_bytes` in the parser applies to an XML attribute's KEY (the four bytes `Name`),
+    // not to its value, and `attributes()` checks only that the name is not blank. So a signed
+    // assertion inside the 512 KiB body cap can carry a `Name` of ~387,000 dots, and one nested
+    // `Map` per segment is a `serde_json::Value` that deep -- whose DERIVED, RECURSIVE
+    // destructor overflows a tokio worker's 2 MiB stack when it drops, on every exit path
+    // including the refusals. A stack overflow is not a panic: nothing catches it, and the whole
+    // multi-tenant process aborts.
+    //
+    // THIS CRATE ALREADY LEARNED THIS ONCE. `ironauth_saml::parse::Element` and `tree::
+    // RichElement` both carry hand-written iterative `Drop` impls because a reviewer watched the
+    // process abort at depth 60,000, and `DEPTH_CEILING` is 512 for the same reason. A verified
+    // signature does not make a document friendly, and this is the first place in the sign-in
+    // path that builds an unbounded recursive structure from one.
+    //
+    // SIXTY-FOUR, AND THE FIRST VERSION OF THIS BOUND WAS TEN, WHICH LOCKED OUT SHIBBOLETH. Its
+    // comment claimed ten was "above every real name" and miscounted its own example:
+    // `urn:oid:0.9.2342.19200300.100.1.3` is SEVEN segments, not six. The arc it did not check
+    // is the eduPerson family -- `urn:oid:1.3.6.1.4.1.5923.1.1.1.6` and its siblings are ELEVEN
+    // -- which is the default attribute release of every InCommon and eduGAIN identity provider.
+    // At ten, releasing any one of them refused every login on that connection forever.
+    //
+    // THE BOUND IS ABOUT STACK DEPTH AND NOTHING ELSE, so it belongs nowhere near the length of
+    // a plausible name: the drop that aborts the process needs tens of thousands of levels, and
+    // sixty-four is three levels of magnitude below that while being six times the longest
+    // vocabulary anybody ships.
+    const MAX_SEGMENTS: usize = 64;
+    if name.split('.').count() > MAX_SEGMENTS {
+        // THE ATTRIBUTE IS SKIPPED, NOT THE SIGN-IN, and the first version refused the whole
+        // response. A name this long is not a mapping target, so dropping it costs nothing --
+        // and refusing over it means an identity provider that adds one exotic attribute locks
+        // out every user, with the request and assertion id already burned so there is nothing
+        // to retry. This matches the arm above that skips an attribute with no usable values.
+        return Ok(Skipped::Yes);
+    }
+
+    let mut segments = name.split('.').peekable();
+    let mut current = root;
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            if current.contains_key(segment) {
+                return Err(conflict());
+            }
+            current.insert(segment.to_owned(), value);
+            return Ok(Skipped::No);
+        }
+        let next = current
+            .entry(segment.to_owned())
+            .or_insert_with(|| JsonValue::Object(Map::new()));
+        match next {
+            JsonValue::Object(object) => current = object,
+            // A SCALAR IS ALREADY AT AN INTERIOR SEGMENT, so `a` and `a.b` both want `a`.
+            _ => return Err(conflict()),
+        }
+    }
+    // UNREACHABLE FOR ANY NAME: `split` yields at least one segment, and the final one returns
+    // above. Written as a value rather than an `unreachable!` because a panic here would be a
+    // way to abort the process from an attacker-chosen string, which is the class of defect the
+    // bound above exists to close.
+    Ok(Skipped::No)
+}
+
+/// Record the person as a member of the connection's organization, if they are not already.
+///
+/// THE ORGANIZATION COMES FROM THE CONNECTION ROW, which is the whole point of migration 0196's
+/// sentence that "a trust anchor that reached two organizations would let one customer's identity
+/// provider assert another customer's users". The membership is what makes a SAML sign-in mean
+/// the same thing as an OIDC one to every reader downstream of it.
+///
+/// IT EMITS `organization.member_added`, and an earlier version called the four-argument
+/// `create`, which forwards no event. That is not cosmetic: the outbound SCIM push shipped in
+/// this same milestone drives its steady state entirely from the event feed, so a membership
+/// committed without an envelope is a person who exists in this deployment and never reaches the
+/// downstream directory. A JIT membership is exactly the case that push exists to carry.
+///
+/// IDEMPOTENT IN THE STORE, WITH NO PRE-READ. An earlier version read `for_user_in_org` first
+/// and returned early, and a test claimed to measure that guard -- but deleting it changed no
+/// answer, because `create`'s own `INSERT ... ON CONFLICT DO NOTHING` already returns the same
+/// conflict for a live row, which this treats as success. A branch whose removal is invisible is
+/// not a guard, it is a second copy of one, and the copy could drift: it sees only LIVE rows
+/// while the insert also revives soft-deleted ones, so the two disagreed about a person an
+/// operator had removed.
+///
+/// So the race is handled where races belong. Two assertions for one new person arrive together,
+/// one insert wins, and the loser has a membership either way.
+async fn ensure_membership(
+    state: &OidcState,
+    scope: Scope,
+    connection: &SamlConnection,
+    user_id: &UserId,
+) -> Result<(), StoreError> {
+    let scoped = state.store().scoped(scope);
+    // THE ID A REVIVE WILL REUSE, and an earlier version minted a fresh one unconditionally.
+    // `create` arbitrates on `(organization_id, user_id)` and revives a soft-deleted row IN
+    // PLACE, keeping its original id -- so on the re-join this module's own doc calls normal (an
+    // operator removes somebody, their directory signs them back in) the envelope named a
+    // membership that does not exist, and a consumer resolving it found nothing.
+    let membership_id = match scoped
+        .org_memberships()
+        .occupied_membership_id(&connection.organization_id, user_id)
+        .await?
+    {
+        Some(existing) => existing,
+        None => OrgMembershipId::generate(state.env(), &scope),
+    };
+    let subject = membership_id.to_string();
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "organization.member_added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        epoch_micros(state.now()) / 1000,
+        &serde_json::json!({
+            "membership_id": subject,
+            "organization_id": connection.organization_id.to_string(),
+            "user_id": user_id.to_string(),
+        }),
+    );
+    let domain_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            subject: &subject,
+            envelope,
+        });
+
+    let actor = interaction::user_actor(user_id);
+    let correlation = CorrelationId::generate(state.env());
+    match scoped
+        .acting(actor, correlation)
+        .org_memberships()
+        .create_with_event(
+            state.env(),
+            NewMembership {
+                id: &membership_id,
+                organization_id: &connection.organization_id,
+                user_id,
+                // NO METADATA. The row records that this person is in this organization; WHY is
+                // recorded by the identity's own external id, which names the connection.
+                metadata: None,
+            },
+            epoch_micros(state.now()),
+            None,
+            domain_event.as_ref(),
+            None,
+        )
+        .await
+    {
+        // THE RACE LOSER ALREADY HAS WHAT THIS FUNCTION EXISTS TO GUARANTEE, which is why a
+        // conflict shares the success arm.
+        Ok(_) | Err(StoreError::Conflict) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The page for an account this deployment will not authenticate.
+///
+/// IT NAMES NO LIFECYCLE STATE: waitlisted, blocked, disabled and deleted are one answer, so
+/// this is not an oracle. What it is not is a 500, which would report a server fault for a
+/// deliberate administrative decision.
+///
+/// DELETED REACHES IT BY A DIFFERENT ROUTE THAN THE OTHERS, and an earlier version of this
+/// sentence listed it as though it came through the same door. A deletion is a soft delete, so
+/// the lifecycle read filters the person out as absent and provisioning collides with the
+/// tombstone instead; that conflict is mapped here. The answer is the same, which is what the
+/// sentence promised.
+fn refused_account() -> Response {
+    page(
+        axum::http::StatusCode::FORBIDDEN,
+        "<p>This response was accepted, but this account cannot sign in here.</p>\
+         <p>Contact your administrator.</p>",
+    )
+}
+
+/// The generic failure this module answers with, which never says what broke.
+fn server_error() -> Response {
+    page(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "<p>This response was accepted, but the sign-in could not be completed.</p>\
+         <p>Try again; if it persists, your administrator should check this connection.</p>",
+    )
+}
+
+/// An uncacheable outcome page carrying `body`, which is always a sentence written in this file.
+fn page(status: axum::http::StatusCode, body: &'static str) -> Response {
+    use axum::response::IntoResponse as _;
+
+    (
+        status,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::response::Html(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Sign-in unavailable</title>{body}"
+        )),
+    )
+        .into_response()
+}

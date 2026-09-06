@@ -87,7 +87,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      retired the duplicate outbound SCIM push policy, \
      outbound SCIM push withdrawal state, \
      SAML connections, SAML connection certificates, \
-     SAML request correlation and assertion replay, SAML SP signing keys.";
+     SAML request correlation and assertion replay, SAML SP signing keys, \
+     SAML browser binding.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -718,7 +719,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        199,
+        200,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -760,7 +761,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
-            194, 195, 196, 197, 198, 199
+            194, 195, 196, 197, 198, 199, 200
         ]
     );
     let phase_of = |version: i64| async move {

@@ -342,17 +342,40 @@ async fn a_started_flow_is_answerable_at_the_acs_that_refuses_unsolicited_respon
         .expect("the request carries an ID")
         .to_owned();
 
+    // THE BROWSER BINDING COOKIE, WHICH THE BROWSER CARRIES BACK. This is what makes the loop a
+    // real one: the assertion consumer now requires the response to arrive in the browser its
+    // request was issued to, so a test that posted without this would be refused -- and one that
+    // did not check the attributes would pass on a `Lax` cookie no real identity provider's
+    // cross-site POST would ever send.
+    let cookie = headers
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .find(|value| value.starts_with(&format!("__Host-ironauth_saml_bind_{id}=")))
+        .expect("the start endpoint set no browser-binding cookie");
+    assert!(cookie.contains("SameSite=None"), "{cookie}");
+    assert!(cookie.contains("Secure"), "{cookie}");
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+    assert!(cookie.contains("Max-Age=300"), "{cookie}");
+    let nonce = cookie
+        .split(';')
+        .next()
+        .and_then(|pair| pair.split_once('='))
+        .map(|(_, value)| value.to_owned())
+        .expect("the cookie carries a nonce");
+
     let response = signed(&wired, harness.env(), "_assertion_looped", &id);
     let encoded = base64::engine::general_purpose::STANDARD.encode(&response);
+    let bound = format!("__Host-ironauth_saml_bind_{id}={nonce}");
     let (status, _, body) = harness
         .post_form(
             &wired.acs_path,
             &format!("SAMLResponse={}", urlencode(&encoded)),
-            None,
+            Some(&bound),
         )
         .await;
     assert_eq!(
-        status, 200,
+        status, 303,
         "a response answering a request this deployment issued was refused: {body}"
     );
 
@@ -362,7 +385,7 @@ async fn a_started_flow_is_answerable_at_the_acs_that_refuses_unsolicited_respon
         .post_form(
             &wired.acs_path,
             &format!("SAMLResponse={}", urlencode(&encoded)),
-            None,
+            Some(&bound),
         )
         .await;
     assert_eq!(
@@ -718,6 +741,7 @@ async fn spend_at(harness: &Harness, wired: &Wired, location: &str) -> Option<St
         .consume_request(&wired.connection, &id, now_micros(harness.env()))
         .await
         .expect("the request was recorded")
+        .relay_state
 }
 
 #[tokio::test]

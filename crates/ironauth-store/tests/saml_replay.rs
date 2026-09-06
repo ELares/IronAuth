@@ -106,6 +106,7 @@ async fn a_request_is_redeemed_once_and_carries_its_relay_state_back() {
             &connection,
             "_req_1",
             Some("/dashboard"),
+            None,
             now,
             now + 300_000_000,
         )
@@ -118,10 +119,14 @@ async fn a_request_is_redeemed_once_and_carries_its_relay_state_back() {
         .await
         .expect("the response names a live request");
     assert_eq!(
-        relay.as_deref(),
+        relay.relay_state.as_deref(),
         Some("/dashboard"),
         "the relay state did not come back, so the browser lands nowhere"
     );
+    // AND THE BINDING THIS REQUEST WAS ISSUED WITHOUT, which is the shape a pre-0200 row and an
+    // unsolicited response both present. `None` here is what the transport reads as "nothing to
+    // compare"; see migration 0200 for why that is not a loophole.
+    assert_eq!(relay.browser_binding_sha256, None);
 
     // A SECOND RESPONSE NAMING IT IS REFUSED. This is the replay, and it is the ordinary shape:
     // somebody captured the POST body and sent it again.
@@ -163,6 +168,7 @@ async fn a_request_that_was_never_issued_is_indistinguishable_from_one_already_u
             &ours,
             "_req_expired",
             None,
+            None,
             now - 2_000_000,
             now - 1_000_000,
         )
@@ -181,7 +187,7 @@ async fn a_request_that_was_never_issued_is_indistinguishable_from_one_already_u
     // response signed by one identity provider must not consume a request issued to another.
     store
         .saml_replay()
-        .issue_request(&ours, "_req_ours", None, now, now + 300_000_000)
+        .issue_request(&ours, "_req_ours", None, None, now, now + 300_000_000)
         .await
         .expect("issue");
     let crossed = store
@@ -221,6 +227,7 @@ async fn concurrent_responses_naming_one_request_admit_exactly_one() {
             &connection,
             "_req_race",
             Some("/after"),
+            None,
             now,
             now + 300_000_000,
         )
@@ -344,6 +351,7 @@ async fn a_request_cannot_be_issued_for_another_scopes_connection() {
             &their_connection,
             "_req_x",
             None,
+            None,
             now_micros(&env),
             now_micros(&env) + 300_000_000,
         )
@@ -373,7 +381,7 @@ async fn a_request_cannot_be_issued_against_a_connection_that_does_not_exist() {
         .store()
         .scoped(scope)
         .saml_replay()
-        .issue_request(&absent, "_req_absent", None, now, now + 300_000_000)
+        .issue_request(&absent, "_req_absent", None, None, now, now + 300_000_000)
         .await;
     assert!(
         matches!(refused, Err(StoreError::NotFound)),

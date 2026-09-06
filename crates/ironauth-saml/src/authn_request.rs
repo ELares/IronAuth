@@ -23,10 +23,14 @@
 //! their own request, answer it at the identity provider as themselves, and auto-submit the
 //! result into somebody else's browser; the row is spent exactly once either way.
 //!
-//! THE MISSING HALF IS A BROWSER BINDING: a cookie set at issue time carrying the request id or
-//! its digest, checked at the assertion consumer service. It lands with sign-in, because that is
-//! when a session first depends on it and this build's consumer mints nothing. One constraint is
-//! worth writing down now rather than rediscovering: the response arrives on a CROSS-SITE POST,
+//! THE OTHER HALF IS A BROWSER BINDING, AND IT SHIPPED WITH SIGN-IN: a cookie set at issue time
+//! carrying a nonce whose digest is on the request row, compared at the assertion consumer
+//! service. This paragraph is the fourth document that said it "lands with sign-in" and the last
+//! to be corrected -- the other three were, and this one was missed, which is the shape a
+//! retraction takes when it is applied by file rather than by claim. It closes the
+//! captured-response attack and not an attacker-initiated one; `ironauth_oidc::saml_route`'s
+//! module doc has the full scope. One constraint was written down here before it was built and
+//! held: the response arrives on a CROSS-SITE POST,
 //! so that cookie must be `SameSite=None; Secure` -- a `Lax` or `Strict` one is simply not sent,
 //! and the binding would silently never match.
 

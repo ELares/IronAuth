@@ -49563,6 +49563,48 @@ impl OrgMembershipRepo<'_> {
             .transpose()
     }
 
+    /// The membership id this `(organization, user)` pair would OCCUPY, live or tombstoned.
+    ///
+    /// # Why a caller needs the id of a row it cannot use
+    ///
+    /// [`ActingOrgMembershipRepo::create`] arbitrates on `(organization_id, user_id)` and REVIVES
+    /// a soft-deleted row in place, keeping its ORIGINAL id -- so a caller that mints a fresh id,
+    /// builds a domain event naming it, and then calls `create` publishes an envelope for a row
+    /// that does not exist. The SAML just-in-time membership hit exactly that: an operator
+    /// removes somebody, their identity provider signs them in again, the row is revived under
+    /// its old id, and `organization.member_added` named a new one no consumer could resolve.
+    ///
+    /// So this answers what `create` WILL use, letting the caller mint the event correctly. It is
+    /// deliberately NOT a liveness check -- it returns tombstoned rows, which is the whole point
+    /// -- and [`Self::for_user_in_org`] remains the read for "is this person a member".
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn occupied_membership_id(
+        &self,
+        org_id: &OrganizationId,
+        user_id: &UserId,
+    ) -> Result<Option<OrgMembershipId>, StoreError> {
+        if org_id.scope() != self.scope || user_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM org_memberships \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             AND user_id = $4 AND owner_kind = 'user'",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(org_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.and_then(|id| OrgMembershipId::parse_in_scope(&id, &self.scope).ok()))
+    }
+
     /// The organization's live member USER IDS, ordered by user id, for an outbound enumeration.
     ///
     /// Ordered by `user_id` rather than by `(created_at, id)`, and returning the USER id rather
@@ -75757,6 +75799,20 @@ pub struct NewSamlSpKey<'a> {
     pub created_at_unix_micros: i64,
 }
 
+/// What a spent outstanding request carried (issue #139).
+///
+/// A STRUCT RATHER THAN THE RELAY STATE ALONE, because the caller now needs two facts from one
+/// spend and the spend can only happen once. Reading the binding in a second statement would
+/// read a row this one has already marked consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentRequest {
+    /// The `RelayState` recorded when the request was issued, if any.
+    pub relay_state: Option<String>,
+    /// SHA-256 of the nonce the browser-binding cookie must carry, or [`None`] for a request
+    /// issued before that column existed. See migration 0200 for why NULL is not a loophole.
+    pub browser_binding_sha256: Option<Vec<u8>>,
+}
+
 /// The key this deployment signs its own SAML messages with, on one connection (issue #139).
 pub struct SamlSpKey {
     /// The `sps_` identifier.
@@ -75833,6 +75889,7 @@ impl SamlReplayRepo<'_> {
         connection_id: &SamlConnectionId,
         request_id: &str,
         relay_state: Option<&str>,
+        browser_binding_sha256: Option<&[u8]>,
         issued_at_unix_micros: i64,
         expires_at_unix_micros: i64,
     ) -> Result<(), StoreError> {
@@ -75846,10 +75903,11 @@ impl SamlReplayRepo<'_> {
         // and the redemption keyed on it would then be answerable there.
         let inserted = sqlx::query(
             "INSERT INTO saml_outstanding_requests \
-             (id, tenant_id, environment_id, connection_id, relay_state, created_at, expires_at) \
-             SELECT $1, $2, $3, $4, $5, \
-                    TIMESTAMPTZ 'epoch' + ($6::text || ' microseconds')::interval, \
-                    TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval \
+             (id, tenant_id, environment_id, connection_id, relay_state, \
+              browser_binding_sha256, created_at, expires_at) \
+             SELECT $1, $2, $3, $4, $5, $6, \
+                    TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                    TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval \
              WHERE EXISTS (SELECT 1 FROM saml_connections \
                            WHERE tenant_id = $2 AND environment_id = $3 AND id = $4)",
         )
@@ -75858,6 +75916,7 @@ impl SamlReplayRepo<'_> {
         .bind(self.scope.environment().to_string())
         .bind(connection_id.to_string())
         .bind(relay_state)
+        .bind(browser_binding_sha256)
         .bind(issued_at_unix_micros)
         .bind(expires_at_unix_micros)
         .execute(&mut *tx)
@@ -75869,7 +75928,7 @@ impl SamlReplayRepo<'_> {
         Ok(())
     }
 
-    /// Consume the request a response names, answering the relay state it carried.
+    /// Consume the request a response names, answering what it carried.
     ///
     /// # One statement, because two would be a race
     ///
@@ -75891,7 +75950,7 @@ impl SamlReplayRepo<'_> {
         connection_id: &SamlConnectionId,
         request_id: &str,
         now_unix_micros: i64,
-    ) -> Result<Option<String>, StoreError> {
+    ) -> Result<SpentRequest, StoreError> {
         if connection_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -75902,7 +75961,7 @@ impl SamlReplayRepo<'_> {
              WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3 AND id = $4 \
                AND consumed_at IS NULL \
                AND expires_at > TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval \
-             RETURNING relay_state",
+             RETURNING relay_state, browser_binding_sha256",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
@@ -75915,7 +75974,10 @@ impl SamlReplayRepo<'_> {
         let Some(row) = row else {
             return Err(StoreError::NotFound);
         };
-        Ok(row.get::<Option<String>, _>("relay_state"))
+        Ok(SpentRequest {
+            relay_state: row.get::<Option<String>, _>("relay_state"),
+            browser_binding_sha256: row.get::<Option<Vec<u8>>, _>("browser_binding_sha256"),
+        })
     }
 
     /// Admit an assertion id exactly once, for the window it stays valid.
