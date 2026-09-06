@@ -457,7 +457,11 @@ fn jws_algorithm_for(algorithm: &str) -> Option<JwsAlgorithm> {
 /// SPELLED OUT RATHER THAN PULLED IN. A date library on this path would be a dependency for one
 /// format string, and the civil-from-days algorithm is short, exact, and has no locale, no
 /// leap-second table and no parsing.
-fn rfc3339_utc(seconds: i64) -> String {
+///
+/// `pub(crate)` because the self-service portal renders connection deadlines with it (issue
+/// #140). A second copy of this arithmetic is how two surfaces come to print two different dates
+/// for one timestamp, and the tests below are what either of them relies on.
+pub(crate) fn rfc3339_utc(seconds: i64) -> String {
     let days = seconds.div_euclid(86_400);
     let rest = seconds.rem_euclid(86_400);
     let z = days + 719_468;
