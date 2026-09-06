@@ -1588,7 +1588,20 @@ fn validate_resource(
         ResourceType::OrgConnection => {
             reject_unknown_keys(object, &ORG_CONNECTION_KEYS, None, path, violations);
             require_nonempty_string(object, "organization_id", path, violations);
-            require_nonempty_string(object, "connector_id", path, violations);
+            // EXACTLY ONE UPSTREAM, WHICH IS WHAT THE TABLE'S OWN CHECK SAYS (migration 0201).
+            // Requiring `connector_id` unconditionally -- as this did while a binding could only
+            // name a connector -- turned every SAML binding into a violation the moment the
+            // exporter learned to emit one, so a single SAML customer in an environment made its
+            // OWN snapshot unimportable and blocked promotion for everything else in it.
+            let connector = nonempty_str(object, "connector_id");
+            let saml = nonempty_str(object, "saml_connection_id");
+            if connector.is_some() == saml.is_some() {
+                violations.push(SnapshotViolation::new(
+                    format!("{path}/connector_id"),
+                    "exactly one of connector_id and saml_connection_id must be a non-empty \
+                     string",
+                ));
+            }
         }
         ResourceType::RoutingRule => {
             reject_unknown_keys(object, &ROUTING_RULE_KEYS, None, path, violations);
@@ -2007,6 +2020,22 @@ fn validate_secret_field(
 }
 
 /// Require a non-empty string field `field` on `object`, else push a violation.
+/// The field's value when it is a non-empty string, or [`None`] when it is absent, null, empty or
+/// not a string.
+///
+/// FOR A FIELD WHOSE PRESENCE IS CONDITIONAL, where `require_nonempty_string` cannot be used
+/// because absence is not itself a violation -- the violation is the COMBINATION, and only the
+/// caller knows which combinations are legal.
+fn nonempty_str<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'a str> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 fn require_nonempty_string(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,

@@ -69,7 +69,7 @@ a type is added and nothing fails when it does:
 | `dcr_policy`           | `resources.dcr_policy`             | `name`                     |
 | `variable`             | `resources.variable`               | `name`                     |
 | `connector`            | `resources.connector`              | `connector_slug`           |
-| `org_connection`       | `resources.org_connection`         | `(organization_id, connector_id)` |
+| `org_connection`       | `resources.org_connection`         | `(organization_id, upstream)` where upstream is whichever of `connector_id` / `saml_connection_id` is set |
 | `routing_rule`         | `resources.routing_rule`           | `(rule_kind, selector, org_connection_id)` |
 | `upstream_token_grant` | `resources.upstream_token_grant`   | `(client_id, org_connection_id)` |
 | `brand`                | `resources.brand`                  | `slug`                     |

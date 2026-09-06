@@ -1096,6 +1096,67 @@ async fn a_fenced_accounts_stored_identity_is_not_rewritten() {
 }
 
 #[tokio::test]
+async fn a_routed_sign_in_stamps_the_binding_the_overlay_is_read_from() {
+    // THE BROKER OVERLAY IS ENFORCED FROM THE USER'S STAMPED `org_connection`, so a sign-in that
+    // leaves it NULL makes `requirement_for_session_org` return an empty requirement and every
+    // `overlay_min_acr` / `overlay_min_class` / `max_age_secs` column on the routing binding
+    // silently unenforced. An earlier version passed `None` here with a comment saying a SAML
+    // connection had no such binding -- true when written, false from the change that let a
+    // routing rule name one. The identical binding with a CONNECTOR upstream enforced the
+    // overlay; this one did not.
+    let harness = Harness::start_store_backed().await;
+    let wired = wire(&harness, ISSUER, &json!({})).await;
+
+    // A BINDING WHOSE UPSTREAM IS THIS CONNECTION, which is what a routed deployment has.
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let ocn_id = ironauth_store::OrgConnectionId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            now_micros(&env),
+            ironauth_store::NewOrgConnection {
+                organization_id: &wired.organization,
+                upstream: ironauth_store::OrgConnectionUpstream::Saml(&wired.connection),
+                overlay_min_acr: Some("mfa"),
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create the SAML org binding");
+
+    let response = signed(&wired, harness.env(), ISSUER, "_ovl1", SUBJECT, &[]);
+    let (status, _, body) = post(&harness, &wired, &response).await;
+    assert_eq!(status, 303, "{body}");
+
+    let people = users(&harness, harness.scope()).await;
+    let user_id =
+        ironauth_store::UserId::parse_in_scope(&people[0].0, &harness.scope()).expect("a user id");
+    let stamped = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .users()
+        .org_connection(&user_id)
+        .await
+        .expect("read the stamp");
+    assert_eq!(
+        stamped.map(|id| id.to_string()),
+        Some(ocn_id.to_string()),
+        "a SAML sign-in did not stamp the routed binding, so its broker overlay is unenforceable"
+    );
+}
+
+#[tokio::test]
 async fn the_jit_membership_reaches_the_event_feed() {
     // THE OUTBOUND SCIM PUSH SHIPPED IN THIS MILESTONE drives its steady state entirely from the
     // event feed, so a membership committed with no envelope is a person who exists here and

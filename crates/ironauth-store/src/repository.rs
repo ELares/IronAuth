@@ -37342,6 +37342,52 @@ impl OrgConnectionRepo<'_> {
         }
     }
 
+    /// The ENABLED binding whose upstream is this SAML connection, or [`None`].
+    ///
+    /// # Why the sign-in path re-derives this rather than carrying it
+    ///
+    /// A SAML flow crosses the browser twice -- out to the identity provider, back to the
+    /// assertion consumer -- and anything the browser carries is a value an attacker chooses.
+    /// The OIDC branch solves that with a keyed MAC over the routed `ocn_`; the SAML branch does
+    /// not need one, because a connection belongs to exactly one organization by its own row and
+    /// the binding that routes to it is discoverable FROM the connection. So the consumer looks
+    /// it up here instead of trusting a parameter.
+    ///
+    /// WHAT IT IS FOR: the binding carries the broker overlay columns (`overlay_min_acr`,
+    /// `overlay_min_class`, `max_age_secs`), and those are enforced from the USER's stamped
+    /// `org_connection`. Without this read the columns are accepted on write and silently never
+    /// enforced -- an operator sets an MFA floor on the binding that routes their people, and no
+    /// ceremony ever runs.
+    ///
+    /// AT MOST ONE, by the partial unique index migration 0201 adds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn for_saml_connection(
+        &self,
+        saml_connection_id: &SamlConnectionId,
+    ) -> Result<Option<OrgConnectionRecord>, StoreError> {
+        if saml_connection_id.scope() != self.scope {
+            return Ok(None);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ORG_CONNECTION_READ_COLUMNS} FROM org_connections \
+             WHERE tenant_id = $1 AND environment_id = $2 AND saml_connection_id = $3 \
+             AND enabled"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(saml_connection_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.as_ref()
+            .map(|row| org_connection_record_from_row(row, self.scope))
+            .transpose()
+    }
+
     /// Every binding in the scope, ordered by the stable `(created_at, id)` key, for
     /// the config-snapshot export (issue #77). Scope-bound.
     ///
@@ -37520,8 +37566,6 @@ impl RoutingRuleRepo<'_> {
     }
 }
 
-/// A new organization-to-connector binding (issue #77). The broker overlay policy
-/// columns ship NULLABLE and unset in PR 1; a later PR fills and enforces them.
 /// Which upstream an organization binding routes to (issue #139).
 ///
 /// A SUM RATHER THAN TWO OPTIONS, because the schema says exactly one is set and a caller
@@ -37535,8 +37579,9 @@ pub enum OrgConnectionUpstream<'a> {
     Saml(&'a SamlConnectionId),
 }
 
-/// Everything the org-connection create needs, bundled so the repository method stays within the
-/// readable-argument-count lint (issue #52). The broker overlay columns ship NULLABLE.
+/// A new organization-to-an-upstream binding (issue #77, extended to SAML by issue #139),
+/// bundled so the repository method stays within the readable-argument-count lint (issue #52).
+/// The broker overlay policy columns ship NULLABLE.
 #[derive(Debug, Clone, Copy)]
 pub struct NewOrgConnection<'a> {
     /// The organization this binding belongs to (validated in scope on write).

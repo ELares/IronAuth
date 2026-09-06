@@ -133,6 +133,15 @@ fn router(harness: &Harness, runtime: &Arc<FederationRuntime>) -> Router {
     oidc_router(harness.state().clone().with_federation(Arc::clone(runtime)))
 }
 
+/// The router a DEFAULT deployment serves: no federation runtime installed.
+///
+/// `oidc.federation.enabled` is false unless an operator turns it on, and `with_federation` is
+/// the only setter -- so this is what most deployments actually run, and it is the shape SAML
+/// routing must work under.
+fn router_without_federation(harness: &Harness) -> Router {
+    oidc_router(harness.state().clone())
+}
+
 /// Seed a connector at `slug` pointing at the mock upstream, an organization, and a
 /// binding between them (with NO broker overlay); return the binding id.
 async fn seed_binding(harness: &Harness, slug: &str) -> OrgConnectionId {
@@ -949,17 +958,43 @@ async fn a_domain_rule_can_route_to_a_saml_connection() {
         !location.contains("/federation/"),
         "a SAML route went through the OIDC broker: {location}"
     );
-    // AND IT CARRIES THE RESUME TARGET, so a completed sign-in resumes what the person asked
-    // for rather than dropping them on a dashboard.
+    // AND IT CARRIES THE RESUME TARGET, PERCENT-ENCODED. A non-empty check is satisfied by an
+    // UNencoded value too, and the fixture's resume has a single parameter -- so dropping the
+    // encoding entirely left this green. What an unencoded resume costs is the rest of itself:
+    // the second parameter onward is parsed as part of the START endpoint's own query and never
+    // reaches the recorded RelayState.
+    let encoded = param(&location, "return_to");
     assert!(
-        !param(&location, "return_to").is_empty(),
-        "the SAML route dropped the return target: {location}"
+        encoded.contains("%2F") && encoded.contains("%3F"),
+        "the resume target was not percent-encoded, so a multi-parameter one would be truncated: \
+         {location}"
     );
     // AND NO ROUTING TOKEN, which would authenticate a pairing that does not exist here: the
     // connection names its own organization, so there is no second value a browser could swap.
     assert!(
         !location.contains("routing="),
         "a SAML route minted a connector routing token: {location}"
+    );
+}
+
+#[tokio::test]
+async fn saml_routing_does_not_need_the_oidc_federation_runtime() {
+    // THE GATE WAS IN THE WRONG PLACE. An earlier version checked `state.federation()` before
+    // either branch, so SAML routing was silently off on every deployment that had not enabled
+    // OIDC federation -- which is the default, and which has nothing to do with SAML: the SAML
+    // routes are mounted unconditionally and need no runtime at all. The symptom was not an
+    // error anybody could see; the login simply fell through to the local prompt.
+    let harness = Harness::start().await;
+    let (ocn_id, connection) = seed_saml_binding(&harness, true).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+
+    // THE ROUTER WITHOUT A FEDERATION RUNTIME, which is what a default deployment serves.
+    let router = router_without_federation(&harness);
+    let response = post_login(router, &harness, &format!("ada@{ROUTED_DOMAIN}")).await;
+    let location = location(&response);
+    assert!(
+        location.contains(&format!("/saml/start/{connection}")),
+        "SAML routing was gated behind the OIDC federation runtime: {location}"
     );
 }
 
