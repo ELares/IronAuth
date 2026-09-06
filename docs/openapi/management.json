@@ -19275,7 +19275,7 @@
         },
         "responses": {
           "201": {
-            "description": "The minted link; the token appears here and nowhere else. The returned url_path is not served until the portal session slice of issue #140 lands",
+            "description": "The minted link; the token appears here and nowhere else",
             "content": {
               "application/json": {
                 "schema": {
@@ -33914,7 +33914,7 @@
           },
           "url_path": {
             "type": "string",
-            "description": "The path to hand the IT admin, token included, joined to whatever origin the vendor\npublishes for this deployment.\n\nNOT YET SERVED. The redeeming route lands in the next slice of #140; until it does,\nfollowing this path reaches a 404. It is stated here rather than left to be discovered\nbecause the alternative is a vendor emailing a customer's IT admin a link that looks\ncorrect and goes nowhere, which is the one artifact that customer sees first.\n\nRETURNED ONCE. The store keeps only a digest, so this response is the only place the\ntoken ever exists outside the caller."
+            "description": "The path to hand the IT admin, token included, joined to whatever origin the vendor\npublishes for this deployment.\n\nFOLLOW IT AND IT WORKS. It did not when this endpoint first shipped, which the field's\nown description said at the time; the redeeming routes landed in the next slice and this\nsentence changed with them rather than a release later.\n\nRETURNED ONCE. The store keeps only a digest, so this response is the only place the\ntoken ever exists outside the caller."
           }
         }
       },

@@ -159,6 +159,7 @@ mod phone;
 /// CLI would recreate exactly that.
 pub mod pkce;
 mod policy_trace;
+pub mod portal_route;
 pub mod pow;
 mod pow_gate;
 pub mod prm;
@@ -495,6 +496,36 @@ pub fn oidc_router(state: OidcState) -> Router {
         // THE SP METADATA DOCUMENT (issue #139), which is how an identity provider gets the key
         // that verifies the requests the route above signs. Public and cacheable: everything in
         // it is announced in every message this deployment sends anyway.
+        // THE SELF-SERVICE PORTAL LINK (issue #140). Two routes on one path, and the split is
+        // the design: the GET confirms and consumes nothing, the POST redeems. An IT admin
+        // receives this by email and enterprise mail scanners follow links, so a link burned on
+        // GET is dead before its recipient clicks it -- and it is single-use, so there is no
+        // second attempt. See `portal_route`.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/{link_id}",
+            get(portal_route::confirm_get).post(portal_route::redeem_post),
+        )
+        // WHERE A REDEEMED SESSION LANDS, mounted in the same change as the redirect that sends
+        // a browser here: a 303 to a path nothing serves is a 404 at the end of a successful
+        // redemption, and the link is already spent by then.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal",
+            get(portal_route::home_get),
+        )
+        // ONE CONFIGURATION SURFACE, behind the intent fence. Two segments after `portal`, so it
+        // cannot collide with the one-segment link path above. The surfaces themselves land in
+        // later slices of #140; the fence lands with a caller.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/{intent}",
+            get(portal_route::surface_get),
+        )
+        // ENDING A SESSION, which is what gives `PortalSessionRepo::revoke` a caller. An admin
+        // who has finished should not leave a live portal session in a browser for the rest of
+        // the half hour, and a revocation method nothing calls is a control nothing consults.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/finish",
+            post(portal_route::finish_post),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/saml/metadata/{connection}",
             get(saml_metadata::metadata_get),

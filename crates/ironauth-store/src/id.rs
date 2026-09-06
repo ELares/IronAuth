@@ -1253,6 +1253,22 @@ impl ScopedKind for PortalLinkKind {
     const PREFIX: &'static str = "plk";
 }
 
+/// Marker for a self-service portal SESSION (`pss_`, issue #140).
+///
+/// THE SESSION, NOT THE LINK. A link is redeemed exactly once and becomes one of these; the two
+/// are separate rows with separate lifetimes because they answer separate questions -- the link
+/// asks "may this person start", the session asks "may this request continue". Collapsing them
+/// would mean either a link that stays live as long as an admin is working or a session that
+/// dies five minutes in, and neither is what #140 asks for.
+///
+/// The non-secret HANDLE, like the link's. The session's authority is a cookie whose digest the
+/// row holds, so this identifier appearing in an audit row grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortalSessionKind;
+impl ScopedKind for PortalSessionKind {
+    const PREFIX: &'static str = "pss";
+}
+
 /// Marker for an OUTBOUND SCIM connection (`spc_`, issue #137).
 ///
 /// The mirror of [`ScimConnectionKind`], and the direction is the whole difference: inbound, an
@@ -2193,6 +2209,9 @@ pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
 
 /// A self-service portal entry link identifier (`plk_`, issue #140).
 pub type PortalLinkId = ScopedId<PortalLinkKind>;
+
+/// A self-service portal session identifier (`pss_`, issue #140).
+pub type PortalSessionId = ScopedId<PortalSessionKind>;
 /// An OUTBOUND SCIM connection identifier (`spc_...`), issue #137.
 pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
 /// An inbound SAML connection identifier (`smc_...`), issue #139. The trust decision, never a key.

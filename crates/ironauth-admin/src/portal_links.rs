@@ -18,13 +18,12 @@
 //! cannot be one; a vendor that loses it mints another. That is the same posture the rest of this
 //! crate takes with client secrets and API keys, and for the same reason.
 //!
-//! # The path is not served yet
+//! # The path is served
 //!
-//! This slice mints the link and nothing redeems it: the portal session, the GET that renders a
-//! confirmation and the POST that consumes the row all land in the next slice of #140. A vendor
-//! calling this today gets a real, single-use, expiring row and a path that answers 404. That is
-//! recorded in the published contract and on the field itself rather than left to be found,
-//! because the failure lands on somebody else's IT admin rather than on the caller.
+//! It was not when this module first shipped, and the sentence saying so outlived the fact by
+//! one commit. The redeeming routes now exist: a GET that renders a confirmation and a POST that
+//! consumes the row and opens a portal session bound to this link's organization and intent.
+//! What a vendor hands their customer today works.
 //!
 //! # Why the response carries a PATH and not an absolute URL
 //!
@@ -110,10 +109,9 @@ pub struct PortalLinkView {
     /// The path to hand the IT admin, token included, joined to whatever origin the vendor
     /// publishes for this deployment.
     ///
-    /// NOT YET SERVED. The redeeming route lands in the next slice of #140; until it does,
-    /// following this path reaches a 404. It is stated here rather than left to be discovered
-    /// because the alternative is a vendor emailing a customer's IT admin a link that looks
-    /// correct and goes nowhere, which is the one artifact that customer sees first.
+    /// FOLLOW IT AND IT WORKS. It did not when this endpoint first shipped, which the field's
+    /// own description said at the time; the redeeming routes landed in the next slice and this
+    /// sentence changed with them rather than a release later.
     ///
     /// RETURNED ONCE. The store keeps only a digest, so this response is the only place the
     /// token ever exists outside the caller.
@@ -138,7 +136,7 @@ pub struct PortalLinkView {
     ),
     security(("bearer" = [])),
     responses(
-        (status = 201, description = "The minted link; the token appears here and nowhere else. The returned url_path is not served until the portal session slice of issue #140 lands", body = PortalLinkView),
+        (status = 201, description = "The minted link; the token appears here and nowhere else", body = PortalLinkView),
         (status = 400, description = "An unknown intent or an out-of-range TTL", body = ErrorBody),
         (status = 401, description = "Missing or invalid credential", body = ErrorBody),
         (status = 403, description = "Wrong plane or scope", body = ErrorBody),

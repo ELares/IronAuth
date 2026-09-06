@@ -799,6 +799,61 @@ async fn a_confinement_that_will_not_parse_denies_the_credential_rather_than_wid
     );
 }
 
+/// Two live organizations plus a credential confined to the first.
+///
+/// SHARED BY THE TWO LOG-STREAM CONFINEMENT TESTS, which need identical ground: a sibling that
+/// really exists, so a refusal is about the confinement rather than about the sibling being
+/// absent, and a credential holding the permission so a refusal is about WHERE it may act rather
+/// than WHAT it may do. Extracted when the second test pushed the first past the crate's
+/// function-length lint.
+async fn confined_org_pair(
+    h: &Harness,
+    tenant: &str,
+    environment: &str,
+    key: &str,
+) -> (String, String, String) {
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let mut ids = Vec::new();
+    for (n, name) in ["Mine", "Theirs"].into_iter().enumerate() {
+        let (status, _, created) = h
+            .post(
+                &orgs,
+                &format!("{key}-org-{n}"),
+                &serde_json::json!({ "display_name": name }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "seed {name}: {created}");
+        ids.push(
+            serde_json::from_str::<Value>(&created).expect("json")["id"]
+                .as_str()
+                .expect("id")
+                .to_owned(),
+        );
+    }
+    let (key_id, secret) = mint_key(h, tenant, environment, &format!("{key}-mint")).await;
+    restrict(
+        h,
+        tenant,
+        environment,
+        &key_id,
+        &["management.read", "management.write_config"],
+    )
+    .await;
+    confine(h, tenant, environment, &key_id, &ids[0]).await;
+    (ids[0].clone(), ids[1].clone(), secret)
+}
+
+/// A stream body naming one organization.
+fn log_stream_body(organization: &str) -> String {
+    serde_json::json!({
+        "source": "admin_action",
+        "sink_type": "http",
+        "sink_config": { "url": "https://sink.example/ingest" },
+        "organization_id": organization,
+    })
+    .to_string()
+}
+
 /// A confined credential cannot point a LOG STREAM at a sibling organization's rows.
 ///
 /// # The one this PR did not go looking for
@@ -824,53 +879,14 @@ async fn a_confined_credential_cannot_ship_a_sibling_organizations_rows() {
     let h = Harness::start(50).await;
     let (tenant, environment) = h.create_tenant("acme", "ls-tenant").await;
     let base = format!("/v1/tenants/{tenant}/environments/{environment}");
-    let orgs = format!("{base}/organizations");
     let streams = format!("{base}/log-streams");
-
-    let mut ids = Vec::new();
-    for (n, name) in ["Mine", "Theirs"].into_iter().enumerate() {
-        let (status, _, created) = h
-            .post(
-                &orgs,
-                &format!("ls-org-{n}"),
-                &serde_json::json!({ "display_name": name }).to_string(),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "seed {name}: {created}");
-        ids.push(
-            serde_json::from_str::<Value>(&created).expect("json")["id"]
-                .as_str()
-                .expect("id")
-                .to_owned(),
-        );
-    }
-    let (mine, theirs) = (&ids[0], &ids[1]);
-
-    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ls-mint").await;
-    restrict(
-        &h,
-        &tenant,
-        &environment,
-        &key_id,
-        &["management.read", "management.write_config"],
-    )
-    .await;
-    confine(&h, &tenant, &environment, &key_id, mine).await;
-
-    let stream_body = |organization: &str| {
-        serde_json::json!({
-            "source": "admin_action",
-            "sink_type": "http",
-            "sink_config": { "url": "https://sink.example/ingest" },
-            "organization_id": organization,
-        })
-        .to_string()
-    };
+    let (mine, theirs, secret) = confined_org_pair(&h, &tenant, &environment, "ls").await;
+    let (mine, theirs) = (&mine, &theirs);
 
     // ITS OWN ORGANIZATION WORKS, so the refusal below is the confinement rather than the
     // endpoint being unreachable for this credential at all.
     let (status, _, body) = h
-        .post_as(&streams, &secret, "ls-mine", &stream_body(mine))
+        .post_as(&streams, &secret, "ls-mine", &log_stream_body(mine))
         .await;
     assert_eq!(
         status,
@@ -881,7 +897,7 @@ async fn a_confined_credential_cannot_ship_a_sibling_organizations_rows() {
 
     // THE SIBLING IS REFUSED, as the uniform not-found.
     let (status, _, body) = h
-        .post_as(&streams, &secret, "ls-theirs", &stream_body(theirs))
+        .post_as(&streams, &secret, "ls-theirs", &log_stream_body(theirs))
         .await;
     assert_eq!(
         status,
@@ -926,11 +942,40 @@ async fn a_confined_credential_cannot_ship_a_sibling_organizations_rows() {
         "a confined credential created an environment-wide log stream, which ships every \
          organization's rows including the ones it is fenced away from: {body}"
     );
+}
+
+/// A confined credential cannot LIST, DELETE or REPLAY a sibling organization's log stream.
+///
+/// SPLIT FROM THE CREATE TEST ABOVE, which grew past the crate's function-length lint when these
+/// cases were added to it. The subjects are different anyway: that one is about what a confined
+/// credential may CREATE, this one about what it may do to a stream it did not create -- the
+/// half a create-only fence leaves entirely open, and the half that was open in a shipped
+/// release.
+#[tokio::test]
+async fn a_confined_credential_cannot_touch_a_sibling_organizations_stream() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "lt-tenant").await;
+    let base = format!("/v1/tenants/{tenant}/environments/{environment}");
+    let streams = format!("{base}/log-streams");
+    let (mine, theirs, secret) = confined_org_pair(&h, &tenant, &environment, "lt").await;
+    let (mine, theirs) = (&mine, &theirs);
+    // The confined credential's OWN stream, so the narrowed listing below has something to show
+    // and its emptiness cannot satisfy the assertions for the wrong reason.
+    let (status, _, body) = h
+        .post_as(&streams, &secret, "lt-mine", &log_stream_body(mine))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the credential's own stream: {body}"
+    );
 
     // THE SIBLING'S STREAM EXISTS, created by the unconfined operator. Everything below is
     // about what the CONFINED credential can do to a stream it did not create, which is the
     // half a create-only fence leaves entirely open.
-    let (status, _, created) = h.post(&streams, "ls-op-theirs", &stream_body(theirs)).await;
+    let (status, _, created) = h
+        .post(&streams, "ls-op-theirs", &log_stream_body(theirs))
+        .await;
     assert_eq!(
         status,
         StatusCode::CREATED,

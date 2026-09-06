@@ -1023,3 +1023,11 @@ required-features = ["testing"]
 name = "portal_links"
 path = "tests/portal_links.rs"
 required-features = ["testing"]
+
+# The portal SESSION a redeemed link opens (issue #140). Its own target rather than more cases in
+# the file above, because the subject is different: that one is about a link being spent exactly
+# once, this one is about what the resulting credential may reach and for how long.
+[[test]]
+name = "portal_sessions"
+path = "tests/portal_sessions.rs"
+required-features = ["testing"]
