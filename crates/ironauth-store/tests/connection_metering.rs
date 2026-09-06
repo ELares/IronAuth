@@ -25,7 +25,7 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
-    OrgConnectionId, OrganizationId, Scope,
+    OrgConnectionId, OrgConnectionUpstream, OrganizationId, Scope,
 };
 
 /// Organizations to bind, and connectors to bind them to. The product is the number of
@@ -116,7 +116,7 @@ async fn many_connections_across_many_organizations_all_succeed() {
                     1_000_000,
                     NewOrgConnection {
                         organization_id,
-                        connector_id,
+                        upstream: OrgConnectionUpstream::Connector(connector_id),
                         overlay_min_acr: None,
                         max_age_secs: None,
                         overlay_min_class: None,
@@ -213,7 +213,7 @@ async fn a_real_connection_open_is_metered_once() {
 
     let spec = || NewOrgConnection {
         organization_id: &org,
-        connector_id: &connector,
+        upstream: OrgConnectionUpstream::Connector(&connector),
         overlay_min_acr: None,
         max_age_secs: None,
         overlay_min_class: None,

@@ -156,7 +156,13 @@ pub async fn retrieve_upstream_token(
     else {
         return not_found();
     };
-    let connector_id = org_connection.connector_id;
+    // A SAML BINDING HAS NO UPSTREAM TOKEN TO HAND BACK, and it never will: SAML returns a
+    // signed assertion, not a token grant, so there is nothing this endpoint could have captured
+    // and nothing to exchange. It is the same not-found every other absence answers with, which
+    // keeps the endpoint from telling a caller which protocol an organization federates over.
+    let Some(connector_id) = org_connection.connector_id else {
+        return not_found();
+    };
 
     // CLIENT CAPABILITY (part 2): an ENABLED grant must exist for (this client, the
     // session's org connection). Absent means a TYPED unauthorized_client denial, never a

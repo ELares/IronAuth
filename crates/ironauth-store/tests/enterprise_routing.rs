@@ -18,8 +18,8 @@ use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     ConnectorCapabilities, ConnectorId, CorrelationId, NewConnector, NewOrgConnection,
-    NewRoutingRule, OrgConnectionId, OrganizationId, RoutingRuleId, RoutingSelector, Scope,
-    StoreError, export_snapshot,
+    NewRoutingRule, OrgConnectionId, OrgConnectionUpstream, OrganizationId, RoutingRuleId,
+    RoutingSelector, Scope, StoreError, export_snapshot,
 };
 
 const CONNECTOR_SLUG: &str = "acme-oidc";
@@ -90,7 +90,7 @@ async fn seed_binding(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -267,7 +267,7 @@ async fn a_second_domain_mapping_is_rejected_by_the_per_scope_unique_index() {
                 1_000_000,
                 NewOrgConnection {
                     organization_id: &org_b,
-                    connector_id: &connector_b,
+                    upstream: OrgConnectionUpstream::Connector(&connector_b),
                     overlay_min_acr: None,
                     max_age_secs: None,
                     overlay_min_class: None,
@@ -525,7 +525,7 @@ async fn the_broker_overlay_columns_round_trip_through_a_binding()
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: Some("urn:ironauth:acr:mfa"),
                 max_age_secs: Some(3_600),
                 overlay_min_class: Some("passkey"),
@@ -561,7 +561,7 @@ async fn the_broker_overlay_columns_round_trip_through_a_binding()
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: Some("not_a_rung"),

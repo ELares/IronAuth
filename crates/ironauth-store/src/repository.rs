@@ -36996,8 +36996,16 @@ pub struct OrgConnectionRecord {
     pub id: OrgConnectionId,
     /// The `org_` organization this binding belongs to.
     pub organization_id: String,
-    /// The `cnr_` connector describing the organization's upstream.
-    pub connector_id: String,
+    /// The `cnr_` connector describing the organization's upstream, or [`None`] when this
+    /// binding's upstream is a SAML connection instead.
+    ///
+    /// EXACTLY ONE OF THIS AND [`Self::saml_connection_id`] IS SET, enforced by the schema
+    /// (`org_connections_one_upstream`, migration 0201) rather than by convention -- so a reader
+    /// matching on the pair has two arms and no third to guess at.
+    pub connector_id: Option<String>,
+    /// The `smc_` SAML connection describing the organization's upstream, or [`None`] when this
+    /// binding names a connector (issue #139).
+    pub saml_connection_id: Option<String>,
     /// The broker overlay minimum acr (a later PR enforces it), or [`None`].
     pub overlay_min_acr: Option<String>,
     /// The broker overlay maximum authentication age in seconds, or [`None`].
@@ -37053,7 +37061,8 @@ pub struct RoutingRuleRecord {
 }
 
 /// The columns an org-connection read projects (issue #77). No secret column exists.
-const ORG_CONNECTION_READ_COLUMNS: &str = "id, organization_id, connector_id, overlay_min_acr, \
+const ORG_CONNECTION_READ_COLUMNS: &str = "id, organization_id, connector_id, \
+     saml_connection_id, overlay_min_acr, \
      max_age_secs, overlay_min_class, capture_upstream_tokens, enabled, \
      (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
      (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
@@ -37076,6 +37085,7 @@ fn org_connection_record_from_row(
         id,
         organization_id: row.get("organization_id"),
         connector_id: row.get("connector_id"),
+        saml_connection_id: row.get("saml_connection_id"),
         overlay_min_acr: row.get("overlay_min_acr"),
         // The column is `integer` (INT4); widen to i64 for the record so the enforcement
         // path composes it as an age window without a narrowing cast at every read site.
@@ -37512,12 +37522,27 @@ impl RoutingRuleRepo<'_> {
 
 /// A new organization-to-connector binding (issue #77). The broker overlay policy
 /// columns ship NULLABLE and unset in PR 1; a later PR fills and enforces them.
+/// Which upstream an organization binding routes to (issue #139).
+///
+/// A SUM RATHER THAN TWO OPTIONS, because the schema says exactly one is set and a caller
+/// holding two `Option`s can express three states the database will refuse. This makes the
+/// impossible ones unwritable rather than merely rejected.
+#[derive(Debug, Clone, Copy)]
+pub enum OrgConnectionUpstream<'a> {
+    /// A `cnr_` OIDC or OAuth 2.0 connector.
+    Connector(&'a ConnectorId),
+    /// A `smc_` SAML connection.
+    Saml(&'a SamlConnectionId),
+}
+
+/// Everything the org-connection create needs, bundled so the repository method stays within the
+/// readable-argument-count lint (issue #52). The broker overlay columns ship NULLABLE.
 #[derive(Debug, Clone, Copy)]
 pub struct NewOrgConnection<'a> {
     /// The organization this binding belongs to (validated in scope on write).
     pub organization_id: &'a OrganizationId,
-    /// The connector describing the organization's upstream (validated in scope).
-    pub connector_id: &'a ConnectorId,
+    /// The upstream this binding routes to: a connector, or a SAML connection (issue #139).
+    pub upstream: OrgConnectionUpstream<'a>,
     /// The broker overlay minimum `acr` this binding layers on top of the upstream
     /// (issue #77 PR 2), or [`None`] for no `acr` floor. Persisted verbatim; the
     /// federation callback and the authorization step-up gate canonicalize and enforce
@@ -37592,22 +37617,38 @@ impl ActingOrgConnectionRepo<'_> {
         created_at_micros: i64,
         params: NewOrgConnection<'_>,
     ) -> Result<(), StoreError> {
+        let upstream_in_scope = match params.upstream {
+            OrgConnectionUpstream::Connector(connector) => connector.scope() == self.scope,
+            OrgConnectionUpstream::Saml(connection) => connection.scope() == self.scope,
+        };
         if id.scope() != self.scope
             || params.organization_id.scope() != self.scope
-            || params.connector_id.scope() != self.scope
+            || !upstream_in_scope
         {
             return Err(StoreError::NotFound);
         }
         let id = *id;
         let scope = self.scope;
         let organization_id = params.organization_id.to_string();
-        let connector_id = params.connector_id.to_string();
+        // EXACTLY ONE IS BOUND AND THE OTHER IS NULL, which is what the schema's
+        // `org_connections_one_upstream` CHECK requires. Deriving both from one enum means the
+        // pair cannot drift out of that shape between here and the statement.
+        let (connector_id, saml_connection_id) = match params.upstream {
+            OrgConnectionUpstream::Connector(connector) => (Some(connector.to_string()), None),
+            OrgConnectionUpstream::Saml(connection) => (None, Some(connection.to_string())),
+        };
         let overlay_min_acr = params.overlay_min_acr.map(str::to_owned);
         let max_age_secs = params.max_age_secs;
         let overlay_min_class = params.overlay_min_class.map(str::to_owned);
         let capture = params.capture_upstream_tokens;
         let enabled = params.enabled;
-        let detail = format!("organization={organization_id} connector={connector_id}");
+        let detail = match (&connector_id, &saml_connection_id) {
+            (Some(connector), _) => format!("organization={organization_id} connector={connector}"),
+            (_, Some(connection)) => format!("organization={organization_id} saml={connection}"),
+            // UNREACHABLE BY CONSTRUCTION: the match above binds exactly one. Written as a
+            // sentence rather than a panic, because an audit detail is not worth aborting over.
+            (None, None) => format!("organization={organization_id}"),
+        };
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,
@@ -37621,17 +37662,18 @@ impl ActingOrgConnectionRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO org_connections \
                      (id, tenant_id, environment_id, organization_id, connector_id, \
-                      overlay_min_acr, max_age_secs, overlay_min_class, \
+                      saml_connection_id, overlay_min_acr, max_age_secs, overlay_min_class, \
                       capture_upstream_tokens, enabled, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval, \
-                             TIMESTAMPTZ 'epoch' + ($11::text || ' microseconds')::interval)",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($12::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(&organization_id)
-                .bind(&connector_id)
+                .bind(connector_id.as_deref())
+                .bind(saml_connection_id.as_deref())
                 .bind(overlay_min_acr.as_deref())
                 .bind(max_age_secs)
                 .bind(overlay_min_class.as_deref())

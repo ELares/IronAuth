@@ -436,7 +436,8 @@ mod tests {
         OrgConnectionRecord {
             id: OrgConnectionId::generate(&env, &scope),
             organization_id: "org_x".to_owned(),
-            connector_id: "cnr_x".to_owned(),
+            connector_id: Some("cnr_x".to_owned()),
+            saml_connection_id: None,
             overlay_min_acr: overlay_min_acr.map(str::to_owned),
             max_age_secs,
             overlay_min_class: overlay_min_class.map(str::to_owned),

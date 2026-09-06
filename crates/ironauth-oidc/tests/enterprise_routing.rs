@@ -202,7 +202,7 @@ async fn seed_binding_with_overlay(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr,
                 max_age_secs,
                 overlay_min_class,
@@ -276,7 +276,7 @@ async fn seed_capture_binding(harness: &Harness, slug: &str) -> OrgConnectionId 
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -778,7 +778,7 @@ async fn per_app_and_per_user_rules_override_a_domain_rule() {
                 1_000_000,
                 NewOrgConnection {
                     organization_id: &org,
-                    connector_id: &connector,
+                    upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector),
                     overlay_min_acr: None,
                     max_age_secs: None,
                     overlay_min_class: None,
@@ -829,6 +829,165 @@ async fn per_app_and_per_user_rules_override_a_domain_rule() {
         location(&user_routed).contains("/federation/override/authorize"),
         "the user rule overrides the app and domain rules: {}",
         location(&user_routed)
+    );
+}
+
+/// Seed a SAML connection and an org binding that routes to it (issue #139, criterion 5).
+///
+/// THE ORGANIZATION IS THE CONNECTION'S OWN, which is the coupling that makes a SAML binding
+/// safe without a routing token: an OIDC binding pairs an organization with a connector and the
+/// pair travels in the redirect, so it needs a MAC; a SAML connection carries its organization
+/// in its own row, so there is no pair to swap.
+async fn seed_saml_binding(harness: &Harness, active: bool) -> (OrgConnectionId, String) {
+    let env = harness.env().clone();
+    let scope = harness.scope();
+    let organization = ironauth_store::OrganizationId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .management()
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .create(&env, &organization, 1_000_000, "Globex", None)
+        .await
+        .expect("create organization");
+
+    let connection = ironauth_store::SamlConnectionId::generate(&env, &scope);
+    let acting = harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env));
+    acting
+        .saml_connections()
+        .create(
+            &env,
+            ironauth_store::NewSamlConnection {
+                id: &connection,
+                organization_id: &organization,
+                display_name: "Okta",
+                idp_entity_id: "urn:idp",
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/sp",
+                acs_url: "https://ironauth.example/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &serde_json::json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+    if !active {
+        acting
+            .saml_connections()
+            .set_active(&env, &connection, false, None)
+            .await
+            .expect("disable the connection");
+    }
+
+    let ocn_id = OrgConnectionId::generate(&env, &scope);
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &ocn_id,
+            1_000_000,
+            NewOrgConnection {
+                organization_id: &organization,
+                upstream: ironauth_store::OrgConnectionUpstream::Saml(&connection),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create the SAML org binding");
+    (ocn_id, connection.to_string())
+}
+
+#[tokio::test]
+async fn a_domain_rule_can_route_to_a_saml_connection() {
+    // #139 CRITERION 5: "SAML connections participate in domain-based discovery routing
+    // identically to OIDC connections". Identically means the SELECTOR side -- the same rules,
+    // the same precedence, the same verified-domain gate, resolved through the same binding.
+    // What differs is only where the browser is sent, because a SAML flow begins with an
+    // AuthnRequest this deployment signs rather than an authorization request it brokers.
+    //
+    // Before this change a SAML customer could be signed in but never ROUTED: typing their email
+    // found no rule that could name their connection, so the operator's only option was to hand
+    // every user a deep link.
+    let harness = Harness::start().await;
+    let (ocn_id, connection) = seed_saml_binding(&harness, true).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let runtime = build_runtime(([127, 0, 0, 1], 1).into());
+
+    let response = post_login(
+        router(&harness, &runtime),
+        &harness,
+        &format!("ada@{ROUTED_DOMAIN}"),
+    )
+    .await;
+    let location = location(&response);
+
+    // THE SAML START ENDPOINT FOR THAT CONNECTION, not the federation authorize leg.
+    assert!(
+        location.contains(&format!("/saml/start/{connection}")),
+        "a domain rule naming a SAML connection did not route to it: {location}"
+    );
+    assert!(
+        !location.contains("/federation/"),
+        "a SAML route went through the OIDC broker: {location}"
+    );
+    // AND IT CARRIES THE RESUME TARGET, so a completed sign-in resumes what the person asked
+    // for rather than dropping them on a dashboard.
+    assert!(
+        !param(&location, "return_to").is_empty(),
+        "the SAML route dropped the return target: {location}"
+    );
+    // AND NO ROUTING TOKEN, which would authenticate a pairing that does not exist here: the
+    // connection names its own organization, so there is no second value a browser could swap.
+    assert!(
+        !location.contains("routing="),
+        "a SAML route minted a connector routing token: {location}"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_saml_connection_falls_back_to_the_local_prompt() {
+    // A DISABLED CONNECTION IS NOT A ROUTE, exactly as a disabled connector is not. The check
+    // is `find_active`, so an operator switching a connection off returns their users to the
+    // local prompt rather than sending them to an endpoint that will turn them away -- which
+    // is an availability property, not a policy one, and the same one the OIDC branch has.
+    let harness = Harness::start().await;
+    let (ocn_id, connection) = seed_saml_binding(&harness, false).await;
+    seed_rule(&harness, RoutingSelector::Domain(ROUTED_DOMAIN), &ocn_id).await;
+    let runtime = build_runtime(([127, 0, 0, 1], 1).into());
+
+    let response = post_login(
+        router(&harness, &runtime),
+        &harness,
+        &format!("ada@{ROUTED_DOMAIN}"),
+    )
+    .await;
+    let routed = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|location| location.contains(&format!("/saml/start/{connection}")));
+    assert!(
+        !routed,
+        "a disabled SAML connection still routed a login to itself"
     );
 }
 
@@ -918,7 +1077,7 @@ async fn seed_connector_and_binding(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -958,7 +1117,7 @@ async fn seed_extra_binding(harness: &Harness, connector_id: &ConnectorId) -> Or
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,
@@ -1721,7 +1880,7 @@ async fn seed_github_binding_with_overlay(
             1_000_000,
             NewOrgConnection {
                 organization_id: &org_id,
-                connector_id: &connector_id,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class,

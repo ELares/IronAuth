@@ -1629,6 +1629,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0200_saml_browser_binding.sql"),
         },
+        Migration {
+            version: 201,
+            name: "org_connections_saml_target",
+            // EXPAND. One nullable column and a relaxed NOT NULL. The relaxation is safe because
+            // a NULL can only appear in a row a new binary wrote: see the migration's own
+            // reasoning, which is the part worth reading before copying this shape.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0201_org_connections_saml_target.sql"),
+        },
     ]
 }
 

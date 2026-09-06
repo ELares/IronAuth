@@ -855,7 +855,14 @@ pub(crate) async fn issue_upstream_authorize(
                 return Err(not_found());
             };
             match scoped.org_connections().get(&ocn_id).await {
-                Ok(binding) if binding.enabled && binding.connector_id == record.id.to_string() => {
+                // THE BINDING MUST NAME THIS CONNECTOR, and a SAML binding names none -- its
+                // `connector_id` is `None`, so the comparison is false and the routing token is
+                // refused here rather than resolving to a connector it does not belong to.
+                Ok(binding)
+                    if binding.enabled
+                        && binding.connector_id.as_deref()
+                            == Some(record.id.to_string().as_str()) =>
+                {
                     Some(ocn_id.to_string())
                 }
                 Ok(_) | Err(StoreError::NotFound) => return Err(not_found()),

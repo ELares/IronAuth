@@ -610,6 +610,8 @@ impl Fixture {
         // EXISTS. A synthetic one answers the uniform not-found at a live environment
         // too, which would make driving it at a soft-deleted one measure nothing.
         let org_connection = ironauth_store::OrgConnectionId::generate(&env, &scope);
+        let connector_id = ironauth_store::ConnectorId::parse_in_scope(&connector, &scope)
+            .expect("the seeded connector id");
         h.db()
             .control_store()
             .scoped(scope)
@@ -625,8 +627,7 @@ impl Fixture {
                         &scope,
                     )
                     .expect("the seeded organization id"),
-                    connector_id: &ironauth_store::ConnectorId::parse_in_scope(&connector, &scope)
-                        .expect("the seeded connector id"),
+                    upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
                     overlay_min_acr: None,
                     max_age_secs: None,
                     overlay_min_class: None,

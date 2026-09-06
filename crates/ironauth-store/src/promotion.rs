@@ -1615,7 +1615,8 @@ mod tests {
             }],
             org_connection: vec![OrgConnectionSnapshot {
                 organization_id: "org_a".to_owned(),
-                connector_id: "con_a".to_owned(),
+                connector_id: Some("con_a".to_owned()),
+                saml_connection_id: None,
                 overlay_min_acr: None,
                 max_age_secs: None,
                 overlay_min_class: None,

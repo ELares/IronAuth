@@ -264,9 +264,14 @@ pub struct ConnectorSnapshot {
 pub struct OrgConnectionSnapshot {
     /// The organization this binding belongs to.
     pub organization_id: String,
-    /// The connector describing the organization's upstream. Part of the stable
-    /// natural key the export orders by.
-    pub connector_id: String,
+    /// The connector describing the organization's upstream, absent when the upstream is a
+    /// SAML connection instead (issue #139). Part of the stable natural key the export orders by.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub connector_id: Option<String>,
+    /// The SAML connection describing the organization's upstream, absent when the upstream is a
+    /// connector. Exactly one of the two is present.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub saml_connection_id: Option<String>,
     /// The broker overlay minimum acr, if set (a later PR enforces it).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub overlay_min_acr: Option<String>,
@@ -843,6 +848,7 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
         .map(|record| OrgConnectionSnapshot {
             organization_id: record.organization_id,
             connector_id: record.connector_id,
+            saml_connection_id: record.saml_connection_id,
             overlay_min_acr: record.overlay_min_acr,
             max_age_secs: record.max_age_secs,
             overlay_min_class: record.overlay_min_class,
@@ -850,9 +856,17 @@ pub async fn export(scoped: &ScopedStore<'_>) -> Result<Snapshot, StoreError> {
             enabled: record.enabled,
         })
         .collect();
+    // THE UPSTREAM IS ONE KEY COMPONENT WHICHEVER SHAPE IT TAKES, so the sort reads whichever
+    // of the two is set rather than defaulting the absent one to "" -- which would make every
+    // SAML binding sort as though it had no upstream and order them among themselves by nothing.
     org_connection.sort_by(|a, b| {
-        (a.organization_id.as_str(), a.connector_id.as_str())
-            .cmp(&(b.organization_id.as_str(), b.connector_id.as_str()))
+        let upstream = |row: &OrgConnectionSnapshot| {
+            row.connector_id
+                .clone()
+                .or_else(|| row.saml_connection_id.clone())
+                .unwrap_or_default()
+        };
+        (a.organization_id.clone(), upstream(a)).cmp(&(b.organization_id.clone(), upstream(b)))
     });
 
     // Routing rules (issue #77): the user selector travels as an OPAQUE base64 blind
@@ -1295,9 +1309,10 @@ const CONNECTOR_KEYS: [&str; 3] = ["connector_slug", "definition", "enabled"];
 
 /// Every key a snapshot `org_connection` element may carry (issue #77). No secret
 /// slot: a binding holds no secret material.
-const ORG_CONNECTION_KEYS: [&str; 7] = [
+const ORG_CONNECTION_KEYS: [&str; 8] = [
     "organization_id",
     "connector_id",
+    "saml_connection_id",
     "overlay_min_acr",
     "max_age_secs",
     "overlay_min_class",
