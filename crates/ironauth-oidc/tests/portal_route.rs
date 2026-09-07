@@ -1871,4 +1871,137 @@ async fn the_page_reports_whether_anything_has_actually_used_each_connection() {
         "the mid-cutover row leads with the reassuring half: {}",
         row(&body, "mid-cutover")
     );
+
+    // THE DATE ITSELF, which nothing asserted: the column divides microseconds to seconds before
+    // formatting, and feeding microseconds straight in prints a year around fifty-five thousand.
+    // Derived independently here, for the reason the deadline assertions above give.
+    let secs = now / 1_000_000;
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day_of = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let stamped = format!(
+        "{year:04}-{month:02}-{day_of:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    );
+    assert!(
+        row(&body, "in-use").contains(&stamped),
+        "the activity column does not carry the time of the request it is reporting: {}",
+        row(&body, "in-use")
+    );
+
+    // AND A REVOKED CONNECTION REPORTS NO ACTIVITY AT ALL. Its state is explained by the
+    // revocation, and a last-used time beside it would invite the reader to wonder whether it is
+    // still working. Nothing drove this arm before.
+    let switched =
+        connect_with_provider(&harness, &org, "switched-off", "okta", "act-d", None).await;
+    assert!(
+        harness
+            .db()
+            .store()
+            .scoped(harness.scope())
+            .scim_connections()
+            .authenticate(&hex_digest("act-d"), now)
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the fixture's request was refused before the revocation"
+    );
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &switched, now)
+        .await
+        .expect("revoke");
+    let (_, after) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert!(
+        row(&after, "switched-off").contains("Revoked"),
+        "the premise: the row reports the revocation: {}",
+        row(&after, "switched-off")
+    );
+    assert!(
+        !row(&after, "switched-off").contains("Last request"),
+        "a revoked connection reports when it was last used, which invites the reader to wonder \
+         whether it still works: {}",
+        row(&after, "switched-off")
+    );
+}
+
+/// A connection with no token rows is not reported as unused, because nothing knows.
+///
+/// # The population this page must not lie about
+///
+/// A connection created by an un-upgraded replica after migration 0205 has no row in
+/// `scim_connection_tokens`: it authenticates through the fallback on
+/// `scim_connections.token_digest`, and the authentication path has nothing to stamp. Every
+/// request it serves leaves no trace.
+///
+/// SAYING "NO REQUESTS YET" THERE REPORTS A WORKING CONNECTION AS DEAD, and the admin's remedy
+/// would be to go reconfigure something already correct. The page says "Not recorded" instead --
+/// which is what it actually knows.
+#[tokio::test]
+async fn a_connection_with_no_token_rows_reports_that_nothing_is_recorded() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let legacy = connect_with_provider(&harness, &org, "old-binary", "okta", "leg-1", None).await;
+    // SIMULATE THE UN-UPGRADED REPLICA'S CREATE: the connection row exists and the token row does
+    // not, which is the state the fallback and the adopt-on-rotate both exist for.
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(legacy.to_string())
+        .execute(harness.db().owner_pool())
+        .await
+        .expect("remove the token rows");
+
+    // AND IT REALLY IS PROVISIONING: the request authenticates through the fallback, which is
+    // what makes "no requests yet" a lie rather than merely unhelpful.
+    let now = now_micros(&harness);
+    assert!(
+        harness
+            .db()
+            .store()
+            .scoped(harness.scope())
+            .scim_connections()
+            .authenticate(&hex_digest("leg-1"), now)
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the fallback connection stopped authenticating, so this fixture proves nothing"
+    );
+
+    let cookie = open_session_in(&harness, "scim", "tok-legacy", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    assert!(
+        row(&body, "old-binary").contains("Not recorded"),
+        "a connection whose requests leave no trace does not say so: {}",
+        row(&body, "old-binary")
+    );
+    assert!(
+        !row(&body, "old-binary").contains("No requests yet"),
+        "a connection that just served a provisioning request is reported as never used, so an \
+         admin would go reconfigure something that is already working: {}",
+        row(&body, "old-binary")
+    );
 }

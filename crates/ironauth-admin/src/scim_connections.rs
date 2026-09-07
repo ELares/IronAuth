@@ -1064,6 +1064,11 @@ mod rotation_tests {
             live_token_count,
             credential_expires_at_unix_micros: soonest,
             created_at_unix_micros: 1_698_000_000_000_000,
+            // THE VIEW READS NEITHER, which is why they are fixed here rather than parameterised:
+            // if it ever starts, this module stops compiling and the omission becomes a decision
+            // somebody makes.
+            last_seen_at_unix_micros: None,
+            newest_token_used: None,
         }
     }
 

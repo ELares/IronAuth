@@ -36,6 +36,17 @@ COMMENT ON COLUMN scim_connection_tokens.last_seen_at IS
 -- neither. `migration.rs::the_data_plane_holds_no_table_wide_update_on_any_table` reads
 -- `information_schema.table_privileges` and fails on the table-wide form.
 --
--- IT IS ALSO NOT A REVOCATION BYPASS: the RESTRICTIVE one-way policy 0205 installs still applies,
--- and this grant cannot clear `revoked_at` because it does not cover that column.
+-- IT IS NOT A REVOCATION BYPASS, and the reason is the GRANT rather than the policy. 0205's
+-- RESTRICTIVE one-way policy is `TO ironauth_control`, so it does not constrain this role at all
+-- -- and if it did it would REFUSE this write, since its `WITH CHECK (revoked_at IS NOT NULL OR
+-- expires_at IS NOT NULL)` fails for an ordinary live token with neither set. What stops the data
+-- plane clearing `revoked_at` is that this grant does not name that column, and column-scoped
+-- UPDATE privileges are enforced per column by Postgres itself.
+--
+-- 0205 SAYS OF THIS ROLE "It may not write", under a heading arguing that a provisioning
+-- credential able to mint another would be an escalation. That argument still holds and this
+-- grant does not weaken it -- a timestamp mints nothing -- but the sentence is now literally
+-- false, and it is stated in a shipped migration this project checksums whole, so it cannot be
+-- edited in place. This paragraph is its retraction: as of 0206 the data plane writes exactly
+-- one column of this table, `last_seen_at`, and nothing else.
 GRANT UPDATE (last_seen_at) ON scim_connection_tokens TO ironauth_app;

@@ -2874,3 +2874,125 @@ async fn the_listing_says_whether_the_new_token_has_been_used() {
         "the fresh token authenticated and the listing still reports the cutover as pending"
     );
 }
+
+/// A legacy rotation makes the adopted token unambiguously older than the minted one.
+///
+/// # The coin flip this replaced
+///
+/// `rotate_token` adopts the legacy credential and mints the replacement in ONE transaction, and
+/// `now()` returns one value for a whole transaction -- so both rows used to take the same
+/// `created_at` and "which token is newest" was decided by comparing two unrelated SHA-256 hex
+/// strings. It failed in both directions on roughly half of legacy rotations: an old token that
+/// won the comparison reported a cutover complete that had never started, and a new token that
+/// lost it reported one pending forever after it finished.
+///
+/// THE FIXTURE PINS THE DIGEST ORDERING so the test is not itself a coin flip: the legacy digest
+/// sorts ABOVE the minted one, which is the half that used to pick the wrong row.
+#[tokio::test]
+async fn a_legacy_rotation_orders_the_adopted_token_before_the_minted_one() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    // TWO DIGESTS WHOSE HEX ORDERING IS KNOWN. `digest()` hashes, so the ordering is a property
+    // of the hash rather than of the label; these are chosen by measuring, and the assertion
+    // below states which way round they must be for this fixture to drive the tie-break.
+    let mut legacy = "tie-legacy";
+    let mut minted = "tie-minted";
+    if digest(legacy) < digest(minted) {
+        std::mem::swap(&mut legacy, &mut minted);
+    }
+    assert!(
+        digest(legacy) > digest(minted),
+        "the fixture needs the legacy digest to sort ABOVE the minted one, which is the half a \
+         digest tie-break used to get wrong"
+    );
+
+    let id = connect(&db, &env, scope, &organization, legacy).await;
+    // MAKE IT A FALLBACK CONNECTION: no token rows, so the rotation adopts. This is the
+    // population created by an un-upgraded replica after migration 0205 ran.
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &id, minted, 3600, at)
+        .await
+        .expect("rotate");
+
+    // THE CUSTOMER KEEPS USING THE OLD CREDENTIAL through the overlap, which is what the overlap
+    // is for -- and is the state where the cutover warning has to fire.
+    let during = at + 1;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest(legacy), during)
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the adopted legacy token stopped working inside its own overlap"
+    );
+
+    let listed = listed(&db, scope, &organization, &id, during).await;
+    assert_eq!(
+        listed.newest_token_used,
+        Some(false),
+        "the adopted OLD token was picked as the newest, so a connection whose customer has \
+         never presented the replacement reports its cutover as complete and nothing warns \
+         before the overlap ends"
+    );
+}
+
+/// The listing reports the MOST RECENT use across a connection's tokens, not the oldest.
+///
+/// # Why min and max are otherwise indistinguishable here
+///
+/// Every other fixture stamps exactly one token, and one row makes `min` and `max` the same
+/// answer. Two tokens used at different times is the only shape that separates them -- and the
+/// wrong one would report a connection in daily use as last seen whenever its oldest credential
+/// happened to be presented.
+#[tokio::test]
+async fn the_listing_reports_the_most_recent_use_not_the_oldest() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "recent-1").await;
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &id, "recent-2", 3600, at)
+        .await
+        .expect("rotate");
+
+    let read = db.store().scoped(scope);
+    // THE OLD TOKEN FIRST, then the new one much later, so the two stamps are far apart and the
+    // aggregate has to choose.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("recent-1"), at + 1)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    let later = at + 600 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("recent-2"), later)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+
+    assert_eq!(
+        listed(&db, scope, &organization, &id, later)
+            .await
+            .last_seen_at_unix_micros,
+        Some(later),
+        "the listing reported the OLDEST use rather than the most recent, so a connection \
+         provisioning right now reads as last seen ten minutes ago"
+    );
+}

@@ -9283,3 +9283,40 @@ async fn the_outbound_connection_update_grant_is_scoped_to_the_columns_a_stateme
         );
     }
 }
+
+/// The data plane's writable columns on `scim_connection_tokens` are EXACTLY `last_seen_at`.
+///
+/// # What the neighbouring guard cannot see
+///
+/// `the_data_plane_holds_no_table_wide_update_on_any_table` refuses a TABLE-wide grant, which is
+/// the coarse form. It says nothing about WHICH columns a column-scoped grant names, so widening
+/// 0206 from `last_seen_at` to `(last_seen_at, expires_at)` -- or to `revoked_at` -- passes it
+/// untouched, and passes every test and shell gate in this repository.
+///
+/// Those two columns are the ones that decide whether a credential still works. A data plane able
+/// to write them could extend a token it was about to lose, or clear a revocation an operator
+/// performed, from the request path of any customer's identity provider. This asserts the SET, so
+/// a future grant on this table is a decision somebody makes here rather than one that arrives
+/// unremarked.
+#[tokio::test]
+async fn the_data_plane_writes_exactly_one_column_of_scim_connection_tokens() {
+    let db = TestDatabase::start().await;
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.column_privileges \
+         WHERE grantee = 'ironauth_app' AND privilege_type = 'UPDATE' \
+           AND table_schema = 'public' AND table_name = 'scim_connection_tokens' \
+         ORDER BY column_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the column privileges");
+
+    assert_eq!(
+        columns,
+        vec!["last_seen_at".to_owned()],
+        "the data plane's writable columns on scim_connection_tokens changed. `last_seen_at` is a \
+         timestamp that mints nothing; `expires_at` and `revoked_at` decide whether a credential \
+         works, and a data plane able to write them could extend a token or clear a revocation \
+         from any customer's provisioning request"
+    );
+}

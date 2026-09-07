@@ -75290,14 +75290,19 @@ pub struct ScimConnection {
     /// the wrong application. The stamp is coarse by design; see `LAST_SEEN_THROTTLE_MICROS`.
     pub last_seen_at_unix_micros: Option<i64>,
     /// Whether the NEWEST unrevoked token has ever authenticated, or `None` when the connection
-    /// holds no token row at all.
+    /// holds no UNREVOKED token row.
     ///
     /// THE CUTOVER QUESTION, which the timestamp above cannot answer. During a rotation overlap
     /// both tokens work, so `last_seen_at` keeps moving on the strength of the OLD one and looks
     /// healthy right up to the moment the overlap ends and provisioning stops. What predicts that
     /// outage is whether the credential the customer was asked to paste has been used yet.
     ///
-    /// `None` is the legacy population, which has no token rows to ask about.
+    /// `None` covers two populations and both mean "not a question this connection can answer":
+    /// the fallback population, created by an un-upgraded replica after migration 0205, which has
+    /// no token rows at all; and a connection whose every token row has been revoked, which has no
+    /// current credential to cut over TO. A surface must not render `None` as "never used" -- the
+    /// first of those may be provisioning perfectly through
+    /// `scim_connections.token_digest` right now.
     pub newest_token_used: Option<bool>,
     /// The next deadline one of this connection's credentials meets, if any of them has one.
     ///
@@ -78987,11 +78992,11 @@ impl ScimConnectionRepo<'_> {
                     live_token_count: live_token_count(&row),
                     created_at_unix_micros: row.get("created_us"),
                     last_seen_at_unix_micros: row.get("last_seen_us"),
-                    // NULL when the connection has no unrevoked token row at all, which is the
-                    // legacy population: it authenticates through `scim_connections.token_digest`
-                    // and has nothing here to stamp. `None` says "not a question this connection
-                    // can answer", which is different from `Some(false)`, "there is a newest
-                    // credential and nothing has used it".
+                    // NULL when the connection has no UNREVOKED token row: the fallback
+                    // population, which authenticates through `scim_connections.token_digest` and
+                    // has nothing here to stamp, and a connection whose tokens are all revoked.
+                    // `None` says "not a question this connection can answer", which is different
+                    // from `Some(false)`, "there is a newest credential and nothing has used it".
                     newest_token_used: row.get("newest_token_used"),
                 })
             })
@@ -79112,9 +79117,9 @@ mod scim_connection_signal_tests {
             live_token_count,
             credential_expires_at_unix_micros: deadline,
             created_at_unix_micros: 1_698_000_000_000_000,
-            // NEITHER SIGNAL READS THESE, which is the point of listing them at a fixed value:
-            // if one ever starts, this module stops compiling and the omission is a decision
-            // somebody makes rather than a default they inherit.
+            // NEITHER SIGNAL READS THESE. They are listed because the literal is exhaustive, so
+            // a field added to `ScimConnection` stops this module compiling until somebody
+            // decides what it should be here -- which is how these two arrived.
             last_seen_at_unix_micros: None,
             newest_token_used: None,
         }
@@ -79646,9 +79651,23 @@ impl ActingScimConnectionRepo<'_> {
         // (token_digest)`, which 0183 withholds because it is how a known credential gets
         // installed.
         sqlx::query(
+            // `created_at` IS COPIED FROM THE CONNECTION, not left to `now()`. The adopted row is
+            // a credential that has existed since the connection was created, so the connection's
+            // own timestamp is the truer value -- and leaving it to the default made it EQUAL to
+            // the row this same transaction mints a few statements later, because `now()` is
+            // `transaction_timestamp()` and returns one value for the whole transaction.
+            //
+            // THAT TIE DECIDED WHICH TOKEN IS "NEWEST" BY COMPARING TWO HEX DIGESTS. On every
+            // legacy rotation it was a coin flip, and it failed in both directions: an old token
+            // that won the comparison reported the cutover as complete while the customer had
+            // never presented the new credential, so nothing warned before the overlap ended; and
+            // a new token that lost it reported "not used yet" forever after a cutover that had
+            // finished. Copying the connection's timestamp makes the adopted row unambiguously
+            // older, which is what it is.
             "INSERT INTO scim_connection_tokens \
-             (token_digest, connection_id, tenant_id, environment_id, expires_at) \
-             SELECT c.token_digest, c.id, c.tenant_id, c.environment_id, c.expires_at \
+             (token_digest, connection_id, tenant_id, environment_id, expires_at, created_at) \
+             SELECT c.token_digest, c.id, c.tenant_id, c.environment_id, c.expires_at, \
+                    c.created_at \
              FROM scim_connections c \
              WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.id = $3 \
                AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \

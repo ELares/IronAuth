@@ -548,6 +548,18 @@ fn connection_rows<'a>(
                     crate::saml_start::rfc3339_utc(seen / 1_000_000)
                 )
             }
+        } else if connection.newest_token_used.is_none() {
+            // NOTHING IS RECORDED FOR THIS ONE, which is not the same as nothing having happened.
+            // A connection with no unrevoked token row authenticates through the fallback on
+            // `scim_connections.token_digest` -- the population created by an un-upgraded replica
+            // after migration 0205 -- and there is no row for the authentication path to stamp.
+            // It may be provisioning perfectly right now.
+            //
+            // SAYING "NO REQUESTS YET" HERE WOULD BE A LIE OF THE WORST KIND ON THIS PAGE: it
+            // reports a working connection as dead, and the admin's remedy would be to go
+            // reconfigure something that is already right. Rotating it adopts the credential into
+            // a row, after which activity is recorded normally.
+            "Not recorded".to_owned()
         } else {
             // NEVER USED AT ALL, which is not the same as a cutover in progress and must not
             // borrow its wording: "new token not used yet" tells an admin a rotation is pending
@@ -673,10 +685,11 @@ fn setup_guides(
 /// # It reads and does not write
 ///
 /// Rotation is not offered, and its absence is deliberate rather than unfinished: this plane
-/// authenticates as the data-plane role, which holds `SELECT` and nothing else on both SCIM
-/// tables. Migration 0205 argues the case -- a provisioning credential that could mint another
-/// provisioning credential is an escalation with no operator in the loop -- so offering rotation
-/// from here is a grant decision, not a page.
+/// authenticates as the data-plane role, which on the two SCIM tables holds `SELECT` plus exactly
+/// one column-scoped write, `scim_connection_tokens.last_seen_at` (migration 0206), and nothing
+/// that could mint or extend a credential. Migration 0205 argues the case -- a provisioning
+/// credential that could mint another provisioning credential is an escalation with no operator
+/// in the loop -- so offering rotation from here is a grant decision, not a page.
 async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     let now = epoch_micros(state.env().clock().now_utc());
     let read = state
