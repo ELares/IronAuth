@@ -543,6 +543,90 @@ async fn a_second_assertion_signs_in_the_same_person_rather_than_forking_the_acc
 }
 
 #[tokio::test]
+async fn a_second_assertion_refreshes_the_traits_it_carries() {
+    // THE OTHER HALF OF "CREATE ON FIRST AND UPDATE ON SUBSEQUENT" (issue #139). Its sibling
+    // above proves the second assertion does not FORK the account, which is the failure everyone
+    // thinks of. It says nothing about whether anything was UPDATED: an implementation that
+    // resolved the existing user and then ignored the assertion entirely passes it, and the
+    // account silently keeps whatever the person's details were on the day they first signed in.
+    //
+    // WHY THAT MATTERS HERE RATHER THAN BEING A NICETY. The directory is the authority for these
+    // values; that is the whole premise of federated sign-in. Somebody changes their surname, or
+    // an address is corrected after a typo, and the vendor keeps notifying and displaying the old
+    // one forever. The failure is silent on both sides: the identity provider shows the change
+    // applied, and nothing here reports having dropped it.
+    let harness = Harness::start_store_backed().await;
+    // A TRAIT SCHEMA AND A MAPPING, both of which this test needs before it can say anything
+    // about updating: with no schema the mapped write fails closed and the sign-in answers 500,
+    // and with no mapping no trait is written at all. Neither failure has anything to do with
+    // the property under test, so both are set up here rather than discovered in an assertion.
+    seed_trait_schema(&harness).await;
+    let wired = wire(
+        &harness,
+        ISSUER,
+        &json!({"traits": {"email": {"source": ["email"], "required": false}}}),
+    )
+    .await;
+
+    // FIRST: the person signs in with the address the directory then held. The NameID is a
+    // directory id and the address is an ATTRIBUTE, following the lesson its neighbour records:
+    // if the two were the same string, a build that ignored every mapping and wrote the NameID
+    // into every trait would pass.
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(
+            &wired,
+            harness.env(),
+            ISSUER,
+            "_u1",
+            "uid=ada,ou=people",
+            &[("email", "ada.lovelace@acme.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let traits = trait_emails(&harness).await;
+    assert!(
+        traits.contains(&"ada.lovelace@acme.example".to_owned()),
+        "the first assertion's trait was not stored at all: {traits:?}"
+    );
+
+    // THEN: the same person, same NameID, and the directory now carries a different address.
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(
+            &wired,
+            harness.env(),
+            ISSUER,
+            "_u2",
+            "uid=ada,ou=people",
+            &[("email", "ada.byron@acme.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+
+    // ONE PERSON, CARRYING THE NEW VALUE AND NOT THE OLD ONE. Both halves are asserted: the
+    // account must not have forked (which would show two entries), and the stale value must be
+    // GONE rather than sitting beside the new one, because a reader picking either is a reader
+    // that sometimes picks the wrong one.
+    let people = users(&harness, harness.scope()).await;
+    assert_eq!(people.len(), 1, "the update forked the account: {people:?}");
+    let traits = trait_emails(&harness).await;
+    assert!(
+        traits.contains(&"ada.byron@acme.example".to_owned()),
+        "the second assertion's trait was dropped, so the directory's change never landed: \
+         {traits:?}"
+    );
+    assert!(
+        !traits.contains(&"ada.lovelace@acme.example".to_owned()),
+        "the superseded address is still stored, so a reader can still pick it: {traits:?}"
+    );
+}
+
+#[tokio::test]
 async fn two_organizations_sharing_one_identity_provider_are_two_people() {
     // THE OBJECTION THAT TOOK THE FIRST ATTEMPT APART, as a test, and in the shape that actually
     // reaches it. Migration 0196 makes `idp_entity_id` unique per (tenant, environment,

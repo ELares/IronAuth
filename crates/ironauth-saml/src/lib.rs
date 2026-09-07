@@ -525,6 +525,54 @@ pub mod test_util {
         wrap(&with_signature(&assertion, &signed_info, &value))
     }
 
+    /// The same as [`signed_element_with`], but the signature carries a `ds:KeyInfo` block
+    /// holding `certificate_base64` as an `X509Certificate`.
+    ///
+    /// # Why a caller needs this
+    ///
+    /// Issue #139 requires that a response signed by a valid but UNPINNED certificate is refused
+    /// "even when the certificate is embedded in the response". That is the CVE-2026-9090 class:
+    /// a verifier that reads the signer out of the document it is verifying will happily confirm
+    /// any attacker's self-signature, because the attacker supplies both halves.
+    ///
+    /// [`crate::verify`] takes its anchors as an ARGUMENT and never parses `KeyInfo`, so it is
+    /// not vulnerable -- but nothing MEASURED that, because no fixture could produce a document
+    /// carrying a `KeyInfo` at all. A structural argument that a field is ignored is exactly the
+    /// kind of claim that stops being true when somebody adds the field, and no test would have
+    /// noticed. This makes the attack expressible.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_element_with_key_info(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        qualified: &str,
+        declarations: &str,
+        id: &str,
+        children: &str,
+        certificate_base64: &str,
+    ) -> String {
+        let signed = signed_element_with(key, qualified, declarations, id, children);
+        let key_info = [
+            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>",
+            certificate_base64,
+            "</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+        ]
+        .concat();
+        // AFTER `SignatureValue`, which is where the schema puts it, and which is also what makes
+        // this a fair test: the digest and the signature were computed over the document WITHOUT
+        // the KeyInfo, and `KeyInfo` sits outside `SignedInfo`, so splicing it in does not
+        // invalidate a signature that was already valid. An attacker gets to add it for free,
+        // which is precisely the property that makes reading it dangerous.
+        let marker = "</ds:SignatureValue>";
+        let at = signed
+            .find(marker)
+            .expect("the signature this just built has a SignatureValue")
+            + marker.len();
+        format!("{}{key_info}{}", &signed[..at], &signed[at..])
+    }
+
     fn wrap(assertion: &str) -> String {
         [
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
