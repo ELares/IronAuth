@@ -469,37 +469,12 @@ pub async fn surface_get(
     crate::pages::secure_html(StatusCode::OK, body)
 }
 
-/// The SCIM configuration surface: what this organization's provisioning credentials are doing.
+/// One table row per connection, each saying which state that connection is in.
 ///
-/// # What an IT admin came here to find out
-///
-/// Whether provisioning is working, and if it is going to stop, when. Those are two different
-/// questions and the page answers them separately, because a connection with no working
-/// credential and one whose credential never expires publish the same absent deadline and only
-/// one of them needs somebody today.
-///
-/// THE ANSWERS ARE THE ROW'S OWN. `ScimConnection::no_live_credential` and
-/// `credential_expiring_soon` are what the management API's listing reports to the vendor's
-/// operator, and this page calls the same two methods with the same lead time -- which reaches
-/// this plane as a declared cross-plane value for exactly that reason. A copy of the rule here
-/// would let one connection be "expiring" in the vendor's console and "healthy" in their
-/// customer's portal, with nobody positioned to see both.
-///
-/// # It says nothing it cannot stand behind
-///
-/// The provisioning base URL is printed only when this deployment actually serves `/scim/v2`.
-/// With the surface off it is a uniform 404, and nothing stops a `scim` portal link being minted
-/// on such a deployment, so the page says the surface is unavailable rather than handing over an
-/// address that answers nothing.
-///
-/// # It reads and does not write
-///
-/// Rotation is not offered, and its absence is deliberate rather than unfinished: this plane
-/// authenticates as the data-plane role, which holds `SELECT` and nothing else on both SCIM
-/// tables. Migration 0205 argues the case -- a provisioning credential that could mint another
-/// provisioning credential is an escalation with no operator in the loop -- so offering rotation
-/// from here is a grant decision, not a page.
-/// One table row per connection, each saying which of the five states that connection is in.
+/// NO COUNT HERE, deliberately. An earlier version of this line said "which of the five states",
+/// which was wrong by two the day it was written -- the branch that added it had itself added an
+/// arm -- and a number in this sentence is the one thing a reader auditing arm coverage would key
+/// on. The arms below are the list.
 ///
 /// Split out of `scim_surface` so the handler reads as the shape of the page rather than as the
 /// wording of its rows; the reasoning for each branch lives at the branch.
@@ -642,6 +617,36 @@ fn setup_guides(
     guides
 }
 
+/// The SCIM configuration surface: what this organization's provisioning credentials are doing.
+///
+/// # What an IT admin came here to find out
+///
+/// Whether provisioning is working, and if it is going to stop, when. Those are two different
+/// questions and the page answers them separately, because a connection with no working
+/// credential and one whose credential never expires publish the same absent deadline and only
+/// one of them needs somebody today.
+///
+/// THE ANSWERS ARE THE ROW'S OWN. `ScimConnection::no_live_credential` and
+/// `credential_expiring_soon` are what the management API's listing reports to the vendor's
+/// operator, and this page calls the same two methods with the same lead time -- which reaches
+/// this plane as a declared cross-plane value for exactly that reason. A copy of the rule here
+/// would let one connection be "expiring" in the vendor's console and "healthy" in their
+/// customer's portal, with nobody positioned to see both.
+///
+/// # It says nothing it cannot stand behind
+///
+/// The provisioning base URL is printed only when this deployment actually serves `/scim/v2`.
+/// With the surface off it is a uniform 404, and nothing stops a `scim` portal link being minted
+/// on such a deployment, so the page says the surface is unavailable rather than handing over an
+/// address that answers nothing.
+///
+/// # It reads and does not write
+///
+/// Rotation is not offered, and its absence is deliberate rather than unfinished: this plane
+/// authenticates as the data-plane role, which holds `SELECT` and nothing else on both SCIM
+/// tables. Migration 0205 argues the case -- a provisioning credential that could mint another
+/// provisioning credential is an escalation with no operator in the loop -- so offering rotation
+/// from here is a grant decision, not a page.
 async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     let now = epoch_micros(state.env().clock().now_utc());
     let read = state

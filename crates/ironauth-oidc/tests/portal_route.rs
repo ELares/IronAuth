@@ -1314,12 +1314,14 @@ async fn each_connection_gets_its_own_providers_setup_guide() {
     // NO GUIDE OFFERS THE TOKEN, because no reader can produce it: the store holds a digest and
     // the plaintext existed once, in the response that minted it. Every guide says where it
     // comes from instead.
-    assert_eq!(
-        body.matches("ask your vendor to rotate it").count(),
-        3,
-        "a guide does not say where the token comes from, which is the one value it cannot show \
-         and the one an admin will not otherwise have: {body}"
-    );
+    for name in ["okta-primary", "entra-secondary", "homegrown"] {
+        assert!(
+            guide(name).contains("ask your vendor to rotate it"),
+            "the guide for {name} does not say where the token comes from, which is the one \
+             value it cannot show and the one an admin will not otherwise have: {}",
+            guide(name)
+        );
+    }
 }
 
 /// A revoked connection gets no guide, and a deployment serving no SCIM gets none at all.
@@ -1609,10 +1611,14 @@ async fn a_connection_that_lost_its_tokens_still_gets_its_guide() {
 ///
 /// # The other half of `is_some_and`
 ///
-/// Every other guide fixture creates its connection with no expiry at all, so the filter could
-/// test `expires_at_unix_micros.is_some()` -- suppressing the guide for every connection that has
-/// an expiry, whether or not it has passed -- and the whole suite would stay green. That is a
-/// large population: an expiry is what a cautious vendor sets.
+/// The filter could test `expires_at_unix_micros.is_some()` -- suppressing the guide for every
+/// connection that has an expiry, whether or not it has passed -- and only a fixture whose expiry
+/// is in the FUTURE can tell that apart from the shipped condition. That is a large population to
+/// be wrong about: an expiry is what a cautious vendor sets.
+///
+/// Its sibling `a_connection_that_lost_its_tokens_still_gets_its_guide` also carries a future
+/// expiry and would fail the same mutation. This one keeps it as the case stated plainly, with
+/// nothing else going on in the fixture to explain a failure.
 #[tokio::test]
 async fn a_connection_with_a_future_expiry_still_gets_its_guide() {
     let harness = Harness::start_store_backed_with_scim_surface(true).await;
@@ -1698,5 +1704,69 @@ async fn a_revoked_and_lapsed_connection_reads_as_revoked() {
         !row(&body, "off-and-expired").contains("must be replaced"),
         "the revoked row also carries the lapsed remedy: {}",
         row(&body, "off-and-expired")
+    );
+
+    // AND NO EMPTY GUIDES SECTION. The surface is on and every connection here is filtered out,
+    // which is the only state that reaches the heading's emptiness guard -- an organization that
+    // has offboarded its identity provider, or has no connections yet on a SCIM-serving
+    // deployment. Without this the guard can be deleted and the page ships a heading with
+    // nothing underneath, which reads as a section that failed to load.
+    assert!(
+        !body.contains("Setting up your identity provider"),
+        "a heading was rendered over no guides at all: {body}"
+    );
+}
+
+/// A display name carrying markup is escaped everywhere the page prints it.
+///
+/// # The one value on this page that a customer's own vendor controls
+///
+/// Everything else in a row and a guide is a constant, a timestamp, or the deployment's own URL.
+/// The display name is chosen by whoever created the connection through the management API, which
+/// accepts any text the column allows -- so it is the only value here that can carry markup, and
+/// it is printed twice: once in the table cell and once in the guide's summary. Dropping the
+/// escape on either was invisible; the row cell had no fixture with markup in it either.
+#[tokio::test]
+async fn a_display_name_carrying_markup_is_escaped_in_the_row_and_the_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    // A NAME THAT WOULD CLOSE THE CELL AND OPEN A SCRIPT if it reached the page unescaped. It
+    // stays a legal display name: the column bounds its length and nothing else.
+    let hostile = "</td><script>alert(1)</script>";
+    connect_with_provider(&harness, &org, hostile, "okta", "esc-1", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-esc", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE PREMISE: the connection really is on the page, so the absences below are escaping
+    // rather than a row that never rendered.
+    assert!(
+        body.contains("alert(1)"),
+        "the connection is missing from the page entirely, so this proves nothing: {body}"
+    );
+    assert!(
+        !body.contains("<script>"),
+        "a display name opened a script tag on the portal page: {body}"
+    );
+    assert!(
+        !body.contains("</td><script"),
+        "a display name closed its own table cell: {body}"
+    );
+    // AND THE GUIDE, which prints the same name in its summary. The row and the guide escape
+    // separately, so one being right says nothing about the other.
+    let summary_at = body
+        .find("<summary>Set up ")
+        .expect("the connection's guide is missing");
+    let summary = &body[summary_at..body[summary_at..].find("</summary>").unwrap() + summary_at];
+    assert!(
+        summary.contains("&lt;/td&gt;") || summary.contains("&lt;script&gt;"),
+        "the guide summary did not escape the display name: {summary}"
     );
 }
