@@ -1724,7 +1724,14 @@ impl OidcState {
     /// Install whether the inbound SCIM surface is mounted (issue #135's `scim.enabled`).
     ///
     /// Installed from the same `[scim]` section as the lead, by the same boot install, so the
-    /// portal cannot be told the surface is on while the router leaves it off.
+    /// portal reads the operator's own setting rather than a second copy of it.
+    ///
+    /// IT IS THE CONFIGURED INTENT, NOT PROOF THE ROUTER MOUNTED. `assemble_planes` also declines
+    /// to build the SCIM plane when its store is unreachable, so `true` here means "the operator
+    /// asked for it" rather than "it is serving". That is the right value for this page anyway:
+    /// with the flag off the URL is permanently a 404 and saying so is correct, while a plane
+    /// that failed to assemble is an outage the deployment reports through its own health, not
+    /// something to tell a customer is a configuration they must ask their vendor to change.
     #[must_use]
     pub fn with_scim_surface_enabled(mut self, enabled: bool) -> Self {
         self.scim_surface_enabled = enabled;

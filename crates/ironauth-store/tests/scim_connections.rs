@@ -2027,7 +2027,7 @@ async fn the_listing_reports_the_soonest_live_token_horizon() {
         listed
             .iter()
             .find(|c| c.id == connection)
-            .and_then(|c| c.provisioning_stops_at_unix_micros),
+            .and_then(|c| c.credential_expires_at_unix_micros),
         None,
         "a connection nobody has rotated reports a token horizon"
     );
@@ -2046,7 +2046,7 @@ async fn the_listing_reports_the_soonest_live_token_horizon() {
     let reported = listed
         .iter()
         .find(|c| c.id == connection)
-        .and_then(|c| c.provisioning_stops_at_unix_micros)
+        .and_then(|c| c.credential_expires_at_unix_micros)
         .expect("a rotated connection has a token horizon");
     assert_eq!(
         reported,
@@ -2075,7 +2075,7 @@ async fn the_listing_reports_the_soonest_live_token_horizon() {
         listed
             .iter()
             .find(|c| c.id == connection)
-            .and_then(|c| c.provisioning_stops_at_unix_micros),
+            .and_then(|c| c.credential_expires_at_unix_micros),
         None,
         "a REVOKED token's horizon is still reported, so the listing warns about a deadline \
          that cannot arrive"
@@ -2115,7 +2115,7 @@ async fn a_completed_rotation_stops_warning_once_the_overlap_has_passed() {
         .find(|c| c.id == connection)
         .expect("listed");
     assert_eq!(
-        during.provisioning_stops_at_unix_micros,
+        during.credential_expires_at_unix_micros,
         Some(at + 600 * 1_000_000)
     );
     assert_eq!(
@@ -2134,7 +2134,7 @@ async fn a_completed_rotation_stops_warning_once_the_overlap_has_passed() {
         .find(|c| c.id == connection)
         .expect("listed");
     assert_eq!(
-        after.provisioning_stops_at_unix_micros, None,
+        after.credential_expires_at_unix_micros, None,
         "a completed rotation still reports the superseded token's dead horizon, so this \
          connection warns forever and its next real deadline is hidden behind it"
     );
@@ -2226,7 +2226,7 @@ async fn a_connection_whose_live_credentials_are_all_gone_reports_no_live_token(
          whose token never expires"
     );
     assert_eq!(
-        gone.provisioning_stops_at_unix_micros, None,
+        gone.credential_expires_at_unix_micros, None,
         "a connection with nothing live published the date provisioning WILL stop, ninety days \
          out, while the count beside it said it already had"
     );
@@ -2319,7 +2319,7 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
     // rotation's hour-long window, so the live set holds two DIFFERENT horizons and this
     // assertion fails against MAX, which would answer `at+1s+3600s`.
     assert_eq!(
-        subject_row.provisioning_stops_at_unix_micros,
+        subject_row.credential_expires_at_unix_micros,
         Some(at + 100 * 1_000_000),
         "the horizon is not the SOONEST of this connection's live tokens; MAX and MIN cannot be \
          told apart by this fixture unless two of them differ"
@@ -2328,12 +2328,13 @@ async fn the_horizon_is_the_soonest_of_several_live_tokens_and_is_per_connection
 
     let sibling_row = listed.iter().find(|c| c.id == sibling).expect("listed");
     assert_eq!(
-        sibling_row.provisioning_stops_at_unix_micros,
+        sibling_row.credential_expires_at_unix_micros,
         Some(at + 60 * 1_000_000),
         "the sibling's own earlier horizon is not reported against the sibling"
     );
     assert_ne!(
-        subject_row.provisioning_stops_at_unix_micros, sibling_row.provisioning_stops_at_unix_micros,
+        subject_row.credential_expires_at_unix_micros,
+        sibling_row.credential_expires_at_unix_micros,
         "two connections report one horizon, so the subquery is not correlated per connection"
     );
 }
@@ -2391,7 +2392,7 @@ async fn a_rotated_connection_still_warns_about_its_own_expiry() {
         .find(|c| c.id == id)
         .expect("listed");
     assert_eq!(
-        after.provisioning_stops_at_unix_micros,
+        after.credential_expires_at_unix_micros,
         Some(horizon),
         "a rotated connection reports no horizon at all, so it will stop working on its own \
          expiry with nothing having warned"
@@ -2488,7 +2489,9 @@ async fn live_count(
     id: &ScimConnectionId,
     at: i64,
 ) -> i64 {
-    listed(db, scope, organization, id, at).await.live_token_count
+    listed(db, scope, organization, id, at)
+        .await
+        .live_token_count
 }
 
 /// A revoked connection, and one whose organization was disabled, each count zero live
@@ -2518,8 +2521,16 @@ async fn a_connection_that_cannot_authenticate_counts_no_live_credential() {
 
     // THE CONTROL. Both are live and counted, so the two zeroes below are the change and not
     // the state this fixture starts in.
-    assert_eq!(live_count(&db, scope, &organization, &revoked, at).await, 1, "the control: revoked-to-be");
-    assert_eq!(live_count(&db, scope, &organization, &disabled, at).await, 1, "the control: disabled-to-be");
+    assert_eq!(
+        live_count(&db, scope, &organization, &revoked, at).await,
+        1,
+        "the control: revoked-to-be"
+    );
+    assert_eq!(
+        live_count(&db, scope, &organization, &disabled, at).await,
+        1,
+        "the control: disabled-to-be"
+    );
 
     db.control_store()
         .scoped(scope)
@@ -2574,4 +2585,84 @@ async fn a_connection_that_cannot_authenticate_counts_no_live_credential() {
         "a connection in a DISABLED organization is counted as having a usable credential; \
          authenticate refuses it, so the listing contradicts the surface it describes"
     );
+}
+
+/// A rotation in progress publishes the CUTOVER deadline, not an outage date.
+///
+/// # What this pins, and the alternative that would have been worse
+///
+/// The deadline is the soonest live credential's. During an overlap that is the superseded token,
+/// which dies at the end of the window while the fresh one carries on -- so provisioning does not
+/// stop then, and a surface that renders this date as "stops working" is wrong. A review caught
+/// the portal doing exactly that.
+///
+/// The fix considered first was to publish the LAST credential's deadline instead, which would
+/// have been accurate about outages and useless: during a rotation the fresh token usually never
+/// expires, so the field would have gone empty and the customer would have lost the only date
+/// they have to act on. The date stayed; the words on top of it changed.
+#[tokio::test]
+async fn a_rotation_in_progress_publishes_the_cutover_deadline() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    let at = now_micros(&env);
+    let id = ScimConnectionId::generate(&env, &scope);
+    let writes = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+    writes
+        .scim_connections()
+        .create(
+            &env,
+            NewScimConnection {
+                id: &id,
+                organization_id: &organization,
+                display_name: "Okta production",
+                provider: "okta",
+                token_digest: &digest("cutover-1"),
+                // NO CONNECTION EXPIRY, so the only deadline that can appear is a token's and
+                // this measures the token side alone.
+                expires_at_unix_micros: None,
+            },
+            None,
+        )
+        .await
+        .expect("create");
+
+    // BEFORE THE ROTATION there is no deadline at all: the only token never expires. This is the
+    // control that stops the assertion below passing against a listing that reports nothing.
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .credential_expires_at_unix_micros,
+        None
+    );
+
+    writes
+        .scim_connections()
+        .rotate_token(&env, &id, &digest("cutover-2"), 3600, at)
+        .await
+        .expect("rotate");
+
+    let during = listed(&db, scope, &organization, &id, at + 1).await;
+    assert_eq!(
+        during.live_token_count, 2,
+        "the premise: both tokens are live inside the overlap"
+    );
+    assert_eq!(
+        during.credential_expires_at_unix_micros,
+        Some(at + 3600 * 1_000_000),
+        "the overlap's end is the date the customer must finish the cutover by, and it is the \
+         only date they have; a listing that reported the fresh token's absence of one instead \
+         would leave them nothing to act on"
+    );
+
+    // AND PAST THE OVERLAP the deadline is gone rather than stuck on the dead token: the fresh
+    // credential has no horizon, so there is nothing left to act on.
+    let after = listed(&db, scope, &organization, &id, at + 3601 * 1_000_000).await;
+    assert_eq!(after.live_token_count, 1);
+    assert_eq!(after.credential_expires_at_unix_micros, None);
 }

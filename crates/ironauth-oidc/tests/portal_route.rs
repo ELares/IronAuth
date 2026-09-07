@@ -744,6 +744,11 @@ async fn a_portal_session_sees_only_its_own_organizations_connections() {
 ///
 /// # The five states, and why the page has to keep them apart
 ///
+/// Neither deadline wording promises an outage. The date is the SOONEST credential's, which during
+/// a rotation overlap is the superseded token's -- provisioning carries on past it on the fresh
+/// token. So a row reads "Renew before" inside the lead and "Next deadline" outside it, and
+/// neither tells a customer their provisioning is ending on a day it is not.
+///
 /// An absent deadline is published by a healthy connection whose token never expires AND by one
 /// that has already stopped working, so a page that rendered only deadlines would show those two
 /// identically while only one of them needs the admin today. A revoked connection also has no
@@ -753,7 +758,7 @@ async fn a_portal_session_sees_only_its_own_organizations_connections() {
 ///
 /// The harness installs THIRTY days. A connection lapsing in twenty is inside that and OUTSIDE
 /// the shipped fourteen-day default, so it warns only if the page read the lead off the state.
-/// A page that hardcoded the default renders it "Active until" and turns this red. That is the
+/// A page that hardcoded the default renders it "Next deadline" and turns this red. That is the
 /// whole reason the harness has the knob: at the default, every fixture would pass against a
 /// hardcoded page.
 #[tokio::test]
@@ -771,14 +776,35 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
     };
 
     connect(&harness, &org, "never-expires", "tok-a", None).await;
-    connect(&harness, &org, "lapses-in-twenty-days", "tok-b", Some(now + 20 * day)).await;
+    connect(
+        &harness,
+        &org,
+        "lapses-in-twenty-days",
+        "tok-b",
+        Some(now + 20 * day),
+    )
+    .await;
     // THE STATE NOTHING RENDERED BEFORE: a live credential with a deadline OUTSIDE the lead.
     // Every other row here is caught by an earlier branch -- revoked, or no live credential, or
-    // inside the lead -- so without this one the "Active until" arm was unreachable in the whole
+    // inside the lead -- so without this one the "Next deadline" arm was unreachable in the whole
     // suite and could be deleted, or made to print the wrong word or the wrong date, in silence.
-    connect(&harness, &org, "lapses-in-forty-days", "tok-e", Some(now + 40 * day)).await;
+    connect(
+        &harness,
+        &org,
+        "lapses-in-forty-days",
+        "tok-e",
+        Some(now + 40 * day),
+    )
+    .await;
 
-    let revoked = connect(&harness, &org, "switched-off", "tok-c", Some(now + 40 * day)).await;
+    let revoked = connect(
+        &harness,
+        &org,
+        "switched-off",
+        "tok-c",
+        Some(now + 40 * day),
+    )
+    .await;
     writes()
         .scim_connections()
         .revoke(&env, &revoked, now)
@@ -789,7 +815,14 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
     // superseded to the end of a short overlap, then revoke the fresh token outright. The
     // CONNECTION stays live -- its own expiry is forty days out -- so what the page reports is
     // the loss of its credentials rather than the connection lapsing.
-    let broken = connect(&harness, &org, "credentials-gone", "tok-d", Some(now + 40 * day)).await;
+    let broken = connect(
+        &harness,
+        &org,
+        "credentials-gone",
+        "tok-d",
+        Some(now + 40 * day),
+    )
+    .await;
     writes()
         .scim_connections()
         .rotate_token(&env, &broken, &hex_digest("tok-d2"), 60, now)
@@ -804,9 +837,7 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
     // "stops working in sixty seconds" rather than as broken. The rotation is what makes the
     // original token lapse and the revocation is what removes its replacement; neither has
     // happened yet on a clock that has not moved.
-    harness
-        .clock()
-        .advance(std::time::Duration::from_secs(120));
+    harness.clock().advance(std::time::Duration::from_secs(120));
 
     let cookie = open_session_in(&harness, "scim", "tok-p2", &org).await;
     let scope = harness.scope();
@@ -818,7 +849,7 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
     let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
     assert_eq!(status, 200, "the provisioning page: {body}");
 
-    // PER ROW, not per page: asserting that the page contains "Stops working" somewhere would be
+    // PER ROW, not per page: asserting that the page contains "Renew before" somewhere would be
     // satisfied by any one of the four rows carrying it, including the wrong one.
     let row = |name: &str| -> String {
         let cell = format!("<td>{name}</td>");
@@ -836,7 +867,7 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
         row("never-expires")
     );
     assert!(
-        row("lapses-in-twenty-days").contains("Stops working"),
+        row("lapses-in-twenty-days").contains("Renew before"),
         "a connection lapsing twenty days out, under a THIRTY-day configured lead, is not \
          reported as stopping -- the page is reading a lead it was not given: {}",
         row("lapses-in-twenty-days")
@@ -877,14 +908,14 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
         row("lapses-in-twenty-days")
     );
     assert!(
-        row("lapses-in-forty-days").contains("Active until")
+        row("lapses-in-forty-days").contains("Next deadline")
             && row("lapses-in-forty-days").contains(&rendered(now + 40 * day)),
-        "a live connection whose deadline is OUTSIDE the thirty-day lead must read Active until \
-         that date, which is the state an admin plans around: {}",
+        "a live connection whose deadline is OUTSIDE the thirty-day lead must read its next \
+         deadline and that date, which is the state an admin plans around: {}",
         row("lapses-in-forty-days")
     );
     assert!(
-        !row("lapses-in-forty-days").contains("Stops working"),
+        !row("lapses-in-forty-days").contains("Renew before"),
         "a deadline outside the lead is reported as imminent, so the lead bounds nothing: {}",
         row("lapses-in-forty-days")
     );
@@ -911,7 +942,7 @@ async fn each_connection_row_reports_which_of_the_five_states_it_is_in() {
     // catches this row two branches before the deadline arm is reached, and the store has already
     // nulled its deadline. The lead's outside edge is held by `lapses-in-forty-days` above.
     assert!(
-        !row("credentials-gone").contains("Stops working"),
+        !row("credentials-gone").contains("Renew before"),
         "a connection with nothing live is counting down to a moment that has passed: {}",
         row("credentials-gone")
     );
@@ -934,7 +965,14 @@ async fn a_list_longer_than_the_page_says_so() {
     let harness = Harness::start_store_backed().await;
     let org = seed_org(&harness, "Acme").await;
     for index in 0..101 {
-        connect(&harness, &org, &format!("conn-{index:03}"), &format!("tok-{index}"), None).await;
+        connect(
+            &harness,
+            &org,
+            &format!("conn-{index:03}"),
+            &format!("tok-{index}"),
+            None,
+        )
+        .await;
     }
 
     let cookie = open_session_in(&harness, "scim", "tok-many", &org).await;

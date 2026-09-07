@@ -75280,19 +75280,32 @@ pub struct ScimConnection {
     /// `scim_connections.token_digest` and provisions perfectly. Counting rows reported it as
     /// broken. It has one usable credential, and that is what this says.
     pub live_token_count: i64,
-    /// When this connection stops provisioning, if anything about it has a deadline.
+    /// The next deadline one of this connection's credentials meets, if any of them has one.
     ///
-    /// # The soonest of TWO deadlines, either of which ends provisioning
+    /// # Two sources, whichever comes first
     ///
-    /// The connection's own `expires_at` and the horizons of its live tokens. Both are read
-    /// because `authenticate` reads both, and an operator needs whichever arrives first: after a
-    /// rotation a connection holds the superseded token lapsing at the end of the overlap and a
-    /// fresh one usually with no horizon at all, so token horizons alone say nothing about a
-    /// connection three days from its own expiry.
+    /// The connection's own `expires_at` and the soonest horizon among its live tokens. Both are
+    /// read because `authenticate` refuses on either: a connection past its own expiry
+    /// authenticates nothing however long its tokens would have lasted.
     ///
-    /// SOONEST rather than latest, because a warning has to fire before the first thing that can
-    /// break, not after the last. `None` means neither the connection nor any live token has a
-    /// future deadline, which is the ordinary state of a connection nobody gave an expiry.
+    /// # The SOONEST, which is the actionable one, and what it does NOT mean
+    ///
+    /// It is the next deadline a credential of this connection meets, not the moment provisioning
+    /// ends. During a rotation overlap those differ and the difference is the whole point of the
+    /// overlap: the superseded token dies at the end of the window while the fresh one carries
+    /// on, so this reports the date the customer has to have finished pasting the new token by.
+    /// That is the date an admin must act on; the date provisioning would actually stop is
+    /// usually never, and telling them so would remove the only deadline they have.
+    ///
+    /// AN EARLIER VERSION OF THIS FIELD WAS CALLED `provisioning_stops_at`, and a review caught
+    /// the portal rendering it to a customer as "Stops working" during a healthy cutover -- an
+    /// IT admin told their provisioning was about to end at the exact moment a successful
+    /// rotation had guaranteed it would not. The value was right and the name was the defect, so
+    /// the name changed rather than the rule. Whatever renders this has to say what it is: a
+    /// deadline to act on, not an outage to expect.
+    ///
+    /// `None` means no live credential has a horizon and the connection has no future expiry,
+    /// which is the ordinary state of a connection nobody gave one.
     ///
     /// THE TWO DEADLINES ARE NOT INTERCHANGEABLE TO WHOEVER ACTS ON THEM. A token horizon is
     /// cleared by rotating; the connection's own expiry is not, because nothing in this store
@@ -75327,7 +75340,7 @@ pub struct ScimConnection {
     ///
     /// A lapsed token is not a HORIZON, it is a token that is gone. That it has gone is reported
     /// by `live_token_count` above.
-    pub provisioning_stops_at_unix_micros: Option<i64>,
+    pub credential_expires_at_unix_micros: Option<i64>,
     /// Creation time, which is the listing's sort key and therefore its cursor position.
     pub created_at_unix_micros: i64,
 }
@@ -78754,7 +78767,7 @@ impl ScimConnectionRepo<'_> {
             // question the LISTING answers, and computing it here would add a second read to
             // the hot path of every provisioning request to produce something no caller of
             // `authenticate` looks at.
-            provisioning_stops_at_unix_micros: None,
+            credential_expires_at_unix_micros: None,
             created_at_unix_micros: row.get("created_us"),
         }))
     }
@@ -78841,7 +78854,7 @@ impl ScimConnectionRepo<'_> {
                            AND t.revoked_at IS NULL \
                            AND t.expires_at > TIMESTAMPTZ 'epoch' \
                                               + ($7::bigint * INTERVAL '1 microsecond')))) \
-                     * 1000000)::bigint AS provisioning_stops_us, \
+                     * 1000000)::bigint AS credential_expires_us, \
                     (SELECT count(*) FROM scim_connection_tokens t \
                      WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
                        AND t.environment_id = c.environment_id \
@@ -78891,7 +78904,7 @@ impl ScimConnectionRepo<'_> {
                     expires_at_unix_micros: row.get("expires_us"),
                     revoked_at_unix_micros: row.get("revoked_us"),
                     revoked: row.get("revoked"),
-                    provisioning_stops_at_unix_micros: {
+                    credential_expires_at_unix_micros: {
                         // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
                         // one. The connection's own expiry is folded into this column, so a
                         // connection whose tokens have all lapsed or been revoked -- and one
@@ -78902,7 +78915,7 @@ impl ScimConnectionRepo<'_> {
                         if live_token_count(&row) == 0 {
                             None
                         } else {
-                            row.get("provisioning_stops_us")
+                            row.get("credential_expires_us")
                         }
                     },
                     live_token_count: live_token_count(&row),
@@ -78968,11 +78981,11 @@ impl ScimConnection {
     ///
     /// A ZERO LEAD is the operator turning warnings off, so nothing is ever expiring.
     #[must_use]
-    pub fn stops_provisioning_soon(&self, now_micros: i64, lead_secs: u64) -> bool {
+    pub fn credential_expiring_soon(&self, now_micros: i64, lead_secs: u64) -> bool {
         if lead_secs == 0 || self.live_token_count == 0 {
             return false;
         }
-        let Some(deadline) = self.provisioning_stops_at_unix_micros else {
+        let Some(deadline) = self.credential_expires_at_unix_micros else {
             return false;
         };
         // SATURATING, because a lead time of a year in microseconds is comfortably inside i64
@@ -79024,7 +79037,7 @@ mod scim_connection_signal_tests {
             revoked_at_unix_micros: revoked.then_some(1_699_000_000_000_000),
             revoked,
             live_token_count,
-            provisioning_stops_at_unix_micros: deadline,
+            credential_expires_at_unix_micros: deadline,
             created_at_unix_micros: 1_698_000_000_000_000,
         }
     }
@@ -79039,11 +79052,11 @@ mod scim_connection_signal_tests {
         let now = 1_700_000_000_000_000_i64;
         let lead = 14 * 24 * 60 * 60;
         assert!(
-            connection(false, 1, Some(now + 13 * DAY)).stops_provisioning_soon(now, lead),
+            connection(false, 1, Some(now + 13 * DAY)).credential_expiring_soon(now, lead),
             "a token lapsing inside the lead time is not reported as expiring"
         );
         assert!(
-            !connection(false, 1, Some(now + 15 * DAY)).stops_provisioning_soon(now, lead),
+            !connection(false, 1, Some(now + 15 * DAY)).credential_expiring_soon(now, lead),
             "a token lapsing beyond the lead time is reported as expiring, so the warning is \
              always on and says nothing"
         );
@@ -79059,16 +79072,16 @@ mod scim_connection_signal_tests {
     fn a_zero_lead_or_no_horizon_never_warns() {
         let now = 1_700_000_000_000_000_i64;
         assert!(
-            !connection(false, 1, Some(now)).stops_provisioning_soon(now, 0),
+            !connection(false, 1, Some(now)).credential_expiring_soon(now, 0),
             "the operator disabled warnings and got one anyway: a horizon of exactly now \
              satisfies the comparison, so only the zero branch can refuse it"
         );
         assert!(
-            !connection(false, 1, Some(now + 1)).stops_provisioning_soon(now, 0),
+            !connection(false, 1, Some(now + 1)).credential_expiring_soon(now, 0),
             "the operator disabled warnings and got one anyway"
         );
         assert!(
-            !connection(false, 1, None).stops_provisioning_soon(now, 14 * 24 * 60 * 60),
+            !connection(false, 1, None).credential_expiring_soon(now, 14 * 24 * 60 * 60),
             "a connection whose tokens have no horizon was reported as expiring"
         );
     }
@@ -79093,7 +79106,7 @@ mod scim_connection_signal_tests {
     fn a_past_deadline_warns_rather_than_going_quiet() {
         let now = 1_700_000_000_000_000_i64;
         assert!(
-            connection(false, 1, Some(now - DAY)).stops_provisioning_soon(now, 14 * 24 * 60 * 60),
+            connection(false, 1, Some(now - DAY)).credential_expiring_soon(now, 14 * 24 * 60 * 60),
             "a deadline in the past answered quiet; the store does not produce this input, and \
              if it ever did, quiet would be indistinguishable from healthy"
         );
@@ -79107,8 +79120,8 @@ mod scim_connection_signal_tests {
     fn a_token_lapsing_exactly_at_the_lead_time_is_warned_about() {
         let now = 1_700_000_000_000_000_i64;
         let lead = 7 * 24 * 60 * 60;
-        assert!(connection(false, 1, Some(now + 7 * DAY)).stops_provisioning_soon(now, lead));
-        assert!(!connection(false, 1, Some(now + 7 * DAY + 1)).stops_provisioning_soon(now, lead));
+        assert!(connection(false, 1, Some(now + 7 * DAY)).credential_expiring_soon(now, lead));
+        assert!(!connection(false, 1, Some(now + 7 * DAY + 1)).credential_expiring_soon(now, lead));
     }
     /// An enormous lead time does not wrap into `false`.
     ///
@@ -79119,7 +79132,7 @@ mod scim_connection_signal_tests {
     fn an_enormous_lead_saturates_rather_than_wrapping() {
         let now = 1_700_000_000_000_000_i64;
         assert!(
-            connection(false, 1, Some(now + 365 * DAY)).stops_provisioning_soon(now, u64::MAX),
+            connection(false, 1, Some(now + 365 * DAY)).credential_expiring_soon(now, u64::MAX),
             "a huge lead time wrapped and inverted the comparison"
         );
     }

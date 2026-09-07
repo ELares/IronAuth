@@ -681,7 +681,9 @@ impl Harness {
     /// connection cannot read "expiring" in the vendor's console and "healthy" in their
     /// customer's portal; this is what checks that the page is on the receiving end of it.
     pub async fn start_store_backed_with_scim_warning_lead(secs: u64) -> Self {
-        Self::start_store_backed().await.with_scim_warning_lead(secs)
+        Self::start_store_backed()
+            .await
+            .with_scim_warning_lead(secs)
     }
 
     /// A store-backed harness whose inbound SCIM surface is MOUNTED or not (issue #135's
@@ -705,10 +707,7 @@ impl Harness {
         // THE ROUTER IS REBUILT, matching `with_hook_runtime` below: the router captures the
         // state it was built from, so installing on the state afterwards without rebuilding
         // leaves every request served by the state as it was.
-        let state = self
-            .state
-            .clone()
-            .with_scim_token_expiry_warning_secs(secs);
+        let state = self.state.clone().with_scim_token_expiry_warning_secs(secs);
         self.router = oidc_router(state.clone());
         self.state = state;
         self

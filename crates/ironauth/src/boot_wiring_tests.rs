@@ -803,8 +803,53 @@ async fn the_scim_surface_assembles_with_the_configured_limits() {
     // FIXTURE rather than a constant written here: the section is driven from the `scim` probe's
     // TOML now, and a constant beside these assertions could stop matching it silently.
     let unconfigured = ironauth_scim::ScimLimits::default();
-    assert_ne!(unconfigured.max_results, fixture.config.scim.max_results as usize);
+    assert_ne!(
+        unconfigured.max_results,
+        fixture.config.scim.max_results as usize
+    );
     assert_ne!(unconfigured.max_scan, fixture.config.scim.max_scan as usize);
+}
+
+#[tokio::test]
+async fn the_data_plane_holds_whether_the_scim_surface_is_mounted() {
+    // THE SECOND `[scim]` KEY, which the section's own probe cannot cover. `observe_probe`
+    // requires the two planes to report the SAME shape, and only the data plane takes
+    // `scim.enabled` -- so a probe entry for it would fail on the management side by
+    // construction. That left the install unobserved, and unobserved here is not cosmetic: with
+    // the call deleted the state keeps its constructor default, which is OFF, and every portal
+    // provisioning page on every deployment tells the customer's IT admin that this deployment
+    // serves no provisioning and to go ask their vendor to enable something already enabled.
+    //
+    // It is the shape this harness exists for, and the shape the branch that added the key had
+    // just deleted the other instance of.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(
+        &db,
+        &env,
+        LadderIntent {
+            signup_quarantine: true,
+            advanced_recovery: true,
+        },
+    );
+    let planes = boot_both_planes(&fixture).await;
+
+    assert_eq!(
+        planes.oidc.scim_surface_enabled(),
+        fixture.config.scim.enabled,
+        "the data plane must hold the configured `scim.enabled`, which is what the portal reads \
+         to decide whether the provisioning URL it prints is served at all"
+    );
+    // AND THE FIXTURE VALUE IS DISTINGUISHABLE FROM AN UNWIRED STATE, which reports the shipped
+    // default. The harness config turns the surface ON and the default is OFF, so this assertion
+    // cannot be satisfied by a plane that installed nothing.
+    let unwired = unwired_planes(&db, &env).await;
+    assert_ne!(
+        unwired.oidc.scim_surface_enabled(),
+        fixture.config.scim.enabled,
+        "the harness config no longer differs from the shipped default, so the assertion above \
+         would hold against a boot path that installed nothing"
+    );
 }
 
 #[tokio::test]

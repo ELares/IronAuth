@@ -88,8 +88,8 @@ use std::sync::Arc;
 
 use ironauth_admin::AdminState;
 use ironauth_config::{
-    ADVANCED_RECOVERY_FEATURE, Config, FeatureRegistry, OrganizationsConfig, ScimConfig,
-    SIGNUP_QUARANTINE_FEATURE, TokenClaimsConfig,
+    ADVANCED_RECOVERY_FEATURE, Config, FeatureRegistry, OrganizationsConfig,
+    SIGNUP_QUARANTINE_FEATURE, ScimConfig, TokenClaimsConfig,
 };
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
@@ -483,7 +483,11 @@ impl SharedPlaneState for OidcState {
         // TWO KEYS ON THIS PLANE, from the one section and the one install. The portal reads the
         // lead to warn, and reads `enabled` to know whether the provisioning URL it would print
         // is served at all. Taking them from the same section in the same call is what stops the
-        // page believing the surface is mounted while the router left it off.
+        // page reading a second copy of the operator's setting.
+        //
+        // `the_data_plane_holds_whether_the_scim_surface_is_mounted` in `boot_wiring_tests` is
+        // what observes the second call: the section's own probe cannot, because it compares a
+        // shape both planes report and only this one takes `enabled`.
         self.with_scim_token_expiry_warning_secs(section.token_expiry_warning_secs)
             .with_scim_surface_enabled(section.enabled)
     }

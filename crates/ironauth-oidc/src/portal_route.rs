@@ -477,7 +477,7 @@ pub async fn surface_get(
 /// one of them needs somebody today.
 ///
 /// THE ANSWERS ARE THE ROW'S OWN. `ScimConnection::no_live_credential` and
-/// `stops_provisioning_soon` are what the management API's listing reports to the vendor's
+/// `credential_expiring_soon` are what the management API's listing reports to the vendor's
 /// operator, and this page calls the same two methods with the same lead time -- which reaches
 /// this plane as a declared cross-plane value for exactly that reason. A copy of the rule here
 /// would let one connection be "expiring" in the vendor's console and "healthy" in their
@@ -525,12 +525,18 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
             "Revoked".to_owned()
         } else if connection.no_live_credential() {
             "Provisioning has stopped: no working token".to_owned()
-        } else if let Some(deadline) = connection.provisioning_stops_at_unix_micros {
+        } else if let Some(deadline) = connection.credential_expires_at_unix_micros {
             let when = crate::saml_start::rfc3339_utc(deadline / 1_000_000);
-            if connection.stops_provisioning_soon(now, lead) {
-                format!("Stops working {when}")
+            // NEITHER WORDING PROMISES AN OUTAGE, because the deadline is the soonest credential's
+            // and not the moment provisioning ends. During a rotation overlap the superseded token
+            // dies on this date while the fresh one carries on, so "stops working" would tell an
+            // admin their provisioning was about to end at exactly the moment a successful cutover
+            // had guaranteed it would not. What is true in every case is that a credential meets a
+            // deadline then, and inside the lead they have to do something about it.
+            if connection.credential_expiring_soon(now, lead) {
+                format!("Renew before {when}")
             } else {
-                format!("Active until {when}")
+                format!("Next deadline {when}")
             }
         } else {
             "Active".to_owned()

@@ -68,24 +68,30 @@ pub struct ScimConnectionView {
     /// Revocation time in milliseconds since the epoch, absent while the connection is live.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at_unix_ms: Option<i64>,
-    /// When this connection stops provisioning, in milliseconds since the epoch.
+    /// The next deadline one of this connection's credentials meets, in milliseconds since the
+    /// epoch.
     ///
-    /// THE EARLIEST OF TWO DEADLINES, because either one ends provisioning and an operator needs
-    /// whichever comes first: the soonest horizon among the connection's live tokens, and the
-    /// connection's own `expires_at_unix_ms`. After a rotation a connection holds two tokens, the
-    /// superseded one lapsing at the end of the overlap and the fresh one usually with no horizon
-    /// at all -- so a listing that reported only token horizons would say nothing about a
-    /// connection three days from its own expiry.
+    /// THE EARLIEST OF TWO, because either one ends a credential and whoever acts needs whichever
+    /// comes first: the soonest horizon among the connection's live tokens, and the connection's
+    /// own `expires_at_unix_ms`.
     ///
-    /// IT MAY THEREFORE EQUAL `expires_at_unix_ms`, and when it does the remedy is different:
-    /// rotating mints a token with no horizon and never touches the connection's own expiry --
-    /// nothing does, since `revoke` is the only write this API makes to that row -- so the
-    /// warning would come back unchanged. That connection has to be replaced rather than rotated.
+    /// IT IS NOT WHEN PROVISIONING STOPS, and the difference is routine rather than exotic. After
+    /// a rotation a connection holds the superseded token, lapsing at the end of the overlap, and
+    /// a fresh one usually with no horizon at all: this reports the overlap's end, which is the
+    /// date the customer must have finished the cutover by, and provisioning carries on past it.
+    /// A surface that renders this as "stops working" tells an operator their customer is about
+    /// to lose provisioning at the exact moment a successful rotation guaranteed otherwise. An
+    /// earlier name for this field said exactly that, and this is what the rename was for.
     ///
-    /// Absent only when neither the connection nor any live token has a future horizon.
+    /// IT MAY EQUAL `expires_at_unix_ms`, and when it does the remedy is different: rotating
+    /// mints a token with no horizon and never touches the connection's own expiry -- nothing
+    /// does, since `revoke` is the only write this API makes to that row -- so the deadline would
+    /// come back unchanged. That connection has to be replaced rather than rotated.
+    ///
+    /// Absent when neither the connection nor any live token has a future horizon.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provisioning_stops_at_unix_ms: Option<i64>,
-    /// Whether that horizon falls inside the configured warning lead time.
+    pub credential_expires_at_unix_ms: Option<i64>,
+    /// Whether that deadline falls inside the configured warning lead time.
     ///
     /// #140 asks for "expiry warnings at the configured lead time". This is that warning,
     /// computed here rather than left to the caller: a client that had to compare two timestamps
@@ -103,7 +109,7 @@ pub struct ScimConnectionView {
     /// A DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would
     /// otherwise be indistinguishable through an absent horizon: a connection whose tokens have
     /// all lapsed and a perfectly healthy one whose token never expires BOTH publish no
-    /// `provisioning_stops_at_unix_ms`. One of those needs an operator today.
+    /// `credential_expires_at_unix_ms`. One of those needs an operator today.
     ///
     /// TRUE for a connection whose live tokens have all lapsed or been revoked, one past its own
     /// expiry, and one whose organization has been DISABLED: `authenticate` refuses each, so
@@ -492,7 +498,7 @@ fn view(
     // BOTH SIGNALS COME FROM THE ROW ITSELF, not from a copy of the rule kept here. The
     // self-service portal renders the same two facts about the same connections on the data
     // plane, in another crate, and one lead time producing two answers is a disagreement nobody
-    // could see. `ScimConnection::stops_provisioning_soon` and `no_live_credential` are where
+    // could see. `ScimConnection::credential_expiring_soon` and `no_live_credential` are where
     // that rule lives, and their documentation carries the reasoning this comment used to.
     ScimConnectionView {
         id: connection.id.to_string(),
@@ -500,14 +506,13 @@ fn view(
         provider: connection.provider.clone(),
         expires_at_unix_ms: connection.expires_at_unix_micros.map(micros_to_millis),
         revoked_at_unix_ms: connection.revoked_at_unix_micros.map(micros_to_millis),
-        provisioning_stops_at_unix_ms: connection
-            .provisioning_stops_at_unix_micros
+        credential_expires_at_unix_ms: connection
+            .credential_expires_at_unix_micros
             .map(micros_to_millis),
-        token_expiring_soon: connection.stops_provisioning_soon(now_micros, warning_lead_secs),
+        token_expiring_soon: connection.credential_expiring_soon(now_micros, warning_lead_secs),
         no_live_token: connection.no_live_credential(),
     }
 }
-
 
 /// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-connections`
 #[utoipa::path(
@@ -1040,7 +1045,7 @@ mod rotation_tests {
     use super::{rotated_payload, view};
     use ironauth_env::Env;
     use ironauth_store::{
-        EnvironmentId, OrganizationId, Scope, ScimConnection, ScimConnectionId, TenantId,
+        EnvironmentId, OrganizationId, ScimConnection, ScimConnectionId, Scope, TenantId,
     };
 
     /// A connection carrying exactly the four fields the view reads, with everything else at a
@@ -1057,15 +1062,12 @@ mod rotation_tests {
             revoked_at_unix_micros: revoked.then_some(1_699_000_000_000_000),
             revoked,
             live_token_count,
-            provisioning_stops_at_unix_micros: soonest,
+            credential_expires_at_unix_micros: soonest,
             created_at_unix_micros: 1_698_000_000_000_000,
         }
     }
 
     const DAY: i64 = 24 * 60 * 60 * 1_000_000;
-
-
-
 
     /// The two derived signals, each driven against the input that distinguishes it.
     ///
@@ -1109,7 +1111,7 @@ mod rotation_tests {
         // The timestamp itself survives: the suppression is of the derived flag, not of the
         // fact under it.
         assert_eq!(
-            dead.provisioning_stops_at_unix_ms,
+            dead.credential_expires_at_unix_ms,
             imminent.map(super::micros_to_millis),
             "suppressing the countdown must not blank the horizon it was derived from"
         );
@@ -1133,8 +1135,6 @@ mod rotation_tests {
              the one row whose state revoked_at already explains"
         );
     }
-
-
 
     /// The envelope this producer mints satisfies the schema the fan-out enforces.
     ///

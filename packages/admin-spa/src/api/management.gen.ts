@@ -7855,6 +7855,31 @@ export interface components {
          *     nothing to leak even by accident.
          */
         ScimConnectionView: {
+            /**
+             * Format: int64
+             * @description The next deadline one of this connection's credentials meets, in milliseconds since the
+             *     epoch.
+             *
+             *     THE EARLIEST OF TWO, because either one ends a credential and whoever acts needs whichever
+             *     comes first: the soonest horizon among the connection's live tokens, and the connection's
+             *     own `expires_at_unix_ms`.
+             *
+             *     IT IS NOT WHEN PROVISIONING STOPS, and the difference is routine rather than exotic. After
+             *     a rotation a connection holds the superseded token, lapsing at the end of the overlap, and
+             *     a fresh one usually with no horizon at all: this reports the overlap's end, which is the
+             *     date the customer must have finished the cutover by, and provisioning carries on past it.
+             *     A surface that renders this as "stops working" tells an operator their customer is about
+             *     to lose provisioning at the exact moment a successful rotation guaranteed otherwise. An
+             *     earlier name for this field said exactly that, and this is what the rename was for.
+             *
+             *     IT MAY EQUAL `expires_at_unix_ms`, and when it does the remedy is different: rotating
+             *     mints a token with no horizon and never touches the connection's own expiry -- nothing
+             *     does, since `revoke` is the only write this API makes to that row -- so the deadline would
+             *     come back unchanged. That connection has to be replaced rather than rotated.
+             *
+             *     Absent when neither the connection nor any live token has a future horizon.
+             */
+            credential_expires_at_unix_ms?: number | null;
             /** @description The operator-facing label. */
             display_name: string;
             /**
@@ -7870,7 +7895,7 @@ export interface components {
              *     A DIFFERENT FACT FROM THE WARNING, and it needs its own field because the two would
              *     otherwise be indistinguishable through an absent horizon: a connection whose tokens have
              *     all lapsed and a perfectly healthy one whose token never expires BOTH publish no
-             *     `provisioning_stops_at_unix_ms`. One of those needs an operator today.
+             *     `credential_expires_at_unix_ms`. One of those needs an operator today.
              *
              *     TRUE for a connection whose live tokens have all lapsed or been revoked, one past its own
              *     expiry, and one whose organization has been DISABLED: `authenticate` refuses each, so
@@ -7884,30 +7909,11 @@ export interface components {
             provider: string;
             /**
              * Format: int64
-             * @description When this connection stops provisioning, in milliseconds since the epoch.
-             *
-             *     THE EARLIEST OF TWO DEADLINES, because either one ends provisioning and an operator needs
-             *     whichever comes first: the soonest horizon among the connection's live tokens, and the
-             *     connection's own `expires_at_unix_ms`. After a rotation a connection holds two tokens, the
-             *     superseded one lapsing at the end of the overlap and the fresh one usually with no horizon
-             *     at all -- so a listing that reported only token horizons would say nothing about a
-             *     connection three days from its own expiry.
-             *
-             *     IT MAY THEREFORE EQUAL `expires_at_unix_ms`, and when it does the remedy is different:
-             *     rotating mints a token with no horizon and never touches the connection's own expiry --
-             *     nothing does, since `revoke` is the only write this API makes to that row -- so the
-             *     warning would come back unchanged. That connection has to be replaced rather than rotated.
-             *
-             *     Absent only when neither the connection nor any live token has a future horizon.
-             */
-            provisioning_stops_at_unix_ms?: number | null;
-            /**
-             * Format: int64
              * @description Revocation time in milliseconds since the epoch, absent while the connection is live.
              */
             revoked_at_unix_ms?: number | null;
             /**
-             * @description Whether that horizon falls inside the configured warning lead time.
+             * @description Whether that deadline falls inside the configured warning lead time.
              *
              *     #140 asks for "expiry warnings at the configured lead time". This is that warning,
              *     computed here rather than left to the caller: a client that had to compare two timestamps
