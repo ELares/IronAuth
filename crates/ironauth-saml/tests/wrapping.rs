@@ -351,6 +351,29 @@ fn a_valid_signature_from_an_unpinned_key_is_refused() {
     .expect("the signer's own key verifies it");
 }
 
+/// THE EMBEDDED FIXTURE IS A CERTIFICATE THIS CRATE'S OWN READER ACCEPTS.
+///
+/// The test below is only as strong as that. Its first version embedded a raw EC point, and a
+/// verifier that read the field, failed to parse it and fell back to its anchors reached the same
+/// verdict as one that never looked -- so the regression survived, and the "mutation caught"
+/// claim published with it was scoped to a shape XMLDSIG does not define. This asserts the
+/// premise directly, so the fixture cannot quietly stop being consumable while the test above it
+/// keeps passing for the wrong reason.
+#[test]
+fn the_embedded_certificate_fixture_parses_as_x509() {
+    let key = XmlTestKey::generate();
+    let der = certificate_carrying(&key.public_point());
+    let pinned = ironauth_saml::x509::pinned(&der)
+        .expect("the embedded fixture must be a certificate an X.509 reader accepts");
+    // AND IT CARRIES THE KEY IT WAS BUILT AROUND, so a reader that consults it gets the
+    // attacker's key rather than something inert.
+    assert_eq!(
+        pinned.key,
+        TrustAnchor::EcdsaP256(key.public_point()),
+        "the certificate does not carry the point it was built around"
+    );
+}
+
 /// AND IT IS STILL REFUSED WHEN THE ATTACKER SHIPS THEIR OWN CERTIFICATE INSIDE THE RESPONSE
 /// (issue #139, the CVE-2026-9090 class).
 ///
