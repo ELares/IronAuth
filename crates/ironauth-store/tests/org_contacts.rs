@@ -369,11 +369,15 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Acme").await;
 
-    // EVERY CLAUSE THE DOC ON `plausible_email` NAMES, one case each, and each case chosen so
-    // that DELETING THAT CLAUSE is what turns it red. A doc listing refusals the test does not
-    // drive is a doc nothing holds to the code -- but so is a case some OTHER clause refuses
-    // first: `a@b@c.example` looks like it drives the multi-@ rule and does not, because with
-    // that rule gone the domain is `b`, which the no-dot rule refuses anyway.
+    // EVERY TERM THE DOC ON `plausible_email` NAMES, each case chosen so that DELETING THAT
+    // TERM is what turns it red. Nine cases over seven terms: term 3 (exactly one `@`) gets one
+    // case per failure shape, and term 5 (a domain with no dot) gets the no-dot and the
+    // empty-domain shapes it covers together.
+    //
+    // A doc listing refusals the test does not drive is a doc nothing holds to the code -- but
+    // so is a case some OTHER term refuses first: `a@b@c.example` looks like it drives the
+    // multi-@ term and does not, because with that term gone the domain is `b`, which the
+    // no-dot term refuses anyway.
     let long_local = format!("{}@acme.example", "a".repeat(320));
     for (email, why) in [
         ("ada @acme.example", "whitespace inside the address"),
@@ -821,14 +825,50 @@ async fn both_writes_are_audited() {
         ],
         "the contact writes left no attributable trail"
     );
+
+    // AND A REPEAT ADDS NOTHING. This is the property the pre-probe exists for and the only
+    // thing that measures it: `write_audited` commits its audit row on ANY `Ok` the closure
+    // returns, so a repeat answered as `Ok(false)` from INSIDE the audited write would land a
+    // second `org_contact.remove` for a removal that did not happen -- the trail would say the
+    // contact was taken off the list twice, and an operator reading it could not tell which
+    // entry was the real one. The answer therefore has to be decided before the write opens.
+    let repeated = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &org, &id, now_micros(&env))
+        .await
+        .expect("a repeat is not an error");
+    assert!(!repeated, "a repeat reported that it removed something");
+
+    let after: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE target_id = $1 ORDER BY occurred_at",
+    )
+    .bind(id.to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(
+        after, actions,
+        "the repeat wrote an audit row for a removal that never happened"
+    );
 }
 
 #[tokio::test]
 async fn the_grants_and_the_one_way_policy_are_enforced() {
-    // EVERY CLAIM 0207 MAKES ABOUT THE TWO ROLES, driven against the catalog rather than read
-    // from the migration's prose. The identical gap on 0205 is why its sibling test exists: a
-    // grant nothing drives is a grant somebody widens without noticing, and a migration is
-    // checksum-frozen once shipped, so a policy that ships wrong cannot be corrected in place.
+    // THE ROLE CLAIMS 0207 MAKES, driven as the ROLES rather than read from the migration's
+    // prose -- a grant nothing drives is a grant somebody widens without noticing, and a
+    // migration is checksum-frozen once shipped, so a policy that ships wrong cannot be
+    // corrected in place.
+    //
+    // WHAT IT DRIVES AND WHAT IT DOES NOT. This issues statements and reads the ERRORS; it does
+    // not read `information_schema`, so it cannot enumerate the grant set and cannot notice a
+    // column added later that nobody listed here. It probes the five columns the control role
+    // must not write -- every column of this table except `updated_at` and `deleted_at`, which
+    // are the two the grant names -- plus the policy in both directions and both halves of the
+    // data plane. The catalog-wide sweep that no per-table test can do lives in
+    // `migration.rs::the_data_plane_holds_no_table_wide_update_on_any_table`.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -925,8 +965,9 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
         "the app role is refused by the grant rather than by something else: {error}"
     );
 
-    // AND ITS READ WORKS, so the four refusals above are a narrowing rather than a role with no
-    // access to the table at all.
+    // AND ITS READ WORKS, so the INSERT refusal just above is a narrowing of this role rather
+    // than a role with no access to the table at all. It speaks only for the data plane: the six
+    // refusals before it are the CONTROL role's, and its own read says nothing about those.
     as_app(&db, scope, "SELECT 1 FROM org_contacts")
         .await
         .expect("the data plane must be able to read the list it delivers to");

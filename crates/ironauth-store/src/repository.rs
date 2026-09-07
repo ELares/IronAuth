@@ -61833,14 +61833,26 @@ fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) 
 ///
 /// DELIBERATELY SHALLOW. A full grammar is wrong in both directions -- it refuses valid addresses
 /// and admits undeliverable ones -- and the authority on deliverability is the send path. What
-/// this refuses is the shapes that are certainly not addresses, and it is exactly these five:
-/// whitespace anywhere; longer than the 320 octets the address syntax allows; no `@` at all; MORE
-/// THAN ONE `@` (`ada@acme.example@evil.example` has an apparent domain that is not the one it
-/// would be delivered to); an empty local part; and a domain that names nothing registrable --
-/// no dot, or a leading or trailing one. That last rule is also what refuses an EMPTY domain, so
-/// there is deliberately no separate clause for it: one would be unreachable, and an unreachable
-/// clause is one no test can hold. Everything else it admits, including addresses no mail server
-/// will accept.
+/// this refuses is SEVEN independently deletable terms -- one per `&&`-joined condition below,
+/// counted that way because a term is exactly what a mutation can remove:
+///
+///   1. longer than the 320 octets the address syntax allows;
+///   2. whitespace anywhere;
+///   3. not EXACTLY ONE `@`. ONE term, TWO failure shapes, because a single destructuring
+///      decides both: none at all, and more than one (`ada@acme.example@evil.example`, whose
+///      apparent domain is not the one it would be delivered to);
+///   4. an empty local part;
+///   5. a domain with no dot. This is ALSO what refuses an EMPTY domain, so there is
+///      deliberately no emptiness term: one would be unreachable, and an unreachable term is
+///      one no test can hold;
+///   6. a domain whose dot LEADS (`ada@.example`);
+///   7. a domain whose dot TRAILS (`ada@example.`) -- 6 and 7 are separate terms, so a case
+///      for one does not hold the other.
+///
+/// `a_malformed_address_or_an_unknown_category_is_refused` drives nine cases over these seven:
+/// two for term 3, one per failure shape, and two for term 5, the no-dot and empty-domain
+/// shapes it deliberately covers together. Everything else this admits, including addresses no
+/// mail server will accept.
 fn plausible_email(email: &str) -> bool {
     if email.len() > 320 || email.chars().any(char::is_whitespace) {
         return false;
@@ -78819,6 +78831,10 @@ impl OrgContactRepo<'_> {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Encryption`] if the scope has no key, if a row names a DEK version that is
+    /// gone, or if a sealed column does not open under its own AAD label -- which is what a name
+    /// ciphertext sitting on `email_sealed` produces, and what
+    /// `the_name_and_the_address_do_not_open_under_each_others_context` asserts;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn list_for_organization(
         &self,
@@ -79011,7 +79027,9 @@ impl ActingOrgContactRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if either identifier is out of this scope, or if the contact
     /// does not exist in that organization at all; [`StoreError::Database`] on a persistence
-    /// failure.
+    /// failure. It does NOT return [`StoreError::Conflict`]: the losing side of a concurrent
+    /// double removal reports `Ok(false)`, the same answer a sequential repeat gets, so the
+    /// caller's result does not depend on the interleaving.
     pub async fn remove(
         &self,
         env: &Env,
@@ -79026,10 +79044,12 @@ impl ActingOrgContactRepo<'_> {
         let contact = *id;
         let organization = organization_id.to_string();
 
-        // THE STATE IS SETTLED BEFORE THE AUDITED WRITE, because `write_audited` commits its row
-        // whatever the closure returns: wrapping a no-op in it logs a removal that never
-        // happened, and the trail then disagrees with the table it describes. A repeat and a
-        // stranger are both answered here, without an entry.
+        // THE STATE IS SETTLED BEFORE THE AUDITED WRITE, because `write_audited` commits its
+        // audit row whenever the closure returns `Ok` -- `Ok(false)` lands the row exactly as
+        // `Ok(true)` does, so a no-op reported from inside logs a removal that never happened
+        // and the trail then disagrees with the table it describes. Only an `Err` rolls both
+        // back, which is what the concurrent-loser branch below relies on. A repeat and a
+        // stranger are therefore both answered out here, without an entry.
         let mut probe = begin_scoped(self.store, scope).await?;
         let existing: Option<bool> = sqlx::query_scalar(
             "SELECT deleted_at IS NOT NULL FROM org_contacts \
@@ -79076,9 +79096,11 @@ impl ActingOrgContactRepo<'_> {
                 .execute(&mut **tx)
                 .await?
                 .rows_affected();
-                // A CONCURRENT LOSER MATCHED NOTHING. Reporting `true` would tell the caller it
-                // performed a removal another transaction had already committed -- and the audit
-                // row this write is inside would say so too. Refusing rolls both back.
+                // A CONCURRENT LOSER MATCHED NOTHING. Reporting `true` would tell the caller
+                // it performed a removal another transaction had already committed -- and the
+                // audit row this write is inside would say so too. `Err` is the only report
+                // that rolls both back, so that is what the closure gives; the caller's answer
+                // is decided outside it, below.
                 if affected == 0 {
                     return Err(StoreError::Conflict);
                 }
@@ -79087,6 +79109,19 @@ impl ActingOrgContactRepo<'_> {
             false,
         )
         .await
+        // AND THE LOSER IS TOLD WHAT THE SEQUENTIAL REPEAT IS TOLD. `affected == 0` here can
+        // mean only one thing: the probe above saw a live row, and between the two statements
+        // another transaction removed it. Nothing else can produce it, because the row's
+        // `organization_id` is unwritable and the RESTRICTIVE policy makes removal one way, so
+        // no row can leave this statement's predicate any other way. That is the same fact as
+        // the sequential repeat -- the contact is gone, this caller did not remove it -- and
+        // reporting it differently would make the answer depend on the interleaving. Surfacing
+        // the raw `Conflict` sent a 409 whose text names a uniqueness rule this table does not
+        // have. The `Err` is still what rolls the audit row back; only the report changes.
+        .or_else(|error| match error {
+            StoreError::Conflict => Ok(false),
+            other => Err(other),
+        })
     }
 }
 

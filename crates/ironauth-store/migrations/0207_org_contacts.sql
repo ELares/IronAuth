@@ -39,13 +39,20 @@ CREATE TABLE org_contacts (
     -- WHERE THE NOTIFICATION GOES, SEALED. An address is classified PII in this system and every
     -- other table holding one seals it (0048 for the factor recipients, 0155 for a queued
     -- message), for the reason those state: whoever can read this table must not thereby learn
-    -- who a customer's staff are. A sender opens it at delivery time; nothing else needs to.
+    -- who a customer's staff are. TWO READERS OPEN IT, not one: a sender at delivery time, and
+    -- the management listing on every call, because an operator managing the list has to see the
+    -- address they are managing. So the seal is not "opened once, at the edge" -- it is opened
+    -- wherever the address is legitimately shown, and what it protects against is the reader who
+    -- has the TABLE and not the key.
     email_sealed      bytea       NOT NULL,
     -- THE BLIND INDEX, a deterministic per-tenant keyed HMAC of the address (issue #48). It is
     -- what the duplicate rule keys on, because a ciphertext cannot be compared: two seals of one
     -- address differ, so a unique index over `email_sealed` would refuse nothing.
     email_bidx        bytea       NOT NULL,
-    -- Which DEK sealed the address, so it can be opened after a rotation.
+    -- Which DEK sealed BOTH the name and the address, so either can be opened after a rotation.
+    -- ONE VERSION FOR THE PAIR, because one write seals them together under one DEK and two AAD
+    -- labels; they cannot come from different generations, so a second column would be a fact
+    -- with two homes that nothing keeps in step.
     pii_dek_version   integer     NOT NULL,
     -- WHICH KIND OF NOTIFICATION THEY WANT, as a closed set. Adding one is a migration, which is
     -- the point: a category nothing can be routed to is a promise the product cannot keep, and a

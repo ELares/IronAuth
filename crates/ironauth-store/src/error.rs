@@ -428,9 +428,9 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::NotFound => f.write_str("resource not found"),
             StoreError::Invalid => f.write_str(
-                "a value was refused by a rule the schema cannot express: an organization \
-                 contact's address must be shaped like a deliverable address and its category \
-                 must be one this deployment routes",
+                "a value was refused by a shape rule: an organization contact's address must \
+                 be shaped like a deliverable address, its name must be present and within the \
+                 length ceiling, and its category must be one this deployment routes",
             ),
             // The RECONCILE GUIDANCE criterion 6 asks for lives here, because this text is
             // what the management surface renders. An error that only said "gap" would tell
