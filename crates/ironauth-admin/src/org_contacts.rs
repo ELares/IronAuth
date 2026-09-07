@@ -129,6 +129,7 @@ pub struct CreateOrgContactRequest {
     responses(
         (status = 201, description = "The contact was added", body = OrgContactView),
         (status = 400, description = "Malformed request", body = crate::error::ErrorBody),
+        (status = 401, description = "Missing or invalid credential", body = crate::error::ErrorBody),
         (status = 403, description = "Insufficient permission", body = crate::error::ErrorBody),
         (status = 404, description = "Unknown scope or organization", body = crate::error::ErrorBody),
         (status = 409, description = "Already listed on that category", body = crate::error::ErrorBody),
@@ -250,6 +251,7 @@ pub async fn create_org_contact(
     ),
     responses(
         (status = 200, description = "The organization's live contacts", body = OrgContactList),
+        (status = 401, description = "Missing or invalid credential", body = crate::error::ErrorBody),
         (status = 403, description = "Insufficient permission", body = crate::error::ErrorBody),
         (status = 404, description = "Unknown scope or organization", body = crate::error::ErrorBody),
     ),
@@ -312,6 +314,7 @@ pub async fn list_org_contacts(
     ),
     responses(
         (status = 204, description = "The contact is off the list"),
+        (status = 401, description = "Missing or invalid credential", body = crate::error::ErrorBody),
         (status = 403, description = "Insufficient permission", body = crate::error::ErrorBody),
         (status = 404, description = "Unknown scope, organization or contact", body = crate::error::ErrorBody),
     ),

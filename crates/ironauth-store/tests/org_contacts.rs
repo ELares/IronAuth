@@ -682,18 +682,19 @@ async fn the_listing_pages_on_its_cursor_and_the_pages_cover_every_contact() {
 }
 
 #[tokio::test]
-async fn a_removal_announces_itself_however_far_down_the_list_the_contact_is() {
-    // THE BUG THIS EXISTS FOR, and it shipped: the removal handler learned the event's category
-    // by scanning ONE PAGE of the live listing, so a contact created after the page limit yielded
-    // no match and its removal announced NOTHING -- while still tombstoning the row, still writing
-    // its audit entry, and still answering 204. A consumer counting `org_contact.removed` would
-    // have undercounted, silently, and a subscriber that keeps notifying the removed person never
-    // learns to stop.
+async fn a_removal_announces_once_and_a_repeat_announces_nothing() {
+    // WHAT THIS HOLDS, STATED EXACTLY, because an earlier version of it claimed more. It pins the
+    // STORE's half of the removal event: a real removal announces exactly one event, and a repeat
+    // announces none -- so a consumer counting `org_contact.removed` is counting removals.
     //
-    // NOTHING MEASURED IT. The fix (a point lookup that reads only the plaintext category) was
-    // correct and unheld: reverting it to the paged scan left every test in this file green,
-    // because none of them drives an event at all. This drives the shape that distinguishes them,
-    // which is a contact that is NOT on the first page.
+    // IT DOES NOT HOLD THE PAGED-SCAN BUG, and cannot. That defect is the HANDLER choosing which
+    // event to pass; this test passes an event of its own, which is the very step the handler got
+    // wrong, so it stays green against the buggy paged read and the correct point lookup alike --
+    // measured, by a mutation that survived it. The test that holds that bug lives where the bug
+    // does, in `ironauth-admin/tests/org_contacts.rs`.
+    //
+    // The contact removed below is deliberately NOT the first one, which costs nothing and keeps
+    // the fixture honest about ordering, but the page limit is not what this measures.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -731,8 +732,9 @@ async fn a_removal_announces_itself_however_far_down_the_list_the_contact_is() {
         );
     }
 
-    // THE CONTACT IS PAST THE FIRST PAGE, which is the whole point: read one at a time and it is
-    // not there, so a category learned by paging would be absent for exactly this row.
+    // The removed contact is not the first one, so the ordering the listing promises is exercised
+    // alongside the event. What a page limit implies for the HANDLER is measured in the admin
+    // suite, not here.
     let first_page = db
         .control_store()
         .scoped(scope)
@@ -743,7 +745,7 @@ async fn a_removal_announces_itself_however_far_down_the_list_the_contact_is() {
     assert_eq!(first_page.len(), 1);
     assert_ne!(
         &first_page[0].id, last,
-        "the fixture put the removed contact on the first page, so it cannot see the bug"
+        "the fixture removed the oldest contact, so ordering is not exercised"
     );
 
     // AND ITS REMOVAL STILL ANNOUNCES, carrying its own category.
@@ -781,11 +783,7 @@ async fn a_removal_announces_itself_however_far_down_the_list_the_contact_is() {
     assert!(removed, "the removal reported that it removed nothing");
 
     let announced = queued_events(&db, &env, scope).await;
-    assert_eq!(
-        announced.len(),
-        1,
-        "a removal past the first page announced {announced:?}"
-    );
+    assert_eq!(announced.len(), 1, "the removal announced {announced:?}");
     assert_eq!(announced[0]["type"], "org_contact.removed");
 
     // AND A REPEAT ANNOUNCES NOTHING, which is the other half: the event must count REMOVALS, so
@@ -847,6 +845,28 @@ async fn the_category_lookup_is_scope_fenced_and_sees_only_live_contacts() {
             .expect("read"),
         None,
         "a foreign organization's handle resolved this contact's category"
+    );
+
+    // AND A FOREIGN SCOPE IS REFUSED OUTRIGHT, not answered with `None`. The two-argument guard
+    // checks BOTH identifiers against this repo's scope, and only a second scope can tell that
+    // apart from the organization check above -- which is why an earlier version of this test,
+    // using two organizations in ONE scope, left the scope half of the guard unmeasured.
+    let other_scope = db.seed_scope(&env).await;
+    let stranger = OrgContactId::generate(&env, &other_scope);
+    let foreign_org = OrganizationId::generate(&env, &other_scope);
+    assert!(
+        matches!(
+            read.org_contacts().live_category(&mine, &stranger).await,
+            Err(StoreError::NotFound)
+        ),
+        "a contact id from another scope was looked up rather than refused"
+    );
+    assert!(
+        matches!(
+            read.org_contacts().live_category(&foreign_org, &id).await,
+            Err(StoreError::NotFound)
+        ),
+        "an organization id from another scope was looked up rather than refused"
     );
 
     // AND A REMOVED CONTACT IS GONE FROM IT, so a repeat cannot build a second removal event.
@@ -1381,9 +1401,29 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
         "the app role is refused by the grant rather than by something else: {error}"
     );
 
-    // AND ITS READ WORKS, so the INSERT refusal just above is a narrowing of this role rather
-    // than a role with no access to the table at all. It speaks only for the data plane: the
-    // eleven refusals before it are the CONTROL role's, and its own read says nothing about
+    // AND ITS UPDATE IS REFUSED TOO, which no other check in the suite covers. The catalog-wide
+    // sweep reads `information_schema.table_privileges`, and a COLUMN-scoped grant never appears
+    // there -- `migration.rs` says so itself and calls that the likelier regression -- while the
+    // per-table column sweeps name fixed table lists this table is not on. So
+    // `GRANT UPDATE (deleted_at) ON org_contacts TO ironauth_app` would leave every other test
+    // green, and the schema would not stop it either: `org_contacts_removal_is_one_way` is
+    // `TO ironauth_control`, so it does not constrain this role at all. The delivery plane could
+    // then take contacts off the list and put them back.
+    let outcome = as_app(
+        &db,
+        scope,
+        &format!("UPDATE org_contacts SET deleted_at = NULL WHERE id = '{id}'"),
+    )
+    .await;
+    let error = outcome.expect_err("the data plane must not write deleted_at");
+    assert!(
+        error.to_string().contains("permission denied"),
+        "the app role's UPDATE is refused by something other than the grant: {error}"
+    );
+
+    // AND ITS READ WORKS, so the two refusals just above are a narrowing of this role rather
+    // than a role with no access to the table at all. They speak only for the data plane: the
+    // eleven refusals before them are the CONTROL role's, and its own read says nothing about
     // those.
     as_app(&db, scope, "SELECT 1 FROM org_contacts")
         .await

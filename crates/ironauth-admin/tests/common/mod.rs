@@ -214,7 +214,6 @@ impl Harness {
         }
     }
 
-    /// A router whose `AuthZEN` batch bound is `max_authzen_batch` (issue #100).
     /// A harness whose page-size CEILING is `max_page_size` (issue #141).
     ///
     /// Exists so a test can put a row past the first page without seeding two hundred of them.
@@ -242,6 +241,7 @@ impl Harness {
         }
     }
 
+    /// A router whose `AuthZEN` batch bound is `max_authzen_batch` (issue #100).
     pub async fn start_with_authzen_batch(default_page_size: u32, max_authzen_batch: u32) -> Self {
         let mut db = TestDatabase::start().await;
         db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());

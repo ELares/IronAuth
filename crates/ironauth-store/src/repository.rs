@@ -61849,21 +61849,20 @@ fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) 
 ///
 /// DELIBERATELY SHALLOW. A full grammar is wrong in both directions -- it refuses valid addresses
 /// and admits undeliverable ones -- and the authority on deliverability is the send path. What
-/// this refuses is SEVEN independently deletable terms. They do not all have the same SHAPE --
+/// this refuses is SEVEN terms, each of which some case below turns red. They do not all have
+/// the same SHAPE --
 /// terms 1 and 2 are the two halves of an `||` in the early return, term 3 is the `let ... else`
 /// destructuring, and 4 to 7 are the `&&`-joined conditions of the final expression -- and they
-/// are counted this way because a term is exactly what a mutation can remove, not because they
-/// look alike:
+/// and they are counted this way because a term is what a case has to distinguish, not because
+/// they look alike:
 ///
 ///   1. longer than the 320 octets the address syntax allows;
 ///   2. whitespace anywhere;
-///   3. not EXACTLY ONE `@`. ONE term, TWO failure shapes, because a single destructuring
+///   3. not EXACTLY ONE `@`. ONE term with TWO failure shapes, because a single destructuring
 ///      decides both: none at all, and more than one (`ada@acme.example@evil.example`, whose
-///      apparent domain is not the one it would be delivered to). It is the one term no case
-///      holds ALONE: it cannot simply be deleted, because `domain` is the name it binds, and
-///      the reachable weakening -- accepting two parts instead of exactly two -- is caught by
-///      the more-than-one case while the `no @` case is caught by term 5 anyway. So the `no @`
-///      case documents a refusal rather than pinning a term, and says so;
+///      apparent domain is not the one it would be delivered to). Both shapes are refused HERE
+///      and nowhere else -- with no `@` there is no domain for any later term to judge -- so
+///      each gets its own case;
 ///   4. an empty local part;
 ///   5. a domain with no dot. This is ALSO what refuses an EMPTY domain, so there is
 ///      deliberately no emptiness term: one would be unreachable, and an unreachable term is
@@ -78866,7 +78865,8 @@ impl OrgContactRepo<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::NotFound`] if EITHER identifier is out of this scope -- the contact's as
+    /// well as the organization's, which is what the guard checks;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn live_category(
         &self,
@@ -79030,9 +79030,9 @@ impl ActingOrgContactRepo<'_> {
         if !plausible_email(contact.email) {
             return Err(StoreError::Invalid);
         }
-        // AND THE NAME'S, for the same reason and one more: 0207 sealed the name, so the ceiling
-        // the plaintext column used to state is now unstatable in the schema. Only the presence
-        // of SOME bytes survives there.
+        // AND THE NAME'S, for the same reason and one more: 0207 seals the name, so no CHECK can
+        // measure its length -- the schema can see only that SOME bytes are present. The ceiling
+        // has to live here because there is nowhere in the schema it could live.
         if !plausible_contact_name(contact.display_name) {
             return Err(StoreError::Invalid);
         }

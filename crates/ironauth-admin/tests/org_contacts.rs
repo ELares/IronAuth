@@ -36,6 +36,15 @@ fn scope_of(tenant: &str, environment: &str) -> Scope {
 /// about one object is not claimable until the first is COMPLETED. A single pass silently stops
 /// being a drain the moment a test makes two writes about one object.
 async fn drain(harness: &Harness, scope: Scope) -> Vec<String> {
+    drain_full(harness, scope)
+        .await
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
+}
+
+/// [`drain`] keeping each event's payload as well as its type.
+async fn drain_full(harness: &Harness, scope: Scope) -> Vec<(String, serde_json::Value)> {
     let mut seen = Vec::new();
     loop {
         let claimed = harness
@@ -54,12 +63,13 @@ async fn drain(harness: &Harness, scope: Scope) -> Vec<String> {
             return seen;
         }
         for message in claimed {
-            seen.push(
+            seen.push((
                 message.payload["type"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
-            );
+                message.payload["payload"].clone(),
+            ));
             harness
                 .store()
                 .scoped(scope)
@@ -144,10 +154,19 @@ async fn removing_a_contact_past_the_first_page_still_announces_it() {
     // AND ITS REMOVAL ANNOUNCES.
     let (status, _, body) = harness.delete(&format!("{contacts}/{}", ids[1])).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "delete: {body}");
-    let announced = drain(&harness, scope).await;
+    let announced = drain_full(&harness, scope).await;
     assert_eq!(
-        announced,
-        vec!["org_contact.removed".to_owned()],
+        announced.len(),
+        1,
         "a removal past the first page announced {announced:?}"
+    );
+    assert_eq!(announced[0].0, "org_contact.removed");
+    // AND IT CARRIES THAT CONTACT'S OWN CATEGORY. Comparing only the TYPE would pass against a
+    // handler that reached for any contact's category it could find -- which is close to what
+    // the paged scan did. The second contact is the `security` one; the first is `technical`,
+    // so a handler that took the first page's row would announce the wrong word here.
+    assert_eq!(
+        announced[0].1["category"], "security",
+        "the removal announced another contact's category: {announced:?}"
     );
 }

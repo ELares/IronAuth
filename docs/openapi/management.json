@@ -13892,6 +13892,16 @@
               }
             }
           },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "403": {
             "description": "Insufficient permission",
             "content": {
@@ -13995,6 +14005,16 @@
               }
             }
           },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "403": {
             "description": "Insufficient permission",
             "content": {
@@ -14082,6 +14102,16 @@
         "responses": {
           "204": {
             "description": "The contact is off the list"
+          },
+          "401": {
+            "description": "Missing or invalid credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           },
           "403": {
             "description": "Insufficient permission",
