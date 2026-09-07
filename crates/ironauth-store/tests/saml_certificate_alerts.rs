@@ -677,6 +677,143 @@ async fn the_soonest_expiry_comes_first_and_a_repeated_lead_is_one_lead() {
 }
 
 #[tokio::test]
+async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
+    // THE ATOMICITY CLAIM, MEASURED. Its sibling above observes a SUCCESSFUL call and a losing
+    // one, and neither can tell one transaction from two: success leaves a row and a message
+    // either way, and the conflict returns before the enqueue either way. Splitting `record_sent`
+    // so the row commits alone and the notice goes in a SECOND transaction left all ten tests
+    // green -- and that split IS the failure the doc warns about, a ledger saying a customer was
+    // told when the notice never went out and nothing can correct it.
+    //
+    // So this forces an error after both writes are staged and requires BOTH to be gone. That is
+    // the technique `write_audited` already carries for the same reason.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/l").await;
+    let now = now_micros(&env);
+    let alerts = db.control_store().scoped(scope).saml_certificate_alerts();
+    let certificate = pin_expiring(&db, &env, scope, &connection, 50, 2 * DAY).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_cert_poisoned",
+        "saml_certificate.expiring",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now / 1000,
+        &serde_json::json!({
+            "saml_certificate_id": certificate.to_string(),
+            "saml_connection_id": connection.to_string(),
+            "lead_secs": 3 * DAY,
+            "not_after_unix_ms": (now + 2 * DAY * 1_000_000) / 1000,
+        }),
+    )
+    .expect("registered");
+
+    let outcome = alerts
+        .record_sent_injecting_post_enqueue_failure(
+            &env,
+            &certificate,
+            3 * DAY,
+            now,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_cert_poisoned",
+                subject: &certificate.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::Database(_))),
+        "the poisoned write must fail: {outcome:?}"
+    );
+
+    // NEITHER WRITE SURVIVES. The notice is not in the outbox...
+    let announced = queued_events(&db, &env, scope).await;
+    assert!(
+        announced.is_empty(),
+        "a notice survived a rolled-back write: {announced:?}"
+    );
+    // ...and the pair is STILL DUE, which is the half that matters operationally: the next sweep
+    // picks it up and the customer is told. A ledger row surviving here is the silent failure.
+    let due = alerts.due(now, &[3 * DAY], 100).await.expect("due");
+    assert_eq!(
+        due.len(),
+        1,
+        "the ledger row survived a rolled-back notice, so this customer is never told: {due:?}"
+    );
+
+    // AND THE CONTROL: without the poison the same call succeeds, so the emptiness above is the
+    // rollback and not a call that cannot work.
+    alerts
+        .record_sent(
+            &env,
+            &certificate,
+            3 * DAY,
+            now,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_cert_ok",
+                subject: &certificate.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("the unpoisoned write succeeds");
+    assert_eq!(queued_events(&db, &env, scope).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_certificate_unpinned_under_the_sweep_is_not_found_rather_than_a_fault() {
+    // THE LIKELIEST RACE ON THIS PATH, and round 2 shipped the mapping for it with no test: the
+    // SQLSTATE constant could be changed by one character, or the whole match arm deleted, and
+    // everything stayed green.
+    //
+    // It is not exotic. A sweep reads `due()`, and before it records the notice an operator
+    // replaces the certificate -- which is exactly what the warning asked them to do. Left as
+    // `Database` that reads as a persistence fault and pages somebody; it means "that work item
+    // is gone".
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/m").await;
+    let now = now_micros(&env);
+    let certificate = pin_expiring(&db, &env, scope, &connection, 51, 2 * DAY).await;
+
+    // The sweep has its work item...
+    let due = db
+        .control_store()
+        .scoped(scope)
+        .saml_certificate_alerts()
+        .due(now, &[3 * DAY], 100)
+        .await
+        .expect("due");
+    assert_eq!(due.len(), 1, "the fixture is not due: {due:?}");
+
+    // ...and the operator renews the certificate before the notice is recorded.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .saml_connections()
+        .unpin_certificate(&env, &certificate, None)
+        .await
+        .expect("unpin");
+
+    let outcome = db
+        .control_store()
+        .scoped(scope)
+        .saml_certificate_alerts()
+        .record_sent(&env, &certificate, 3 * DAY, now, None)
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::NotFound)),
+        "a certificate unpinned under the sweep is a persistence fault rather than a vanished \
+         work item: {outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn another_scopes_certificate_is_not_due_here() {
     // THE LEDGER IS SCOPED LIKE EVERYTHING ELSE. A sweep running for one environment must not
     // find another's certificates, or it would notify one customer's contacts about another

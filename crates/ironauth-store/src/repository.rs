@@ -77007,6 +77007,47 @@ impl SamlCertificateAlertRepo<'_> {
         at_unix_micros: i64,
         event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
+        self.record_sent_inner(env, certificate_id, lead_secs, at_unix_micros, event, false)
+            .await
+    }
+
+    /// [`record_sent`](Self::record_sent) with a guaranteed failure forced AFTER the ledger row
+    /// is staged and after the notice is enqueued, both inside the one transaction.
+    ///
+    /// # Why this seam exists
+    ///
+    /// "The event and the ledger row commit together" is the property this API was reshaped for,
+    /// and a test that only observes a SUCCESSFUL call cannot measure it: success leaves a row
+    /// and a message whether the two writes share a transaction or not. Splitting them into two
+    /// transactions -- the exact failure the doc warns about, a ledger saying a customer was told
+    /// when the notice never went out -- left the whole suite green. This is the seam
+    /// `write_audited` already carries for the same reason, under the same feature.
+    ///
+    /// # Errors
+    ///
+    /// Always errors, which is the point: the injected failure must roll back BOTH writes.
+    #[cfg(feature = "testing")]
+    pub async fn record_sent_injecting_post_enqueue_failure(
+        &self,
+        env: &Env,
+        certificate_id: &SamlCertificateId,
+        lead_secs: i64,
+        at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        self.record_sent_inner(env, certificate_id, lead_secs, at_unix_micros, event, true)
+            .await
+    }
+
+    async fn record_sent_inner(
+        &self,
+        env: &Env,
+        certificate_id: &SamlCertificateId,
+        lead_secs: i64,
+        at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+        poison_after_enqueue: bool,
+    ) -> Result<(), StoreError> {
         // THE SCOPE GUARD THE SCHEMA CANNOT GIVE. 0208's foreign key names the certificate by id
         // ALONE, and referential integrity bypasses row-level security, so it admits any
         // globally existing certificate -- 0205 states that contract explicitly and says what
@@ -77049,6 +77090,12 @@ impl SamlCertificateAlertRepo<'_> {
         // IN THE LEDGER ROW'S OWN TRANSACTION, so "recorded" and "announced" are one fact. The
         // conflict above returns BEFORE this, so a loser announces nothing.
         enqueue_domain_event(&mut tx, env, self.scope, event).await?;
+        if poison_after_enqueue {
+            // Testing seam only (every production caller passes false): a guaranteed error after
+            // BOTH writes are staged, so their joint rollback is what proves they share one
+            // transaction. Without it, a success observation cannot tell one transaction from two.
+            sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
