@@ -213,9 +213,17 @@ impl<'a> ScopedStore<'a> {
 
     /// The people an organization's operational notifications reach (issue #141).
     ///
-    /// READ side. The notification senders run on the data plane and need to know where to
-    /// deliver; editing who is notified is an operator and portal-admin action, so it goes
-    /// through [`ScopedStore::acting`] and migration 0207 grants `ironauth_app` SELECT only.
+    /// READ side. Editing who is notified is an operator and portal-admin action, so it goes
+    /// through [`ScopedStore::acting`], and migration 0207 grants `ironauth_app` SELECT only.
+    ///
+    /// NO DATA-PLANE READER EXISTS YET, and this is the accessor every reader reaches the repo
+    /// through, so the correction belongs here rather than only on the type. The `ironauth_app`
+    /// grant is forward provisioning for the senders #141 describes; nothing on the data plane
+    /// reads this table today. 0207's header, its `email_sealed` comment and its grant comment
+    /// all say a sender reads it at delivery time. That migration is SHIPPED and checksummed, so
+    /// its text cannot be corrected without making every migrated database refuse to boot on
+    /// `ChecksumMismatch` -- this doc is where the correction lives, exactly as
+    /// [`PolicyDecisionInputs`] carries the correction to migration 0073's header.
     #[must_use]
     pub fn org_contacts(&self) -> OrgContactRepo<'a> {
         OrgContactRepo {
@@ -61197,9 +61205,15 @@ const ORG_CONTACT_NAME_SEAL_LABEL: &str = "ironauth.envelope.org-contact-name.v1
 /// The longest contact name this accepts, in octets.
 ///
 /// HELD HERE BECAUSE THE SCHEMA CANNOT HOLD IT: 0207 seals the name, and a CHECK cannot measure
-/// what it cannot read. The value matches the ceiling every other short display column in this
-/// schema carries -- `org_contacts.id`, and the `display_name` of a SCIM connection -- so a name
-/// this surface accepts is one those would have accepted too.
+/// what it cannot read.
+///
+/// THE VALUE IS 0207'S OWN, and that is the only claim made for it: the migration bounds
+/// `org_contacts.id` at `octet_length(id) <= 256`, so this is the one length that table already
+/// states and the sealed column keeps its sibling's bound rather than inventing one. Two earlier
+/// versions of this sentence justified the number by comparison with other columns and were
+/// wrong both times -- the SCIM connection display name is 252 octets and lives in the admin
+/// crate, not 256 in this schema -- which is why the derivation now points at a line in the same
+/// migration a reader can check.
 const ORG_CONTACT_NAME_MAX_OCTETS: usize = 256;
 
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
@@ -61845,10 +61859,11 @@ fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) 
 ///   2. whitespace anywhere;
 ///   3. not EXACTLY ONE `@`. ONE term, TWO failure shapes, because a single destructuring
 ///      decides both: none at all, and more than one (`ada@acme.example@evil.example`, whose
-///      apparent domain is not the one it would be delivered to). It is the one term a case
-///      cannot hold ALONE: deleting it does not compile, because `domain` is the name it binds,
-///      so weakening it to two parts leaves `no @` to be refused by term 5 instead. The
-///      more-than-one shape IS held alone, which is the half a weakening could reach;
+///      apparent domain is not the one it would be delivered to). It is the one term no case
+///      holds ALONE: it cannot simply be deleted, because `domain` is the name it binds, and
+///      the reachable weakening -- accepting two parts instead of exactly two -- is caught by
+///      the more-than-one case while the `no @` case is caught by term 5 anyway. So the `no @`
+///      case documents a refusal rather than pinning a term, and says so;
 ///   4. an empty local part;
 ///   5. a domain with no dot. This is ALSO what refuses an EMPTY domain, so there is
 ///      deliberately no emptiness term: one would be unreachable, and an unreachable term is

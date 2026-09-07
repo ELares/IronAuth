@@ -215,6 +215,33 @@ impl Harness {
     }
 
     /// A router whose `AuthZEN` batch bound is `max_authzen_batch` (issue #100).
+    /// A harness whose page-size CEILING is `max_page_size` (issue #141).
+    ///
+    /// Exists so a test can put a row past the first page without seeding two hundred of them.
+    /// The defect it was written for is a handler that read one page of a listing to learn
+    /// something about ONE row: correct for every row on that page and silently wrong for the
+    /// rest, which at the shipped ceiling of 200 needs 201 rows to reach and at a ceiling of 1
+    /// needs two. The property is the ceiling, not the number.
+    pub async fn start_with_max_page_size(default_page_size: u32, max_page_size: u32) -> Self {
+        let mut db = TestDatabase::start().await;
+        db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());
+        let config = AdminConfig {
+            bootstrap_operator_token: Some(Secret::Literal(SecretString::new(OPERATOR_TOKEN))),
+            max_page_size,
+            default_page_size,
+            ..AdminConfig::default()
+        };
+        let state = AdminState::new(db.control_store().clone(), Env::system(), &config)
+            .expect("admin state builds");
+        let router = management_router(install_hook_runtime(state));
+        Self {
+            db,
+            router,
+            outbound_scope: None,
+            txt: None,
+        }
+    }
+
     pub async fn start_with_authzen_batch(default_page_size: u32, max_authzen_batch: u32) -> Self {
         let mut db = TestDatabase::start().await;
         db.own_seeded_scopes_by(ironauth_admin::bootstrap_operator_id());

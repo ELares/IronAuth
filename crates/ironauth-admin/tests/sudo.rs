@@ -344,7 +344,6 @@ async fn a_scim_token_rotation_is_sudo_gated() {
     );
 }
 
-/// "the refused revoke changed nothing" are two claims about two different fixtures.
 /// Adding or removing an operational contact is sudo gated (issue #141).
 ///
 /// WHY THIS SURFACE NEEDS THE GATE. A contact is who a vendor tells when a certificate is about
@@ -460,6 +459,7 @@ async fn adding_or_removing_a_contact_is_sudo_gated() {
     );
 }
 
+/// "the refused revoke changed nothing" are two claims about two different fixtures.
 #[tokio::test]
 async fn a_scim_connection_mint_or_revoke_is_sudo_gated() {
     let (harness, clock) = Harness::start_with_sudo(600).await;

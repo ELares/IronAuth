@@ -48,6 +48,85 @@ async fn run_as(pool: &sqlx::PgPool, scope: Scope, sql: &str) -> Result<u64, sql
     Ok(affected)
 }
 
+/// Add one contact and announce it, as the management handler does.
+async fn add_announcing(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    display_name: &str,
+    email: &str,
+    category: &str,
+) -> OrgContactId {
+    let id = OrgContactId::generate(env, &scope);
+    let subject = id.to_string();
+    let event_id = format!("evt_{id}");
+    // THE CATALOG BUILDS THE ENVELOPE, not this test. A hand-written one is a second opinion
+    // about a shape the registry validates at enqueue time, and the registry wins.
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "org_contact.added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros(env) / 1000,
+        &serde_json::json!({
+            "org_contact_id": subject,
+            "organization_id": organization.to_string(),
+            "category": category,
+        }),
+    )
+    .expect("the added type is registered");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_contacts()
+        .add_with_event(
+            env,
+            NewOrgContact {
+                id: &id,
+                organization_id: organization,
+                display_name,
+                email,
+                category,
+                created_at_micros: now_micros(env),
+            },
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: &event_id,
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("add");
+    id
+}
+
+/// Every event the outbox is holding for this scope, drained.
+async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_json::Value> {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
 /// The scope's clock in epoch microseconds.
 fn now_micros(env: &Env) -> i64 {
     i64::try_from(
@@ -380,6 +459,11 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
     // so is a case some OTHER term refuses first: `a@b@c.example` looks like it drives the
     // multi-@ term and does not, because with that term gone the domain is `b`, which the
     // no-dot term refuses anyway.
+    //
+    // ONE CASE HERE DOCUMENTS RATHER THAN PINS, and saying which is the honest form of the
+    // claim above. `not-an-address` names term 3, but term 3 cannot be deleted on its own --
+    // `domain` is the name it binds -- and under the reachable weakening the no-dot term
+    // refuses it anyway. Its more-than-one sibling is the case that holds term 3.
     let long_local = format!("{}@acme.example", "a".repeat(320));
     for (email, why) in [
         ("ada @acme.example", "whitespace inside the address"),
@@ -469,9 +553,13 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
 async fn the_listing_pages_on_its_cursor_and_the_pages_cover_every_contact() {
     // THE CURSOR EXISTS BECAUSE THE SHARED `ListQuery` CARRIES ONE. Every management listing
     // accepts `cursor`, so a store listing that took only a limit would have made the handler
-    // ACCEPT a caller's cursor and silently answer page one forever. Nothing else drives the
-    // `after` argument -- every other call in the tree passes `None` -- so without this the
-    // whole keyset predicate could be deleted and the suite would stay green.
+    // ACCEPT a caller's cursor and silently answer page one forever.
+    //
+    // THE HANDLER DOES DRIVE IT -- `list_org_contacts` passes `page.after()` -- so this is not
+    // the only caller that supplies one, and an earlier version of this comment claiming so was
+    // wrong. What it is, is the only place the predicate's BEHAVIOUR is asserted: the handler
+    // hands the argument over and never checks what came back, so deleting the predicate would
+    // leave the handler compiling, serving, and quietly returning page one to every cursor.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -527,6 +615,255 @@ async fn the_listing_pages_on_its_cursor_and_the_pages_cover_every_contact() {
     assert_eq!(
         walked, expected,
         "the paged walk did not cover every contact exactly once, oldest first"
+    );
+
+    // AND THE `id` HALF OF THE COMPOSITE, which the walk above never reaches because those five
+    // contacts have distinct timestamps. Ties are not hypothetical here: the write binds the
+    // CALLER'S clock rather than taking the column default, so two contacts added in one
+    // operator action share a `created_at` exactly. On a tie the cursor's `created_at` alone
+    // cannot say which row was already returned -- `(created_at, id) > (t, id)` is what does --
+    // so a predicate keyed on the timestamp alone either repeats a row forever or skips one.
+    let tied_org = seed_org(&db, &env, scope, "Tied").await;
+    let at = now_micros(&env);
+    let mut tied = Vec::new();
+    for (index, category) in ["technical", "security"].into_iter().enumerate() {
+        let id = OrgContactId::generate(&env, &scope);
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .org_contacts()
+            .add(
+                &env,
+                NewOrgContact {
+                    id: &id,
+                    organization_id: &tied_org,
+                    display_name: &format!("Tied {index}"),
+                    email: &format!("tied{index}@acme.example"),
+                    category,
+                    created_at_micros: at,
+                },
+            )
+            .await
+            .expect("add");
+        tied.push(id);
+    }
+
+    let first = read
+        .org_contacts()
+        .list_for_organization(&tied_org, 1, None)
+        .await
+        .expect("first tied page");
+    assert_eq!(first.len(), 1, "the tied page returned {first:?}");
+    let second = read
+        .org_contacts()
+        .list_for_organization(
+            &tied_org,
+            1,
+            Some(&CursorPosition {
+                created_at_unix_micros: first[0].created_at_unix_micros,
+                id: first[0].id.to_string(),
+            }),
+        )
+        .await
+        .expect("second tied page");
+    assert_eq!(
+        second.len(),
+        1,
+        "the cursor could not step past a tied timestamp: {second:?}"
+    );
+    assert_ne!(
+        second[0].id, first[0].id,
+        "the cursor returned the same contact twice on a tied timestamp"
+    );
+    assert_eq!(
+        second[0].created_at_unix_micros, first[0].created_at_unix_micros,
+        "the fixture did not actually produce a tie, so it cannot see the id half"
+    );
+}
+
+#[tokio::test]
+async fn a_removal_announces_itself_however_far_down_the_list_the_contact_is() {
+    // THE BUG THIS EXISTS FOR, and it shipped: the removal handler learned the event's category
+    // by scanning ONE PAGE of the live listing, so a contact created after the page limit yielded
+    // no match and its removal announced NOTHING -- while still tombstoning the row, still writing
+    // its audit entry, and still answering 204. A consumer counting `org_contact.removed` would
+    // have undercounted, silently, and a subscriber that keeps notifying the removed person never
+    // learns to stop.
+    //
+    // NOTHING MEASURED IT. The fix (a point lookup that reads only the plaintext category) was
+    // correct and unheld: reverting it to the paged scan left every test in this file green,
+    // because none of them drives an event at all. This drives the shape that distinguishes them,
+    // which is a contact that is NOT on the first page.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+
+    // Three contacts; the LAST is the one removed, and the listing is read with a limit of one
+    // below, which is the paged-scan condition in miniature. A production limit of 200 needs 201
+    // contacts to reach the same state; the property is the same and the fixture is not absurd.
+    let mut ids = Vec::new();
+    for (index, category) in ["technical", "security", "billing"].into_iter().enumerate() {
+        ids.push(
+            add_announcing(
+                &db,
+                &env,
+                scope,
+                &org,
+                &format!("Person {index}"),
+                &format!("person{index}@acme.example"),
+                category,
+            )
+            .await,
+        );
+    }
+    let last = ids.last().expect("three contacts");
+
+    // The adds announced, one each, carrying the category and NEITHER the name nor the address.
+    let added = queued_events(&db, &env, scope).await;
+    assert_eq!(added.len(), 3, "the adds announced {added:?}");
+    for event in &added {
+        assert_eq!(event["type"], "org_contact.added");
+        let rendered = serde_json::to_string(event).expect("json");
+        assert!(
+            !rendered.contains("@acme.example") && !rendered.contains("Person "),
+            "an add event carried a contact's address or name to the wire: {rendered}"
+        );
+    }
+
+    // THE CONTACT IS PAST THE FIRST PAGE, which is the whole point: read one at a time and it is
+    // not there, so a category learned by paging would be absent for exactly this row.
+    let first_page = db
+        .control_store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&org, 1, None)
+        .await
+        .expect("first page");
+    assert_eq!(first_page.len(), 1);
+    assert_ne!(
+        &first_page[0].id, last,
+        "the fixture put the removed contact on the first page, so it cannot see the bug"
+    );
+
+    // AND ITS REMOVAL STILL ANNOUNCES, carrying its own category.
+    let removal_envelope = ironauth_store::event_catalog::envelope(
+        "evt_contact_removed",
+        "org_contact.removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros(&env) / 1000,
+        &serde_json::json!({
+            "org_contact_id": last.to_string(),
+            "organization_id": org.to_string(),
+            "category": "billing",
+        }),
+    )
+    .expect("the removed type is registered");
+    let removed = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove_with_event(
+            &env,
+            &org,
+            last,
+            now_micros(&env),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_contact_removed",
+                subject: &last.to_string(),
+                envelope: &removal_envelope,
+            }),
+        )
+        .await
+        .expect("remove");
+    assert!(removed, "the removal reported that it removed nothing");
+
+    let announced = queued_events(&db, &env, scope).await;
+    assert_eq!(
+        announced.len(),
+        1,
+        "a removal past the first page announced {announced:?}"
+    );
+    assert_eq!(announced[0]["type"], "org_contact.removed");
+
+    // AND A REPEAT ANNOUNCES NOTHING, which is the other half: the event must count REMOVALS, so
+    // an answer of "it was already gone" cannot also emit one.
+    let repeated = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &org, last, now_micros(&env))
+        .await
+        .expect("a repeat is not an error");
+    assert!(!repeated);
+    let after = queued_events(&db, &env, scope).await;
+    assert!(
+        after.is_empty(),
+        "a repeated removal announced a removal that did not happen: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_category_lookup_is_scope_fenced_and_sees_only_live_contacts() {
+    // `live_category` is what the removal path reads to build its event, and it shipped with no
+    // test of its own. Three properties decide whether the event is right: it must answer for a
+    // live contact of THIS organization, and refuse or decline for anything else.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = seed_org(&db, &env, scope, "Acme").await;
+    let theirs = seed_org(&db, &env, scope, "Globex").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &mine,
+        "Ada",
+        "ada@acme.example",
+        "security",
+    )
+    .await
+    .expect("add");
+
+    let read = db.control_store().scoped(scope);
+    assert_eq!(
+        read.org_contacts()
+            .live_category(&mine, &id)
+            .await
+            .expect("read"),
+        Some("security".to_owned()),
+        "the live contact's own category was not returned"
+    );
+
+    // ANOTHER ORGANIZATION'S HANDLE SEES NOTHING, which is what keeps the removal path from
+    // building an event for a contact the caller cannot address.
+    assert_eq!(
+        read.org_contacts()
+            .live_category(&theirs, &id)
+            .await
+            .expect("read"),
+        None,
+        "a foreign organization's handle resolved this contact's category"
+    );
+
+    // AND A REMOVED CONTACT IS GONE FROM IT, so a repeat cannot build a second removal event.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &mine, &id, now_micros(&env))
+        .await
+        .expect("remove");
+    assert_eq!(
+        read.org_contacts()
+            .live_category(&mine, &id)
+            .await
+            .expect("read"),
+        None,
+        "a removed contact still answers with a category"
     );
 }
 
