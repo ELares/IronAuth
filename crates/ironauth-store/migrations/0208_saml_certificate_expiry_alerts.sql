@@ -9,10 +9,16 @@
 -- table is that it makes each (certificate, lead) pair announce exactly once.
 --
 -- THE INSERT IS THE CHECK, which is the same shape `saml_assertion_replay` (0198) uses and for
--- the same reason: a composite primary key makes a duplicate a unique violation INSIDE the
--- transaction that is sending the notification, so two sweep workers racing over one certificate
--- send exactly one notice between them. A read-then-write cannot give that, and a sweep is
--- exactly the kind of job an operator ends up running twice.
+-- the same reason: a composite primary key makes a duplicate a unique violation, so two sweep
+-- workers racing over one certificate announce exactly one notice between them and the loser
+-- learns it BEFORE delivering. A read-then-write cannot give that, and a sweep is exactly the
+-- kind of job an operator ends up running twice.
+--
+-- THE ROW AND THE ANNOUNCEMENT COMMIT TOGETHER. `record_sent` takes the domain event and
+-- enqueues it in the row's own transaction, because a row that committed first and an
+-- announcement that then failed would leave a ledger saying a customer was told when they were
+-- not -- and nothing re-surfaces it: `due()` filters on exactly this row and no role may delete
+-- one.
 --
 -- THE LEAD IS PART OF THE KEY, not a column beside it. Storing "last alerted at" instead would
 -- make the thirty-day and fourteen-day notices one fact, so crossing the fourteen-day threshold
@@ -59,6 +65,14 @@ CREATE TABLE saml_certificate_expiry_alerts (
     -- they just performed should not inherit the old one's "already warned" state.
     FOREIGN KEY (certificate_id) REFERENCES saml_connection_certificates (id) ON DELETE CASCADE
 );
+
+-- THE INDEX 0197 DEFERRED TO "THE MIGRATION THAT ADDS THE SWEEP". This is that migration. The
+-- sweep reads `saml_connection_certificates` by scope and expiry -- every certificate whose
+-- `not_after` falls inside the widest configured lead -- and without this it is a sequential scan
+-- of every pinned certificate in the deployment on every pass. The ordering matches the query's
+-- own `ORDER BY not_after`, so the scan and the sort come from one structure.
+CREATE INDEX saml_connection_certificates_by_expiry
+    ON saml_connection_certificates (tenant_id, environment_id, not_after);
 
 ALTER TABLE saml_certificate_expiry_alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE saml_certificate_expiry_alerts FORCE ROW LEVEL SECURITY;

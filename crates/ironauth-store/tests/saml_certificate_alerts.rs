@@ -249,7 +249,7 @@ async fn a_recorded_notice_is_not_due_again_and_its_siblings_still_are() {
     let certificate = pin_expiring(&db, &env, scope, &connection, 6, 2 * DAY).await;
 
     alerts
-        .record_sent(&certificate.to_string(), 30 * DAY, now)
+        .record_sent(&env, &certificate, 30 * DAY, now, None)
         .await
         .expect("record the thirty-day notice");
 
@@ -265,7 +265,7 @@ async fn a_recorded_notice_is_not_due_again_and_its_siblings_still_are() {
     // over one certificate send exactly one notice between them: the insert is the check, so the
     // loser finds out inside its own transaction rather than after delivering.
     let again = alerts
-        .record_sent(&certificate.to_string(), 30 * DAY, now + 1)
+        .record_sent(&env, &certificate, 30 * DAY, now + 1, None)
         .await;
     assert!(
         matches!(again, Err(StoreError::Conflict)),
@@ -290,7 +290,7 @@ async fn a_lead_nobody_configured_is_never_looked_up() {
 
     // Sent under the old set.
     alerts
-        .record_sent(&certificate.to_string(), 14 * DAY, now)
+        .record_sent(&env, &certificate, 14 * DAY, now, None)
         .await
         .expect("record");
 
@@ -315,6 +315,102 @@ async fn a_lead_nobody_configured_is_never_looked_up() {
     // AND AN EMPTY SET ASKS NOTHING, rather than meaning "every lead".
     let due = alerts.due(now, &[], 100).await.expect("due");
     assert!(due.is_empty(), "an empty lead set returned work: {due:?}");
+}
+
+#[tokio::test]
+async fn a_recorded_notice_suppresses_only_its_own_certificate() {
+    // THE ANTI-JOIN NAMES THREE COLUMNS AND ONLY TWO WERE MEASURED. Every earlier test in this
+    // file used ONE certificate, so `AND a.certificate_id = c.id` could be deleted and they all
+    // stayed green: with a single certificate the scope columns alone already match the right
+    // row. Two certificates is what tells them apart -- drop that clause and a notice sent for
+    // one silences the OTHER, which is a customer never warned about a certificate nobody has
+    // touched.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/f").await;
+    let now = now_micros(&env);
+    let alerts = db.control_store().scoped(scope).saml_certificate_alerts();
+
+    let told = pin_expiring(&db, &env, scope, &connection, 20, 2 * DAY).await;
+    let untold = pin_expiring(&db, &env, scope, &connection, 21, 2 * DAY).await;
+    for lead in LEADS {
+        alerts
+            .record_sent(&env, &told, *lead, now, None)
+            .await
+            .expect("record every lead for the first certificate");
+    }
+
+    let due = alerts.due(now, LEADS, 100).await.expect("due");
+    let certificates: Vec<&str> = due
+        .iter()
+        .map(|entry| entry.certificate_id.as_str())
+        .collect();
+    assert!(
+        !certificates.contains(&told.to_string().as_str()),
+        "a fully-announced certificate is still due: {due:?}"
+    );
+    assert_eq!(
+        due.len(),
+        3,
+        "the untouched certificate lost notices to its neighbour's ledger rows: {due:?}"
+    );
+    assert!(
+        certificates
+            .iter()
+            .all(|id| *id == untold.to_string().as_str()),
+        "the due set is not exactly the untouched certificate: {due:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_field_the_caller_is_handed_is_the_certificates_own() {
+    // THREE OF FOUR FIELDS WERE NEVER READ. The tests matched on `certificate_id` and
+    // `lead_secs` and never looked at `connection_id` or `not_after_unix_micros`, so both could
+    // have been the wrong row's and nothing would have said. They are not decoration: the sweep
+    // finds the organization to notify THROUGH `connection_id`, and puts the expiry date in the
+    // notice it sends.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    // TWO connections, so a build that returned "a connection" rather than "this certificate's
+    // connection" has something to get wrong.
+    let mine = connect(&db, &env, scope, &org, "https://idp.example/g").await;
+    let other = connect(&db, &env, scope, &org, "https://idp.example/h").await;
+    let now = now_micros(&env);
+    pin_expiring(&db, &env, scope, &other, 22, 20 * DAY).await;
+    let certificate = pin_expiring(&db, &env, scope, &mine, 23, 2 * DAY).await;
+
+    let due = db
+        .control_store()
+        .scoped(scope)
+        .saml_certificate_alerts()
+        .due(now, &[3 * DAY], 100)
+        .await
+        .expect("due");
+    assert_eq!(
+        due.len(),
+        1,
+        "expected exactly the two-day certificate: {due:?}"
+    );
+    let entry = &due[0];
+    assert_eq!(entry.certificate_id, certificate.to_string());
+    assert_eq!(
+        entry.connection_id,
+        mine.to_string(),
+        "the entry names the wrong connection, so the sweep would notify the wrong organization"
+    );
+    assert_eq!(entry.lead_secs, 3 * DAY);
+    // WITHIN A SECOND of what was pinned: the fixture computes the expiry from the same clock
+    // reading, and the column round-trips through microseconds.
+    let expected = now + 2 * DAY * 1_000_000;
+    assert!(
+        (entry.not_after_unix_micros - expected).abs() < 1_000_000,
+        "the entry's expiry is not the certificate's: {} against {expected}",
+        entry.not_after_unix_micros
+    );
 }
 
 #[tokio::test]

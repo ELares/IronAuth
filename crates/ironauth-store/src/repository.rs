@@ -260,8 +260,11 @@ impl<'a> ScopedStore<'a> {
     /// Which certificate expiry notices are due, and the record of those already sent (#141).
     ///
     /// ON THE CONTROL PLANE. Deciding that a customer should be told their identity provider's
-    /// certificate is about to expire reads the contact list, which 0207 grants to the control
-    /// role alone, and writes an audited notification. Signing people in has no part in it.
+    /// certificate is about to expire is an operator-plane job: it reads the contact list and
+    /// announces a notification. 0208 grants this ledger to the control role alone. (0207 grants
+    /// the contact list itself to BOTH roles -- `ironauth_app` holds SELECT on `org_contacts` as
+    /// forward provisioning for the senders #141 describes -- so the control-plane argument rests
+    /// on this table's grant, not on that one.)
     #[must_use]
     pub fn saml_certificate_alerts(&self) -> SamlCertificateAlertRepo<'a> {
         SamlCertificateAlertRepo {
@@ -76896,6 +76899,13 @@ impl SamlCertificateAlertRepo<'_> {
     /// died last week is worse than silence -- it tells an operator the wrong thing about how
     /// much time they have. Expiry itself is a different event and belongs to connection health.
     ///
+    /// # A repeated lead is one lead
+    ///
+    /// The caller's list is DISTINCTed before the join. A configuration that names thirty days
+    /// twice is one threshold, not two, and without this it would yield the pair twice -- so a
+    /// sweep would send two identical notices, and the second `record_sent` would answer
+    /// `Conflict` for a notice it had genuinely just delivered.
+    ///
     /// # Ordered, and why it matters here
     ///
     /// Soonest expiry first, then certificate, then lead. A sweep that is behind will find more
@@ -76919,7 +76929,8 @@ impl SamlCertificateAlertRepo<'_> {
             "SELECT c.id AS certificate_id, c.connection_id, l.lead_secs, \
                     (EXTRACT(EPOCH FROM c.not_after) * 1000000)::bigint AS not_after_us \
              FROM saml_connection_certificates c \
-             CROSS JOIN UNNEST($3::bigint[]) AS l(lead_secs) \
+             CROSS JOIN (SELECT DISTINCT unnest AS lead_secs \
+                         FROM UNNEST($3::bigint[])) AS l \
              LEFT JOIN saml_certificate_expiry_alerts a \
                     ON a.tenant_id = c.tenant_id \
                    AND a.environment_id = c.environment_id \
@@ -76953,24 +76964,45 @@ impl SamlCertificateAlertRepo<'_> {
             .collect())
     }
 
-    /// Record that the notice for one (certificate, lead) has gone out.
+    /// Record that the notice for one (certificate, lead) has gone out, announcing it in the
+    /// SAME transaction.
+    ///
+    /// THE EVENT AND THE LEDGER ROW COMMIT TOGETHER, and that ordering is the point rather than a
+    /// detail. A row here says "this customer has been told". If it committed first and the
+    /// announcement then failed, the row would be a lie no later sweep can correct -- `due()`
+    /// filters on exactly this row, there is no DELETE grant, and nothing re-surfaces it -- so
+    /// the customer is never told and the ledger says they were. That is the outage #141 exists
+    /// to prevent, reintroduced by the thing meant to prevent it. Passing the announcement in
+    /// means a failure to enqueue rolls the row back and the next sweep tries again.
     ///
     /// THE INSERT IS THE CHECK, as `admit_assertion` is for the replay cache: the primary key
-    /// makes a second attempt a unique violation inside the caller's own transaction, so two
-    /// sweeps racing over one certificate send exactly one notice between them. A read-then-write
-    /// cannot give that, and a sweep is the kind of job an operator ends up running twice.
+    /// makes a second attempt a unique violation, so two sweeps racing over one certificate
+    /// announce exactly one notice between them and the loser learns it before delivering.
     ///
     /// # Errors
     ///
+    /// [`StoreError::NotFound`] if the certificate is out of this scope;
     /// [`StoreError::Conflict`] when this (certificate, lead) was already announced -- which the
     /// caller should treat as "somebody else sent it", not as a failure;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn record_sent(
         &self,
-        certificate_id: &str,
+        env: &Env,
+        certificate_id: &SamlCertificateId,
         lead_secs: i64,
         at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
+        // THE SCOPE GUARD THE SCHEMA CANNOT GIVE. 0208's foreign key names the certificate by id
+        // ALONE, and referential integrity bypasses row-level security, so it admits any
+        // globally existing certificate -- 0205 states that contract explicitly and says what
+        // refuses a cross-scope one is the repository. Without this a caller in one scope could
+        // write a ledger row against another tenant's certificate: unreachable to `due()`,
+        // undeletable (no DELETE grant), and cascade-deleted by a stranger. It would also tell
+        // the caller apart a real foreign id from a fabricated one, which is an existence oracle.
+        if certificate_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let inserted = sqlx::query(
             "INSERT INTO saml_certificate_expiry_alerts \
@@ -76981,15 +77013,18 @@ impl SamlCertificateAlertRepo<'_> {
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
-        .bind(certificate_id)
+        .bind(certificate_id.to_string())
         .bind(lead_secs)
         .bind(at_unix_micros)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
         if inserted.rows_affected() == 0 {
             return Err(StoreError::Conflict);
         }
+        // IN THE LEDGER ROW'S OWN TRANSACTION, so "recorded" and "announced" are one fact. The
+        // conflict above returns BEFORE this, so a loser announces nothing.
+        enqueue_domain_event(&mut tx, env, self.scope, event).await?;
+        tx.commit().await?;
         Ok(())
     }
 }

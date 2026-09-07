@@ -91,7 +91,7 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      SAML browser binding, organization connection SAML target, \
      organization connection SAML same organization, \
      self-service portal links, self-service portal sessions, SCIM connection tokens, \
-     SCIM token last-seen, organization contacts., SAML certificate expiry alerts";
+     SCIM token last-seen, organization contacts, SAML certificate expiry alerts";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
