@@ -13829,7 +13829,7 @@
         "tags": [
           "organizations"
         ],
-        "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`",
+        "summary": "List the people an organization's operational notifications reach.",
         "description": "# Errors\n\n`403` if the credential lacks `management.read`; `404` if the scope or organization is not\naddressable.",
         "operationId": "listOrganizationContacts",
         "parameters": [
@@ -13923,7 +13923,7 @@
         "tags": [
           "organizations"
         ],
-        "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`",
+        "summary": "Add a person to an organization's operational notification list.",
         "description": "# Errors\n\n`400` if the body, the address, the name or the category is malformed; `403` if the\ncredential lacks `management.write_organizations`; `404` if the scope or organization is not\naddressable; `409` if this organization already lists that address on that category.",
         "operationId": "createOrganizationContact",
         "parameters": [
@@ -14038,7 +14038,7 @@
         "tags": [
           "organizations"
         ],
-        "summary": "`DELETE .../organizations/{organization_id}/contacts/{contact_id}`",
+        "summary": "Take a person off an organization's operational notification list.",
         "description": "# Errors\n\n`403` if the credential lacks `management.write_organizations`; `404` if the scope, the\norganization or the contact is not addressable from here.",
         "operationId": "deleteOrganizationContact",
         "parameters": [

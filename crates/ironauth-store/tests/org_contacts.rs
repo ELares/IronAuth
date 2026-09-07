@@ -14,7 +14,7 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewOrgContact, OrgContactId, OrganizationId, Scope, StoreError,
+    CorrelationId, CursorPosition, NewOrgContact, OrgContactId, OrganizationId, Scope, StoreError,
 };
 
 /// Run one statement as `ironauth_control` with this scope's RLS settings bound.
@@ -96,6 +96,7 @@ async fn add(
                 display_name,
                 email,
                 category,
+                created_at_micros: now_micros(env),
             },
         )
         .await?;
@@ -336,6 +337,7 @@ async fn a_foreign_organization_or_id_is_refused_before_any_write() {
                 display_name: "Ada",
                 email: "ada@acme.example",
                 category: "technical",
+                created_at_micros: now_micros(&env),
             },
         )
         .await;
@@ -382,7 +384,10 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
     for (email, why) in [
         ("ada @acme.example", "whitespace inside the address"),
         (long_local.as_str(), "longer than the 320-octet ceiling"),
-        ("not-an-address", "no @ at all"),
+        (
+            "not-an-address",
+            "no @ at all, which term 3 refuses by binding no domain",
+        ),
         (
             "ada@acme.example@evil.example",
             "two @: the apparent domain is not the deliverable one",
@@ -458,6 +463,71 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
     add(&db, &env, scope, &org, "Ada", "ada@acme.example", "billing")
         .await
         .expect("a well-formed contact");
+}
+
+#[tokio::test]
+async fn the_listing_pages_on_its_cursor_and_the_pages_cover_every_contact() {
+    // THE CURSOR EXISTS BECAUSE THE SHARED `ListQuery` CARRIES ONE. Every management listing
+    // accepts `cursor`, so a store listing that took only a limit would have made the handler
+    // ACCEPT a caller's cursor and silently answer page one forever. Nothing else drives the
+    // `after` argument -- every other call in the tree passes `None` -- so without this the
+    // whole keyset predicate could be deleted and the suite would stay green.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+
+    // Five contacts across the three categories, so the duplicate rule does not refuse them.
+    let mut added = Vec::new();
+    for (index, category) in ["technical", "security", "billing", "technical", "security"]
+        .into_iter()
+        .enumerate()
+    {
+        added.push(
+            add(
+                &db,
+                &env,
+                scope,
+                &org,
+                &format!("Person {index}"),
+                &format!("person{index}@acme.example"),
+                category,
+            )
+            .await
+            .expect("add"),
+        );
+    }
+
+    let read = db.control_store().scoped(scope);
+    let mut seen = Vec::new();
+    let mut after: Option<CursorPosition> = None;
+    // Two at a time, so the walk crosses a page boundary more than once.
+    for _ in 0..5 {
+        let page = read
+            .org_contacts()
+            .list_for_organization(&org, 2, after.as_ref())
+            .await
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "a page returned more rows than its limit");
+        let last = page.last().expect("a non-empty page");
+        after = Some(CursorPosition {
+            created_at_unix_micros: last.created_at_unix_micros,
+            id: last.id.to_string(),
+        });
+        seen.extend(page.into_iter().map(|contact| contact.id));
+    }
+
+    // EVERY CONTACT ONCE, IN ORDER. A cursor the query ignored would return the same first page
+    // forever, so `seen` would be the first two repeated; one that skipped would come up short.
+    let expected: Vec<String> = added.iter().map(ToString::to_string).collect();
+    let walked: Vec<String> = seen.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        walked, expected,
+        "the paged walk did not cover every contact exactly once, oldest first"
+    );
 }
 
 #[tokio::test]
@@ -863,11 +933,11 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
     // corrected in place.
     //
     // WHAT IT DRIVES AND WHAT IT DOES NOT. This issues statements and reads the ERRORS; it does
-    // not read `information_schema`, so it cannot enumerate the grant set and cannot notice a
-    // column added later that nobody listed here. It probes the five columns the control role
-    // must not write -- every column of this table except `updated_at` and `deleted_at`, which
-    // are the two the grant names -- plus the policy in both directions and both halves of the
-    // data plane. The catalog-wide sweep that no per-table test can do lives in
+    // not read `information_schema`, so it cannot enumerate the grant set, and a column ADDED to
+    // this table by a later migration would not appear here until somebody added it. What it
+    // does cover is every column 0207 declares: the ten the control role must not write, named
+    // one by one below, plus `updated_at` and `deleted_at`, which the grant does name and which
+    // the policy cases exercise. The catalog-wide sweep that no per-table test can do lives in
     // `migration.rs::the_data_plane_holds_no_table_wide_update_on_any_table`.
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -886,14 +956,23 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
     .await
     .expect("add");
 
-    // THE COLUMN SCOPE. Each of these decides what the row IS -- whose list it is on, who it
-    // reaches, and which notices it receives -- and the control role may write none of them.
+    // THE COLUMN SCOPE, OVER EVERY COLUMN THE GRANT DOES NOT NAME. 0207 grants
+    // `UPDATE (updated_at, deleted_at)` and nothing else, so the other TEN columns of this table
+    // must all be refused -- and the claim worth making is about all ten, not about the
+    // interesting five. An earlier draft of this loop listed five and the comment above it said
+    // "every column except `updated_at` and `deleted_at`", which was a claim the loop did not
+    // hold: a grant widened to include `created_at` or `pii_dek_version` would have passed.
     for (column, value) in [
+        ("id", "'oct_other'".to_owned()),
+        ("tenant_id", "'ten_other'".to_owned()),
+        ("environment_id", "'env_other'".to_owned()),
         ("organization_id", format!("'{other}'")),
+        ("display_name_sealed", "'\\x00'::bytea".to_owned()),
         ("email_sealed", "'\\x00'::bytea".to_owned()),
         ("email_bidx", "'\\x00'::bytea".to_owned()),
+        ("pii_dek_version", "2".to_owned()),
         ("category", "'billing'".to_owned()),
-        ("display_name_sealed", "'\\x00'::bytea".to_owned()),
+        ("created_at", "now()".to_owned()),
     ] {
         let outcome = as_control(
             &db,
@@ -966,8 +1045,9 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
     );
 
     // AND ITS READ WORKS, so the INSERT refusal just above is a narrowing of this role rather
-    // than a role with no access to the table at all. It speaks only for the data plane: the six
-    // refusals before it are the CONTROL role's, and its own read says nothing about those.
+    // than a role with no access to the table at all. It speaks only for the data plane: the
+    // eleven refusals before it are the CONTROL role's, and its own read says nothing about
+    // those.
     as_app(&db, scope, "SELECT 1 FROM org_contacts")
         .await
         .expect("the data plane must be able to read the list it delivers to");

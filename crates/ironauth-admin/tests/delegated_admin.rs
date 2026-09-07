@@ -5199,9 +5199,6 @@ async fn write_organizations_is_required_to_add_a_machine_identity_to_an_org() {
     );
 }
 
-/// Registering and revoking an agent is `write_organizations`; listing them is `read`
-/// (issue #130).
-///
 /// The organization CONTACT surface splits adding and removing a notification destination from
 /// reading the list (issue #141).
 ///
@@ -5242,6 +5239,31 @@ async fn the_contact_surface_splits_writing_the_list_from_reading_it() {
         StatusCode::FORBIDDEN,
         "a read credential must be able to see who an organization notifies: {response}"
     );
+
+    // AND THE READ GATE IS A GATE. Showing that `management.read` REACHES the listing does not
+    // show that anything is required to: without the negative direction, deleting the
+    // `require_permission(Read)` call from the handler leaves this test green, and the
+    // classification would look like enforcement while enforcing nothing.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&contacts, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a credential without management.read READ the contact list: {response}"
+    );
+    assert!(
+        response.contains("management.read"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
 
     let (status, _, response) = h
         .post_as(&contacts, &secret, "k-contact-forbidden", &create)
@@ -5292,6 +5314,9 @@ async fn the_contact_surface_splits_writing_the_list_from_reading_it() {
     );
 }
 
+/// Registering and revoking an agent is `write_organizations`; listing them is `read`
+/// (issue #130).
+///
 /// An agent acts with a person's authority inside an organization, so "who may create one"
 /// and "who may only look at the list" is the distinction that matters most on this surface.
 /// A read-only credential must be able to answer "what is acting here" -- that is the

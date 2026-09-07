@@ -2011,7 +2011,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`
+         * List the people an organization's operational notifications reach.
          * @description # Errors
          *
          *     `403` if the credential lacks `management.read`; `404` if the scope or organization is not
@@ -2020,7 +2020,7 @@ export interface paths {
         get: operations["listOrganizationContacts"];
         put?: never;
         /**
-         * `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`
+         * Add a person to an organization's operational notification list.
          * @description # Errors
          *
          *     `400` if the body, the address, the name or the category is malformed; `403` if the
@@ -2045,7 +2045,7 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * `DELETE .../organizations/{organization_id}/contacts/{contact_id}`
+         * Take a person off an organization's operational notification list.
          * @description # Errors
          *
          *     `403` if the credential lacks `management.write_organizations`; `404` if the scope, the

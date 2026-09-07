@@ -107,7 +107,7 @@ pub struct CreateOrgContactRequest {
     pub category: String,
 }
 
-/// `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`
+/// Add a person to an organization's operational notification list.
 ///
 /// # Errors
 ///
@@ -216,6 +216,9 @@ pub async fn create_org_contact(
                 display_name: &display_name,
                 email: &email,
                 category: &category,
+                // The SAME value the 201 body reports, so the create response and every later
+                // listing agree about when this contact was added.
+                created_at_micros,
             },
             Some(write),
             pending
@@ -227,7 +230,7 @@ pub async fn create_org_contact(
     Ok(json(StatusCode::CREATED, body_string))
 }
 
-/// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`
+/// List the people an organization's operational notifications reach.
 ///
 /// # Errors
 ///
@@ -290,7 +293,7 @@ pub async fn list_org_contacts(
     Ok(json(StatusCode::OK, body))
 }
 
-/// `DELETE .../organizations/{organization_id}/contacts/{contact_id}`
+/// Take a person off an organization's operational notification list.
 ///
 /// # Errors
 ///
@@ -341,17 +344,23 @@ pub async fn delete_org_contact(
 
     // THE CATEGORY FOR THE EVENT IS READ BEFORE THE REMOVAL, because after it the row is a
     // tombstone the live listing no longer returns. A contact this caller cannot address is
-    // absent from that listing, so this yields nothing and the removal below answers the uniform
+    // absent from it, so this yields `None` and the removal below answers the uniform
     // not-found -- the read is not what decides the outcome.
+    //
+    // A POINT LOOKUP, NOT A PAGE. Reading the category out of `list_for_organization` looked
+    // equivalent and was not: that listing is paged, so a contact past the first page yielded
+    // `None` and its removal announced NOTHING while still tombstoning the row and writing its
+    // audit entry -- a consumer counting `org_contact.removed` would have undercounted, silently.
+    // The point lookup also opens no seal, which matters here more than anywhere: a row whose
+    // ciphertext will not open is exactly the row an operator most needs to remove, and routing
+    // the removal through a listing that opens every seal made the remedy fail on the thing it
+    // was meant to remedy.
     let category = state
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org_id, i64::from(state.max_page_size()), None)
-        .await?
-        .into_iter()
-        .find(|contact| contact.id == id)
-        .map(|contact| contact.category);
+        .live_category(&org_id, &id)
+        .await?;
 
     let pending = category.as_ref().and_then(|category| {
         org_contact_event(&state, scope, &id, &org_id, category, "org_contact.removed")

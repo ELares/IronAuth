@@ -295,6 +295,13 @@ func (c *Client) CreateOrganizationApiKey(tenant_id string, environment_id strin
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/api-keys", query, body)
 }
 
+// CreateOrganizationContact performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts.
+//
+// Add a person to an organization's operational notification list.
+func (c *Client) CreateOrganizationContact(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/contacts", query, body)
+}
+
 // CreatePermission performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions.
 //
 // Define a permission in an environment.
@@ -524,6 +531,13 @@ func (c *Client) DeleteOrgRole(tenant_id string, environment_id string, organiza
 // Deactivate an organization (soft delete; idempotent in effect).
 func (c *Client) DeleteOrganization(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id), query, nil)
+}
+
+// DeleteOrganizationContact performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts/{contact_id}.
+//
+// Take a person off an organization's operational notification list.
+func (c *Client) DeleteOrganizationContact(tenant_id string, environment_id string, organization_id string, contact_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/contacts/" + escape(contact_id), query, nil)
 }
 
 // DeleteOutboundVerification performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification.
@@ -1259,6 +1273,13 @@ func (c *Client) ListOrgRoles(tenant_id string, environment_id string, organizat
 // listOrganizationApiKeys.
 func (c *Client) ListOrganizationApiKeys(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/api-keys", query, nil)
+}
+
+// ListOrganizationContacts performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts.
+//
+// List the people an organization's operational notifications reach.
+func (c *Client) ListOrganizationContacts(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/contacts", query, nil)
 }
 
 // ListOrganizations performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations.

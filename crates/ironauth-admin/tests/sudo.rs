@@ -345,6 +345,121 @@ async fn a_scim_token_rotation_is_sudo_gated() {
 }
 
 /// "the refused revoke changed nothing" are two claims about two different fixtures.
+/// Adding or removing an operational contact is sudo gated (issue #141).
+///
+/// WHY THIS SURFACE NEEDS THE GATE. A contact is who a vendor tells when a certificate is about
+/// to expire. Quietly removing the one security contact is how an incident notification reaches
+/// nobody, and it leaves the product working normally in every other respect -- so it is exactly
+/// the kind of change a stolen-but-stale credential should not be able to make.
+///
+/// BOTH WRITES, AND THE STATE AFTER THEM. The 401s alone would also pass against a handler that
+/// challenged and then wrote anyway, so the listing is read afterwards: the refused add must not
+/// appear and the refused removal must not have taken the seeded contact away.
+#[tokio::test]
+async fn adding_or_removing_a_contact_is_sudo_gated() {
+    let (harness, clock) = Harness::start_with_sudo(600).await;
+    let (tenant, env) = harness.create_tenant("Acme", "k1").await;
+    let elevate = elevate_path(&tenant, &env);
+    let orgs = organizations_path(&tenant, &env);
+
+    // Seed the organization and one contact, both of which need an elevation of their own. The
+    // seeding elevation is LAPSED below rather than never taken, so the challenged half measures
+    // a stale credential and not a missing one.
+    let (status, _, elevated) = harness.post(&elevate, "e-seed", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate to seed: {elevated}");
+    let (status, _, created) = harness
+        .post(
+            &orgs,
+            "k-org",
+            &serde_json::json!({ "display_name": "Globex" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {created}");
+    let org = id_of(&created);
+    let base = format!("{orgs}/{org}/contacts");
+    let (status, _, seeded) = harness
+        .post(
+            &base,
+            "k-seed",
+            &serde_json::json!({
+                "display_name": "Seeded Contact",
+                "email": "seeded@acme.example",
+                "category": "security",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "seed contact: {seeded}");
+    let seeded_id = id_of(&seeded);
+
+    clock.advance(Duration::from_secs(601));
+
+    // AN ADD without a fresh elevation is challenged.
+    let (status, _, challenge) = harness
+        .post(
+            &base,
+            "k-stale-add",
+            &serde_json::json!({
+                "display_name": "Stale Contact",
+                "email": "stale@acme.example",
+                "category": "billing",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale contact add is challenged: {challenge}"
+    );
+    assert!(
+        challenge.contains("insufficient_user_authentication"),
+        "the challenge body carries the RFC 9470 error: {challenge}"
+    );
+
+    // A REMOVAL without one is challenged too.
+    let (status, _, challenge) = harness.delete(&format!("{base}/{seeded_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the stale contact removal is challenged: {challenge}"
+    );
+
+    // NOTHING LANDED. Reads are unaffected by sudo, so the listing answers, and it must still
+    // hold exactly the seeded contact: one more would mean the refused add wrote, and none would
+    // mean the refused removal did.
+    let (status, _, listed) = harness.get(&base).await;
+    assert_eq!(status, StatusCode::OK, "reads are unaffected: {listed}");
+    assert_eq!(item_count(&listed), 1, "the refused write landed: {listed}");
+    assert!(
+        listed.contains("seeded@acme.example"),
+        "the refused removal took the seeded contact away: {listed}"
+    );
+
+    // After a fresh elevation both succeed.
+    let (status, _, elevated) = harness.post(&elevate, "e1", "{}").await;
+    assert_eq!(status, StatusCode::OK, "elevate: {elevated}");
+    let (status, _, added) = harness
+        .post(
+            &base,
+            "k-fresh-add",
+            &serde_json::json!({
+                "display_name": "Fresh Contact",
+                "email": "fresh@acme.example",
+                "category": "billing",
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "the elevated add: {added}");
+    let (status, _, removed) = harness.delete(&format!("{base}/{seeded_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the elevated removal: {removed}"
+    );
+}
+
 #[tokio::test]
 async fn a_scim_connection_mint_or_revoke_is_sudo_gated() {
     let (harness, clock) = Harness::start_with_sudo(600).await;

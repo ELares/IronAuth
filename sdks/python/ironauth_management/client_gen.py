@@ -179,6 +179,10 @@ class Client:
         """createOrganizationApiKey. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/api-keys", query, body)
 
+    def create_organization_contact(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """Add a person to an organization's operational notification list. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/contacts", query, body)
+
     def create_permission(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Define a permission in an environment. POST /v1/tenants/{tenant_id}/environments/{environment_id}/permissions."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/permissions", query, body)
@@ -310,6 +314,10 @@ class Client:
     def delete_organization(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Deactivate an organization (soft delete; idempotent in effect). DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}", query, None)
+
+    def delete_organization_contact(self, tenant_id: str, environment_id: str, organization_id: str, contact_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """Take a person off an organization's operational notification list. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts/{contact_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/contacts/{urllib.parse.quote(contact_id)}", query, None)
 
     def delete_outbound_verification(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Disable one environment's outbound verification, destroying its token. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification."""
@@ -730,6 +738,10 @@ class Client:
     def list_organization_api_keys(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """listOrganizationApiKeys. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/api-keys", query, None)
+
+    def list_organization_contacts(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """List the people an organization's operational notifications reach. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/contacts", query, None)
 
     def list_organizations(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List organizations under an environment (cursor paginated). GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations."""

@@ -61197,7 +61197,9 @@ const ORG_CONTACT_NAME_SEAL_LABEL: &str = "ironauth.envelope.org-contact-name.v1
 /// The longest contact name this accepts, in octets.
 ///
 /// HELD HERE BECAUSE THE SCHEMA CANNOT HOLD IT: 0207 seals the name, and a CHECK cannot measure
-/// what it cannot read. The value is the one the plaintext column carried before it was sealed.
+/// what it cannot read. The value matches the ceiling every other short display column in this
+/// schema carries -- `org_contacts.id`, and the `display_name` of a SCIM connection -- so a name
+/// this surface accepts is one those would have accepted too.
 const ORG_CONTACT_NAME_MAX_OCTETS: usize = 256;
 
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
@@ -61833,14 +61835,20 @@ fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) 
 ///
 /// DELIBERATELY SHALLOW. A full grammar is wrong in both directions -- it refuses valid addresses
 /// and admits undeliverable ones -- and the authority on deliverability is the send path. What
-/// this refuses is SEVEN independently deletable terms -- one per `&&`-joined condition below,
-/// counted that way because a term is exactly what a mutation can remove:
+/// this refuses is SEVEN independently deletable terms. They do not all have the same SHAPE --
+/// terms 1 and 2 are the two halves of an `||` in the early return, term 3 is the `let ... else`
+/// destructuring, and 4 to 7 are the `&&`-joined conditions of the final expression -- and they
+/// are counted this way because a term is exactly what a mutation can remove, not because they
+/// look alike:
 ///
 ///   1. longer than the 320 octets the address syntax allows;
 ///   2. whitespace anywhere;
 ///   3. not EXACTLY ONE `@`. ONE term, TWO failure shapes, because a single destructuring
 ///      decides both: none at all, and more than one (`ada@acme.example@evil.example`, whose
-///      apparent domain is not the one it would be delivered to);
+///      apparent domain is not the one it would be delivered to). It is the one term a case
+///      cannot hold ALONE: deleting it does not compile, because `domain` is the name it binds,
+///      so weakening it to two parts leaves `no @` to be refused by term 5 instead. The
+///      more-than-one shape IS held alone, which is the half a weakening could reach;
 ///   4. an empty local part;
 ///   5. a domain with no dot. This is ALSO what refuses an EMPTY domain, so there is
 ///      deliberately no emptiness term: one would be unreachable, and an unreachable term is
@@ -78815,12 +78823,60 @@ pub struct OrgContact {
 
 /// The people an organization's operational notifications reach, for one scope, read only
 /// (issue #141).
+///
+/// WHO READS IT TODAY: the management API, and only the management API. #141 exists so that a
+/// certificate expiry or a degrading connection reaches somebody who will act, but the senders
+/// that will route on this list are not written yet -- so "a sender opens it at delivery time"
+/// describes the intent, not the tree. Nothing here should be read as claiming a delivery path
+/// exists.
 pub struct OrgContactRepo<'a> {
     store: &'a Store,
     scope: Scope,
 }
 
 impl OrgContactRepo<'_> {
+    /// The category of ONE live contact of one organization, or `None` if there is no such
+    /// contact here (issue #141).
+    ///
+    /// A POINT LOOKUP rather than a scan of [`Self::list_for_organization`], for the reason the
+    /// SCIM repo's `exists_in_organization` gives: the moment that listing took a page limit, a
+    /// contact past the first page stopped being findable through it, and a caller using it to
+    /// learn one row's category would silently get `None` for a contact that exists.
+    ///
+    /// AND IT OPENS NO SEAL. The category is a plaintext column, so this needs no DEK and cannot
+    /// fail on a ciphertext that will not open. That matters because the one caller is the
+    /// REMOVAL path: a row whose seal is broken is exactly the row an operator most needs to be
+    /// able to take off the list, and routing that path through the listing would make the
+    /// remedy fail on the thing it is meant to remedy.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn live_category(
+        &self,
+        organization_id: &OrganizationId,
+        id: &OrgContactId,
+    ) -> Result<Option<String>, StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let category: Option<String> = sqlx::query_scalar(
+            "SELECT category FROM org_contacts \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND organization_id = $4 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(category)
+    }
+
     /// Every LIVE contact of one organization, oldest first, from `after` onward.
     ///
     /// KEYSET, on the same `(created_at, id)` total order every management listing uses, so a
@@ -78990,6 +79046,7 @@ impl ActingOrgContactRepo<'_> {
         let display_name = contact.display_name.to_owned();
         let email = contact.email.to_owned();
         let category = contact.category.to_owned();
+        let created_at_micros = contact.created_at_micros;
         let bidx = org_contact_email_blind_index(master, scope, &email);
         write_audited(
             AuditedWrite {
@@ -79017,8 +79074,11 @@ impl ActingOrgContactRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO org_contacts \
                      (id, tenant_id, environment_id, organization_id, display_name_sealed, \
-                      email_sealed, email_bidx, pii_dek_version, category) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                      email_sealed, email_bidx, pii_dek_version, category, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -79029,6 +79089,7 @@ impl ActingOrgContactRepo<'_> {
                 .bind(bidx.into_bytes())
                 .bind(dek_version)
                 .bind(&category)
+                .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await;
                 match result {
@@ -79195,6 +79256,15 @@ pub struct NewOrgContact<'a> {
     pub email: &'a str,
     /// Which kind they asked for.
     pub category: &'a str,
+    /// When the contact was added, epoch microseconds, from the CALLER'S clock.
+    ///
+    /// BOUND EXPLICITLY RATHER THAN LEFT TO THE COLUMN DEFAULT. 0207 declares
+    /// `DEFAULT now()`, and a row taking it is stamped by the DATABASE while the handler
+    /// answers 201 with a timestamp from `Env`'s clock -- two different clocks for one fact, so
+    /// the created time in the create response and the one every later listing reports could
+    /// not agree. The migration is shipped and checksum-frozen, so the default stays; binding
+    /// the value is what stops it being reached.
+    pub created_at_micros: i64,
 }
 
 /// The inbound SCIM connections for one scope (issue #135).
