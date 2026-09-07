@@ -1873,7 +1873,9 @@ async fn the_page_reports_whether_anything_has_actually_used_each_connection() {
     );
 
     // THE DATE ITSELF, which nothing asserted: the column divides microseconds to seconds before
-    // formatting, and feeding microseconds straight in prints a year around fifty-five thousand.
+    // formatting, and feeding microseconds straight in puts the date tens of millions of years
+    // out. (An earlier version of this comment said "around fifty-five thousand", which is the
+    // figure for a MILLISECOND value; microseconds are a thousand times worse.)
     // Derived independently here, for the reason the deadline assertions above give.
     let secs = now / 1_000_000;
     let days = secs.div_euclid(86_400);

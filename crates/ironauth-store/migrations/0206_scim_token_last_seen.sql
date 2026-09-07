@@ -33,23 +33,32 @@ ALTER TABLE scim_connection_tokens
 -- never used -- which is the diagnosis this feature exists to deliver, a token pasted into the
 -- wrong field.
 --
--- THE DEFAULT DOES THE BACKFILL. Adding a NOT NULL column with a default stamps every existing
--- row with the migration's own `now()`, which is later than those rows' `created_at`; a row
--- inserted afterwards takes `now()` at insert, equal to its own `created_at`. So the test is
--- simply whether `observed_since <= created_at`, and it needs no separate backfill statement and
--- no reference to the migration ledger.
+-- NULLABLE AND WITHOUT A DEFAULT, which is the whole design and the opposite of the first
+-- attempt. A `DEFAULT now()` is written by ANY inserter, including a replica still running the
+-- previous binary during a rolling upgrade -- and that replica authenticates SCIM requests
+-- without recording them, because the stamp is code rather than schema. Such a row would have
+-- claimed to be watched for its whole life while nothing was watching, and the portal would have
+-- told the customer their provisioning had never run.
+--
+-- SO ONLY A BINARY THAT STAMPS WRITES THIS COLUMN. The inserts in `create_with_event` and
+-- `rotate_token` name it explicitly; an older binary's insert leaves it NULL, and NULL reads as
+-- unobserved. Every row that existed before this migration is NULL for the same reason and means
+-- the same thing. That is the shape 0205 used for the population it could not see either.
 ALTER TABLE scim_connection_tokens
-    ADD COLUMN observed_since timestamptz NOT NULL DEFAULT now();
+    ADD COLUMN observed_since timestamptz;
 
 COMMENT ON COLUMN scim_connection_tokens.observed_since IS
-    'When this row began being observed for use. Equal to created_at for rows inserted after '
-    'migration 0206, and later than it for rows that already existed -- so a NULL last_seen_at '
-    'means "never used" only when observed_since <= created_at (issue #140).';
+    'When a binary that records use began watching this row, or NULL if none has. Written only '
+    'by an inserter that also stamps last_seen_at, so a row from an older binary or from before '
+    'migration 0206 stays NULL. A NULL last_seen_at means "never used" only when observed_since '
+    'is set and not later than created_at (issue #140).';
 
 COMMENT ON COLUMN scim_connection_tokens.last_seen_at IS
     'When this token last authenticated a SCIM request, or NULL if it never has. Written by the '
     'data plane on the authentication path, throttled so an ordinary provisioning run does not '
-    'write once per request (issue #140).';
+    'write once per request. NULL does NOT mean the token was never used: it means no request '
+    'through it was ever observed, which is also true of every row older than this migration and '
+    'of any request served by a replica that predates it. See observed_since (issue #140).';
 
 -- THE DATA PLANE WRITES IT, which is a departure from every other column here and needs saying.
 -- Provisioning requests authenticate against the data-plane role, so it is the only role in a

@@ -3112,3 +3112,108 @@ async fn adopting_a_legacy_credential_does_not_claim_it_was_never_used() {
          called at the exact moment they rotated it"
     );
 }
+
+/// An unwatched connection that HAS been seen reports the date, not "not recorded".
+///
+/// # The state the observation column must not swallow
+///
+/// `usage_history_complete` is false for a row nobody watched from the start, and the page uses
+/// it to refuse the claim "never used". It must not refuse a claim the stamp itself supports: a
+/// pre-existing connection whose token is used after the upgrade has a real timestamp, and the
+/// page has to prefer it. Without this fixture the two branches could be ordered the other way
+/// round and every other test would pass -- "Not recorded" would swallow a date the deployment
+/// genuinely observed.
+#[tokio::test]
+async fn an_unwatched_connection_that_has_been_seen_reports_the_date() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "seen-unwatched").await;
+
+    // AGE THE OBSERVATION WINDOW, which is what every row that predates migration 0206 looks
+    // like: watched only from some point after it was created.
+    sqlx::query("UPDATE scim_connection_tokens SET observed_since = NULL WHERE connection_id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("unset the observation window");
+
+    let at = now_micros(&env);
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("seen-unwatched"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+
+    let listed = listed(&db, scope, &organization, &id, at).await;
+    assert!(
+        !listed.usage_history_complete,
+        "the premise: this connection's history is not fully watched"
+    );
+    assert_eq!(
+        listed.last_seen_at_unix_micros,
+        Some(at),
+        "a request served and recorded after the upgrade left no timestamp, so the page would \
+         report 'not recorded' about a use the deployment actually observed"
+    );
+}
+
+/// The newest-token question ignores revoked tokens.
+///
+/// # Why the filter is not cosmetic
+///
+/// Revoking the token a customer was asked to paste is how an operator withdraws a botched
+/// rotation. Without the filter the listing keeps pointing at that dead credential and reports
+/// the cutover as pending forever, while the credential that is actually current -- the one the
+/// customer never stopped using -- is ignored.
+#[tokio::test]
+async fn the_newest_token_question_ignores_revoked_tokens() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "withdraw-1").await;
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("withdraw-1"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    rotate(&db, &env, scope, &id, "withdraw-2", 3600, at)
+        .await
+        .expect("rotate");
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at + 1)
+            .await
+            .newest_token_used,
+        Some(false),
+        "the control: while the fresh token stands, the cutover is pending"
+    );
+
+    // THE OPERATOR WITHDRAWS THE BOTCHED ROTATION by revoking the token nobody pasted.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke_token(&env, &id, &digest("withdraw-2"), at + 2)
+        .await
+        .expect("revoke the fresh token");
+
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at + 3)
+            .await
+            .newest_token_used,
+        Some(true),
+        "a revoked token is still treated as the one to cut over to, so the listing reports a \
+         pending cutover to a credential the operator has withdrawn"
+    );
+}

@@ -75288,6 +75288,12 @@ pub struct ScimConnection {
     /// indistinguishable, through every other field, from one provisioning happily -- and that is
     /// the ordinary result of pasting a token into the wrong field, or into the right field of
     /// the wrong application. The stamp is coarse by design; see `LAST_SEEN_THROTTLE_MICROS`.
+    ///
+    /// `None` DOES NOT MEAN NEVER USED. It means no request through this connection was ever
+    /// observed, which is also true of every row older than migration 0206 and of any request
+    /// served by a replica that predates it. `usage_history_complete` beside this is what says
+    /// whether the absence can be read as an absence of use, and nothing should draw that
+    /// conclusion from this field alone.
     pub last_seen_at_unix_micros: Option<i64>,
     /// Whether the NEWEST unrevoked token has ever authenticated, or `None` when the connection
     /// holds no UNREVOKED token row.
@@ -75316,6 +75322,20 @@ pub struct ScimConnection {
     /// It is also false for a connection with no token rows at all, which has nothing to observe:
     /// that population authenticates through `scim_connections.token_digest`, and after a
     /// rotation adopts a credential whose earlier life went unwatched.
+    ///
+    /// # What it still cannot see, stated because a surface acts on it
+    ///
+    /// It attests that the ROWS were written by a binary that records use. It cannot attest that
+    /// the replica which SERVED a given request was one: mid-rolling-upgrade, a connection
+    /// created by an upgraded replica whose provisioning traffic happens to land only on
+    /// un-upgraded ones is watched by nobody, and reads as knowably unused. The window closes on
+    /// the first request an upgraded replica serves, within one throttle interval, and it is the
+    /// same rollout window migration 0205 already tells operators to finish before rotating.
+    ///
+    /// Closing it properly needs a deployment-level watermark rather than a per-row one, which is
+    /// a change to what this column means and not a wording fix. Until then a surface should read
+    /// `true` as "no request was observed, and observation was in place" rather than as proof
+    /// that none happened.
     pub usage_history_complete: bool,
     /// The next deadline one of this connection's credentials meets, if any of them has one.
     ///
@@ -78635,7 +78655,12 @@ pub struct RotateScimToken<'a> {
     pub now_micros: i64,
 }
 
-/// The inbound SCIM connections for one scope, read only (issue #135).
+/// The inbound SCIM connections for one scope (issue #135).
+///
+/// READ ONLY WITH ONE EXCEPTION, and the exception is deliberate: [`Self::authenticate`] records
+/// that the token it just accepted was used, in the same transaction as the read (issue #140).
+/// That is an observation rather than a change to what the credential is or how long it lasts,
+/// and it is the only column the data-plane role may write on the table (migration 0206).
 pub struct ScimConnectionRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -78839,7 +78864,7 @@ impl ScimConnectionRepo<'_> {
             // NOT ANSWERED ON THE AUTHENTICATION PATH EITHER, and deliberately not answered with
             // "now". This call is itself what stamps the token, so returning the stamp it just
             // wrote would hand every caller a value that says only "you are here" -- true of
-            // every authenticated request and informative about none of them. Both fields are
+            // every authenticated request and informative about none of them. All three are
             // operator questions the LISTING answers.
             last_seen_at_unix_micros: None,
             newest_token_used: None,
@@ -78954,7 +78979,8 @@ impl ScimConnectionRepo<'_> {
                                        WHERE t.connection_id = c.id \
                                          AND t.tenant_id = c.tenant_id \
                                          AND t.environment_id = c.environment_id \
-                                         AND t.observed_since > t.created_at)) \
+                                         AND (t.observed_since IS NULL \
+                                              OR t.observed_since > t.created_at))) \
                         AS usage_history_complete \
                     , (SELECT t.last_seen_at IS NOT NULL FROM scim_connection_tokens t \
                        WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
@@ -79143,7 +79169,8 @@ mod scim_connection_signal_tests {
             created_at_unix_micros: 1_698_000_000_000_000,
             // NEITHER SIGNAL READS THESE. They are listed because the literal is exhaustive, so
             // a field added to `ScimConnection` stops this module compiling until somebody
-            // decides what it should be here -- which is how these two arrived.
+            // decides what it should be here -- which is how each of these arrived. A field the
+            // signals START READING is not caught that way; nothing here would notice.
             last_seen_at_unix_micros: None,
             newest_token_used: None,
             usage_history_complete: false,
@@ -79254,8 +79281,13 @@ mod scim_connection_signal_tests {
 /// thousand -- on a table every customer of the deployment shares.
 ///
 /// It is deliberately NOT configurable: an operator who tuned it down would be paying write
-/// amplification for a precision no surface reads, and one who tuned it up would make a freshly
-/// pasted token look unused for as long as they chose.
+/// amplification for a precision no surface reads.
+///
+/// TUNING IT UP DOES NOT DELAY THE CUTOVER SIGNAL, which an earlier version of this note claimed.
+/// The statement's `last_seen_at IS NULL` disjunct means a token's FIRST use is always recorded
+/// however large the window is; the throttle only skips REFRESHES. So a freshly pasted token
+/// stops reading as unused on its first request regardless, and what a longer window costs is
+/// staleness in the "last request" date.
 const LAST_SEEN_THROTTLE_MICROS: i64 = 60 * 1_000_000;
 
 /// The WRITE side of the inbound SCIM connections, for this scope and actor (issue #135).
@@ -79382,12 +79414,17 @@ impl ActingScimConnectionRepo<'_> {
                 // Migration 0205 carries the full account and why it is documented rather than
                 // coded away.
                 sqlx::query(
+                    // `observed_since` IS WRITTEN BY THIS BINARY BECAUSE THIS BINARY STAMPS.
+                    // The column has no default precisely so that a replica which does not
+                    // record use cannot claim it does; see migration 0206.
                     "INSERT INTO scim_connection_tokens \
-                     (token_digest, connection_id, tenant_id, environment_id, expires_at) \
+                     (token_digest, connection_id, tenant_id, environment_id, expires_at, \
+                      observed_since) \
                      VALUES ($1, $2, $3, $4, \
                              CASE WHEN $5::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($5::bigint * INTERVAL '1 microsecond') END)",
+                                       + ($5::bigint * INTERVAL '1 microsecond') END, \
+                             now())",
                 )
                 .bind(&token_digest)
                 .bind(id.to_string())
@@ -79738,9 +79775,12 @@ impl ActingScimConnectionRepo<'_> {
         let superseded_expires_micros = superseded.iter().filter_map(|(us,)| *us).max();
 
         sqlx::query(
+            // AS THE CREATE PATH: this binary stamps, so it records that it is watching. The
+            // ADOPTED row above deliberately does NOT get one -- its credential existed and was
+            // used before anything watched it.
             "INSERT INTO scim_connection_tokens \
-             (token_digest, connection_id, tenant_id, environment_id) \
-             VALUES ($1, $2, $3, $4)",
+             (token_digest, connection_id, tenant_id, environment_id, observed_since) \
+             VALUES ($1, $2, $3, $4, now())",
         )
         .bind(new_token_digest)
         .bind(id.to_string())

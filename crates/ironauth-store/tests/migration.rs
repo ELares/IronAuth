@@ -9317,8 +9317,9 @@ async fn the_data_plane_writes_exactly_one_column_of_scim_connection_tokens() {
         "the data plane's writable columns on scim_connection_tokens changed. `last_seen_at` is a \
          timestamp that mints nothing; `expires_at` and `revoked_at` decide whether a credential \
          works, and a data plane able to write them could extend a token or clear a revocation \
-         from any customer's provisioning request. A widening to `revoked_at` is additionally \
-         caught by `the_token_tables_grants_and_one_way_policy_are_enforced`, which drives that \
-         write directly; `expires_at` is caught only here"
+         from any customer's provisioning request. Both widenings are additionally caught by \
+         `the_token_tables_grants_and_one_way_policy_are_enforced`, which drives each write \
+         directly; what only this test can see is a widening to a column no statement there \
+         happens to name"
     );
 }
