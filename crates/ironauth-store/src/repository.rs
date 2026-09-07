@@ -257,6 +257,22 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// Which certificate expiry notices are due, and the record of those already sent (#141).
+    ///
+    /// ON THE CONTROL PLANE. Deciding that a customer should be told their identity provider's
+    /// certificate is about to expire is an operator-plane job: it reads the contact list and
+    /// announces a notification. 0208 grants this ledger to the control role alone. (0207 grants
+    /// the contact list itself to BOTH roles -- `ironauth_app` holds SELECT on `org_contacts` as
+    /// forward provisioning for the senders #141 describes -- so the control-plane argument rests
+    /// on this table's grant, not on that one.)
+    #[must_use]
+    pub fn saml_certificate_alerts(&self) -> SamlCertificateAlertRepo<'a> {
+        SamlCertificateAlertRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The self-service portal entry links for this scope (issue #140).
     ///
     /// ON THE DATA PLANE because redeeming one is what a customer's IT admin does in a browser,
@@ -44084,6 +44100,20 @@ impl ActingConsentRepo<'_> {
     }
 }
 
+/// Whether a database error is a Postgres foreign-key violation (SQLSTATE 23503).
+///
+/// DISTINCT FROM [`crate::error::is_absent_scope`], which folds the SCOPE keys specifically and
+/// keys on the `_tenant_id_fkey` suffix. This one is for a key naming a PARENT ROW that a
+/// concurrent write removed -- an ordinary race whose caller-facing answer is "that work item is
+/// gone", not a persistence fault.
+fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("23503")
+}
+
 /// Whether a database error is a Postgres unique-violation (SQLSTATE 23505).
 /// Used to turn a duplicate bootstrap login handle into the caller-facing
 /// [`StoreError::Conflict`] rather than an opaque database fault.
@@ -76848,6 +76878,226 @@ impl PortalLinkRepo<'_> {
                 .map_err(|_| StoreError::NotFound)?,
             intent,
         })
+    }
+}
+
+/// One certificate that has entered a configured lead window and has not been announced for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueCertificateAlert {
+    /// The certificate, `saml_connection_certificates.id`.
+    pub certificate_id: String,
+    /// The connection it is pinned on, so a caller can find the organization to notify.
+    pub connection_id: String,
+    /// The lead this row is due for, in seconds. One certificate can be due for MORE THAN ONE
+    /// lead on a single pass -- a sweep that has not run for a month crosses several at once --
+    /// and each is its own entry here rather than being collapsed to the nearest.
+    pub lead_secs: i64,
+    /// When the certificate stops being valid, epoch microseconds.
+    pub not_after_unix_micros: i64,
+}
+
+/// The certificate expiry alert ledger for one scope (issue #141).
+pub struct SamlCertificateAlertRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SamlCertificateAlertRepo<'_> {
+    /// Every (certificate, lead) pair inside its window at `now` that has not been announced.
+    ///
+    /// # What "inside its window" means
+    ///
+    /// A certificate is due for lead L when it expires within L of now AND has not already
+    /// expired. The second half is deliberate: once a certificate is past `not_after` the
+    /// connection is already broken, and a "expires in 3 days" notice about a certificate that
+    /// died last week is worse than silence -- it tells an operator the wrong thing about how
+    /// much time they have. Expiry itself is a different event and belongs to connection health.
+    ///
+    /// # A repeated lead is one lead
+    ///
+    /// The caller's list is DISTINCTed before the join. A configuration that names thirty days
+    /// twice is one threshold, not two, and without this it would yield the pair twice -- so a
+    /// sweep would send two identical notices, and the second `record_sent` would answer
+    /// `Conflict` for a notice it had genuinely just delivered.
+    ///
+    /// # Ordered, and why it matters here
+    ///
+    /// Soonest expiry first, then certificate, then lead. A sweep that is behind will find more
+    /// work than it can send in one pass, and the certificates closest to breaking are the ones
+    /// whose notices matter most.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn due(
+        &self,
+        now_unix_micros: i64,
+        leads_secs: &[i64],
+        limit: i64,
+    ) -> Result<Vec<DueCertificateAlert>, StoreError> {
+        if leads_secs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT c.id AS certificate_id, c.connection_id, l.lead_secs, \
+                    (EXTRACT(EPOCH FROM c.not_after) * 1000000)::bigint AS not_after_us \
+             FROM saml_connection_certificates c \
+             CROSS JOIN (SELECT DISTINCT unnest AS lead_secs \
+                         FROM UNNEST($3::bigint[])) AS l \
+             LEFT JOIN saml_certificate_expiry_alerts a \
+                    ON a.tenant_id = c.tenant_id \
+                   AND a.environment_id = c.environment_id \
+                   AND a.certificate_id = c.id \
+                   AND a.lead_secs = l.lead_secs \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 \
+               AND a.certificate_id IS NULL \
+               AND c.not_after > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+               AND c.not_after <= TIMESTAMPTZ 'epoch' \
+                                  + ($4::text || ' microseconds')::interval \
+                                  + (l.lead_secs * INTERVAL '1 second') \
+             ORDER BY c.not_after, c.id, l.lead_secs \
+             LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(leads_secs)
+        .bind(now_unix_micros)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| DueCertificateAlert {
+                certificate_id: row.get("certificate_id"),
+                connection_id: row.get("connection_id"),
+                lead_secs: row.get("lead_secs"),
+                not_after_unix_micros: row.get("not_after_us"),
+            })
+            .collect())
+    }
+
+    /// Record that the notice for one (certificate, lead) has gone out, announcing it in the
+    /// SAME transaction.
+    ///
+    /// THE EVENT AND THE LEDGER ROW COMMIT TOGETHER, and that ordering is the point rather than a
+    /// detail. A row here says "this customer has been told". If it committed first and the
+    /// announcement then failed, the row would be a lie no later sweep can correct -- `due()`
+    /// filters on exactly this row, there is no DELETE grant, and nothing re-surfaces it -- so
+    /// the customer is never told and the ledger says they were. That is the outage #141 exists
+    /// to prevent, reintroduced by the thing meant to prevent it. Passing the announcement in
+    /// means a failure to enqueue rolls the row back and the next sweep tries again.
+    ///
+    /// THE INSERT IS THE CHECK, as `admit_assertion` is for the replay cache: the primary key
+    /// makes a second attempt a unique violation, so two sweeps racing over one certificate
+    /// announce exactly one notice between them and the loser learns it before delivering.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the certificate is out of this scope;
+    /// [`StoreError::Conflict`] when this (certificate, lead) was already announced -- which the
+    /// caller should treat as "somebody else sent it", not as a failure;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_sent(
+        &self,
+        env: &Env,
+        certificate_id: &SamlCertificateId,
+        lead_secs: i64,
+        at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        self.record_sent_inner(env, certificate_id, lead_secs, at_unix_micros, event, false)
+            .await
+    }
+
+    /// [`record_sent`](Self::record_sent) with a guaranteed failure forced AFTER the ledger row
+    /// is staged and after the notice is enqueued, both inside the one transaction.
+    ///
+    /// # Why this seam exists
+    ///
+    /// "The event and the ledger row commit together" is the property this API was reshaped for,
+    /// and a test that only observes a SUCCESSFUL call cannot measure it: success leaves a row
+    /// and a message whether the two writes share a transaction or not. Splitting them into two
+    /// transactions -- the exact failure the doc warns about, a ledger saying a customer was told
+    /// when the notice never went out -- left the whole suite green. This is the seam
+    /// `write_audited` already carries for the same reason, under the same feature.
+    ///
+    /// # Errors
+    ///
+    /// Always errors, which is the point: the injected failure must roll back BOTH writes.
+    #[cfg(feature = "testing")]
+    pub async fn record_sent_injecting_post_enqueue_failure(
+        &self,
+        env: &Env,
+        certificate_id: &SamlCertificateId,
+        lead_secs: i64,
+        at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        self.record_sent_inner(env, certificate_id, lead_secs, at_unix_micros, event, true)
+            .await
+    }
+
+    async fn record_sent_inner(
+        &self,
+        env: &Env,
+        certificate_id: &SamlCertificateId,
+        lead_secs: i64,
+        at_unix_micros: i64,
+        event: Option<&DomainEvent<'_>>,
+        poison_after_enqueue: bool,
+    ) -> Result<(), StoreError> {
+        // THE SCOPE GUARD THE SCHEMA CANNOT GIVE. 0208's foreign key names the certificate by id
+        // ALONE, and referential integrity bypasses row-level security, so it admits any
+        // globally existing certificate -- 0205 states that contract explicitly and says what
+        // refuses a cross-scope one is the repository. Without this a caller in one scope could
+        // write a ledger row against another tenant's certificate: unreachable to `due()`,
+        // undeletable (no DELETE grant), and cascade-deleted by a stranger. It would also tell
+        // the caller apart a real foreign id from a fabricated one, which is an existence oracle.
+        if certificate_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO saml_certificate_expiry_alerts \
+             (tenant_id, environment_id, certificate_id, lead_secs, alerted_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(certificate_id.to_string())
+        .bind(lead_secs)
+        .bind(at_unix_micros)
+        .execute(&mut *tx)
+        .await;
+        // THE ROLLOVER RACE IS ORDINARY, NOT EXCEPTIONAL. A sweep reads `due()`, and before it
+        // records the notice an operator replaces the certificate -- which is exactly what an
+        // expiry warning asks them to do, so this is the likeliest interleaving on this path,
+        // not a rare one. The row is gone and the foreign key fails. Left as `Database` that
+        // reads as a persistence fault and would page somebody; it is simply "the work item
+        // expired", which is what `NotFound` means to this caller.
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(error) if is_foreign_key_violation(&error) => return Err(StoreError::NotFound),
+            Err(error) => return Err(error.into()),
+        };
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::Conflict);
+        }
+        // IN THE LEDGER ROW'S OWN TRANSACTION, so "recorded" and "announced" are one fact. The
+        // conflict above returns BEFORE this, so a loser announces nothing.
+        enqueue_domain_event(&mut tx, env, self.scope, event).await?;
+        if poison_after_enqueue {
+            // Testing seam only (every production caller passes false): a guaranteed error after
+            // BOTH writes are staged, so their joint rollback is what proves they share one
+            // transaction. Without it, a success observation cannot tell one transaction from two.
+            sqlx::query("SELECT 1 / 0").execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 

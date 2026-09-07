@@ -76,6 +76,7 @@ crates/ironauth-store/src/repository.rs:provision_sp_key:1
 crates/ironauth-store/src/repository.rs:publish_snapshot_inner:1
 crates/ironauth-store/src/repository.rs:put_with_event:1
 crates/ironauth-store/src/repository.rs:record_domain_verification_with_event:1
+crates/ironauth-store/src/repository.rs:record_sent_inner:1
 crates/ironauth-store/src/repository.rs:record_with_event:1
 crates/ironauth-store/src/repository.rs:redeem:1
 crates/ironauth-store/src/repository.rs:register:1
