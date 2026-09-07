@@ -597,6 +597,26 @@ async fn connect(
     token: &str,
     expires_at_unix_micros: Option<i64>,
 ) -> ironauth_store::ScimConnectionId {
+    connect_with_provider(
+        harness,
+        organization,
+        display_name,
+        "okta",
+        token,
+        expires_at_unix_micros,
+    )
+    .await
+}
+
+/// As [`connect`], naming the provider, which is what the setup guides are keyed on.
+async fn connect_with_provider(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    provider: &str,
+    token: &str,
+    expires_at_unix_micros: Option<i64>,
+) -> ironauth_store::ScimConnectionId {
     let env = Env::system();
     let scope = harness.scope();
     let id = ironauth_store::ScimConnectionId::generate(&env, &scope);
@@ -615,7 +635,7 @@ async fn connect(
                 id: &id,
                 organization_id: organization,
                 display_name,
-                provider: "okta",
+                provider,
                 token_digest: &hex_digest(token),
                 expires_at_unix_micros,
             },
@@ -1182,5 +1202,166 @@ async fn a_page_that_is_exactly_full_is_not_called_truncated() {
         !body.contains("Showing the first"),
         "a complete list of exactly the page size is labelled truncated, telling a customer \
          their vendor is withholding connections that do not exist: {body}"
+    );
+}
+
+/// Every provider gets ITS OWN guide, naming ITS OWN connection, carrying THIS deployment's URL.
+///
+/// # Issue #140 criterion 4, and the half of it that is easy to fake
+///
+/// "Setup guides render per IdP with correct copy-paste values for the specific connection being
+/// configured." A page carrying one generic guide would satisfy a test that only looked for the
+/// word "SCIM", so this asserts the discriminating parts: each provider's guide names the field
+/// ITS console calls the URL (Okta's Base URL, Entra's Tenant URL), each guide is attached to the
+/// connection it configures by name, and the URL in them is this deployment's own rather than a
+/// literal.
+#[tokio::test]
+async fn each_connection_gets_its_own_providers_setup_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    connect_with_provider(&harness, &org, "okta-primary", "okta", "g-a", None).await;
+    connect_with_provider(&harness, &org, "entra-secondary", "entra", "g-b", None).await;
+    connect_with_provider(&harness, &org, "homegrown", "generic", "g-c", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-guides", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // ONE GUIDE PER CONNECTION, each naming the connection it belongs to. An organization with
+    // two providers needs to know which steps go with which row.
+    for (name, provider) in [
+        ("okta-primary", "Okta"),
+        ("entra-secondary", "Microsoft Entra ID"),
+        ("homegrown", "your identity provider"),
+    ] {
+        let heading = format!("Set up {name} in {provider}");
+        assert!(
+            body.contains(&heading),
+            "no guide headed {heading:?}, so this connection's steps are missing or are filed \
+             under another connection: {body}"
+        );
+    }
+
+    // THE STEPS ARE THE PROVIDER'S OWN, not one generic set relabelled. Each console calls the
+    // endpoint something different, and pasting into the wrong field is the failure these guides
+    // exist to prevent.
+    assert!(
+        body.contains("Base URL field"),
+        "the Okta guide does not name the field Okta calls the endpoint: {body}"
+    );
+    assert!(
+        body.contains("Tenant URL field"),
+        "the Entra guide does not name the field Entra calls the endpoint: {body}"
+    );
+    assert!(
+        body.contains("Secret Token field"),
+        "the Entra guide does not name the field Entra calls the token: {body}"
+    );
+    assert!(
+        body.contains("API Token field"),
+        "the Okta guide does not name the field Okta calls the token: {body}"
+    );
+
+    // AND THE URL IS THIS DEPLOYMENT'S, in every guide. Asserting merely that "/scim/v2" appears
+    // would be satisfied by a hardcoded literal, which is what a guide copied from a vendor
+    // document would contain.
+    let scope_path = format!("/t/{}/e/{}", scope.tenant(), scope.environment());
+    let deployment_base = harness
+        .issuer()
+        .strip_suffix(&scope_path)
+        .expect("the per-environment issuer is the deployment base plus the scope path");
+    let expected = format!("{deployment_base}/scim/v2");
+    assert_eq!(
+        body.matches(&expected).count(),
+        4,
+        "the deployment's own SCIM URL must appear once above the table and once in each of the \
+         three guides; a guide carrying a different URL is one a customer would paste: {body}"
+    );
+
+    // NO GUIDE OFFERS THE TOKEN, because no reader can produce it: the store holds a digest and
+    // the plaintext existed once, in the response that minted it. Every guide says where it
+    // comes from instead.
+    assert_eq!(
+        body.matches("ask your vendor to rotate it").count(),
+        3,
+        "a guide does not say where the token comes from, which is the one value it cannot show \
+         and the one an admin will not otherwise have: {body}"
+    );
+}
+
+/// A revoked connection gets no guide, and a deployment serving no SCIM gets none at all.
+///
+/// # Both are the same mistake: instructions that cannot succeed
+///
+/// Configuring an identity provider against a credential an operator has switched off is wasted
+/// work, and pasting a URL this deployment answers 404 for is worse -- the admin has no way to
+/// tell the setup failed for a reason on the vendor's side.
+#[tokio::test]
+async fn no_guide_is_offered_for_work_that_cannot_succeed() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let live = connect_with_provider(&harness, &org, "still-working", "okta", "g-live", None).await;
+    let dead = connect_with_provider(&harness, &org, "switched-off", "entra", "g-dead", None).await;
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &dead, now_micros(&harness))
+        .await
+        .expect("revoke");
+
+    let cookie = open_session_in(&harness, "scim", "tok-g2", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE CONTROL: the live connection does get one, so the absence below is the revocation.
+    assert!(
+        body.contains("Set up still-working in Okta"),
+        "the live connection has no guide, so the absence asserted next proves nothing: {body}"
+    );
+    assert!(
+        !body.contains("Set up switched-off in"),
+        "a revoked connection is offered setup steps that cannot succeed: {body}"
+    );
+    let _ = live;
+
+    // AND WITH THE SURFACE OFF, no guide at all -- the steps would point at a 404.
+    let dark = Harness::start_store_backed_with_scim_surface(false).await;
+    let dark_org = seed_org(&dark, "Acme").await;
+    connect_with_provider(&dark, &dark_org, "hopeful", "okta", "g-dark", None).await;
+    let dark_cookie = open_session_in(&dark, "scim", "tok-g3", &dark_org).await;
+    let dark_scope = dark.scope();
+    let dark_path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        dark_scope.tenant(),
+        dark_scope.environment()
+    );
+    let (status, dark_body) = get_with_cookie(&dark, &dark_path, Some(&dark_cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {dark_body}");
+    assert!(
+        !dark_body.contains("Setting up your identity provider"),
+        "a deployment that serves no provisioning offers setup steps for it: {dark_body}"
+    );
+    assert!(
+        dark_body.contains("hopeful"),
+        "the connection itself vanished along with its guide: {dark_body}"
     );
 }

@@ -159,6 +159,7 @@ mod phone;
 /// CLI would recreate exactly that.
 pub mod pkce;
 mod policy_trace;
+mod portal_guides;
 pub mod portal_route;
 pub mod pow;
 mod pow_gate;

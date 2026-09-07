@@ -517,6 +517,10 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     };
 
     let lead = state.scim_token_expiry_warning_secs();
+    // DERIVED ONCE, and used by the paragraph above the table AND by every setup guide below it.
+    // Two derivations of one deployment's endpoint is how a page comes to print two different
+    // URLs, and the guides are the half a customer actually pastes from.
+    let scim_base = format!("{}/scim/v2", state.issuer_base());
     let truncated = connections.len() > usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
     let shown = connections
         .iter()
@@ -565,6 +569,46 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     if connections.is_empty() {
         rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
     }
+    // ONE GUIDE PER CONNECTION, keyed on that connection's own provider (issue #140 criterion 4:
+    // "setup guides render per IdP with correct copy-paste values for the specific connection
+    // being configured"). Per CONNECTION rather than per distinct provider, because an
+    // organization with an Okta connection and an Entra one needs to know which set of steps
+    // belongs to which -- and a guide that named no connection would leave them guessing exactly
+    // where a generic vendor document already leaves them.
+    //
+    // ONLY WHERE THE ENDPOINT IS SERVED. With the surface off the steps would tell a customer to
+    // paste a URL this deployment answers 404 for, which is the same defect the endpoint
+    // paragraph above already refuses to commit.
+    //
+    // AND NOT FOR A REVOKED CONNECTION: configuring an identity provider against a credential an
+    // operator has switched off is work that cannot succeed.
+    let mut guides = String::new();
+    if state.scim_surface_enabled() {
+        for connection in connections
+            .iter()
+            .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX))
+            .filter(|connection| !connection.revoked)
+        {
+            let guide = crate::portal_guides::guide_for(&connection.provider, &scim_base);
+            let mut steps = String::new();
+            for step in &guide.steps {
+                let _ = write!(steps, "<li>{}</li>", escape_html(step));
+            }
+            let _ = write!(
+                guides,
+                "<details><summary>Set up {name} in {provider}</summary>\
+                 <p>{where_to_go}</p><ol>{steps}</ol></details>",
+                name = escape_html(&connection.display_name),
+                provider = escape_html(guide.provider_name),
+                where_to_go = escape_html(guide.where_to_go),
+                steps = steps,
+            );
+        }
+        if !guides.is_empty() {
+            guides.insert_str(0, "<h2>Setting up your identity provider</h2>");
+        }
+    }
+
     if truncated {
         let _ = write!(
             rows,
@@ -581,8 +625,8 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     // started" with the portal's own instructions as evidence that it should have.
     let endpoint = if state.scim_surface_enabled() {
         format!(
-            "<h2>Where your provisioning client connects</h2><p><code>{base}/scim/v2</code></p>",
-            base = escape_html(state.issuer_base()),
+            "<h2>Where your provisioning client connects</h2><p><code>{base}</code></p>",
+            base = escape_html(&scim_base),
         )
     } else {
         "<h2>Where your provisioning client connects</h2>\
@@ -596,10 +640,12 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          {endpoint}\
          <h2>Your connections</h2>\
          <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th></tr></thead>\
-         <tbody>{rows}</tbody></table>",
+         <tbody>{rows}</tbody></table>\
+         {guides}",
         organization = escape_html(&session.organization().to_string()),
         endpoint = endpoint,
         rows = rows,
+        guides = guides,
     );
     crate::pages::secure_html(StatusCode::OK, body)
 }
