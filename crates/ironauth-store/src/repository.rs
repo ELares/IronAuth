@@ -257,6 +257,19 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// Which certificate expiry notices are due, and the record of those already sent (#141).
+    ///
+    /// ON THE CONTROL PLANE. Deciding that a customer should be told their identity provider's
+    /// certificate is about to expire reads the contact list, which 0207 grants to the control
+    /// role alone, and writes an audited notification. Signing people in has no part in it.
+    #[must_use]
+    pub fn saml_certificate_alerts(&self) -> SamlCertificateAlertRepo<'a> {
+        SamlCertificateAlertRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// The self-service portal entry links for this scope (issue #140).
     ///
     /// ON THE DATA PLANE because redeeming one is what a customer's IT admin does in a browser,
@@ -76848,6 +76861,136 @@ impl PortalLinkRepo<'_> {
                 .map_err(|_| StoreError::NotFound)?,
             intent,
         })
+    }
+}
+
+/// One certificate that has entered a configured lead window and has not been announced for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueCertificateAlert {
+    /// The certificate, `saml_connection_certificates.id`.
+    pub certificate_id: String,
+    /// The connection it is pinned on, so a caller can find the organization to notify.
+    pub connection_id: String,
+    /// The lead this row is due for, in seconds. One certificate can be due for MORE THAN ONE
+    /// lead on a single pass -- a sweep that has not run for a month crosses several at once --
+    /// and each is its own entry here rather than being collapsed to the nearest.
+    pub lead_secs: i64,
+    /// When the certificate stops being valid, epoch microseconds.
+    pub not_after_unix_micros: i64,
+}
+
+/// The certificate expiry alert ledger for one scope (issue #141).
+pub struct SamlCertificateAlertRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SamlCertificateAlertRepo<'_> {
+    /// Every (certificate, lead) pair inside its window at `now` that has not been announced.
+    ///
+    /// # What "inside its window" means
+    ///
+    /// A certificate is due for lead L when it expires within L of now AND has not already
+    /// expired. The second half is deliberate: once a certificate is past `not_after` the
+    /// connection is already broken, and a "expires in 3 days" notice about a certificate that
+    /// died last week is worse than silence -- it tells an operator the wrong thing about how
+    /// much time they have. Expiry itself is a different event and belongs to connection health.
+    ///
+    /// # Ordered, and why it matters here
+    ///
+    /// Soonest expiry first, then certificate, then lead. A sweep that is behind will find more
+    /// work than it can send in one pass, and the certificates closest to breaking are the ones
+    /// whose notices matter most.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn due(
+        &self,
+        now_unix_micros: i64,
+        leads_secs: &[i64],
+        limit: i64,
+    ) -> Result<Vec<DueCertificateAlert>, StoreError> {
+        if leads_secs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT c.id AS certificate_id, c.connection_id, l.lead_secs, \
+                    (EXTRACT(EPOCH FROM c.not_after) * 1000000)::bigint AS not_after_us \
+             FROM saml_connection_certificates c \
+             CROSS JOIN UNNEST($3::bigint[]) AS l(lead_secs) \
+             LEFT JOIN saml_certificate_expiry_alerts a \
+                    ON a.tenant_id = c.tenant_id \
+                   AND a.environment_id = c.environment_id \
+                   AND a.certificate_id = c.id \
+                   AND a.lead_secs = l.lead_secs \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 \
+               AND a.certificate_id IS NULL \
+               AND c.not_after > TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+               AND c.not_after <= TIMESTAMPTZ 'epoch' \
+                                  + ($4::text || ' microseconds')::interval \
+                                  + (l.lead_secs * INTERVAL '1 second') \
+             ORDER BY c.not_after, c.id, l.lead_secs \
+             LIMIT $5",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(leads_secs)
+        .bind(now_unix_micros)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| DueCertificateAlert {
+                certificate_id: row.get("certificate_id"),
+                connection_id: row.get("connection_id"),
+                lead_secs: row.get("lead_secs"),
+                not_after_unix_micros: row.get("not_after_us"),
+            })
+            .collect())
+    }
+
+    /// Record that the notice for one (certificate, lead) has gone out.
+    ///
+    /// THE INSERT IS THE CHECK, as `admit_assertion` is for the replay cache: the primary key
+    /// makes a second attempt a unique violation inside the caller's own transaction, so two
+    /// sweeps racing over one certificate send exactly one notice between them. A read-then-write
+    /// cannot give that, and a sweep is the kind of job an operator ends up running twice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] when this (certificate, lead) was already announced -- which the
+    /// caller should treat as "somebody else sent it", not as a failure;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn record_sent(
+        &self,
+        certificate_id: &str,
+        lead_secs: i64,
+        at_unix_micros: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO saml_certificate_expiry_alerts \
+             (tenant_id, environment_id, certificate_id, lead_secs, alerted_at) \
+             VALUES ($1, $2, $3, $4, \
+                     TIMESTAMPTZ 'epoch' + ($5::text || ' microseconds')::interval) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(certificate_id)
+        .bind(lead_secs)
+        .bind(at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
     }
 }
 

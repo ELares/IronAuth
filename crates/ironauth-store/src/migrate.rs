@@ -1702,6 +1702,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0207_org_contacts.sql"),
         },
+        Migration {
+            version: 208,
+            name: "saml_certificate_expiry_alerts",
+            // EXPAND. A new table with no writer on any older binary, so nothing reads or writes
+            // it during a rolling upgrade and there is nothing to backfill.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0208_saml_certificate_expiry_alerts.sql"),
+        },
     ]
 }
 

@@ -1017,6 +1017,13 @@ name = "saml_connections"
 path = "tests/saml_connections.rs"
 required-features = ["testing"]
 
+# The expiry-alert ledger for those trust anchors (issue #141): which notices are due and which
+# have gone out. Its own file because the questions are about COUNTING notices, not about trust.
+[[test]]
+name = "saml_certificate_alerts"
+path = "tests/saml_certificate_alerts.rs"
+required-features = ["testing"]
+
 # What makes a SAML response usable exactly once. Separate from the connection file because the
 # property it measures is a concurrency property, and #139 asks for it to be proven as one.
 [[test]]
