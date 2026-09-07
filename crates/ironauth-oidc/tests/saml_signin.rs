@@ -543,6 +543,206 @@ async fn a_second_assertion_signs_in_the_same_person_rather_than_forking_the_acc
 }
 
 #[tokio::test]
+async fn a_second_assertion_refreshes_the_traits_it_carries() {
+    // THE OTHER HALF OF "CREATE ON FIRST AND UPDATE ON SUBSEQUENT" (issue #139). Its sibling
+    // above proves the second assertion does not FORK the account, which is the failure everyone
+    // thinks of. It says nothing about whether anything was UPDATED: an implementation that
+    // resolved the existing user and then ignored the assertion entirely passes it, and the
+    // account silently keeps whatever the person's details were on the day they first signed in.
+    //
+    // WHY THAT MATTERS HERE RATHER THAN BEING A NICETY. The directory is the authority for these
+    // values; that is the whole premise of federated sign-in. Somebody changes their surname, or
+    // an address is corrected after a typo, and the vendor keeps notifying and displaying the old
+    // one forever. The failure is silent on both sides: the identity provider shows the change
+    // applied, and nothing here reports having dropped it.
+    let harness = Harness::start_store_backed().await;
+    // A TRAIT SCHEMA AND A MAPPING, both of which this test needs before it can say anything
+    // about updating: with no schema the mapped write fails closed and the sign-in answers 500,
+    // and with no mapping no trait is written at all. Neither failure has anything to do with
+    // the property under test, so both are set up here rather than discovered in an assertion.
+    seed_trait_schema(&harness).await;
+    let wired = wire(
+        &harness,
+        ISSUER,
+        &json!({"traits": {"email": {"source": ["email"], "required": false}}}),
+    )
+    .await;
+
+    // FIRST: the person signs in with the address the directory then held. The NameID is a
+    // directory id and the address is an ATTRIBUTE, following the lesson its neighbour records:
+    // if the two were the same string, a build that ignored every mapping and wrote the NameID
+    // into every trait would pass.
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(
+            &wired,
+            harness.env(),
+            ISSUER,
+            "_u1",
+            "uid=ada,ou=people",
+            &[("email", "ada.lovelace@acme.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    let traits = trait_emails(&harness).await;
+    assert!(
+        traits.contains(&"ada.lovelace@acme.example".to_owned()),
+        "the first assertion's trait was not stored at all: {traits:?}"
+    );
+
+    // THEN: the same person, same NameID, and the directory now carries a different address.
+    let (status, _, body) = post(
+        &harness,
+        &wired,
+        &signed(
+            &wired,
+            harness.env(),
+            ISSUER,
+            "_u2",
+            "uid=ada,ou=people",
+            &[("email", "ada.byron@acme.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+
+    // ONE PERSON, CARRYING THE NEW VALUE AND NOT THE OLD ONE. Both halves are asserted: the
+    // account must not have forked (which would show two entries), and the stale value must be
+    // GONE rather than sitting beside the new one, because a reader picking either is a reader
+    // that sometimes picks the wrong one.
+    let people = users(&harness, harness.scope()).await;
+    assert_eq!(people.len(), 1, "the update forked the account: {people:?}");
+
+    // ONE PERSON CARRYING EXACTLY THE NEW VALUE. Stated as an equality over the whole list
+    // rather than as "contains the new" plus "does not contain the old": with one account those
+    // two are the SAME assertion, since a one-element list containing the new value cannot also
+    // contain the old, and the second one could never have failed. An equality says the thing
+    // once and can fail on either side of it.
+    let traits = trait_emails(&harness).await;
+    assert_eq!(
+        traits,
+        vec!["ada.byron@acme.example".to_owned()],
+        "the account does not carry exactly the address the second assertion asserted, so either \
+         the update was dropped or the superseded value is still readable: {traits:?}"
+    );
+}
+
+/// One vendor-shaped login fixture (issue #139).
+///
+/// See `tests/fixtures/saml/PROVENANCE.md` for what a green run does and does not claim.
+#[derive(serde::Deserialize)]
+struct VendorFixture {
+    vendor: String,
+    issuer: String,
+    nameid_format: String,
+    nameid: String,
+    attributes: Vec<(String, String)>,
+    mapping: serde_json::Value,
+    expect_email: String,
+}
+
+#[tokio::test]
+async fn an_okta_and_an_entra_shaped_assertion_both_sign_in_through_their_own_mapping() {
+    // #139 CRITERION 1 asks that login completes "against Okta and Entra SAML fixtures". The
+    // suite had no fixture NAMED for either vendor and none carrying a vendor's own vocabulary
+    // end to end -- the mapping test beside this one does drive a `urn:oid:` name against a
+    // short one, so per-connection mapping was measured, but nothing said the mapper copes with
+    // what Okta and Entra actually send. Those vocabularies are the part that differs in practice -- Okta sends short
+    // names like `email`, Entra sends `schemas.xmlsoap.org` claim URIs, and their NameID formats
+    // differ too (an address versus an opaque persistent id).
+    //
+    // ONE TEST OVER TWO FIXTURES, DELIBERATELY. Driving them through one loop is what makes a
+    // hardcoded reading of any single attribute name fail: the mapping travels WITH the fixture,
+    // so a build that ignored `source` and always read `email` signs the Okta fixture in and
+    // fails the Entra one.
+    let fixtures: Vec<VendorFixture> = [
+        include_str!("fixtures/saml/okta_login.json"),
+        include_str!("fixtures/saml/entra_login.json"),
+    ]
+    .iter()
+    .map(|raw| serde_json::from_str(raw).expect("a vendor fixture parses"))
+    .collect();
+    // THE PROPERTY THE PAIR EXISTS FOR, GUARDED WHERE IT LIVES. What makes a hardcoded reader
+    // fail is that NEITHER fixture carries an attribute named by the OTHER'S mapping source: if
+    // the Entra document also carried an `email` attribute, a build that ignored `source` and
+    // always read `email` would sign BOTH in and the pair would silently stop measuring
+    // per-connection mapping.
+    //
+    // Two earlier guards here were adjacent to that property rather than it. A count over a
+    // two-element array could not fail at all; comparing `attributes[0]` only compares the FIRST
+    // entry, so adding `email` further down the Entra list -- the natural "make it more
+    // realistic" edit -- leaves it green while the property dies.
+    for (mine, theirs) in [(0_usize, 1_usize), (1, 0)] {
+        let their_sources: Vec<&str> = fixtures[theirs].mapping["traits"]
+            .as_object()
+            .expect("a traits mapping")
+            .values()
+            .filter_map(|entry| entry["source"].as_array())
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        for (name, _) in &fixtures[mine].attributes {
+            assert!(
+                !their_sources.contains(&name.as_str()),
+                "the {} fixture carries {name:?}, which is a mapping source of the {} fixture, \
+                 so a build that ignored `source` would sign both in",
+                fixtures[mine].vendor,
+                fixtures[theirs].vendor,
+            );
+        }
+    }
+
+    for fixture in fixtures {
+        let harness = Harness::start_store_backed().await;
+        seed_trait_schema(&harness).await;
+        // THE CONNECTION'S NameID FORMAT MUST MATCH THE DOCUMENT'S, which is a property of this
+        // surface rather than of the fixture: `examine` refuses a mismatch before anything about
+        // mapping runs, so a test varying one has to vary both.
+        let wired = wire_with_format(
+            &harness,
+            &fixture.issuer,
+            &fixture.mapping,
+            &fixture.nameid_format,
+        )
+        .await;
+
+        let attributes: Vec<(&str, &str)> = fixture
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let response = signed_inner(
+            &wired,
+            harness.env(),
+            &fixture.issuer,
+            "_vendor1",
+            &fixture.nameid,
+            &fixture.nameid_format,
+            &attributes,
+        );
+        let (status, _, body) = post(&harness, &wired, &response).await;
+        assert_eq!(
+            status, 303,
+            "the {} fixture did not sign in: {body}",
+            fixture.vendor
+        );
+
+        // THE MAPPED ADDRESS, not the NameID. For the Entra fixture those are very different --
+        // the NameID is an opaque persistent id -- so a build that wrote the NameID into every
+        // trait cannot pass this, and for Okta the two coincide by the vendor's own convention,
+        // which is why the pair is driven together rather than either alone.
+        let traits = trait_emails(&harness).await;
+        assert!(
+            traits.contains(&fixture.expect_email),
+            "the {} fixture's mapped address is not what was stored: {traits:?}",
+            fixture.vendor
+        );
+    }
+}
+
+#[tokio::test]
 async fn two_organizations_sharing_one_identity_provider_are_two_people() {
     // THE OBJECTION THAT TOOK THE FIRST ATTEMPT APART, as a test, and in the shape that actually
     // reaches it. Migration 0196 makes `idp_entity_id` unique per (tenant, environment,

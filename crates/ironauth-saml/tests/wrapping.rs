@@ -28,7 +28,12 @@
 use ironauth_jose::xmldsig::test_util::XmlTestKey;
 use ironauth_saml::{Limits, TrustAnchor, VerifyError, verify};
 
-/// The XMLDSIG namespace, for the rows that name a signature element.
+/// Standard base64, which is what an `X509Certificate` element carries.
+fn base64_standard(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// The key, the anchor, and a document that really verifies.
@@ -273,6 +278,139 @@ fn a_valid_signature_from_an_unpinned_key_is_refused() {
         "Assertion",
     )
     .expect("the signer's own key verifies it");
+}
+
+/// THE EMBEDDED FIXTURE IS A CERTIFICATE THIS CRATE'S OWN READER ACCEPTS.
+///
+/// The test below is only as strong as that. Its first version embedded a raw EC point, and a
+/// verifier that read the field, failed to parse it and fell back to its anchors reached the same
+/// verdict as one that never looked -- so the regression survived, and the "mutation caught"
+/// claim published with it was scoped to a shape XMLDSIG does not define. This asserts the
+/// premise directly, so the fixture cannot quietly stop being consumable while the test above it
+/// keeps passing for the wrong reason.
+#[test]
+fn the_embedded_certificate_fixture_parses_as_x509() {
+    let key = XmlTestKey::generate();
+    let der = ironauth_saml::test_util::certificate_carrying(&key.public_point());
+    let pinned = ironauth_saml::x509::pinned(&der)
+        .expect("the embedded fixture must be a certificate an X.509 reader accepts");
+    // AND IT CARRIES THE KEY IT WAS BUILT AROUND, so a reader that consults it gets the
+    // attacker's key rather than something inert.
+    assert_eq!(
+        pinned.key,
+        TrustAnchor::EcdsaP256(key.public_point()),
+        "the certificate does not carry the point it was built around"
+    );
+}
+
+/// AND IT IS STILL REFUSED WHEN THE ATTACKER SHIPS THEIR OWN CERTIFICATE INSIDE THE RESPONSE
+/// (issue #139, the CVE-2026-9090 class).
+///
+/// THE ATTACK. A verifier that resolves its signing key from the document it is verifying can be
+/// handed both halves at once: the attacker signs with a key they own and encloses the matching
+/// certificate in `ds:KeyInfo`. Everything is internally consistent, so the signature checks out,
+/// and the only thing that ever said WHOSE assertion this is was the certificate the attacker
+/// chose. That is how a SAML implementation gets forged assertions accepted while every crypto
+/// operation in it succeeds.
+///
+/// WHY THIS TEST AND NOT THE ONE ABOVE. The sibling case proves an unpinned key is refused when
+/// the document says nothing about its signer, and it cannot see this bug: a verifier that
+/// started reading `KeyInfo` would still PASS it, because the documents it builds carry none and
+/// so nothing changes for them. No fixture in this workspace put a `ds:KeyInfo` INSIDE a
+/// `ds:Signature` -- the only placement a signer-resolving verifier would read -- so the claim
+/// that `KeyInfo` is ignored rested on reading the parser, a structural argument of exactly the
+/// kind that stops being true when somebody adds the field and no test notices.
+///
+/// NOT "no KeyInfo anywhere", which two earlier versions of this sentence said and which is
+/// plainly false: the SP metadata this deployment publishes carries one, and `encrypted.rs`
+/// reads one on an INBOUND response as the container for an `xenc:EncryptedKey`. Neither is a
+/// signer, and neither reaches a signature check.
+///
+/// The splice is free for the attacker, which is the point: `KeyInfo` sits OUTSIDE `SignedInfo`,
+/// so adding it does not disturb a signature that was already valid over the rest.
+#[test]
+fn a_valid_signature_is_refused_even_when_the_response_embeds_the_signers_certificate() {
+    let attacker = XmlTestKey::generate();
+    // A REAL DER CERTIFICATE carrying the attacker's key, because a plausible-looking blob is not
+    // enough: a verifier that reads the field, fails to parse it, and falls back to its anchors
+    // reaches the same verdict as one that never looked, so the regression would survive.
+    let embedded = base64_standard(&ironauth_saml::test_util::certificate_carrying(
+        &attacker.public_point(),
+    ));
+    let document = ironauth_saml::test_util::signed_element_with_key_info(
+        &attacker,
+        "saml:Assertion",
+        r#" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion""#,
+        "_assertion",
+        &[
+            "<saml:Issuer>urn:idp</saml:Issuer>",
+            "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
+        ]
+        .concat(),
+        &embedded,
+    );
+
+    // The document really does carry the certificate, so a passing run is not passing because the
+    // splice silently did nothing.
+    assert!(
+        document.contains("<ds:X509Certificate>") && document.contains(&embedded),
+        "the fixture did not embed the certificate it is supposed to: {document}"
+    );
+
+    // PINNED: SOMEBODY ELSE. The deployment trusts the identity provider it configured, and the
+    // attacker is not it.
+    let genuine = XmlTestKey::generate();
+    let anchors = vec![TrustAnchor::EcdsaP256(genuine.public_point())];
+    assert_eq!(
+        verify(
+            document.as_bytes(),
+            &Limits::default(),
+            &anchors,
+            ironauth_saml::ASSERTION_NS,
+            "Assertion"
+        ),
+        Err(VerifyError::SignatureInvalid),
+        "an assertion was accepted on the strength of a certificate it carried itself"
+    );
+
+    // TWO CONTROLS, because the refusal above has two uninteresting explanations.
+    //
+    // First: the document is not malformed. Pin the attacker and it verifies -- so the refusal
+    // was about WHOSE key it is, not about the KeyInfo block breaking the parse.
+    let anchors = vec![TrustAnchor::EcdsaP256(attacker.public_point())];
+    verify(
+        document.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        ironauth_saml::ASSERTION_NS,
+        "Assertion",
+    )
+    .expect("the embedded-certificate document is well formed and verifies against its signer");
+
+    // Second: the genuine key is not simply refusing everything. Its own assertion, carrying the
+    // ATTACKER's certificate in KeyInfo, still verifies -- so a document is judged by the key
+    // that signed it and never by the certificate it advertises, in both directions.
+    let genuine_document = ironauth_saml::test_util::signed_element_with_key_info(
+        &genuine,
+        "saml:Assertion",
+        r#" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion""#,
+        "_assertion",
+        &[
+            "<saml:Issuer>urn:idp</saml:Issuer>",
+            "<saml:Subject><saml:NameID>victim@example.test</saml:NameID></saml:Subject>",
+        ]
+        .concat(),
+        &embedded,
+    );
+    let anchors = vec![TrustAnchor::EcdsaP256(genuine.public_point())];
+    verify(
+        genuine_document.as_bytes(),
+        &Limits::default(),
+        &anchors,
+        ironauth_saml::ASSERTION_NS,
+        "Assertion",
+    )
+    .expect("a genuine assertion is not refused for advertising somebody else's certificate");
 }
 
 /// AN EMPTY ANCHOR LIST VERIFIES NOTHING.

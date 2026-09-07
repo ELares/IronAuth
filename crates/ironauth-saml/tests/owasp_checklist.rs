@@ -373,11 +373,21 @@ const CHEAT_SHEET: &[Item] = &[
     Item {
         control: "Never take the trust anchor from the document (embedded certificates)",
         coverage: Coverage::Tests(&[
+            "a_valid_signature_is_refused_even_when_the_response_embeds_the_signers_certificate",
+            "the_embedded_certificate_fixture_parses_as_x509",
             "a_valid_signature_from_an_unpinned_key_is_refused",
             "no_pinned_key_means_no_signature_verifies",
         ]),
-        rationale: "Anchors are a caller-supplied argument and `KeyInfo` is never read. The \
-                    first test carries a document with a genuinely valid self-signature.",
+        rationale: "Anchors are a caller-supplied argument and `KeyInfo` is never read. THE \
+                    FIRST TEST IS THE ONE THAT MEASURES THIS CONTROL: it presents a document \
+                    carrying the attacker's own certificate, which is the shape the control is \
+                    named for. The two listed after it cannot see that bug at all -- their \
+                    documents carry no `KeyInfo`, so a verifier that began resolving one would \
+                    still pass them -- and this row named only those two until #139. The second \
+                    test pins the first one's premise: the embedded blob must be a certificate \
+                    an X.509 reader accepts, because a blob that will not parse leaves a \
+                    KeyInfo-reading verifier falling back to its anchors and reaching the right \
+                    answer for the wrong reason.",
     },
     Item {
         control: "Enforce a signature algorithm allowlist and exclude SHA-1",

@@ -552,6 +552,70 @@ async fn an_unsolicited_response_on_an_opted_in_connection_is_still_replay_prote
 }
 
 #[tokio::test]
+async fn the_replay_cache_refuses_an_assertion_whose_recorded_expiry_has_passed() {
+    // #139 CRITERION 4 asks that a replayed assertion id "is rejected by the replay cache FOR THE
+    // FULL VALIDITY WINDOW". Its sibling above replays immediately; what THAT leaves open is
+    // whether the refusal has a time bound at all.
+    //
+    // TWO EARLIER VERSIONS OF THIS TEST MEASURED NOTHING, and both failures are worth recording
+    // because they look like progress. The first replayed at a clock PAST the window: the
+    // assertion's own conditions are checked before the cache, so the answer was
+    // `Condition(Expired)` and the cache was never consulted -- that test passed against a cache
+    // deleted outright. The second moved the clock to the far edge of the window instead, which
+    // fixed the conditions problem and still measured nothing NEW: the cache is keyed on the
+    // primary key with NO time predicate, so moving the ACS clock reaches nothing the cache
+    // reads, and it killed no mutation its immediate-replay sibling does not.
+    //
+    // WHAT ACTUALLY DISTINGUISHES A BOUNDED CACHE FROM AN UNBOUNDED ONE is the row's OWN
+    // `expires_at`, so this seeds one that has already passed and then presents the assertion.
+    // 0198 records that column and NOTHING READS IT -- the check is the primary key, so an
+    // assertion is refused for as long as its row exists, which with no sweep is for ever. That
+    // is strictly stronger than the criterion asks, and the migration writes the discrepancy down
+    // rather than leaving it to be found.
+    //
+    // WHAT THIS DOES AND DOES NOT DEMONSTRATE. It documents the retention property against a row
+    // whose recorded expiry has passed, which its immediate-replay sibling cannot do. It is NOT
+    // demonstrated that this test alone goes red when the cache is narrowed: every narrowing
+    // tried -- a sweep on admission, and a conditional upsert keyed on `expires_at` -- also
+    // breaks the sibling, so no mutation isolates this one. Saying that is better than the
+    // sentence that stood here, which promised an isolation the commit introducing it admitted
+    // it had not found.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let fixture = fixture(&db, &env, true).await;
+    let replay = db.store().scoped(fixture.scope).saml_replay();
+
+    // SEEN LONG AGO, AND RECORDED AS EXPIRED LONG AGO: a row a time-bounded cache would have
+    // forgotten, written directly so the fixture does not depend on the ACS clock at all.
+    let long_ago = (NOW - 86_400) * 1_000_000;
+    replay
+        .admit_assertion(
+            &fixture.connection.id,
+            "_assertion_stale",
+            long_ago,
+            long_ago + 300 * 1_000_000,
+        )
+        .await
+        .expect("seed a replay row whose recorded expiry is in the past");
+
+    // AND THE ASSERTION IS STILL REFUSED AS A REPLAY, at the ordinary clock, with conditions that
+    // pass -- so the refusal is the cache's and not the conditions'.
+    let response = signed(&fixture.key, "_assertion_stale", None);
+    let outcome = consume(&replay, &fixture.acs(), response.as_bytes()).await;
+    assert!(
+        matches!(outcome, Err(AcsError::Replayed)),
+        "the replay cache forgot an assertion once its recorded expiry passed: {outcome:?}"
+    );
+
+    // THE CONTROL: an assertion with NO row is admitted at that same clock, so the refusal above
+    // is about the seeded row and not about anything this fixture does to every document.
+    let fresh = signed(&fixture.key, "_assertion_stale_control", None);
+    consume(&replay, &fixture.acs(), fresh.as_bytes())
+        .await
+        .expect("a never-seen assertion is admitted at this clock");
+}
+
+#[tokio::test]
 async fn a_response_for_another_service_provider_is_refused_on_its_audience() {
     // CVE-2026-9093 THROUGH THE PIPELINE rather than through `check` alone: what this adds is
     // that the audience compared is the CONNECTION'S `sp_entity_id`, read from the row, and not

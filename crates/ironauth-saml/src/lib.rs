@@ -525,6 +525,135 @@ pub mod test_util {
         wrap(&with_signature(&assertion, &signed_info, &value))
     }
 
+    /// An X.509 certificate whose `SubjectPublicKeyInfo` carries `point` (a P-256 public key).
+    ///
+    /// # Why this lives here rather than in a test file
+    ///
+    /// `signed_element_with_key_info` is only useful with a certificate a reader can CONSUME, so
+    /// the builder belongs beside it. `tests/certificates.rs` keeps its own DER primitives on
+    /// purpose: that file's subject is MALFORMED encodings, and it needs to bend each rule one at
+    /// a time. This one only ever builds the well-formed shape.
+    ///
+    /// # Panics
+    ///
+    /// Never; the lengths involved are all short-form or two-byte.
+    #[must_use]
+    pub fn certificate_carrying(point: &[u8]) -> Vec<u8> {
+        const EC_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+        const P256_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+        fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if value.len() < 0x80 {
+                out.push(u8::try_from(value.len()).expect("short form"));
+            } else {
+                let bytes = value.len().to_be_bytes();
+                let significant: Vec<u8> = bytes
+                    .iter()
+                    .copied()
+                    .skip_while(|byte| *byte == 0)
+                    .collect();
+                out.push(0x80 | u8::try_from(significant.len()).expect("at most eight"));
+                out.extend_from_slice(&significant);
+            }
+            out.extend_from_slice(value);
+            out
+        }
+
+        fn integer(magnitude: &[u8]) -> Vec<u8> {
+            let mut value = Vec::new();
+            if magnitude.first().is_some_and(|byte| byte & 0x80 != 0) {
+                value.push(0);
+            }
+            value.extend_from_slice(magnitude);
+            tlv(0x02, &value)
+        }
+
+        let mut identifier = tlv(0x06, EC_OID);
+        identifier.extend_from_slice(&tlv(0x06, P256_OID));
+        let mut bits = vec![0];
+        bits.extend_from_slice(point);
+        let mut spki_body = tlv(0x30, &identifier);
+        spki_body.extend_from_slice(&tlv(0x03, &bits));
+        let key = tlv(0x30, &spki_body);
+
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&tlv(0xa0, &integer(&[2]))); // [0] EXPLICIT v3
+        tbs.extend_from_slice(&integer(&[0x01])); // serialNumber
+        tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, EC_OID))); // signature
+        tbs.extend_from_slice(&tlv(0x30, &[])); // issuer
+        let mut validity = tlv(0x17, b"260101000000Z");
+        validity.extend_from_slice(&tlv(0x17, b"271231235959Z"));
+        tbs.extend_from_slice(&tlv(0x30, &validity));
+        tbs.extend_from_slice(&tlv(0x30, &[])); // subject
+        tbs.extend_from_slice(&key);
+        let mut certificate = tlv(0x30, &tbs);
+        certificate.extend_from_slice(&tlv(0x30, &tlv(0x06, EC_OID)));
+        certificate.extend_from_slice(&tlv(0x03, &[0, 0x11, 0x22]));
+        tlv(0x30, &certificate)
+    }
+
+    /// The same as [`signed_element_with`], but the signature carries a `ds:KeyInfo` block
+    /// holding `certificate_base64` as an `X509Certificate`.
+    ///
+    /// # Why a caller needs this
+    ///
+    /// Issue #139 requires that a response signed by a valid but UNPINNED certificate is refused
+    /// "even when the certificate is embedded in the response". That is the CVE-2026-9090 class:
+    /// a verifier that reads the signer out of the document it is verifying will happily confirm
+    /// any attacker's self-signature, because the attacker supplies both halves.
+    ///
+    /// [`crate::verify`] takes its anchors as an ARGUMENT and never parses `KeyInfo`, so it is
+    /// not vulnerable -- but nothing MEASURED that, because no fixture put a `ds:KeyInfo` INSIDE
+    /// A `ds:Signature`, which is the only placement a signer-resolving verifier would read.
+    ///
+    /// SAY IT THAT WAY AND NOT MORE BROADLY, which took three attempts. `ds:KeyInfo` is all over
+    /// this crate: the SP metadata it publishes carries one, and `encrypted.rs` READS one on an
+    /// INBOUND response -- as the XML-Encryption container for an `xenc:EncryptedKey`, never as a
+    /// signer -- with fixtures that have carried it all along. Neither reaches a signature check.
+    /// So the honest form is "no fixture put one where a signature check would look", which is
+    /// the same distinction `verify.rs` already draws about X.509 parsing: "not on this path",
+    /// not "not in this crate". A structural argument that a field is ignored is exactly the kind
+    /// of claim that stops being true when somebody adds the field, and no test would notice.
+    ///
+    /// THE CERTIFICATE A CALLER PASSES SHOULD BE A REAL DER ONE. A blob that will not parse as
+    /// X.509 leaves a verifier that consults the field falling back to its anchors, reaching the
+    /// same verdict as one that never looked -- so the regression survives the test. Measured:
+    /// with a raw EC point here, an additive KeyInfo-resolving `verify` left the whole suite
+    /// green.
+    ///
+    /// # Panics
+    ///
+    /// If the document it just built does not parse, which would be a bug in this function.
+    #[must_use]
+    pub fn signed_element_with_key_info(
+        key: &ironauth_jose::xmldsig::test_util::XmlTestKey,
+        qualified: &str,
+        declarations: &str,
+        id: &str,
+        children: &str,
+        certificate_base64: &str,
+    ) -> String {
+        let signed = signed_element_with(key, qualified, declarations, id, children);
+        let key_info = [
+            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>",
+            certificate_base64,
+            "</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+        ]
+        .concat();
+        // AFTER `SignatureValue`, which is where the schema puts it, and which is also what makes
+        // this a fair test: the digest and the signature were computed over the document WITHOUT
+        // the KeyInfo, and `KeyInfo` sits outside `SignedInfo`, so splicing it in does not
+        // invalidate a signature that was already valid. An attacker gets to add it for free,
+        // which is precisely the property that makes reading it dangerous.
+        let marker = "</ds:SignatureValue>";
+        let at = signed
+            .find(marker)
+            .expect("the signature this just built has a SignatureValue")
+            + marker.len();
+        format!("{}{key_info}{}", &signed[..at], &signed[at..])
+    }
+
     fn wrap(assertion: &str) -> String {
         [
             r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" "#,
