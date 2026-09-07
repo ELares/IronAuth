@@ -37,9 +37,17 @@ covered instead by `crates/ironauth-saml/tests/wrapping.rs`, which drives
 signature wrapping, line-wrapped base64, embedded certificates, and the
 algorithm allowlist directly.
 
-Replacing a fixture with a real capture is a drop-in change: the files are data,
-with no test code to touch. When that happens, change the `source` field in the
-fixture and delete the corresponding caveat from the issue.
+Replacing these with a real capture is **not** a drop-in change, and an earlier
+version of this file claimed it was four paragraphs after explaining why it
+cannot be. A capture is a signed XML document; this format has no field that can
+hold one, and `signed_inner` synthesises the envelope and re-signs it on every
+run. Using a captured Okta response needs new test code: a field for the document,
+a pinned real certificate, and a path that does not re-sign. That is worth doing
+and it is a change to the harness, not to data.
+
+The `source` field in each fixture is prose for a reader. `VendorFixture` does not
+deserialize it and serde ignores unknown fields, so nothing checks it -- which is
+fine for a provenance note and would not be fine for anything a test relies on.
 
 | Fixture | source |
 |---|---|

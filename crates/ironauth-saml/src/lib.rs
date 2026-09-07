@@ -536,10 +536,17 @@ pub mod test_util {
     /// any attacker's self-signature, because the attacker supplies both halves.
     ///
     /// [`crate::verify`] takes its anchors as an ARGUMENT and never parses `KeyInfo`, so it is
-    /// not vulnerable -- but nothing MEASURED that, because no fixture could produce a document
-    /// carrying a `KeyInfo` at all. A structural argument that a field is ignored is exactly the
-    /// kind of claim that stops being true when somebody adds the field, and no test would have
-    /// noticed. This makes the attack expressible.
+    /// not vulnerable -- but nothing MEASURED that, because no fixture for an INBOUND assertion
+    /// could produce one. (`ds:KeyInfo` does appear elsewhere in this crate, in the SP metadata
+    /// this deployment publishes; what was missing was one on a document being verified.) A
+    /// structural argument that a field is ignored is exactly the kind of claim that stops being
+    /// true when somebody adds the field, and no test would have noticed.
+    ///
+    /// THE CERTIFICATE A CALLER PASSES SHOULD BE A REAL DER ONE. A blob that will not parse as
+    /// X.509 leaves a verifier that consults the field falling back to its anchors, reaching the
+    /// same verdict as one that never looked -- so the regression survives the test. Measured:
+    /// with a raw EC point here, an additive KeyInfo-resolving `verify` left the whole suite
+    /// green.
     ///
     /// # Panics
     ///

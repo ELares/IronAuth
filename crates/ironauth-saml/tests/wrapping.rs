@@ -34,6 +34,76 @@ fn base64_standard(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+const EC_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+const P256_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+/// A tag, a DER length, and contents.
+fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    if value.len() < 0x80 {
+        out.push(u8::try_from(value.len()).expect("checked"));
+    } else {
+        let bytes = value.len().to_be_bytes();
+        let significant: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .skip_while(|byte| *byte == 0)
+            .collect();
+        out.push(0x80 | u8::try_from(significant.len()).expect("at most eight"));
+        out.extend_from_slice(&significant);
+    }
+    out.extend_from_slice(value);
+    out
+}
+
+/// A DER INTEGER holding a non-negative number, with the sign byte a real encoder would add.
+fn integer(magnitude: &[u8]) -> Vec<u8> {
+    let mut value = Vec::new();
+    if magnitude.first().is_some_and(|byte| byte & 0x80 != 0) {
+        value.push(0);
+    }
+    value.extend_from_slice(magnitude);
+    tlv(0x02, &value)
+}
+
+/// A `SubjectPublicKeyInfo` carrying a P-256 point.
+fn spki_p256(point: &[u8]) -> Vec<u8> {
+    let mut identifier = tlv(0x06, EC_OID);
+    identifier.extend_from_slice(&tlv(0x06, P256_OID));
+    let mut bits = vec![0];
+    bits.extend_from_slice(point);
+    let mut body = tlv(0x30, &identifier);
+    body.extend_from_slice(&tlv(0x03, &bits));
+    tlv(0x30, &body)
+}
+
+/// An X.509 certificate whose `SubjectPublicKeyInfo` carries `point`.
+///
+/// A REAL DER DOCUMENT, and that is the whole point of it. An earlier version of the
+/// embedded-certificate test put the raw 65-byte EC point in the `X509Certificate` element on the
+/// reasoning that a verifier consulting the field at all is already wrong. It is not enough: a
+/// verifier that consults the field, tries to parse it as X.509 and FAILS changes no verdict, so
+/// the regression this test exists to catch survived it. Measured -- an additive KeyInfo-resolving
+/// `verify` running the blob through this crate's own `x509::pinned` left all 42 tests green.
+/// Only a certificate the reader can actually consume makes the attack reachable.
+fn certificate_carrying(point: &[u8]) -> Vec<u8> {
+    let key = spki_p256(point);
+    let mut tbs = Vec::new();
+    tbs.extend_from_slice(&tlv(0xa0, &integer(&[2]))); // [0] EXPLICIT v3
+    tbs.extend_from_slice(&integer(&[0x01])); // serialNumber
+    tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, EC_OID))); // signature
+    tbs.extend_from_slice(&tlv(0x30, &[])); // issuer
+    let mut validity = tlv(0x17, b"260101000000Z");
+    validity.extend_from_slice(&tlv(0x17, b"271231235959Z"));
+    tbs.extend_from_slice(&tlv(0x30, &validity));
+    tbs.extend_from_slice(&tlv(0x30, &[])); // subject
+    tbs.extend_from_slice(&key);
+    let mut certificate = tlv(0x30, &tbs);
+    certificate.extend_from_slice(&tlv(0x30, &tlv(0x06, EC_OID)));
+    certificate.extend_from_slice(&tlv(0x03, &[0, 0x11, 0x22]));
+    tlv(0x30, &certificate)
+}
+
 /// The XMLDSIG namespace, for the rows that name a signature element.
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
@@ -292,22 +362,23 @@ fn a_valid_signature_from_an_unpinned_key_is_refused() {
 /// operation in it succeeds.
 ///
 /// WHY THIS TEST AND NOT THE ONE ABOVE. The sibling case proves an unpinned key is refused when
-/// the document says nothing about its signer. It cannot see this bug at all: a verifier that
-/// started reading `KeyInfo` would still fail that test, because the documents it builds carry
-/// none. Until now nothing in the tree could even PRODUCE a response with a `KeyInfo`, so the
-/// claim that `KeyInfo` is ignored rested on reading the parser -- a structural argument, which
-/// is exactly the kind that stops being true when somebody adds the field and no test notices.
+/// the document says nothing about its signer, and it cannot see this bug: a verifier that
+/// started reading `KeyInfo` would still PASS it, because the documents it builds carry none and
+/// so nothing changes for them. The SAML fixtures in this workspace carried no `KeyInfo` either,
+/// so the claim that `KeyInfo` is ignored rested on reading the parser -- a structural argument,
+/// exactly the kind that stops being true when somebody adds the field and no test notices.
+/// (`ds:KeyInfo` does appear elsewhere in the tree, in the SP metadata this deployment
+/// PUBLISHES; what was missing was one on an inbound assertion.)
 ///
 /// The splice is free for the attacker, which is the point: `KeyInfo` sits OUTSIDE `SignedInfo`,
 /// so adding it does not disturb a signature that was already valid over the rest.
 #[test]
 fn a_valid_signature_is_refused_even_when_the_response_embeds_the_signers_certificate() {
     let attacker = XmlTestKey::generate();
-    // What a real attacker encloses is a DER certificate; what matters to this test is only that
-    // the field is populated and plausible, because a verifier that consults it at all is already
-    // wrong. The bytes are the attacker's own public point, base64 as an X509Certificate carries
-    // its content.
-    let embedded = base64_standard(&attacker.public_point());
+    // A REAL DER CERTIFICATE carrying the attacker's key, because a plausible-looking blob is not
+    // enough: a verifier that reads the field, fails to parse it, and falls back to its anchors
+    // reaches the same verdict as one that never looked, so the regression would survive.
+    let embedded = base64_standard(&certificate_carrying(&attacker.public_point()));
     let document = ironauth_saml::test_util::signed_element_with_key_info(
         &attacker,
         "saml:Assertion",

@@ -614,15 +614,18 @@ async fn a_second_assertion_refreshes_the_traits_it_carries() {
     // that sometimes picks the wrong one.
     let people = users(&harness, harness.scope()).await;
     assert_eq!(people.len(), 1, "the update forked the account: {people:?}");
+
+    // ONE PERSON CARRYING EXACTLY THE NEW VALUE. Stated as an equality over the whole list
+    // rather than as "contains the new" plus "does not contain the old": with one account those
+    // two are the SAME assertion, since a one-element list containing the new value cannot also
+    // contain the old, and the second one could never have failed. An equality says the thing
+    // once and can fail on either side of it.
     let traits = trait_emails(&harness).await;
-    assert!(
-        traits.contains(&"ada.byron@acme.example".to_owned()),
-        "the second assertion's trait was dropped, so the directory's change never landed: \
-         {traits:?}"
-    );
-    assert!(
-        !traits.contains(&"ada.lovelace@acme.example".to_owned()),
-        "the superseded address is still stored, so a reader can still pick it: {traits:?}"
+    assert_eq!(
+        traits,
+        vec!["ada.byron@acme.example".to_owned()],
+        "the account does not carry exactly the address the second assertion asserted, so either \
+         the update was dropped or the superseded value is still readable: {traits:?}"
     );
 }
 
@@ -660,7 +663,18 @@ async fn an_okta_and_an_entra_shaped_assertion_both_sign_in_through_their_own_ma
     .iter()
     .map(|raw| serde_json::from_str(raw).expect("a vendor fixture parses"))
     .collect();
-    assert_eq!(fixtures.len(), 2, "both vendor fixtures are loaded");
+    // THE TWO FIXTURES ARE DIFFERENT VENDORS. Asserting the COUNT could not fail -- the list is
+    // built from a two-element array -- so it said nothing. This can: it fails if one file is
+    // ever copied over the other, which would leave the loop driving one vocabulary twice and
+    // quietly stop measuring the property the pair exists for.
+    assert_ne!(
+        fixtures[0].vendor, fixtures[1].vendor,
+        "the two fixtures name the same vendor, so the pair drives one vocabulary twice"
+    );
+    assert_ne!(
+        fixtures[0].attributes[0].0, fixtures[1].attributes[0].0,
+        "the two fixtures use the same attribute name, so a hardcoded reader passes both"
+    );
 
     for fixture in fixtures {
         let harness = Harness::start_store_backed().await;

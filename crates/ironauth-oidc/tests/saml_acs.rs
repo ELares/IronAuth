@@ -552,66 +552,61 @@ async fn an_unsolicited_response_on_an_opted_in_connection_is_still_replay_prote
 }
 
 #[tokio::test]
-async fn a_replayed_assertion_stays_refused_across_its_whole_validity_window() {
+async fn the_replay_cache_refuses_an_assertion_whose_recorded_expiry_has_passed() {
     // #139 CRITERION 4 asks that a replayed assertion id "is rejected by the replay cache FOR THE
-    // FULL VALIDITY WINDOW". Its sibling above replays immediately, at one instant, which leaves
-    // the criterion's own words unmeasured: a cache that forgot the row a second later passes it.
+    // FULL VALIDITY WINDOW". Its sibling above replays immediately; what THAT leaves open is
+    // whether the refusal has a time bound at all.
     //
-    // THE WINDOW IS WHERE THIS HAS TO SIT, and finding that out corrected the first version of
-    // this test. Replaying at a clock PAST the window does not measure the cache at all: the
-    // assertion's own conditions are checked first and answer `Condition(Expired)`, so the cache
-    // is never consulted and the test passes for a reason that has nothing to do with it. What
-    // the criterion is about is the span in which the assertion would OTHERWISE still be good.
+    // TWO EARLIER VERSIONS OF THIS TEST MEASURED NOTHING, and both failures are worth recording
+    // because they look like progress. The first replayed at a clock PAST the window: the
+    // assertion's own conditions are checked before the cache, so the answer was
+    // `Condition(Expired)` and the cache was never consulted -- that test passed against a cache
+    // deleted outright. The second moved the clock to the far edge of the window instead, which
+    // fixed the conditions problem and still measured nothing NEW: the cache is keyed on the
+    // primary key with NO time predicate, so moving the ACS clock reaches nothing the cache
+    // reads, and it killed no mutation its immediate-replay sibling does not.
     //
-    // So the replay is driven near the LAST moment the assertion is still conditionally valid,
-    // against a window sized to the connection's own `max_assertion_age_secs` ceiling.
+    // WHAT ACTUALLY DISTINGUISHES A BOUNDED CACHE FROM AN UNBOUNDED ONE is the row's OWN
+    // `expires_at`, so this seeds one that has already passed and then presents the assertion.
+    // 0198 records that column and NOTHING READS IT -- the check is the primary key, so an
+    // assertion is refused for as long as its row exists, which with no sweep is for ever. That
+    // is strictly stronger than the criterion asks, and the migration writes the discrepancy down
+    // rather than leaving it to be found. This is what keeps the stronger behaviour from being
+    // narrowed silently: add a sweep, or an `expires_at` predicate to the admission check, and
+    // this test goes red while every other test in the file stays green.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let fixture = fixture(&db, &env, true).await;
     let replay = db.store().scoped(fixture.scope).saml_replay();
 
-    // A WINDOW AS LONG AS THIS CONNECTION ALLOWS: four minutes, inside the 300-second ceiling
-    // `max_assertion_age_secs` puts on the whole `NotBefore`-to-`NotOnOrAfter` span. A longer one
-    // is refused as `TooLongLived` before any of this is reached, which is a different rule.
-    let long_window = Body {
-        not_before: "2025-12-31T23:59:00Z",
-        not_on_or_after: "2026-01-01T00:03:00Z",
-        ..Body::default()
-    };
-    let response = signed_body(&fixture.key, "_assertion_window", &long_window);
-    consume(&replay, &fixture.acs(), response.as_bytes())
+    // SEEN LONG AGO, AND RECORDED AS EXPIRED LONG AGO: a row a time-bounded cache would have
+    // forgotten, written directly so the fixture does not depend on the ACS clock at all.
+    let long_ago = (NOW - 86_400) * 1_000_000;
+    replay
+        .admit_assertion(
+            &fixture.connection.id,
+            "_assertion_stale",
+            long_ago,
+            long_ago + 300 * 1_000_000,
+        )
         .await
-        .expect("an opted-in connection accepts an unsolicited response");
+        .expect("seed a replay row whose recorded expiry is in the past");
 
-    // NEAR THE FAR EDGE OF THAT WINDOW, and still inside it: one second before it closes.
-    let late = Acs {
-        connection: &fixture.connection,
-        certificates: &fixture.certificates,
-        now_unix_secs: NOW + 179,
-        limits: &fixture.limits,
-    };
-
-    // THE CONTROL FIRST: at this same clock a FRESH assertion is ACCEPTED. Without it the refusal
-    // below has a second explanation -- that the clock has moved past something -- and this is
-    // what rules it out: the window is still open, so whatever refuses the replay is the cache.
-    let fresh = signed_body(&fixture.key, "_assertion_window_fresh", &long_window);
-    consume(&replay, &late, fresh.as_bytes())
-        .await
-        .expect("the window is still open at this clock, so a fresh assertion is admitted");
-
-    // AND THE REPLAY IS STILL REPLAYED, at the far end of the window it was admitted in.
-    let again = consume(&replay, &late, response.as_bytes()).await;
+    // AND THE ASSERTION IS STILL REFUSED AS A REPLAY, at the ordinary clock, with conditions that
+    // pass -- so the refusal is the cache's and not the conditions'.
+    let response = signed(&fixture.key, "_assertion_stale", None);
+    let outcome = consume(&replay, &fixture.acs(), response.as_bytes()).await;
     assert!(
-        matches!(again, Err(AcsError::Replayed)),
-        "the replay cache forgot an assertion inside its own validity window: {again:?}"
+        matches!(outcome, Err(AcsError::Replayed)),
+        "the replay cache forgot an assertion once its recorded expiry passed: {outcome:?}"
     );
 
-    // WHAT HOLDS THIS TODAY IS STRONGER THAN THE CRITERION ASKS, and worth writing down because
-    // the column's name suggests otherwise. 0198 records `expires_at` on the replay row and
-    // NOTHING READS IT: the check is the primary key, so an assertion is refused for as long as
-    // its row exists, and with no sweep yet that is for ever. Unbounded retention covers the full
-    // window and then some. If a sweep or an `expires_at` predicate is ever added, this test is
-    // what makes the narrowing visible rather than silent.
+    // THE CONTROL: an assertion with NO row is admitted at that same clock, so the refusal above
+    // is about the seeded row and not about anything this fixture does to every document.
+    let fresh = signed(&fixture.key, "_assertion_stale_control", None);
+    consume(&replay, &fixture.acs(), fresh.as_bytes())
+        .await
+        .expect("a never-seen assertion is admitted at this clock");
 }
 
 #[tokio::test]
