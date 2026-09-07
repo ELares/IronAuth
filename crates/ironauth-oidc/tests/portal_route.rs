@@ -1295,11 +1295,20 @@ async fn each_connection_gets_its_own_providers_setup_guide() {
         .strip_suffix(&scope_path)
         .expect("the per-environment issuer is the deployment base plus the scope path");
     let expected = format!("{deployment_base}/scim/v2");
-    assert_eq!(
-        body.matches(&expected).count(),
-        4,
-        "the deployment's own SCIM URL must appear once above the table and once in each of the \
-         three guides; a guide carrying a different URL is one a customer would paste: {body}"
+    // PER GUIDE, not a page-global count. Counting occurrences cannot see WHICH guide carries the
+    // URL, so four copies in one guide and none in the others would satisfy it -- the same defect
+    // the field-name assertions beside this one were just reshaped to remove.
+    for name in ["okta-primary", "entra-secondary", "homegrown"] {
+        assert!(
+            guide(name).contains(&expected),
+            "the guide for {name} does not carry this deployment's SCIM URL, so the customer \
+             would paste an address from somewhere else: {}",
+            guide(name)
+        );
+    }
+    assert!(
+        body.contains(&format!("<code>{expected}</code>")),
+        "the endpoint paragraph above the table does not carry the deployment's URL: {body}"
     );
 
     // NO GUIDE OFFERS THE TOKEN, because no reader can produce it: the store holds a digest and
@@ -1511,5 +1520,183 @@ async fn the_guides_stop_where_the_table_stops() {
         100,
         "the guides do not stop where the table stops, so the page offers setup steps for a \
          connection it says it is not showing"
+    );
+}
+
+/// A connection that has lost its TOKENS still gets its guide; one past its own expiry does not.
+///
+/// # The positive control the filter's narrowness depends on
+///
+/// The filter suppresses a guide for a connection nothing can revive, keyed on the connection's
+/// own expiry. Keying it on `no_live_credential()` instead would be a strict superset -- the
+/// store zeroes `live_token_count` for any lapsed row before it looks at the token rows at all,
+/// so lapsed always implies no live credential -- and every other test would stay green under
+/// that broader condition.
+///
+/// What separates them is exactly one row: a connection that is live and unrevoked but whose
+/// tokens are gone. Rotation works there, the admin has a fresh token to paste, and these steps
+/// are what they need. Without this assertion the narrowness is unobservable and the next
+/// simplification silently removes the guide from the population the feature was reshaped for.
+#[tokio::test]
+async fn a_connection_that_lost_its_tokens_still_gets_its_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    let day = 24 * 60 * 60 * 1_000_000_i64;
+    let writes = || {
+        harness.db().control_store().scoped(harness.scope()).acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+    };
+
+    // THE CONNECTION OUTLIVES ITS CREDENTIALS: ninety days out, so it is neither revoked nor
+    // lapsed, while a rotation followed by revoking the fresh token leaves nothing live.
+    let stranded = connect_with_provider(
+        &harness,
+        &org,
+        "tokens-gone",
+        "okta",
+        "tg-1",
+        Some(now + 90 * day),
+    )
+    .await;
+    writes()
+        .scim_connections()
+        .rotate_token(&env, &stranded, &hex_digest("tg-2"), 60, now)
+        .await
+        .expect("rotate");
+    writes()
+        .scim_connections()
+        .revoke_token(&env, &stranded, &hex_digest("tg-2"), now)
+        .await
+        .expect("revoke the fresh token");
+    harness.clock().advance(std::time::Duration::from_secs(120));
+
+    let cookie = open_session_in(&harness, "scim", "tok-stranded", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE PREMISE: this row really has lost its credentials, so the guide below is being kept
+    // for a connection that reports itself stopped rather than for an ordinary healthy one.
+    assert!(
+        row(&body, "tokens-gone").contains("no working token"),
+        "the fixture did not reach the tokens-gone state, so the assertion below proves nothing \
+         about the filter: {}",
+        row(&body, "tokens-gone")
+    );
+    assert!(
+        !row(&body, "tokens-gone").contains("must be replaced"),
+        "a connection whose tokens are gone is reported as needing replacement, which is the \
+         lapsed remedy and not this one: {}",
+        row(&body, "tokens-gone")
+    );
+    assert!(
+        body.contains("Set up tokens-gone in Okta"),
+        "the connection that most needs setup steps -- live, rotatable, and with nothing to \
+         authenticate -- was denied them: {body}"
+    );
+}
+
+/// A live connection WITH a future expiry still gets its guide.
+///
+/// # The other half of `is_some_and`
+///
+/// Every other guide fixture creates its connection with no expiry at all, so the filter could
+/// test `expires_at_unix_micros.is_some()` -- suppressing the guide for every connection that has
+/// an expiry, whether or not it has passed -- and the whole suite would stay green. That is a
+/// large population: an expiry is what a cautious vendor sets.
+#[tokio::test]
+async fn a_connection_with_a_future_expiry_still_gets_its_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    connect_with_provider(
+        &harness,
+        &org,
+        "expires-next-year",
+        "okta",
+        "fe-1",
+        Some(now + 365 * 24 * 60 * 60 * 1_000_000),
+    )
+    .await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-future", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+    assert!(
+        body.contains("Set up expires-next-year in Okta"),
+        "a connection with an expiry a year away is treated as already lapsed and denied its \
+         setup steps: {body}"
+    );
+}
+
+/// A connection that is BOTH revoked and lapsed reads as revoked.
+///
+/// # Which of two true things a row says
+///
+/// Both branches apply, and the order decides. Revocation is the one somebody did on purpose and
+/// the one `revoked_at` timestamps, so it is the more informative answer -- and without a fixture
+/// carrying both, the branch order is free to change with nothing noticing.
+#[tokio::test]
+async fn a_revoked_and_lapsed_connection_reads_as_revoked() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    let both = connect_with_provider(
+        &harness,
+        &org,
+        "off-and-expired",
+        "okta",
+        "bl-1",
+        Some(now + 60 * 1_000_000),
+    )
+    .await;
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &both, now)
+        .await
+        .expect("revoke");
+    harness.clock().advance(std::time::Duration::from_secs(120));
+
+    let cookie = open_session_in(&harness, "scim", "tok-both", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert!(
+        row(&body, "off-and-expired").contains("Revoked"),
+        "a connection that was switched off AND has since lapsed reports the lapse, hiding the \
+         deliberate act that is the more useful answer: {}",
+        row(&body, "off-and-expired")
+    );
+    assert!(
+        !row(&body, "off-and-expired").contains("must be replaced"),
+        "the revoked row also carries the lapsed remedy: {}",
+        row(&body, "off-and-expired")
     );
 }

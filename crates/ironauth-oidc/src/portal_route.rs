@@ -499,34 +499,17 @@ pub async fn surface_get(
 /// tables. Migration 0205 argues the case -- a provisioning credential that could mint another
 /// provisioning credential is an escalation with no operator in the loop -- so offering rotation
 /// from here is a grant decision, not a page.
-async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
-    let now = epoch_micros(state.env().clock().now_utc());
-    let read = state
-        .store()
-        .scoped(session.scope())
-        .scim_connections()
-        // ONE MORE THAN THE PAGE SHOWS, so a longer list can be REPORTED as longer rather than
-        // silently cut. A page titled "your connections" that quietly drops some is worse than
-        // one that admits its bound.
-        .list_for_organization(session.organization(), PORTAL_LIST_LIMIT + 1, None, now)
-        .await;
-    // THE ORGANIZATION IS THE SESSION'S, so a failure here is not an addressing mistake a holder
-    // could have made; it is this deployment failing to read its own row.
-    let Ok(connections) = read else {
-        return PortalRefusal::Unavailable.into_response();
-    };
-
-    let lead = state.scim_token_expiry_warning_secs();
-    // DERIVED ONCE, and used by the paragraph above the table AND by every setup guide below it.
-    // Two derivations of one deployment's endpoint is how a page comes to print two different
-    // URLs, and the guides are the half a customer actually pastes from.
-    let scim_base = format!("{}/scim/v2", state.issuer_base());
-    let truncated = connections.len() > usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
-    let shown = connections
-        .iter()
-        .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX));
+/// One table row per connection, each saying which of the five states that connection is in.
+///
+/// Split out of `scim_surface` so the handler reads as the shape of the page rather than as the
+/// wording of its rows; the reasoning for each branch lives at the branch.
+fn connection_rows<'a>(
+    connections: impl Iterator<Item = &'a ironauth_store::ScimConnection>,
+    now: i64,
+    lead: u64,
+) -> String {
     let mut rows = String::new();
-    for connection in shown {
+    for connection in connections {
         let status = if connection.revoked {
             "Revoked".to_owned()
         } else if connection.no_live_credential() {
@@ -577,9 +560,21 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
             status = escape_html(&status),
         );
     }
-    if connections.is_empty() {
+    // NO ROW WAS WRITTEN, which is the same fact as an empty listing and is one this function
+    // can see for itself rather than taking on trust from its caller.
+    if rows.is_empty() {
         rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
     }
+    rows
+}
+
+/// One setup guide per connection, keyed on that connection's own provider.
+fn setup_guides(
+    state: &OidcState,
+    connections: &[ironauth_store::ScimConnection],
+    scim_base: &str,
+    now: i64,
+) -> String {
     // ONE GUIDE PER CONNECTION, keyed on that connection's own provider (issue #140 criterion 4:
     // "setup guides render per IdP with correct copy-paste values for the specific connection
     // being configured").
@@ -625,7 +620,7 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
                 !connection.revoked && !lapsed
             })
         {
-            let guide = crate::portal_guides::guide_for(&connection.provider, &scim_base);
+            let guide = crate::portal_guides::guide_for(&connection.provider, scim_base);
             let mut steps = String::new();
             for step in &guide.steps {
                 let _ = write!(steps, "<li>{}</li>", escape_html(step));
@@ -644,6 +639,37 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
             guides.insert_str(0, "<h2>Setting up your identity provider</h2>");
         }
     }
+    guides
+}
+
+async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
+    let now = epoch_micros(state.env().clock().now_utc());
+    let read = state
+        .store()
+        .scoped(session.scope())
+        .scim_connections()
+        // ONE MORE THAN THE PAGE SHOWS, so a longer list can be REPORTED as longer rather than
+        // silently cut. A page titled "your connections" that quietly drops some is worse than
+        // one that admits its bound.
+        .list_for_organization(session.organization(), PORTAL_LIST_LIMIT + 1, None, now)
+        .await;
+    // THE ORGANIZATION IS THE SESSION'S, so a failure here is not an addressing mistake a holder
+    // could have made; it is this deployment failing to read its own row.
+    let Ok(connections) = read else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let lead = state.scim_token_expiry_warning_secs();
+    // DERIVED ONCE, and used by the paragraph above the table AND by every setup guide below it.
+    // Two derivations of one deployment's endpoint is how a page comes to print two different
+    // URLs, and the guides are the half a customer actually pastes from.
+    let scim_base = format!("{}/scim/v2", state.issuer_base());
+    let truncated = connections.len() > usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
+    let shown = connections
+        .iter()
+        .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX));
+    let mut rows = connection_rows(shown, now, lead);
+    let guides = setup_guides(state, &connections, &scim_base, now);
 
     if truncated {
         let _ = write!(

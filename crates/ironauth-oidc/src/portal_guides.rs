@@ -25,12 +25,16 @@
 //! `scim_connections.provider` is `CHECK (provider IN ('okta', 'entra', 'generic'))` (migration
 //! 0183), so a guide exists for every value a row can hold.
 //!
-//! THE CATCH-ALL ARM IS THE `generic` GUIDE, not an unreachable fallback, and it is reached by
-//! every `generic` connection -- which is the column's DEFAULT, so it is the arm the ordinary
-//! case takes. It doubles as the fallback because what a provider without a named console needs
-//! is the protocol facts, and those are the same facts an unexpected value would need. Writing
-//! it as `_` rather than `"generic" | _` is deliberate: an unexpected value must render a usable
-//! guide rather than leave the page silently missing a section.
+//! THE CATCH-ALL ARM IS THE `generic` GUIDE, not an unreachable fallback: every connection whose
+//! provider is `generic` takes it, and that is a value a vendor chooses explicitly -- the
+//! management API requires `provider` on create and refuses anything outside the three. The
+//! column also DEFAULTS to `generic`, but no writer relies on that default, so the reachability
+//! that matters is the explicit one.
+//!
+//! It doubles as the fallback because what a provider without a named console needs is the
+//! protocol facts, and those are the same facts an unexpected value would need. Writing it as `_`
+//! rather than `"generic" | _` is deliberate: an unexpected value must render a usable guide
+//! rather than leave the page silently missing a section.
 
 /// One identity provider's setup guide, already resolved for a specific connection.
 pub(crate) struct SetupGuide {
@@ -83,8 +87,9 @@ pub(crate) fn guide_for(provider: &str, scim_base: &str) -> SetupGuide {
                     .to_owned(),
             ],
         },
-        // `generic` AND ANYTHING UNEXPECTED, deliberately the same arm: see the module doc. This
-        // is the DEFAULT provider, so it is the common case rather than a fallback.
+        // `generic` AND ANYTHING UNEXPECTED, deliberately the same arm: see the module doc. A
+        // vendor chooses `generic` explicitly, so this is an ordinary case rather than a
+        // fallback.
         _ => SetupGuide {
             provider_name: "your identity provider",
             where_to_go: "In your identity provider's SCIM or provisioning settings:",
