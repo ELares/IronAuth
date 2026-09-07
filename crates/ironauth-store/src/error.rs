@@ -48,6 +48,20 @@ pub enum StoreError {
     /// value that could never be a safe redirect target never reaches the
     /// registered set. Carries no tenant data.
     InvalidRedirectUri,
+    /// A caller-supplied value was refused by a shape rule the repository holds, for one
+    /// of TWO distinct reasons (issue #141).
+    ///
+    /// EITHER THE SCHEMA CANNOT EXPRESS IT: an organization contact's address and name
+    /// live in sealed columns, and a `CHECK` cannot see through a seal, so the rule that
+    /// would otherwise be a column constraint has nowhere else to live.
+    ///
+    /// OR THE SCHEMA DOES EXPRESS IT AND THE REPOSITORY GETS THERE FIRST: the contact
+    /// category is a plaintext column with a real `CHECK` behind it. Letting the insert
+    /// reach that constraint would surface a caller's typo as an opaque database failure
+    /// -- a 500 for what is a bad request -- so it is refused here instead, and the
+    /// constraint stays as the thing that makes the rule true of the stored data rather
+    /// than of one code path. Carries no tenant data.
+    Invalid,
     /// A config write violated one of the environment's TYPED guardrails (issue
     /// #42): for example registering an `http` loopback redirect URI in a
     /// PRODUCTION environment, which the two-class asymmetry forbids (dev and
@@ -387,7 +401,10 @@ impl StoreError {
             | StoreError::InvalidCustomDomain
             | StoreError::InvalidName
             | StoreError::InvalidIdentifier
-            | StoreError::SchemaMalformed(_) => StoreErrorWire::BadRequest,
+            | StoreError::SchemaMalformed(_)
+            // A shape rule the schema cannot express is still a caller mistake: the address or
+            // the category was wrong, and the caller can fix it and retry.
+            | StoreError::Invalid => StoreErrorWire::BadRequest,
             // Well formed values a policy, a schema, or a structure refuses.
             StoreError::QuotaExceeded
             | StoreError::TraitsInvalid(_)
@@ -410,6 +427,11 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::NotFound => f.write_str("resource not found"),
+            StoreError::Invalid => f.write_str(
+                "a value was refused by a shape rule: an organization contact's address must \
+                 be shaped like a deliverable address, its name must be present and within the \
+                 length ceiling, and its category must be one this deployment routes",
+            ),
             // The RECONCILE GUIDANCE criterion 6 asks for lives here, because this text is
             // what the management surface renders. An error that only said "gap" would tell
             // a consumer it had a problem without telling it the move.
@@ -495,6 +517,7 @@ impl std::error::Error for StoreError {
             | StoreError::RetentionGap
             | StoreError::IdempotencyConflict
             | StoreError::Conflict
+            | StoreError::Invalid
             | StoreError::InvalidRedirectUri
             | StoreError::GuardrailViolation(_)
             | StoreError::QuotaExceeded

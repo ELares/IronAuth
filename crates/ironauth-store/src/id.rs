@@ -1242,6 +1242,17 @@ impl ScopedKind for ScimConnectionKind {
     const PREFIX: &'static str = "scim";
 }
 
+/// Marker for an organization's operational contact (`oct_`, issue #141).
+///
+/// A ROUTING DESTINATION, NOT A PRINCIPAL. A contact authenticates nothing and holds no session:
+/// the identifier names somebody a notification is sent TO, which is why it is its own kind
+/// rather than a `UserId` for a person who never signs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrgContactKind;
+impl ScopedKind for OrgContactKind {
+    const PREFIX: &'static str = "oct";
+}
+
 /// Marker for a self-service portal entry link (`plk_`, issue #140).
 ///
 /// The non-secret HANDLE of the link, never its bearer value. The value exists only in the URL
@@ -2206,6 +2217,10 @@ pub type ScimPushLinkId = ScopedId<ScimPushLinkKind>;
 /// An inbound SCIM connection identifier (`scim_...`), issue #135. The handle, never the
 /// bearer token.
 pub type ScimConnectionId = ScopedId<ScimConnectionKind>;
+
+/// An organization contact identifier (`oct_...`), issue #141. A notification destination, not a
+/// principal.
+pub type OrgContactId = ScopedId<OrgContactKind>;
 
 /// A self-service portal entry link identifier (`plk_`, issue #140).
 pub type PortalLinkId = ScopedId<PortalLinkKind>;

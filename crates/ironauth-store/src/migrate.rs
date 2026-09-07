@@ -1694,6 +1694,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0206_scim_token_last_seen.sql"),
         },
+        Migration {
+            version: 207,
+            name: "org_contacts",
+            // EXPAND. A new table with no writer on any older binary, so nothing reads or writes
+            // it during a rolling upgrade and there is nothing to backfill.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0207_org_contacts.sql"),
+        },
     ]
 }
 

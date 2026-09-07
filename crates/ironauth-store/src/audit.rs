@@ -1282,6 +1282,15 @@ pub enum Action {
     /// so a replayed device cookie fails server-side IMMEDIATELY. The row targets the
     /// `tdv_` device; the `detail` records the revocation reason.
     TrustedDeviceRevoke,
+    /// A contact was added to an organization's notification list (issue #141). The row
+    /// targets the `oct_` contact; the address itself is sealed and appears in no audit
+    /// row, because a trail that leaked the PII the table exists to protect would be a
+    /// disclosure with a timestamp on it.
+    OrgContactAdd,
+    /// A contact was removed from an organization's notification list (issue #141). The
+    /// row targets the `oct_` contact, whose row survives the removal precisely so this
+    /// entry keeps a referent.
+    OrgContactRemove,
     /// A credential-abuse BAN was placed on a regulated dimension (issue #64): an
     /// operator, through the CLI or the admin API, banned an attacker IP, an account,
     /// or a canonical identifier on ONE authentication path. The row targets the
@@ -1919,6 +1928,12 @@ impl Action {
             Action::TrustedDeviceRemember => "trusted_device.remember",
             Action::TrustedDeviceRevoke => "trusted_device.revoke",
             Action::AccountSessionsRevokeOthers => "account.sessions.revoke_others",
+            // `org_contact`, NOT `org.contact`: the OCSF classifier keys on the text before the
+            // FIRST dot, so `org.contact.add` would claim a domain of `org` -- which classifies
+            // nothing and would be refused at write time. Wire strings freeze into the audit
+            // trail, so the shape is chosen once, here.
+            Action::OrgContactAdd => "org_contact.add",
+            Action::OrgContactRemove => "org_contact.remove",
             Action::AbuseBanCreate => "abuse.ban.create",
             Action::AbuseBanLift => "abuse.ban.lift",
             Action::ScopeStepUpPolicySet => "step_up.scope_policy.set",

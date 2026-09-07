@@ -91,7 +91,7 @@ use crate::id::{
     GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
     KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageId,
     MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId, OperatorId,
-    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
+    OrgAuthPolicyId, OrgConnectionId, OrgContactId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
     OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
     OutboxMessageId, PermissionId, PortalLinkId, PortalSessionId, PowChallengeId, ProjectGrantId,
     ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
@@ -206,6 +206,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ScimConnectionRepo<'a> {
         ScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The people an organization's operational notifications reach (issue #141).
+    ///
+    /// READ side. The notification senders run on the data plane and need to know where to
+    /// deliver; editing who is notified is an operator and portal-admin action, so it goes
+    /// through [`ScopedStore::acting`] and migration 0207 grants `ironauth_app` SELECT only.
+    #[must_use]
+    pub fn org_contacts(&self) -> OrgContactRepo<'a> {
+        OrgContactRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1702,6 +1715,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> ActingAgentVaultRepo<'a> {
         ActingAgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of an organization's operational contacts (issue #141).
+    ///
+    /// Who a vendor notifies about their customer's outages is an operator and portal-admin
+    /// decision, and a delivery path able to rewrite its own destinations is one nobody can
+    /// audit -- which is why 0207 grants the data plane SELECT only.
+    #[must_use]
+    pub fn org_contacts(&self) -> ActingOrgContactRepo<'a> {
+        ActingOrgContactRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -61152,6 +61179,27 @@ const RISK_LOGIN_GEO_IP_PURPOSE: &str = "ip";
 const RISK_LOGIN_GEO_GEO_PURPOSE: &str = "geo";
 /// The purpose label bound into a sealed `risk_login_geo.user_agent_sealed` value.
 const RISK_LOGIN_GEO_USER_AGENT_PURPOSE: &str = "user_agent";
+/// The envelope label for a sealed organization contact address (issue #141).
+const ORG_CONTACT_EMAIL_SEAL_LABEL: &str = "ironauth.envelope.org-contact-email.v1";
+/// The blind-index label for an organization contact address (issue #141).
+///
+/// ITS OWN LABEL, deliberately, for the reason the `messages` index gives: sharing one with the
+/// email-factor index would make a contact row and a login-code row for the same person carry
+/// the SAME bytes, so anyone holding one table could join it to the other and learn that a
+/// customer's notification contact is also an end user of the product.
+const ORG_CONTACT_EMAIL_BIDX_LABEL: &str = "ironauth.bidx.org-contact-email.v1";
+/// The envelope label for a sealed organization contact NAME (issue #141).
+///
+/// ITS OWN LABEL, not the address one, so the two seals authenticate under different contexts: a
+/// name ciphertext moved onto `email_sealed` (or the reverse) fails to open rather than yielding
+/// a name where the delivery path expects an address.
+const ORG_CONTACT_NAME_SEAL_LABEL: &str = "ironauth.envelope.org-contact-name.v1";
+/// The longest contact name this accepts, in octets.
+///
+/// HELD HERE BECAUSE THE SCHEMA CANNOT HOLD IT: 0207 seals the name, and a CHECK cannot measure
+/// what it cannot read. The value is the one the plaintext column carried before it was sealed.
+const ORG_CONTACT_NAME_MAX_OCTETS: usize = 256;
+
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
 /// dimension value, issue #64) from every other envelope context, so a ban-subject
 /// seal never authenticates under the users-PII, invitation, or secret-store context.
@@ -61725,6 +61773,95 @@ fn abuse_subject_blind_index(
 /// device-verification counter keys its source (issue #24).
 fn abuse_counter_key(path: AuthPath, kind: AbuseSubjectKind, keyed_value: &str) -> String {
     format!("abuse:{}:{}:{}", path.as_str(), kind.as_str(), keyed_value)
+}
+
+/// The associated data binding a sealed organization contact address (issue #141) to its scope
+/// and the DEK version that sealed it.
+fn org_contact_email_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(ORG_CONTACT_EMAIL_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The associated data binding a sealed organization contact NAME (issue #141) to its scope and
+/// the DEK version that sealed it.
+///
+/// THE SAME SHAPE AS THE ADDRESS AAD BUT A DIFFERENT LABEL, which is what keeps the two columns
+/// of one row from being interchangeable: both are sealed under the same DEK, so without the
+/// label a name and an address of the same row would open under each other's context.
+fn org_contact_name_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(ORG_CONTACT_NAME_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// Whether `name` is shaped like a name an operator can act on (issue #141): present, and within
+/// the ceiling the sealed column can no longer state.
+fn plausible_contact_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= ORG_CONTACT_NAME_MAX_OCTETS
+}
+
+/// The blind-index context for an organization contact address (issue #141): the label, the
+/// scope, and the address FOLDED TO LOWER CASE.
+///
+/// FOLDED, because the duplicate rule is about people rather than bytes: `Ada@acme.example` and
+/// `ada@acme.example` reach the same person, and listing both would send them one outage notice
+/// twice. The domain is case-insensitive by specification and the local part is case-sensitive by
+/// specification but case-insensitive at every mail provider anybody uses, so folding is the
+/// answer that matches how addresses actually behave.
+fn org_contact_email_bidx_aad(scope: Scope, email: &str) -> Aad {
+    Aad::builder()
+        .text(ORG_CONTACT_EMAIL_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(&email.to_lowercase())
+        .build()
+}
+
+/// The blind index for an organization contact address (issue #141).
+fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) -> BlindIndex {
+    master.blind_index(&org_contact_email_bidx_aad(scope, email))
+}
+
+/// Whether `email` is shaped like an address something could be delivered to (issue #141).
+///
+/// DELIBERATELY SHALLOW. A full grammar is wrong in both directions -- it refuses valid addresses
+/// and admits undeliverable ones -- and the authority on deliverability is the send path. What
+/// this refuses is SEVEN independently deletable terms -- one per `&&`-joined condition below,
+/// counted that way because a term is exactly what a mutation can remove:
+///
+///   1. longer than the 320 octets the address syntax allows;
+///   2. whitespace anywhere;
+///   3. not EXACTLY ONE `@`. ONE term, TWO failure shapes, because a single destructuring
+///      decides both: none at all, and more than one (`ada@acme.example@evil.example`, whose
+///      apparent domain is not the one it would be delivered to);
+///   4. an empty local part;
+///   5. a domain with no dot. This is ALSO what refuses an EMPTY domain, so there is
+///      deliberately no emptiness term: one would be unreachable, and an unreachable term is
+///      one no test can hold;
+///   6. a domain whose dot LEADS (`ada@.example`);
+///   7. a domain whose dot TRAILS (`ada@example.`) -- 6 and 7 are separate terms, so a case
+///      for one does not hold the other.
+///
+/// `a_malformed_address_or_an_unknown_category_is_refused` drives nine cases over these seven:
+/// two for term 3, one per failure shape, and two for term 5, the no-dot and empty-domain
+/// shapes it deliberately covers together. Everything else this admits, including addresses no
+/// mail server will accept.
+fn plausible_email(email: &str) -> bool {
+    if email.len() > 320 || email.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = email.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
 /// The associated data binding a sealed recipient email on an email-factor row (issue
@@ -78655,6 +78792,353 @@ pub struct RotateScimToken<'a> {
     pub now_micros: i64,
 }
 
+/// One person an organization's operational notifications reach (issue #141).
+///
+/// NOTHING SECRET IS IN HERE, which is what makes `Debug` safe: an email address is the delivery
+/// destination an operator manages through the API, not a credential, and the row holds no token,
+/// digest or key.
+#[derive(Debug, Clone)]
+pub struct OrgContact {
+    /// The `oct_` handle every management operation and audit row names.
+    pub id: OrgContactId,
+    /// THE boundary: the one organization whose notifications this person receives.
+    pub organization_id: OrganizationId,
+    /// Who they are, for an operator reading the list.
+    pub display_name: String,
+    /// Where the notification goes.
+    pub email: String,
+    /// Which kind of notification they asked for: `technical`, `security` or `billing`.
+    pub category: String,
+    /// When the contact was added.
+    pub created_at_unix_micros: i64,
+}
+
+/// The people an organization's operational notifications reach, for one scope, read only
+/// (issue #141).
+pub struct OrgContactRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgContactRepo<'_> {
+    /// Every LIVE contact of one organization, oldest first.
+    ///
+    /// LIVE ONLY, because this answers "who do we notify". A removed contact is kept for the
+    /// audit trail -- "who was told about the certificate that then expired" is answerable only
+    /// while the row survives -- and a sender that reached one would be delivering to somebody an
+    /// operator had already taken off the list.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Encryption`] if the scope has no key, if a row names a DEK version that is
+    /// gone, or if a sealed column does not open under its own AAD label -- which is what a name
+    /// ciphertext sitting on `email_sealed` produces, and what
+    /// `the_name_and_the_address_do_not_open_under_each_others_context` asserts;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+        limit: i64,
+    ) -> Result<Vec<OrgContact>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, organization_id, display_name_sealed, email_sealed, pii_dek_version, \
+                    category, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM org_contacts \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND deleted_at IS NULL \
+             ORDER BY created_at, id LIMIT $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut contacts = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let stored_id: String = row.get("id");
+            let dek_version: i32 = row.get("pii_dek_version");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let sealed: Vec<u8> = row.get("email_sealed");
+            let opened = dek.open(
+                &org_contact_email_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            let sealed_name: Vec<u8> = row.get("display_name_sealed");
+            let opened_name = dek.open(
+                &org_contact_name_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed_name)?,
+            )?;
+            contacts.push(OrgContact {
+                id: OrgContactId::parse_in_scope(&stored_id, &self.scope)
+                    .map_err(|_| StoreError::NotFound)?,
+                organization_id: OrganizationId::parse_in_scope(
+                    &row.get::<String, _>("organization_id"),
+                    &self.scope,
+                )
+                .map_err(|_| StoreError::NotFound)?,
+                display_name: String::from_utf8(opened_name).map_err(|_| StoreError::Encryption)?,
+                email: String::from_utf8(opened).map_err(|_| StoreError::Encryption)?,
+                category: row.get("category"),
+                created_at_unix_micros: row.get("created_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(contacts)
+    }
+}
+
+/// The WRITE side of an organization's contacts, for this scope and actor (issue #141).
+pub struct ActingOrgContactRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingOrgContactRepo<'_> {
+    /// Add a contact.
+    ///
+    /// BOTH HALVES OF THE PERSON ARE SEALED before they reach the row -- the name and the
+    /// address, under one DEK and two AAD labels -- and the address's blind index is what the
+    /// duplicate rule keys on: two seals of one address differ, so an index over the ciphertext
+    /// would refuse nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the identifier or organization is out of this scope;
+    /// [`StoreError::Invalid`] if the address, the name, or the category is refused by a shape
+    /// rule ([`plausible_email`], [`plausible_contact_name`], the closed category set) -- checked
+    /// BEFORE any key is provisioned and before the audited write opens, so a refused call leaves
+    /// no row and no audit entry; [`StoreError::Conflict`] if this organization already lists
+    /// that address on that category, or if the identifier is already in use;
+    /// [`StoreError::Encryption`] if the scope has no key to seal under;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn add(&self, env: &Env, contact: NewOrgContact<'_>) -> Result<(), StoreError> {
+        if contact.id.scope() != self.scope || contact.organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        // THE SHAPE CHECK LIVES HERE because it cannot live in the schema: a CHECK constraint
+        // cannot see through a seal. Deliberately shallow, for the reason a full grammar is
+        // wrong in both directions -- it refuses valid addresses and admits undeliverable ones,
+        // and the authority on deliverability is the send path.
+        if !plausible_email(contact.email) {
+            return Err(StoreError::Invalid);
+        }
+        // AND THE NAME'S, for the same reason and one more: 0207 sealed the name, so the ceiling
+        // the plaintext column used to state is now unstatable in the schema. Only the presence
+        // of SOME bytes survives there.
+        if !plausible_contact_name(contact.display_name) {
+            return Err(StoreError::Invalid);
+        }
+        if !matches!(contact.category, "technical" | "security" | "billing") {
+            return Err(StoreError::Invalid);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // LAZILY PROVISION THE SCOPE'S KEYS, as the ban path does: the first contact an
+        // environment adds may precede any other sealed write it has ever made.
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        let scope = self.scope;
+        let id = *contact.id;
+        let organization_id = contact.organization_id.to_string();
+        let display_name = contact.display_name.to_owned();
+        let email = contact.email.to_owned();
+        let category = contact.category.to_owned();
+        let bidx = org_contact_email_blind_index(master, scope, &email);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrgContactAdd,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &org_contact_email_seal_aad(scope, dek_version),
+                    email.as_bytes(),
+                );
+                // ONE DEK, TWO CONTEXTS. The name seals under its own AAD label, so the two
+                // ciphertexts of one row do not open under each other's context.
+                let sealed_name = dek.seal(
+                    env.entropy(),
+                    &org_contact_name_seal_aad(scope, dek_version),
+                    display_name.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "INSERT INTO org_contacts \
+                     (id, tenant_id, environment_id, organization_id, display_name_sealed, \
+                      email_sealed, email_bidx, pii_dek_version, category) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(sealed_name.into_bytes())
+                .bind(sealed.into_bytes())
+                .bind(bidx.into_bytes())
+                .bind(dek_version)
+                .bind(&category)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Remove a contact from ONE organization's list, keeping the row.
+    ///
+    /// THE ORGANIZATION IS A PREDICATE, not context. Both identifiers are caller-supplied, and a
+    /// removal keyed on the contact alone would let a caller holding one organization's handle
+    /// remove a contact of any other organization in the same environment -- the two are only
+    /// related by this row, so nothing else in the statement would notice.
+    ///
+    /// Returns whether a live contact of that organization was removed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if either identifier is out of this scope, or if the contact
+    /// does not exist in that organization at all; [`StoreError::Database`] on a persistence
+    /// failure. It does NOT return [`StoreError::Conflict`]: the losing side of a concurrent
+    /// double removal reports `Ok(false)`, the same answer a sequential repeat gets, so the
+    /// caller's result does not depend on the interleaving.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgContactId,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let contact = *id;
+        let organization = organization_id.to_string();
+
+        // THE STATE IS SETTLED BEFORE THE AUDITED WRITE, because `write_audited` commits its
+        // audit row whenever the closure returns `Ok` -- `Ok(false)` lands the row exactly as
+        // `Ok(true)` does, so a no-op reported from inside logs a removal that never happened
+        // and the trail then disagrees with the table it describes. Only an `Err` rolls both
+        // back, which is what the concurrent-loser branch below relies on. A repeat and a
+        // stranger are therefore both answered out here, without an entry.
+        let mut probe = begin_scoped(self.store, scope).await?;
+        let existing: Option<bool> = sqlx::query_scalar(
+            "SELECT deleted_at IS NOT NULL FROM org_contacts \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 AND organization_id = $4",
+        )
+        .bind(contact.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(&organization)
+        .fetch_optional(&mut *probe)
+        .await?;
+        probe.commit().await?;
+        let Some(already_removed) = existing else {
+            return Err(StoreError::NotFound);
+        };
+        if already_removed {
+            return Ok(false);
+        }
+
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrgContactRemove,
+                target: &contact,
+            },
+            async move |tx| {
+                let affected = sqlx::query(
+                    "UPDATE org_contacts \
+                     SET deleted_at = TIMESTAMPTZ 'epoch' \
+                                      + ($1::bigint * INTERVAL '1 microsecond'), \
+                         updated_at = TIMESTAMPTZ 'epoch' \
+                                      + ($1::bigint * INTERVAL '1 microsecond') \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                       AND organization_id = $5 AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(contact.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+                // A CONCURRENT LOSER MATCHED NOTHING. Reporting `true` would tell the caller
+                // it performed a removal another transaction had already committed -- and the
+                // audit row this write is inside would say so too. `Err` is the only report
+                // that rolls both back, so that is what the closure gives; the caller's answer
+                // is decided outside it, below.
+                if affected == 0 {
+                    return Err(StoreError::Conflict);
+                }
+                Ok(true)
+            },
+            false,
+        )
+        .await
+        // AND THE LOSER IS TOLD WHAT THE SEQUENTIAL REPEAT IS TOLD. `affected == 0` here can
+        // mean only one thing: the probe above saw a live row, and between the two statements
+        // another transaction removed it. Nothing else can produce it, because the row's
+        // `organization_id` is unwritable and the RESTRICTIVE policy makes removal one way, so
+        // no row can leave this statement's predicate any other way. That is the same fact as
+        // the sequential repeat -- the contact is gone, this caller did not remove it -- and
+        // reporting it differently would make the answer depend on the interleaving. Surfacing
+        // the raw `Conflict` sent a 409 whose text names a uniqueness rule this table does not
+        // have. The `Err` is still what rolls the audit row back; only the report changes.
+        .or_else(|error| match error {
+            StoreError::Conflict => Ok(false),
+            other => Err(other),
+        })
+    }
+}
+
+/// A contact to add (issue #141).
+pub struct NewOrgContact<'a> {
+    /// The `oct_` handle, minted by the caller.
+    pub id: &'a OrgContactId,
+    /// The one organization whose notifications this person receives.
+    pub organization_id: &'a OrganizationId,
+    /// Who they are.
+    pub display_name: &'a str,
+    /// Where the notification goes.
+    pub email: &'a str,
+    /// Which kind they asked for.
+    pub category: &'a str,
+}
+
 /// The inbound SCIM connections for one scope (issue #135).
 ///
 /// READ ONLY WITH ONE EXCEPTION, and the exception is deliberate: [`Self::authenticate`] records
@@ -79009,49 +79493,59 @@ impl ScimConnectionRepo<'_> {
         .await?;
         tx.commit().await?;
         rows.into_iter()
-            .map(|row| {
-                let stored_id: String = row.get("id");
-                Ok(ScimConnection {
-                    id: ScimConnectionId::parse_in_scope(&stored_id, &self.scope)
-                        .map_err(|_| StoreError::NotFound)?,
-                    organization_id: OrganizationId::parse_in_scope(
-                        &row.get::<String, _>("organization_id"),
-                        &self.scope,
-                    )
-                    .map_err(|_| StoreError::NotFound)?,
-                    display_name: row.get("display_name"),
-                    provider: row.get("provider"),
-                    expires_at_unix_micros: row.get("expires_us"),
-                    revoked_at_unix_micros: row.get("revoked_us"),
-                    revoked: row.get("revoked"),
-                    credential_expires_at_unix_micros: {
-                        // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
-                        // one. The connection's own expiry is folded into this column, so a
-                        // connection whose tokens have all lapsed or been revoked -- and one
-                        // whose organization was disabled -- would otherwise publish the date
-                        // provisioning WILL stop while `live_token_count` beside it says it
-                        // already has. Two fields derived from one row and contradicting each
-                        // other is the defect this listing has now produced twice.
-                        if live_token_count(&row) == 0 {
-                            None
-                        } else {
-                            row.get("credential_expires_us")
-                        }
-                    },
-                    live_token_count: live_token_count(&row),
-                    created_at_unix_micros: row.get("created_us"),
-                    last_seen_at_unix_micros: row.get("last_seen_us"),
-                    // NULL when the connection has no UNREVOKED token row: the fallback
-                    // population, which authenticates through `scim_connections.token_digest` and
-                    // has nothing here to stamp, and a connection whose tokens are all revoked.
-                    // `None` says "not a question this connection can answer", which is different
-                    // from `Some(false)`, "there is a newest credential and nothing has used it".
-                    newest_token_used: row.get("newest_token_used"),
-                    usage_history_complete: row.get("usage_history_complete"),
-                })
-            })
+            .map(|row| hydrate_connection(&row, self.scope))
             .collect()
     }
+}
+
+/// One listed connection, built from its row.
+///
+/// Split out of `list_for_organization` because it is a different concern from the query: the
+/// statement decides WHICH connections and computes their columns, and this decides what each
+/// column means -- which is where the derived signals and their reasoning live.
+fn hydrate_connection(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<ScimConnection, StoreError> {
+    let stored_id: String = row.get("id");
+    Ok(ScimConnection {
+        id: ScimConnectionId::parse_in_scope(&stored_id, &scope)
+            .map_err(|_| StoreError::NotFound)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            &scope,
+        )
+        .map_err(|_| StoreError::NotFound)?,
+        display_name: row.get("display_name"),
+        provider: row.get("provider"),
+        expires_at_unix_micros: row.get("expires_us"),
+        revoked_at_unix_micros: row.get("revoked_us"),
+        revoked: row.get("revoked"),
+        credential_expires_at_unix_micros: {
+            // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
+            // one. The connection's own expiry is folded into this column, so a
+            // connection whose tokens have all lapsed or been revoked -- and one
+            // whose organization was disabled -- would otherwise publish the date
+            // provisioning WILL stop while `live_token_count` beside it says it
+            // already has. Two fields derived from one row and contradicting each
+            // other is the defect this listing has now produced twice.
+            if live_token_count(row) == 0 {
+                None
+            } else {
+                row.get("credential_expires_us")
+            }
+        },
+        live_token_count: live_token_count(row),
+        created_at_unix_micros: row.get("created_us"),
+        last_seen_at_unix_micros: row.get("last_seen_us"),
+        // NULL when the connection has no UNREVOKED token row: the fallback
+        // population, which authenticates through `scim_connections.token_digest` and
+        // has nothing here to stamp, and a connection whose tokens are all revoked.
+        // `None` says "not a question this connection can answer", which is different
+        // from `Some(false)`, "there is a newest credential and nothing has used it".
+        newest_token_used: row.get("newest_token_used"),
+        usage_history_complete: row.get("usage_history_complete"),
+    })
 }
 
 /// How many credentials of one listed connection would actually authenticate.
