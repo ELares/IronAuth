@@ -2004,4 +2004,40 @@ async fn a_connection_with_no_token_rows_reports_that_nothing_is_recorded() {
          admin would go reconfigure something that is already working: {}",
         row(&body, "old-binary")
     );
+
+    // AND ROTATING IT DOES NOT CHANGE THAT ANSWER. Adoption gives the connection token rows, and
+    // a page that keyed on "are there rows" flipped straight to "No requests yet" here -- the
+    // same lie, one step later in the same lifecycle, at the exact moment an admin loads the page
+    // to check whether their rotation landed.
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&Env::system())),
+            CorrelationId::generate(&Env::system()),
+        )
+        .scim_connections()
+        .rotate_token(
+            &Env::system(),
+            &legacy,
+            &hex_digest("leg-2"),
+            3600,
+            now_micros(&harness),
+        )
+        .await
+        .expect("rotate");
+
+    let (_, after) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert!(
+        row(&after, "old-binary").contains("Not recorded"),
+        "rotating a connection whose history was never watched reports it as never used: {}",
+        row(&after, "old-binary")
+    );
+    assert!(
+        !row(&after, "old-binary").contains("No requests yet"),
+        "the page asserts as fact that a months-old working connection has never been called, \
+         moments after its rotation: {}",
+        row(&after, "old-binary")
+    );
 }

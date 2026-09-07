@@ -1064,11 +1064,13 @@ mod rotation_tests {
             live_token_count,
             credential_expires_at_unix_micros: soonest,
             created_at_unix_micros: 1_698_000_000_000_000,
-            // THE VIEW READS NEITHER, which is why they are fixed here rather than parameterised:
-            // if it ever starts, this module stops compiling and the omission becomes a decision
-            // somebody makes.
+            // THE VIEW READS NONE OF THESE. They are listed because the literal is exhaustive, so
+            // a field ADDED to `ScimConnection` stops this module compiling until somebody decides
+            // what it should be here -- which is how these arrived. A field the view starts
+            // READING is not caught that way; nothing here would notice.
             last_seen_at_unix_micros: None,
             newest_token_used: None,
+            usage_history_complete: false,
         }
     }
 

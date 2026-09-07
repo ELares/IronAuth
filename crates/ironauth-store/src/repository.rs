@@ -75304,6 +75304,19 @@ pub struct ScimConnection {
     /// first of those may be provisioning perfectly through
     /// `scim_connections.token_digest` right now.
     pub newest_token_used: Option<bool>,
+    /// Whether every credential this connection holds has been watched for its whole life, so an
+    /// absent `last_seen_at_unix_micros` can be read as "never used" rather than "not observed".
+    ///
+    /// FALSE IS THE INSTALLED BASE. Migration 0206 added the observation column, and every token
+    /// row that already existed -- including every row 0205 backfilled -- began being watched
+    /// only then. For those, a NULL last-seen means nobody was looking, not that nothing called.
+    /// A surface that read the two as one would tell every customer of a freshly upgraded
+    /// deployment that their working connection has never been used.
+    ///
+    /// It is also false for a connection with no token rows at all, which has nothing to observe:
+    /// that population authenticates through `scim_connections.token_digest`, and after a
+    /// rotation adopts a credential whose earlier life went unwatched.
+    pub usage_history_complete: bool,
     /// The next deadline one of this connection's credentials meets, if any of them has one.
     ///
     /// # Two sources, whichever comes first
@@ -78830,6 +78843,7 @@ impl ScimConnectionRepo<'_> {
             // operator questions the LISTING answers.
             last_seen_at_unix_micros: None,
             newest_token_used: None,
+            usage_history_complete: false,
         }))
     }
 
@@ -78933,6 +78947,15 @@ impl ScimConnectionRepo<'_> {
                        FROM scim_connection_tokens t \
                        WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
                          AND t.environment_id = c.environment_id) AS last_seen_us \
+                    , (EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                               WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                                 AND t.environment_id = c.environment_id) \
+                       AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                                       WHERE t.connection_id = c.id \
+                                         AND t.tenant_id = c.tenant_id \
+                                         AND t.environment_id = c.environment_id \
+                                         AND t.observed_since > t.created_at)) \
+                        AS usage_history_complete \
                     , (SELECT t.last_seen_at IS NOT NULL FROM scim_connection_tokens t \
                        WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
                          AND t.environment_id = c.environment_id \
@@ -78998,6 +79021,7 @@ impl ScimConnectionRepo<'_> {
                     // `None` says "not a question this connection can answer", which is different
                     // from `Some(false)`, "there is a newest credential and nothing has used it".
                     newest_token_used: row.get("newest_token_used"),
+                    usage_history_complete: row.get("usage_history_complete"),
                 })
             })
             .collect()
@@ -79122,6 +79146,7 @@ mod scim_connection_signal_tests {
             // decides what it should be here -- which is how these two arrived.
             last_seen_at_unix_micros: None,
             newest_token_used: None,
+            usage_history_complete: false,
         }
     }
 

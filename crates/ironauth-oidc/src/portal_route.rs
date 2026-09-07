@@ -548,25 +548,26 @@ fn connection_rows<'a>(
                     crate::saml_start::rfc3339_utc(seen / 1_000_000)
                 )
             }
-        } else if connection.newest_token_used.is_none() {
-            // NOTHING IS RECORDED FOR THIS ONE, which is not the same as nothing having happened.
-            // A connection with no unrevoked token row authenticates through the fallback on
-            // `scim_connections.token_digest` -- the population created by an un-upgraded replica
-            // after migration 0205 -- and there is no row for the authentication path to stamp.
-            // It may be provisioning perfectly right now.
-            //
-            // SAYING "NO REQUESTS YET" HERE WOULD BE A LIE OF THE WORST KIND ON THIS PAGE: it
-            // reports a working connection as dead, and the admin's remedy would be to go
-            // reconfigure something that is already right. Rotating it adopts the credential into
-            // a row, after which activity is recorded normally.
-            "Not recorded".to_owned()
-        } else {
-            // NEVER USED AT ALL, which is not the same as a cutover in progress and must not
-            // borrow its wording: "new token not used yet" tells an admin a rotation is pending
-            // when what actually happened is that nothing has ever reached this connection. On a
-            // connection nobody has called, `newest_token_used` is `Some(false)` too, so the
-            // order of these two branches is the whole distinction.
+        } else if connection.usage_history_complete {
+            // EVERY CREDENTIAL HAS BEEN WATCHED SINCE IT EXISTED, so an absent stamp means what it
+            // looks like: nothing has ever presented one. That is the diagnosis this column exists
+            // for -- a token pasted into the wrong field, or the right field of the wrong
+            // application -- and it is only assertable here.
             "No requests yet".to_owned()
+        } else {
+            // NOT OBSERVED, WHICH IS NOT THE SAME AS NOT USED, and the page must not collapse them.
+            // Three populations land here: a connection with no token rows, which authenticates
+            // through the fallback on `scim_connections.token_digest` and leaves nothing to stamp;
+            // a connection whose rows predate migration 0206, which is the entire installed base
+            // on upgrade day; and one that has just adopted a legacy credential by rotation, whose
+            // earlier life went unwatched.
+            //
+            // ALL THREE MAY BE PROVISIONING RIGHT NOW. Saying "no requests yet" about them reports
+            // a working connection as dead, and the admin's remedy would be to reconfigure
+            // something already correct. An earlier version of this page said exactly that to the
+            // whole installed base, and then -- after that was fixed for connections with no rows
+            // at all -- said it again to any of them the moment a rotation gave them one.
+            "Not recorded".to_owned()
         };
         let _ = write!(
             rows,

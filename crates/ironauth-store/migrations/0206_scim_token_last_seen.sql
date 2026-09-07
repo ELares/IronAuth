@@ -21,6 +21,31 @@
 ALTER TABLE scim_connection_tokens
     ADD COLUMN last_seen_at timestamptz;
 
+-- SINCE WHEN THIS ROW HAS BEEN OBSERVED AT ALL, which is what makes a NULL `last_seen_at`
+-- readable.
+--
+-- WITHOUT IT, NULL MEANS TWO OPPOSITE THINGS. Every token row that exists when this migration
+-- runs -- the whole installed base, including every row 0205 backfilled -- gets a NULL
+-- `last_seen_at`, and it means "nobody was watching", not "nothing has used it". A surface that
+-- rendered NULL as "never used" would tell every customer of every upgraded deployment that
+-- their working connection has never been called, on the day of the upgrade. A row created
+-- AFTER this point has been watched for its whole life, and there NULL genuinely does mean
+-- never used -- which is the diagnosis this feature exists to deliver, a token pasted into the
+-- wrong field.
+--
+-- THE DEFAULT DOES THE BACKFILL. Adding a NOT NULL column with a default stamps every existing
+-- row with the migration's own `now()`, which is later than those rows' `created_at`; a row
+-- inserted afterwards takes `now()` at insert, equal to its own `created_at`. So the test is
+-- simply whether `observed_since <= created_at`, and it needs no separate backfill statement and
+-- no reference to the migration ledger.
+ALTER TABLE scim_connection_tokens
+    ADD COLUMN observed_since timestamptz NOT NULL DEFAULT now();
+
+COMMENT ON COLUMN scim_connection_tokens.observed_since IS
+    'When this row began being observed for use. Equal to created_at for rows inserted after '
+    'migration 0206, and later than it for rows that already existed -- so a NULL last_seen_at '
+    'means "never used" only when observed_since <= created_at (issue #140).';
+
 COMMENT ON COLUMN scim_connection_tokens.last_seen_at IS
     'When this token last authenticated a SCIM request, or NULL if it never has. Written by the '
     'data plane on the authentication path, throttled so an ordinary provisioning run does not '

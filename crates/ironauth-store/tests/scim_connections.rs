@@ -594,6 +594,7 @@ async fn the_control_role_may_revoke_and_may_change_nothing_else() {
     // requires the result to be revoked, so an update that TOUCHES a live row without
     // revoking it is refused by the WITH CHECK half alone. A reviewer weakened that half to
     // `true` and the whole suite stayed green; this is the statement that notices.
+
     let live = connect(&db, &env, scope, &org, "scim_tok_touch").await;
     let outcome = as_control(
         &db,
@@ -1985,13 +1986,25 @@ async fn the_token_tables_grants_and_one_way_policy_are_enforced() {
         "a revoked token was un-revoked, so the one-way policy admits the row it must hide"
     );
 
-    // AND THE DATA PLANE MAY NOT WRITE AT ALL. A provisioning credential that could mint another
-    // would be a privilege escalation with no operator in the loop.
+    // AND THE DATA PLANE MAY NOT MINT, REVOKE OR DELETE. A provisioning credential that could
+    // mint another would be a privilege escalation with no operator in the loop.
+    //
+    // IT MAY WRITE EXACTLY ONE COLUMN, `last_seen_at`, granted by migration 0206 so the
+    // authentication path can record that a token was used (issue #140). An earlier version of
+    // this comment said "may not write at all", which 0206 made false; the property that still
+    // holds, and that these three statements assert, is that nothing it can write decides whether
+    // a credential works. `the_data_plane_writes_exactly_one_column_of_scim_connection_tokens` in
+    // the migration suite pins the writable set, and the fourth statement below is the one that
+    // proves the grant is column-scoped rather than absent.
     for statement in [
         "INSERT INTO scim_connection_tokens (token_digest, connection_id, tenant_id, \
          environment_id) VALUES (repeat('a', 64), 'scim_x', 'ten_x', 'env_x')",
         "UPDATE scim_connection_tokens SET revoked_at = now()",
         "DELETE FROM scim_connection_tokens",
+        // THE NEIGHBOURING COLUMN, which decides how long a credential lasts. The grant names
+        // `last_seen_at` and nothing else, so this is refused while the stamp below succeeds --
+        // which is what makes the grant column-scoped rather than a table-wide write.
+        "UPDATE scim_connection_tokens SET expires_at = now() + INTERVAL '1 year'",
     ] {
         let outcome = as_app(&db, scope, statement).await;
         let error = outcome.expect_err("the data plane must not write to this table");
@@ -2000,6 +2013,21 @@ async fn the_token_tables_grants_and_one_way_policy_are_enforced() {
             "the app role is refused by the grant rather than by something else: {error}"
         );
     }
+
+    // AND THE ONE COLUMN IT MAY WRITE, IT CAN. Without this the four refusals above would pass
+    // equally against a role holding no UPDATE on this table at all, and the stamp the whole
+    // last-seen feature depends on would be refused in production with nothing here noticing.
+    let stamped = as_app(
+        &db,
+        scope,
+        "UPDATE scim_connection_tokens SET last_seen_at = now()",
+    )
+    .await
+    .expect("the data plane must be able to record that a token was used");
+    assert!(
+        stamped > 0,
+        "the stamp touched no rows, so this asserts nothing about the grant"
+    );
 }
 
 #[tokio::test]
@@ -2994,5 +3022,93 @@ async fn the_listing_reports_the_most_recent_use_not_the_oldest() {
         Some(later),
         "the listing reported the OLDEST use rather than the most recent, so a connection \
          provisioning right now reads as last seen ten minutes ago"
+    );
+}
+
+/// A token row that predates observation is not reported as never used.
+///
+/// # The installed base, on upgrade day
+///
+/// Migration 0206 added the observation column, so every token row that already existed -- the
+/// whole installed base, including every row 0205 backfilled -- has a NULL `last_seen_at` that
+/// means "nobody was watching". Reading it as "never used" would tell every customer of every
+/// upgraded deployment that their working connection has never been called.
+#[tokio::test]
+async fn a_row_that_predates_observation_is_not_called_never_used() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "pre-obs").await;
+
+    let at = now_micros(&env);
+    // A ROW CREATED AFTER OBSERVATION BEGAN is knowably unused, which is the control: without it
+    // the assertion below would pass against a listing that never claims completeness at all.
+    assert!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .usage_history_complete,
+        "a connection created after the migration must be knowably unused"
+    );
+
+    // NOW MAKE IT LOOK LIKE A ROW THAT PREDATES THE COLUMN, which is what every existing row got:
+    // observed_since stamped at migration time, later than the row's own created_at.
+    sqlx::query(
+        "UPDATE scim_connection_tokens SET observed_since = created_at + INTERVAL '1 hour' \
+         WHERE connection_id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("age the observation window");
+
+    let listed = listed(&db, scope, &organization, &id, at).await;
+    assert!(
+        !listed.usage_history_complete,
+        "a token row that existed before anything watched it is reported as knowably unused, so \
+         the whole installed base reads as never called on upgrade day"
+    );
+    assert_eq!(
+        listed.last_seen_at_unix_micros, None,
+        "the premise: there is no stamp, which is exactly why the distinction matters"
+    );
+}
+
+/// Rotating a connection whose history is unwatched does not make it knowably unused.
+///
+/// # The state the previous round's fix routed around
+///
+/// A connection with no token rows correctly reported "not recorded". Rotating it adopts the
+/// legacy credential and mints a replacement -- and both rows start unstamped, so a listing that
+/// keyed only on "are there rows" flipped straight to "never used" about a connection that had
+/// been provisioning for months. The adopted row's unwatched earlier life is what says otherwise.
+#[tokio::test]
+async fn adopting_a_legacy_credential_does_not_claim_it_was_never_used() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "adopt-obs").await;
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &id, "adopt-obs-2", 3600, at)
+        .await
+        .expect("rotate");
+
+    let listed = listed(&db, scope, &organization, &id, at + 1).await;
+    assert_eq!(
+        listed.last_seen_at_unix_micros, None,
+        "the premise: neither row has been stamped yet"
+    );
+    assert!(
+        !listed.usage_history_complete,
+        "a connection that just adopted a credential with an unwatched history is reported as \
+         knowably unused, so the page tells an admin their working connection has never been \
+         called at the exact moment they rotated it"
     );
 }
