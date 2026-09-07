@@ -571,9 +571,15 @@ async fn the_replay_cache_refuses_an_assertion_whose_recorded_expiry_has_passed(
     // 0198 records that column and NOTHING READS IT -- the check is the primary key, so an
     // assertion is refused for as long as its row exists, which with no sweep is for ever. That
     // is strictly stronger than the criterion asks, and the migration writes the discrepancy down
-    // rather than leaving it to be found. This is what keeps the stronger behaviour from being
-    // narrowed silently: add a sweep, or an `expires_at` predicate to the admission check, and
-    // this test goes red while every other test in the file stays green.
+    // rather than leaving it to be found.
+    //
+    // WHAT THIS DOES AND DOES NOT DEMONSTRATE. It documents the retention property against a row
+    // whose recorded expiry has passed, which its immediate-replay sibling cannot do. It is NOT
+    // demonstrated that this test alone goes red when the cache is narrowed: every narrowing
+    // tried -- a sweep on admission, and a conditional upsert keyed on `expires_at` -- also
+    // breaks the sibling, so no mutation isolates this one. Saying that is better than the
+    // sentence that stood here, which promised an isolation the commit introducing it admitted
+    // it had not found.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let fixture = fixture(&db, &env, true).await;

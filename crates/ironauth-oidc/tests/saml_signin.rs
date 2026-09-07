@@ -646,9 +646,10 @@ struct VendorFixture {
 #[tokio::test]
 async fn an_okta_and_an_entra_shaped_assertion_both_sign_in_through_their_own_mapping() {
     // #139 CRITERION 1 asks that login completes "against Okta and Entra SAML fixtures". The
-    // suite had none: every document under test was synthesised inline with the same invented
-    // attribute name, so nothing said the mapper copes with the vocabularies these two providers
-    // actually use. Those vocabularies are the part that differs in practice -- Okta sends short
+    // suite had no fixture NAMED for either vendor and none carrying a vendor's own vocabulary
+    // end to end -- the mapping test beside this one does drive a `urn:oid:` name against a
+    // short one, so per-connection mapping was measured, but nothing said the mapper copes with
+    // what Okta and Entra actually send. Those vocabularies are the part that differs in practice -- Okta sends short
     // names like `email`, Entra sends `schemas.xmlsoap.org` claim URIs, and their NameID formats
     // differ too (an address versus an opaque persistent id).
     //
@@ -663,18 +664,35 @@ async fn an_okta_and_an_entra_shaped_assertion_both_sign_in_through_their_own_ma
     .iter()
     .map(|raw| serde_json::from_str(raw).expect("a vendor fixture parses"))
     .collect();
-    // THE TWO FIXTURES ARE DIFFERENT VENDORS. Asserting the COUNT could not fail -- the list is
-    // built from a two-element array -- so it said nothing. This can: it fails if one file is
-    // ever copied over the other, which would leave the loop driving one vocabulary twice and
-    // quietly stop measuring the property the pair exists for.
-    assert_ne!(
-        fixtures[0].vendor, fixtures[1].vendor,
-        "the two fixtures name the same vendor, so the pair drives one vocabulary twice"
-    );
-    assert_ne!(
-        fixtures[0].attributes[0].0, fixtures[1].attributes[0].0,
-        "the two fixtures use the same attribute name, so a hardcoded reader passes both"
-    );
+    // THE PROPERTY THE PAIR EXISTS FOR, GUARDED WHERE IT LIVES. What makes a hardcoded reader
+    // fail is that NEITHER fixture carries an attribute named by the OTHER'S mapping source: if
+    // the Entra document also carried an `email` attribute, a build that ignored `source` and
+    // always read `email` would sign BOTH in and the pair would silently stop measuring
+    // per-connection mapping.
+    //
+    // Two earlier guards here were adjacent to that property rather than it. A count over a
+    // two-element array could not fail at all; comparing `attributes[0]` only compares the FIRST
+    // entry, so adding `email` further down the Entra list -- the natural "make it more
+    // realistic" edit -- leaves it green while the property dies.
+    for (mine, theirs) in [(0_usize, 1_usize), (1, 0)] {
+        let their_sources: Vec<&str> = fixtures[theirs].mapping["traits"]
+            .as_object()
+            .expect("a traits mapping")
+            .values()
+            .filter_map(|entry| entry["source"].as_array())
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        for (name, _) in &fixtures[mine].attributes {
+            assert!(
+                !their_sources.contains(&name.as_str()),
+                "the {} fixture carries {name:?}, which is a mapping source of the {} fixture, \
+                 so a build that ignored `source` would sign both in",
+                fixtures[mine].vendor,
+                fixtures[theirs].vendor,
+            );
+        }
+    }
 
     for fixture in fixtures {
         let harness = Harness::start_store_backed().await;
