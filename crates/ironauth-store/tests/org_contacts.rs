@@ -617,23 +617,31 @@ async fn the_listing_pages_on_its_cursor_and_the_pages_cover_every_contact() {
         "the paged walk did not cover every contact exactly once, oldest first"
     );
 
-    // AND THE `id` HALF OF THE COMPOSITE, which the walk above never reaches because those five
+    ties_are_broken_on_the_id(&db, &env, scope).await;
+}
+
+/// The `id` half of the `(created_at, id)` cursor, split out of its caller because appending it
+/// pushed that function past the crate's hundred-line ceiling -- which `cargo test` does not see
+/// and clippy does.
+async fn ties_are_broken_on_the_id(db: &TestDatabase, env: &Env, scope: Scope) {
+    let read = db.control_store().scoped(scope);
+    // THE `id` HALF OF THE COMPOSITE, which the paged walk never reaches because those five
     // contacts have distinct timestamps. Ties are not hypothetical here: the write binds the
     // CALLER'S clock rather than taking the column default, so two contacts added in one
     // operator action share a `created_at` exactly. On a tie the cursor's `created_at` alone
     // cannot say which row was already returned -- `(created_at, id) > (t, id)` is what does --
     // so a predicate keyed on the timestamp alone either repeats a row forever or skips one.
-    let tied_org = seed_org(&db, &env, scope, "Tied").await;
-    let at = now_micros(&env);
+    let tied_org = seed_org(db, env, scope, "Tied").await;
+    let at = now_micros(env);
     let mut tied = Vec::new();
     for (index, category) in ["technical", "security"].into_iter().enumerate() {
-        let id = OrgContactId::generate(&env, &scope);
+        let id = OrgContactId::generate(env, &scope);
         db.control_store()
             .scoped(scope)
-            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .acting(db.test_actor(env), CorrelationId::generate(env))
             .org_contacts()
             .add(
-                &env,
+                env,
                 NewOrgContact {
                     id: &id,
                     organization_id: &tied_org,

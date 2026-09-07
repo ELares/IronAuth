@@ -76890,11 +76890,14 @@ pub struct DueCertificateAlert {
     pub connection_id: String,
     /// The organization whose contacts must be told.
     ///
-    /// CARRIED RATHER THAN LOOKED UP, because the alternative is a sweep that resolves it per
-    /// row: an extra query for every work item, and a second chance to resolve the WRONG one. It
-    /// is the connection's own `organization_id`, joined here, so a notice cannot be routed to an
-    /// organization that does not own the certificate it is about -- which would tell one
-    /// customer about another customer's identity provider.
+    /// CARRIED RATHER THAN LOOKED UP, because the alternative is resolving it per row: an extra
+    /// query for every work item, and a second chance to resolve the WRONG one. It is the
+    /// connection's own `organization_id`, joined here, so a work item cannot name an
+    /// organization that does not own the certificate it is about.
+    ///
+    /// NOTHING CONSUMES THIS YET. The sweep #141 describes -- read the due items, read those
+    /// organizations' contacts, deliver, record -- is not written; this is the field it will
+    /// route on, and saying so is not the same as saying it routes.
     pub organization_id: String,
     /// The lead this row is due for, in seconds. One certificate can be due for MORE THAN ONE
     /// lead on a single pass -- a sweep that has not run for a month crosses several at once --
@@ -76923,15 +76926,21 @@ impl SamlCertificateAlertRepo<'_> {
     ///
     /// # The organization comes from the join, not from a second query
     ///
-    /// The connection is joined on its FULL scoped key -- id AND tenant AND environment -- rather
-    /// than on the id alone. The id is globally unique so the two forms return the same row
-    /// today, and they stop agreeing the moment anything reuses an id across scopes; a certificate
-    /// resolving to a foreign connection would route a notice about one customer's identity
-    /// provider to another customer's contacts.
+    /// Resolving it per row would mean an extra query for every work item and a second chance to
+    /// resolve the wrong one. What the join must not get wrong is WHOSE organization: both
+    /// organizations in an environment are scope-legal and both have real contact lists, so
+    /// pairing a certificate with the wrong one tells a customer about another customer's
+    /// identity provider and no tenant fence notices.
+    ///
+    /// The scope columns in the join condition are BELT AND BRACES, not the thing that makes it
+    /// safe: `saml_connections` is under forced row-level security and this runs inside
+    /// `begin_scoped`, so the policy already confines the join to this scope and an id-only
+    /// condition would return the same rows. They are written out because the id-only form reads
+    /// as if scope were nobody's job, and this module has shipped that mistake before.
     ///
     /// # A repeated lead is one lead
     ///
-    /// The caller's list is DISTINCTed before the join. A configuration that names thirty days
+    /// The caller's list is de-duplicated before the join. A configuration that names thirty days
     /// twice is one threshold, not two, and without this it would yield the pair twice -- so a
     /// sweep would send two identical notices, and the second `record_sent` would answer
     /// `Conflict` for a notice it had genuinely just delivered.

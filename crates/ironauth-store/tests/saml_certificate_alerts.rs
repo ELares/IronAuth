@@ -442,11 +442,11 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
         mine.to_string(),
         "the entry names the wrong connection, so the sweep would notify the wrong organization"
     );
-    assert_eq!(
-        entry.organization_id,
-        org.to_string(),
-        "the entry names the wrong organization: {entry:?}"
-    );
+    // NOT AN ORGANIZATION ASSERTION HERE. Both connections in this fixture belong to ONE
+    // organization, so comparing `organization_id` against it would hold for any row the query
+    // returned and would measure nothing -- the same decoy flaw this test's own comment warns
+    // about. `the_work_item_names_the_certificates_own_organization` builds two organizations,
+    // which is what that claim needs.
     assert_eq!(entry.lead_secs, 3 * DAY);
     // WITHIN A SECOND of what was pinned: the fixture computes the expiry from the same clock
     // reading, and the column round-trips through microseconds.
@@ -838,7 +838,7 @@ async fn the_work_item_names_the_certificates_own_organization() {
     let now = now_micros(&env);
 
     // Different expiries so the ORDER is known, and both inside the lead.
-    let acme_cert = pin_expiring(&db, &env, scope, &acme_connection, 60, 1 * DAY).await;
+    let acme_cert = pin_expiring(&db, &env, scope, &acme_connection, 60, DAY).await;
     let globex_cert = pin_expiring(&db, &env, scope, &globex_connection, 61, 2 * DAY).await;
 
     let due = db
