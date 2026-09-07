@@ -1,0 +1,21 @@
+{
+  "source": "Microsoft Entra ID SAML token reference (claims URIs) and the SAML 2.0 core schema (spec-derived, not a live capture)",
+  "vendor": "Microsoft Entra ID",
+  "issuer": "https://sts.windows.net/00000000-0000-0000-0000-000000000000/",
+  "nameid_format": "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+  "nameid": "AAAAAAAAAAAAAAAAAAAAAHVzZXItb2JqZWN0LWlk",
+  "attributes": [
+    ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress", "grace.hopper@acme.example"],
+    ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname", "Grace"],
+    ["http://schemas.microsoft.com/identity/claims/objectidentifier", "00000000-0000-0000-0000-00000000beef"]
+  ],
+  "mapping": {
+    "traits": {
+      "email": {
+        "source": ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"],
+        "required": false
+      }
+    }
+  },
+  "expect_email": "grace.hopper@acme.example"
+}

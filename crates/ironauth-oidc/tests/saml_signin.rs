@@ -626,6 +626,90 @@ async fn a_second_assertion_refreshes_the_traits_it_carries() {
     );
 }
 
+/// One vendor-shaped login fixture (issue #139).
+///
+/// See `tests/fixtures/saml/PROVENANCE.md` for what a green run does and does not claim.
+#[derive(serde::Deserialize)]
+struct VendorFixture {
+    vendor: String,
+    issuer: String,
+    nameid_format: String,
+    nameid: String,
+    attributes: Vec<(String, String)>,
+    mapping: serde_json::Value,
+    expect_email: String,
+}
+
+#[tokio::test]
+async fn an_okta_and_an_entra_shaped_assertion_both_sign_in_through_their_own_mapping() {
+    // #139 CRITERION 1 asks that login completes "against Okta and Entra SAML fixtures". The
+    // suite had none: every document under test was synthesised inline with the same invented
+    // attribute name, so nothing said the mapper copes with the vocabularies these two providers
+    // actually use. Those vocabularies are the part that differs in practice -- Okta sends short
+    // names like `email`, Entra sends `schemas.xmlsoap.org` claim URIs, and their NameID formats
+    // differ too (an address versus an opaque persistent id).
+    //
+    // ONE TEST OVER TWO FIXTURES, DELIBERATELY. Driving them through one loop is what makes a
+    // hardcoded reading of any single attribute name fail: the mapping travels WITH the fixture,
+    // so a build that ignored `source` and always read `email` signs the Okta fixture in and
+    // fails the Entra one.
+    let fixtures: Vec<VendorFixture> = [
+        include_str!("fixtures/saml/okta_login.json"),
+        include_str!("fixtures/saml/entra_login.json"),
+    ]
+    .iter()
+    .map(|raw| serde_json::from_str(raw).expect("a vendor fixture parses"))
+    .collect();
+    assert_eq!(fixtures.len(), 2, "both vendor fixtures are loaded");
+
+    for fixture in fixtures {
+        let harness = Harness::start_store_backed().await;
+        seed_trait_schema(&harness).await;
+        // THE CONNECTION'S NameID FORMAT MUST MATCH THE DOCUMENT'S, which is a property of this
+        // surface rather than of the fixture: `examine` refuses a mismatch before anything about
+        // mapping runs, so a test varying one has to vary both.
+        let wired = wire_with_format(
+            &harness,
+            &fixture.issuer,
+            &fixture.mapping,
+            &fixture.nameid_format,
+        )
+        .await;
+
+        let attributes: Vec<(&str, &str)> = fixture
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let response = signed_inner(
+            &wired,
+            harness.env(),
+            &fixture.issuer,
+            "_vendor1",
+            &fixture.nameid,
+            &fixture.nameid_format,
+            &attributes,
+        );
+        let (status, _, body) = post(&harness, &wired, &response).await;
+        assert_eq!(
+            status, 303,
+            "the {} fixture did not sign in: {body}",
+            fixture.vendor
+        );
+
+        // THE MAPPED ADDRESS, not the NameID. For the Entra fixture those are very different --
+        // the NameID is an opaque persistent id -- so a build that wrote the NameID into every
+        // trait cannot pass this, and for Okta the two coincide by the vendor's own convention,
+        // which is why the pair is driven together rather than either alone.
+        let traits = trait_emails(&harness).await;
+        assert!(
+            traits.contains(&fixture.expect_email),
+            "the {} fixture's mapped address is not what was stored: {traits:?}",
+            fixture.vendor
+        );
+    }
+}
+
 #[tokio::test]
 async fn two_organizations_sharing_one_identity_provider_are_two_people() {
     // THE OBJECTION THAT TOOK THE FIRST ATTEMPT APART, as a test, and in the shape that actually

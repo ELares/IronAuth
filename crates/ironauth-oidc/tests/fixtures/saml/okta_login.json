@@ -1,0 +1,18 @@
+{
+  "source": "Okta SAML app configuration reference and the SAML 2.0 core schema (spec-derived, not a live capture)",
+  "vendor": "Okta",
+  "issuer": "http://www.okta.com/exk1fake0Example0h8",
+  "nameid_format": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+  "nameid": "ada.lovelace@acme.example",
+  "attributes": [
+    ["email", "ada.lovelace@acme.example"],
+    ["firstName", "Ada"],
+    ["lastName", "Lovelace"]
+  ],
+  "mapping": {
+    "traits": {
+      "email": { "source": ["email"], "required": false }
+    }
+  },
+  "expect_email": "ada.lovelace@acme.example"
+}
