@@ -442,6 +442,11 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
         mine.to_string(),
         "the entry names the wrong connection, so the sweep would notify the wrong organization"
     );
+    assert_eq!(
+        entry.organization_id,
+        org.to_string(),
+        "the entry names the wrong organization: {entry:?}"
+    );
     assert_eq!(entry.lead_secs, 3 * DAY);
     // WITHIN A SECOND of what was pinned: the fixture computes the expiry from the same clock
     // reading, and the column round-trips through microseconds.
@@ -810,6 +815,61 @@ async fn a_certificate_unpinned_under_the_sweep_is_not_found_rather_than_a_fault
         matches!(outcome, Err(StoreError::NotFound)),
         "a certificate unpinned under the sweep is a persistence fault rather than a vanished \
          work item: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_work_item_names_the_certificates_own_organization() {
+    // THE SWEEP ROUTES ON THIS FIELD, so getting it wrong tells one customer about another
+    // customer's identity provider -- and both organizations are in the same scope, so no
+    // tenant fence catches it.
+    //
+    // TWO ORGANIZATIONS, EACH WITH A CONNECTION AND A DUE CERTIFICATE, so a build that returned
+    // "an organization" rather than "this certificate's" has something to get wrong and both
+    // rows are in the result set at once. An earlier field test kept a decoy that the lead
+    // filtered out before the assertion ran, which measured nothing.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let acme = seed_org(&db, &env, scope, "Acme").await;
+    let globex = seed_org(&db, &env, scope, "Globex").await;
+    let acme_connection = connect(&db, &env, scope, &acme, "https://idp.example/acme").await;
+    let globex_connection = connect(&db, &env, scope, &globex, "https://idp.example/globex").await;
+    let now = now_micros(&env);
+
+    // Different expiries so the ORDER is known, and both inside the lead.
+    let acme_cert = pin_expiring(&db, &env, scope, &acme_connection, 60, 1 * DAY).await;
+    let globex_cert = pin_expiring(&db, &env, scope, &globex_connection, 61, 2 * DAY).await;
+
+    let due = db
+        .control_store()
+        .scoped(scope)
+        .saml_certificate_alerts()
+        .due(now, &[3 * DAY], 100)
+        .await
+        .expect("due");
+    assert_eq!(due.len(), 2, "both certificates are due: {due:?}");
+
+    let pairs: Vec<(&str, &str)> = due
+        .iter()
+        .map(|entry| {
+            (
+                entry.certificate_id.as_str(),
+                entry.organization_id.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            (acme_cert.to_string().as_str(), acme.to_string().as_str()),
+            (
+                globex_cert.to_string().as_str(),
+                globex.to_string().as_str()
+            ),
+        ],
+        "a certificate is paired with the wrong organization, so its notice would go to the \
+         wrong customer's contacts: {due:?}"
     );
 }
 

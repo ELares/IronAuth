@@ -76886,8 +76886,16 @@ impl PortalLinkRepo<'_> {
 pub struct DueCertificateAlert {
     /// The certificate, `saml_connection_certificates.id`.
     pub certificate_id: String,
-    /// The connection it is pinned on, so a caller can find the organization to notify.
+    /// The connection it is pinned on.
     pub connection_id: String,
+    /// The organization whose contacts must be told.
+    ///
+    /// CARRIED RATHER THAN LOOKED UP, because the alternative is a sweep that resolves it per
+    /// row: an extra query for every work item, and a second chance to resolve the WRONG one. It
+    /// is the connection's own `organization_id`, joined here, so a notice cannot be routed to an
+    /// organization that does not own the certificate it is about -- which would tell one
+    /// customer about another customer's identity provider.
+    pub organization_id: String,
     /// The lead this row is due for, in seconds. One certificate can be due for MORE THAN ONE
     /// lead on a single pass -- a sweep that has not run for a month crosses several at once --
     /// and each is its own entry here rather than being collapsed to the nearest.
@@ -76912,6 +76920,14 @@ impl SamlCertificateAlertRepo<'_> {
     /// connection is already broken, and a "expires in 3 days" notice about a certificate that
     /// died last week is worse than silence -- it tells an operator the wrong thing about how
     /// much time they have. Expiry itself is a different event and belongs to connection health.
+    ///
+    /// # The organization comes from the join, not from a second query
+    ///
+    /// The connection is joined on its FULL scoped key -- id AND tenant AND environment -- rather
+    /// than on the id alone. The id is globally unique so the two forms return the same row
+    /// today, and they stop agreeing the moment anything reuses an id across scopes; a certificate
+    /// resolving to a foreign connection would route a notice about one customer's identity
+    /// provider to another customer's contacts.
     ///
     /// # A repeated lead is one lead
     ///
@@ -76940,9 +76956,12 @@ impl SamlCertificateAlertRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT c.id AS certificate_id, c.connection_id, l.lead_secs, \
+            "SELECT c.id AS certificate_id, c.connection_id, n.organization_id, l.lead_secs, \
                     (EXTRACT(EPOCH FROM c.not_after) * 1000000)::bigint AS not_after_us \
              FROM saml_connection_certificates c \
+             JOIN saml_connections n ON n.id = c.connection_id \
+                                    AND n.tenant_id = c.tenant_id \
+                                    AND n.environment_id = c.environment_id \
              CROSS JOIN (SELECT DISTINCT unnest AS lead_secs \
                          FROM UNNEST($3::bigint[])) AS l \
              LEFT JOIN saml_certificate_expiry_alerts a \
@@ -76972,6 +76991,7 @@ impl SamlCertificateAlertRepo<'_> {
             .map(|row| DueCertificateAlert {
                 certificate_id: row.get("certificate_id"),
                 connection_id: row.get("connection_id"),
+                organization_id: row.get("organization_id"),
                 lead_secs: row.get("lead_secs"),
                 not_after_unix_micros: row.get("not_after_us"),
             })
