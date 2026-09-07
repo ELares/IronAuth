@@ -440,6 +440,35 @@ async fn another_scopes_certificate_is_not_due_here() {
         "another environment's certificate is due in this one: {due:?}"
     );
 
+    // AND THE WRITE SIDE IS FENCED TOO, which the read side above says nothing about. 0208's
+    // foreign key names the certificate by id ALONE and referential integrity bypasses row-level
+    // security, so without a guard in the repository this insert would SUCCEED: a ledger row in
+    // one tenant's table against another tenant's certificate, invisible to `due()` here,
+    // undeletable (no DELETE grant), and cascade-removed by a stranger. It would also tell a
+    // caller apart a real foreign id from a fabricated one.
+    let their_certificate = db
+        .control_store()
+        .scoped(theirs)
+        .saml_certificate_alerts()
+        .due(now, LEADS, 1)
+        .await
+        .expect("due")
+        .first()
+        .map(|entry| entry.certificate_id.clone())
+        .expect("their certificate is due in their own scope");
+    let parsed = ironauth_store::SamlCertificateId::parse_in_scope(&their_certificate, &theirs)
+        .expect("their certificate id parses in their scope");
+    let outcome = db
+        .control_store()
+        .scoped(mine)
+        .saml_certificate_alerts()
+        .record_sent(&env, &parsed, 3 * DAY, now, None)
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::NotFound)),
+        "a ledger row was written against another scope's certificate: {outcome:?}"
+    );
+
     // THE CONTROL: it IS due in its own scope, so the emptiness above is the fence and not an
     // empty table.
     let due = db
