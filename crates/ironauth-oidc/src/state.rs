@@ -382,8 +382,14 @@ pub struct OidcState {
     // directly-built state (every test harness) behaves like a default deployment rather
     // than pinning the walk to zero. Bounds tree DEPTH only; nothing counted is capped.
     max_group_depth: u32,
-    // How long before a SCIM connection stops provisioning the surfaces start calling it
-    // expiring (issue #140), installed by the boot path from `scim.token_expiry_warning_secs`.
+    // How long before one of a SCIM connection's credentials meets its deadline the surfaces
+    // start calling it expiring (issue #140), installed by the boot path from
+    // `scim.token_expiry_warning_secs`.
+    //
+    // A DEADLINE, NOT AN OUTAGE: the value this lead is measured against is the soonest of the
+    // connection's own expiry and its live tokens' horizons, and during a rotation overlap the
+    // latter belongs to a superseded token that provisioning carries on without. Saying "stops
+    // provisioning" here is the framing this feature had to retract once already.
     // Kept OUTSIDE `Inner` and set through the builder for the SAME top-level-config reason as
     // the group depth: the setting lives in `[scim]`, not `[oidc]`.
     //

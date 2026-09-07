@@ -454,9 +454,11 @@ pub async fn surface_get(
     if intent == "scim" {
         return scim_surface(&state, &session).await;
     }
-    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER. `sso` and `domain-verification` land in
-    // later slices of #140, and the fence above has already refused an intent this session does
-    // not carry, so what reaches here is a surface this deployment serves and has not built yet.
+    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER. `sso`, `domain-verification` and
+    // `log-streams` land in later slices of #140 -- the closed set the `portal_links` intent
+    // CHECK constraint permits is those three plus `scim` -- and the fence above has already
+    // refused an intent this session does not carry, so what reaches here is a surface this
+    // deployment serves and has not built yet.
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>{intent}</title>\
          <h1>{intent}</h1>\
@@ -527,13 +529,24 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
             "Provisioning has stopped: no working token".to_owned()
         } else if let Some(deadline) = connection.credential_expires_at_unix_micros {
             let when = crate::saml_start::rfc3339_utc(deadline / 1_000_000);
-            // NEITHER WORDING PROMISES AN OUTAGE, because the deadline is the soonest credential's
-            // and not the moment provisioning ends. During a rotation overlap the superseded token
-            // dies on this date while the fresh one carries on, so "stops working" would tell an
-            // admin their provisioning was about to end at exactly the moment a successful cutover
-            // had guaranteed it would not. What is true in every case is that a credential meets a
-            // deadline then, and inside the lead they have to do something about it.
-            if connection.credential_expiring_soon(now, lead) {
+            // WHICH DEADLINE IT IS DECIDES WHAT THE ADMIN CAN DO ABOUT IT, and the row carries the
+            // discriminator: the published deadline is the LEAST of the connection's own expiry
+            // and its soonest live token's, so when it equals the connection's own expiry that is
+            // the arm that produced it.
+            //
+            // A TOKEN deadline is cleared by rotating -- during an overlap the superseded token
+            // dies on this date while the fresh one carries on, so an outage warning there would
+            // be a false alarm at the exact moment a successful cutover guaranteed otherwise.
+            //
+            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. No path in this system writes
+            // `scim_connections.expires_at`: migration 0183 grants the control role
+            // `UPDATE (revoked_at, updated_at)` and no more, and rotating mints a token with no
+            // horizon while leaving that column exactly where it was. So "renew before" there
+            // names a remedy the customer can perform forever without moving the date, and on it
+            // provisioning stops for good. That one has to say so, and say what actually helps.
+            if connection.expires_at_unix_micros == Some(deadline) {
+                format!("Provisioning stops {when}: ask your vendor to replace this connection")
+            } else if connection.credential_expiring_soon(now, lead) {
                 format!("Renew before {when}")
             } else {
                 format!("Next deadline {when}")
