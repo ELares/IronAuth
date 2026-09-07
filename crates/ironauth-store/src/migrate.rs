@@ -1679,6 +1679,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0205_scim_connection_tokens.sql"),
         },
+        Migration {
+            version: 206,
+            name: "scim_token_last_seen",
+            // EXPAND. One nullable column and one column-scoped grant. An old binary neither
+            // writes nor reads it, and a new one treats NULL as "never used" -- which is exactly
+            // what every backfilled row means, so there is nothing to backfill.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0206_scim_token_last_seen.sql"),
+        },
     ]
 }
 

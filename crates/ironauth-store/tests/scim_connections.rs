@@ -2666,3 +2666,211 @@ async fn a_rotation_in_progress_publishes_the_cutover_deadline() {
     assert_eq!(after.live_token_count, 1);
     assert_eq!(after.credential_expires_at_unix_micros, None);
 }
+
+/// Using a token stamps it, and using it again inside the throttle window does not rewrite it.
+///
+/// # Both halves matter and they pull against each other
+///
+/// Without the stamp the portal cannot tell a connection nobody has ever called from one
+/// provisioning happily, which is what a token pasted into the wrong field looks like. Without
+/// the throttle every provisioning request in the deployment writes a row on a shared table --
+/// a point read turned into a read plus an update, on the hottest path this crate has.
+#[tokio::test]
+async fn using_a_token_stamps_it_once_per_window() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "seen-1").await;
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+
+    // BEFORE ANY REQUEST it has never been seen, which is the state a failed setup sits in.
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .last_seen_at_unix_micros,
+        None,
+        "a connection nobody has called reports a last-seen time"
+    );
+
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("seen-1"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .last_seen_at_unix_micros,
+        Some(at),
+        "the request that authenticated left no trace, so the portal cannot tell this \
+         connection from one nobody has ever called"
+    );
+
+    // INSIDE THE WINDOW the stamp does not move: this is the write the throttle exists to skip,
+    // and asserting the value is UNCHANGED is what distinguishes a throttle from an update that
+    // happens to be idempotent.
+    let soon = at + 30 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("seen-1"), soon)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, soon)
+            .await
+            .last_seen_at_unix_micros,
+        Some(at),
+        "a request thirty seconds later rewrote the stamp, so a busy provisioning run writes a \
+         row per request on a table the whole deployment shares"
+    );
+
+    // PAST THE WINDOW it moves again, or the stamp would freeze at the first request ever made
+    // and stop answering the question it exists for.
+    let later = at + 61 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("seen-1"), later)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, later)
+            .await
+            .last_seen_at_unix_micros,
+        Some(later),
+        "the stamp never moved past the first request, so a connection last used months ago \
+         reads as one used just now"
+    );
+}
+
+/// A REFUSED request stamps nothing.
+///
+/// # Otherwise the field answers the wrong question
+///
+/// "Last seen" has to mean a credential that WORKED. A revoked or lapsed token being presented
+/// is exactly the state an admin is trying to diagnose -- their identity provider is calling and
+/// being turned away -- and a stamp that moved for it would report the connection as healthy at
+/// the moment it is failing.
+#[tokio::test]
+async fn a_refused_request_stamps_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "refused-1").await;
+
+    let at = now_micros(&env);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &id, at)
+        .await
+        .expect("revoke");
+
+    let after = at + 1;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("refused-1"), after)
+            .await
+            .expect("authenticate")
+            .is_none(),
+        "the premise: the revoked connection refuses the request"
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, after)
+            .await
+            .last_seen_at_unix_micros,
+        None,
+        "a REFUSED request stamped the token, so a connection being turned away reports itself \
+         as recently used -- at the exact moment an admin is trying to work out why nothing is \
+         provisioning"
+    );
+}
+
+/// After a rotation the listing says whether the NEW token has been used yet.
+///
+/// # The question the timestamp cannot answer
+///
+/// During an overlap both tokens work, so `last_seen_at` keeps moving on the old one and the
+/// connection looks healthy right up to the moment the overlap ends and provisioning stops. What
+/// predicts that outage is whether the credential the customer was asked to paste has been used.
+#[tokio::test]
+async fn the_listing_says_whether_the_new_token_has_been_used() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "cut-1").await;
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("cut-1"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .newest_token_used,
+        Some(true),
+        "the control: before any rotation the only token IS the newest, and it has been used"
+    );
+
+    rotate(&db, &env, scope, &id, "cut-2", 3600, at)
+        .await
+        .expect("rotate");
+
+    // THE CUSTOMER KEEPS USING THE OLD TOKEN, which is what the overlap is for and also what
+    // makes this state dangerous: everything else about the connection looks fine.
+    let during = at + 120 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("cut-1"), during)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    let mid = listed(&db, scope, &organization, &id, during).await;
+    assert_eq!(
+        mid.last_seen_at_unix_micros,
+        Some(during),
+        "the connection is plainly in use, which is the appearance that hides the problem"
+    );
+    assert_eq!(
+        mid.newest_token_used,
+        Some(false),
+        "the listing cannot tell that the token the customer was asked to paste has never been \
+         used, so nothing warns before the overlap ends and provisioning stops"
+    );
+
+    // ONCE THEY PASTE IT, the cutover is done and the listing says so.
+    let after = during + 61 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("cut-2"), after)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, after)
+            .await
+            .newest_token_used,
+        Some(true),
+        "the fresh token authenticated and the listing still reports the cutover as pending"
+    );
+}

@@ -527,18 +527,48 @@ fn connection_rows<'a>(
         } else {
             "Active".to_owned()
         };
+        // WHAT HAS ACTUALLY HAPPENED, beside what is configured. A connection can be healthy in
+        // every other column and have never received a request -- which is what pasting a token
+        // into the wrong field looks like, and there is nothing else on this page that would
+        // tell an admin so.
+        let activity = if connection.revoked {
+            // Nothing to act on: the operator switched this off, and a last-used time would only
+            // invite the reader to wonder whether it is still working.
+            String::new()
+        } else if let Some(seen) = connection.last_seen_at_unix_micros {
+            // IT HAS BEEN USED AT LEAST ONCE, so the question becomes WHICH credential. A newest
+            // token nobody has presented means a rotation the customer has not finished: the
+            // connection is plainly in use on the OLD one, and "last request two minutes ago"
+            // would report exactly the health that ends when the overlap does.
+            if connection.newest_token_used == Some(false) {
+                "New token not used yet".to_owned()
+            } else {
+                format!(
+                    "Last request {}",
+                    crate::saml_start::rfc3339_utc(seen / 1_000_000)
+                )
+            }
+        } else {
+            // NEVER USED AT ALL, which is not the same as a cutover in progress and must not
+            // borrow its wording: "new token not used yet" tells an admin a rotation is pending
+            // when what actually happened is that nothing has ever reached this connection. On a
+            // connection nobody has called, `newest_token_used` is `Some(false)` too, so the
+            // order of these two branches is the whole distinction.
+            "No requests yet".to_owned()
+        };
         let _ = write!(
             rows,
-            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td></tr>",
+            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td><td>{activity}</td></tr>",
             name = escape_html(&connection.display_name),
             provider = escape_html(&connection.provider),
             status = escape_html(&status),
+            activity = escape_html(&activity),
         );
     }
     // NO ROW WAS WRITTEN, which is the same fact as an empty listing and is one this function
     // can see for itself rather than taking on trust from its caller.
     if rows.is_empty() {
-        rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
+        rows.push_str("<tr><td colspan=\"4\">No provisioning connections yet.</td></tr>");
     }
     rows
 }
@@ -679,7 +709,7 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     if truncated {
         let _ = write!(
             rows,
-            "<tr><td colspan=\"3\">Showing the first {PORTAL_LIST_LIMIT}. \
+            "<tr><td colspan=\"4\">Showing the first {PORTAL_LIST_LIMIT}. \
              Ask your vendor for the rest.</td></tr>"
         );
     }
@@ -706,7 +736,8 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          <p>Organization: {organization}</p>\
          {endpoint}\
          <h2>Your connections</h2>\
-         <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th></tr></thead>\
+         <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th><th>Activity</th>\
+         </tr></thead>\
          <tbody>{rows}</tbody></table>\
          {guides}",
         organization = escape_html(&session.organization().to_string()),

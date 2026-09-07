@@ -1770,3 +1770,105 @@ async fn a_display_name_carrying_markup_is_escaped_in_the_row_and_the_guide() {
         "the guide summary did not escape the display name: {summary}"
     );
 }
+
+/// The page says what has actually happened, not only what is configured.
+///
+/// # The failure this column exists to make visible
+///
+/// A connection whose credentials are live and whose identity provider has never called is
+/// identical, in every other column, to one provisioning happily. That is the ordinary result of
+/// pasting a token into the wrong field, or into the right field of the wrong application, and
+/// nothing else on this page would tell an admin so.
+#[tokio::test]
+async fn the_page_reports_whether_anything_has_actually_used_each_connection() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+
+    connect_with_provider(&harness, &org, "never-called", "okta", "act-a", None).await;
+    connect_with_provider(&harness, &org, "in-use", "okta", "act-b", None).await;
+    // A REAL PROVISIONING REQUEST, through the store's own authentication path, because the
+    // stamp is written there: seeding a timestamp directly would test the column and not the
+    // thing that fills it.
+    assert!(
+        harness
+            .db()
+            .store()
+            .scoped(harness.scope())
+            .scim_connections()
+            .authenticate(&hex_digest("act-b"), now)
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the fixture's provisioning request was refused"
+    );
+
+    // AND A CONNECTION MID-CUTOVER: rotated, with the customer still on the old token.
+    let cutting = connect_with_provider(&harness, &org, "mid-cutover", "okta", "act-c", None).await;
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .rotate_token(&env, &cutting, &hex_digest("act-c2"), 3600, now)
+        .await
+        .expect("rotate");
+    assert!(
+        harness
+            .db()
+            .store()
+            .scoped(harness.scope())
+            .scim_connections()
+            .authenticate(&hex_digest("act-c"), now)
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the customer's old token stopped working inside its own overlap"
+    );
+
+    let cookie = open_session_in(&harness, "scim", "tok-activity", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    assert!(
+        row(&body, "never-called").contains("No requests yet"),
+        "a connection nothing has ever called is indistinguishable from one in use, which is \
+         what a token pasted into the wrong field looks like: {}",
+        row(&body, "never-called")
+    );
+    assert!(
+        row(&body, "in-use").contains("Last request"),
+        "a connection that has served a provisioning request does not say so: {}",
+        row(&body, "in-use")
+    );
+    assert!(
+        !row(&body, "in-use").contains("No requests yet"),
+        "a connection in use is reported as never called: {}",
+        row(&body, "in-use")
+    );
+
+    // THE CUTOVER OUTRANKS THE TIMESTAMP. This connection is plainly in use -- on the OLD token --
+    // so a last-request time would report exactly the health that ends when the overlap does.
+    assert!(
+        row(&body, "mid-cutover").contains("New token not used yet"),
+        "a connection whose customer has not pasted the new token yet reports itself healthy, so \
+         nothing warns before the overlap ends and provisioning stops: {}",
+        row(&body, "mid-cutover")
+    );
+    assert!(
+        !row(&body, "mid-cutover").contains("Last request"),
+        "the mid-cutover row leads with the reassuring half: {}",
+        row(&body, "mid-cutover")
+    );
+}

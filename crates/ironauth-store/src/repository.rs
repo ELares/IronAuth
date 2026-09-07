@@ -75280,6 +75280,25 @@ pub struct ScimConnection {
     /// `scim_connections.token_digest` and provisions perfectly. Counting rows reported it as
     /// broken. It has one usable credential, and that is what this says.
     pub live_token_count: i64,
+    /// When any of this connection's tokens last authenticated a request, or `None` if none ever
+    /// has (issue #140).
+    ///
+    /// WHAT A CONFIGURED-BUT-DEAD CONNECTION LOOKS LIKE, and there is no other way to see it. A
+    /// connection whose credentials are live and whose identity provider has never called is
+    /// indistinguishable, through every other field, from one provisioning happily -- and that is
+    /// the ordinary result of pasting a token into the wrong field, or into the right field of
+    /// the wrong application. The stamp is coarse by design; see `LAST_SEEN_THROTTLE_MICROS`.
+    pub last_seen_at_unix_micros: Option<i64>,
+    /// Whether the NEWEST unrevoked token has ever authenticated, or `None` when the connection
+    /// holds no token row at all.
+    ///
+    /// THE CUTOVER QUESTION, which the timestamp above cannot answer. During a rotation overlap
+    /// both tokens work, so `last_seen_at` keeps moving on the strength of the OLD one and looks
+    /// healthy right up to the moment the overlap ends and provisioning stops. What predicts that
+    /// outage is whether the credential the customer was asked to paste has been used yet.
+    ///
+    /// `None` is the legacy population, which has no token rows to ask about.
+    pub newest_token_used: Option<bool>,
     /// The next deadline one of this connection's credentials meets, if any of them has one.
     ///
     /// # Two sources, whichever comes first
@@ -78692,6 +78711,36 @@ impl ScimConnectionRepo<'_> {
         .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?;
+        // RECORD THAT THIS TOKEN WAS USED, in the same transaction as the read that accepted it,
+        // so the two cannot disagree about whether a request authenticated (issue #140).
+        //
+        // THROTTLED, because this is the hot path: every provisioning request from every
+        // customer's identity provider comes through here, and a write per request would turn a
+        // point read into a read plus a row update on a table an entire deployment shares. The
+        // `WHERE` skips the write whenever the stored stamp is already inside the window, so a
+        // provisioning run that makes a thousand requests a minute writes once.
+        //
+        // A COARSE STAMP IS WHAT THE FEATURE NEEDS. The portal says "last used" to a human
+        // deciding whether their cutover landed; a minute of staleness is invisible to that
+        // question, and the alternative is a write amplification no operator asked for.
+        if row.is_some() {
+            sqlx::query(
+                "UPDATE scim_connection_tokens \
+                 SET last_seen_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
+                   AND (last_seen_at IS NULL \
+                        OR last_seen_at <= TIMESTAMPTZ 'epoch' \
+                                           + (($4::bigint - $5::bigint) \
+                                              * INTERVAL '1 microsecond'))",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(token_digest)
+            .bind(now_micros)
+            .bind(LAST_SEEN_THROTTLE_MICROS)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         // THE LEGACY FALLBACK, AS A SECOND POINT LOOKUP rather than an `OR` in the first.
         //
@@ -78769,6 +78818,13 @@ impl ScimConnectionRepo<'_> {
             // `authenticate` looks at.
             credential_expires_at_unix_micros: None,
             created_at_unix_micros: row.get("created_us"),
+            // NOT ANSWERED ON THE AUTHENTICATION PATH EITHER, and deliberately not answered with
+            // "now". This call is itself what stamps the token, so returning the stamp it just
+            // wrote would hand every caller a value that says only "you are here" -- true of
+            // every authenticated request and informative about none of them. Both fields are
+            // operator questions the LISTING answers.
+            last_seen_at_unix_micros: None,
+            newest_token_used: None,
         }))
     }
 
@@ -78868,6 +78924,16 @@ impl ScimConnectionRepo<'_> {
                     , EXISTS (SELECT 1 FROM scim_connection_tokens t \
                               WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
                                 AND t.environment_id = c.environment_id) AS has_token_rows \
+                    , (SELECT (EXTRACT(EPOCH FROM max(t.last_seen_at)) * 1000000)::bigint \
+                       FROM scim_connection_tokens t \
+                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                         AND t.environment_id = c.environment_id) AS last_seen_us \
+                    , (SELECT t.last_seen_at IS NOT NULL FROM scim_connection_tokens t \
+                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                         AND t.environment_id = c.environment_id \
+                         AND t.revoked_at IS NULL \
+                       ORDER BY t.created_at DESC, t.token_digest DESC LIMIT 1) \
+                        AS newest_token_used \
                     , (SELECT (o.deleted_at IS NULL AND o.state = 'active') \
                        FROM organizations o \
                        WHERE o.id = $3 AND o.tenant_id = $1 AND o.environment_id = $2) \
@@ -78920,6 +78986,13 @@ impl ScimConnectionRepo<'_> {
                     },
                     live_token_count: live_token_count(&row),
                     created_at_unix_micros: row.get("created_us"),
+                    last_seen_at_unix_micros: row.get("last_seen_us"),
+                    // NULL when the connection has no unrevoked token row at all, which is the
+                    // legacy population: it authenticates through `scim_connections.token_digest`
+                    // and has nothing here to stamp. `None` says "not a question this connection
+                    // can answer", which is different from `Some(false)`, "there is a newest
+                    // credential and nothing has used it".
+                    newest_token_used: row.get("newest_token_used"),
                 })
             })
             .collect()
@@ -79039,6 +79112,11 @@ mod scim_connection_signal_tests {
             live_token_count,
             credential_expires_at_unix_micros: deadline,
             created_at_unix_micros: 1_698_000_000_000_000,
+            // NEITHER SIGNAL READS THESE, which is the point of listing them at a fixed value:
+            // if one ever starts, this module stops compiling and the omission is a decision
+            // somebody makes rather than a default they inherit.
+            last_seen_at_unix_micros: None,
+            newest_token_used: None,
         }
     }
 
@@ -79137,6 +79215,18 @@ mod scim_connection_signal_tests {
         );
     }
 }
+
+/// How stale a token's `last_seen_at` may be before the authentication path refreshes it.
+///
+/// ONE MINUTE. The stamp answers "has this credential been used", asked by a human reading a
+/// portal page, and a minute of staleness cannot change that answer. What it buys is that a
+/// provisioning run pushing a thousand requests through one token writes one row rather than a
+/// thousand -- on a table every customer of the deployment shares.
+///
+/// It is deliberately NOT configurable: an operator who tuned it down would be paying write
+/// amplification for a precision no surface reads, and one who tuned it up would make a freshly
+/// pasted token look unused for as long as they chose.
+const LAST_SEEN_THROTTLE_MICROS: i64 = 60 * 1_000_000;
 
 /// The WRITE side of the inbound SCIM connections, for this scope and actor (issue #135).
 pub struct ActingScimConnectionRepo<'a> {
