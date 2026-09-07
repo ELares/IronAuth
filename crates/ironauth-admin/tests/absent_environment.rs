@@ -1270,6 +1270,18 @@ fn organization_cases(base: &str, ids: &Ids) -> Vec<Case> {
             body: None,
         },
         Case {
+            label: "org_contacts.createOrganizationContact",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/contacts"),
+            body: Some(serde_json::json!({ "display_name": "Sweep Contact", "email": "sweep@acme.example", "category": "technical" }).to_string()),
+        },
+        Case {
+            label: "org_contacts.deleteOrganizationContact",
+            method: "DELETE",
+            path: format!("{base}/organizations/{org}/contacts/oct_absent"),
+            body: None,
+        },
+        Case {
             label: "org_groups.createOrgGroup",
             method: "POST",
             path: format!("{base}/organizations/{org}/groups"),

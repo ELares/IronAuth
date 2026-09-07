@@ -108,6 +108,7 @@ mod migration_status;
 pub mod offboarding_worker;
 mod openapi;
 mod operators;
+mod org_contacts;
 mod org_context;
 mod org_effective_roles;
 mod org_group_members;
@@ -769,6 +770,18 @@ pub fn management_router(state: AdminState) -> Router {
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/roles/{role_id}/permissions/{permission_id}",
             delete(org_role_permissions::unassign_org_role_permission),
+        )
+        // Organization contacts (issue #141): the people an organization's operational
+        // notifications reach. Create, list and remove -- there is no update, because 0207
+        // grants the control plane only `updated_at` and `deleted_at` and the tombstone must
+        // keep naming the address actually notified.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts",
+            post(org_contacts::create_org_contact).get(org_contacts::list_org_contacts),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts/{contact_id}",
+            delete(org_contacts::delete_org_contact),
         )
         // Organization groups (issue #97): first-class, per-organization named groups
         // holding a position in that organization's group forest. Uncapped in number,

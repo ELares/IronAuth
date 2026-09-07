@@ -341,6 +341,11 @@ struct Fixture {
     spare_role: String,
     group: String,
     child_group: String,
+    /// Seeded on the `technical` category: the target of the contact removal case. A second
+    /// contact is never needed, because the create case uses a DIFFERENT address -- one address
+    /// per category per organization is unique among live rows, so reusing this one would be a
+    /// 409 against the seed rather than the 201 the sweep is measuring.
+    contact: String,
     /// Seeded a member of `group` and holding `role`.
     membership: String,
     /// Seeded a membership of the organization but bound to no group.
@@ -497,6 +502,20 @@ impl Fixture {
         let (agent, approval) = Self::seed_agent(h, tenant, environment, &base, &user, key).await;
         let member_user = user.clone();
 
+        let contact = seed_row(
+            h,
+            &format!("{base}/contacts"),
+            &format!("{key}-oct"),
+            &serde_json::json!({
+                "display_name": "Seeded Contact",
+                "email": "seeded@acme.example",
+                "category": "technical",
+            })
+            .to_string(),
+            "organization contact",
+        )
+        .await;
+
         let scim_connection = seed_row(
             h,
             &format!("{base}/scim-connections"),
@@ -519,6 +538,7 @@ impl Fixture {
             spare_role,
             group,
             child_group,
+            contact,
             membership,
             spare_membership,
             spare_user,
@@ -1178,9 +1198,18 @@ impl Fixture {
             child_group,
             membership,
             spare_membership,
+            contact,
             ..
         } = self;
         vec![
+            Case {
+                label: "org_contacts.listOrganizationContacts",
+                method: "GET",
+                path: format!("{base}/contacts"),
+                body: None,
+                intent: Intent::Read(vec![contact.clone()]),
+                live: StatusCode::OK,
+            },
             Case {
                 label: "org_groups.listOrgGroups",
                 method: "GET",
@@ -1356,6 +1385,21 @@ impl Fixture {
                 live: StatusCode::CREATED,
             },
             Case {
+                label: "org_contacts.createOrganizationContact",
+                method: "POST",
+                path: format!("{base}/contacts"),
+                body: Some(
+                    serde_json::json!({
+                        "display_name": "Swept Contact",
+                        "email": "swept@acme.example",
+                        "category": "billing",
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
                 label: "org_groups.createOrgGroup",
                 method: "POST",
                 path: format!("{base}/groups"),
@@ -1505,6 +1549,7 @@ impl Fixture {
             membership,
             permission,
             grant,
+            contact,
             ..
         } = self;
         vec![
@@ -1569,6 +1614,14 @@ impl Fixture {
                 label: "org_roles.deleteOrgRole",
                 method: "DELETE",
                 path: format!("{base}/roles/{role}"),
+                body: None,
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "org_contacts.deleteOrganizationContact",
+                method: "DELETE",
+                path: format!("{base}/contacts/{contact}"),
                 body: None,
                 intent: Intent::Write,
                 live: StatusCode::NO_CONTENT,
@@ -1668,6 +1721,7 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
         spare_role: "rol_y".to_owned(),
         group: "grp_x".to_owned(),
         child_group: "grp_y".to_owned(),
+        contact: "oct_x".to_owned(),
         membership: "omb_x".to_owned(),
         spare_membership: "omb_y".to_owned(),
         spare_user: "usr_x".to_owned(),
@@ -2176,6 +2230,16 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             serde_json::json!({ "slug": "replay.role", "display_name": "Replay" }).to_string(),
         ),
         (
+            "org_contacts.createOrganizationContact",
+            format!("{base}/contacts"),
+            serde_json::json!({
+                "display_name": "Replay Contact",
+                "email": "replay@acme.example",
+                "category": "security",
+            })
+            .to_string(),
+        ),
+        (
             "org_groups.createOrgGroup",
             format!("{base}/groups"),
             serde_json::json!({ "slug": "replay.group", "display_name": "Replay" }).to_string(),
@@ -2392,6 +2456,7 @@ fn replay_fixture() -> Fixture {
         spare_role: "rol_y".to_owned(),
         group: "grp_x".to_owned(),
         child_group: "grp_y".to_owned(),
+        contact: "oct_x".to_owned(),
         membership: "omb_x".to_owned(),
         spare_membership: "omb_y".to_owned(),
         spare_user: "usr_x".to_owned(),
@@ -2653,8 +2718,8 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 40;
-    const READS: usize = 18;
+    const WRITES: usize = 42;
+    const READS: usize = 19;
 
     let cases = replay_fixture_cases();
     let writes = cases

@@ -13824,6 +13824,293 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts": {
+      "get": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`",
+        "description": "# Errors\n\n`403` if the credential lacks `management.read`; `404` if the scope or organization is not\naddressable.",
+        "operationId": "listOrganizationContacts",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum contacts to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Cursor from a previous page",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The organization's live contacts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgContactList"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown scope or organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "`POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`",
+        "description": "# Errors\n\n`400` if the body, the address, the name or the category is malformed; `403` if the\ncredential lacks `management.write_organizations`; `404` if the scope or organization is not\naddressable; `409` if this organization already lists that address on that category.",
+        "operationId": "createOrganizationContact",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required replay key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOrgContactRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The contact was added",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgContactView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown scope or organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already listed on that category",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts/{contact_id}": {
+      "delete": {
+        "tags": [
+          "organizations"
+        ],
+        "summary": "`DELETE .../organizations/{organization_id}/contacts/{contact_id}`",
+        "description": "# Errors\n\n`403` if the credential lacks `management.write_organizations`; `404` if the scope, the\norganization or the contact is not addressable from here.",
+        "operationId": "deleteOrganizationContact",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "contact_id",
+            "in": "path",
+            "description": "Contact identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The contact is off the list"
+          },
+          "403": {
+            "description": "Insufficient permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown scope, organization or contact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
       "put": {
         "tags": [
@@ -30380,6 +30667,29 @@
           }
         }
       },
+      "CreateOrgContactRequest": {
+        "type": "object",
+        "description": "The body of a create request (issue #141).",
+        "required": [
+          "display_name",
+          "email",
+          "category"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "Which kind of notification they want: `technical`, `security` or `billing`."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Who they are."
+          },
+          "email": {
+            "type": "string",
+            "description": "Where the notification goes."
+          }
+        }
+      },
       "CreateOrgGroupRequest": {
         "type": "object",
         "description": "The body to define a group in an organization.",
@@ -33203,6 +33513,68 @@
           "id": {
             "type": "string",
             "description": "The operator identifier (`op_...`)."
+          }
+        }
+      },
+      "OrgContactList": {
+        "type": "object",
+        "description": "A page of contacts (issue #141).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrgContactView"
+            },
+            "description": "The contacts on this page, oldest first."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, or null when this is the last one."
+          }
+        }
+      },
+      "OrgContactView": {
+        "type": "object",
+        "description": "One operational contact, as returned by the management API (issue #141).",
+        "required": [
+          "id",
+          "organization_id",
+          "display_name",
+          "email",
+          "category",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "Which kind of notification they want: `technical`, `security` or `billing`."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the contact was added, epoch milliseconds."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Who they are. Sealed at rest; opened for this response."
+          },
+          "email": {
+            "type": "string",
+            "description": "Where the notification goes. Sealed at rest; opened for this response."
+          },
+          "id": {
+            "type": "string",
+            "description": "The contact identifier (`oct_...`, embeds its scope)."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization whose notifications this person receives (`org_...`)."
           }
         }
       },

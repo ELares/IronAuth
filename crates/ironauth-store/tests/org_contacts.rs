@@ -140,7 +140,7 @@ async fn a_contact_is_listed_for_its_own_organization_and_no_other() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&mine, 50)
+        .list_for_organization(&mine, 50, None)
         .await
         .expect("list");
     let addresses: Vec<&str> = listed.iter().map(|c| c.email.as_str()).collect();
@@ -205,7 +205,7 @@ async fn the_same_address_cannot_be_listed_twice_on_one_category() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 50)
+        .list_for_organization(&org, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -261,7 +261,7 @@ async fn removing_a_contact_stops_notifying_them_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 50)
+        .list_for_organization(&org, 50, None)
         .await
         .expect("list");
     assert!(
@@ -350,7 +350,7 @@ async fn a_foreign_organization_or_id_is_refused_before_any_write() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&foreign_org, 50)
+        .list_for_organization(&foreign_org, 50, None)
         .await;
     assert!(
         matches!(outcome, Err(StoreError::NotFound)),
@@ -508,7 +508,7 @@ async fn neither_the_name_nor_the_address_is_readable_from_the_table() {
         .control_store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 10)
+        .list_for_organization(&org, 10, None)
         .await
         .expect("list");
     assert_eq!(listed.len(), 1);
@@ -555,7 +555,7 @@ async fn the_name_and_the_address_do_not_open_under_each_others_context() {
         .control_store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 10)
+        .list_for_organization(&org, 10, None)
         .await;
     assert!(
         matches!(outcome, Err(StoreError::Encryption)),
@@ -606,7 +606,7 @@ async fn one_organizations_caller_cannot_remove_anothers_contact() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&theirs, 50)
+        .list_for_organization(&theirs, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -727,7 +727,7 @@ async fn the_duplicate_rule_folds_case_and_is_per_organization() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&theirs, 50)
+        .list_for_organization(&theirs, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -773,7 +773,7 @@ async fn the_stored_address_is_sealed_and_the_listing_opens_it() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 50)
+        .list_for_organization(&org, 50, None)
         .await
         .expect("list");
     assert_eq!(

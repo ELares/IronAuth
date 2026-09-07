@@ -78821,7 +78821,10 @@ pub struct OrgContactRepo<'a> {
 }
 
 impl OrgContactRepo<'_> {
-    /// Every LIVE contact of one organization, oldest first.
+    /// Every LIVE contact of one organization, oldest first, from `after` onward.
+    ///
+    /// KEYSET, on the same `(created_at, id)` total order every management listing uses, so a
+    /// contact added or removed between pages neither skips a row nor repeats one.
     ///
     /// LIVE ONLY, because this answers "who do we notify". A removed contact is kept for the
     /// audit trail -- "who was told about the certificate that then expired" is answerable only
@@ -78840,11 +78843,13 @@ impl OrgContactRepo<'_> {
         &self,
         organization_id: &OrganizationId,
         limit: i64,
+        after: Option<&CursorPosition>,
     ) -> Result<Vec<OrgContact>, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, organization_id, display_name_sealed, email_sealed, pii_dek_version, \
@@ -78853,11 +78858,15 @@ impl OrgContactRepo<'_> {
              FROM org_contacts \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
                AND deleted_at IS NULL \
-             ORDER BY created_at, id LIMIT $4",
+               AND ($4::bigint IS NULL OR (created_at, id) > \
+                    (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(organization_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
@@ -78921,6 +78930,25 @@ impl ActingOrgContactRepo<'_> {
     /// [`StoreError::Encryption`] if the scope has no key to seal under;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn add(&self, env: &Env, contact: NewOrgContact<'_>) -> Result<(), StoreError> {
+        self.add_with_event(env, contact, None, None).await
+    }
+
+    /// Add a contact, optionally recording an idempotency result and announcing a domain event.
+    ///
+    /// THE EVENT RIDES THE WRITE'S OWN TRANSACTION, so a rolled-back add announces nothing: a
+    /// consumer that received `org_contact.added` for a row that does not exist would route a
+    /// notification to a destination the table cannot produce.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`add`](Self::add).
+    pub async fn add_with_event(
+        &self,
+        env: &Env,
+        contact: NewOrgContact<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if contact.id.scope() != self.scope || contact.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -79004,10 +79032,14 @@ impl ActingOrgContactRepo<'_> {
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
-                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
-                    Err(error) => Err(error.into()),
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
                 }
+                insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -79036,6 +79068,30 @@ impl ActingOrgContactRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgContactId,
         now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        self.remove_with_event(env, organization_id, id, now_micros, None)
+            .await
+    }
+
+    /// Remove a contact, announcing a domain event when one actually happened.
+    ///
+    /// THE EVENT IS INSIDE THE AUDITED WRITE, which is the only place it can be: a repeat and a
+    /// stranger are both answered before that write opens, so neither reaches this and neither
+    /// announces. A consumer therefore sees exactly one `org_contact.removed` per contact really
+    /// taken off the list, which is the count the audit trail carries too. The concurrent loser
+    /// announces nothing for the same reason it writes no audit row -- its `Err` rolls the whole
+    /// transaction back before the report is turned into `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`remove`](Self::remove).
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgContactId,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -79104,6 +79160,8 @@ impl ActingOrgContactRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::Conflict);
                 }
+                // Announced only on the branch that really removed something.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(true)
             },
             false,

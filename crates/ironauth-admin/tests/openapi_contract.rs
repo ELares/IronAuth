@@ -117,6 +117,7 @@ fn operation_ids_are_the_stable_set() {
             "createOrgRole",
             "createOrganization",
             "createOrganizationApiKey",
+            "createOrganizationContact",
             "createPermission",
             "createPortalLink",
             "createProjectGrant",
@@ -150,6 +151,7 @@ fn operation_ids_are_the_stable_set() {
             "deleteOrgGroup",
             "deleteOrgRole",
             "deleteOrganization",
+            "deleteOrganizationContact",
             "deleteOutboundVerification",
             "deletePermission",
             "deleteScimPushConnection",
@@ -255,6 +257,7 @@ fn operation_ids_are_the_stable_set() {
             "listOrgRolePermissions",
             "listOrgRoles",
             "listOrganizationApiKeys",
+            "listOrganizationContacts",
             "listOrganizations",
             "listPermissions",
             "listProjectGrants",
@@ -569,6 +572,7 @@ fn documented_paths_are_the_expected_set() {
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/migration/outbound-verification",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}",
+            "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts/{contact_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members/{membership_id}",
@@ -657,6 +661,7 @@ fn documented_paths_are_the_expected_set() {
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agent-approvals",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
+            "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}",
             "GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups/{group_id}/members",
@@ -755,6 +760,7 @@ fn documented_paths_are_the_expected_set() {
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/agents",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/api-keys/{key_id}/rotate",
+            "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/disable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/enable",
             "POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/groups",
@@ -928,7 +934,7 @@ async fn served_routes_match_documented_routes() {
     let documented = documented_method_paths();
     assert_eq!(
         documented.len(),
-        289,
+        292,
         "the documented route count is pinned"
     );
 

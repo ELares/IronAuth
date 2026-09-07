@@ -357,6 +357,10 @@ struct Fixture {
     family: String,
     recovery_flow: String,
     group: String,
+    /// A LIVE contact, so the removal case has a target that exists. The create case uses a
+    /// different address on a different category: one address per category per organization is
+    /// unique among live rows, so reusing this one would be a 409 rather than a 201.
+    contact: String,
     invitation: String,
     key: String,
     membership: String,
@@ -505,6 +509,24 @@ impl Fixture {
             .await;
         assert_eq!(status, StatusCode::CREATED, "create org group: {body}");
         let group = field(&body, "/id", "seed group");
+
+        // A LIVE contact, so the removal case has a target that exists. The create case below
+        // uses a DIFFERENT address: one address per category per organization is unique among
+        // live rows, so reusing this one would be a 409 rather than the 201 the sweep measures.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/contacts"),
+                "seed-contact",
+                &serde_json::json!({
+                    "display_name": "Seeded Contact",
+                    "email": "seeded@acme.example",
+                    "category": "technical",
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create org contact: {body}");
+        let contact = field(&body, "/id", "seed contact");
 
         let (status, _, body) = h
             .post(
@@ -1395,6 +1417,7 @@ impl Fixture {
             second_quarantined_user,
             unenrolled_user,
             group,
+            contact,
             invitation,
             key,
             membership,
@@ -1449,6 +1472,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         family,
         recovery_flow,
         group,
+        contact,
         invitation,
         key,
         membership,
@@ -2478,6 +2502,27 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "POST",
             format!("{org_base}/enable"),
         ),
+        // ---- organization contacts (issue #141) ----
+        Case::empty(
+            "org_contacts.listOrganizationContacts",
+            "GET",
+            format!("{org_base}/contacts"),
+        ),
+        Case::json(
+            "org_contacts.createOrganizationContact",
+            "POST",
+            format!("{org_base}/contacts"),
+            &serde_json::json!({
+                "display_name": "Sweep Contact",
+                "email": "sweep@acme.example",
+                "category": "billing",
+            }),
+        ),
+        Case::empty(
+            "org_contacts.deleteOrganizationContact",
+            "DELETE",
+            format!("{org_base}/contacts/{contact}"),
+        ),
         // ---- organization groups ----
         Case::empty(
             "org_groups.listOrgGroups",
@@ -3284,6 +3329,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         family: "rfm_0".to_owned(),
         recovery_flow: "rcf_0".to_owned(),
         group: "grp_0".to_owned(),
+        contact: "oct_0".to_owned(),
         invitation: "inv_0".to_owned(),
         key: "mgk_0".to_owned(),
         membership: "mem_0".to_owned(),

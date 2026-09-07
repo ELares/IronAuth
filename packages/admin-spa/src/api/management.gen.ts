@@ -2003,6 +2003,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`
+         * @description # Errors
+         *
+         *     `403` if the credential lacks `management.read`; `404` if the scope or organization is not
+         *     addressable.
+         */
+        get: operations["listOrganizationContacts"];
+        put?: never;
+        /**
+         * `POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts`
+         * @description # Errors
+         *
+         *     `400` if the body, the address, the name or the category is malformed; `403` if the
+         *     credential lacks `management.write_organizations`; `404` if the scope or organization is not
+         *     addressable; `409` if this organization already lists that address on that category.
+         */
+        post: operations["createOrganizationContact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/contacts/{contact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE .../organizations/{organization_id}/contacts/{contact_id}`
+         * @description # Errors
+         *
+         *     `403` if the credential lacks `management.write_organizations`; `404` if the scope, the
+         *     organization or the contact is not addressable from here.
+         */
+        delete: operations["deleteOrganizationContact"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/default-role": {
         parameters: {
             query?: never;
@@ -5004,6 +5058,15 @@ export interface components {
              */
             user_id: string;
         };
+        /** @description The body of a create request (issue #141). */
+        CreateOrgContactRequest: {
+            /** @description Which kind of notification they want: `technical`, `security` or `billing`. */
+            category: string;
+            /** @description Who they are. */
+            display_name: string;
+            /** @description Where the notification goes. */
+            email: string;
+        };
         /** @description The body to define a group in an organization. */
         CreateOrgGroupRequest: {
             /**
@@ -6633,6 +6696,31 @@ export interface components {
             display_name: string;
             /** @description The operator identifier (`op_...`). */
             id: string;
+        };
+        /** @description A page of contacts (issue #141). */
+        OrgContactList: {
+            /** @description The contacts on this page, oldest first. */
+            items: components["schemas"]["OrgContactView"][];
+            /** @description The cursor for the next page, or null when this is the last one. */
+            next_cursor?: string | null;
+        };
+        /** @description One operational contact, as returned by the management API (issue #141). */
+        OrgContactView: {
+            /** @description Which kind of notification they want: `technical`, `security` or `billing`. */
+            category: string;
+            /**
+             * Format: int64
+             * @description When the contact was added, epoch milliseconds.
+             */
+            created_at_unix_ms: number;
+            /** @description Who they are. Sealed at rest; opened for this response. */
+            display_name: string;
+            /** @description Where the notification goes. Sealed at rest; opened for this response. */
+            email: string;
+            /** @description The contact identifier (`oct_...`, embeds its scope). */
+            id: string;
+            /** @description The organization whose notifications this person receives (`org_...`). */
+            organization_id: string;
         };
         /** @description A page of organization groups. */
         OrgGroupList: {
@@ -19224,6 +19312,171 @@ export interface operations {
             };
             /** @description Idempotency-Key reused with a different request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listOrganizationContacts: {
+        parameters: {
+            query?: {
+                /** @description Maximum contacts to return */
+                limit?: number;
+                /** @description Cursor from a previous page */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The organization's live contacts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgContactList"];
+                };
+            };
+            /** @description Insufficient permission */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown scope or organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createOrganizationContact: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required replay key */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateOrgContactRequest"];
+            };
+        };
+        responses: {
+            /** @description The contact was added */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrgContactView"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Insufficient permission */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown scope or organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Already listed on that category */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteOrganizationContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Contact identifier */
+                contact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The contact is off the list */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Insufficient permission */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unknown scope, organization or contact */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
