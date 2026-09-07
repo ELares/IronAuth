@@ -2874,6 +2874,36 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // WHAT A VENDOR DOES WITH THIS. #141 asks for a renewal webhook so the vendor can act
+        // before their customer's logins break -- open a ticket, mail the IT contact themselves,
+        // or drive their own renewal flow. It carries the LEAD it was sent for as well as the
+        // expiry, because "thirty days out" and "three days out" call for different responses and
+        // a consumer processing late cannot tell them apart from the timestamp alone.
+        //
+        // NO CERTIFICATE BYTES AND NO FINGERPRINT. A consumer that needs them reads them back
+        // through the management API, where scope and permission are checked; putting them on the
+        // wire would spread a customer's pinned trust material across every subscriber and the
+        // outbox row it sits in.
+        "saml_certificate.expiring",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "saml_certificate_id": {"type": "string", "minLength": 1},
+                "saml_connection_id": {"type": "string", "minLength": 1},
+                "lead_secs": {"type": "integer", "minimum": 1},
+                "not_after_unix_ms": {"type": "integer"}
+            },
+            "required": [
+                "saml_certificate_id",
+                "saml_connection_id",
+                "lead_secs",
+                "not_after_unix_ms"
+            ]
+        }"#,
+    ),
+    (
         // The id and the ORGANIZATION, because a SCIM connection provisions INTO exactly one
         // organization and a consumer routing on "who gained a provisioning credential"
         // cannot get that from the id. The PROVIDER too: a SIEM correlating a new connection

@@ -107,6 +107,46 @@ async fn connect(
     id
 }
 
+/// Pin a P-256 key whose `not_after` is exactly `at_micros`, returning the handle.
+///
+/// EXISTS SO A FIXTURE CAN SIT ON A BOUNDARY. `pin_expiring` computes the expiry from its OWN
+/// clock reading, which is microseconds later than the caller's `now`, so a certificate meant to
+/// land exactly on `now + lead` lands just past it and the comparison at the boundary is never
+/// the one being driven.
+async fn pin_at(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    connection: &SamlConnectionId,
+    seed: u8,
+    at_micros: i64,
+) -> SamlCertificateId {
+    let id = SamlCertificateId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .saml_connections()
+        .pin_certificate(
+            env,
+            NewSamlCertificate {
+                id: &id,
+                connection_id: connection,
+                key_kind: SamlKeyKind::EcdsaP256,
+                public_key: &p256_point(seed),
+                rsa_exponent: None,
+                certificate_der: &[0x30, 0x82, seed],
+                fingerprint_sha256: &fingerprint(seed),
+                not_before_unix_micros: at_micros - 365 * DAY * 1_000_000,
+                not_after_unix_micros: at_micros,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("pin the certificate");
+    id
+}
+
 /// Pin a P-256 key expiring `in_secs` from now, returning the handle.
 async fn pin_expiring(
     db: &TestDatabase,
@@ -410,6 +450,229 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
         (entry.not_after_unix_micros - expected).abs() < 1_000_000,
         "the entry's expiry is not the certificate's: {} against {expected}",
         entry.not_after_unix_micros
+    );
+}
+
+/// Every event the outbox is holding for this scope, drained.
+async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_json::Value> {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
+}
+
+#[tokio::test]
+async fn the_notice_and_the_ledger_row_commit_together() {
+    // THE ORDERING THIS API EXISTS FOR, and until now nothing measured it: every call passed
+    // `event: None`, so the parameter added to make "recorded" and "announced" one fact was
+    // exercised by no test at all.
+    //
+    // WHY IT MATTERS. A ledger row says "this customer has been told". If the row committed and
+    // the announcement then failed, nothing would ever correct it -- `due()` filters on exactly
+    // this row, no role may delete one, and no later sweep re-surfaces it. The customer is never
+    // told and the ledger says they were, which is the outage #141 exists to prevent.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/i").await;
+    let now = now_micros(&env);
+    let alerts = db.control_store().scoped(scope).saml_certificate_alerts();
+    let certificate = pin_expiring(&db, &env, scope, &connection, 30, 2 * DAY).await;
+
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_cert_expiring",
+        "saml_certificate.expiring",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now / 1000,
+        &serde_json::json!({
+            "saml_certificate_id": certificate.to_string(),
+            "saml_connection_id": connection.to_string(),
+            "lead_secs": 3 * DAY,
+            "not_after_unix_ms": (now + 2 * DAY * 1_000_000) / 1000,
+        }),
+    )
+    .expect("the expiring type is registered");
+
+    alerts
+        .record_sent(
+            &env,
+            &certificate,
+            3 * DAY,
+            now,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_cert_expiring",
+                subject: &certificate.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("record and announce");
+
+    let announced = queued_events(&db, &env, scope).await;
+    assert_eq!(announced.len(), 1, "the notice announced {announced:?}");
+    assert_eq!(announced[0]["type"], "saml_certificate.expiring");
+    assert_eq!(
+        announced[0]["payload"]["lead_secs"],
+        3 * DAY,
+        "the notice does not carry the lead it was sent for: {announced:?}"
+    );
+
+    // AND A LOSER ANNOUNCES NOTHING. The conflict returns BEFORE the enqueue, so the second sweep
+    // to reach this pair does not send a duplicate notice -- which is the half that makes the
+    // primary key a delivery guarantee rather than just a uniqueness rule.
+    let again = alerts
+        .record_sent(
+            &env,
+            &certificate,
+            3 * DAY,
+            now + 1,
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_cert_expiring_again",
+                subject: &certificate.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(again, Err(StoreError::Conflict)),
+        "a second send was not refused: {again:?}"
+    );
+    let after = queued_events(&db, &env, scope).await;
+    assert!(
+        after.is_empty(),
+        "the losing sweep announced a duplicate notice: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn both_interval_bounds_are_driven_where_they_sit() {
+    // NEITHER COMPARISON WAS DRIVEN AT ITS BOUNDARY. Every fixture sat a day or more either side,
+    // so `<=` could become `<`, `>` could become `>=`, or the window could shrink by half a day,
+    // and all of them stayed green. A lead is a promise about a moment; the moment is where it
+    // has to be measured.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/j").await;
+    let now = now_micros(&env);
+    let alerts = db.control_store().scoped(scope).saml_certificate_alerts();
+    let lead = 3 * DAY;
+
+    // EXACTLY ON THE UPPER BOUND: expiring at `now + lead`. The clause is `<=`, so this is due --
+    // a certificate exactly a lead away has just entered the window.
+    let on_bound = pin_at(&db, &env, scope, &connection, 40, now + lead * 1_000_000).await;
+    // ONE MICROSECOND PAST IT: not yet due, which is the other side of the same comparison.
+    let past_bound = pin_at(
+        &db,
+        &env,
+        scope,
+        &connection,
+        41,
+        now + lead * 1_000_000 + 1,
+    )
+    .await;
+    // EXACTLY AT EXPIRY: the lower clause is `>`, so a certificate expiring at this instant is
+    // NOT due for a warning -- there is no time left to warn about.
+    let at_expiry = pin_at(&db, &env, scope, &connection, 42, now).await;
+    // ONE MICROSECOND BEFORE EXPIRY: still alive, so still due.
+    let barely_alive = pin_at(&db, &env, scope, &connection, 43, now + 1).await;
+
+    let due = alerts.due(now, &[lead], 100).await.expect("due");
+    let ids: Vec<&str> = due
+        .iter()
+        .map(|entry| entry.certificate_id.as_str())
+        .collect();
+
+    assert!(
+        ids.contains(&on_bound.to_string().as_str()),
+        "a certificate exactly one lead from expiry is not due, so the upper bound is `<` not \
+         `<=`: {due:?}"
+    );
+    assert!(
+        !ids.contains(&past_bound.to_string().as_str()),
+        "a certificate one microsecond beyond the lead is due, so the window is too wide: {due:?}"
+    );
+    assert!(
+        !ids.contains(&at_expiry.to_string().as_str()),
+        "a certificate expiring at this instant is queued for a WARNING: {due:?}"
+    );
+    assert!(
+        ids.contains(&barely_alive.to_string().as_str()),
+        "a certificate one microsecond from expiry is not due, so the lower bound is `>=` not \
+         `>`: {due:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_soonest_expiry_comes_first_and_a_repeated_lead_is_one_lead() {
+    // TWO CLAIMS THE RUSTDOC MAKES AND NOTHING MEASURED. The ordering paragraph exists because a
+    // sweep that is behind finds more work than it can send in one pass, and the certificates
+    // closest to breaking are the ones whose notices matter most -- so a reversed sort is a real
+    // regression, and it could be reversed with every test green. The DISTINCT was added in round
+    // 1 with no test passing a repeated lead at all.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/k").await;
+    let now = now_micros(&env);
+    let alerts = db.control_store().scoped(scope).saml_certificate_alerts();
+
+    // Pinned OUT of order, so a passing run cannot be insertion order.
+    let later = pin_expiring(&db, &env, scope, &connection, 44, 20 * DAY).await;
+    let sooner = pin_expiring(&db, &env, scope, &connection, 45, 2 * DAY).await;
+
+    let due = alerts.due(now, &[30 * DAY], 100).await.expect("due");
+    let ids: Vec<&str> = due
+        .iter()
+        .map(|entry| entry.certificate_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![sooner.to_string().as_str(), later.to_string().as_str()],
+        "the soonest expiry is not first, so a truncated sweep would drop the urgent one: {due:?}"
+    );
+
+    // AND THE LIMIT TAKES THE SOONEST, which is what makes the ordering worth having.
+    let one = alerts.due(now, &[30 * DAY], 1).await.expect("due");
+    assert_eq!(one.len(), 1);
+    assert_eq!(
+        one[0].certificate_id,
+        sooner.to_string(),
+        "a limited sweep took the later certificate: {one:?}"
+    );
+
+    // A REPEATED LEAD IS ONE LEAD. Without the DISTINCT this yields each pair twice, so a sweep
+    // sends two identical notices and the second `record_sent` answers Conflict for one it had
+    // just delivered.
+    let repeated = alerts
+        .due(now, &[30 * DAY, 30 * DAY], 100)
+        .await
+        .expect("due");
+    assert_eq!(
+        repeated.len(),
+        2,
+        "a lead named twice produced the pair twice: {repeated:?}"
     );
 }
 

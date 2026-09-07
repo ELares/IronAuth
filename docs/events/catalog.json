@@ -2649,6 +2649,38 @@
       "type": "routing_rule.domain_verification_changed"
     },
     {
+      "domain": "saml_certificate",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "lead_secs": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "not_after_unix_ms": {
+            "type": "integer"
+          },
+          "saml_certificate_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "saml_connection_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "saml_certificate_id",
+          "saml_connection_id",
+          "lead_secs",
+          "not_after_unix_ms"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "saml_certificate.expiring"
+    },
+    {
       "domain": "scim_connection",
       "payload_schema": {
         "additionalProperties": false,

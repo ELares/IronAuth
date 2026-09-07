@@ -44100,6 +44100,20 @@ impl ActingConsentRepo<'_> {
     }
 }
 
+/// Whether a database error is a Postgres foreign-key violation (SQLSTATE 23503).
+///
+/// DISTINCT FROM [`crate::error::is_absent_scope`], which folds the SCOPE keys specifically and
+/// keys on the `_tenant_id_fkey` suffix. This one is for a key naming a PARENT ROW that a
+/// concurrent write removed -- an ordinary race whose caller-facing answer is "that work item is
+/// gone", not a persistence fault.
+fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("23503")
+}
+
 /// Whether a database error is a Postgres unique-violation (SQLSTATE 23505).
 /// Used to turn a duplicate bootstrap login handle into the caller-facing
 /// [`StoreError::Conflict`] rather than an opaque database fault.
@@ -77017,7 +77031,18 @@ impl SamlCertificateAlertRepo<'_> {
         .bind(lead_secs)
         .bind(at_unix_micros)
         .execute(&mut *tx)
-        .await?;
+        .await;
+        // THE ROLLOVER RACE IS ORDINARY, NOT EXCEPTIONAL. A sweep reads `due()`, and before it
+        // records the notice an operator replaces the certificate -- which is exactly what an
+        // expiry warning asks them to do, so this is the likeliest interleaving on this path,
+        // not a rare one. The row is gone and the foreign key fails. Left as `Database` that
+        // reads as a persistence fault and would page somebody; it is simply "the work item
+        // expired", which is what `NotFound` means to this caller.
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(error) if is_foreign_key_violation(&error) => return Err(StoreError::NotFound),
+            Err(error) => return Err(error.into()),
+        };
         if inserted.rows_affected() == 0 {
             return Err(StoreError::Conflict);
         }
