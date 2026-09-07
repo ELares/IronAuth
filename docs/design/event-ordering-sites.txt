@@ -33,7 +33,7 @@ crates/ironauth-oidc/src/message_sender.rs:enqueue_notice:1
 crates/ironauth-store/src/repository.rs:abandon_with_event:1
 crates/ironauth-store/src/repository.rs:activate_version_idempotent_with_event:1
 crates/ironauth-store/src/repository.rs:add_allowlist_country_with_event:1
-crates/ironauth-store/src/repository.rs:add_with_event:2
+crates/ironauth-store/src/repository.rs:add_with_event:3
 crates/ironauth-store/src/repository.rs:admin_create_emitting:1
 crates/ironauth-store/src/repository.rs:apply_promotion_with_event:1
 crates/ironauth-store/src/repository.rs:apply_uniqueness_mode_with_event:1
@@ -82,7 +82,7 @@ crates/ironauth-store/src/repository.rs:register:1
 crates/ironauth-store/src/repository.rs:register_with_event:1
 crates/ironauth-store/src/repository.rs:reject_with_event:1
 crates/ironauth-store/src/repository.rs:remove_allowlist_country_with_event:1
-crates/ironauth-store/src/repository.rs:remove_with_event:4
+crates/ironauth-store/src/repository.rs:remove_with_event:5
 crates/ironauth-store/src/repository.rs:reorder:1
 crates/ironauth-store/src/repository.rs:reparent_with_event:1
 crates/ironauth-store/src/repository.rs:request_dead_letter_replay:1

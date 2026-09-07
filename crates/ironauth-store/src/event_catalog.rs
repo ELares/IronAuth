@@ -1989,6 +1989,48 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // NO ADDRESS AND NO NAME IN THE PAYLOAD, deliberately, and this is the one thing worth
+        // saying about these two types. 0207 seals both columns so that whoever can read the
+        // table cannot learn who a customer's staff are; an event carrying the address in the
+        // clear would hand it to every consumer, to the outbox row it sits in, and to whatever
+        // a subscriber logs -- undoing the seal by a route that never touches the table. A
+        // consumer that needs the address reads it back through the management API, where the
+        // scope and the permission are checked.
+        //
+        // THE CATEGORY IS HERE, because it is a closed set of three vendor-chosen words that
+        // names nobody, and routing is the reason a consumer subscribes at all: "a billing
+        // contact was added for this organization" is actionable without knowing who they are.
+        "org_contact.added",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_contact_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "category": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_contact_id", "organization_id", "category"]
+        }"#,
+    ),
+    (
+        // EMITTED ONLY WHEN A CONTACT REALLY LEFT THE LIST. A repeat, a stranger and the loser
+        // of a concurrent double removal all answer before or inside a transaction that rolls
+        // back, so none of them announces. A consumer counting these is counting removals.
+        "org_contact.removed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "org_contact_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "category": {"type": "string", "minLength": 1}
+            },
+            "required": ["org_contact_id", "organization_id", "category"]
+        }"#,
+    ),
+    (
         "org_group.created",
         1,
         r#"{

@@ -14,7 +14,7 @@
 use ironauth_env::Env;
 use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
-    CorrelationId, NewOrgContact, OrgContactId, OrganizationId, Scope, StoreError,
+    CorrelationId, CursorPosition, NewOrgContact, OrgContactId, OrganizationId, Scope, StoreError,
 };
 
 /// Run one statement as `ironauth_control` with this scope's RLS settings bound.
@@ -46,6 +46,85 @@ async fn run_as(pool: &sqlx::PgPool, scope: Scope, sql: &str) -> Result<u64, sql
     let affected = sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
     tx.commit().await?;
     Ok(affected)
+}
+
+/// Add one contact and announce it, as the management handler does.
+async fn add_announcing(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    display_name: &str,
+    email: &str,
+    category: &str,
+) -> OrgContactId {
+    let id = OrgContactId::generate(env, &scope);
+    let subject = id.to_string();
+    let event_id = format!("evt_{id}");
+    // THE CATALOG BUILDS THE ENVELOPE, not this test. A hand-written one is a second opinion
+    // about a shape the registry validates at enqueue time, and the registry wins.
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "org_contact.added",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros(env) / 1000,
+        &serde_json::json!({
+            "org_contact_id": subject,
+            "organization_id": organization.to_string(),
+            "category": category,
+        }),
+    )
+    .expect("the added type is registered");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_contacts()
+        .add_with_event(
+            env,
+            NewOrgContact {
+                id: &id,
+                organization_id: organization,
+                display_name,
+                email,
+                category,
+                created_at_micros: now_micros(env),
+            },
+            None,
+            Some(&ironauth_store::DomainEvent {
+                id: &event_id,
+                subject: &subject,
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("add");
+    id
+}
+
+/// Every event the outbox is holding for this scope, drained.
+async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_json::Value> {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::WEBHOOK_EVENT_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.into_iter().map(|message| message.payload).collect()
 }
 
 /// The scope's clock in epoch microseconds.
@@ -96,6 +175,7 @@ async fn add(
                 display_name,
                 email,
                 category,
+                created_at_micros: now_micros(env),
             },
         )
         .await?;
@@ -140,7 +220,7 @@ async fn a_contact_is_listed_for_its_own_organization_and_no_other() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&mine, 50)
+        .list_for_organization(&mine, 50, None)
         .await
         .expect("list");
     let addresses: Vec<&str> = listed.iter().map(|c| c.email.as_str()).collect();
@@ -205,7 +285,7 @@ async fn the_same_address_cannot_be_listed_twice_on_one_category() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 50)
+        .list_for_organization(&org, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -261,7 +341,7 @@ async fn removing_a_contact_stops_notifying_them_and_keeps_the_row() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 50)
+        .list_for_organization(&org, 50, None)
         .await
         .expect("list");
     assert!(
@@ -336,6 +416,7 @@ async fn a_foreign_organization_or_id_is_refused_before_any_write() {
                 display_name: "Ada",
                 email: "ada@acme.example",
                 category: "technical",
+                created_at_micros: now_micros(&env),
             },
         )
         .await;
@@ -350,7 +431,7 @@ async fn a_foreign_organization_or_id_is_refused_before_any_write() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&foreign_org, 50)
+        .list_for_organization(&foreign_org, 50, None)
         .await;
     assert!(
         matches!(outcome, Err(StoreError::NotFound)),
@@ -378,11 +459,19 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
     // so is a case some OTHER term refuses first: `a@b@c.example` looks like it drives the
     // multi-@ term and does not, because with that term gone the domain is `b`, which the
     // no-dot term refuses anyway.
+    //
+    // ONE CASE HERE DOCUMENTS RATHER THAN PINS, and saying which is the honest form of the
+    // claim above. `not-an-address` names term 3, but term 3 cannot be deleted on its own --
+    // `domain` is the name it binds -- and under the reachable weakening the no-dot term
+    // refuses it anyway. Its more-than-one sibling is the case that holds term 3.
     let long_local = format!("{}@acme.example", "a".repeat(320));
     for (email, why) in [
         ("ada @acme.example", "whitespace inside the address"),
         (long_local.as_str(), "longer than the 320-octet ceiling"),
-        ("not-an-address", "no @ at all"),
+        (
+            "not-an-address",
+            "no @ at all, which term 3 refuses by binding no domain",
+        ),
         (
             "ada@acme.example@evil.example",
             "two @: the apparent domain is not the deliverable one",
@@ -461,6 +550,344 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
 }
 
 #[tokio::test]
+async fn the_listing_pages_on_its_cursor_and_the_pages_cover_every_contact() {
+    // THE CURSOR EXISTS BECAUSE THE SHARED `ListQuery` CARRIES ONE. Every management listing
+    // accepts `cursor`, so a store listing that took only a limit would have made the handler
+    // ACCEPT a caller's cursor and silently answer page one forever.
+    //
+    // THE HANDLER DOES DRIVE IT -- `list_org_contacts` passes `page.after()` -- so this is not
+    // the only caller that supplies one, and an earlier version of this comment claiming so was
+    // wrong. What it is, is the only place the predicate's BEHAVIOUR is asserted: the handler
+    // hands the argument over and never checks what came back, so deleting the predicate would
+    // leave the handler compiling, serving, and quietly returning page one to every cursor.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+
+    // Five contacts across the three categories, so the duplicate rule does not refuse them.
+    let mut added = Vec::new();
+    for (index, category) in ["technical", "security", "billing", "technical", "security"]
+        .into_iter()
+        .enumerate()
+    {
+        added.push(
+            add(
+                &db,
+                &env,
+                scope,
+                &org,
+                &format!("Person {index}"),
+                &format!("person{index}@acme.example"),
+                category,
+            )
+            .await
+            .expect("add"),
+        );
+    }
+
+    let read = db.control_store().scoped(scope);
+    let mut seen = Vec::new();
+    let mut after: Option<CursorPosition> = None;
+    // Two at a time, so the walk crosses a page boundary more than once.
+    for _ in 0..5 {
+        let page = read
+            .org_contacts()
+            .list_for_organization(&org, 2, after.as_ref())
+            .await
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "a page returned more rows than its limit");
+        let last = page.last().expect("a non-empty page");
+        after = Some(CursorPosition {
+            created_at_unix_micros: last.created_at_unix_micros,
+            id: last.id.to_string(),
+        });
+        seen.extend(page.into_iter().map(|contact| contact.id));
+    }
+
+    // EVERY CONTACT ONCE, IN ORDER. A cursor the query ignored would return the same first page
+    // forever, so `seen` would be the first two repeated; one that skipped would come up short.
+    let expected: Vec<String> = added.iter().map(ToString::to_string).collect();
+    let walked: Vec<String> = seen.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        walked, expected,
+        "the paged walk did not cover every contact exactly once, oldest first"
+    );
+
+    // AND THE `id` HALF OF THE COMPOSITE, which the walk above never reaches because those five
+    // contacts have distinct timestamps. Ties are not hypothetical here: the write binds the
+    // CALLER'S clock rather than taking the column default, so two contacts added in one
+    // operator action share a `created_at` exactly. On a tie the cursor's `created_at` alone
+    // cannot say which row was already returned -- `(created_at, id) > (t, id)` is what does --
+    // so a predicate keyed on the timestamp alone either repeats a row forever or skips one.
+    let tied_org = seed_org(&db, &env, scope, "Tied").await;
+    let at = now_micros(&env);
+    let mut tied = Vec::new();
+    for (index, category) in ["technical", "security"].into_iter().enumerate() {
+        let id = OrgContactId::generate(&env, &scope);
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .org_contacts()
+            .add(
+                &env,
+                NewOrgContact {
+                    id: &id,
+                    organization_id: &tied_org,
+                    display_name: &format!("Tied {index}"),
+                    email: &format!("tied{index}@acme.example"),
+                    category,
+                    created_at_micros: at,
+                },
+            )
+            .await
+            .expect("add");
+        tied.push(id);
+    }
+
+    let first = read
+        .org_contacts()
+        .list_for_organization(&tied_org, 1, None)
+        .await
+        .expect("first tied page");
+    assert_eq!(first.len(), 1, "the tied page returned {first:?}");
+    let second = read
+        .org_contacts()
+        .list_for_organization(
+            &tied_org,
+            1,
+            Some(&CursorPosition {
+                created_at_unix_micros: first[0].created_at_unix_micros,
+                id: first[0].id.to_string(),
+            }),
+        )
+        .await
+        .expect("second tied page");
+    assert_eq!(
+        second.len(),
+        1,
+        "the cursor could not step past a tied timestamp: {second:?}"
+    );
+    assert_ne!(
+        second[0].id, first[0].id,
+        "the cursor returned the same contact twice on a tied timestamp"
+    );
+    assert_eq!(
+        second[0].created_at_unix_micros, first[0].created_at_unix_micros,
+        "the fixture did not actually produce a tie, so it cannot see the id half"
+    );
+}
+
+#[tokio::test]
+async fn a_removal_announces_once_and_a_repeat_announces_nothing() {
+    // WHAT THIS HOLDS, STATED EXACTLY, because an earlier version of it claimed more. It pins the
+    // STORE's half of the removal event: a real removal announces exactly one event, and a repeat
+    // announces none -- so a consumer counting `org_contact.removed` is counting removals.
+    //
+    // IT DOES NOT HOLD THE PAGED-SCAN BUG, and cannot. That defect is the HANDLER choosing which
+    // event to pass; this test passes an event of its own, which is the very step the handler got
+    // wrong, so it stays green against the buggy paged read and the correct point lookup alike --
+    // measured, by a mutation that survived it. The test that holds that bug lives where the bug
+    // does, in `ironauth-admin/tests/org_contacts.rs`.
+    //
+    // The contact removed below is deliberately NOT the first one, which costs nothing and keeps
+    // the fixture honest about ordering, but the page limit is not what this measures.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+
+    // Three contacts; the LAST is the one removed, and the listing is read with a limit of one
+    // below, which is the paged-scan condition in miniature. A production limit of 200 needs 201
+    // contacts to reach the same state; the property is the same and the fixture is not absurd.
+    let mut ids = Vec::new();
+    for (index, category) in ["technical", "security", "billing"].into_iter().enumerate() {
+        ids.push(
+            add_announcing(
+                &db,
+                &env,
+                scope,
+                &org,
+                &format!("Person {index}"),
+                &format!("person{index}@acme.example"),
+                category,
+            )
+            .await,
+        );
+    }
+    let last = ids.last().expect("three contacts");
+
+    // The adds announced, one each, carrying the category and NEITHER the name nor the address.
+    let added = queued_events(&db, &env, scope).await;
+    assert_eq!(added.len(), 3, "the adds announced {added:?}");
+    for event in &added {
+        assert_eq!(event["type"], "org_contact.added");
+        let rendered = serde_json::to_string(event).expect("json");
+        assert!(
+            !rendered.contains("@acme.example") && !rendered.contains("Person "),
+            "an add event carried a contact's address or name to the wire: {rendered}"
+        );
+    }
+
+    // The removed contact is not the first one, so the ordering the listing promises is exercised
+    // alongside the event. What a page limit implies for the HANDLER is measured in the admin
+    // suite, not here.
+    let first_page = db
+        .control_store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&org, 1, None)
+        .await
+        .expect("first page");
+    assert_eq!(first_page.len(), 1);
+    assert_ne!(
+        &first_page[0].id, last,
+        "the fixture removed the oldest contact, so ordering is not exercised"
+    );
+
+    // AND ITS REMOVAL STILL ANNOUNCES, carrying its own category.
+    let removal_envelope = ironauth_store::event_catalog::envelope(
+        "evt_contact_removed",
+        "org_contact.removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros(&env) / 1000,
+        &serde_json::json!({
+            "org_contact_id": last.to_string(),
+            "organization_id": org.to_string(),
+            "category": "billing",
+        }),
+    )
+    .expect("the removed type is registered");
+    let removed = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove_with_event(
+            &env,
+            &org,
+            last,
+            now_micros(&env),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_contact_removed",
+                subject: &last.to_string(),
+                envelope: &removal_envelope,
+            }),
+        )
+        .await
+        .expect("remove");
+    assert!(removed, "the removal reported that it removed nothing");
+
+    let announced = queued_events(&db, &env, scope).await;
+    assert_eq!(announced.len(), 1, "the removal announced {announced:?}");
+    assert_eq!(announced[0]["type"], "org_contact.removed");
+
+    // AND A REPEAT ANNOUNCES NOTHING, which is the other half: the event must count REMOVALS, so
+    // an answer of "it was already gone" cannot also emit one.
+    let repeated = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &org, last, now_micros(&env))
+        .await
+        .expect("a repeat is not an error");
+    assert!(!repeated);
+    let after = queued_events(&db, &env, scope).await;
+    assert!(
+        after.is_empty(),
+        "a repeated removal announced a removal that did not happen: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_category_lookup_is_scope_fenced_and_sees_only_live_contacts() {
+    // `live_category` is what the removal path reads to build its event, and it shipped with no
+    // test of its own. Three properties decide whether the event is right: it must answer for a
+    // live contact of THIS organization, and refuse or decline for anything else.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = seed_org(&db, &env, scope, "Acme").await;
+    let theirs = seed_org(&db, &env, scope, "Globex").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &mine,
+        "Ada",
+        "ada@acme.example",
+        "security",
+    )
+    .await
+    .expect("add");
+
+    let read = db.control_store().scoped(scope);
+    assert_eq!(
+        read.org_contacts()
+            .live_category(&mine, &id)
+            .await
+            .expect("read"),
+        Some("security".to_owned()),
+        "the live contact's own category was not returned"
+    );
+
+    // ANOTHER ORGANIZATION'S HANDLE SEES NOTHING, which is what keeps the removal path from
+    // building an event for a contact the caller cannot address.
+    assert_eq!(
+        read.org_contacts()
+            .live_category(&theirs, &id)
+            .await
+            .expect("read"),
+        None,
+        "a foreign organization's handle resolved this contact's category"
+    );
+
+    // AND A FOREIGN SCOPE IS REFUSED OUTRIGHT, not answered with `None`. The two-argument guard
+    // checks BOTH identifiers against this repo's scope, and only a second scope can tell that
+    // apart from the organization check above -- which is why an earlier version of this test,
+    // using two organizations in ONE scope, left the scope half of the guard unmeasured.
+    let other_scope = db.seed_scope(&env).await;
+    let stranger = OrgContactId::generate(&env, &other_scope);
+    let foreign_org = OrganizationId::generate(&env, &other_scope);
+    assert!(
+        matches!(
+            read.org_contacts().live_category(&mine, &stranger).await,
+            Err(StoreError::NotFound)
+        ),
+        "a contact id from another scope was looked up rather than refused"
+    );
+    assert!(
+        matches!(
+            read.org_contacts().live_category(&foreign_org, &id).await,
+            Err(StoreError::NotFound)
+        ),
+        "an organization id from another scope was looked up rather than refused"
+    );
+
+    // AND A REMOVED CONTACT IS GONE FROM IT, so a repeat cannot build a second removal event.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &mine, &id, now_micros(&env))
+        .await
+        .expect("remove");
+    assert_eq!(
+        read.org_contacts()
+            .live_category(&mine, &id)
+            .await
+            .expect("read"),
+        None,
+        "a removed contact still answers with a category"
+    );
+}
+
+#[tokio::test]
 async fn neither_the_name_nor_the_address_is_readable_from_the_table() {
     // 0207 CLAIMS "whoever can read this table cannot thereby learn who a customer's staff are".
     // A sealed address next to a PLAINTEXT NAME does not have that property -- the name alone
@@ -508,7 +935,7 @@ async fn neither_the_name_nor_the_address_is_readable_from_the_table() {
         .control_store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 10)
+        .list_for_organization(&org, 10, None)
         .await
         .expect("list");
     assert_eq!(listed.len(), 1);
@@ -555,7 +982,7 @@ async fn the_name_and_the_address_do_not_open_under_each_others_context() {
         .control_store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 10)
+        .list_for_organization(&org, 10, None)
         .await;
     assert!(
         matches!(outcome, Err(StoreError::Encryption)),
@@ -606,7 +1033,7 @@ async fn one_organizations_caller_cannot_remove_anothers_contact() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&theirs, 50)
+        .list_for_organization(&theirs, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -727,7 +1154,7 @@ async fn the_duplicate_rule_folds_case_and_is_per_organization() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&theirs, 50)
+        .list_for_organization(&theirs, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -773,7 +1200,7 @@ async fn the_stored_address_is_sealed_and_the_listing_opens_it() {
         .store()
         .scoped(scope)
         .org_contacts()
-        .list_for_organization(&org, 50)
+        .list_for_organization(&org, 50, None)
         .await
         .expect("list");
     assert_eq!(
@@ -863,11 +1290,11 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
     // corrected in place.
     //
     // WHAT IT DRIVES AND WHAT IT DOES NOT. This issues statements and reads the ERRORS; it does
-    // not read `information_schema`, so it cannot enumerate the grant set and cannot notice a
-    // column added later that nobody listed here. It probes the five columns the control role
-    // must not write -- every column of this table except `updated_at` and `deleted_at`, which
-    // are the two the grant names -- plus the policy in both directions and both halves of the
-    // data plane. The catalog-wide sweep that no per-table test can do lives in
+    // not read `information_schema`, so it cannot enumerate the grant set, and a column ADDED to
+    // this table by a later migration would not appear here until somebody added it. What it
+    // does cover is every column 0207 declares: the ten the control role must not write, named
+    // one by one below, plus `updated_at` and `deleted_at`, which the grant does name and which
+    // the policy cases exercise. The catalog-wide sweep that no per-table test can do lives in
     // `migration.rs::the_data_plane_holds_no_table_wide_update_on_any_table`.
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -886,14 +1313,23 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
     .await
     .expect("add");
 
-    // THE COLUMN SCOPE. Each of these decides what the row IS -- whose list it is on, who it
-    // reaches, and which notices it receives -- and the control role may write none of them.
+    // THE COLUMN SCOPE, OVER EVERY COLUMN THE GRANT DOES NOT NAME. 0207 grants
+    // `UPDATE (updated_at, deleted_at)` and nothing else, so the other TEN columns of this table
+    // must all be refused -- and the claim worth making is about all ten, not about the
+    // interesting five. An earlier draft of this loop listed five and the comment above it said
+    // "every column except `updated_at` and `deleted_at`", which was a claim the loop did not
+    // hold: a grant widened to include `created_at` or `pii_dek_version` would have passed.
     for (column, value) in [
+        ("id", "'oct_other'".to_owned()),
+        ("tenant_id", "'ten_other'".to_owned()),
+        ("environment_id", "'env_other'".to_owned()),
         ("organization_id", format!("'{other}'")),
+        ("display_name_sealed", "'\\x00'::bytea".to_owned()),
         ("email_sealed", "'\\x00'::bytea".to_owned()),
         ("email_bidx", "'\\x00'::bytea".to_owned()),
+        ("pii_dek_version", "2".to_owned()),
         ("category", "'billing'".to_owned()),
-        ("display_name_sealed", "'\\x00'::bytea".to_owned()),
+        ("created_at", "now()".to_owned()),
     ] {
         let outcome = as_control(
             &db,
@@ -965,9 +1401,30 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
         "the app role is refused by the grant rather than by something else: {error}"
     );
 
-    // AND ITS READ WORKS, so the INSERT refusal just above is a narrowing of this role rather
-    // than a role with no access to the table at all. It speaks only for the data plane: the six
-    // refusals before it are the CONTROL role's, and its own read says nothing about those.
+    // AND ITS UPDATE IS REFUSED TOO, which no other check in the suite covers. The catalog-wide
+    // sweep reads `information_schema.table_privileges`, and a COLUMN-scoped grant never appears
+    // there -- `migration.rs` says so itself and calls that the likelier regression -- while the
+    // per-table column sweeps name fixed table lists this table is not on. So
+    // `GRANT UPDATE (deleted_at) ON org_contacts TO ironauth_app` would leave every other test
+    // green, and the schema would not stop it either: `org_contacts_removal_is_one_way` is
+    // `TO ironauth_control`, so it does not constrain this role at all. The delivery plane could
+    // then take contacts off the list and put them back.
+    let outcome = as_app(
+        &db,
+        scope,
+        &format!("UPDATE org_contacts SET deleted_at = NULL WHERE id = '{id}'"),
+    )
+    .await;
+    let error = outcome.expect_err("the data plane must not write deleted_at");
+    assert!(
+        error.to_string().contains("permission denied"),
+        "the app role's UPDATE is refused by something other than the grant: {error}"
+    );
+
+    // AND ITS READ WORKS, so the two refusals just above are a narrowing of this role rather
+    // than a role with no access to the table at all. They speak only for the data plane: the
+    // eleven refusals before them are the CONTROL role's, and its own read says nothing about
+    // those.
     as_app(&db, scope, "SELECT 1 FROM org_contacts")
         .await
         .expect("the data plane must be able to read the list it delivers to");

@@ -386,6 +386,15 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
     // import, outbound verification and client postures. `exportIdentities` is `read` and is
     // the heaviest read on the surface: a persona that must not drain the environment should
     // not hold read at all.
+    (
+        "createOrganizationContact",
+        ManagementPermission::WriteOrganizations,
+    ),
+    ("listOrganizationContacts", ManagementPermission::Read),
+    (
+        "deleteOrganizationContact",
+        ManagementPermission::WriteOrganizations,
+    ),
     ("createOrgGroup", ManagementPermission::WriteOrganizations),
     ("updateOrgGroup", ManagementPermission::WriteOrganizations),
     (
@@ -764,6 +773,14 @@ const PERMISSION_PROVEN: &[&str] = &[
     // lacked. Proven the moment the operation shipped, because the classification alone is not
     // enforcement -- it records an intention nothing compares against the call.
     "createPortalLink",
+    // The organization CONTACT surface (issue #141), proven by
+    // `the_contact_surface_splits_writing_the_list_from_reading_it`: all three operations in
+    // BOTH directions, because whoever can write this list decides who finds out about an
+    // outage -- and silently removing the one security contact is how a notification reaches
+    // nobody -- while "who would we have told?" must stay answerable to a read credential.
+    "createOrganizationContact",
+    "listOrganizationContacts",
+    "deleteOrganizationContact",
     "registerAgent",
     "setAgentState",
     "listAgents",
@@ -1032,12 +1049,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        228,
+        231,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        84,
+        87,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -1115,6 +1132,11 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ("bans.rs", include_str!("../src/bans.rs")),
     ("export.rs", include_str!("../src/export.rs")),
     ("org_roles.rs", include_str!("../src/org_roles.rs")),
+    // The organization contact surface (issue #141). Listed the moment it existed, for the
+    // reason the neighbours state: a file absent here is one this gate never reads, so a
+    // mutation deleting its `require_permission` call would SURVIVE while the classification
+    // above still looked like enforcement.
+    ("org_contacts.rs", include_str!("../src/org_contacts.rs")),
     ("org_groups.rs", include_str!("../src/org_groups.rs")),
 ];
 

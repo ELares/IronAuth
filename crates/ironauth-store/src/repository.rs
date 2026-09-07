@@ -213,9 +213,17 @@ impl<'a> ScopedStore<'a> {
 
     /// The people an organization's operational notifications reach (issue #141).
     ///
-    /// READ side. The notification senders run on the data plane and need to know where to
-    /// deliver; editing who is notified is an operator and portal-admin action, so it goes
-    /// through [`ScopedStore::acting`] and migration 0207 grants `ironauth_app` SELECT only.
+    /// READ side. Editing who is notified is an operator and portal-admin action, so it goes
+    /// through [`ScopedStore::acting`], and migration 0207 grants `ironauth_app` SELECT only.
+    ///
+    /// NO DATA-PLANE READER EXISTS YET, and this is the accessor every reader reaches the repo
+    /// through, so the correction belongs here rather than only on the type. The `ironauth_app`
+    /// grant is forward provisioning for the senders #141 describes; nothing on the data plane
+    /// reads this table today. 0207's header, its `email_sealed` comment and its grant comment
+    /// all say a sender reads it at delivery time. That migration is SHIPPED and checksummed, so
+    /// its text cannot be corrected without making every migrated database refuse to boot on
+    /// `ChecksumMismatch` -- this doc is where the correction lives, exactly as
+    /// [`PolicyDecisionInputs`] carries the correction to migration 0073's header.
     #[must_use]
     pub fn org_contacts(&self) -> OrgContactRepo<'a> {
         OrgContactRepo {
@@ -61197,7 +61205,15 @@ const ORG_CONTACT_NAME_SEAL_LABEL: &str = "ironauth.envelope.org-contact-name.v1
 /// The longest contact name this accepts, in octets.
 ///
 /// HELD HERE BECAUSE THE SCHEMA CANNOT HOLD IT: 0207 seals the name, and a CHECK cannot measure
-/// what it cannot read. The value is the one the plaintext column carried before it was sealed.
+/// what it cannot read.
+///
+/// THE VALUE IS 0207'S OWN, and that is the only claim made for it: the migration bounds
+/// `org_contacts.id` at `octet_length(id) <= 256`, so this is the one length that table already
+/// states and the sealed column keeps its sibling's bound rather than inventing one. Two earlier
+/// versions of this sentence justified the number by comparison with other columns and were
+/// wrong both times -- the SCIM connection display name is 252 octets and lives in the admin
+/// crate, not 256 in this schema -- which is why the derivation now points at a line in the same
+/// migration a reader can check.
 const ORG_CONTACT_NAME_MAX_OCTETS: usize = 256;
 
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
@@ -61833,14 +61849,20 @@ fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) 
 ///
 /// DELIBERATELY SHALLOW. A full grammar is wrong in both directions -- it refuses valid addresses
 /// and admits undeliverable ones -- and the authority on deliverability is the send path. What
-/// this refuses is SEVEN independently deletable terms -- one per `&&`-joined condition below,
-/// counted that way because a term is exactly what a mutation can remove:
+/// this refuses is SEVEN terms, each of which some case below turns red. They do not all have
+/// the same SHAPE --
+/// terms 1 and 2 are the two halves of an `||` in the early return, term 3 is the `let ... else`
+/// destructuring, and 4 to 7 are the `&&`-joined conditions of the final expression -- and they
+/// and they are counted this way because a term is what a case has to distinguish, not because
+/// they look alike:
 ///
 ///   1. longer than the 320 octets the address syntax allows;
 ///   2. whitespace anywhere;
-///   3. not EXACTLY ONE `@`. ONE term, TWO failure shapes, because a single destructuring
+///   3. not EXACTLY ONE `@`. ONE term with TWO failure shapes, because a single destructuring
 ///      decides both: none at all, and more than one (`ada@acme.example@evil.example`, whose
-///      apparent domain is not the one it would be delivered to);
+///      apparent domain is not the one it would be delivered to). Both shapes are refused HERE
+///      and nowhere else -- with no `@` there is no domain for any later term to judge -- so
+///      each gets its own case;
 ///   4. an empty local part;
 ///   5. a domain with no dot. This is ALSO what refuses an EMPTY domain, so there is
 ///      deliberately no emptiness term: one would be unreachable, and an unreachable term is
@@ -78815,13 +78837,65 @@ pub struct OrgContact {
 
 /// The people an organization's operational notifications reach, for one scope, read only
 /// (issue #141).
+///
+/// WHO READS IT TODAY: the management API, and only the management API. #141 exists so that a
+/// certificate expiry or a degrading connection reaches somebody who will act, but the senders
+/// that will route on this list are not written yet -- so "a sender opens it at delivery time"
+/// describes the intent, not the tree. Nothing here should be read as claiming a delivery path
+/// exists.
 pub struct OrgContactRepo<'a> {
     store: &'a Store,
     scope: Scope,
 }
 
 impl OrgContactRepo<'_> {
-    /// Every LIVE contact of one organization, oldest first.
+    /// The category of ONE live contact of one organization, or `None` if there is no such
+    /// contact here (issue #141).
+    ///
+    /// A POINT LOOKUP rather than a scan of [`Self::list_for_organization`], for the reason the
+    /// SCIM repo's `exists_in_organization` gives: the moment that listing took a page limit, a
+    /// contact past the first page stopped being findable through it, and a caller using it to
+    /// learn one row's category would silently get `None` for a contact that exists.
+    ///
+    /// AND IT OPENS NO SEAL. The category is a plaintext column, so this needs no DEK and cannot
+    /// fail on a ciphertext that will not open. That matters because the one caller is the
+    /// REMOVAL path: a row whose seal is broken is exactly the row an operator most needs to be
+    /// able to take off the list, and routing that path through the listing would make the
+    /// remedy fail on the thing it is meant to remedy.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if EITHER identifier is out of this scope -- the contact's as
+    /// well as the organization's, which is what the guard checks;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn live_category(
+        &self,
+        organization_id: &OrganizationId,
+        id: &OrgContactId,
+    ) -> Result<Option<String>, StoreError> {
+        if organization_id.scope() != self.scope || id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let category: Option<String> = sqlx::query_scalar(
+            "SELECT category FROM org_contacts \
+             WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+               AND organization_id = $4 AND deleted_at IS NULL",
+        )
+        .bind(id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(category)
+    }
+
+    /// Every LIVE contact of one organization, oldest first, from `after` onward.
+    ///
+    /// KEYSET, on the same `(created_at, id)` total order every management listing uses, so a
+    /// contact added or removed between pages neither skips a row nor repeats one.
     ///
     /// LIVE ONLY, because this answers "who do we notify". A removed contact is kept for the
     /// audit trail -- "who was told about the certificate that then expired" is answerable only
@@ -78840,11 +78914,13 @@ impl OrgContactRepo<'_> {
         &self,
         organization_id: &OrganizationId,
         limit: i64,
+        after: Option<&CursorPosition>,
     ) -> Result<Vec<OrgContact>, StoreError> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let master = self.store.master().ok_or(StoreError::Encryption)?;
+        let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
             "SELECT id, organization_id, display_name_sealed, email_sealed, pii_dek_version, \
@@ -78853,11 +78929,15 @@ impl OrgContactRepo<'_> {
              FROM org_contacts \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
                AND deleted_at IS NULL \
-             ORDER BY created_at, id LIMIT $4",
+               AND ($4::bigint IS NULL OR (created_at, id) > \
+                    (TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, $5::text)) \
+             ORDER BY created_at, id LIMIT $6",
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(organization_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
@@ -78921,6 +79001,25 @@ impl ActingOrgContactRepo<'_> {
     /// [`StoreError::Encryption`] if the scope has no key to seal under;
     /// [`StoreError::Database`] on a persistence failure.
     pub async fn add(&self, env: &Env, contact: NewOrgContact<'_>) -> Result<(), StoreError> {
+        self.add_with_event(env, contact, None, None).await
+    }
+
+    /// Add a contact, optionally recording an idempotency result and announcing a domain event.
+    ///
+    /// THE EVENT RIDES THE WRITE'S OWN TRANSACTION, so a rolled-back add announces nothing: a
+    /// consumer that received `org_contact.added` for a row that does not exist would route a
+    /// notification to a destination the table cannot produce.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`add`](Self::add).
+    pub async fn add_with_event(
+        &self,
+        env: &Env,
+        contact: NewOrgContact<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
         if contact.id.scope() != self.scope || contact.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
@@ -78931,9 +79030,9 @@ impl ActingOrgContactRepo<'_> {
         if !plausible_email(contact.email) {
             return Err(StoreError::Invalid);
         }
-        // AND THE NAME'S, for the same reason and one more: 0207 sealed the name, so the ceiling
-        // the plaintext column used to state is now unstatable in the schema. Only the presence
-        // of SOME bytes survives there.
+        // AND THE NAME'S, for the same reason and one more: 0207 seals the name, so no CHECK can
+        // measure its length -- the schema can see only that SOME bytes are present. The ceiling
+        // has to live here because there is nowhere in the schema it could live.
         if !plausible_contact_name(contact.display_name) {
             return Err(StoreError::Invalid);
         }
@@ -78962,6 +79061,7 @@ impl ActingOrgContactRepo<'_> {
         let display_name = contact.display_name.to_owned();
         let email = contact.email.to_owned();
         let category = contact.category.to_owned();
+        let created_at_micros = contact.created_at_micros;
         let bidx = org_contact_email_blind_index(master, scope, &email);
         write_audited(
             AuditedWrite {
@@ -78989,8 +79089,11 @@ impl ActingOrgContactRepo<'_> {
                 let result = sqlx::query(
                     "INSERT INTO org_contacts \
                      (id, tenant_id, environment_id, organization_id, display_name_sealed, \
-                      email_sealed, email_bidx, pii_dek_version, category) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                      email_sealed, email_bidx, pii_dek_version, category, \
+                      created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval, \
+                             TIMESTAMPTZ 'epoch' + ($10::text || ' microseconds')::interval)",
                 )
                 .bind(id.to_string())
                 .bind(scope.tenant().to_string())
@@ -79001,13 +79104,18 @@ impl ActingOrgContactRepo<'_> {
                 .bind(bidx.into_bytes())
                 .bind(dek_version)
                 .bind(&category)
+                .bind(created_at_micros)
                 .execute(&mut **tx)
                 .await;
                 match result {
-                    Ok(_) => Ok(()),
-                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
-                    Err(error) => Err(error.into()),
+                    Ok(_) => {}
+                    Err(error) if is_unique_violation(&error) => return Err(StoreError::Conflict),
+                    Err(error) => return Err(error.into()),
                 }
+                insert_idempotency(tx, idempotency).await?;
+                // In the write's transaction: a rolled-back change announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
+                Ok(())
             },
             false,
         )
@@ -79036,6 +79144,30 @@ impl ActingOrgContactRepo<'_> {
         organization_id: &OrganizationId,
         id: &OrgContactId,
         now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        self.remove_with_event(env, organization_id, id, now_micros, None)
+            .await
+    }
+
+    /// Remove a contact, announcing a domain event when one actually happened.
+    ///
+    /// THE EVENT IS INSIDE THE AUDITED WRITE, which is the only place it can be: a repeat and a
+    /// stranger are both answered before that write opens, so neither reaches this and neither
+    /// announces. A consumer therefore sees exactly one `org_contact.removed` per contact really
+    /// taken off the list, which is the count the audit trail carries too. The concurrent loser
+    /// announces nothing for the same reason it writes no audit row -- its `Err` rolls the whole
+    /// transaction back before the report is turned into `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`remove`](Self::remove).
+    pub async fn remove_with_event(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &OrgContactId,
+        now_micros: i64,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<bool, StoreError> {
         if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -79104,6 +79236,8 @@ impl ActingOrgContactRepo<'_> {
                 if affected == 0 {
                     return Err(StoreError::Conflict);
                 }
+                // Announced only on the branch that really removed something.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(true)
             },
             false,
@@ -79137,6 +79271,15 @@ pub struct NewOrgContact<'a> {
     pub email: &'a str,
     /// Which kind they asked for.
     pub category: &'a str,
+    /// When the contact was added, epoch microseconds, from the CALLER'S clock.
+    ///
+    /// BOUND EXPLICITLY RATHER THAN LEFT TO THE COLUMN DEFAULT. 0207 declares
+    /// `DEFAULT now()`, and a row taking it is stamped by the DATABASE while the handler
+    /// answers 201 with a timestamp from `Env`'s clock -- two different clocks for one fact, so
+    /// the created time in the create response and the one every later listing reports could
+    /// not agree. The migration is shipped and checksum-frozen, so the default stays; binding
+    /// the value is what stops it being reached.
+    pub created_at_micros: i64,
 }
 
 /// The inbound SCIM connections for one scope (issue #135).

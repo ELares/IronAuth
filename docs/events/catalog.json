@@ -1639,6 +1639,62 @@
       "type": "message_template.set"
     },
     {
+      "domain": "org_contact",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_contact_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_contact_id",
+          "organization_id",
+          "category"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_contact.added"
+    },
+    {
+      "domain": "org_contact",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "org_contact_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_contact_id",
+          "organization_id",
+          "category"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "org_contact.removed"
+    },
+    {
       "domain": "org_group",
       "payload_schema": {
         "additionalProperties": false,

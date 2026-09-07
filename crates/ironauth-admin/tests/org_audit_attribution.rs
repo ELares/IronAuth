@@ -98,6 +98,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createOrgGroup",
     "createOrgRole",
     "createOrganizationApiKey",
+    "createOrganizationContact",
     "createPortalLink",
     "createProjectGrant",
     "createScimConnection",
@@ -108,6 +109,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "deleteOrgGroup",
     "deleteOrgRole",
     "deleteOrganization",
+    "deleteOrganizationContact",
     "deleteScimPushConnection",
     "disableOrganization",
     "enableOrganization",
@@ -178,6 +180,18 @@ const UNATTRIBUTED_CEILING: usize = 1;
 /// function and reads that function plus the same-file functions it calls, which is the
 /// granularity `org_confinement_surface.rs` already uses for the confinement fence.
 const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
+    // The organization contact writes (issue #141). Both attribute through
+    // `.in_organization(org_id)`: a contact is a person one CUSTOMER named, so an unattributed
+    // row would leave that customer's own log stream blind to somebody being added to -- or
+    // quietly taken off -- the list of who hears about their outages.
+    (
+        "createOrganizationContact",
+        include_str!("../src/org_contacts.rs"),
+    ),
+    (
+        "deleteOrganizationContact",
+        include_str!("../src/org_contacts.rs"),
+    ),
     // The outbound provisioning writes (issue #137). All three attribute through
     // `.in_organization(org_id)`; they did not, and `audit_log.organization_id` was NULL for
     // every one of them, so a per-organization log stream saw none of an operator re-pointing

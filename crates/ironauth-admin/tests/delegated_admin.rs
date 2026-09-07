@@ -5199,6 +5199,121 @@ async fn write_organizations_is_required_to_add_a_machine_identity_to_an_org() {
     );
 }
 
+/// The organization CONTACT surface splits adding and removing a notification destination from
+/// reading the list (issue #141).
+///
+/// WHY THIS SPLIT IS THE ONE THAT MATTERS HERE. A contact is who a vendor tells when a
+/// certificate is about to expire or a connection is degrading. Whoever can write the list
+/// decides who finds out about an outage -- and, just as importantly, who does NOT: silently
+/// removing the one security contact is how an incident notification reaches nobody. Reading the
+/// list has to stay open to a read-only credential, because "who would we have told?" is exactly
+/// the question an investigator asks afterwards.
+///
+/// ALL THREE OPERATIONS, IN BOTH DIRECTIONS. The organization and contact ids below are
+/// deliberately absent, so the permission gate is what answers: it runs before any of them is
+/// resolved, and 403-versus-anything-else separates the gate from the handler without seeding a
+/// contact first. A blanket refusal would look identical to a correct gate on the write half
+/// alone, which is why the read half and the write credential are both driven.
+#[tokio::test]
+async fn the_contact_surface_splits_writing_the_list_from_reading_it() {
+    let h = Harness::start(261).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ak-contacts").await;
+    let contacts = format!(
+        "/v1/tenants/{tenant}/environments/{environment}/organizations/org_absent/contacts"
+    );
+    let one = format!("{contacts}/oct_absent");
+    let create = serde_json::json!({
+        "display_name": "Grace Okonjo",
+        "email": "grace@acme.example",
+        "category": "security",
+    })
+    .to_string();
+
+    // A READ-ONLY credential may LIST and may not add or remove.
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let (status, _, response) = h.get_as(&contacts, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read credential must be able to see who an organization notifies: {response}"
+    );
+
+    // AND THE READ GATE IS A GATE. Showing that `management.read` REACHES the listing does not
+    // show that anything is required to: without the negative direction, deleting the
+    // `require_permission(Read)` call from the handler leaves this test green, and the
+    // classification would look like enforcement while enforcing nothing.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, response) = h.get_as(&contacts, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a credential without management.read READ the contact list: {response}"
+    );
+    assert!(
+        response.contains("management.read"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    let (status, _, response) = h
+        .post_as(&contacts, &secret, "k-contact-forbidden", &create)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential ADDED a notification destination: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    let (status, _, response) = h.delete_as(&one, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential REMOVED a notification destination: {response}"
+    );
+    assert!(
+        response.contains("management.write_organizations"),
+        "the refusal does not name the permission required: {response}"
+    );
+
+    // And a WRITE credential reaches both writes.
+    restrict(
+        &h,
+        &tenant,
+        &environment,
+        &key_id,
+        &["management.write_organizations"],
+    )
+    .await;
+    let (status, _, response) = h
+        .post_as(&contacts, &secret, "k-contact-allowed", &create)
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover adding a contact: {response}"
+    );
+    let (status, _, response) = h.delete_as(&one, &secret).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write_organizations did not cover removing a contact: {response}"
+    );
+}
+
 /// Registering and revoking an agent is `write_organizations`; listing them is `read`
 /// (issue #130).
 ///

@@ -42,6 +42,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     // whole module. All four already resolve through `resolve_live_org`; the omission
     // was the scan's, not theirs.
     ("agents.rs", include_str!("../src/agents.rs")),
+    // The organization contact surface (issue #141): three organization-addressed operations,
+    // all three resolving through `resolve_live_org`. Added with them rather than after a
+    // review measured the gap, which is how `api_keys.rs` got here.
+    ("org_contacts.rs", include_str!("../src/org_contacts.rs")),
     // The outbound provisioning module (issue #137): four organization-addressed operations,
     // all four of which resolve through `resolve_live_org`. Added with them rather than after a
     // review measured the gap, which is how `api_keys.rs` got here.
@@ -99,7 +103,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 58;
+const ORG_ADDRESSED_OPERATIONS: usize = 61;
 
 /// Operations that name their organization in the REQUEST BODY rather than the path.
 ///

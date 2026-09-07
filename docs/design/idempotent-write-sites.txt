@@ -62,6 +62,7 @@ crates/ironauth-admin/src/memberships.rs:create_service_account_membership:1
 crates/ironauth-admin/src/messages.rs:resend_message:1
 crates/ironauth-admin/src/migration_runs.rs:abandon_migration_run:1
 crates/ironauth-admin/src/migration_runs.rs:detail_view:0
+crates/ironauth-admin/src/org_contacts.rs:create_org_contact:1
 crates/ironauth-admin/src/org_context.rs:require_live_environment:0
 crates/ironauth-admin/src/org_context.rs:require_role_in_org:0
 crates/ironauth-admin/src/org_context.rs:resolve_live_org:0

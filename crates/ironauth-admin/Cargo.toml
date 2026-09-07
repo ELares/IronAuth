@@ -155,6 +155,12 @@ name = "delegated_admin"
 path = "tests/delegated_admin.rs"
 required-features = ["testing"]
 
+# The organization contact surface (issue #141). Needs a database, like its neighbours.
+[[test]]
+name = "org_contacts"
+path = "tests/org_contacts.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "project_grants"
 path = "tests/project_grants.rs"
