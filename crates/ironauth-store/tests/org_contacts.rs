@@ -17,6 +17,37 @@ use ironauth_store::{
     CorrelationId, NewOrgContact, OrgContactId, OrganizationId, Scope, StoreError,
 };
 
+/// Run one statement as `ironauth_control` with this scope's RLS settings bound.
+async fn as_control(db: &TestDatabase, scope: Scope, sql: &str) -> Result<u64, sqlx::Error> {
+    run_as(db.control_pool(), scope, sql).await
+}
+
+/// Run one statement as `ironauth_app` -- the DATA plane role -- with this scope's settings.
+async fn as_app(db: &TestDatabase, scope: Scope, sql: &str) -> Result<u64, sqlx::Error> {
+    run_as(db.app_pool(), scope, sql).await
+}
+
+/// The shared body of [`as_control`] and [`as_app`].
+///
+/// THE GRANTS AND THE POLICY ARE ENFORCED BY POSTGRES, and a suite that only ever reaches the
+/// table through the repository cannot tell a control from its absence: every repository
+/// statement carries explicit scope predicates, so it would pass against a table with no policy
+/// and every grant wide open.
+async fn run_as(pool: &sqlx::PgPool, scope: Scope, sql: &str) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, true)")
+        .bind(scope.tenant().to_string())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, true)")
+        .bind(scope.environment().to_string())
+        .execute(&mut *tx)
+        .await?;
+    let affected = sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    Ok(affected)
+}
+
 /// The scope's clock in epoch microseconds.
 fn now_micros(env: &Env) -> i64 {
     i64::try_from(
@@ -338,23 +369,195 @@ async fn a_malformed_address_or_an_unknown_category_is_refused() {
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Acme").await;
 
-    for (email, category) in [
-        ("not-an-address", "technical"),
-        ("ada@example", "technical"),
-        ("ada@acme.example", "marketing"),
+    // EVERY CLAUSE THE DOC ON `plausible_email` NAMES, one case each, and each case chosen so
+    // that DELETING THAT CLAUSE is what turns it red. A doc listing refusals the test does not
+    // drive is a doc nothing holds to the code -- but so is a case some OTHER clause refuses
+    // first: `a@b@c.example` looks like it drives the multi-@ rule and does not, because with
+    // that rule gone the domain is `b`, which the no-dot rule refuses anyway.
+    let long_local = format!("{}@acme.example", "a".repeat(320));
+    for (email, why) in [
+        ("ada @acme.example", "whitespace inside the address"),
+        (long_local.as_str(), "longer than the 320-octet ceiling"),
+        ("not-an-address", "no @ at all"),
+        (
+            "ada@acme.example@evil.example",
+            "two @: the apparent domain is not the deliverable one",
+        ),
+        ("@acme.example", "an empty local part"),
+        ("ada@", "an empty domain, which the no-dot rule refuses"),
+        ("ada@example", "a domain with no dot"),
+        ("ada@.example", "a domain whose dot leads"),
+        ("ada@example.", "a domain whose dot trails"),
     ] {
-        let outcome = add(&db, &env, scope, &org, "Ada", email, category).await;
+        let outcome = add(&db, &env, scope, &org, "Ada", email, "technical").await;
         assert!(
             matches!(outcome, Err(StoreError::Invalid)),
-            "the shape rules accepted email={email:?} category={category:?}: {outcome:?}"
+            "the address rule accepted {email:?} ({why}): {outcome:?}"
         );
     }
+
+    // THE CATEGORY, whose `CHECK` exists but which the repository refuses FIRST so a caller's
+    // typo is a bad request rather than an opaque database failure.
+    let outcome = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "marketing",
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(StoreError::Invalid)),
+        "an unknown category was accepted: {outcome:?}"
+    );
+
+    // AND THE NAME'S CEILING, which moved out of the schema when 0207 sealed the column: a
+    // `CHECK` cannot measure what it cannot read, so nothing but this rule holds it.
+    let too_long = "n".repeat(257);
+    for (name, why) in [
+        ("", "an empty name"),
+        (too_long.as_str(), "one octet past the ceiling"),
+    ] {
+        let outcome = add(
+            &db,
+            &env,
+            scope,
+            &org,
+            name,
+            "ada@acme.example",
+            "technical",
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(StoreError::Invalid)),
+            "the name rule accepted {why}: {outcome:?}"
+        );
+    }
+
+    // THE BOUNDARY IS WHERE IT SAYS IT IS: exactly at the ceiling is accepted.
+    add(
+        &db,
+        &env,
+        scope,
+        &org,
+        &"n".repeat(256),
+        "at-the-ceiling@acme.example",
+        "technical",
+    )
+    .await
+    .expect("a name exactly at the ceiling");
 
     // THE CONTROL: a well-formed pair is accepted, so the refusals above are the constraints and
     // not a table that refuses everything.
     add(&db, &env, scope, &org, "Ada", "ada@acme.example", "billing")
         .await
         .expect("a well-formed contact");
+}
+
+#[tokio::test]
+async fn neither_the_name_nor_the_address_is_readable_from_the_table() {
+    // 0207 CLAIMS "whoever can read this table cannot thereby learn who a customer's staff are".
+    // A sealed address next to a PLAINTEXT NAME does not have that property -- the name alone
+    // tells a reader who a customer's security lead is -- so the claim is only true while BOTH
+    // columns are ciphertext, and this is what says so.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Grace Okonjo",
+        "grace@acme.example",
+        "security",
+    )
+    .await
+    .expect("add");
+
+    // READ AS THE TABLE OWNER, which is strictly more than any deployed role can do: if the
+    // plaintext is absent from what the owner sees, it is absent from a dump and from every role
+    // below. Cast to text so the comparison is over the stored bytes rather than a decoded value.
+    let row: (String, String) = sqlx::query_as(
+        "SELECT encode(display_name_sealed, 'escape'), encode(email_sealed, 'escape') \
+         FROM org_contacts WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("the row is readable as bytes");
+    for (column, stored) in [("display_name_sealed", &row.0), ("email_sealed", &row.1)] {
+        for secret in ["Grace Okonjo", "Grace", "Okonjo", "grace@acme.example"] {
+            assert!(
+                !stored.contains(secret),
+                "{column} carries {secret:?} in the clear, so reading this table names a \
+                 customer's staff"
+            );
+        }
+    }
+
+    // AND THE LISTING STILL ANSWERS, so the seal is a seal rather than a column nothing can use.
+    let listed = db
+        .control_store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&org, 10)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].display_name, "Grace Okonjo");
+    assert_eq!(listed[0].email, "grace@acme.example");
+}
+
+#[tokio::test]
+async fn the_name_and_the_address_do_not_open_under_each_others_context() {
+    // THE TWO SEALS SHARE ONE DEK, so what keeps them from being interchangeable is the AAD
+    // LABEL and nothing else. Both docs claim that separation; this is the only thing that
+    // measures it. Give the labels the same value and this test is the one that goes red --
+    // without it, a shared label is invisible, because every row seals and opens on the same
+    // side of the swap.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Grace Okonjo",
+        "grace@acme.example",
+        "security",
+    )
+    .await
+    .expect("add");
+
+    // SWAP THE TWO CIPHERTEXTS. Both were sealed by the same key under the same scope and DEK
+    // version, so every input to the open agrees EXCEPT the label.
+    sqlx::query(
+        "UPDATE org_contacts \
+         SET display_name_sealed = email_sealed, email_sealed = display_name_sealed \
+         WHERE id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("the swap is writable as the owner");
+
+    let outcome = db
+        .control_store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&org, 10)
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::Encryption)),
+        "a name ciphertext opened as an address, so the delivery path would send to a person's \
+         name: {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -618,4 +821,113 @@ async fn both_writes_are_audited() {
         ],
         "the contact writes left no attributable trail"
     );
+}
+
+#[tokio::test]
+async fn the_grants_and_the_one_way_policy_are_enforced() {
+    // EVERY CLAIM 0207 MAKES ABOUT THE TWO ROLES, driven against the catalog rather than read
+    // from the migration's prose. The identical gap on 0205 is why its sibling test exists: a
+    // grant nothing drives is a grant somebody widens without noticing, and a migration is
+    // checksum-frozen once shipped, so a policy that ships wrong cannot be corrected in place.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let other = seed_org(&db, &env, scope, "Globex").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("add");
+
+    // THE COLUMN SCOPE. Each of these decides what the row IS -- whose list it is on, who it
+    // reaches, and which notices it receives -- and the control role may write none of them.
+    for (column, value) in [
+        ("organization_id", format!("'{other}'")),
+        ("email_sealed", "'\\x00'::bytea".to_owned()),
+        ("email_bidx", "'\\x00'::bytea".to_owned()),
+        ("category", "'billing'".to_owned()),
+        ("display_name_sealed", "'\\x00'::bytea".to_owned()),
+    ] {
+        let outcome = as_control(
+            &db,
+            scope,
+            &format!("UPDATE org_contacts SET {column} = {value} WHERE id = '{id}'"),
+        )
+        .await;
+        let error = outcome.expect_err(&format!("{column} must not be updatable"));
+        assert!(
+            error.to_string().contains("permission denied"),
+            "{column} is refused by something other than the grant: {error}"
+        );
+    }
+
+    // THE WITH CHECK HALF: an update that TOUCHES a live row without removing it is refused by
+    // the policy, not by the grant -- `updated_at` is a column the role may write.
+    let outcome = as_control(
+        &db,
+        scope,
+        &format!("UPDATE org_contacts SET updated_at = now() WHERE id = '{id}'"),
+    )
+    .await;
+    let error = outcome.expect_err("a live row may not be touched without being removed");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "refused by the policy's WITH CHECK half, not by something else: {error}"
+    );
+
+    // AND REMOVAL IS ONE WAY. The grant cannot express this, because `deleted_at` is exactly the
+    // column a removal writes; `USING (deleted_at IS NULL)` hides the removed row, so the
+    // un-removal is FILTERED rather than errored and touches nothing.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &org, &id, now_micros(&env))
+        .await
+        .expect("remove");
+    let affected = as_control(
+        &db,
+        scope,
+        &format!("UPDATE org_contacts SET deleted_at = NULL WHERE id = '{id}'"),
+    )
+    .await
+    .expect("an un-removal is filtered, not errored");
+    assert_eq!(
+        affected, 0,
+        "a removed contact was resurrected, so the sender starts notifying somebody an operator \
+         took off the list"
+    );
+
+    // THE DATA PLANE READS AND ONLY READS. Its INSERT is the half no catalog-wide sweep covers:
+    // the table-wide UPDATE and the DELETE set are both asserted elsewhere in the migration
+    // suite, and an INSERT grant here would let the delivery path invent its own destinations.
+    let outcome = as_app(
+        &db,
+        scope,
+        "INSERT INTO org_contacts \
+         (id, tenant_id, environment_id, organization_id, display_name_sealed, email_sealed, \
+          email_bidx, pii_dek_version, category) \
+         VALUES ('oct_x', 'ten_x', 'env_x', 'org_x', '\\x01'::bytea, '\\x00'::bytea, \
+                 '\\x00'::bytea, 1, \
+                 'technical')",
+    )
+    .await;
+    let error = outcome.expect_err("the data plane must not insert contacts");
+    assert!(
+        error.to_string().contains("permission denied"),
+        "the app role is refused by the grant rather than by something else: {error}"
+    );
+
+    // AND ITS READ WORKS, so the four refusals above are a narrowing rather than a role with no
+    // access to the table at all.
+    as_app(&db, scope, "SELECT 1 FROM org_contacts")
+        .await
+        .expect("the data plane must be able to read the list it delivers to");
 }

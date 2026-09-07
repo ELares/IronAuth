@@ -12,7 +12,16 @@
 -- somebody who never signs in, and every membership and permission path would then have to reason
 -- about a person who cannot. The email here is a delivery address and nothing more.
 --
--- ONE ORGANIZATION, NAMED HERE AND NEVER BY THE CALLER, exactly as `scim_connections` does it.
+-- THE WHOLE PERSON IS SEALED, NOT JUST THE ADDRESS. Both columns that identify a human -- the
+-- name and the address -- are envelope ciphertext under the tenant's DEK, because the property
+-- worth having is that whoever can read this table cannot thereby learn who a customer's staff
+-- are, and a plaintext name defeats that on its own. The blind index over the address is the one
+-- deterministic value here, and it is an HMAC that reveals no address it did not already have.
+--
+-- ONE ORGANIZATION PER CONTACT, and it is fixed at insert: no path updates `organization_id`,
+-- and the column-scoped grant below cannot. The caller DOES supply it -- every write takes a
+-- scope-checked `OrganizationId` -- so what this column guarantees is not that the caller was
+-- silent but that a contact cannot later be moved onto another organization's list.
 CREATE TABLE org_contacts (
     -- The `oct_` scoped identifier; embeds its (tenant, environment).
     id                text        PRIMARY KEY,
@@ -20,8 +29,13 @@ CREATE TABLE org_contacts (
     environment_id    text        NOT NULL,
     -- THE boundary: the one organization whose notifications this person receives.
     organization_id   text        NOT NULL,
-    -- Who they are, for an operator reading the list.
-    display_name      text        NOT NULL,
+    -- WHO THEY ARE, SEALED UNDER THE SAME DEK AS THE ADDRESS AND FOR THE SAME REASON. A
+    -- contact's name is a customer's staff member's name: a table holding "Jane Okafor, security"
+    -- next to a sealed address still tells whoever reads it who a customer's security lead is,
+    -- which is precisely what sealing the address is for. The listing opens both, and it already
+    -- fetches the DEK per row to open the address, so this costs the read nothing. Nothing orders
+    -- or searches by it -- the listing is by `created_at, id` -- so no index needs it readable.
+    display_name_sealed bytea     NOT NULL,
     -- WHERE THE NOTIFICATION GOES, SEALED. An address is classified PII in this system and every
     -- other table holding one seals it (0048 for the factor recipients, 0155 for a queued
     -- message), for the reason those state: whoever can read this table must not thereby learn
@@ -41,7 +55,7 @@ CREATE TABLE org_contacts (
     updated_at        timestamptz NOT NULL DEFAULT now(),
     -- Set when the contact is removed. A DELETE would take the audit trail's referent with it:
     -- "who was notified about the certificate that then expired" is answerable only while the
-    -- row survives, and both writes to this table carry an `org.contact.*` audit row that names
+    -- row survives, and both writes to this table carry an `org_contact.*` audit row that names
     -- this identifier.
     deleted_at        timestamptz,
 
@@ -49,16 +63,20 @@ CREATE TABLE org_contacts (
         CHECK (tenant_id <> '' AND environment_id <> ''),
     CONSTRAINT org_contacts_id_shape
         CHECK (id <> '' AND octet_length(id) <= 256),
-    CONSTRAINT org_contacts_display_name_shape
-        CHECK (display_name <> '' AND octet_length(display_name) <= 256),
-    -- THE SEALED ADDRESS AND ITS INDEX ARE BOTH PRESENT OR THE ROW IS UNUSABLE. A seal with no
-    -- index cannot be deduplicated and an index with no seal is a contact nothing can be
-    -- delivered to; either is a row the notification path can only fail on.
-    CONSTRAINT org_contacts_sealed_address_complete
-        CHECK (octet_length(email_sealed) > 0 AND octet_length(email_bidx) > 0),
-    -- THE ADDRESS SHAPE IS CHECKED WHERE THE ADDRESS IS READABLE, which is the repository: a
-    -- CHECK cannot see through a seal. Stated here because its absence is otherwise a gap a
-    -- reader would have to notice, rather than a decision somebody made.
+    -- EVERY SEALED COLUMN AND THE INDEX ARE PRESENT OR THE ROW IS UNUSABLE. A seal with no index
+    -- cannot be deduplicated, an index with no seal is a contact nothing can be delivered to, and
+    -- a row with no name is one an operator cannot act on; each is a row a reader can only fail
+    -- on.
+    CONSTRAINT org_contacts_sealed_columns_complete
+        CHECK (octet_length(email_sealed) > 0
+               AND octet_length(email_bidx) > 0
+               AND octet_length(display_name_sealed) > 0),
+    -- THE SHAPE OF WHAT IS SEALED IS CHECKED WHERE IT IS READABLE, which is the repository: a
+    -- CHECK cannot see through a seal, so neither the address's shape nor the name's ceiling can
+    -- be stated here. `ActingOrgContactRepo::add` holds both and refuses before it seals. Stated
+    -- because the absence is otherwise a gap a reader must notice rather than a decision somebody
+    -- made. The category is NOT sealed -- it is a closed set of three vendor-chosen words, tells
+    -- nobody who anybody is, and the notification path selects on it -- so it keeps its CHECK.
     CONSTRAINT org_contacts_category_known
         CHECK (category IN ('technical', 'security', 'billing')),
 

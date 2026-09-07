@@ -48,11 +48,19 @@ pub enum StoreError {
     /// value that could never be a safe redirect target never reaches the
     /// registered set. Carries no tenant data.
     InvalidRedirectUri,
-    /// A caller-supplied value was refused by a shape rule the SCHEMA cannot express
-    /// (issue #141): an organization contact's address and category, which live in a
-    /// sealed column and a closed set respectively. A `CHECK` constraint cannot see
-    /// through a seal, so the rule that would otherwise be a column constraint is
-    /// enforced here and reported as this. Carries no tenant data.
+    /// A caller-supplied value was refused by a shape rule the repository holds, for one
+    /// of TWO distinct reasons (issue #141).
+    ///
+    /// EITHER THE SCHEMA CANNOT EXPRESS IT: an organization contact's address and name
+    /// live in sealed columns, and a `CHECK` cannot see through a seal, so the rule that
+    /// would otherwise be a column constraint has nowhere else to live.
+    ///
+    /// OR THE SCHEMA DOES EXPRESS IT AND THE REPOSITORY GETS THERE FIRST: the contact
+    /// category is a plaintext column with a real `CHECK` behind it. Letting the insert
+    /// reach that constraint would surface a caller's typo as an opaque database failure
+    /// -- a 500 for what is a bad request -- so it is refused here instead, and the
+    /// constraint stays as the thing that makes the rule true of the stored data rather
+    /// than of one code path. Carries no tenant data.
     Invalid,
     /// A config write violated one of the environment's TYPED guardrails (issue
     /// #42): for example registering an `http` loopback redirect URI in a
