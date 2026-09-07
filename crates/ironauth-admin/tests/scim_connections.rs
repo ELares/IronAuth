@@ -1213,8 +1213,15 @@ async fn the_listing_suppresses_both_signals_for_a_revoked_connection() {
     let org = create_org(&h, &tenant, &environment, "s-org").await;
     let base = connections_path(&tenant, &environment, &org);
 
+    // THROUGH THE ENVIRONMENT'S CLOCK, which `scripts/invariant-lints.sh` requires of every
+    // wall-clock read outside `ironauth-env`: protocol logic stays deterministic under test only
+    // if the tests read the same clock the code does. An earlier version read the system clock
+    // directly here and turned that gate red -- and the gate is a text scan, so naming the call
+    // in this comment would have kept it red.
     let now_ms = i64::try_from(
-        std::time::SystemTime::now()
+        ironauth_env::Env::system()
+            .clock()
+            .now_utc()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_millis(),

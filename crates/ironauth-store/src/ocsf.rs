@@ -307,6 +307,11 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     "message_template",
     "migration_run",
     "org_connection",
+    // AN ORGANIZATION CONTACT is a notification destination configured on an organization
+    // (issue #141). Entity management for the reason `org_connection` is: it decides where a
+    // later operational message goes, rather than being a change to an account or an access
+    // grant. The contact authenticates nothing, so it is not access management.
+    "org_contact",
     // A PORTAL LINK is authority to CONFIGURE an organization, handed to somebody outside this
     // deployment (issue #140). Entity management for the same reason `org_connection` is: it
     // decides what a later session may change, rather than being a change to an account or an

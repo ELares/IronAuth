@@ -61182,6 +61182,16 @@ const RISK_LOGIN_GEO_USER_AGENT_PURPOSE: &str = "user_agent";
 /// The AAD label domain-separating a sealed `abuse_bans.subject` value (the regulated
 /// dimension value, issue #64) from every other envelope context, so a ban-subject
 /// seal never authenticates under the users-PII, invitation, or secret-store context.
+/// The envelope label for a sealed organization contact address (issue #141).
+const ORG_CONTACT_EMAIL_SEAL_LABEL: &str = "ironauth.envelope.org-contact-email.v1";
+/// The blind-index label for an organization contact address (issue #141).
+///
+/// ITS OWN LABEL, deliberately, for the reason the `messages` index gives: sharing one with the
+/// email-factor index would make a contact row and a login-code row for the same person carry
+/// the SAME bytes, so anyone holding one table could join it to the other and learn that a
+/// customer's notification contact is also an end user of the product.
+const ORG_CONTACT_EMAIL_BIDX_LABEL: &str = "ironauth.bidx.org-contact-email.v1";
+
 const ABUSE_SUBJECT_SEAL_LABEL: &str = "ironauth.envelope.abuse-subject.v1";
 /// The AAD label domain-separating the `abuse_bans.subject_bidx` blind index (issue
 /// #64) from every other keyed derivation, so the same string as a ban subject and as
@@ -61752,6 +61762,61 @@ fn abuse_subject_blind_index(
 /// device-verification counter keys its source (issue #24).
 fn abuse_counter_key(path: AuthPath, kind: AbuseSubjectKind, keyed_value: &str) -> String {
     format!("abuse:{}:{}:{}", path.as_str(), kind.as_str(), keyed_value)
+}
+
+/// The associated data binding a sealed organization contact address (issue #141) to its scope
+/// and the DEK version that sealed it.
+fn org_contact_email_seal_aad(scope: Scope, dek_version: i32) -> Aad {
+    Aad::builder()
+        .text(ORG_CONTACT_EMAIL_SEAL_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .version(i64::from(dek_version))
+        .build()
+}
+
+/// The blind-index context for an organization contact address (issue #141): the label, the
+/// scope, and the address FOLDED TO LOWER CASE.
+///
+/// FOLDED, because the duplicate rule is about people rather than bytes: `Ada@acme.example` and
+/// `ada@acme.example` reach the same person, and listing both would send them one outage notice
+/// twice. The domain is case-insensitive by specification and the local part is case-sensitive by
+/// specification but case-insensitive at every mail provider anybody uses, so folding is the
+/// answer that matches how addresses actually behave.
+fn org_contact_email_bidx_aad(scope: Scope, email: &str) -> Aad {
+    Aad::builder()
+        .text(ORG_CONTACT_EMAIL_BIDX_LABEL)
+        .text(&scope.tenant().to_string())
+        .text(&scope.environment().to_string())
+        .text(&email.to_lowercase())
+        .build()
+}
+
+/// The blind index for an organization contact address (issue #141).
+fn org_contact_email_blind_index(master: &MasterKey, scope: Scope, email: &str) -> BlindIndex {
+    master.blind_index(&org_contact_email_bidx_aad(scope, email))
+}
+
+/// Whether `email` is shaped like an address something could be delivered to (issue #141).
+///
+/// DELIBERATELY SHALLOW. A full grammar is wrong in both directions -- it refuses valid addresses
+/// and admits undeliverable ones -- and the authority on deliverability is the send path. What
+/// this refuses is the shapes that are certainly not addresses: no `@`, nothing before or after
+/// it, no dot in the domain, whitespace anywhere, or longer than the 320 octets the address
+/// syntax allows.
+fn plausible_email(email: &str) -> bool {
+    if email.len() > 320 || email.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = email.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
 }
 
 /// The associated data binding a sealed recipient email on an email-factor row (issue
@@ -78730,9 +78795,10 @@ impl OrgContactRepo<'_> {
         if organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT id, organization_id, display_name, email, category, \
+            "SELECT id, organization_id, display_name, email_sealed, pii_dek_version, category, \
                     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
              FROM org_contacts \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
@@ -78745,25 +78811,32 @@ impl OrgContactRepo<'_> {
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
-        tx.commit().await?;
-        rows.into_iter()
-            .map(|row| {
-                let stored_id: String = row.get("id");
-                Ok(OrgContact {
-                    id: OrgContactId::parse_in_scope(&stored_id, &self.scope)
-                        .map_err(|_| StoreError::NotFound)?,
-                    organization_id: OrganizationId::parse_in_scope(
-                        &row.get::<String, _>("organization_id"),
-                        &self.scope,
-                    )
+        let mut contacts = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let stored_id: String = row.get("id");
+            let dek_version: i32 = row.get("pii_dek_version");
+            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
+            let sealed: Vec<u8> = row.get("email_sealed");
+            let opened = dek.open(
+                &org_contact_email_seal_aad(self.scope, dek_version),
+                &Sealed::from_bytes(sealed)?,
+            )?;
+            contacts.push(OrgContact {
+                id: OrgContactId::parse_in_scope(&stored_id, &self.scope)
                     .map_err(|_| StoreError::NotFound)?,
-                    display_name: row.get("display_name"),
-                    email: row.get("email"),
-                    category: row.get("category"),
-                    created_at_unix_micros: row.get("created_us"),
-                })
-            })
-            .collect()
+                organization_id: OrganizationId::parse_in_scope(
+                    &row.get::<String, _>("organization_id"),
+                    &self.scope,
+                )
+                .map_err(|_| StoreError::NotFound)?,
+                display_name: row.get("display_name"),
+                email: String::from_utf8(opened).map_err(|_| StoreError::Encryption)?,
+                category: row.get("category"),
+                created_at_unix_micros: row.get("created_us"),
+            });
+        }
+        tx.commit().await?;
+        Ok(contacts)
     }
 }
 
@@ -78777,82 +78850,179 @@ pub struct ActingOrgContactRepo<'a> {
 impl ActingOrgContactRepo<'_> {
     /// Add a contact.
     ///
+    /// THE ADDRESS IS SEALED before it reaches the row, and its blind index is what the duplicate
+    /// rule keys on: two seals of one address differ, so an index over the ciphertext would refuse
+    /// nothing.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id or organization is out of this scope;
-    /// [`StoreError::Conflict`] if this organization already lists that address on that
-    /// category; [`StoreError::Database`] on a persistence failure.
+    /// [`StoreError::NotFound`] if the identifier or organization is out of this scope;
+    /// [`StoreError::Conflict`] if this organization already lists that address on that category,
+    /// or if the identifier is already in use; [`StoreError::Encryption`] if the scope has no
+    /// key to seal under; [`StoreError::Database`] on a persistence failure.
     pub async fn add(&self, env: &Env, contact: NewOrgContact<'_>) -> Result<(), StoreError> {
         if contact.id.scope() != self.scope || contact.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
-        let scope = self.scope;
-        let mut tx = begin_scoped(self.store, scope).await?;
-        let outcome = sqlx::query(
-            "INSERT INTO org_contacts \
-             (id, tenant_id, environment_id, organization_id, display_name, email, category) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(contact.id.to_string())
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .bind(contact.organization_id.to_string())
-        .bind(contact.display_name)
-        .bind(contact.email)
-        .bind(contact.category)
-        .execute(&mut *tx)
-        .await;
-        match outcome {
-            Ok(_) => {}
-            // THE PARTIAL UNIQUE INDEX, which is a duplicate rather than a malformed request: the
-            // same person is already on this category and a second row would send them the same
-            // notification twice.
-            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-                return Err(StoreError::Conflict);
-            }
-            Err(error) => return Err(StoreError::from(error)),
+        // THE SHAPE CHECK LIVES HERE because it cannot live in the schema: a CHECK constraint
+        // cannot see through a seal. Deliberately shallow, for the reason a full grammar is
+        // wrong in both directions -- it refuses valid addresses and admits undeliverable ones,
+        // and the authority on deliverability is the send path.
+        if !plausible_email(contact.email) {
+            return Err(StoreError::Invalid);
         }
-        let _ = (env, &self.acting);
-        tx.commit().await?;
-        Ok(())
+        if !matches!(contact.category, "technical" | "security" | "billing") {
+            return Err(StoreError::Invalid);
+        }
+        let master = self.store.master().ok_or(StoreError::Encryption)?;
+        // LAZILY PROVISION THE SCOPE'S KEYS, as the ban path does: the first contact an
+        // environment adds may precede any other sealed write it has ever made.
+        let envelope = ActingEnvelopeRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        };
+        match envelope.provision_kek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        match envelope.provision_dek(env, master).await {
+            Ok(_) | Err(StoreError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        let scope = self.scope;
+        let id = *contact.id;
+        let organization_id = contact.organization_id.to_string();
+        let display_name = contact.display_name.to_owned();
+        let email = contact.email.to_owned();
+        let category = contact.category.to_owned();
+        let bidx = org_contact_email_blind_index(master, scope, &email);
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrgContactAdd,
+                target: &id,
+            },
+            async move |tx| {
+                let (dek_version, dek) = fetch_active_dek(tx, scope, master).await?;
+                let sealed = dek.seal(
+                    env.entropy(),
+                    &org_contact_email_seal_aad(scope, dek_version),
+                    email.as_bytes(),
+                );
+                let result = sqlx::query(
+                    "INSERT INTO org_contacts \
+                     (id, tenant_id, environment_id, organization_id, display_name, \
+                      email_sealed, email_bidx, pii_dek_version, category) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization_id)
+                .bind(&display_name)
+                .bind(sealed.into_bytes())
+                .bind(bidx.into_bytes())
+                .bind(dek_version)
+                .bind(&category)
+                .execute(&mut **tx)
+                .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(error) if is_unique_violation(&error) => Err(StoreError::Conflict),
+                    Err(error) => Err(error.into()),
+                }
+            },
+            false,
+        )
+        .await
     }
 
-    /// Remove a contact, keeping the row.
+    /// Remove a contact from ONE organization's list, keeping the row.
     ///
-    /// Returns whether a live contact was removed, so a caller can tell a removal from a
-    /// repeat.
+    /// THE ORGANIZATION IS A PREDICATE, not context. Both identifiers are caller-supplied, and a
+    /// removal keyed on the contact alone would let a caller holding one organization's handle
+    /// remove a contact of any other organization in the same environment -- the two are only
+    /// related by this row, so nothing else in the statement would notice.
+    ///
+    /// Returns whether a live contact of that organization was removed.
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] if the id is out of this scope; [`StoreError::Database`] on a
-    /// persistence failure.
+    /// [`StoreError::NotFound`] if either identifier is out of this scope, or if the contact
+    /// does not exist in that organization at all; [`StoreError::Database`] on a persistence
+    /// failure.
     pub async fn remove(
         &self,
         env: &Env,
+        organization_id: &OrganizationId,
         id: &OrgContactId,
         now_micros: i64,
     ) -> Result<bool, StoreError> {
-        if id.scope() != self.scope {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
-        let mut tx = begin_scoped(self.store, scope).await?;
-        let changed = sqlx::query(
-            "UPDATE org_contacts \
-             SET deleted_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
-                 updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
-             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND deleted_at IS NULL \
-             RETURNING id",
+        let contact = *id;
+        let organization = organization_id.to_string();
+        write_audited(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::OrgContactRemove,
+                target: &contact,
+            },
+            async move |tx| {
+                // A REMOVAL AND A REPEAT ARE DIFFERENT ANSWERS, and both differ from a handle
+                // that names nothing. The row is looked up first so a caller can tell them apart:
+                // `Ok(true)` removed it, `Ok(false)` it was already removed, `NotFound` there is
+                // no such contact in this organization.
+                // ASKED AS A BOOLEAN rather than read as a timestamp: the question is whether
+                // the contact is already removed, and a type that carries the instant would
+                // invite a caller to compare removal times the row does not promise.
+                let existing: Option<bool> = sqlx::query_scalar(
+                    "SELECT deleted_at IS NOT NULL FROM org_contacts \
+                     WHERE id = $1 AND tenant_id = $2 AND environment_id = $3 \
+                       AND organization_id = $4",
+                )
+                .bind(contact.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization)
+                .fetch_optional(&mut **tx)
+                .await?;
+                let Some(already_removed) = existing else {
+                    return Err(StoreError::NotFound);
+                };
+                if already_removed {
+                    return Ok(false);
+                }
+                sqlx::query(
+                    "UPDATE org_contacts \
+                     SET deleted_at = TIMESTAMPTZ 'epoch' \
+                                      + ($1::bigint * INTERVAL '1 microsecond'), \
+                         updated_at = TIMESTAMPTZ 'epoch' \
+                                      + ($1::bigint * INTERVAL '1 microsecond') \
+                     WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 \
+                       AND organization_id = $5 AND deleted_at IS NULL",
+                )
+                .bind(now_micros)
+                .bind(contact.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization)
+                .execute(&mut **tx)
+                .await?;
+                Ok(true)
+            },
+            false,
         )
-        .bind(now_micros)
-        .bind(id.to_string())
-        .bind(scope.tenant().to_string())
-        .bind(scope.environment().to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-        let _ = (env, &self.acting);
-        tx.commit().await?;
-        Ok(changed.is_some())
+        .await
     }
 }
 

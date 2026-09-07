@@ -22,9 +22,17 @@ CREATE TABLE org_contacts (
     organization_id   text        NOT NULL,
     -- Who they are, for an operator reading the list.
     display_name      text        NOT NULL,
-    -- Where the notification goes. Stored as given: this is a delivery address, and the
-    -- messaging subsystem owns normalisation and send hygiene.
-    email             text        NOT NULL,
+    -- WHERE THE NOTIFICATION GOES, SEALED. An address is classified PII in this system and every
+    -- other table holding one seals it (0048 for the factor recipients, 0155 for a queued
+    -- message), for the reason those state: whoever can read this table must not thereby learn
+    -- who a customer's staff are. A sender opens it at delivery time; nothing else needs to.
+    email_sealed      bytea       NOT NULL,
+    -- THE BLIND INDEX, a deterministic per-tenant keyed HMAC of the address (issue #48). It is
+    -- what the duplicate rule keys on, because a ciphertext cannot be compared: two seals of one
+    -- address differ, so a unique index over `email_sealed` would refuse nothing.
+    email_bidx        bytea       NOT NULL,
+    -- Which DEK sealed the address, so it can be opened after a rotation.
+    pii_dek_version   integer     NOT NULL,
     -- WHICH KIND OF NOTIFICATION THEY WANT, as a closed set. Adding one is a migration, which is
     -- the point: a category nothing can be routed to is a promise the product cannot keep, and a
     -- free string becomes a de facto enum whose members nobody can enumerate.
@@ -33,7 +41,8 @@ CREATE TABLE org_contacts (
     updated_at        timestamptz NOT NULL DEFAULT now(),
     -- Set when the contact is removed. A DELETE would take the audit trail's referent with it:
     -- "who was notified about the certificate that then expired" is answerable only while the
-    -- row survives.
+    -- row survives, and both writes to this table carry an `org.contact.*` audit row that names
+    -- this identifier.
     deleted_at        timestamptz,
 
     CONSTRAINT org_contacts_scope_nonempty
@@ -42,13 +51,14 @@ CREATE TABLE org_contacts (
         CHECK (id <> '' AND octet_length(id) <= 256),
     CONSTRAINT org_contacts_display_name_shape
         CHECK (display_name <> '' AND octet_length(display_name) <= 256),
-    -- AN ADDRESS THAT COULD BE DELIVERED TO. Deliberately shallow: a full grammar here would be
-    -- wrong in both directions, refusing valid addresses and admitting undeliverable ones, and
-    -- the authority on deliverability is the send path rather than a CHECK constraint. What this
-    -- refuses is the shapes that are certainly not addresses.
-    CONSTRAINT org_contacts_email_shape
-        CHECK (email ~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
-               AND octet_length(email) <= 320),
+    -- THE SEALED ADDRESS AND ITS INDEX ARE BOTH PRESENT OR THE ROW IS UNUSABLE. A seal with no
+    -- index cannot be deduplicated and an index with no seal is a contact nothing can be
+    -- delivered to; either is a row the notification path can only fail on.
+    CONSTRAINT org_contacts_sealed_address_complete
+        CHECK (octet_length(email_sealed) > 0 AND octet_length(email_bidx) > 0),
+    -- THE ADDRESS SHAPE IS CHECKED WHERE THE ADDRESS IS READABLE, which is the repository: a
+    -- CHECK cannot see through a seal. Stated here because its absence is otherwise a gap a
+    -- reader would have to notice, rather than a decision somebody made.
     CONSTRAINT org_contacts_category_known
         CHECK (category IN ('technical', 'security', 'billing')),
 
@@ -71,7 +81,7 @@ CREATE INDEX org_contacts_by_org
 -- cannot tell which row to remove. Partial, so a removed contact does not block re-adding the
 -- same person later -- which is the ordinary case when somebody rejoins a team.
 CREATE UNIQUE INDEX org_contacts_live_address
-    ON org_contacts (tenant_id, environment_id, organization_id, category, lower(email))
+    ON org_contacts (tenant_id, environment_id, organization_id, category, email_bidx)
     WHERE deleted_at IS NULL;
 
 ALTER TABLE org_contacts ENABLE ROW LEVEL SECURITY;
@@ -93,8 +103,22 @@ CREATE POLICY org_contacts_scope ON org_contacts
 -- re-point `organization_id` at another organization, which is the boundary this table exists to
 -- hold.
 GRANT SELECT, INSERT ON org_contacts TO ironauth_control;
-GRANT UPDATE (display_name, email, category, updated_at, deleted_at) ON org_contacts
-    TO ironauth_control;
+GRANT UPDATE (updated_at, deleted_at) ON org_contacts TO ironauth_control;
+
+-- REMOVAL IS ONE WAY, and the grant cannot say so: `deleted_at` is exactly the column a removal
+-- must write, so a role able to set it is able to clear it. A RESTRICTIVE policy is what makes it
+-- one way, as 0205 does for a revoked token.
+--
+-- `USING (deleted_at IS NULL)` hides an already-removed row from any UPDATE, and the `WITH CHECK`
+-- requires the result to be removed -- so a live row can only move to removed, and a removed row
+-- cannot be touched at all. Without it the tombstone this table keeps for the audit trail could
+-- be quietly un-set by the same role that wrote it.
+CREATE POLICY org_contacts_removal_is_one_way ON org_contacts
+    AS RESTRICTIVE
+    FOR UPDATE
+    TO ironauth_control
+    USING (deleted_at IS NULL)
+    WITH CHECK (deleted_at IS NOT NULL);
 
 -- THE DATA PLANE READS, and only reads. The notification senders run there and need to know
 -- where to deliver; nothing on that side may edit who is notified, because a delivery path that

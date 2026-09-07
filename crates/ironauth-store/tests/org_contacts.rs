@@ -212,7 +212,7 @@ async fn removing_a_contact_stops_notifying_them_and_keeps_the_row() {
     assert!(
         writes
             .org_contacts()
-            .remove(&env, &id, at)
+            .remove(&env, &org, &id, at)
             .await
             .expect("remove"),
         "the first removal must report that it removed something"
@@ -220,7 +220,7 @@ async fn removing_a_contact_stops_notifying_them_and_keeps_the_row() {
     assert!(
         !writes
             .org_contacts()
-            .remove(&env, &id, at + 1)
+            .remove(&env, &org, &id, at + 1)
             .await
             .expect("remove again"),
         "a repeated removal reported a second removal, so a caller cannot tell one from a retry"
@@ -328,10 +328,11 @@ async fn a_foreign_organization_or_id_is_refused_before_any_write() {
 }
 
 #[tokio::test]
-async fn the_column_checks_refuse_a_malformed_address_and_an_unknown_category() {
-    // THE CLOSED SET AND THE SHALLOW ADDRESS CHECK, asserted at the database rather than trusted
-    // from the handler: a category nothing routes is a promise the product cannot keep, and an
-    // address with no domain is one the send path can only fail on.
+async fn a_malformed_address_or_an_unknown_category_is_refused() {
+    // THE CLOSED SET AND THE SHALLOW ADDRESS CHECK. They are enforced in the REPOSITORY rather
+    // than by a CHECK constraint, and not by preference: the address is sealed, and a constraint
+    // cannot see through a seal. A category nothing routes is a promise the product cannot keep,
+    // and an address with no domain is one the send path can only fail on.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -344,8 +345,8 @@ async fn the_column_checks_refuse_a_malformed_address_and_an_unknown_category() 
     ] {
         let outcome = add(&db, &env, scope, &org, "Ada", email, category).await;
         assert!(
-            matches!(outcome, Err(StoreError::Database(_))),
-            "the column checks accepted email={email:?} category={category:?}: {outcome:?}"
+            matches!(outcome, Err(StoreError::Invalid)),
+            "the shape rules accepted email={email:?} category={category:?}: {outcome:?}"
         );
     }
 
@@ -354,4 +355,267 @@ async fn the_column_checks_refuse_a_malformed_address_and_an_unknown_category() 
     add(&db, &env, scope, &org, "Ada", "ada@acme.example", "billing")
         .await
         .expect("a well-formed contact");
+}
+
+#[tokio::test]
+async fn one_organizations_caller_cannot_remove_anothers_contact() {
+    // THE ORGANIZATION IS A PREDICATE, NOT CONTEXT. Both identifiers are caller-supplied and the
+    // two are related only by the row, so a removal keyed on the contact alone would let a
+    // handler holding one organization's handle silence any other organization's notifications
+    // in the same environment -- and nothing in the statement would notice.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = seed_org(&db, &env, scope, "Acme").await;
+    let theirs = seed_org(&db, &env, scope, "Globex").await;
+    let target = add(
+        &db,
+        &env,
+        scope,
+        &theirs,
+        "Grace",
+        "grace@globex.example",
+        "security",
+    )
+    .await
+    .expect("add theirs");
+
+    let at = now_micros(&env);
+    let outcome = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &mine, &target, at)
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::NotFound)),
+        "a caller removed a contact belonging to another organization: {outcome:?}"
+    );
+
+    // AND THE CONTACT IS STILL BEING NOTIFIED, which is the consequence that matters: the
+    // refusal above would be worthless if the row had been removed anyway.
+    let still = db
+        .store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&theirs, 50)
+        .await
+        .expect("list");
+    assert_eq!(
+        still.len(),
+        1,
+        "the foreign removal took effect despite refusing"
+    );
+}
+
+#[tokio::test]
+async fn removal_tells_a_first_removal_a_repeat_and_a_stranger_apart() {
+    // THREE ANSWERS, because a caller acts differently on each: it removed something, it was
+    // already gone, or the handle names nothing here at all. An earlier version collapsed the
+    // last two into `Ok(false)`, so a handler could not tell a repeat from a typo.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("add");
+    let at = now_micros(&env);
+    let writes = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env));
+
+    assert!(
+        writes
+            .org_contacts()
+            .remove(&env, &org, &id, at)
+            .await
+            .expect("first")
+    );
+    assert!(
+        !writes
+            .org_contacts()
+            .remove(&env, &org, &id, at + 1)
+            .await
+            .expect("repeat"),
+        "a repeated removal reported a second removal"
+    );
+
+    let stranger = OrgContactId::generate(&env, &scope);
+    let outcome = writes
+        .org_contacts()
+        .remove(&env, &org, &stranger, at + 2)
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::NotFound)),
+        "a handle that names no contact reported a repeat rather than a miss: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_duplicate_rule_folds_case_and_is_per_organization() {
+    // TWO DIMENSIONS OF THE INDEX, each unmeasured by the plain duplicate test.
+    //
+    // CASE: `Ada@acme.example` and `ada@acme.example` reach the same person, and listing both
+    // sends them one outage notice twice. Both probes in the plain test used byte-identical
+    // strings, so dropping the folding changed nothing.
+    //
+    // ORGANIZATION: two customers may employ the same consultant. Refusing the second would let
+    // one organization's contact list decide another's.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = seed_org(&db, &env, scope, "Acme").await;
+    let theirs = seed_org(&db, &env, scope, "Globex").await;
+
+    add(
+        &db,
+        &env,
+        scope,
+        &mine,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("the first");
+    let folded = add(
+        &db,
+        &env,
+        scope,
+        &mine,
+        "Ada",
+        "Ada@ACME.example",
+        "technical",
+    )
+    .await;
+    assert!(
+        matches!(folded, Err(StoreError::Conflict)),
+        "the same address in another case was accepted, so one person receives every notice \
+         twice: {folded:?}"
+    );
+
+    add(
+        &db,
+        &env,
+        scope,
+        &theirs,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("the same consultant for another customer");
+    let listed = db
+        .store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&theirs, 50)
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.len(),
+        1,
+        "one organization's contact list refused an address because another organization uses it"
+    );
+}
+
+#[tokio::test]
+async fn the_stored_address_is_sealed_and_the_listing_opens_it() {
+    // THE PII GUARANTEE, asked of the bytes on disk rather than of the migration's prose. A
+    // database dump must not carry a customer's staff addresses, and the listing must still
+    // return one a sender can deliver to -- both halves, because either alone is satisfiable by
+    // a mistake (a sealed column nothing can open, or a readable one).
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("add");
+
+    let sealed: Vec<u8> = sqlx::query_scalar("SELECT email_sealed FROM org_contacts")
+        .fetch_one(db.owner_pool())
+        .await
+        .expect("read the sealed column");
+    assert!(
+        !String::from_utf8_lossy(&sealed).contains("ada@acme.example"),
+        "the address is readable in the stored bytes, so a database dump carries every \
+         customer's staff in the clear"
+    );
+
+    let listed = db
+        .store()
+        .scoped(scope)
+        .org_contacts()
+        .list_for_organization(&org, 50)
+        .await
+        .expect("list");
+    assert_eq!(
+        listed[0].email, "ada@acme.example",
+        "the listing cannot recover the address, so nothing can be delivered"
+    );
+}
+
+#[tokio::test]
+async fn both_writes_are_audited() {
+    // THE TRAIL THE SOFT DELETE EXISTS FOR. The migration keeps a removed row so an audit entry
+    // has a referent; a removal that wrote no entry would leave the tombstone pointing at
+    // nothing, and an unaudited add is a change to who a vendor notifies with no actor on it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("add");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .org_contacts()
+        .remove(&env, &org, &id, now_micros(&env))
+        .await
+        .expect("remove");
+
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE target_id = $1 ORDER BY occurred_at",
+    )
+    .bind(id.to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(
+        actions,
+        vec![
+            "org_contact.add".to_owned(),
+            "org_contact.remove".to_owned()
+        ],
+        "the contact writes left no attributable trail"
+    );
 }
