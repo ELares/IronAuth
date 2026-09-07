@@ -469,6 +469,154 @@ pub async fn surface_get(
     crate::pages::secure_html(StatusCode::OK, body)
 }
 
+/// One table row per connection, each saying which state that connection is in.
+///
+/// NO COUNT HERE, deliberately. An earlier version of this line said "which of the five states",
+/// which was wrong by two the day it was written -- the branch that added it had itself added an
+/// arm -- and a number in this sentence is the one thing a reader auditing arm coverage would key
+/// on. The arms below are the list.
+///
+/// Split out of `scim_surface` so the handler reads as the shape of the page rather than as the
+/// wording of its rows; the reasoning for each branch lives at the branch.
+fn connection_rows<'a>(
+    connections: impl Iterator<Item = &'a ironauth_store::ScimConnection>,
+    now: i64,
+    lead: u64,
+) -> String {
+    let mut rows = String::new();
+    for connection in connections {
+        let status = if connection.revoked {
+            "Revoked".to_owned()
+        } else if connection.no_live_credential() {
+            // WHICH KIND OF STOPPED IT IS decides the remedy, exactly as the deadline arm below
+            // does. A connection past its own expiry cannot be rotated -- `rotate_token` refuses
+            // it -- so telling this customer their token stopped working would point them at the
+            // wrong half of the problem and at a request their vendor cannot fulfil.
+            if connection
+                .expires_at_unix_micros
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                "Provisioning has stopped: this connection expired and must be replaced".to_owned()
+            } else {
+                "Provisioning has stopped: no working token".to_owned()
+            }
+        } else if let Some(deadline) = connection.credential_expires_at_unix_micros {
+            let when = crate::saml_start::rfc3339_utc(deadline / 1_000_000);
+            // WHICH DEADLINE IT IS DECIDES WHAT THE ADMIN CAN DO ABOUT IT, and the row carries the
+            // discriminator: the published deadline is the LEAST of the connection's own expiry
+            // and its soonest live token's, so when it equals the connection's own expiry that is
+            // the arm that produced it.
+            //
+            // A TOKEN deadline is cleared by rotating -- during an overlap the superseded token
+            // dies on this date while the fresh one carries on, so an outage warning there would
+            // be a false alarm at the exact moment a successful cutover guaranteed otherwise.
+            //
+            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. No path in this system writes
+            // `scim_connections.expires_at`: migration 0183 grants the control role
+            // `UPDATE (revoked_at, updated_at)` and no more, and rotating mints a token with no
+            // horizon while leaving that column exactly where it was. So "renew before" there
+            // names a remedy the customer can perform forever without moving the date, and on it
+            // provisioning stops for good. That one has to say so, and say what actually helps.
+            if connection.expires_at_unix_micros == Some(deadline) {
+                format!("Provisioning stops {when}: ask your vendor to replace this connection")
+            } else if connection.credential_expiring_soon(now, lead) {
+                format!("Renew before {when}")
+            } else {
+                format!("Next deadline {when}")
+            }
+        } else {
+            "Active".to_owned()
+        };
+        let _ = write!(
+            rows,
+            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td></tr>",
+            name = escape_html(&connection.display_name),
+            provider = escape_html(&connection.provider),
+            status = escape_html(&status),
+        );
+    }
+    // NO ROW WAS WRITTEN, which is the same fact as an empty listing and is one this function
+    // can see for itself rather than taking on trust from its caller.
+    if rows.is_empty() {
+        rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
+    }
+    rows
+}
+
+/// One setup guide per connection, keyed on that connection's own provider.
+fn setup_guides(
+    state: &OidcState,
+    connections: &[ironauth_store::ScimConnection],
+    scim_base: &str,
+    now: i64,
+) -> String {
+    // ONE GUIDE PER CONNECTION, keyed on that connection's own provider (issue #140 criterion 4:
+    // "setup guides render per IdP with correct copy-paste values for the specific connection
+    // being configured").
+    //
+    // PER CONNECTION RATHER THAN PER DISTINCT PROVIDER, and the case that separates those is TWO
+    // CONNECTIONS OF THE SAME PROVIDER -- a customer migrating between two Okta tenants, or
+    // running one for staging. Per-provider rendering gives them a single "Okta" section and no
+    // way to tell which of their two connections it configures, which is precisely where a
+    // vendor's generic documentation already leaves them. An earlier version of this comment
+    // offered an Okta-plus-Entra organization as the justification; those differ by provider too,
+    // so it demonstrated nothing about the choice.
+    //
+    // ONLY WHERE THE ENDPOINT IS SERVED. With the surface off the steps would tell a customer to
+    // paste a URL this deployment answers 404 for, which is the same defect the endpoint
+    // paragraph above already refuses to commit.
+    //
+    // AND NOT FOR A CONNECTION NOTHING CAN REVIVE. Two states qualify and an earlier version of
+    // this filter named only the first:
+    //
+    //   * REVOKED, which an operator did on purpose.
+    //   * LAPSED, meaning the connection is past its OWN `expires_at`. That one arrives by itself
+    //     with nobody acting, and it is the worse of the two to be wrong about: `authenticate`
+    //     requires `c.expires_at > now`, so no token the admin pastes will ever work, and the
+    //     guide's own closing sentence tells them to ask their vendor to ROTATE -- which
+    //     `rotate_token` refuses with a not-found for exactly this connection. The customer would
+    //     do the work, watch it fail with no explanation, and ask for a remedy the product
+    //     answers 404 to.
+    //
+    // IT IS KEYED ON THE CONNECTION'S OWN EXPIRY, not on `no_live_credential()`. The other way a
+    // row reports no live credential is that its TOKENS are gone while the connection itself is
+    // fine -- and there rotation works, the admin pastes the fresh token, and these steps are
+    // exactly what they need. Suppressing the guide on the broader condition would hide it from
+    // the one row it helps most.
+    let mut guides = String::new();
+    if state.scim_surface_enabled() {
+        for connection in connections
+            .iter()
+            .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX))
+            .filter(|connection| {
+                let lapsed = connection
+                    .expires_at_unix_micros
+                    .is_some_and(|expires_at| expires_at <= now);
+                !connection.revoked && !lapsed
+            })
+        {
+            let guide = crate::portal_guides::guide_for(&connection.provider, scim_base);
+            let mut steps = String::new();
+            for step in &guide.steps {
+                let _ = write!(steps, "<li>{}</li>", escape_html(step));
+            }
+            let _ = write!(
+                guides,
+                "<details><summary>Set up {name} in {provider}</summary>\
+                 <p>{where_to_go}</p><ol>{steps}</ol></details>",
+                name = escape_html(&connection.display_name),
+                provider = escape_html(guide.provider_name),
+                where_to_go = escape_html(guide.where_to_go),
+                steps = steps,
+            );
+        }
+        if !guides.is_empty() {
+            guides.insert_str(0, "<h2>Setting up your identity provider</h2>");
+        }
+    }
+    guides
+}
+
 /// The SCIM configuration surface: what this organization's provisioning credentials are doing.
 ///
 /// # What an IT admin came here to find out
@@ -517,54 +665,17 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     };
 
     let lead = state.scim_token_expiry_warning_secs();
+    // DERIVED ONCE, and used by the paragraph above the table AND by every setup guide below it.
+    // Two derivations of one deployment's endpoint is how a page comes to print two different
+    // URLs, and the guides are the half a customer actually pastes from.
+    let scim_base = format!("{}/scim/v2", state.issuer_base());
     let truncated = connections.len() > usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
     let shown = connections
         .iter()
         .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX));
-    let mut rows = String::new();
-    for connection in shown {
-        let status = if connection.revoked {
-            "Revoked".to_owned()
-        } else if connection.no_live_credential() {
-            "Provisioning has stopped: no working token".to_owned()
-        } else if let Some(deadline) = connection.credential_expires_at_unix_micros {
-            let when = crate::saml_start::rfc3339_utc(deadline / 1_000_000);
-            // WHICH DEADLINE IT IS DECIDES WHAT THE ADMIN CAN DO ABOUT IT, and the row carries the
-            // discriminator: the published deadline is the LEAST of the connection's own expiry
-            // and its soonest live token's, so when it equals the connection's own expiry that is
-            // the arm that produced it.
-            //
-            // A TOKEN deadline is cleared by rotating -- during an overlap the superseded token
-            // dies on this date while the fresh one carries on, so an outage warning there would
-            // be a false alarm at the exact moment a successful cutover guaranteed otherwise.
-            //
-            // THE CONNECTION'S OWN EXPIRY IS CLEARED BY NOTHING. No path in this system writes
-            // `scim_connections.expires_at`: migration 0183 grants the control role
-            // `UPDATE (revoked_at, updated_at)` and no more, and rotating mints a token with no
-            // horizon while leaving that column exactly where it was. So "renew before" there
-            // names a remedy the customer can perform forever without moving the date, and on it
-            // provisioning stops for good. That one has to say so, and say what actually helps.
-            if connection.expires_at_unix_micros == Some(deadline) {
-                format!("Provisioning stops {when}: ask your vendor to replace this connection")
-            } else if connection.credential_expiring_soon(now, lead) {
-                format!("Renew before {when}")
-            } else {
-                format!("Next deadline {when}")
-            }
-        } else {
-            "Active".to_owned()
-        };
-        let _ = write!(
-            rows,
-            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td></tr>",
-            name = escape_html(&connection.display_name),
-            provider = escape_html(&connection.provider),
-            status = escape_html(&status),
-        );
-    }
-    if connections.is_empty() {
-        rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
-    }
+    let mut rows = connection_rows(shown, now, lead);
+    let guides = setup_guides(state, &connections, &scim_base, now);
+
     if truncated {
         let _ = write!(
             rows,
@@ -581,8 +692,8 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     // started" with the portal's own instructions as evidence that it should have.
     let endpoint = if state.scim_surface_enabled() {
         format!(
-            "<h2>Where your provisioning client connects</h2><p><code>{base}/scim/v2</code></p>",
-            base = escape_html(state.issuer_base()),
+            "<h2>Where your provisioning client connects</h2><p><code>{base}</code></p>",
+            base = escape_html(&scim_base),
         )
     } else {
         "<h2>Where your provisioning client connects</h2>\
@@ -596,10 +707,12 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          {endpoint}\
          <h2>Your connections</h2>\
          <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th></tr></thead>\
-         <tbody>{rows}</tbody></table>",
+         <tbody>{rows}</tbody></table>\
+         {guides}",
         organization = escape_html(&session.organization().to_string()),
         endpoint = endpoint,
         rows = rows,
+        guides = guides,
     );
     crate::pages::secure_html(StatusCode::OK, body)
 }

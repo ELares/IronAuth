@@ -597,6 +597,26 @@ async fn connect(
     token: &str,
     expires_at_unix_micros: Option<i64>,
 ) -> ironauth_store::ScimConnectionId {
+    connect_with_provider(
+        harness,
+        organization,
+        display_name,
+        "okta",
+        token,
+        expires_at_unix_micros,
+    )
+    .await
+}
+
+/// As [`connect`], naming the provider, which is what the setup guides are keyed on.
+async fn connect_with_provider(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    provider: &str,
+    token: &str,
+    expires_at_unix_micros: Option<i64>,
+) -> ironauth_store::ScimConnectionId {
     let env = Env::system();
     let scope = harness.scope();
     let id = ironauth_store::ScimConnectionId::generate(&env, &scope);
@@ -615,7 +635,7 @@ async fn connect(
                 id: &id,
                 organization_id: organization,
                 display_name,
-                provider: "okta",
+                provider,
                 token_digest: &hex_digest(token),
                 expires_at_unix_micros,
             },
@@ -1182,5 +1202,571 @@ async fn a_page_that_is_exactly_full_is_not_called_truncated() {
         !body.contains("Showing the first"),
         "a complete list of exactly the page size is labelled truncated, telling a customer \
          their vendor is withholding connections that do not exist: {body}"
+    );
+}
+
+/// Every provider gets ITS OWN guide, naming ITS OWN connection, carrying THIS deployment's URL.
+///
+/// # Issue #140 criterion 4, and the half of it that is easy to fake
+///
+/// "Setup guides render per IdP with correct copy-paste values for the specific connection being
+/// configured." A page carrying one generic guide would satisfy a test that only looked for the
+/// word "SCIM", so this asserts the discriminating parts: each provider's guide names the field
+/// ITS console calls the URL (Okta's Base URL, Entra's Tenant URL), each guide is attached to the
+/// connection it configures by name, and the URL in them is this deployment's own rather than a
+/// literal.
+#[tokio::test]
+async fn each_connection_gets_its_own_providers_setup_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    connect_with_provider(&harness, &org, "okta-primary", "okta", "g-a", None).await;
+    connect_with_provider(&harness, &org, "entra-secondary", "entra", "g-b", None).await;
+    connect_with_provider(&harness, &org, "homegrown", "generic", "g-c", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-guides", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // ONE GUIDE PER CONNECTION, each naming the connection it belongs to. An organization with
+    // two providers needs to know which steps go with which row.
+    for (name, provider) in [
+        ("okta-primary", "Okta"),
+        ("entra-secondary", "Microsoft Entra ID"),
+        ("homegrown", "your identity provider"),
+    ] {
+        let heading = format!("Set up {name} in {provider}");
+        assert!(
+            body.contains(&heading),
+            "no guide headed {heading:?}, so this connection's steps are missing or are filed \
+             under another connection: {body}"
+        );
+    }
+
+    // THE STEPS ARE THE PROVIDER'S OWN, asserted INSIDE the guide they belong to. Page-global
+    // `contains` checks are satisfied by the right words appearing anywhere, so the Okta and
+    // Entra step lists could be swapped wholesale and every one of them would still pass -- which
+    // is the exact failure these guides exist to prevent, pasting into the wrong console's field.
+    let guide = |name: &str| -> String {
+        let heading = format!("Set up {name} in ");
+        let at = body
+            .find(&heading)
+            .unwrap_or_else(|| panic!("no guide for {name}: {body}"));
+        let rest = &body[at..];
+        let end = rest.find("</details>").unwrap_or(rest.len());
+        rest[..end].to_owned()
+    };
+    assert!(
+        guide("okta-primary").contains("Base URL field")
+            && guide("okta-primary").contains("API Token field"),
+        "the Okta guide does not name the fields Okta uses: {}",
+        guide("okta-primary")
+    );
+    assert!(
+        guide("entra-secondary").contains("Tenant URL field")
+            && guide("entra-secondary").contains("Secret Token field"),
+        "the Entra guide does not name the fields Entra uses: {}",
+        guide("entra-secondary")
+    );
+    // AND NEITHER CARRIES THE OTHER'S, which is what makes the pair a swap test rather than two
+    // independent presence checks.
+    assert!(
+        !guide("okta-primary").contains("Tenant URL"),
+        "the Okta guide carries Entra's field names: {}",
+        guide("okta-primary")
+    );
+    assert!(
+        !guide("entra-secondary").contains("API Token"),
+        "the Entra guide carries Okta's field names: {}",
+        guide("entra-secondary")
+    );
+
+    // AND THE URL IS THIS DEPLOYMENT'S, in every guide. Asserting merely that "/scim/v2" appears
+    // would be satisfied by a hardcoded literal, which is what a guide copied from a vendor
+    // document would contain.
+    let scope_path = format!("/t/{}/e/{}", scope.tenant(), scope.environment());
+    let deployment_base = harness
+        .issuer()
+        .strip_suffix(&scope_path)
+        .expect("the per-environment issuer is the deployment base plus the scope path");
+    let expected = format!("{deployment_base}/scim/v2");
+    // PER GUIDE, not a page-global count. Counting occurrences cannot see WHICH guide carries the
+    // URL, so four copies in one guide and none in the others would satisfy it -- the same defect
+    // the field-name assertions beside this one were just reshaped to remove.
+    for name in ["okta-primary", "entra-secondary", "homegrown"] {
+        assert!(
+            guide(name).contains(&expected),
+            "the guide for {name} does not carry this deployment's SCIM URL, so the customer \
+             would paste an address from somewhere else: {}",
+            guide(name)
+        );
+    }
+    assert!(
+        body.contains(&format!("<code>{expected}</code>")),
+        "the endpoint paragraph above the table does not carry the deployment's URL: {body}"
+    );
+
+    // NO GUIDE OFFERS THE TOKEN, because no reader can produce it: the store holds a digest and
+    // the plaintext existed once, in the response that minted it. Every guide says where it
+    // comes from instead.
+    for name in ["okta-primary", "entra-secondary", "homegrown"] {
+        assert!(
+            guide(name).contains("ask your vendor to rotate it"),
+            "the guide for {name} does not say where the token comes from, which is the one \
+             value it cannot show and the one an admin will not otherwise have: {}",
+            guide(name)
+        );
+    }
+}
+
+/// A revoked connection gets no guide, and a deployment serving no SCIM gets none at all.
+///
+/// # Both are the same mistake: instructions that cannot succeed
+///
+/// Configuring an identity provider against a credential an operator has switched off is wasted
+/// work, and pasting a URL this deployment answers 404 for is worse -- the admin has no way to
+/// tell the setup failed for a reason on the vendor's side.
+#[tokio::test]
+async fn no_guide_is_offered_for_work_that_cannot_succeed() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let live = connect_with_provider(&harness, &org, "still-working", "okta", "g-live", None).await;
+    let dead = connect_with_provider(&harness, &org, "switched-off", "entra", "g-dead", None).await;
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &dead, now_micros(&harness))
+        .await
+        .expect("revoke");
+
+    let cookie = open_session_in(&harness, "scim", "tok-g2", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE CONTROL: the live connection does get one, so the absence below is the revocation.
+    assert!(
+        body.contains("Set up still-working in Okta"),
+        "the live connection has no guide, so the absence asserted next proves nothing: {body}"
+    );
+    assert!(
+        !body.contains("Set up switched-off in"),
+        "a revoked connection is offered setup steps that cannot succeed: {body}"
+    );
+    let _ = live;
+
+    // AND A LAPSED CONNECTION, which is the other way a row reaches "cannot succeed" and the one
+    // that arrives by itself. `authenticate` refuses it on `c.expires_at > now`, so no token the
+    // admin pastes will ever work -- and the guide's closing sentence would tell them to ask for
+    // a ROTATION, which `rotate_token` refuses for this same connection with a not-found. The
+    // customer would do the work, watch it fail unexplained, and request a remedy the product
+    // answers 404 to.
+    let lapsing = connect_with_provider(
+        &harness,
+        &org,
+        "already-expired",
+        "okta",
+        "g-lapsed",
+        Some(now_micros(&harness) + 60 * 1_000_000),
+    )
+    .await;
+    harness.clock().advance(std::time::Duration::from_secs(120));
+    let (_, after) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert!(
+        after.contains("already-expired"),
+        "the lapsed connection is missing from the listing entirely: {after}"
+    );
+    assert!(
+        !after.contains("Set up already-expired in"),
+        "a connection past its own expiry is offered setup steps that cannot succeed, ending in \
+         a request its vendor must refuse: {after}"
+    );
+    // AND ITS ROW NAMES THE REMEDY THAT WORKS, rather than blaming a token that is not the
+    // problem: this connection cannot be rotated, only replaced.
+    assert!(
+        after.contains("this connection expired and must be replaced"),
+        "the lapsed row does not say what has to happen to it: {after}"
+    );
+    // THE CONTROL, again after the clock moved: the live connection still has its guide, so the
+    // absence above is the lapse rather than the whole section disappearing.
+    assert!(
+        after.contains("Set up still-working in Okta"),
+        "the live connection lost its guide when a sibling lapsed: {after}"
+    );
+    let _ = lapsing;
+
+    // AND WITH THE SURFACE OFF, no guide at all -- the steps would point at a 404.
+    let dark = Harness::start_store_backed_with_scim_surface(false).await;
+    let dark_org = seed_org(&dark, "Acme").await;
+    connect_with_provider(&dark, &dark_org, "hopeful", "okta", "g-dark", None).await;
+    let dark_cookie = open_session_in(&dark, "scim", "tok-g3", &dark_org).await;
+    let dark_scope = dark.scope();
+    let dark_path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        dark_scope.tenant(),
+        dark_scope.environment()
+    );
+    let (status, dark_body) = get_with_cookie(&dark, &dark_path, Some(&dark_cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {dark_body}");
+    assert!(
+        !dark_body.contains("Setting up your identity provider"),
+        "a deployment that serves no provisioning offers setup steps for it: {dark_body}"
+    );
+    assert!(
+        dark_body.contains("hopeful"),
+        "the connection itself vanished along with its guide: {dark_body}"
+    );
+}
+
+/// Two connections of the SAME provider get two guides, one each.
+///
+/// # The case that separates per-connection from per-provider
+///
+/// An Okta-plus-Entra organization does not: those differ by provider, so per-provider rendering
+/// would give them two sections too. A customer migrating between two Okta tenants, or running
+/// one for staging, is the case where per-provider gives a single "Okta" section and no way to
+/// tell which connection it configures -- which is exactly where a vendor's own documentation
+/// already leaves them.
+#[tokio::test]
+async fn two_connections_of_one_provider_get_a_guide_each() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    connect_with_provider(&harness, &org, "okta-staging", "okta", "g-s", None).await;
+    connect_with_provider(&harness, &org, "okta-production", "okta", "g-p", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-same", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    assert!(
+        body.contains("Set up okta-staging in Okta"),
+        "the staging connection has no guide of its own: {body}"
+    );
+    assert!(
+        body.contains("Set up okta-production in Okta"),
+        "the production connection has no guide of its own: {body}"
+    );
+    assert_eq!(
+        body.matches("<details>").count(),
+        2,
+        "two connections of one provider produced {} guides rather than two, so the admin \
+         cannot tell which set of steps configures which connection: {body}",
+        body.matches("<details>").count()
+    );
+}
+
+/// A page that lists a hundred connections offers a hundred guides, not a hundred and one.
+///
+/// # The bound the guides carry separately from the table
+///
+/// The rows and the guides each `take` the page limit off the same over-long read. Deleting the
+/// guides' `take` renders a guide for a connection the table says is not shown, so the page would
+/// contradict itself -- and nothing observed that: the truncation test counts rows only.
+#[tokio::test]
+async fn the_guides_stop_where_the_table_stops() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    for index in 0..101 {
+        connect_with_provider(
+            &harness,
+            &org,
+            &format!("conn-{index:03}"),
+            "okta",
+            &format!("guide-{index}"),
+            None,
+        )
+        .await;
+    }
+
+    let cookie = open_session_in(&harness, "scim", "tok-bound", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE CONTROL: the page really is truncating, so the count below is the guides honouring the
+    // same bound rather than a page that happens to be short.
+    assert!(
+        body.contains("Showing the first"),
+        "the page is not truncating, so this fixture proves nothing about the bound: {body}"
+    );
+    assert_eq!(
+        body.matches("<details>").count(),
+        100,
+        "the guides do not stop where the table stops, so the page offers setup steps for a \
+         connection it says it is not showing"
+    );
+}
+
+/// A connection that has lost its TOKENS still gets its guide; one past its own expiry does not.
+///
+/// # The positive control the filter's narrowness depends on
+///
+/// The filter suppresses a guide for a connection nothing can revive, keyed on the connection's
+/// own expiry. Keying it on `no_live_credential()` instead would be a strict superset -- the
+/// store zeroes `live_token_count` for any lapsed row before it looks at the token rows at all,
+/// so lapsed always implies no live credential -- and every other test would stay green under
+/// that broader condition.
+///
+/// What separates them is exactly one row: a connection that is live and unrevoked but whose
+/// tokens are gone. Rotation works there, the admin has a fresh token to paste, and these steps
+/// are what they need. Without this assertion the narrowness is unobservable and the next
+/// simplification silently removes the guide from the population the feature was reshaped for.
+#[tokio::test]
+async fn a_connection_that_lost_its_tokens_still_gets_its_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    let day = 24 * 60 * 60 * 1_000_000_i64;
+    let writes = || {
+        harness.db().control_store().scoped(harness.scope()).acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+    };
+
+    // THE CONNECTION OUTLIVES ITS CREDENTIALS: ninety days out, so it is neither revoked nor
+    // lapsed, while a rotation followed by revoking the fresh token leaves nothing live.
+    let stranded = connect_with_provider(
+        &harness,
+        &org,
+        "tokens-gone",
+        "okta",
+        "tg-1",
+        Some(now + 90 * day),
+    )
+    .await;
+    writes()
+        .scim_connections()
+        .rotate_token(&env, &stranded, &hex_digest("tg-2"), 60, now)
+        .await
+        .expect("rotate");
+    writes()
+        .scim_connections()
+        .revoke_token(&env, &stranded, &hex_digest("tg-2"), now)
+        .await
+        .expect("revoke the fresh token");
+    harness.clock().advance(std::time::Duration::from_secs(120));
+
+    let cookie = open_session_in(&harness, "scim", "tok-stranded", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE PREMISE: this row really has lost its credentials, so the guide below is being kept
+    // for a connection that reports itself stopped rather than for an ordinary healthy one.
+    assert!(
+        row(&body, "tokens-gone").contains("no working token"),
+        "the fixture did not reach the tokens-gone state, so the assertion below proves nothing \
+         about the filter: {}",
+        row(&body, "tokens-gone")
+    );
+    assert!(
+        !row(&body, "tokens-gone").contains("must be replaced"),
+        "a connection whose tokens are gone is reported as needing replacement, which is the \
+         lapsed remedy and not this one: {}",
+        row(&body, "tokens-gone")
+    );
+    assert!(
+        body.contains("Set up tokens-gone in Okta"),
+        "the connection that most needs setup steps -- live, rotatable, and with nothing to \
+         authenticate -- was denied them: {body}"
+    );
+}
+
+/// A live connection WITH a future expiry still gets its guide.
+///
+/// # The other half of `is_some_and`
+///
+/// The filter could test `expires_at_unix_micros.is_some()` -- suppressing the guide for every
+/// connection that has an expiry, whether or not it has passed -- and only a fixture whose expiry
+/// is in the FUTURE can tell that apart from the shipped condition. That is a large population to
+/// be wrong about: an expiry is what a cautious vendor sets.
+///
+/// Its sibling `a_connection_that_lost_its_tokens_still_gets_its_guide` also carries a future
+/// expiry and would fail the same mutation. This one keeps it as the case stated plainly, with
+/// nothing else going on in the fixture to explain a failure.
+#[tokio::test]
+async fn a_connection_with_a_future_expiry_still_gets_its_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    connect_with_provider(
+        &harness,
+        &org,
+        "expires-next-year",
+        "okta",
+        "fe-1",
+        Some(now + 365 * 24 * 60 * 60 * 1_000_000),
+    )
+    .await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-future", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+    assert!(
+        body.contains("Set up expires-next-year in Okta"),
+        "a connection with an expiry a year away is treated as already lapsed and denied its \
+         setup steps: {body}"
+    );
+}
+
+/// A connection that is BOTH revoked and lapsed reads as revoked.
+///
+/// # Which of two true things a row says
+///
+/// Both branches apply, and the order decides. Revocation is the one somebody did on purpose and
+/// the one `revoked_at` timestamps, so it is the more informative answer -- and without a fixture
+/// carrying both, the branch order is free to change with nothing noticing.
+#[tokio::test]
+async fn a_revoked_and_lapsed_connection_reads_as_revoked() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let env = Env::system();
+    let org = seed_org(&harness, "Acme").await;
+    let now = now_micros(&harness);
+    let both = connect_with_provider(
+        &harness,
+        &org,
+        "off-and-expired",
+        "okta",
+        "bl-1",
+        Some(now + 60 * 1_000_000),
+    )
+    .await;
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .scim_connections()
+        .revoke(&env, &both, now)
+        .await
+        .expect("revoke");
+    harness.clock().advance(std::time::Duration::from_secs(120));
+
+    let cookie = open_session_in(&harness, "scim", "tok-both", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (_, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert!(
+        row(&body, "off-and-expired").contains("Revoked"),
+        "a connection that was switched off AND has since lapsed reports the lapse, hiding the \
+         deliberate act that is the more useful answer: {}",
+        row(&body, "off-and-expired")
+    );
+    assert!(
+        !row(&body, "off-and-expired").contains("must be replaced"),
+        "the revoked row also carries the lapsed remedy: {}",
+        row(&body, "off-and-expired")
+    );
+
+    // AND NO EMPTY GUIDES SECTION. The surface is on and every connection here is filtered out,
+    // which is the only state that reaches the heading's emptiness guard -- an organization that
+    // has offboarded its identity provider, or has no connections yet on a SCIM-serving
+    // deployment. Without this the guard can be deleted and the page ships a heading with
+    // nothing underneath, which reads as a section that failed to load.
+    assert!(
+        !body.contains("Setting up your identity provider"),
+        "a heading was rendered over no guides at all: {body}"
+    );
+}
+
+/// A display name carrying markup is escaped everywhere the page prints it.
+///
+/// # The one value on this page that a customer's own vendor controls
+///
+/// Everything else in a row and a guide is a constant, a timestamp, or the deployment's own URL.
+/// The display name is chosen by whoever created the connection through the management API, which
+/// accepts any text the column allows -- so it is the only value here that can carry markup, and
+/// it is printed twice: once in the table cell and once in the guide's summary. Dropping the
+/// escape on either was invisible; the row cell had no fixture with markup in it either.
+#[tokio::test]
+async fn a_display_name_carrying_markup_is_escaped_in_the_row_and_the_guide() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    // A NAME THAT WOULD CLOSE THE CELL AND OPEN A SCRIPT if it reached the page unescaped. It
+    // stays a legal display name: the column bounds its length and nothing else.
+    let hostile = "</td><script>alert(1)</script>";
+    connect_with_provider(&harness, &org, hostile, "okta", "esc-1", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-esc", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE PREMISE: the connection really is on the page, so the absences below are escaping
+    // rather than a row that never rendered.
+    assert!(
+        body.contains("alert(1)"),
+        "the connection is missing from the page entirely, so this proves nothing: {body}"
+    );
+    assert!(
+        !body.contains("<script>"),
+        "a display name opened a script tag on the portal page: {body}"
+    );
+    assert!(
+        !body.contains("</td><script"),
+        "a display name closed its own table cell: {body}"
+    );
+    // AND THE GUIDE, which prints the same name in its summary. The row and the guide escape
+    // separately, so one being right says nothing about the other.
+    let summary_at = body
+        .find("<summary>Set up ")
+        .expect("the connection's guide is missing");
+    let summary = &body[summary_at..body[summary_at..].find("</summary>").unwrap() + summary_at];
+    assert!(
+        summary.contains("&lt;/td&gt;") || summary.contains("&lt;script&gt;"),
+        "the guide summary did not escape the display name: {summary}"
     );
 }
