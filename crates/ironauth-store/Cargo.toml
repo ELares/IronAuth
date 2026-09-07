@@ -984,6 +984,14 @@ name = "scim_connections"
 path = "tests/scim_connections.rs"
 required-features = ["testing"]
 
+# AN ORGANIZATION'S OPERATIONAL CONTACTS (issue #141). The boundary, the duplicate rule and the
+# survival of a removed row are all properties of the table rather than of any handler, so they
+# are measured against a real database.
+[[test]]
+name = "org_contacts"
+path = "tests/org_contacts.rs"
+required-features = ["testing"]
+
 # THE OUTBOUND IDENTITY MAP (issue #137). Criterion 3's no-duplicates claim rests on this table
 # rather than on the client, so it is measured here.
 [[test]]

@@ -91,7 +91,7 @@ use crate::id::{
     GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
     KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageId,
     MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId, OperatorId,
-    OrgAuthPolicyId, OrgConnectionId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
+    OrgAuthPolicyId, OrgConnectionId, OrgContactId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
     OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
     OutboxMessageId, PermissionId, PortalLinkId, PortalSessionId, PowChallengeId, ProjectGrantId,
     ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
@@ -206,6 +206,19 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_connections(&self) -> ScimConnectionRepo<'a> {
         ScimConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// The people an organization's operational notifications reach (issue #141).
+    ///
+    /// READ side. The notification senders run on the data plane and need to know where to
+    /// deliver; editing who is notified is an operator and portal-admin action, so it goes
+    /// through [`ScopedStore::acting`] and migration 0207 grants `ironauth_app` SELECT only.
+    #[must_use]
+    pub fn org_contacts(&self) -> OrgContactRepo<'a> {
+        OrgContactRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1702,6 +1715,20 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn agent_vault(&self) -> ActingAgentVaultRepo<'a> {
         ActingAgentVaultRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// The WRITE side of an organization's operational contacts (issue #141).
+    ///
+    /// Who a vendor notifies about their customer's outages is an operator and portal-admin
+    /// decision, and a delivery path able to rewrite its own destinations is one nobody can
+    /// audit -- which is why 0207 grants the data plane SELECT only.
+    #[must_use]
+    pub fn org_contacts(&self) -> ActingOrgContactRepo<'a> {
+        ActingOrgContactRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -78655,6 +78682,194 @@ pub struct RotateScimToken<'a> {
     pub now_micros: i64,
 }
 
+/// One person an organization's operational notifications reach (issue #141).
+///
+/// NOTHING SECRET IS IN HERE, which is what makes `Debug` safe: an email address is the delivery
+/// destination an operator manages through the API, not a credential, and the row holds no token,
+/// digest or key.
+#[derive(Debug, Clone)]
+pub struct OrgContact {
+    /// The `oct_` handle every management operation and audit row names.
+    pub id: OrgContactId,
+    /// THE boundary: the one organization whose notifications this person receives.
+    pub organization_id: OrganizationId,
+    /// Who they are, for an operator reading the list.
+    pub display_name: String,
+    /// Where the notification goes.
+    pub email: String,
+    /// Which kind of notification they asked for: `technical`, `security` or `billing`.
+    pub category: String,
+    /// When the contact was added.
+    pub created_at_unix_micros: i64,
+}
+
+/// The people an organization's operational notifications reach, for one scope, read only
+/// (issue #141).
+pub struct OrgContactRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl OrgContactRepo<'_> {
+    /// Every LIVE contact of one organization, oldest first.
+    ///
+    /// LIVE ONLY, because this answers "who do we notify". A removed contact is kept for the
+    /// audit trail -- "who was told about the certificate that then expired" is answerable only
+    /// while the row survives -- and a sender that reached one would be delivering to somebody an
+    /// operator had already taken off the list.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the organization is out of this scope;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+        limit: i64,
+    ) -> Result<Vec<OrgContact>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT id, organization_id, display_name, email, category, \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us \
+             FROM org_contacts \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND deleted_at IS NULL \
+             ORDER BY created_at, id LIMIT $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let stored_id: String = row.get("id");
+                Ok(OrgContact {
+                    id: OrgContactId::parse_in_scope(&stored_id, &self.scope)
+                        .map_err(|_| StoreError::NotFound)?,
+                    organization_id: OrganizationId::parse_in_scope(
+                        &row.get::<String, _>("organization_id"),
+                        &self.scope,
+                    )
+                    .map_err(|_| StoreError::NotFound)?,
+                    display_name: row.get("display_name"),
+                    email: row.get("email"),
+                    category: row.get("category"),
+                    created_at_unix_micros: row.get("created_us"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The WRITE side of an organization's contacts, for this scope and actor (issue #141).
+pub struct ActingOrgContactRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingOrgContactRepo<'_> {
+    /// Add a contact.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id or organization is out of this scope;
+    /// [`StoreError::Conflict`] if this organization already lists that address on that
+    /// category; [`StoreError::Database`] on a persistence failure.
+    pub async fn add(&self, env: &Env, contact: NewOrgContact<'_>) -> Result<(), StoreError> {
+        if contact.id.scope() != self.scope || contact.organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let outcome = sqlx::query(
+            "INSERT INTO org_contacts \
+             (id, tenant_id, environment_id, organization_id, display_name, email, category) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(contact.id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .bind(contact.organization_id.to_string())
+        .bind(contact.display_name)
+        .bind(contact.email)
+        .bind(contact.category)
+        .execute(&mut *tx)
+        .await;
+        match outcome {
+            Ok(_) => {}
+            // THE PARTIAL UNIQUE INDEX, which is a duplicate rather than a malformed request: the
+            // same person is already on this category and a second row would send them the same
+            // notification twice.
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                return Err(StoreError::Conflict);
+            }
+            Err(error) => return Err(StoreError::from(error)),
+        }
+        let _ = (env, &self.acting);
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a contact, keeping the row.
+    ///
+    /// Returns whether a live contact was removed, so a caller can tell a removal from a
+    /// repeat.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the id is out of this scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn remove(
+        &self,
+        env: &Env,
+        id: &OrgContactId,
+        now_micros: i64,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let changed = sqlx::query(
+            "UPDATE org_contacts \
+             SET deleted_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond'), \
+                 updated_at = TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 microsecond') \
+             WHERE id = $2 AND tenant_id = $3 AND environment_id = $4 AND deleted_at IS NULL \
+             RETURNING id",
+        )
+        .bind(now_micros)
+        .bind(id.to_string())
+        .bind(scope.tenant().to_string())
+        .bind(scope.environment().to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let _ = (env, &self.acting);
+        tx.commit().await?;
+        Ok(changed.is_some())
+    }
+}
+
+/// A contact to add (issue #141).
+pub struct NewOrgContact<'a> {
+    /// The `oct_` handle, minted by the caller.
+    pub id: &'a OrgContactId,
+    /// The one organization whose notifications this person receives.
+    pub organization_id: &'a OrganizationId,
+    /// Who they are.
+    pub display_name: &'a str,
+    /// Where the notification goes.
+    pub email: &'a str,
+    /// Which kind they asked for.
+    pub category: &'a str,
+}
+
 /// The inbound SCIM connections for one scope (issue #135).
 ///
 /// READ ONLY WITH ONE EXCEPTION, and the exception is deliberate: [`Self::authenticate`] records
@@ -79009,49 +79224,59 @@ impl ScimConnectionRepo<'_> {
         .await?;
         tx.commit().await?;
         rows.into_iter()
-            .map(|row| {
-                let stored_id: String = row.get("id");
-                Ok(ScimConnection {
-                    id: ScimConnectionId::parse_in_scope(&stored_id, &self.scope)
-                        .map_err(|_| StoreError::NotFound)?,
-                    organization_id: OrganizationId::parse_in_scope(
-                        &row.get::<String, _>("organization_id"),
-                        &self.scope,
-                    )
-                    .map_err(|_| StoreError::NotFound)?,
-                    display_name: row.get("display_name"),
-                    provider: row.get("provider"),
-                    expires_at_unix_micros: row.get("expires_us"),
-                    revoked_at_unix_micros: row.get("revoked_us"),
-                    revoked: row.get("revoked"),
-                    credential_expires_at_unix_micros: {
-                        // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
-                        // one. The connection's own expiry is folded into this column, so a
-                        // connection whose tokens have all lapsed or been revoked -- and one
-                        // whose organization was disabled -- would otherwise publish the date
-                        // provisioning WILL stop while `live_token_count` beside it says it
-                        // already has. Two fields derived from one row and contradicting each
-                        // other is the defect this listing has now produced twice.
-                        if live_token_count(&row) == 0 {
-                            None
-                        } else {
-                            row.get("credential_expires_us")
-                        }
-                    },
-                    live_token_count: live_token_count(&row),
-                    created_at_unix_micros: row.get("created_us"),
-                    last_seen_at_unix_micros: row.get("last_seen_us"),
-                    // NULL when the connection has no UNREVOKED token row: the fallback
-                    // population, which authenticates through `scim_connections.token_digest` and
-                    // has nothing here to stamp, and a connection whose tokens are all revoked.
-                    // `None` says "not a question this connection can answer", which is different
-                    // from `Some(false)`, "there is a newest credential and nothing has used it".
-                    newest_token_used: row.get("newest_token_used"),
-                    usage_history_complete: row.get("usage_history_complete"),
-                })
-            })
+            .map(|row| hydrate_connection(&row, self.scope))
             .collect()
     }
+}
+
+/// One listed connection, built from its row.
+///
+/// Split out of `list_for_organization` because it is a different concern from the query: the
+/// statement decides WHICH connections and computes their columns, and this decides what each
+/// column means -- which is where the derived signals and their reasoning live.
+fn hydrate_connection(
+    row: &sqlx::postgres::PgRow,
+    scope: Scope,
+) -> Result<ScimConnection, StoreError> {
+    let stored_id: String = row.get("id");
+    Ok(ScimConnection {
+        id: ScimConnectionId::parse_in_scope(&stored_id, &scope)
+            .map_err(|_| StoreError::NotFound)?,
+        organization_id: OrganizationId::parse_in_scope(
+            &row.get::<String, _>("organization_id"),
+            &scope,
+        )
+        .map_err(|_| StoreError::NotFound)?,
+        display_name: row.get("display_name"),
+        provider: row.get("provider"),
+        expires_at_unix_micros: row.get("expires_us"),
+        revoked_at_unix_micros: row.get("revoked_us"),
+        revoked: row.get("revoked"),
+        credential_expires_at_unix_micros: {
+            // A CONNECTION WITH NOTHING LIVE HAS NO FUTURE DEADLINE, it has a past
+            // one. The connection's own expiry is folded into this column, so a
+            // connection whose tokens have all lapsed or been revoked -- and one
+            // whose organization was disabled -- would otherwise publish the date
+            // provisioning WILL stop while `live_token_count` beside it says it
+            // already has. Two fields derived from one row and contradicting each
+            // other is the defect this listing has now produced twice.
+            if live_token_count(row) == 0 {
+                None
+            } else {
+                row.get("credential_expires_us")
+            }
+        },
+        live_token_count: live_token_count(row),
+        created_at_unix_micros: row.get("created_us"),
+        last_seen_at_unix_micros: row.get("last_seen_us"),
+        // NULL when the connection has no UNREVOKED token row: the fallback
+        // population, which authenticates through `scim_connections.token_digest` and
+        // has nothing here to stamp, and a connection whose tokens are all revoked.
+        // `None` says "not a question this connection can answer", which is different
+        // from `Some(false)`, "there is a newest credential and nothing has used it".
+        newest_token_used: row.get("newest_token_used"),
+        usage_history_complete: row.get("usage_history_complete"),
+    })
 }
 
 /// How many credentials of one listed connection would actually authenticate.
