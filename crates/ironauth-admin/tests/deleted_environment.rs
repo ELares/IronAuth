@@ -433,6 +433,41 @@ impl Fixture {
     }
 
     /// Seed one environment with the entities above AND the relations between them.
+    /// The inbound SCIM connection this sweep addresses.
+    ///
+    /// Split out for the same reason as [`Self::seed_contact`]: `seed` sits against a hundred-line
+    /// ceiling, so each self-contained block it grows moves out rather than pushing it over.
+    async fn seed_scim_connection(h: &Harness, base: &str, key: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/scim-connections"),
+            &format!("{key}-sc"),
+            &serde_json::json!({ "display_name": "Seeded Okta", "provider": "okta" }).to_string(),
+            "scim connection",
+        )
+        .await
+    }
+
+    /// The organization contact this sweep removes (issue #141).
+    ///
+    /// SPLIT OUT OF `seed` because appending it pushed that function past the crate's hundred-line
+    /// ceiling -- which `cargo test` does not see and clippy does.
+    async fn seed_contact(h: &Harness, base: &str, key: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/contacts"),
+            &format!("{key}-oct"),
+            &serde_json::json!({
+                "display_name": "Seeded Contact",
+                "email": "seeded@acme.example",
+                "category": "technical",
+            })
+            .to_string(),
+            "organization contact",
+        )
+        .await
+    }
+
     async fn seed(h: &Harness, tenant: &str, environment: &str, key: &str) -> Self {
         let env_base = format!("/v1/tenants/{tenant}/environments/{environment}");
         let [user, other_user, spare_user, permission, spare_permission] =
@@ -502,28 +537,9 @@ impl Fixture {
         let (agent, approval) = Self::seed_agent(h, tenant, environment, &base, &user, key).await;
         let member_user = user.clone();
 
-        let contact = seed_row(
-            h,
-            &format!("{base}/contacts"),
-            &format!("{key}-oct"),
-            &serde_json::json!({
-                "display_name": "Seeded Contact",
-                "email": "seeded@acme.example",
-                "category": "technical",
-            })
-            .to_string(),
-            "organization contact",
-        )
-        .await;
+        let contact = Self::seed_contact(h, &base, key).await;
 
-        let scim_connection = seed_row(
-            h,
-            &format!("{base}/scim-connections"),
-            &format!("{key}-sc"),
-            &serde_json::json!({ "display_name": "Seeded Okta", "provider": "okta" }).to_string(),
-            "scim connection",
-        )
-        .await;
+        let scim_connection = Self::seed_scim_connection(h, &base, key).await;
 
         let scim_push_connection = Self::seed_scim_push_connection(h, &base, key).await;
         let scim_push_resource =
@@ -1540,6 +1556,23 @@ impl Fixture {
     }
 
     /// The WRITES that destroy, each undoing one of the amendments above.
+    /// The contact removal, chained rather than appended.
+    ///
+    /// APPENDING A CASE TO A LIST ALREADY AT THE CEILING is what pushed this function over the
+    /// hundred-line limit, and `cargo test` does not see that -- only clippy does. A new family
+    /// gets its own function and is chained in.
+    fn contact_destructive_cases(&self) -> Vec<Case> {
+        let Self { base, contact, .. } = self;
+        vec![Case {
+            label: "org_contacts.deleteOrganizationContact",
+            method: "DELETE",
+            path: format!("{base}/contacts/{contact}"),
+            body: None,
+            intent: Intent::Write,
+            live: StatusCode::NO_CONTENT,
+        }]
+    }
+
     fn destructive_write_cases(&self) -> Vec<Case> {
         let Self {
             base,
@@ -1549,10 +1582,15 @@ impl Fixture {
             membership,
             permission,
             grant,
-            contact,
             ..
         } = self;
-        vec![
+        // THE CONTACT REMOVAL COMES FIRST, and the order is load-bearing: these cases run in
+        // sequence and the last of them removes the parent every other case addresses, so a
+        // contact case chained at the END finds its organization already gone and answers 404
+        // where its pinned answer is 204. Splitting a case out of a list like this moves it in
+        // the sequence unless you say where it goes.
+        let mut cases = self.contact_destructive_cases();
+        cases.extend(vec![
             // --- The WRITES that destroy, each undoing one of the amendments above.
             Case {
                 label: "project_grants.withdrawProjectGrant",
@@ -1619,14 +1657,6 @@ impl Fixture {
                 live: StatusCode::NO_CONTENT,
             },
             Case {
-                label: "org_contacts.deleteOrganizationContact",
-                method: "DELETE",
-                path: format!("{base}/contacts/{contact}"),
-                body: None,
-                intent: Intent::Write,
-                live: StatusCode::NO_CONTENT,
-            },
-            Case {
                 label: "org_groups.deleteOrgGroup",
                 method: "DELETE",
                 path: format!("{base}/groups/{child_group}"),
@@ -1643,7 +1673,8 @@ impl Fixture {
                 intent: Intent::Write,
                 live: StatusCode::NO_CONTENT,
             },
-        ]
+        ]);
+        cases
     }
 }
 

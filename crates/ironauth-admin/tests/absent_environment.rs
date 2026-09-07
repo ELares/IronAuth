@@ -1221,6 +1221,36 @@ fn user_cases(base: &str, ids: &Ids) -> Vec<Case> {
 /// The organization and GROUP writes. Every one of them resolves the parent
 /// organization first, and `organizations` carries the same foreign key to
 /// `environments`, so none of them can reach a constraint in an absent environment.
+/// The organization CONTACT writes (issue #141), chained rather than appended.
+///
+/// APPENDING TO A LIST ALREADY AT THE CEILING is what pushed `organization_cases` past the
+/// hundred-line limit, which `cargo test` does not see and clippy does. A new family gets its own
+/// function.
+fn organization_contact_cases(base: &str, ids: &Ids) -> Vec<Case> {
+    let Ids { org, .. } = ids;
+    vec![
+        Case {
+            label: "org_contacts.createOrganizationContact",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/contacts"),
+            body: Some(
+                serde_json::json!({
+                    "display_name": "Sweep Contact",
+                    "email": "sweep@acme.example",
+                    "category": "technical",
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "org_contacts.deleteOrganizationContact",
+            method: "DELETE",
+            path: format!("{base}/organizations/{org}/contacts/oct_absent"),
+            body: None,
+        },
+    ]
+}
+
 fn organization_cases(base: &str, ids: &Ids) -> Vec<Case> {
     let Ids {
         org,
@@ -1267,18 +1297,6 @@ fn organization_cases(base: &str, ids: &Ids) -> Vec<Case> {
             label: "org_roles.clearOrgDefaultRole",
             method: "DELETE",
             path: format!("{base}/organizations/{org}/default-role"),
-            body: None,
-        },
-        Case {
-            label: "org_contacts.createOrganizationContact",
-            method: "POST",
-            path: format!("{base}/organizations/{org}/contacts"),
-            body: Some(serde_json::json!({ "display_name": "Sweep Contact", "email": "sweep@acme.example", "category": "technical" }).to_string()),
-        },
-        Case {
-            label: "org_contacts.deleteOrganizationContact",
-            method: "DELETE",
-            path: format!("{base}/organizations/{org}/contacts/oct_absent"),
             body: None,
         },
         Case {
@@ -1692,6 +1710,7 @@ fn all_cases(tenant: &str, environment: &str) -> Vec<Case> {
     cases.extend(resource_cases(&base, &ids));
     cases.extend(user_cases(&base, &ids));
     cases.extend(organization_cases(&base, &ids));
+    cases.extend(organization_contact_cases(&base, &ids));
     cases.extend(org_membership_cases(&base, &ids));
     cases.extend(personal_access_token_cases(&base));
     cases.extend(impersonation_cases(&base));

@@ -76932,11 +76932,20 @@ impl SamlCertificateAlertRepo<'_> {
     /// pairing a certificate with the wrong one tells a customer about another customer's
     /// identity provider and no tenant fence notices.
     ///
-    /// The scope columns in the join condition are BELT AND BRACES, not the thing that makes it
-    /// safe: `saml_connections` is under forced row-level security and this runs inside
-    /// `begin_scoped`, so the policy already confines the join to this scope and an id-only
-    /// condition would return the same rows. They are written out because the id-only form reads
-    /// as if scope were nobody's job, and this module has shipped that mistake before.
+    /// THE JOIN IS INNER, AND THAT IS THE ONLY THING IT CHANGES. Measured against a replica of
+    /// 0196/0197/0208: under forced row-level security an id-only join resolves a foreign
+    /// connection to ZERO rows rather than to a foreign row, so the misroute an earlier version
+    /// of this paragraph warned about is not a state the query can reach, and the scope columns
+    /// in the condition change no result. What the join DOES change is that a certificate whose
+    /// connection is not visible in this scope stops producing a work item at all -- silently,
+    /// with no row and no error.
+    ///
+    /// THAT SILENT DROP IS THE RIGHT ANSWER AND STILL WORTH NAMING. Such a certificate has no
+    /// organization to notify, so there is nothing a work item could do with it. It is also not
+    /// reachable today: `pin_certificate` refuses a cross-scope connection with its own
+    /// `WHERE EXISTS`, and it is the only insert into that table. The schema alone would allow
+    /// the row -- 0197's foreign key names the connection by id and referential integrity
+    /// bypasses row security -- so what keeps it out is the repository, as 0205 says.
     ///
     /// # A repeated lead is one lead
     ///
