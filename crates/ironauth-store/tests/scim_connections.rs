@@ -594,6 +594,7 @@ async fn the_control_role_may_revoke_and_may_change_nothing_else() {
     // requires the result to be revoked, so an update that TOUCHES a live row without
     // revoking it is refused by the WITH CHECK half alone. A reviewer weakened that half to
     // `true` and the whole suite stayed green; this is the statement that notices.
+
     let live = connect(&db, &env, scope, &org, "scim_tok_touch").await;
     let outcome = as_control(
         &db,
@@ -1985,13 +1986,25 @@ async fn the_token_tables_grants_and_one_way_policy_are_enforced() {
         "a revoked token was un-revoked, so the one-way policy admits the row it must hide"
     );
 
-    // AND THE DATA PLANE MAY NOT WRITE AT ALL. A provisioning credential that could mint another
-    // would be a privilege escalation with no operator in the loop.
+    // AND THE DATA PLANE MAY NOT MINT, REVOKE OR DELETE. A provisioning credential that could
+    // mint another would be a privilege escalation with no operator in the loop.
+    //
+    // IT MAY WRITE EXACTLY ONE COLUMN, `last_seen_at`, granted by migration 0206 so the
+    // authentication path can record that a token was used (issue #140). An earlier version of
+    // this comment said "may not write at all", which 0206 made false; the property that still
+    // holds, and that these three statements assert, is that nothing it can write decides whether
+    // a credential works. `the_data_plane_writes_exactly_one_column_of_scim_connection_tokens` in
+    // the migration suite pins the writable set, and the fourth statement below is the one that
+    // proves the grant is column-scoped rather than absent.
     for statement in [
         "INSERT INTO scim_connection_tokens (token_digest, connection_id, tenant_id, \
          environment_id) VALUES (repeat('a', 64), 'scim_x', 'ten_x', 'env_x')",
         "UPDATE scim_connection_tokens SET revoked_at = now()",
         "DELETE FROM scim_connection_tokens",
+        // THE NEIGHBOURING COLUMN, which decides how long a credential lasts. The grant names
+        // `last_seen_at` and nothing else, so this is refused while the stamp below succeeds --
+        // which is what makes the grant column-scoped rather than a table-wide write.
+        "UPDATE scim_connection_tokens SET expires_at = now() + INTERVAL '1 year'",
     ] {
         let outcome = as_app(&db, scope, statement).await;
         let error = outcome.expect_err("the data plane must not write to this table");
@@ -2000,6 +2013,21 @@ async fn the_token_tables_grants_and_one_way_policy_are_enforced() {
             "the app role is refused by the grant rather than by something else: {error}"
         );
     }
+
+    // AND THE ONE COLUMN IT MAY WRITE, IT CAN. Without this the four refusals above would pass
+    // equally against a role holding no UPDATE on this table at all, and the stamp the whole
+    // last-seen feature depends on would be refused in production with nothing here noticing.
+    let stamped = as_app(
+        &db,
+        scope,
+        "UPDATE scim_connection_tokens SET last_seen_at = now()",
+    )
+    .await
+    .expect("the data plane must be able to record that a token was used");
+    assert!(
+        stamped > 0,
+        "the stamp touched no rows, so this asserts nothing about the grant"
+    );
 }
 
 #[tokio::test]
@@ -2665,4 +2693,527 @@ async fn a_rotation_in_progress_publishes_the_cutover_deadline() {
     let after = listed(&db, scope, &organization, &id, at + 3601 * 1_000_000).await;
     assert_eq!(after.live_token_count, 1);
     assert_eq!(after.credential_expires_at_unix_micros, None);
+}
+
+/// Using a token stamps it, and using it again inside the throttle window does not rewrite it.
+///
+/// # Both halves matter and they pull against each other
+///
+/// Without the stamp the portal cannot tell a connection nobody has ever called from one
+/// provisioning happily, which is what a token pasted into the wrong field looks like. Without
+/// the throttle every provisioning request in the deployment writes a row on a shared table --
+/// a point read turned into a read plus an update, on the hottest path this crate has.
+#[tokio::test]
+async fn using_a_token_stamps_it_once_per_window() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "seen-1").await;
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+
+    // BEFORE ANY REQUEST it has never been seen, which is the state a failed setup sits in.
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .last_seen_at_unix_micros,
+        None,
+        "a connection nobody has called reports a last-seen time"
+    );
+
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("seen-1"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .last_seen_at_unix_micros,
+        Some(at),
+        "the request that authenticated left no trace, so the portal cannot tell this \
+         connection from one nobody has ever called"
+    );
+
+    // INSIDE THE WINDOW the stamp does not move: this is the write the throttle exists to skip,
+    // and asserting the value is UNCHANGED is what distinguishes a throttle from an update that
+    // happens to be idempotent.
+    let soon = at + 30 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("seen-1"), soon)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, soon)
+            .await
+            .last_seen_at_unix_micros,
+        Some(at),
+        "a request thirty seconds later rewrote the stamp, so a busy provisioning run writes a \
+         row per request on a table the whole deployment shares"
+    );
+
+    // PAST THE WINDOW it moves again, or the stamp would freeze at the first request ever made
+    // and stop answering the question it exists for.
+    let later = at + 61 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("seen-1"), later)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, later)
+            .await
+            .last_seen_at_unix_micros,
+        Some(later),
+        "the stamp never moved past the first request, so a connection last used months ago \
+         reads as one used just now"
+    );
+}
+
+/// A REFUSED request stamps nothing.
+///
+/// # Otherwise the field answers the wrong question
+///
+/// "Last seen" has to mean a credential that WORKED. A revoked or lapsed token being presented
+/// is exactly the state an admin is trying to diagnose -- their identity provider is calling and
+/// being turned away -- and a stamp that moved for it would report the connection as healthy at
+/// the moment it is failing.
+#[tokio::test]
+async fn a_refused_request_stamps_nothing() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "refused-1").await;
+
+    let at = now_micros(&env);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke(&env, &id, at)
+        .await
+        .expect("revoke");
+
+    let after = at + 1;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("refused-1"), after)
+            .await
+            .expect("authenticate")
+            .is_none(),
+        "the premise: the revoked connection refuses the request"
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, after)
+            .await
+            .last_seen_at_unix_micros,
+        None,
+        "a REFUSED request stamped the token, so a connection being turned away reports itself \
+         as recently used -- at the exact moment an admin is trying to work out why nothing is \
+         provisioning"
+    );
+}
+
+/// After a rotation the listing says whether the NEW token has been used yet.
+///
+/// # The question the timestamp cannot answer
+///
+/// During an overlap both tokens work, so `last_seen_at` keeps moving on the old one and the
+/// connection looks healthy right up to the moment the overlap ends and provisioning stops. What
+/// predicts that outage is whether the credential the customer was asked to paste has been used.
+#[tokio::test]
+async fn the_listing_says_whether_the_new_token_has_been_used() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "cut-1").await;
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("cut-1"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .newest_token_used,
+        Some(true),
+        "the control: before any rotation the only token IS the newest, and it has been used"
+    );
+
+    rotate(&db, &env, scope, &id, "cut-2", 3600, at)
+        .await
+        .expect("rotate");
+
+    // THE CUSTOMER KEEPS USING THE OLD TOKEN, which is what the overlap is for and also what
+    // makes this state dangerous: everything else about the connection looks fine.
+    let during = at + 120 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("cut-1"), during)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    let mid = listed(&db, scope, &organization, &id, during).await;
+    assert_eq!(
+        mid.last_seen_at_unix_micros,
+        Some(during),
+        "the connection is plainly in use, which is the appearance that hides the problem"
+    );
+    assert_eq!(
+        mid.newest_token_used,
+        Some(false),
+        "the listing cannot tell that the token the customer was asked to paste has never been \
+         used, so nothing warns before the overlap ends and provisioning stops"
+    );
+
+    // ONCE THEY PASTE IT, the cutover is done and the listing says so.
+    let after = during + 61 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("cut-2"), after)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    assert_eq!(
+        listed(&db, scope, &organization, &id, after)
+            .await
+            .newest_token_used,
+        Some(true),
+        "the fresh token authenticated and the listing still reports the cutover as pending"
+    );
+}
+
+/// A legacy rotation makes the adopted token unambiguously older than the minted one.
+///
+/// # The coin flip this replaced
+///
+/// `rotate_token` adopts the legacy credential and mints the replacement in ONE transaction, and
+/// `now()` returns one value for a whole transaction -- so both rows used to take the same
+/// `created_at` and "which token is newest" was decided by comparing two unrelated SHA-256 hex
+/// strings. It failed in both directions on roughly half of legacy rotations: an old token that
+/// won the comparison reported a cutover complete that had never started, and a new token that
+/// lost it reported one pending forever after it finished.
+///
+/// THE FIXTURE PINS THE DIGEST ORDERING so the test is not itself a coin flip: the legacy digest
+/// sorts ABOVE the minted one, which is the half that used to pick the wrong row.
+#[tokio::test]
+async fn a_legacy_rotation_orders_the_adopted_token_before_the_minted_one() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+
+    // TWO DIGESTS WHOSE HEX ORDERING IS KNOWN. `digest()` hashes, so the ordering is a property
+    // of the hash rather than of the label; these are chosen by measuring, and the assertion
+    // below states which way round they must be for this fixture to drive the tie-break.
+    let mut legacy = "tie-legacy";
+    let mut minted = "tie-minted";
+    if digest(legacy) < digest(minted) {
+        std::mem::swap(&mut legacy, &mut minted);
+    }
+    assert!(
+        digest(legacy) > digest(minted),
+        "the fixture needs the legacy digest to sort ABOVE the minted one, which is the half a \
+         digest tie-break used to get wrong"
+    );
+
+    let id = connect(&db, &env, scope, &organization, legacy).await;
+    // MAKE IT A FALLBACK CONNECTION: no token rows, so the rotation adopts. This is the
+    // population created by an un-upgraded replica after migration 0205 ran.
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &id, minted, 3600, at)
+        .await
+        .expect("rotate");
+
+    // THE CUSTOMER KEEPS USING THE OLD CREDENTIAL through the overlap, which is what the overlap
+    // is for -- and is the state where the cutover warning has to fire.
+    let during = at + 1;
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest(legacy), during)
+            .await
+            .expect("authenticate")
+            .is_some(),
+        "the adopted legacy token stopped working inside its own overlap"
+    );
+
+    let listed = listed(&db, scope, &organization, &id, during).await;
+    assert_eq!(
+        listed.newest_token_used,
+        Some(false),
+        "the adopted OLD token was picked as the newest, so a connection whose customer has \
+         never presented the replacement reports its cutover as complete and nothing warns \
+         before the overlap ends"
+    );
+}
+
+/// The listing reports the MOST RECENT use across a connection's tokens, not the oldest.
+///
+/// # Why min and max are otherwise indistinguishable here
+///
+/// Every other fixture stamps exactly one token, and one row makes `min` and `max` the same
+/// answer. Two tokens used at different times is the only shape that separates them -- and the
+/// wrong one would report a connection in daily use as last seen whenever its oldest credential
+/// happened to be presented.
+#[tokio::test]
+async fn the_listing_reports_the_most_recent_use_not_the_oldest() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "recent-1").await;
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &id, "recent-2", 3600, at)
+        .await
+        .expect("rotate");
+
+    let read = db.store().scoped(scope);
+    // THE OLD TOKEN FIRST, then the new one much later, so the two stamps are far apart and the
+    // aggregate has to choose.
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("recent-1"), at + 1)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    let later = at + 600 * 1_000_000;
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("recent-2"), later)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+
+    assert_eq!(
+        listed(&db, scope, &organization, &id, later)
+            .await
+            .last_seen_at_unix_micros,
+        Some(later),
+        "the listing reported the OLDEST use rather than the most recent, so a connection \
+         provisioning right now reads as last seen ten minutes ago"
+    );
+}
+
+/// A token row that predates observation is not reported as never used.
+///
+/// # The installed base, on upgrade day
+///
+/// Migration 0206 added the observation column, so every token row that already existed -- the
+/// whole installed base, including every row 0205 backfilled -- has a NULL `last_seen_at` that
+/// means "nobody was watching". Reading it as "never used" would tell every customer of every
+/// upgraded deployment that their working connection has never been called.
+#[tokio::test]
+async fn a_row_that_predates_observation_is_not_called_never_used() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "pre-obs").await;
+
+    let at = now_micros(&env);
+    // A ROW CREATED AFTER OBSERVATION BEGAN is knowably unused, which is the control: without it
+    // the assertion below would pass against a listing that never claims completeness at all.
+    assert!(
+        listed(&db, scope, &organization, &id, at)
+            .await
+            .usage_history_complete,
+        "a connection created after the migration must be knowably unused"
+    );
+
+    // NOW MAKE IT LOOK LIKE A ROW THAT PREDATES THE COLUMN, which is what every existing row got:
+    // observed_since stamped at migration time, later than the row's own created_at.
+    sqlx::query(
+        "UPDATE scim_connection_tokens SET observed_since = created_at + INTERVAL '1 hour' \
+         WHERE connection_id = $1",
+    )
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("age the observation window");
+
+    let listed = listed(&db, scope, &organization, &id, at).await;
+    assert!(
+        !listed.usage_history_complete,
+        "a token row that existed before anything watched it is reported as knowably unused, so \
+         the whole installed base reads as never called on upgrade day"
+    );
+    assert_eq!(
+        listed.last_seen_at_unix_micros, None,
+        "the premise: there is no stamp, which is exactly why the distinction matters"
+    );
+}
+
+/// Rotating a connection whose history is unwatched does not make it knowably unused.
+///
+/// # The state the previous round's fix routed around
+///
+/// A connection with no token rows correctly reported "not recorded". Rotating it adopts the
+/// legacy credential and mints a replacement -- and both rows start unstamped, so a listing that
+/// keyed only on "are there rows" flipped straight to "never used" about a connection that had
+/// been provisioning for months. The adopted row's unwatched earlier life is what says otherwise.
+#[tokio::test]
+async fn adopting_a_legacy_credential_does_not_claim_it_was_never_used() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "adopt-obs").await;
+    sqlx::query("DELETE FROM scim_connection_tokens WHERE connection_id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("simulate an old binary's create");
+
+    let at = now_micros(&env);
+    rotate(&db, &env, scope, &id, "adopt-obs-2", 3600, at)
+        .await
+        .expect("rotate");
+
+    let listed = listed(&db, scope, &organization, &id, at + 1).await;
+    assert_eq!(
+        listed.last_seen_at_unix_micros, None,
+        "the premise: neither row has been stamped yet"
+    );
+    assert!(
+        !listed.usage_history_complete,
+        "a connection that just adopted a credential with an unwatched history is reported as \
+         knowably unused, so the page tells an admin their working connection has never been \
+         called at the exact moment they rotated it"
+    );
+}
+
+/// An unwatched connection that HAS been seen reports the date, not "not recorded".
+///
+/// # The state the observation column must not swallow
+///
+/// `usage_history_complete` is false for a row nobody watched from the start, and the page uses
+/// it to refuse the claim "never used". It must not refuse a claim the stamp itself supports: a
+/// pre-existing connection whose token is used after the upgrade has a real timestamp, and the
+/// page has to prefer it. Without this fixture the two branches could be ordered the other way
+/// round and every other test would pass -- "Not recorded" would swallow a date the deployment
+/// genuinely observed.
+#[tokio::test]
+async fn an_unwatched_connection_that_has_been_seen_reports_the_date() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "seen-unwatched").await;
+
+    // AGE THE OBSERVATION WINDOW, which is what every row that predates migration 0206 looks
+    // like: watched only from some point after it was created.
+    sqlx::query("UPDATE scim_connection_tokens SET observed_since = NULL WHERE connection_id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("unset the observation window");
+
+    let at = now_micros(&env);
+    assert!(
+        db.store()
+            .scoped(scope)
+            .scim_connections()
+            .authenticate(&digest("seen-unwatched"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+
+    let listed = listed(&db, scope, &organization, &id, at).await;
+    assert!(
+        !listed.usage_history_complete,
+        "the premise: this connection's history is not fully watched"
+    );
+    assert_eq!(
+        listed.last_seen_at_unix_micros,
+        Some(at),
+        "a request served and recorded after the upgrade left no timestamp, so the page would \
+         report 'not recorded' about a use the deployment actually observed"
+    );
+}
+
+/// The newest-token question ignores revoked tokens.
+///
+/// # Why the filter is not cosmetic
+///
+/// Revoking the token a customer was asked to paste is how an operator withdraws a botched
+/// rotation. Without the filter the listing keeps pointing at that dead credential and reports
+/// the cutover as pending forever, while the credential that is actually current -- the one the
+/// customer never stopped using -- is ignored.
+#[tokio::test]
+async fn the_newest_token_question_ignores_revoked_tokens() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let organization = seed_org(&db, &env, scope, "Globex").await;
+    let id = connect(&db, &env, scope, &organization, "withdraw-1").await;
+
+    let at = now_micros(&env);
+    let read = db.store().scoped(scope);
+    assert!(
+        read.scim_connections()
+            .authenticate(&digest("withdraw-1"), at)
+            .await
+            .expect("authenticate")
+            .is_some()
+    );
+    rotate(&db, &env, scope, &id, "withdraw-2", 3600, at)
+        .await
+        .expect("rotate");
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at + 1)
+            .await
+            .newest_token_used,
+        Some(false),
+        "the control: while the fresh token stands, the cutover is pending"
+    );
+
+    // THE OPERATOR WITHDRAWS THE BOTCHED ROTATION by revoking the token nobody pasted.
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .scim_connections()
+        .revoke_token(&env, &id, &digest("withdraw-2"), at + 2)
+        .await
+        .expect("revoke the fresh token");
+
+    assert_eq!(
+        listed(&db, scope, &organization, &id, at + 3)
+            .await
+            .newest_token_used,
+        Some(true),
+        "a revoked token is still treated as the one to cut over to, so the listing reports a \
+         pending cutover to a credential the operator has withdrawn"
+    );
 }

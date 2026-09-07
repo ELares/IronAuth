@@ -527,18 +527,61 @@ fn connection_rows<'a>(
         } else {
             "Active".to_owned()
         };
+        // WHAT HAS ACTUALLY HAPPENED, beside what is configured. A connection can be healthy in
+        // every other column and have never received a request -- which is what pasting a token
+        // into the wrong field looks like, and there is nothing else on this page that would
+        // tell an admin so.
+        let activity = if connection.revoked {
+            // Nothing to act on: the operator switched this off, and a last-used time would only
+            // invite the reader to wonder whether it is still working.
+            String::new()
+        } else if let Some(seen) = connection.last_seen_at_unix_micros {
+            // IT HAS BEEN USED AT LEAST ONCE, so the question becomes WHICH credential. A newest
+            // token nobody has presented means a rotation the customer has not finished: the
+            // connection is plainly in use on the OLD one, and "last request two minutes ago"
+            // would report exactly the health that ends when the overlap does.
+            if connection.newest_token_used == Some(false) {
+                "New token not used yet".to_owned()
+            } else {
+                format!(
+                    "Last request {}",
+                    crate::saml_start::rfc3339_utc(seen / 1_000_000)
+                )
+            }
+        } else if connection.usage_history_complete {
+            // EVERY CREDENTIAL HAS BEEN WATCHED SINCE IT EXISTED, so an absent stamp means what it
+            // looks like: nothing has ever presented one. That is the diagnosis this column exists
+            // for -- a token pasted into the wrong field, or the right field of the wrong
+            // application -- and it is only assertable here.
+            "No requests yet".to_owned()
+        } else {
+            // NOT OBSERVED, WHICH IS NOT THE SAME AS NOT USED, and the page must not collapse them.
+            // Three populations land here: a connection with no token rows, which authenticates
+            // through the fallback on `scim_connections.token_digest` and leaves nothing to stamp;
+            // a connection whose rows predate migration 0206, which is the entire installed base
+            // on upgrade day; and one that has just adopted a legacy credential by rotation, whose
+            // earlier life went unwatched.
+            //
+            // ALL THREE MAY BE PROVISIONING RIGHT NOW. Saying "no requests yet" about them reports
+            // a working connection as dead, and the admin's remedy would be to reconfigure
+            // something already correct. An earlier version of this page said exactly that to the
+            // whole installed base, and then -- after that was fixed for connections with no rows
+            // at all -- said it again to any of them the moment a rotation gave them one.
+            "Not recorded".to_owned()
+        };
         let _ = write!(
             rows,
-            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td></tr>",
+            "<tr><td>{name}</td><td>{provider}</td><td>{status}</td><td>{activity}</td></tr>",
             name = escape_html(&connection.display_name),
             provider = escape_html(&connection.provider),
             status = escape_html(&status),
+            activity = escape_html(&activity),
         );
     }
     // NO ROW WAS WRITTEN, which is the same fact as an empty listing and is one this function
     // can see for itself rather than taking on trust from its caller.
     if rows.is_empty() {
-        rows.push_str("<tr><td colspan=\"3\">No provisioning connections yet.</td></tr>");
+        rows.push_str("<tr><td colspan=\"4\">No provisioning connections yet.</td></tr>");
     }
     rows
 }
@@ -643,10 +686,11 @@ fn setup_guides(
 /// # It reads and does not write
 ///
 /// Rotation is not offered, and its absence is deliberate rather than unfinished: this plane
-/// authenticates as the data-plane role, which holds `SELECT` and nothing else on both SCIM
-/// tables. Migration 0205 argues the case -- a provisioning credential that could mint another
-/// provisioning credential is an escalation with no operator in the loop -- so offering rotation
-/// from here is a grant decision, not a page.
+/// authenticates as the data-plane role, which on the two SCIM tables holds `SELECT` plus exactly
+/// one column-scoped write, `scim_connection_tokens.last_seen_at` (migration 0206), and nothing
+/// that could mint or extend a credential. Migration 0205 argues the case -- a provisioning
+/// credential that could mint another provisioning credential is an escalation with no operator
+/// in the loop -- so offering rotation from here is a grant decision, not a page.
 async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     let now = epoch_micros(state.env().clock().now_utc());
     let read = state
@@ -679,7 +723,7 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     if truncated {
         let _ = write!(
             rows,
-            "<tr><td colspan=\"3\">Showing the first {PORTAL_LIST_LIMIT}. \
+            "<tr><td colspan=\"4\">Showing the first {PORTAL_LIST_LIMIT}. \
              Ask your vendor for the rest.</td></tr>"
         );
     }
@@ -706,7 +750,8 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
          <p>Organization: {organization}</p>\
          {endpoint}\
          <h2>Your connections</h2>\
-         <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th></tr></thead>\
+         <table><thead><tr><th>Name</th><th>Provider</th><th>Status</th><th>Activity</th>\
+         </tr></thead>\
          <tbody>{rows}</tbody></table>\
          {guides}",
         organization = escape_html(&session.organization().to_string()),

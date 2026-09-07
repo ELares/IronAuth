@@ -1679,6 +1679,21 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0205_scim_connection_tokens.sql"),
         },
+        Migration {
+            version: 206,
+            name: "scim_token_last_seen",
+            // EXPAND. Two nullable columns and one column-scoped grant.
+            //
+            // AN OLD BINARY NEITHER WRITES NOR READS THEM, and that is load bearing rather than
+            // incidental: `observed_since` has no default precisely so a replica which does not
+            // record use cannot leave a row claiming it does. A new binary reads NULL as "not
+            // observed" -- which is what every pre-existing row means, and why there is nothing
+            // to backfill. An earlier version of this line said a new binary treats NULL as
+            // "never used", which is the exact misreading the migration beside it exists to
+            // prevent.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0206_scim_token_last_seen.sql"),
+        },
     ]
 }
 

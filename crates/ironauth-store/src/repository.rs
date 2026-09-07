@@ -75280,6 +75280,63 @@ pub struct ScimConnection {
     /// `scim_connections.token_digest` and provisions perfectly. Counting rows reported it as
     /// broken. It has one usable credential, and that is what this says.
     pub live_token_count: i64,
+    /// When any of this connection's tokens last authenticated a request, or `None` if none ever
+    /// has (issue #140).
+    ///
+    /// WHAT A CONFIGURED-BUT-DEAD CONNECTION LOOKS LIKE, and there is no other way to see it. A
+    /// connection whose credentials are live and whose identity provider has never called is
+    /// indistinguishable, through every other field, from one provisioning happily -- and that is
+    /// the ordinary result of pasting a token into the wrong field, or into the right field of
+    /// the wrong application. The stamp is coarse by design; see `LAST_SEEN_THROTTLE_MICROS`.
+    ///
+    /// `None` DOES NOT MEAN NEVER USED. It means no request through this connection was ever
+    /// observed, which is also true of every row older than migration 0206 and of any request
+    /// served by a replica that predates it. `usage_history_complete` beside this is what says
+    /// whether the absence can be read as an absence of use, and nothing should draw that
+    /// conclusion from this field alone.
+    pub last_seen_at_unix_micros: Option<i64>,
+    /// Whether the NEWEST unrevoked token has ever authenticated, or `None` when the connection
+    /// holds no UNREVOKED token row.
+    ///
+    /// THE CUTOVER QUESTION, which the timestamp above cannot answer. During a rotation overlap
+    /// both tokens work, so `last_seen_at` keeps moving on the strength of the OLD one and looks
+    /// healthy right up to the moment the overlap ends and provisioning stops. What predicts that
+    /// outage is whether the credential the customer was asked to paste has been used yet.
+    ///
+    /// `None` covers two populations and both mean "not a question this connection can answer":
+    /// the fallback population, created by an un-upgraded replica after migration 0205, which has
+    /// no token rows at all; and a connection whose every token row has been revoked, which has no
+    /// current credential to cut over TO. A surface must not render `None` as "never used" -- the
+    /// first of those may be provisioning perfectly through
+    /// `scim_connections.token_digest` right now.
+    pub newest_token_used: Option<bool>,
+    /// Whether every credential this connection holds has been watched for its whole life, so an
+    /// absent `last_seen_at_unix_micros` can be read as "never used" rather than "not observed".
+    ///
+    /// FALSE IS THE INSTALLED BASE. Migration 0206 added the observation column, and every token
+    /// row that already existed -- including every row 0205 backfilled -- began being watched
+    /// only then. For those, a NULL last-seen means nobody was looking, not that nothing called.
+    /// A surface that read the two as one would tell every customer of a freshly upgraded
+    /// deployment that their working connection has never been used.
+    ///
+    /// It is also false for a connection with no token rows at all, which has nothing to observe:
+    /// that population authenticates through `scim_connections.token_digest`, and after a
+    /// rotation adopts a credential whose earlier life went unwatched.
+    ///
+    /// # What it still cannot see, stated because a surface acts on it
+    ///
+    /// It attests that the ROWS were written by a binary that records use. It cannot attest that
+    /// the replica which SERVED a given request was one: mid-rolling-upgrade, a connection
+    /// created by an upgraded replica whose provisioning traffic happens to land only on
+    /// un-upgraded ones is watched by nobody, and reads as knowably unused. The window closes on
+    /// the first request an upgraded replica serves, within one throttle interval, and it is the
+    /// same rollout window migration 0205 already tells operators to finish before rotating.
+    ///
+    /// Closing it properly needs a deployment-level watermark rather than a per-row one, which is
+    /// a change to what this column means and not a wording fix. Until then a surface should read
+    /// `true` as "no request was observed, and observation was in place" rather than as proof
+    /// that none happened.
+    pub usage_history_complete: bool,
     /// The next deadline one of this connection's credentials meets, if any of them has one.
     ///
     /// # Two sources, whichever comes first
@@ -78598,7 +78655,12 @@ pub struct RotateScimToken<'a> {
     pub now_micros: i64,
 }
 
-/// The inbound SCIM connections for one scope, read only (issue #135).
+/// The inbound SCIM connections for one scope (issue #135).
+///
+/// READ ONLY WITH ONE EXCEPTION, and the exception is deliberate: [`Self::authenticate`] records
+/// that the token it just accepted was used, in the same transaction as the read (issue #140).
+/// That is an observation rather than a change to what the credential is or how long it lasts,
+/// and it is the only column the data-plane role may write on the table (migration 0206).
 pub struct ScimConnectionRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -78692,6 +78754,36 @@ impl ScimConnectionRepo<'_> {
         .bind(now_micros)
         .fetch_optional(&mut *tx)
         .await?;
+        // RECORD THAT THIS TOKEN WAS USED, in the same transaction as the read that accepted it,
+        // so the two cannot disagree about whether a request authenticated (issue #140).
+        //
+        // THROTTLED, because this is the hot path: every provisioning request from every
+        // customer's identity provider comes through here, and a write per request would turn a
+        // point read into a read plus a row update on a table an entire deployment shares. The
+        // `WHERE` skips the write whenever the stored stamp is already inside the window, so a
+        // provisioning run that makes a thousand requests a minute writes once.
+        //
+        // A COARSE STAMP IS WHAT THE FEATURE NEEDS. The portal says "last used" to a human
+        // deciding whether their cutover landed; a minute of staleness is invisible to that
+        // question, and the alternative is a write amplification no operator asked for.
+        if row.is_some() {
+            sqlx::query(
+                "UPDATE scim_connection_tokens \
+                 SET last_seen_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 microsecond') \
+                 WHERE tenant_id = $1 AND environment_id = $2 AND token_digest = $3 \
+                   AND (last_seen_at IS NULL \
+                        OR last_seen_at <= TIMESTAMPTZ 'epoch' \
+                                           + (($4::bigint - $5::bigint) \
+                                              * INTERVAL '1 microsecond'))",
+            )
+            .bind(self.scope.tenant().to_string())
+            .bind(self.scope.environment().to_string())
+            .bind(token_digest)
+            .bind(now_micros)
+            .bind(LAST_SEEN_THROTTLE_MICROS)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         // THE LEGACY FALLBACK, AS A SECOND POINT LOOKUP rather than an `OR` in the first.
         //
@@ -78769,6 +78861,14 @@ impl ScimConnectionRepo<'_> {
             // `authenticate` looks at.
             credential_expires_at_unix_micros: None,
             created_at_unix_micros: row.get("created_us"),
+            // NOT ANSWERED ON THE AUTHENTICATION PATH EITHER, and deliberately not answered with
+            // "now". This call is itself what stamps the token, so returning the stamp it just
+            // wrote would hand every caller a value that says only "you are here" -- true of
+            // every authenticated request and informative about none of them. All three are
+            // operator questions the LISTING answers.
+            last_seen_at_unix_micros: None,
+            newest_token_used: None,
+            usage_history_complete: false,
         }))
     }
 
@@ -78868,6 +78968,26 @@ impl ScimConnectionRepo<'_> {
                     , EXISTS (SELECT 1 FROM scim_connection_tokens t \
                               WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
                                 AND t.environment_id = c.environment_id) AS has_token_rows \
+                    , (SELECT (EXTRACT(EPOCH FROM max(t.last_seen_at)) * 1000000)::bigint \
+                       FROM scim_connection_tokens t \
+                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                         AND t.environment_id = c.environment_id) AS last_seen_us \
+                    , (EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                               WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                                 AND t.environment_id = c.environment_id) \
+                       AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
+                                       WHERE t.connection_id = c.id \
+                                         AND t.tenant_id = c.tenant_id \
+                                         AND t.environment_id = c.environment_id \
+                                         AND (t.observed_since IS NULL \
+                                              OR t.observed_since > t.created_at))) \
+                        AS usage_history_complete \
+                    , (SELECT t.last_seen_at IS NOT NULL FROM scim_connection_tokens t \
+                       WHERE t.connection_id = c.id AND t.tenant_id = c.tenant_id \
+                         AND t.environment_id = c.environment_id \
+                         AND t.revoked_at IS NULL \
+                       ORDER BY t.created_at DESC, t.token_digest DESC LIMIT 1) \
+                        AS newest_token_used \
                     , (SELECT (o.deleted_at IS NULL AND o.state = 'active') \
                        FROM organizations o \
                        WHERE o.id = $3 AND o.tenant_id = $1 AND o.environment_id = $2) \
@@ -78920,6 +79040,14 @@ impl ScimConnectionRepo<'_> {
                     },
                     live_token_count: live_token_count(&row),
                     created_at_unix_micros: row.get("created_us"),
+                    last_seen_at_unix_micros: row.get("last_seen_us"),
+                    // NULL when the connection has no UNREVOKED token row: the fallback
+                    // population, which authenticates through `scim_connections.token_digest` and
+                    // has nothing here to stamp, and a connection whose tokens are all revoked.
+                    // `None` says "not a question this connection can answer", which is different
+                    // from `Some(false)`, "there is a newest credential and nothing has used it".
+                    newest_token_used: row.get("newest_token_used"),
+                    usage_history_complete: row.get("usage_history_complete"),
                 })
             })
             .collect()
@@ -79039,6 +79167,13 @@ mod scim_connection_signal_tests {
             live_token_count,
             credential_expires_at_unix_micros: deadline,
             created_at_unix_micros: 1_698_000_000_000_000,
+            // NEITHER SIGNAL READS THESE. They are listed because the literal is exhaustive, so
+            // a field added to `ScimConnection` stops this module compiling until somebody
+            // decides what it should be here -- which is how each of these arrived. A field the
+            // signals START READING is not caught that way; nothing here would notice.
+            last_seen_at_unix_micros: None,
+            newest_token_used: None,
+            usage_history_complete: false,
         }
     }
 
@@ -79137,6 +79272,23 @@ mod scim_connection_signal_tests {
         );
     }
 }
+
+/// How stale a token's `last_seen_at` may be before the authentication path refreshes it.
+///
+/// ONE MINUTE. The stamp answers "has this credential been used", asked by a human reading a
+/// portal page, and a minute of staleness cannot change that answer. What it buys is that a
+/// provisioning run pushing a thousand requests through one token writes one row rather than a
+/// thousand -- on a table every customer of the deployment shares.
+///
+/// It is deliberately NOT configurable: an operator who tuned it down would be paying write
+/// amplification for a precision no surface reads.
+///
+/// TUNING IT UP DOES NOT DELAY THE CUTOVER SIGNAL, which an earlier version of this note claimed.
+/// The statement's `last_seen_at IS NULL` disjunct means a token's FIRST use is always recorded
+/// however large the window is; the throttle only skips REFRESHES. So a freshly pasted token
+/// stops reading as unused on its first request regardless, and what a longer window costs is
+/// staleness in the "last request" date.
+const LAST_SEEN_THROTTLE_MICROS: i64 = 60 * 1_000_000;
 
 /// The WRITE side of the inbound SCIM connections, for this scope and actor (issue #135).
 pub struct ActingScimConnectionRepo<'a> {
@@ -79262,12 +79414,17 @@ impl ActingScimConnectionRepo<'_> {
                 // Migration 0205 carries the full account and why it is documented rather than
                 // coded away.
                 sqlx::query(
+                    // `observed_since` IS WRITTEN BY THIS BINARY BECAUSE THIS BINARY STAMPS.
+                    // The column has no default precisely so that a replica which does not
+                    // record use cannot claim it does; see migration 0206.
                     "INSERT INTO scim_connection_tokens \
-                     (token_digest, connection_id, tenant_id, environment_id, expires_at) \
+                     (token_digest, connection_id, tenant_id, environment_id, expires_at, \
+                      observed_since) \
                      VALUES ($1, $2, $3, $4, \
                              CASE WHEN $5::bigint IS NULL THEN NULL \
                                   ELSE TIMESTAMPTZ 'epoch' \
-                                       + ($5::bigint * INTERVAL '1 microsecond') END)",
+                                       + ($5::bigint * INTERVAL '1 microsecond') END, \
+                             now())",
                 )
                 .bind(&token_digest)
                 .bind(id.to_string())
@@ -79556,9 +79713,23 @@ impl ActingScimConnectionRepo<'_> {
         // (token_digest)`, which 0183 withholds because it is how a known credential gets
         // installed.
         sqlx::query(
+            // `created_at` IS COPIED FROM THE CONNECTION, not left to `now()`. The adopted row is
+            // a credential that has existed since the connection was created, so the connection's
+            // own timestamp is the truer value -- and leaving it to the default made it EQUAL to
+            // the row this same transaction mints a few statements later, because `now()` is
+            // `transaction_timestamp()` and returns one value for the whole transaction.
+            //
+            // THAT TIE DECIDED WHICH TOKEN IS "NEWEST" BY COMPARING TWO HEX DIGESTS. On every
+            // legacy rotation it was a coin flip, and it failed in both directions: an old token
+            // that won the comparison reported the cutover as complete while the customer had
+            // never presented the new credential, so nothing warned before the overlap ended; and
+            // a new token that lost it reported "not used yet" forever after a cutover that had
+            // finished. Copying the connection's timestamp makes the adopted row unambiguously
+            // older, which is what it is.
             "INSERT INTO scim_connection_tokens \
-             (token_digest, connection_id, tenant_id, environment_id, expires_at) \
-             SELECT c.token_digest, c.id, c.tenant_id, c.environment_id, c.expires_at \
+             (token_digest, connection_id, tenant_id, environment_id, expires_at, created_at) \
+             SELECT c.token_digest, c.id, c.tenant_id, c.environment_id, c.expires_at, \
+                    c.created_at \
              FROM scim_connections c \
              WHERE c.tenant_id = $1 AND c.environment_id = $2 AND c.id = $3 \
                AND NOT EXISTS (SELECT 1 FROM scim_connection_tokens t \
@@ -79604,9 +79775,12 @@ impl ActingScimConnectionRepo<'_> {
         let superseded_expires_micros = superseded.iter().filter_map(|(us,)| *us).max();
 
         sqlx::query(
+            // AS THE CREATE PATH: this binary stamps, so it records that it is watching. The
+            // ADOPTED row above deliberately does NOT get one -- its credential existed and was
+            // used before anything watched it.
             "INSERT INTO scim_connection_tokens \
-             (token_digest, connection_id, tenant_id, environment_id) \
-             VALUES ($1, $2, $3, $4)",
+             (token_digest, connection_id, tenant_id, environment_id, observed_since) \
+             VALUES ($1, $2, $3, $4, now())",
         )
         .bind(new_token_digest)
         .bind(id.to_string())

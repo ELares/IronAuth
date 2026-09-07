@@ -90,7 +90,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      SAML request correlation and assertion replay, SAML SP signing keys, \
      SAML browser binding, organization connection SAML target, \
      organization connection SAML same organization, \
-     self-service portal links, self-service portal sessions, SCIM connection tokens.";
+     self-service portal links, self-service portal sessions, SCIM connection tokens, \
+     SCIM token last-seen.";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -721,7 +722,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        205,
+        206,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -763,7 +764,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
-            194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205
+            194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206
         ]
     );
     let phase_of = |version: i64| async move {
@@ -9281,4 +9282,44 @@ async fn the_outbound_connection_update_grant_is_scoped_to_the_columns_a_stateme
              operator's, and a worker that could write it could redirect a live connection"
         );
     }
+}
+
+/// The data plane's writable columns on `scim_connection_tokens` are EXACTLY `last_seen_at`.
+///
+/// # What the neighbouring guard cannot see
+///
+/// `the_data_plane_holds_no_table_wide_update_on_any_table` refuses a TABLE-wide grant, which is
+/// the coarse form. It says nothing about WHICH columns a column-scoped grant names, so widening
+/// 0206 from `last_seen_at` to `(last_seen_at, expires_at)` -- or to `revoked_at` -- passes it
+/// untouched, and passes every test and shell gate in this repository.
+///
+/// Those two columns are the ones that decide whether a credential still works. A data plane able
+/// to write them could extend a token it was about to lose, or clear a revocation an operator
+/// performed, from the request path of any customer's identity provider. This asserts the SET, so
+/// a future grant on this table is a decision somebody makes here rather than one that arrives
+/// unremarked.
+#[tokio::test]
+async fn the_data_plane_writes_exactly_one_column_of_scim_connection_tokens() {
+    let db = TestDatabase::start().await;
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.column_privileges \
+         WHERE grantee = 'ironauth_app' AND privilege_type = 'UPDATE' \
+           AND table_schema = 'public' AND table_name = 'scim_connection_tokens' \
+         ORDER BY column_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the column privileges");
+
+    assert_eq!(
+        columns,
+        vec!["last_seen_at".to_owned()],
+        "the data plane's writable columns on scim_connection_tokens changed. `last_seen_at` is a \
+         timestamp that mints nothing; `expires_at` and `revoked_at` decide whether a credential \
+         works, and a data plane able to write them could extend a token or clear a revocation \
+         from any customer's provisioning request. Both widenings are additionally caught by \
+         `the_token_tables_grants_and_one_way_policy_are_enforced`, which drives each write \
+         directly; what only this test can see is a widening to a column no statement there \
+         happens to name"
+    );
 }
