@@ -849,14 +849,16 @@ async fn build_admin_state(
                     Some((registry, store)) => (Some(registry), Some(store)),
                     None => (None, None),
                 };
-            // Everything that reaches BOTH planes (issue #414): the two config sections
-            // that live outside `[admin]` because both planes consume them (the
-            // `[organizations]` group nesting bound, issue #97, and the `[token_claims]`
-            // budget, issue #98), the two feature-ladder verdicts that arm this plane's
-            // review-queue endpoints and the data plane's enforcement (issue #82), and
-            // the two runtime objects this plane must hold the SAME Arc of (the
+            // Everything that reaches BOTH planes (issue #414): the three config
+            // sections that live outside `[admin]` because both planes consume them (the
+            // `[organizations]` group nesting bound, issue #97, the `[token_claims]`
+            // budget, issue #98, and `[scim]`, whose token expiry warning lead this
+            // plane's connection listing and the data plane's self-service portal both
+            // compute from, issue #140), the two feature-ladder verdicts that arm this
+            // plane's review-queue endpoints and the data plane's enforcement (issue
+            // #82), and the two runtime objects this plane must hold the SAME Arc of (the
             // lazy-migration hook, issue #56, and the federation runtime, issue #76).
-            // All six come from the SAME captured carrier the data plane installs,
+            // All seven come from the SAME captured carrier the data plane installs,
             // through the SAME generic install body, so the two planes cannot be handed
             // different values. The budget is read here only to report an approach
             // warning; it never refuses a write, and the depth bound caps nothing that
@@ -885,16 +887,6 @@ async fn build_admin_state(
             // count live work as ready, and a longer one would count lapsed work as in
             // flight.
             let state = state.with_outbox_visibility_timeout(config.outbox.visibility_timeout_secs);
-            // The SCIM token expiry warning lead time (issue #140). Installed HERE for the
-            // reason `[identifiers]` and `[outbox]` are: it reaches ONE plane. The connection
-            // listing is a management read, and the data plane authenticates tokens without
-            // ever asking how close one is to lapsing.
-            //
-            // It is the SAME `[scim]` section the data plane's own limits come from, read once
-            // here rather than duplicated under `[admin]`, so one setting cannot acquire two
-            // operator-visible names that disagree.
-            let state =
-                state.with_scim_token_expiry_warning_secs(config.scim.token_expiry_warning_secs);
             // Share the data-plane issuer registry (issue #93) so the compatibility wizard
             // can resolve an environment's actually signable ID-token algorithms and write
             // the per-client column through the data plane (the only role that can).
@@ -1739,16 +1731,18 @@ async fn build_oidc_plane(
             state
         }
     };
-    // Everything that reaches BOTH planes (issue #414): the two config sections that
+    // Everything that reaches BOTH planes (issue #414): the three config sections that
     // live outside `[oidc]` because both planes consume them (the `[organizations]`
     // group nesting bound, issue #97, which bounds the ancestor walk the mint-path
-    // effective-role resolution performs, and the `[token_claims]` budget, issue #98,
-    // which bounds a TOKEN's size and what ONE claim carries), the two feature-ladder
+    // effective-role resolution performs, the `[token_claims]` budget, issue #98,
+    // which bounds a TOKEN's size and what ONE claim carries, and `[scim]`, whose token
+    // expiry warning lead the self-service portal on THIS plane and the management
+    // plane's connection listing both compute from, issue #140), the two feature-ladder
     // verdicts that arm this plane's enforcement and the management plane's review
     // queues (issue #82), and the two runtime objects both planes must hold the SAME
     // Arc of (the lazy-migration hook on the login path, issue #56, and the federation
     // runtime whose per-connector health registry the admin read reports, issue #76).
-    // All six come from the SAME captured carrier the management plane installs,
+    // All seven come from the SAME captured carrier the management plane installs,
     // through the SAME generic install body, so the two planes cannot be handed
     // different values. Neither bound caps anything that is stored or counted.
     let mut state = shared.install(state);

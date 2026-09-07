@@ -1104,7 +1104,7 @@ async fn the_listing_warns_about_a_token_lapsing_inside_the_configured_lead() {
          {quiet_item}"
     );
     assert!(
-        quiet_item.get("provisioning_stops_at_unix_ms").is_none(),
+        quiet_item.get("credential_expires_at_unix_ms").is_none(),
         "a connection whose tokens have no horizon published one: {quiet_item}"
     );
 
@@ -1116,7 +1116,9 @@ async fn the_listing_warns_about_a_token_lapsing_inside_the_configured_lead() {
          customer's provisioning is about to stop by it stopping: {loud_item}"
     );
     assert!(
-        loud_item["provisioning_stops_at_unix_ms"].as_i64().is_some(),
+        loud_item["credential_expires_at_unix_ms"]
+            .as_i64()
+            .is_some(),
         "the warning fired without publishing WHEN, which is what an operator acts on: \
          {loud_item}"
     );
