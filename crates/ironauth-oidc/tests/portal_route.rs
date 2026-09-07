@@ -1248,24 +1248,42 @@ async fn each_connection_gets_its_own_providers_setup_guide() {
         );
     }
 
-    // THE STEPS ARE THE PROVIDER'S OWN, not one generic set relabelled. Each console calls the
-    // endpoint something different, and pasting into the wrong field is the failure these guides
-    // exist to prevent.
+    // THE STEPS ARE THE PROVIDER'S OWN, asserted INSIDE the guide they belong to. Page-global
+    // `contains` checks are satisfied by the right words appearing anywhere, so the Okta and
+    // Entra step lists could be swapped wholesale and every one of them would still pass -- which
+    // is the exact failure these guides exist to prevent, pasting into the wrong console's field.
+    let guide = |name: &str| -> String {
+        let heading = format!("Set up {name} in ");
+        let at = body
+            .find(&heading)
+            .unwrap_or_else(|| panic!("no guide for {name}: {body}"));
+        let rest = &body[at..];
+        let end = rest.find("</details>").unwrap_or(rest.len());
+        rest[..end].to_owned()
+    };
     assert!(
-        body.contains("Base URL field"),
-        "the Okta guide does not name the field Okta calls the endpoint: {body}"
+        guide("okta-primary").contains("Base URL field")
+            && guide("okta-primary").contains("API Token field"),
+        "the Okta guide does not name the fields Okta uses: {}",
+        guide("okta-primary")
     );
     assert!(
-        body.contains("Tenant URL field"),
-        "the Entra guide does not name the field Entra calls the endpoint: {body}"
+        guide("entra-secondary").contains("Tenant URL field")
+            && guide("entra-secondary").contains("Secret Token field"),
+        "the Entra guide does not name the fields Entra uses: {}",
+        guide("entra-secondary")
+    );
+    // AND NEITHER CARRIES THE OTHER'S, which is what makes the pair a swap test rather than two
+    // independent presence checks.
+    assert!(
+        !guide("okta-primary").contains("Tenant URL"),
+        "the Okta guide carries Entra's field names: {}",
+        guide("okta-primary")
     );
     assert!(
-        body.contains("Secret Token field"),
-        "the Entra guide does not name the field Entra calls the token: {body}"
-    );
-    assert!(
-        body.contains("API Token field"),
-        "the Okta guide does not name the field Okta calls the token: {body}"
+        !guide("entra-secondary").contains("API Token"),
+        "the Entra guide carries Okta's field names: {}",
+        guide("entra-secondary")
     );
 
     // AND THE URL IS THIS DEPLOYMENT'S, in every guide. Asserting merely that "/scim/v2" appears
@@ -1343,6 +1361,46 @@ async fn no_guide_is_offered_for_work_that_cannot_succeed() {
     );
     let _ = live;
 
+    // AND A LAPSED CONNECTION, which is the other way a row reaches "cannot succeed" and the one
+    // that arrives by itself. `authenticate` refuses it on `c.expires_at > now`, so no token the
+    // admin pastes will ever work -- and the guide's closing sentence would tell them to ask for
+    // a ROTATION, which `rotate_token` refuses for this same connection with a not-found. The
+    // customer would do the work, watch it fail unexplained, and request a remedy the product
+    // answers 404 to.
+    let lapsing = connect_with_provider(
+        &harness,
+        &org,
+        "already-expired",
+        "okta",
+        "g-lapsed",
+        Some(now_micros(&harness) + 60 * 1_000_000),
+    )
+    .await;
+    harness.clock().advance(std::time::Duration::from_secs(120));
+    let (_, after) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert!(
+        after.contains("already-expired"),
+        "the lapsed connection is missing from the listing entirely: {after}"
+    );
+    assert!(
+        !after.contains("Set up already-expired in"),
+        "a connection past its own expiry is offered setup steps that cannot succeed, ending in \
+         a request its vendor must refuse: {after}"
+    );
+    // AND ITS ROW NAMES THE REMEDY THAT WORKS, rather than blaming a token that is not the
+    // problem: this connection cannot be rotated, only replaced.
+    assert!(
+        after.contains("this connection expired and must be replaced"),
+        "the lapsed row does not say what has to happen to it: {after}"
+    );
+    // THE CONTROL, again after the clock moved: the live connection still has its guide, so the
+    // absence above is the lapse rather than the whole section disappearing.
+    assert!(
+        after.contains("Set up still-working in Okta"),
+        "the live connection lost its guide when a sibling lapsed: {after}"
+    );
+    let _ = lapsing;
+
     // AND WITH THE SURFACE OFF, no guide at all -- the steps would point at a 404.
     let dark = Harness::start_store_backed_with_scim_surface(false).await;
     let dark_org = seed_org(&dark, "Acme").await;
@@ -1363,5 +1421,95 @@ async fn no_guide_is_offered_for_work_that_cannot_succeed() {
     assert!(
         dark_body.contains("hopeful"),
         "the connection itself vanished along with its guide: {dark_body}"
+    );
+}
+
+/// Two connections of the SAME provider get two guides, one each.
+///
+/// # The case that separates per-connection from per-provider
+///
+/// An Okta-plus-Entra organization does not: those differ by provider, so per-provider rendering
+/// would give them two sections too. A customer migrating between two Okta tenants, or running
+/// one for staging, is the case where per-provider gives a single "Okta" section and no way to
+/// tell which connection it configures -- which is exactly where a vendor's own documentation
+/// already leaves them.
+#[tokio::test]
+async fn two_connections_of_one_provider_get_a_guide_each() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    connect_with_provider(&harness, &org, "okta-staging", "okta", "g-s", None).await;
+    connect_with_provider(&harness, &org, "okta-production", "okta", "g-p", None).await;
+
+    let cookie = open_session_in(&harness, "scim", "tok-same", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    assert!(
+        body.contains("Set up okta-staging in Okta"),
+        "the staging connection has no guide of its own: {body}"
+    );
+    assert!(
+        body.contains("Set up okta-production in Okta"),
+        "the production connection has no guide of its own: {body}"
+    );
+    assert_eq!(
+        body.matches("<details>").count(),
+        2,
+        "two connections of one provider produced {} guides rather than two, so the admin \
+         cannot tell which set of steps configures which connection: {body}",
+        body.matches("<details>").count()
+    );
+}
+
+/// A page that lists a hundred connections offers a hundred guides, not a hundred and one.
+///
+/// # The bound the guides carry separately from the table
+///
+/// The rows and the guides each `take` the page limit off the same over-long read. Deleting the
+/// guides' `take` renders a guide for a connection the table says is not shown, so the page would
+/// contradict itself -- and nothing observed that: the truncation test counts rows only.
+#[tokio::test]
+async fn the_guides_stop_where_the_table_stops() {
+    let harness = Harness::start_store_backed_with_scim_surface(true).await;
+    let org = seed_org(&harness, "Acme").await;
+    for index in 0..101 {
+        connect_with_provider(
+            &harness,
+            &org,
+            &format!("conn-{index:03}"),
+            "okta",
+            &format!("guide-{index}"),
+            None,
+        )
+        .await;
+    }
+
+    let cookie = open_session_in(&harness, "scim", "tok-bound", &org).await;
+    let scope = harness.scope();
+    let path = format!(
+        "/t/{}/e/{}/portal/s/scim",
+        scope.tenant(),
+        scope.environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the provisioning page: {body}");
+
+    // THE CONTROL: the page really is truncating, so the count below is the guides honouring the
+    // same bound rather than a page that happens to be short.
+    assert!(
+        body.contains("Showing the first"),
+        "the page is not truncating, so this fixture proves nothing about the bound: {body}"
+    );
+    assert_eq!(
+        body.matches("<details>").count(),
+        100,
+        "the guides do not stop where the table stops, so the page offers setup steps for a \
+         connection it says it is not showing"
     );
 }

@@ -530,7 +530,18 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
         let status = if connection.revoked {
             "Revoked".to_owned()
         } else if connection.no_live_credential() {
-            "Provisioning has stopped: no working token".to_owned()
+            // WHICH KIND OF STOPPED IT IS decides the remedy, exactly as the deadline arm below
+            // does. A connection past its own expiry cannot be rotated -- `rotate_token` refuses
+            // it -- so telling this customer their token stopped working would point them at the
+            // wrong half of the problem and at a request their vendor cannot fulfil.
+            if connection
+                .expires_at_unix_micros
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                "Provisioning has stopped: this connection expired and must be replaced".to_owned()
+            } else {
+                "Provisioning has stopped: no working token".to_owned()
+            }
         } else if let Some(deadline) = connection.credential_expires_at_unix_micros {
             let when = crate::saml_start::rfc3339_utc(deadline / 1_000_000);
             // WHICH DEADLINE IT IS DECIDES WHAT THE ADMIN CAN DO ABOUT IT, and the row carries the
@@ -571,23 +582,48 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
     }
     // ONE GUIDE PER CONNECTION, keyed on that connection's own provider (issue #140 criterion 4:
     // "setup guides render per IdP with correct copy-paste values for the specific connection
-    // being configured"). Per CONNECTION rather than per distinct provider, because an
-    // organization with an Okta connection and an Entra one needs to know which set of steps
-    // belongs to which -- and a guide that named no connection would leave them guessing exactly
-    // where a generic vendor document already leaves them.
+    // being configured").
+    //
+    // PER CONNECTION RATHER THAN PER DISTINCT PROVIDER, and the case that separates those is TWO
+    // CONNECTIONS OF THE SAME PROVIDER -- a customer migrating between two Okta tenants, or
+    // running one for staging. Per-provider rendering gives them a single "Okta" section and no
+    // way to tell which of their two connections it configures, which is precisely where a
+    // vendor's generic documentation already leaves them. An earlier version of this comment
+    // offered an Okta-plus-Entra organization as the justification; those differ by provider too,
+    // so it demonstrated nothing about the choice.
     //
     // ONLY WHERE THE ENDPOINT IS SERVED. With the surface off the steps would tell a customer to
     // paste a URL this deployment answers 404 for, which is the same defect the endpoint
     // paragraph above already refuses to commit.
     //
-    // AND NOT FOR A REVOKED CONNECTION: configuring an identity provider against a credential an
-    // operator has switched off is work that cannot succeed.
+    // AND NOT FOR A CONNECTION NOTHING CAN REVIVE. Two states qualify and an earlier version of
+    // this filter named only the first:
+    //
+    //   * REVOKED, which an operator did on purpose.
+    //   * LAPSED, meaning the connection is past its OWN `expires_at`. That one arrives by itself
+    //     with nobody acting, and it is the worse of the two to be wrong about: `authenticate`
+    //     requires `c.expires_at > now`, so no token the admin pastes will ever work, and the
+    //     guide's own closing sentence tells them to ask their vendor to ROTATE -- which
+    //     `rotate_token` refuses with a not-found for exactly this connection. The customer would
+    //     do the work, watch it fail with no explanation, and ask for a remedy the product
+    //     answers 404 to.
+    //
+    // IT IS KEYED ON THE CONNECTION'S OWN EXPIRY, not on `no_live_credential()`. The other way a
+    // row reports no live credential is that its TOKENS are gone while the connection itself is
+    // fine -- and there rotation works, the admin pastes the fresh token, and these steps are
+    // exactly what they need. Suppressing the guide on the broader condition would hide it from
+    // the one row it helps most.
     let mut guides = String::new();
     if state.scim_surface_enabled() {
         for connection in connections
             .iter()
             .take(usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX))
-            .filter(|connection| !connection.revoked)
+            .filter(|connection| {
+                let lapsed = connection
+                    .expires_at_unix_micros
+                    .is_some_and(|expires_at| expires_at <= now);
+                !connection.revoked && !lapsed
+            })
         {
             let guide = crate::portal_guides::guide_for(&connection.provider, &scim_base);
             let mut steps = String::new();

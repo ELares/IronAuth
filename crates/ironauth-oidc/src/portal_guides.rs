@@ -23,10 +23,14 @@
 //! # The provider set is closed and comes from the database
 //!
 //! `scim_connections.provider` is `CHECK (provider IN ('okta', 'entra', 'generic'))` (migration
-//! 0183), so a guide exists for every value a row can hold and the fallback arm is unreachable
-//! from stored data. It is still written, because the column is read as a string and a guide that
-//! silently rendered nothing for an unexpected value would leave the page missing a section with
-//! no sign that anything was wrong.
+//! 0183), so a guide exists for every value a row can hold.
+//!
+//! THE CATCH-ALL ARM IS THE `generic` GUIDE, not an unreachable fallback, and it is reached by
+//! every `generic` connection -- which is the column's DEFAULT, so it is the arm the ordinary
+//! case takes. It doubles as the fallback because what a provider without a named console needs
+//! is the protocol facts, and those are the same facts an unexpected value would need. Writing
+//! it as `_` rather than `"generic" | _` is deliberate: an unexpected value must render a usable
+//! guide rather than leave the page silently missing a section.
 
 /// One identity provider's setup guide, already resolved for a specific connection.
 pub(crate) struct SetupGuide {
@@ -79,8 +83,8 @@ pub(crate) fn guide_for(provider: &str, scim_base: &str) -> SetupGuide {
                     .to_owned(),
             ],
         },
-        // THE FALLBACK IS ALSO THE `generic` GUIDE, deliberately: the two say the same thing,
-        // because what a provider without a named console needs is the protocol facts.
+        // `generic` AND ANYTHING UNEXPECTED, deliberately the same arm: see the module doc. This
+        // is the DEFAULT provider, so it is the common case rather than a fallback.
         _ => SetupGuide {
             provider_name: "your identity provider",
             where_to_go: "In your identity provider's SCIM or provisioning settings:",
