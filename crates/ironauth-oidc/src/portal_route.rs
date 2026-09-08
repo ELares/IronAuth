@@ -457,6 +457,9 @@ pub async fn surface_get(
     if intent == "certificate-renewal" {
         return certificate_renewal_surface(&state, &session).await;
     }
+    if intent == "contacts" {
+        return contacts_surface(&state, &session).await;
+    }
     // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER. `sso`, `domain-verification` and
     // `log-streams` land in later slices of #140 -- the closed set the `portal_links` intent
     // CHECK constraint permits is those three, plus `scim` and `certificate-renewal` above --
@@ -929,6 +932,110 @@ fn certificate_rows(certificates: &[ironauth_store::SamlCertificate], now: i64) 
     }
     rows.push_str("</table>");
     rows
+}
+
+/// The IT contacts surface (issue #141 criterion 3).
+///
+/// # What this page is for
+///
+/// #141 asks that operational notifications "land somewhere real: the person who set up SSO is
+/// rarely the person watching the vendor's status page". This is where a customer's own
+/// administrator sees who is on that list, without going through their vendor.
+///
+/// # It reads and does not write, and that is the grant rather than a decision
+///
+/// 0207 gives `ironauth_app` -- the role this plane authenticates as -- `SELECT` on
+/// `org_contacts` and nothing else: INSERT and the soft-delete UPDATE are `ironauth_control`
+/// only. Adding or removing a contact from here is therefore a control-plane write, and rides a
+/// queue the way a pasted certificate does. That is the next slice; this one is the list, which
+/// is what makes the queue's effect visible when it lands.
+///
+/// # No blind index, no bidx, no id an outsider can act on
+///
+/// The page shows the display name, the address and the category. The address is what the holder
+/// is checking, so withholding it would defeat the page; everything else `org_contacts` holds --
+/// the sealed columns' versions, the blind index -- is machinery this reader has no use for.
+async fn contacts_surface(state: &OidcState, session: &PortalSession) -> Response {
+    let read = state
+        .store()
+        .scoped(session.scope())
+        .org_contacts()
+        // ONE MORE THAN THE PAGE SHOWS, so a longer list is REPORTED as longer rather than
+        // silently cut. A page titled "your contacts" that quietly drops some is how somebody
+        // concludes a departed colleague was already removed.
+        .list_for_organization(session.organization(), PORTAL_LIST_LIMIT + 1, None)
+        .await;
+    let Ok(contacts) = read else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let mut body = String::from(
+        "<!doctype html><meta charset=\"utf-8\"><title>Notification contacts</title>\
+         <h1>Notification contacts</h1>\
+         <p>These are the people this organization's operational notices reach.</p>",
+    );
+    if contacts.is_empty() {
+        // NOT A REFUSAL, and worth saying WHAT IT COSTS. An organization with nobody listed is
+        // the state every organization starts in, and it is also the state in which a
+        // certificate-expiry warning reaches no one at all.
+        body.push_str(
+            "<p>Nobody is listed yet, so operational notices -- including a warning before your \
+             SSO certificate expires -- reach nobody at this organization. Ask your vendor to \
+             add a technical contact.</p>",
+        );
+        return crate::pages::secure_html(StatusCode::OK, body);
+    }
+
+    let limit = usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
+    if contacts.len() > limit {
+        let _ = write!(
+            body,
+            "<p>Showing the first {limit} contacts. Ask your vendor about the rest.</p>"
+        );
+    }
+    body.push_str("<table><tr><th>Name</th><th>Address</th><th>Receives</th></tr>");
+    let mut technical = 0_usize;
+    for contact in contacts.iter().take(limit) {
+        if contact.category == "technical" {
+            technical += 1;
+        }
+        let _ = write!(
+            body,
+            "<tr><td>{name}</td><td>{email}</td><td>{receives}</td></tr>",
+            name = escape_html(&contact.display_name),
+            email = escape_html(&contact.email),
+            receives = escape_html(describes_category(&contact.category)),
+        );
+    }
+    body.push_str("</table>");
+    if technical == 0 {
+        // THE ONE ABSENCE WORTH CALLING OUT. Certificate expiry notices go to the TECHNICAL
+        // contacts only, so a list with none of them looks populated and warns nobody about the
+        // thing most likely to break this organization's sign-in.
+        body.push_str(
+            "<p>None of these is a technical contact, so nobody here is warned before your SSO \
+             certificate expires.</p>",
+        );
+    }
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// What a contact category means, in the words a customer's administrator would use.
+///
+/// The stored values are `technical`, `security` and `billing`, which are the vendor's words. A
+/// page that printed them raw would make the reader guess which one receives a certificate
+/// warning -- and guessing wrong there is how an organization ends up with a list that looks
+/// complete and warns nobody.
+fn describes_category(category: &str) -> &'static str {
+    match category {
+        "technical" => "SSO and provisioning problems, including certificate expiry",
+        "security" => "security notices",
+        "billing" => "billing notices",
+        // A category the closed set does not hold. Unreachable through the management API, which
+        // refuses anything else, and reported rather than hidden because the alternative is a
+        // blank cell that reads as "receives nothing".
+        _ => "an unrecognised category",
+    }
 }
 
 /// What the renewal form posts.

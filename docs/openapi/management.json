@@ -30832,7 +30832,7 @@
         "properties": {
           "intent": {
             "type": "string",
-            "description": "What the session may configure: `sso`, `scim`, `domain-verification`, `log-streams`,\nor `certificate-renewal`.\nA session cannot navigate outside the intent it was opened with."
+            "description": "What the session may configure: `sso`, `scim`, `domain-verification`, `log-streams`,\n`certificate-renewal`, or `contacts`.\nA session cannot navigate outside the intent it was opened with."
           },
           "organization_id": {
             "type": "string",

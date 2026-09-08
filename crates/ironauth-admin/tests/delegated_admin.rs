@@ -1155,6 +1155,22 @@ async fn the_management_api_mints_a_certificate_renewal_link_and_refuses_an_unkn
 
     // AND THE SET IS STILL CLOSED. Widening it by one must not have widened it to anything: an
     // intent no surface serves would mint a link whose redemption lands on a placeholder.
+    // AND THE CONTACTS INTENT, added by 0210. The allow-list is a hand-written array separate
+    // from the two CHECK constraints, so each new intent needs its own line here or the handler
+    // half goes unmeasured -- which is what happened to `certificate-renewal`.
+    let (status, _, body) = h
+        .post(
+            &links,
+            "cr-contacts",
+            &serde_json::json!({ "organization_id": org, "intent": "contacts" }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the management API must mint the contacts intent the portal serves: {body}"
+    );
+
     let (status, _, body) = h
         .post(
             &links,
