@@ -383,8 +383,8 @@ fn identifier_from_octets(attribute: &str, raw: &[u8]) -> String {
 /// DERIVED FROM THE MAPPING, never written at the call site. The reason is a property of the
 /// protocol rather than of this code: `entryUUID` and `objectGUID` are OPERATIONAL attributes,
 /// and a search that does not name them does not receive them. Verified against a live
-/// `OpenLDAP`: `ldapsearch "(uid=ada)"` returns no `entryUUID`, `ldapsearch "(uid=ada)" entryUUID`
-/// does.
+/// `OpenLDAP`: `ldapsearch "(uid=grace)"` returns no `entryUUID`, while
+/// `ldapsearch "(uid=grace)" entryUUID` returns it.
 ///
 /// A caller that hand-listed the attributes and forgot the identifier would get entries that all
 /// appear to have no UUID, so all of them would take the DN fallback. Every person in the
