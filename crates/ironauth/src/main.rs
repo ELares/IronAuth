@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use axum::Router;
+use ironauth_admin::certificate_notices::CertificateNoticeConsumer;
 use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
 use ironauth_admin::message_composer::DefaultComposer;
@@ -3429,6 +3430,42 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
     })
 }
 
+/// Every consumer the MESSAGING worker registers.
+///
+/// A named function returning the list, rather than an array built inline in the boot path, for
+/// the reason [`verification_sender`] is one: a test of the answer is not a test of the wiring.
+/// A consumer left out of this list is not a compile error and not a test failure -- it is a
+/// subsystem whose queue nothing drains, which shows up in production as "the mail just never
+/// arrives" and nowhere else. `messaging_consumers_are_registered_by_name` pins the set.
+fn messaging_consumers(
+    data_store: &ironauth_store::Store,
+    providers: Vec<Box<dyn ironauth_store::message_delivery::MessageProvider>>,
+    composer: Arc<dyn ironauth_store::message_consumer::MessageComposer>,
+) -> Vec<Arc<dyn OutboxConsumer>> {
+    vec![
+        Arc::new(MessageDeliveryConsumer::new(
+            data_store.clone(),
+            providers,
+            composer,
+        )) as Arc<dyn OutboxConsumer>,
+        // CERTIFICATE EXPIRY NOTICES (issue #141): one recorded notice becomes mail for the
+        // organization's technical contacts. Behind the messaging switch and beside delivery for
+        // the reason the webhook fan-out sits beside its delivery: a producer whose output
+        // nothing drains only builds a backlog.
+        //
+        // PER KIND, like the account alerts. An organization renewing several connections at
+        // once would otherwise spend one shared budget on a single kind and silence the other.
+        Arc::new(CertificateNoticeConsumer::new(
+            data_store.clone(),
+            ironauth_store::message_rate::RateBudget::new(
+                NOTICE_RATE_BUDGET.0,
+                NOTICE_RATE_BUDGET.1,
+            )
+            .per_kind(),
+        )) as Arc<dyn OutboxConsumer>,
+    ]
+}
+
 /// How many notices one recipient may be sent in an hour.
 ///
 /// Three, matching the shape the ledger's own tests use for a real budget. Named rather than
@@ -3668,14 +3705,11 @@ async fn spawn_message_delivery_pools(inputs: MessageDeliveryInputs) -> Vec<Outb
         as Arc<dyn ironauth_store::message_consumer::MessageComposer>;
 
     let mut consumers = ConsumerRegistry::new();
-    if let Err(error) = consumers.register(Arc::new(MessageDeliveryConsumer::new(
-        data_store.clone(),
-        providers,
-        composer,
-    )) as Arc<dyn OutboxConsumer>)
-    {
-        tracing::error!(%error, "message delivery worker not started: duplicate consumer name");
-        return Vec::new();
+    for consumer in messaging_consumers(&data_store, providers, composer) {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "message delivery worker not started: duplicate consumer name");
+            return Vec::new();
+        }
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
