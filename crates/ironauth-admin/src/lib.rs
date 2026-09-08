@@ -99,6 +99,7 @@ pub mod ciba_ping;
 mod claims_mappings;
 pub mod contact_changes;
 pub mod ldap_groups;
+pub mod ldap_mapping;
 mod external_issuers;
 pub mod flow_target_delivery;
 mod flow_targets;
