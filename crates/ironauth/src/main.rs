@@ -3581,6 +3581,56 @@ fn certificate_sweep_inputs(config: &Config, env: &Env) -> Option<CertificateSwe
     })
 }
 
+/// Retire superseded certificates across every scope (issue #141 criterion 2).
+///
+/// SEPARATE FROM THE ANNOUNCEMENT PASS and tolerant of its own failures: one scope that cannot
+/// be tidied must not stop another being warned, and retirement is housekeeping where alerting
+/// is the feature. Nothing here is returned, because nothing upstream would do anything with it
+/// -- the ticker's next pass tries again.
+async fn retire_pass(
+    store: &Store,
+    env: &Env,
+    scopes: &dyn ScopeSource,
+    settings: &CertificateSweepSettings,
+) {
+    if settings.rollover_window_secs <= 0 {
+        // Retirement is off. Enumerating scopes to retire nothing is a round trip for a work
+        // list that is empty by construction.
+        return;
+    }
+    let Ok(all) = scopes.scopes().await else {
+        // The announcement pass on the same tick reports this, loudly, and a second copy of the
+        // same line per tick would only make it harder to read.
+        return;
+    };
+    for scope in all {
+        match ironauth_admin::certificate_expiry::retire_once(
+            store,
+            env,
+            scope,
+            settings.rollover_window_secs,
+            settings.batch,
+        )
+        .await
+        {
+            Ok(report) if report.retired > 0 || report.vanished > 0 => tracing::info!(
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                retired = report.retired,
+                vanished = report.vanished,
+                "superseded certificates retired"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                tenant = %scope.tenant(),
+                environment = %scope.environment(),
+                %error,
+                "certificate retirement failed for this scope; other scopes continue"
+            ),
+        }
+    }
+}
+
 /// Start the pass ticker, or [`None`] if it cannot run.
 async fn start_certificate_sweep(
     inputs: CertificateSweepInputs,
@@ -3602,6 +3652,12 @@ async fn start_certificate_sweep(
     };
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
     let leads = settings.leads.clone();
+    // COPIED FOR THE LOG BEFORE `settings` MOVES INTO THE TICKER. Reading them off `settings`
+    // after the spawn is a borrow of a moved value, and reaching for a clone of the whole thing
+    // to fix that would hide which two numbers the line actually reports.
+    let interval_secs = settings.interval.as_secs();
+    let announced_leads = settings.leads.clone();
+    let rollover_window_secs = settings.rollover_window_secs;
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(settings.interval);
         // DELAY, not Burst. A process that was paused past several ticks must not then run that
@@ -3620,6 +3676,11 @@ async fn start_certificate_sweep(
             .await
             {
                 Ok(report) => {
+                    // ON THE SAME TICK, because they are two ends of one lifecycle and a
+                    // deployment tuning how often it looks at certificates means both. Retirement
+                    // runs AFTER the announcement pass so a certificate is never retired in the
+                    // same tick that first warned about its replacement.
+                    retire_pass(&control_store, &env, scopes.as_ref(), &settings).await;
                     if report.announced > 0 || report.failed > 0 {
                         tracing::info!(
                             swept = report.swept,
@@ -3651,8 +3712,9 @@ async fn start_certificate_sweep(
         }
     });
     tracing::info!(
-        interval_secs = settings.interval.as_secs(),
-        leads_secs = ?settings.leads,
+        interval_secs = interval_secs,
+        leads_secs = ?announced_leads,
+        rollover_window_secs = rollover_window_secs,
         "certificate expiry alerting started"
     );
     Some(handle)
@@ -3701,6 +3763,10 @@ fn certificate_sweep_settings(config: &Config) -> Option<CertificateSweepSetting
             config.certificate_expiry.sweep_interval_secs.max(1),
         ),
         batch: i64::from(config.certificate_expiry.sweep_batch),
+        rollover_window_secs: i64::from(config.certificate_expiry.rollover_window_days)
+            * 24
+            * 60
+            * 60,
     })
 }
 
@@ -3713,6 +3779,8 @@ struct CertificateSweepSettings {
     interval: std::time::Duration,
     /// How many pairs one SCOPE's pass may announce. See `CertificateExpiryConfig::sweep_batch`.
     batch: i64,
+    /// How long a superseded certificate stays trusted, in seconds. Zero disables retirement.
+    rollover_window_secs: i64,
 }
 
 /// Every consumer the MESSAGING worker registers.
@@ -7673,6 +7741,10 @@ mod certificate_sweep_wiring_tests {
                 leads: vec![30 * 86_400, 14 * 86_400, 3 * 86_400],
                 interval: std::time::Duration::from_secs(3_600),
                 batch: 500,
+                // THIRTY DAYS, in seconds. Written out rather than read from the constant,
+                // because an expectation taken from the thing it checks passes whatever that
+                // thing says.
+                rollover_window_secs: 30 * 24 * 60 * 60,
             },
             "the shipped defaults are the ones 0208 documents"
         );
