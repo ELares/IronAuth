@@ -33,7 +33,7 @@
 //! the first and says so; where the order would change identity -- the stable id -- a
 //! multi-valued attribute is refused outright rather than resolved by luck.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -268,4 +268,43 @@ pub fn principal_for(
         email,
         display_name,
     })
+}
+
+/// The attributes a search must request in order for [`principal_for`] to be able to do its job.
+///
+/// DERIVED FROM THE MAPPING, never written at the call site. The reason is a property of the
+/// protocol rather than of this code: `entryUUID` and `objectGUID` are OPERATIONAL attributes, and
+/// a search that does not name them does not receive them. Verified against a live `OpenLDAP` --
+/// `ldapsearch "(uid=ada)"` returns no `entryUUID`, `ldapsearch "(uid=ada)" entryUUID` does.
+///
+/// A caller that hand-listed the attributes and forgot the identifier would get entries that all
+/// appear to have no UUID, so all of them would take the DN fallback. Every person in the
+/// directory would silently become rename-fragile, and nothing would report it: the mapping still
+/// succeeds, the sync still runs, and the breakage only shows up when somebody changes their name
+/// and gets deprovisioned.
+///
+/// The returned list is deduplicated and lowercased, matching how [`DirectoryEntry`] keys itself.
+#[must_use]
+pub fn attributes_to_request(mapping: &Value) -> Vec<String> {
+    let mut wanted: BTreeSet<String> = STABLE_ID_ATTRIBUTES
+        .iter()
+        .map(|(attribute, _)| (*attribute).to_owned())
+        .collect();
+
+    // The default username source, which applies when the mapping does not override it. Omitting
+    // it would break exactly the connectors that configured nothing.
+    wanted.insert("uid".to_owned());
+
+    if let Some(object) = mapping.as_object() {
+        for (field, source) in object {
+            if !MAPPABLE.contains(&field.as_str()) {
+                continue;
+            }
+            if let Value::String(attribute) = source {
+                wanted.insert(attribute.to_ascii_lowercase());
+            }
+        }
+    }
+
+    wanted.into_iter().collect()
 }

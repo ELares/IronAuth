@@ -15,6 +15,7 @@ repository.workspace = true
 autotests = false
 
 [dependencies]
+ldap3.workspace = true
 ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-connector.workspace = true
@@ -161,6 +162,10 @@ path = "tests/delegated_admin.rs"
 required-features = ["testing"]
 
 # The organization contact surface (issue #141). Needs a database, like its neighbours.
+[[test]]
+name = "ldap_client"
+path = "tests/ldap_client.rs"
+
 [[test]]
 name = "ldap_groups"
 path = "tests/ldap_groups.rs"
