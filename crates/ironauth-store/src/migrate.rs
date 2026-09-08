@@ -1737,6 +1737,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0211_portal_audit_intent.sql"),
         },
+        Migration {
+            version: 212,
+            name: "ldap_connectors",
+            // EXPAND. A new table with no writer on any older binary, so nothing reads or writes
+            // it during a rolling upgrade and there is nothing to backfill.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0212_ldap_connectors.sql"),
+        },
     ]
 }
 
