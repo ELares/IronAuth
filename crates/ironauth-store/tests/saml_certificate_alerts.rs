@@ -892,8 +892,10 @@ async fn a_certificate_of_a_removed_organization_is_not_due() {
     // TWO EARLIER REASONS HERE WERE MEASURABLY FALSE, which is why this one is labelled for what
     // it is. "Its contacts are gone": they are not. "It signs nobody in": it does -- removal
     // writes `organizations.deleted_at` and nothing else, and the SAML sign-in path never reads
-    // that column. Both are exactly why the filter has to be explicit: nothing downstream would
-    // stop the notice going out.
+    // that column. (The AUTHORIZATION side IS fenced -- such an organization resolves to the
+    // empty role set -- so the sign-in survives and grants nothing. The claim was wrong about
+    // sign-in, not about safety.) Both are why the filter must be explicit: nothing downstream
+    // would stop the notice going out.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
