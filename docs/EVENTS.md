@@ -4199,9 +4199,9 @@ as a sentinel, so an absent one means absent.
 
 | Type | Payload version |
 |---|---|
-| `saml_certificate.expiring` | 1 |
+| `saml_certificate.expiry_announced` | 1 |
 
-### `saml_certificate.expiring` v1
+### `saml_certificate.expiry_announced` v1
 
 ```json
 {
