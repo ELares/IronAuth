@@ -1369,6 +1369,266 @@ async fn creating_a_user_delivers_a_signed_event_to_every_active_endpoint() {
     }
 }
 
+/// Seeding for the certificate-expiry chain test, ported from the sweep's own suite so both
+/// binaries build the same fixture: an organization, a SAML connection, and a pinned
+/// certificate a chosen distance from expiry.
+use ironauth_store::test_support::TestDatabase;
+use ironauth_store::{
+    CorrelationId, NewSamlCertificate, NewSamlConnection, OrganizationId, SamlCertificateId,
+    SamlConnectionId, SamlKeyKind,
+};
+use serde_json::json;
+
+const DAY_SECS: i64 = 24 * 60 * 60;
+
+fn p256_point(seed: u8) -> Vec<u8> {
+    let mut point = vec![0x04];
+    point.extend(std::iter::repeat_n(seed, 64));
+    point
+}
+
+fn fingerprint(seed: u8) -> Vec<u8> {
+    std::iter::repeat_n(seed, 32).collect()
+}
+
+fn now_micros(env: &Env) -> i64 {
+    i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_micros(),
+    )
+    .expect("fits i64")
+}
+
+async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope, name: &str) -> OrganizationId {
+    let id = OrganizationId::generate(env, &scope);
+    db.control_store()
+        .management()
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .organizations(scope)
+        .create(env, &id, now_micros(env), name, None)
+        .await
+        .expect("create organization");
+    id
+}
+
+async fn connect(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    idp_entity_id: &str,
+) -> SamlConnectionId {
+    let id = SamlConnectionId::generate(env, &scope);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .saml_connections()
+        .create(
+            env,
+            NewSamlConnection {
+                id: &id,
+                organization_id: organization,
+                display_name: "Okta",
+                idp_entity_id,
+                idp_sso_url: "https://idp.example/sso",
+                sp_entity_id: "https://ironauth.example/saml/metadata",
+                acs_url: "https://ironauth.example/saml/acs",
+                allow_unsolicited: false,
+                clock_skew_secs: 30,
+                max_assertion_age_secs: 300,
+                nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+                attribute_mapping: &json!({}),
+                require_encrypted_assertion: false,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create the SAML connection");
+    id
+}
+
+async fn pin_expiring(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    connection: &SamlConnectionId,
+    seed: u8,
+    in_secs: i64,
+) -> SamlCertificateId {
+    let id = SamlCertificateId::generate(env, &scope);
+    let now = now_micros(env);
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .saml_connections()
+        .pin_certificate(
+            env,
+            NewSamlCertificate {
+                id: &id,
+                connection_id: connection,
+                key_kind: SamlKeyKind::EcdsaP256,
+                public_key: &p256_point(seed),
+                rsa_exponent: None,
+                certificate_der: &[0x30, 0x82, seed],
+                fingerprint_sha256: &fingerprint(seed),
+                not_before_unix_micros: now + (in_secs - 365 * DAY_SECS) * 1_000_000,
+                not_after_unix_micros: now + in_secs * 1_000_000,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("pin the certificate");
+    id
+}
+
+#[tokio::test]
+async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhook() {
+    // THE RENEWAL WEBHOOK of issue #141, criterion 1, end to end. The sweep that decides a
+    // certificate has crossed a lead shipped separately from the webhook subsystem, and each
+    // has its own tests; NOTHING joined them. That is the shape the `user.created` chain test
+    // above was written for after eight PRs of a broken chain, so it gets measured here on the
+    // day the producer lands rather than the day a customer's logins break.
+    //
+    // It also pins the ROUTING: a vendor subscribes to the events it acts on, and an expiry
+    // notice must not arrive at an endpoint that asked for something else.
+    use ironauth_admin::certificate_expiry;
+    use ironauth_admin::events::WebhookFanoutConsumer;
+    use ironauth_store::{WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER};
+    use std::time::Duration;
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (subscribed, secret, base) = register(&h, &tenant, &environment).await;
+    let (uninterested, _, _) = register_as(&h, &tenant, &environment, "k-register-2").await;
+    for (endpoint, wanted, key) in [
+        (&subscribed, "saml_certificate.expiring", "k-types-1"),
+        (&uninterested, "user.created", "k-types-2"),
+    ] {
+        let (status, _, body) = h
+            .put_with_key(
+                &format!("{base}/{endpoint}/event-types"),
+                key,
+                &serde_json::json!({ "event_types": [wanted] }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let scope = scope_of(&tenant, &environment);
+    let env = Env::system();
+    let store = h.store().clone();
+
+    // A certificate two days from expiry, with one lead configured at three days: it has
+    // crossed, exactly once.
+    let organization = seed_org(h.db(), &env, scope, "Contoso").await;
+    let connection = connect(h.db(), &env, scope, &organization, "https://idp.example/e").await;
+    let certificate = pin_expiring(h.db(), &env, scope, &connection, 7, 2 * DAY).await;
+    // Provisioning, the subscription changes and the pin are all audited writes that emit
+    // events of their own; the chain under test starts after them.
+    drain_setup_events(&store, &env, scope).await;
+
+    // THE PRODUCER, on the CONTROL plane: 0208 grants the alert ledger to `ironauth_control`
+    // alone, so the data-plane store fails on its first read. Driving this test through the
+    // wrong plane is how that was confirmed.
+    let report = certificate_expiry::run_once(h.control_store(), &env, scope, &[3 * DAY], 50)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.announced, 1, "one certificate, one crossed lead");
+
+    // LINK ONE: it announced, on the feed every webhook rides.
+    let events = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_EVENT_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the event");
+    assert_eq!(events.len(), 1, "the sweep emits exactly one event");
+    let envelope = &events[0].payload;
+    assert_eq!(envelope["type"], "saml_certificate.expiring", "{envelope}");
+    assert_eq!(
+        envelope["payload"]["saml_certificate_id"],
+        certificate.to_string(),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["payload"]["saml_connection_id"],
+        connection.to_string(),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["payload"]["organization_id"],
+        organization.to_string(),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["payload"]["lead_secs"],
+        3 * DAY,
+        "the notice carries the lead it was sent for, not just the expiry: {envelope}"
+    );
+    let event_id = envelope["id"].as_str().expect("event id").to_owned();
+
+    // LINK TWO: it reaches the endpoint that asked for it, and ONLY that one.
+    WebhookFanoutConsumer::new(store.clone())
+        .handle(&env, scope, &events[0])
+        .await
+        .expect("the fan-out runs");
+    let deliveries = store
+        .scoped(scope)
+        .outbox()
+        .claim(&env, WEBHOOK_DELIVERY_CONSUMER, Duration::from_secs(30), 10)
+        .await
+        .expect("claim the deliveries");
+    let targets: Vec<&str> = deliveries.iter().map(|d| d.ordering_key.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![subscribed.as_str()],
+        "the subscriber is delivered to and the endpoint that asked for user.created is not"
+    );
+    assert_ne!(
+        subscribed, uninterested,
+        "the two endpoints are distinct, or the line above proves nothing"
+    );
+
+    // LINK THREE: the vendor can verify it, and it does not carry the customer's trust
+    // material.
+    let body = deliver_and_verify(&store, &env, scope, &deliveries[0], &secret).await;
+    assert_eq!(body["type"], "saml_certificate.expiring", "{body}");
+    assert_eq!(body["id"], event_id, "{body}");
+    let mut carried: Vec<&str> = body["payload"]
+        .as_object()
+        .expect("a payload object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    carried.sort_unstable();
+    assert_eq!(
+        carried,
+        vec![
+            "lead_secs",
+            "not_after_unix_ms",
+            "organization_id",
+            "saml_certificate_id",
+            "saml_connection_id",
+        ],
+        "the catalog promises no certificate bytes and no fingerprint on the wire: {body}"
+    );
+    // The key list above is what the catalog schema forbids widening. This is the same
+    // promise checked by VALUE, so smuggling the fingerprint into a permitted field -- an
+    // id, or a future free-text field -- fails here too.
+    let wire = body.to_string();
+    assert!(
+        !wire.contains(&"07".repeat(32)),
+        "the SHA-256 fingerprint must not appear anywhere on the wire: {wire}"
+    );
+}
+
 /// Deliver one queued message and verify its signature under `secret`, returning the body
 /// the receiver was sent.
 ///
