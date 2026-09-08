@@ -31,7 +31,6 @@ crates/ironauth-admin/src/events.rs:explode:1
 crates/ironauth-admin/src/trait_migration_worker.rs:advance_one:1
 crates/ironauth-oidc/src/backchannel.rs:explode:1
 crates/ironauth-oidc/src/message_sender.rs:enqueue_notice:1
-crates/ironauth-oidc/src/portal_route.rs:queue_pin:1
 crates/ironauth-store/src/repository.rs:abandon_with_event:1
 crates/ironauth-store/src/repository.rs:activate_version_idempotent_with_event:1
 crates/ironauth-store/src/repository.rs:add_allowlist_country_with_event:1
