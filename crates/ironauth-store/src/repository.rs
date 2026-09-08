@@ -22231,6 +22231,21 @@ pub const TRAIT_MIGRATION_CONSUMER: &str = "traits.migration";
 /// a worker that executes whatever has come due.
 pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
 
+/// The consumer that turns ONE recorded expiry notice into mail for the organization's IT
+/// contacts (issue #141).
+///
+/// Two stages rather than one, for the reason [`WEBHOOK_EVENT_CONSUMER`] gives: the sweep must
+/// not enqueue a message per contact inside the transaction that records the notice, or the cost
+/// of announcing one certificate grows with how many people an organization has listed. It is
+/// also the wrong transaction to hold: [`MessageRepo::enqueue`] takes a per-recipient advisory
+/// lock, and taking N of those inside the ledger write would order two locks against each other
+/// on a path that already races with certificate rollover.
+///
+/// It rides its OWN row rather than sharing the webhook one, because a single outbox row is
+/// claimed by exactly one consumer: a second consumer named on the same row drains nothing, and
+/// does so silently.
+pub const CERTIFICATE_NOTICE_CONSUMER: &str = "saml_certificate.notice";
+
 /// The registered consumer name a DOMAIN EVENT is fanned out under (issues #105, #108).
 ///
 /// The webhook chain had every stage but its first: endpoints could be registered, secrets
@@ -77163,6 +77178,27 @@ impl SamlCertificateAlertRepo<'_> {
         // IN THE LEDGER ROW'S OWN TRANSACTION, so "recorded" and "announced" are one fact. The
         // conflict above returns BEFORE this, so a loser announces nothing.
         enqueue_domain_event(&mut tx, env, self.scope, event).await?;
+        // AND THE MAIL, in that same transaction and for the same reason. A notice recorded
+        // without one leaves the ledger saying an organization was told about an expiry nobody
+        // told them about, and the ledger is what stops the next pass from trying again.
+        //
+        // The row carries the envelope rather than the recipients: who is on the contact list is
+        // resolved by the consumer, at the moment it sends, so a contact added between the sweep
+        // and the send is included and one removed is not.
+        if let Some(event) = event {
+            enqueue_outbox_in_tx(
+                &mut tx,
+                env,
+                self.scope,
+                &NewOutboxMessage {
+                    consumer: CERTIFICATE_NOTICE_CONSUMER,
+                    idempotency_key: event.id,
+                    ordering_key: event.subject,
+                    payload: event.envelope.clone(),
+                },
+            )
+            .await?;
+        }
         if poison_after_enqueue {
             // Testing seam only (every production caller passes false): a guaranteed error after
             // BOTH writes are staged, so their joint rollback is what proves they share one
