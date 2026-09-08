@@ -76886,8 +76886,19 @@ impl PortalLinkRepo<'_> {
 pub struct DueCertificateAlert {
     /// The certificate, `saml_connection_certificates.id`.
     pub certificate_id: String,
-    /// The connection it is pinned on, so a caller can find the organization to notify.
+    /// The connection it is pinned on.
     pub connection_id: String,
+    /// The organization whose contacts must be told.
+    ///
+    /// CARRIED RATHER THAN LOOKED UP, because the alternative is resolving it per row: an extra
+    /// query for every work item, and a second chance to resolve the WRONG one. It is the
+    /// connection's own `organization_id`, joined here, so a work item cannot name an
+    /// organization that does not own the certificate it is about.
+    ///
+    /// NOTHING CONSUMES THIS YET. The sweep #141 describes -- read the due items, read those
+    /// organizations' contacts, deliver, record -- is not written; this is the field it will
+    /// route on, and saying so is not the same as saying it routes.
+    pub organization_id: String,
     /// The lead this row is due for, in seconds. One certificate can be due for MORE THAN ONE
     /// lead on a single pass -- a sweep that has not run for a month crosses several at once --
     /// and each is its own entry here rather than being collapsed to the nearest.
@@ -76913,9 +76924,51 @@ impl SamlCertificateAlertRepo<'_> {
     /// died last week is worse than silence -- it tells an operator the wrong thing about how
     /// much time they have. Expiry itself is a different event and belongs to connection health.
     ///
+    /// # The organization comes from the join, not from a second query
+    ///
+    /// Resolving it per row would mean an extra query for every work item and a second chance to
+    /// resolve the wrong one. What the join must not get wrong is WHOSE organization: both
+    /// organizations in an environment are scope-legal and both have real contact lists, so
+    /// pairing a certificate with the wrong one tells a customer about another customer's
+    /// identity provider and no tenant fence notices.
+    ///
+    /// THE JOIN IS INNER, AND THAT IS THE ONLY THING IT CHANGES. Measured against a replica of
+    /// 0196/0197/0208: under forced row-level security an id-only join resolves a foreign
+    /// connection to ZERO rows rather than to a foreign row, so the misroute an earlier version
+    /// of this paragraph warned about is not a state the query can reach, and the scope columns
+    /// in the condition change no result. What the join DOES change is that a certificate whose
+    /// connection is not visible in this scope stops producing a work item at all -- silently,
+    /// with no row and no error.
+    ///
+    /// A REMOVED ORGANIZATION PRODUCES NO WORK ITEM EITHER, though NOT because its contacts are
+    /// gone -- they are not. `org_contacts` filters each CONTACT's own `deleted_at` and never the
+    /// organization's, so a soft-deleted organization keeps a readable contact list, and an
+    /// earlier version of this paragraph was wrong to say otherwise.
+    ///
+    /// The reason is that there is nothing left to warn ABOUT. A removed organization signs
+    /// nobody in, so its identity provider's certificate expiring breaks nothing, and a notice
+    /// saying "renew this or logins stop" is false on its face. That the contacts are still
+    /// reachable is exactly why this filter has to be explicit: without it the sweep would find
+    /// somebody to tell and tell them.
+    ///
+    /// A DISABLED ORGANIZATION STILL GETS ITS NOTICE, and that is a decision rather than an
+    /// oversight. `organizations` carries TWO lifecycle facts -- `deleted_at` and a `state` of
+    /// `active` or `disabled` -- and only the first is filtered here. Disabling is reversible and
+    /// administrative: the customer still exists, their contact list is still there, and the
+    /// certificate is still theirs. Suppressing the warning would mean an organization disabled
+    /// across its lead windows comes back with a dead certificate and no one ever told them,
+    /// which is the outage this feature exists to prevent, arrived at by a different route.
+    ///
+    /// THAT SILENT DROP IS THE RIGHT ANSWER AND STILL WORTH NAMING. Such a certificate has no
+    /// organization to notify, so there is nothing a work item could do with it. It is also not
+    /// reachable today: `pin_certificate` refuses a cross-scope connection with its own
+    /// `WHERE EXISTS`, and it is the only insert into that table. The schema alone would allow
+    /// the row -- 0197's foreign key names the connection by id and referential integrity
+    /// bypasses row security -- so what keeps it out is the repository, as 0205 says.
+    ///
     /// # A repeated lead is one lead
     ///
-    /// The caller's list is DISTINCTed before the join. A configuration that names thirty days
+    /// The caller's list is de-duplicated before the join. A configuration that names thirty days
     /// twice is one threshold, not two, and without this it would yield the pair twice -- so a
     /// sweep would send two identical notices, and the second `record_sent` would answer
     /// `Conflict` for a notice it had genuinely just delivered.
@@ -76940,9 +76993,14 @@ impl SamlCertificateAlertRepo<'_> {
         }
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
-            "SELECT c.id AS certificate_id, c.connection_id, l.lead_secs, \
+            "SELECT c.id AS certificate_id, c.connection_id, n.organization_id, l.lead_secs, \
                     (EXTRACT(EPOCH FROM c.not_after) * 1000000)::bigint AS not_after_us \
              FROM saml_connection_certificates c \
+             JOIN saml_connections n ON n.id = c.connection_id \
+                                    AND n.tenant_id = c.tenant_id \
+                                    AND n.environment_id = c.environment_id \
+             JOIN organizations o ON o.id = n.organization_id \
+                                 AND o.deleted_at IS NULL \
              CROSS JOIN (SELECT DISTINCT unnest AS lead_secs \
                          FROM UNNEST($3::bigint[])) AS l \
              LEFT JOIN saml_certificate_expiry_alerts a \
@@ -76972,6 +77030,7 @@ impl SamlCertificateAlertRepo<'_> {
             .map(|row| DueCertificateAlert {
                 certificate_id: row.get("certificate_id"),
                 connection_id: row.get("connection_id"),
+                organization_id: row.get("organization_id"),
                 lead_secs: row.get("lead_secs"),
                 not_after_unix_micros: row.get("not_after_us"),
             })

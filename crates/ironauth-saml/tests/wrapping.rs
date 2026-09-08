@@ -321,7 +321,7 @@ fn the_embedded_certificate_fixture_parses_as_x509() {
 /// that `KeyInfo` is ignored rested on reading the parser, a structural argument of exactly the
 /// kind that stops being true when somebody adds the field and no test notices.
 ///
-/// NOT "no KeyInfo anywhere", which two earlier versions of this sentence said and which is
+/// NOT "no `KeyInfo` anywhere", which two earlier versions of this sentence said and which is
 /// plainly false: the SP metadata this deployment publishes carries one, and `encrypted.rs`
 /// reads one on an INBOUND response as the container for an `xenc:EncryptedKey`. Neither is a
 /// signer, and neither reaches a signature check.

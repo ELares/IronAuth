@@ -1997,6 +1997,12 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // consumer that needs the address reads it back through the management API, where the
         // scope and the permission are checked.
         //
+        // AND THE ORGANIZATION, because this is an organization-scoped event and every other one
+        // in this catalog carries it. A per-organization consumer -- a customer's own SIEM
+        // stream, an integration that opens tickets against the right account -- has no way to
+        // route on a connection id alone, and would have to read the connection back to learn
+        // whose it is.
+        //
         // THE CATEGORY IS HERE, because it is a closed set of three vendor-chosen words that
         // names nobody, and routing is the reason a consumer subscribes at all: "a billing
         // contact was added for this organization" is actionable without knowing who they are.
@@ -2892,12 +2898,14 @@ const REGISTERED: &[(&str, u32, &str)] = &[
             "properties": {
                 "saml_certificate_id": {"type": "string", "minLength": 1},
                 "saml_connection_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
                 "lead_secs": {"type": "integer", "minimum": 1},
                 "not_after_unix_ms": {"type": "integer"}
             },
             "required": [
                 "saml_certificate_id",
                 "saml_connection_id",
+                "organization_id",
                 "lead_secs",
                 "not_after_unix_ms"
             ]
