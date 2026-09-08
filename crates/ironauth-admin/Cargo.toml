@@ -162,6 +162,10 @@ required-features = ["testing"]
 
 # The organization contact surface (issue #141). Needs a database, like its neighbours.
 [[test]]
+name = "ldap_groups"
+path = "tests/ldap_groups.rs"
+
+[[test]]
 name = "org_contacts"
 path = "tests/org_contacts.rs"
 required-features = ["testing"]
