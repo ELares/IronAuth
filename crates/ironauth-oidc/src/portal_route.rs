@@ -437,6 +437,7 @@ pub async fn home_get(
 pub async fn surface_get(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id, intent)): Path<(String, String, String)>,
+    Query(filters): Query<AuditFilterQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
@@ -459,6 +460,9 @@ pub async fn surface_get(
     }
     if intent == "contacts" {
         return contacts_surface(&state, &session).await;
+    }
+    if intent == "audit" {
+        return audit_surface(&state, &session, &filters).await;
     }
     // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER: `sso`, `domain-verification` and
     // `log-streams`, which land in later slices of #140. The fence has already refused an intent
@@ -1288,6 +1292,136 @@ async fn queue_contact_change(
         )
         .await
         .map(|_| ())
+}
+
+/// What the audit surface narrows on, read from the query string.
+///
+/// EVERY FIELD OPTIONAL and absent means "do not narrow", matching
+/// [`ironauth_store::AuditSearch`]. The organization is deliberately not here and cannot be: it
+/// comes from the SESSION, so no query string a holder can write reaches it.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AuditFilterQuery {
+    /// Inclusive lower bound, epoch SECONDS. Seconds because this is a value a person types or
+    /// a link carries, and the store's microseconds would be six digits of noise in a URL.
+    #[serde(default)]
+    since: Option<i64>,
+    /// Inclusive upper bound, epoch seconds.
+    #[serde(default)]
+    until: Option<i64>,
+    /// An exact action, as the audit row spells it.
+    #[serde(default)]
+    action: Option<String>,
+    /// An exact actor identifier.
+    #[serde(default)]
+    actor: Option<String>,
+    /// An exact target identifier.
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// How many events one page of the audit surface shows.
+const AUDIT_PAGE: i64 = 50;
+
+/// The per-organization audit viewer (issue #141 criteria 4 and 5).
+///
+/// # The boundary is the session, not the request
+///
+/// `search_for_organization` takes the organization as a required argument and this passes
+/// `session.organization()`, which came off the portal link. Nothing in the query string can
+/// reach it, so there is no parameter for a holder to tamper with -- which is what makes the
+/// IDOR question answerable by reading this function rather than by auditing every filter.
+///
+/// # What it does NOT show
+///
+/// `detail` and `correlation_id` are on every audit row and neither is here. `detail` is free
+/// text the vendor's own handlers write for their own operators -- `event_types=a,b`, internal
+/// counts, occasionally an identifier from another subsystem -- and putting it on a
+/// customer-facing page publishes whatever a future handler happens to put in it. The
+/// correlation id is an internal request handle that means nothing outside this deployment.
+/// Both are omitted deliberately rather than forgotten.
+async fn audit_surface(
+    state: &OidcState,
+    session: &PortalSession,
+    filters: &AuditFilterQuery,
+) -> Response {
+    // SECONDS TO MICROSECONDS at the one seam that reads the query string. The store speaks
+    // microseconds and a URL speaks seconds; converting here means no other line has to know.
+    let to_micros = |seconds: Option<i64>| seconds.and_then(|s| s.checked_mul(1_000_000));
+    let search = ironauth_store::AuditSearch {
+        since_unix_micros: to_micros(filters.since),
+        until_unix_micros: to_micros(filters.until),
+        action: filters.action.as_deref(),
+        actor_id: filters.actor.as_deref(),
+        target_id: filters.target.as_deref(),
+    };
+    let read = state
+        .store()
+        .scoped(session.scope())
+        .audit()
+        .search_for_organization(session.organization(), &search, AUDIT_PAGE + 1)
+        .await;
+    let Ok(events) = read else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let mut body = String::from(
+        "<!doctype html><meta charset=\"utf-8\"><title>Activity</title><h1>Activity</h1>\
+         <p>What has happened to this organization's configuration.</p>",
+    );
+    if events.is_empty() {
+        // WHICH EMPTY IT IS. "No events" and "no events MATCHING" are different answers, and a
+        // page giving one message for both leaves a reader unable to tell an over-narrow filter
+        // from a quiet month.
+        let narrowed = filters.since.is_some()
+            || filters.until.is_some()
+            || filters.action.is_some()
+            || filters.actor.is_some()
+            || filters.target.is_some();
+        body.push_str(if narrowed {
+            "<p>No events match those filters. Widen them to see everything recorded for this \
+             organization.</p>"
+        } else {
+            "<p>Nothing has been recorded for this organization yet.</p>"
+        });
+        return crate::pages::secure_html(StatusCode::OK, body);
+    }
+
+    let limit = usize::try_from(AUDIT_PAGE).unwrap_or(usize::MAX);
+    if events.len() > limit {
+        let _ = write!(
+            body,
+            "<p>Showing the {limit} most recent. Narrow the time range to see further back.</p>"
+        );
+    }
+    body.push_str("<table><tr><th>When</th><th>What</th><th>Who</th><th>Target</th></tr>");
+    for event in events.iter().take(limit) {
+        let _ = write!(
+            body,
+            "<tr><td>{when}</td><td>{what}</td><td>{who}</td><td>{target}</td></tr>",
+            when = escape_html(&crate::saml_start::rfc3339_utc(
+                event.occurred_at_unix_micros / 1_000_000
+            )),
+            what = escape_html(&event.action),
+            who = escape_html(&actor_label(&event.actor)),
+            target = escape_html(&event.target_id),
+        );
+    }
+    body.push_str("</table>");
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// How an actor is named on the audit page.
+///
+/// THE KIND AND THE IDENTIFIER, because neither alone answers "who did this". An identifier with
+/// no kind leaves a reader unable to tell one of their own administrators from the vendor's
+/// automation, which on a page about their own configuration is the first thing they want to
+/// know.
+fn actor_label(actor: &ironauth_store::ActorRef) -> String {
+    match actor {
+        ironauth_store::ActorRef::Human(id) => format!("person {id}"),
+        ironauth_store::ActorRef::Service(id) => format!("service {id}"),
+        ironauth_store::ActorRef::Agent(id) => format!("agent {id}"),
+    }
 }
 
 /// What the renewal form posts.
