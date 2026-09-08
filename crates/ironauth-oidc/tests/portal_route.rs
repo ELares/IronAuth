@@ -370,6 +370,7 @@ async fn an_sso_session_cannot_reach_the_scim_surface() {
         "domain-verification",
         "log-streams",
         "certificate-renewal",
+        "contacts",
     ] {
         let (status, body) = get_with_cookie(&harness, &surface(forbidden), Some(&cookie)).await;
         assert_eq!(
@@ -3014,4 +3015,233 @@ async fn pasting_the_same_certificate_twice_is_answered_as_success() {
         "and the certificate is queued once, not twice"
     );
     assert_eq!(pinned_count(&harness, &connection).await, 2);
+}
+
+/// Add an IT contact to `organization`, as the vendor does over the management API.
+async fn add_contact(
+    harness: &Harness,
+    organization: &OrganizationId,
+    email: &str,
+    category: &str,
+) -> ironauth_store::OrgContactId {
+    let env = Env::system();
+    let scope = harness.scope();
+    let id = ironauth_store::OrgContactId::generate(&env, &scope);
+    let now = i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_micros(),
+    )
+    .expect("in range");
+    harness
+        .db()
+        .control_store()
+        .scoped(scope)
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .org_contacts()
+        .add(
+            &env,
+            ironauth_store::NewOrgContact {
+                id: &id,
+                organization_id: organization,
+                display_name: "A Person",
+                email,
+                category,
+                created_at_micros: now,
+            },
+        )
+        .await
+        .expect("add the contact");
+    id
+}
+
+async fn contacts_page(harness: &Harness, organization: &OrganizationId, key: &str) -> String {
+    let cookie = open_session_in(harness, "contacts", key, organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/contacts",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let (status, body) = get_with_cookie(harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn the_contacts_page_lists_this_organizations_contacts_and_what_each_receives() {
+    // #141 criterion 3's portal half: the customer's own administrator sees who operational
+    // notices reach, without going through their vendor.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+    add_contact(&harness, &organization, "soc@contoso.test", "security").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(body.contains("ops@contoso.test"), "{body}");
+    assert!(body.contains("soc@contoso.test"), "{body}");
+    // THE CATEGORY IN THE READER'S WORDS. Printing the stored value raw would make them guess
+    // which category receives a certificate warning, and guessing wrong there is how a list ends
+    // up looking complete while warning nobody.
+    assert!(
+        body.contains("certificate expiry"),
+        "the technical row must say it receives certificate warnings: {body}"
+    );
+    assert!(
+        body.contains("security notices"),
+        "and the security row must say what it receives: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_list_with_no_technical_contact_says_nobody_is_warned() {
+    // THE ONE ABSENCE WORTH CALLING OUT. Certificate expiry notices reach the TECHNICAL contacts
+    // only, so a list of security and billing contacts looks populated and warns nobody about
+    // the thing most likely to break this organization's sign-in.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    add_contact(&harness, &organization, "soc@contoso.test", "security").await;
+    add_contact(&harness, &organization, "ap@contoso.test", "billing").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(
+        body.contains("soc@contoso.test"),
+        "the list is not empty: {body}"
+    );
+    assert!(
+        body.contains("nobody here is warned"),
+        "a list with no technical contact must say so: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_contact_list_says_what_it_costs() {
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(
+        body.contains("reach nobody"),
+        "an empty list must say that notices reach nobody: {body}"
+    );
+    assert!(
+        body.contains("certificate expires"),
+        "and name the consequence a reader will care about: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_contacts_session_sees_only_its_own_organizations_contacts() {
+    // A contact list is a list of people's names and work addresses. A holder for one
+    // organization seeing a neighbour's is a disclosure of exactly the thing the portal link's
+    // single-organization scope exists to prevent.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    add_contact(&harness, &mine, "ops@contoso.test", "technical").await;
+    add_contact(&harness, &theirs, "ops@initech.test", "technical").await;
+
+    let body = contacts_page(&harness, &mine, "k-contacts").await;
+
+    assert!(body.contains("ops@contoso.test"), "{body}");
+    assert!(
+        !body.contains("ops@initech.test"),
+        "a contacts session must not see another organization's people: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_technical_contact_past_the_page_bound_is_not_reported_as_nobody() {
+    // THE PAGE MUST NOT CONTRADICT THE ROUTER. `CertificateNoticeConsumer` loops the contact
+    // list TO EXHAUSTION and mails every technical contact wherever it sorts; this page shows a
+    // bounded number. Counting technical contacts only over the RENDERED rows let an
+    // organization whose hundred security contacts sort ahead of its one technical contact read
+    // "nobody here is warned" while the router was warning that person.
+    //
+    // NO FIXTURE HERE EVER REACHED THE BOUND before this test -- the largest was two rows -- so
+    // the truncation banner was unmeasured too.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    for index in 0..101 {
+        add_contact(
+            &harness,
+            &organization,
+            &format!("soc{index}@contoso.test"),
+            "security",
+        )
+        .await;
+    }
+    // Added last, so it sorts last in the (created_at, id) order the listing uses.
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(
+        body.contains("Showing the first"),
+        "a truncated list must admit its bound: {body}"
+    );
+    assert!(
+        !body.contains("so nobody here is warned"),
+        "the page claimed nobody is warned while a technical contact exists: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_no_technical_warning_is_absent_when_a_technical_contact_is_listed() {
+    // MEASURED IN ONE DIRECTION ONLY until now. The suite proved the sentence CAN appear;
+    // nothing proved it does not appear when it should not. Making the technical count
+    // permanently zero left all 52 tests green while every page carried a warning
+    // contradicting its own table.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+    add_contact(&harness, &organization, "soc@contoso.test", "security").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(body.contains("ops@contoso.test"), "{body}");
+    assert!(
+        !body.contains("nobody here is warned"),
+        "a list WITH a technical contact must not warn that nobody is warned: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_category_nothing_routes_to_says_so_rather_than_promising_mail() {
+    // THE RECEIVES COLUMN IS A CLAIM. `CertificateNoticeConsumer` is the only delivery path any
+    // contact category feeds and it compares against `technical` alone -- nothing in the tree
+    // sends a security notice or a billing one. Under a heading saying these are the people
+    // operational notices reach, a cell reading "security notices" tells a customer they are
+    // covered for something no producer exists for.
+    //
+    // The billing arm was also unmeasured outright: replacing its text with the technical
+    // sentence left every test green.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+    add_contact(&harness, &organization, "soc@contoso.test", "security").await;
+    add_contact(&harness, &organization, "ap@contoso.test", "billing").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(
+        body.contains("SSO and provisioning problems, including certificate expiry"),
+        "the technical row must say what it actually receives: {body}"
+    );
+    assert_eq!(
+        body.matches("none are sent yet").count(),
+        2,
+        "both the security and the billing row must say nothing is sent to them: {body}"
+    );
+    assert!(
+        !body.contains(">security notices<"),
+        "and neither may promise mail with no producer behind it: {body}"
+    );
 }
