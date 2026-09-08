@@ -942,12 +942,13 @@ pub struct RenewalPinForm {
 
 /// Pin a replacement certificate from the renewal surface (issue #141 criterion 2).
 ///
-/// # This is the first caller `pin_certificate` has ever had
+/// # `pin_certificate` gets its first production caller, though not this one
 ///
 /// The store has been able to pin a SAML certificate since 0197 and nothing outside tests ever
-/// did it. So the operational story the expiry alerting tells -- "your certificate is about to
+/// did it, so the operational story the expiry alerting tells -- "your certificate is about to
 /// expire, here is a link, replace it" -- ended at a page that could only describe the problem.
-/// This is the half that resolves it.
+/// This handler is what starts the work; the caller is
+/// `ironauth_admin::certificate_pin_requests`, on the control plane, for the reason below.
 ///
 /// # Pinning ADDS, and that is the overlap
 ///
@@ -1065,10 +1066,15 @@ pub async fn renewal_pin_post(
 ///
 /// # What the row carries
 ///
-/// The DER, the connection and the portal session. The DER is public material -- it is what an
-/// identity provider publishes -- so it is not a secret riding a queue; the SESSION is on the row
-/// so the audit the pin writes can name the link this came through rather than attributing a
-/// customer's key change to a background worker.
+/// The DER and the connection, and nothing else. The DER is public material -- it is what an
+/// identity provider publishes -- so it is not a secret riding a queue.
+///
+/// AN EARLIER VERSION ALSO CARRIED THE PORTAL SESSION ID, with a sentence saying it was there so
+/// the audit the pin writes could name the link this came through. Nothing read it: the pin is
+/// audited as a freshly-minted service actor either way, so the field was a durable payload
+/// column supporting a property the code did not have. Removed rather than left as decoration.
+/// Attributing the pin to the link is worth doing and is its own change: it needs an actor kind
+/// the audit layer does not currently have.
 async fn queue_pin(
     state: &OidcState,
     session: &PortalSession,
@@ -1079,12 +1085,29 @@ async fn queue_pin(
     use sha2::{Digest as _, Sha256};
 
     let scope = session.scope();
-    // THE FINGERPRINT IS THE IDEMPOTENCY KEY. A holder who double-submits, or whose browser
-    // retries, must not queue the same certificate twice: the second enqueue collides and the
-    // outbox refuses it, so the pin happens once however many times the form is posted.
-    let fingerprint = Sha256::digest(der);
-    let mut key = String::with_capacity(fingerprint.len() * 2);
-    for byte in fingerprint.as_slice() {
+    // THE CONNECTION AND THE FINGERPRINT, length-prefixed. A holder who double-submits, or whose
+    // browser retries, must not queue the same certificate twice.
+    //
+    // AN EARLIER VERSION KEYED ON THE FINGERPRINT ALONE, which is wrong in a way that reaches
+    // across customers: the outbox's uniqueness is per (tenant, environment, consumer, key), so
+    // two organizations in one environment pasting the SAME certificate -- both federating with
+    // the same identity provider, which is ordinary -- collided, and the second organization's
+    // renewal could never be queued at all. Keying on the pair makes "the same paste for the same
+    // connection" the thing that collapses, which is what idempotent means here.
+    let mut hasher = Sha256::new();
+    let connection_text = connection.to_string();
+    // Length-prefixed for the reason `dedup_key` gives: joined plainly, a crafted identifier
+    // could collide with a different (connection, certificate) pair and suppress its pin.
+    hasher.update(
+        u64::try_from(connection_text.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(connection_text.as_bytes());
+    hasher.update(der);
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
         use std::fmt::Write as _;
         let _ = write!(key, "{byte:02x}");
     }
@@ -1092,7 +1115,7 @@ async fn queue_pin(
         .store()
         .scoped(scope)
         .outbox()
-        .enqueue(
+        .enqueue_once(
             state.env(),
             &ironauth_store::NewOutboxMessage {
                 consumer: ironauth_store::CERTIFICATE_PIN_REQUEST_CONSUMER,
@@ -1102,13 +1125,14 @@ async fn queue_pin(
                 ordering_key: &connection.to_string(),
                 payload: serde_json::json!({
                     "saml_connection_id": connection.to_string(),
-                    "portal_session_id": session.id().to_string(),
                     "certificate_der_base64":
                         base64::engine::general_purpose::STANDARD.encode(der),
                 }),
             },
         )
         .await
+        // ALREADY QUEUED IS DONE. `enqueue_once` reports which happened; the holder is told the
+        // same thing either way, because to them both mean their certificate is on its way.
         .map(|_| ())
 }
 

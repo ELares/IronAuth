@@ -67,9 +67,11 @@ impl CertificatePinRequestConsumer {
             .as_str()
             .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
             .ok_or_else(|| ConsumerError::permanent("pin_request_without_certificate"))?;
-        // PERMANENT, NOT RETRYABLE. A row whose DER does not parse will not parse on the fifth
-        // attempt either; retrying would burn the budget and delay the dead letter that is the
-        // only way an operator learns this happened.
+        // PERMANENT, NOT RETRYABLE. A row whose DER does not parse will not parse on a later
+        // attempt either. The budget is `outbox.max_attempts`, which defaults to FOURTEEN over
+        // roughly a day and a half -- an earlier version of this comment said five, which is what
+        // that setting used to be -- so retrying would hold the dead letter back by that long,
+        // and the dead letter is the only way an operator learns this happened.
         let parsed = ironauth_saml::x509::pinned(&der)
             .map_err(|_| ConsumerError::permanent("pin_request_certificate_unreadable"))?;
 
