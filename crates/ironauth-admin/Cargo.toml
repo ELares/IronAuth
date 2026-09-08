@@ -171,6 +171,12 @@ required-features = ["testing"]
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
 
+# Who joined and who left between two directory reads (issue #142). NO database: pure set
+# comparison plus the rules about when a departure may be concluded at all.
+[[test]]
+name = "ldap_diff"
+path = "tests/ldap_diff.rs"
+
 # Expanding nested directory groups (issue #142). NO database: the expansion runs against a fixed
 # graph through the `GroupSource` trait.
 [[test]]
