@@ -73,6 +73,15 @@ pub enum DirectoryError {
         /// What was configured.
         url: String,
     },
+    /// The server referred part of the subtree to another directory, which this module does not
+    /// chase.
+    ///
+    /// Returned rather than ignored: the entries behind a referral are missing from the result,
+    /// and a short member set is indistinguishable from a departure.
+    Referred {
+        /// The referral URLs the server returned.
+        referrals: Vec<String>,
+    },
     /// The directory refused, or the transport failed. Includes a `StartTLS` upgrade the server
     /// declined, which is fatal rather than a reason to continue in the clear.
     Transport(ldap3::LdapError),
@@ -87,6 +96,11 @@ impl std::fmt::Display for DirectoryError {
                  protected the way the connector says it is"
             ),
             Self::UnsupportedScheme { url } => write!(f, "{url} is not an ldap:// or ldaps:// URL"),
+            Self::Referred { referrals } => write!(
+                f,
+                "the server referred part of the subtree to {}, so the result is incomplete",
+                referrals.join(", ")
+            ),
             Self::Transport(e) => write!(f, "directory transport failed: {e}"),
         }
     }
@@ -154,6 +168,10 @@ impl DirectoryConfig {
 /// A bound connection to a directory.
 pub struct Directory {
     ldap: ldap3::Ldap,
+    /// Carried from the config so a caller cannot pass a page size that disagrees with the
+    /// connector's. The first version took it as a `search_all` argument while the config field
+    /// went unread, which made the field decoration.
+    page_size: i32,
 }
 
 impl Directory {
@@ -175,30 +193,33 @@ impl Directory {
         ldap.simple_bind(&config.bind_dn, &config.bind_password)
             .await?
             .success()?;
-        Ok(Self { ldap })
+        Ok(Self {
+            ldap,
+            page_size: config.page_size,
+        })
     }
 
     /// Search, following RFC 2696 paging until the server stops returning pages.
     ///
     /// `attributes` should come from [`crate::ldap_mapping::attributes_to_request`] so the
     /// identifier attributes are always asked for -- see the module header for what silently
-    /// omitting them costs.
+    /// omitting them costs. The page size is the connector's, taken at connect time.
     ///
     /// # Errors
     ///
-    /// [`DirectoryError::Transport`] if any page fails. A partial result is never returned: a
-    /// short member list reaching a deprovisioning comparison is the failure this subsystem must
-    /// not have.
+    /// [`DirectoryError::Transport`] if any page fails, and [`DirectoryError::Referred`] if the
+    /// server referred part of the subtree elsewhere. A partial result is never returned: a short
+    /// member list reaching a deprovisioning comparison is the failure this subsystem must not
+    /// have, and a dropped referral is one of the ways a list gets short.
     pub async fn search_all(
         &mut self,
         base: &str,
         filter: &str,
         attributes: &[String],
-        page_size: i32,
     ) -> Result<Vec<DirectoryEntry>, DirectoryError> {
         let adapters: Vec<Box<dyn ldap3::adapters::Adapter<_, _>>> = vec![
             Box::new(ldap3::adapters::EntriesOnly::new()),
-            Box::new(ldap3::adapters::PagedResults::new(page_size)),
+            Box::new(ldap3::adapters::PagedResults::new(self.page_size)),
         ];
         let mut stream = self
             .ldap
@@ -208,12 +229,29 @@ impl Directory {
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await? {
             let entry = SearchEntry::construct(entry);
-            out.push(DirectoryEntry::new(
-                entry.dn,
-                entry.attrs.into_iter().collect(),
-            ));
+            // BOTH MAPS. `ldap3` routes any value that is not valid UTF-8 into `bin_attrs` and
+            // never into `attrs`, and Active Directory's `objectGUID` is sixteen raw bytes. The
+            // first version of this loop carried only `attrs`, so the octet-string support in
+            // `ldap_mapping` had no producer: every AD entry arrived with no identifier and took
+            // the rename-fragile DN fallback, silently. Requesting the attribute is necessary
+            // and was not sufficient.
+            out.push(
+                DirectoryEntry::new(entry.dn, entry.attrs.into_iter().collect())
+                    .with_binary(entry.bin_attrs.into_iter().collect()),
+            );
         }
-        stream.finish().await.success()?;
+
+        // A SEARCH THAT WAS REFERRED SOMEWHERE ELSE IS NOT A COMPLETE SEARCH. `EntriesOnly`
+        // collects continuation references and `LdapResult::success` only inspects the result
+        // code, so a subtree spanning a referral would return Ok with a SHORT list -- which is
+        // exactly the input that must not reach a deprovisioning comparison. This module does
+        // not chase referrals, so the honest answer is to refuse rather than under-report.
+        let result = stream.finish().await;
+        let refs = result.refs.clone();
+        result.success()?;
+        if !refs.is_empty() {
+            return Err(DirectoryError::Referred { referrals: refs });
+        }
         Ok(out)
     }
 

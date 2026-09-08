@@ -148,3 +148,37 @@ fn a_malformed_mapping_still_requests_the_identifiers() {
         );
     }
 }
+
+/// THE CLAIM THAT THERE IS NO WAY TO SKIP CERTIFICATE VERIFICATION, ASSERTED.
+///
+/// The module header states it as one of three headline properties, and a sentence is not a
+/// mechanism: adding `set_no_tls_verify(true)` to the connection settings left every test in this
+/// PR green. `ldap3` offers the switch, and an escape hatch that disables verification is the
+/// thing that ends up set in production "temporarily".
+///
+/// A source scan rather than a behavioural test, because the property is about what the code is
+/// ALLOWED to contain. Behaviourally it would need a server with a bad certificate and a second
+/// one with a good one, and it would still not stop the next person adding a config flag.
+#[test]
+fn nothing_in_the_client_can_turn_certificate_verification_off() {
+    let source = include_str!("../src/ldap_client.rs");
+    for line in source.lines() {
+        // The header explains the decision, so mentions in prose are fine; a call is not.
+        let code = line.split("//").next().unwrap_or("");
+        assert!(
+            !code.contains("set_no_tls_verify"),
+            "ldap_client.rs calls set_no_tls_verify: {line}"
+        );
+        assert!(
+            !code.contains("dangerous_accept"),
+            "ldap_client.rs installs a certificate verifier that accepts anything: {line}"
+        );
+    }
+    // And the guard is not vacuous: the string it hunts for is really the ldap3 API name, so a
+    // scan that never matched anything would be indistinguishable from this passing.
+    assert!(
+        source.contains("set_no_tls_verify"),
+        "the header should still explain WHY the switch is not plumbed; if that prose is gone, \
+         this guard is scanning for a name nothing would ever contain"
+    );
+}
