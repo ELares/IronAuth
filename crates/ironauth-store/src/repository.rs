@@ -76358,6 +76358,21 @@ impl SamlConnectionRepo<'_> {
     /// 3. **That replacement has been pinned for at least `window_secs`.** The customer's cutover
     ///    is not instantaneous; the window is how long they get after the new certificate lands.
     ///
+    /// # The comparison in (2) is STRICT, and that is the whole no-lockout guarantee
+    ///
+    /// Because `r.created_at > c.created_at` is strict, the row with the greatest `created_at`
+    /// on a connection can never have a newer one, so it is never returned and at least one pin
+    /// always survives. Relaxing it to `>=` empties a connection whose two certificates were
+    /// pinned at the same microsecond, each being "newer than or equal to" the other, and
+    /// `saml_acs` then refuses every sign-in with `NoTrustAnchor`.
+    ///
+    /// There was an `AND r.id <> c.id` conjunct here too. It could not fail: given a strict
+    /// comparison a row is never newer than itself, so no input distinguished its presence from
+    /// its absence -- which a mutation confirmed by surviving. Removed rather than kept as belt
+    /// and braces, because a conjunct that cannot change a result is one a reader reasons about
+    /// for nothing, and the strictness it doubled up on is now pinned by
+    /// `two_certificates_pinned_at_the_same_instant_retire_neither`.
+    ///
     /// The window is therefore measured from when the REPLACEMENT was pinned, not from when the
     /// old one expired. Those differ whenever a renewal is late, which is the case the window
     /// exists for: a certificate replaced the day after it lapsed still gets the full window.
@@ -76381,7 +76396,6 @@ impl SamlConnectionRepo<'_> {
                       WHERE r.tenant_id = c.tenant_id \
                         AND r.environment_id = c.environment_id \
                         AND r.connection_id = c.connection_id \
-                        AND r.id <> c.id \
                         AND r.created_at > c.created_at \
                         AND r.created_at <= TIMESTAMPTZ 'epoch' \
                                             + ($3::text || ' microseconds')::interval \

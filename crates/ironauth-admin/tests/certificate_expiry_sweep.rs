@@ -934,3 +934,162 @@ async fn a_zero_window_retires_nothing_at_all() {
         "the fixture must be retirable, or the zero case proves nothing"
     );
 }
+
+#[tokio::test]
+async fn two_expired_certificates_on_one_connection_still_leave_the_newest() {
+    // THE CLAUSE THAT ACTUALLY GUARANTEES A SURVIVOR, and until this test nothing measured it.
+    //
+    // `the_last_certificate_is_never_retired_however_old_it_is` names this property and cannot
+    // check it: its fixture holds ONE certificate, so the EXISTS subquery can only match the row
+    // against itself, which `r.id <> c.id` already blocks. What makes the guarantee true in
+    // general is that `r.created_at > c.created_at` is STRICT -- the row with the greatest
+    // created_at can never have a newer one, so it is never returned. Deleting that single line
+    // left all fourteen tests green while stripping this fixture's connection bare.
+    //
+    // TWO EXPIRED CERTIFICATES ON ONE CONNECTION IS ORDINARY. Okta and Entra publish a current
+    // and a next signing certificate, both get pinned, and `saml_acs` ignores `notAfter` on
+    // purpose -- so both keep working after they lapse, which is exactly the state this feature
+    // is aimed at. Emptied, the connection answers `NoTrustAnchor` and every sign-in fails until
+    // an operator re-pins by hand.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/both-dead").await;
+
+    let older = pin_created_at(&db, &env, scope, &connection, 7, -200 * DAY, 900 * DAY).await;
+    let newest = pin_created_at(&db, &env, scope, &connection, 9, -DAY, 800 * DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(report.retired, 1, "only the superseded one goes");
+    assert_eq!(
+        pinned_ids(&db, scope, &connection).await,
+        vec![newest.to_string()],
+        "the newest pin must survive even though it too has expired: an empty connection refuses \
+         every sign-in"
+    );
+    assert!(
+        !pinned_ids(&db, scope, &connection)
+            .await
+            .contains(&older.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_on_one_connection_does_not_retire_another_connections_certificate() {
+    // THE EXISTS SUBQUERY'S CONNECTION SCOPING, which every other test satisfies trivially by
+    // building exactly one connection. Without `r.connection_id = c.connection_id`, a neighbour
+    // that completed a rollover counts as this connection's "newer certificate" -- so an
+    // organization that never renewed anything loses its only trust anchor because somebody
+    // else's renewal landed in the same environment.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+
+    // UNTOUCHED: one expired certificate, its only one, pinned long ago.
+    let quiet = connect(&db, &env, scope, &org, "https://idp.example/quiet").await;
+    let only = pin_created_at(&db, &env, scope, &quiet, 7, -200 * DAY, 900 * DAY).await;
+
+    // RENEWED: an old expired pin and a replacement outside the window.
+    let busy = connect(&db, &env, scope, &org, "https://idp.example/busy").await;
+    let retiring = pin_created_at(&db, &env, scope, &busy, 11, -DAY, 900 * DAY).await;
+    let replacement = pin_created_at(&db, &env, scope, &busy, 13, 300 * DAY, 60 * DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(
+        report.retired, 1,
+        "only the renewed connection's old pin goes"
+    );
+    assert_eq!(
+        pinned_ids(&db, scope, &quiet).await,
+        vec![only.to_string()],
+        "the connection that renewed nothing must keep its certificate"
+    );
+    assert_eq!(
+        pinned_ids(&db, scope, &busy).await,
+        vec![replacement.to_string()],
+        "and the renewed one keeps its replacement"
+    );
+    assert!(
+        !pinned_ids(&db, scope, &busy)
+            .await
+            .contains(&retiring.to_string())
+    );
+}
+
+#[tokio::test]
+async fn two_certificates_pinned_at_the_same_instant_retire_neither() {
+    // WHAT MAKES THE ORDERING STRICT LOAD-BEARING. Relaxing `>` to `>=` survived every test
+    // until this one, and it is not a cosmetic change: with a tie, each of two DIFFERENT rows is
+    // "newer than or equal to" the other, so both qualify and the connection is emptied -- the
+    // same lockout the strict comparison exists to prevent, reached by a one-character edit.
+    //
+    // A TIE IS REACHABLE. `created_at` is a microsecond timestamp the database stamps, and
+    // nothing stops two pins landing in the same microsecond or a backfill writing both at one
+    // instant. When it happens there is genuinely no newer certificate, so retiring either would
+    // be guessing -- and guessing wrong on a trust anchor is an outage.
+    //
+    // (This also documents why `r.id <> c.id` is belt and braces rather than the guarantee:
+    // given a STRICT comparison a row can never be newer than itself, so removing that conjunct
+    // alone changes nothing. It earns its place only if the strictness is ever lost, which is
+    // what this test now stops.)
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/tied").await;
+
+    let first = pin_created_at(&db, &env, scope, &connection, 7, -200 * DAY, 900 * DAY).await;
+    let second = pin_created_at(&db, &env, scope, &connection, 9, -100 * DAY, 900 * DAY).await;
+    // THE SAME INSTANT, to the microsecond, written as the owner because no repository method
+    // offers to and none should.
+    sqlx::query(
+        "UPDATE saml_connection_certificates SET created_at = TIMESTAMPTZ 'epoch' \
+         WHERE tenant_id = $1 AND environment_id = $2 AND connection_id = $3",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(connection.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("tie the pin times");
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(
+        report.retired, 0,
+        "with no newer certificate there is nothing to retire, and picking one would be a guess"
+    );
+    assert_eq!(
+        pinned_ids(&db, scope, &connection).await.len(),
+        2,
+        "both must survive: {first} and {second}"
+    );
+}
