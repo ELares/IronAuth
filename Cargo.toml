@@ -124,6 +124,11 @@ utoipa = { version = "5", features = ["axum_extras"] }
 # and the musl static lane holds (rustls-native-certs reads /etc/ssl at runtime,
 # no C dependency). Pinned to the 0.8 line: 0.9 floors above MSRV 1.85 (see the
 # crate's CHANGELOG and Cargo.lock pins).
+# LDAP client for directory sync (#142). default-features off drops the blocking `sync`
+# API and the native-tls default. The provider is spelled out as ring to match the rest of
+# the workspace (see the sqlx note above): aws-lc would add a C toolchain dependency and
+# break the musl static lane.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-native-roots",

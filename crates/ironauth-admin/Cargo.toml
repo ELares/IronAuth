@@ -15,6 +15,7 @@ repository.workspace = true
 autotests = false
 
 [dependencies]
+ldap3.workspace = true
 ironauth-env.workspace = true
 ironauth-config.workspace = true
 ironauth-connector.workspace = true
@@ -122,6 +123,12 @@ wasm-hooks = ["ironauth-oidc/wasm-hooks"]
 # and every test input are the same eight bytes, so a wrong constant is a feature that rejects
 # every real deploy and a suite that stays green.
 ironauth-hooks = { workspace = true, features = ["testing"] }
+# TEST ONLY, and no new crate: ldap3 is already a normal dependency of this crate. The live
+# paging test needs to issue an UNPAGED search itself, so that the fixture property its result
+# depends on -- a server size limit that stops an unpaged read -- is an assertion rather than a
+# sentence in a doc comment. Review defeated the earlier version by swapping the bind to one
+# without that limit: the test passed with the RFC 2696 adapter deleted.
+ldap3.workspace = true
 
 # The reference downstream SCIM server (issue #137), test builds only. The outbound client is
 # measured against a server written from RFC 7644 BEFORE the client existed, rather than against
@@ -170,9 +177,25 @@ path = "tests/ldap_groups.rs"
 # Mapping a directory entry to an identity (issue #142). NO database: the mapper is a pure
 # function over an entry and a mapping, which is why this block carries no `required-features`
 # while its neighbours do.
+# Mapping a directory entry to an identity (issue #142). NO database: the mapper is a pure
+# function over an entry and a mapping, which is why this block carries no `required-features`
+# while its neighbours do.
 [[test]]
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
+
+# Directory transport rules and the derived attribute list (issue #142). NO database, and no
+# directory either: the transport decision is made before a socket is opened.
+[[test]]
+name = "ldap_client"
+path = "tests/ldap_client.rs"
+
+# The client against a REAL slapd (issue #142). Skips unless IRONAUTH_LDAP_URL is set, because
+# three of the properties it covers are properties of the PROTOCOL and a fixture asserting them
+# only asserts a belief about the protocol.
+[[test]]
+name = "ldap_live"
+path = "tests/ldap_live.rs"
 
 # The organization contact surface (issue #141). Needs a database, like its neighbours.
 [[test]]
