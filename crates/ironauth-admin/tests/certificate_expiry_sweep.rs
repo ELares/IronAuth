@@ -520,6 +520,50 @@ async fn a_clock_before_the_epoch_is_a_clock_fault_and_says_so() {
 }
 
 #[tokio::test]
+async fn the_data_plane_store_is_refused_on_the_read_not_the_write() {
+    // `run_once`'s doc tells a caller which store to hand it and predicts exactly how it breaks
+    // if they get it wrong: "0208 grants the alert ledger to `ironauth_control` alone -- SELECT
+    // and INSERT both -- so a pass handed the data-plane store fails on its first READ, before
+    // it has anything to record."
+    //
+    // That was a sentence a caller is asked to trust while choosing between two values of the
+    // same type, and nothing in the tree checked it. The distinction it draws is the useful
+    // part: a failure on the READ means no ledger row was written, so nothing was consumed and
+    // a corrected caller loses nothing. If it failed on the write instead, a pass could burn
+    // the pairs it had already recorded.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/plane").await;
+    pin_expiring(&db, &env, scope, &connection, 11, 2 * DAY).await;
+
+    let refusal = ironauth_admin::certificate_expiry::run_once(db.store(), &env, scope, LEADS, 100)
+        .await
+        .expect_err("the data plane has no grant on the ledger");
+    assert!(
+        format!("{refusal:?}").contains("permission denied"),
+        "the refusal must be the grant, not something else: {refusal:?}"
+    );
+
+    // ON THE READ: nothing was recorded, so the pair is still due and the control plane can
+    // still announce it. This is the half the doc's "before it has anything to record" claims,
+    // and the half a caller relies on.
+    let due = db
+        .control_store()
+        .scoped(scope)
+        .saml_certificate_alerts()
+        .due(now_micros(&env), LEADS, 100)
+        .await
+        .expect("due");
+    assert_eq!(
+        due.len(),
+        LEADS.len(),
+        "a refused pass must consume nothing: every lead is still due"
+    );
+}
+
+#[tokio::test]
 async fn a_stored_id_that_will_not_parse_names_the_id_and_not_the_clock() {
     // THE `UnreadableId` ARM. Round 2 created the error type so a failure would say what
     // happened; round 3 found the parse call site had never been converted, so a corrupt id

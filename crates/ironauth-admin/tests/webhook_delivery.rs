@@ -1552,6 +1552,14 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
     assert_eq!(events.len(), 1, "the sweep emits exactly one event");
     let envelope = &events[0].payload;
     assert_eq!(envelope["type"], "saml_certificate.expiring", "{envelope}");
+    // THE SCOPE PAIR, which the model test above asserts and this one dropped. The producer
+    // passes tenant and environment as two adjacent positional &str derived from one Scope, so
+    // swapping them compiles, routes correctly (delivery reads the outbox row's own columns,
+    // not the envelope) and tells every subscriber the wrong scope. Nothing else in the tree
+    // asserts these for this event.
+    assert_eq!(envelope["tenant_id"], tenant, "{envelope}");
+    assert_eq!(envelope["environment_id"], environment, "{envelope}");
+    assert_eq!(envelope["payload_schema_version"], 1, "{envelope}");
     assert_eq!(
         envelope["payload"]["saml_certificate_id"],
         certificate.to_string(),
@@ -1573,6 +1581,15 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
         "the notice carries the lead it was sent for, not just the expiry: {envelope}"
     );
     let event_id = envelope["id"].as_str().expect("event id").to_owned();
+    // THE ORDERING SUBJECT IS THE CERTIFICATE, not the lead. The outbox serialises per ordering
+    // key, so this is what keeps the 30-day, 14-day and 3-day notices about one certificate in
+    // order. Keyed on the lead instead they become concurrently claimable and a vendor can be
+    // told "expires in 3 days" before "expires in 30".
+    assert_eq!(
+        events[0].ordering_key,
+        certificate.to_string(),
+        "the notices about one certificate must share its id as their subject"
+    );
 
     // LINK TWO: it reaches the endpoint that asked for it, and ONLY that one.
     WebhookFanoutConsumer::new(store.clone())
@@ -1620,13 +1637,28 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
         "the catalog promises no certificate bytes and no fingerprint on the wire: {body}"
     );
     // The key list above is what the catalog schema forbids widening. This is the same
-    // promise checked by VALUE, so smuggling the fingerprint into a permitted field -- an
-    // id, or a future free-text field -- fails here too.
+    // promise checked by VALUE, so smuggling the fingerprint into a permitted field -- an id,
+    // or a future free-text field -- fails here too, and at the ENVELOPE level rather than
+    // only inside `payload`.
+    //
+    // DERIVED FROM THE FIXTURE, not written as a literal. An earlier version hard-coded
+    // "07" repeated, which silently disarms the moment the seed passed to `pin_expiring`
+    // changes -- the guard would still run, still pass, and check for bytes no longer in the
+    // database.
+    //
+    // WHAT IT COVERS, stated rather than implied: the two hex spellings. A leak encoded as
+    // base64 or as a JSON byte array would pass this line and be caught by the key-set
+    // assertion above instead, which is why both are here.
+    let seeded = fingerprint(7);
+    let lower: String = seeded.iter().map(|byte| format!("{byte:02x}")).collect();
+    let upper = lower.to_uppercase();
     let wire = body.to_string();
-    assert!(
-        !wire.contains(&"07".repeat(32)),
-        "the SHA-256 fingerprint must not appear anywhere on the wire: {wire}"
-    );
+    for spelling in [&lower, &upper] {
+        assert!(
+            !wire.contains(spelling),
+            "the SHA-256 fingerprint must not appear anywhere on the wire: {wire}"
+        );
+    }
 }
 
 /// Deliver one queued message and verify its signature under `secret`, returning the body
