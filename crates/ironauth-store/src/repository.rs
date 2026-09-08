@@ -44264,6 +44264,30 @@ pub struct AuditRepo<'a> {
     scope: Scope,
 }
 
+/// What an audit search narrows on (issue #141 criterion 5).
+///
+/// EVERY FIELD OPTIONAL, and `None` means "do not narrow on this" rather than "match nothing".
+/// The organization is deliberately NOT here: it is a required argument to
+/// [`AuditRepo::search_for_organization`], because a boundary that can be omitted by leaving a
+/// struct field at its default is a boundary that will be.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AuditSearch<'a> {
+    /// Inclusive lower bound on `occurred_at`, epoch microseconds.
+    pub since_unix_micros: Option<i64>,
+    /// Inclusive upper bound on `occurred_at`, epoch microseconds.
+    pub until_unix_micros: Option<i64>,
+    /// An exact action, as the audit row spells it (`saml_certificate.pinned`).
+    ///
+    /// EXACT, not a prefix. A prefix match reads as a convenience and is a footgun on a
+    /// dotted namespace: `user.` also selects `user.deleted`, and somebody auditing "who was
+    /// invited" would silently be reading deletions too.
+    pub action: Option<&'a str>,
+    /// An exact actor identifier.
+    pub actor_id: Option<&'a str>,
+    /// An exact target identifier.
+    pub target_id: Option<&'a str>,
+}
+
 impl AuditRepo<'_> {
     /// Every audit row in this scope, oldest first.
     ///
@@ -44288,6 +44312,79 @@ impl AuditRepo<'_> {
         )
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| self.row_to_audit_record(row))
+            .collect()
+    }
+
+    /// One organization's audit events, newest first, filtered and paged (issue #141
+    /// criteria 4 and 5).
+    ///
+    /// # The organization is a WHERE clause, not a filter the caller may omit
+    ///
+    /// It is a required argument rather than another `Option` on [`AuditSearch`], because this
+    /// is the query a customer's own administrator reads through and the boundary has to be
+    /// impossible to forget. `organization_id = $3` also excludes every NULL row by
+    /// construction: 0138 records that most audit rows belong to no organization at all -- a
+    /// tenant-level config change, a key rotation, an operator action -- and "NULL matches
+    /// nobody" is exactly the property that stops this page showing a customer the vendor's
+    /// own operations.
+    ///
+    /// # Newest first, unlike [`AuditRepo::list`]
+    ///
+    /// `list` is oldest-first because it serves export and replay, where the order IS the
+    /// content. A person searching their own history wants the most recent thing first, and the
+    /// partial index 0138 created is `(tenant, environment, organization, occurred_at)`, which
+    /// serves either direction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure, or if a stored row fails to decode.
+    pub async fn search_for_organization(
+        &self,
+        organization_id: &OrganizationId,
+        search: &AuditSearch<'_>,
+        limit: i64,
+    ) -> Result<Vec<AuditRecord>, StoreError> {
+        if organization_id.scope() != self.scope {
+            // A handle from another scope selects nothing rather than erroring, matching every
+            // other cross-scope read here: the uniform answer is what stops a caller telling
+            // "not yours" from "does not exist".
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // EVERY FILTER IS `$n IS NULL OR ...`, so one prepared statement serves every
+        // combination. Building the SQL by concatenation instead would make the parameter
+        // positions depend on which filters were supplied, which is how a filter comes to be
+        // compared against the wrong bind.
+        let rows = sqlx::query(
+            "SELECT id, action, actor_kind, actor_id, target_kind, target_id, \
+             correlation_id, detail, \
+             (EXTRACT(EPOCH FROM occurred_at) * 1000000)::bigint AS occurred_us \
+             FROM audit_log \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND ($4::bigint IS NULL OR occurred_at >= TIMESTAMPTZ 'epoch' \
+                                          + ($4::text || ' microseconds')::interval) \
+               AND ($5::bigint IS NULL OR occurred_at <= TIMESTAMPTZ 'epoch' \
+                                          + ($5::text || ' microseconds')::interval) \
+               AND ($6::text IS NULL OR action = $6) \
+               AND ($7::text IS NULL OR actor_id = $7) \
+               AND ($8::text IS NULL OR target_id = $8) \
+             ORDER BY occurred_at DESC, recorded_at DESC, id DESC \
+             LIMIT $9",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(search.since_unix_micros)
+        .bind(search.until_unix_micros)
+        .bind(search.action)
+        .bind(search.actor_id)
+        .bind(search.target_id)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;

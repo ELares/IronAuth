@@ -362,6 +362,13 @@ name = "audit"
 path = "tests/audit.rs"
 required-features = ["testing"]
 
+# The per-organization audit search (issue #141 criteria 4 and 5): what a customer's own
+# administrator may read, and what every filter must exclude.
+[[test]]
+name = "org_audit_search"
+path = "tests/org_audit_search.rs"
+required-features = ["testing"]
+
 # Same-transaction atomicity: a mid-transaction failure leaves no orphan data
 # row and no orphan audit row, and the inverse. Needs a real database.
 [[test]]
