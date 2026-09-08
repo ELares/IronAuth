@@ -280,3 +280,117 @@ async fn results_are_newest_first() {
     let found = search(&db, scope, &mine, &AuditSearch::default()).await;
     assert_eq!(found, vec![newer, older], "not newest first: {found:?}");
 }
+
+#[tokio::test]
+async fn a_row_attributed_to_a_foreign_organization_is_not_returned() {
+    // THE CROSS-SCOPE GUARD, and the corpus that can actually see it.
+    //
+    // `an_organization_from_another_scope_selects_nothing` names this boundary and cannot check
+    // it: deleting the guard leaves it green, because tenant_id, environment_id and the RLS
+    // policy already exclude rows LIVING in another scope, and an OrganizationId's wire form
+    // embeds its own scope so it never textually matches one of ours.
+    //
+    // What the guard actually catches is the row that lives HERE and is attributed THERE.
+    // `ActingContext::in_organization` takes the handle by value and compares nothing -- its doc
+    // claimed otherwise until this test was written -- so a caller holding a foreign handle
+    // produces exactly that row. Without the guard, searching this scope for that foreign
+    // organization returns it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let other_scope = db.seed_scope(&env).await;
+    let foreign = OrganizationId::generate(&env, &other_scope);
+
+    // A row in THIS scope, attributed to an organization from the other one.
+    let misattributed = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .in_organization(foreign)
+        .clients()
+        .create(&env, "misattributed")
+        .await
+        .expect("create a client")
+        .to_string();
+
+    let found = search(&db, scope, &foreign, &AuditSearch::default()).await;
+    assert!(
+        !found.contains(&misattributed),
+        "a row attributed to an organization outside this scope was returned: {found:?}"
+    );
+    assert!(
+        found.is_empty(),
+        "and nothing else came back either: {found:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_actor_filter_returns_that_actors_rows_and_not_only_an_empty_set() {
+    // THE POSITIVE DIRECTION, which nothing asserted. The suite checked only that a STRANGER's
+    // actor matches nothing, so an actor filter that matches nothing AT ALL -- a `||` typo, a
+    // comparison against actor_kind, $7 bound where $8 was meant -- shipped green.
+    //
+    // That is the failure mode worth guarding on an audit surface: an org admin asking "what did
+    // this person do" is answered "nothing", which reads as innocent rather than broken.
+    //
+    // ONE ACTOR FOR BOTH ROWS, built by hand: `db.test_actor` generates a FRESH random principal
+    // per call, so the obvious fixture gives two rows two different actors and the assertion
+    // this test needs cannot be written against it.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let mine = OrganizationId::generate(&env, &scope);
+
+    let actor = db.test_actor(&env);
+    let actor_id = match &actor {
+        ironauth_store::ActorRef::Human(id) => id.to_string(),
+        other => panic!("the harness actor is a human: {other:?}"),
+    };
+    let mut theirs = Vec::new();
+    for name in ["first", "second"] {
+        theirs.push(
+            db.store()
+                .scoped(scope)
+                .acting(actor, CorrelationId::generate(&env))
+                .in_organization(mine)
+                .clients()
+                .create(&env, name)
+                .await
+                .expect("create a client")
+                .to_string(),
+        );
+    }
+    // A DIFFERENT actor in the same organization, so the filter has something to exclude.
+    let other = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .in_organization(mine)
+        .clients()
+        .create(&env, "somebody-else")
+        .await
+        .expect("create a client")
+        .to_string();
+
+    let found = search(
+        &db,
+        scope,
+        &mine,
+        &AuditSearch {
+            actor_id: Some(&actor_id),
+            ..AuditSearch::default()
+        },
+    )
+    .await;
+
+    for target in &theirs {
+        assert!(
+            found.contains(target),
+            "the actor's own rows must come back: {found:?}"
+        );
+    }
+    assert!(
+        !found.contains(&other),
+        "and another actor's must not: {found:?}"
+    );
+}
