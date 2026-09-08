@@ -218,18 +218,30 @@ pub async fn run_once(
 /// Three of the four things it does are corrections a `map` would not make, and each one is a
 /// configuration a deployment can actually write.
 ///
-/// A ZERO LEAD IS DROPPED. The event catalog declares `lead_secs` with `minimum: 1`, so a
-/// configured `0` does not warn at expiry -- it makes `envelope()` refuse the notice, which the
-/// sweep reports as `SweepError::Envelope`, a server fault. One plausible number in a config
-/// file would turn every pass into an error, and the operator's log would name the envelope
-/// registry rather than their own setting.
+/// A ZERO LEAD IS DROPPED, because it can never match. The due query selects
+/// `not_after > now AND not_after <= now + lead`, which for a lead of zero is unsatisfiable: a
+/// zero threshold warns nobody at any time. It reads like "warn me at expiry" and is not, so
+/// keeping it would leave an operator with a configured warning that silently never fires.
 ///
-/// DUPLICATES COLLAPSE. `due()` already unnests DISTINCT, so a repeat is harmless there, but a
-/// duplicate here would double the work list this function's caller bounds with `sweep_batch`.
+/// AN EARLIER VERSION OF THIS PARAGRAPH gave a different reason -- that a zero reaches
+/// `envelope()`, fails its `minimum: 1` schema and turns every pass into a server fault. That
+/// failure cannot occur, because the row never comes back from `due()` to be announced. The
+/// behaviour was right and the justification was invented; it had been copied into five
+/// artifacts before a review checked it.
 ///
-/// THE ORDER IS DESCENDING, so a pass announces the earliest warning first when several cross
-/// together. Nothing depends on it -- each pair is decided by its own ledger row -- but a
-/// vendor reading a delivery log sees the sequence a human would expect.
+/// DUPLICATES COLLAPSE, and here the ordering step is what makes that work: `Vec::dedup` removes
+/// only ADJACENT equal elements, so `[7, 30, 7]` collapses only after sorting. `due()` also
+/// unnests DISTINCT, so a duplicate reaching it is harmless -- which makes this a tidiness of
+/// the returned vector rather than a correctness fix, and it is worth saying so rather than
+/// claiming a bug it prevents.
+///
+/// THE ORDER IS DESCENDING -- longest lead first, so the THIRTY-day threshold heads the list.
+/// An earlier version of this sentence called that "the earliest warning first", which is
+/// backwards: the thirty-day threshold is the earliest warning in TIME and the last of the three
+/// a certificate crosses. Nothing downstream depends on either reading, because `due()` orders
+/// its own rows `BY c.not_after, c.id, l.lead_secs` and announces the SHORTEST crossed lead
+/// first regardless of how this vector is arranged. What the order actually decides is the shape
+/// of the startup log line and of this function's return value.
 #[must_use]
 pub fn leads_from_days(days: &[u32]) -> Vec<i64> {
     const SECS_PER_DAY: i64 = 24 * 60 * 60;
@@ -261,6 +273,11 @@ pub struct PassReport {
 
 /// Run one pass over every scope the source reports.
 ///
+/// `limit` bounds ONE SCOPE's pass, not the whole sweep: it is handed to each `run_once` in
+/// turn, so a sweep over N scopes may announce up to N times it. That is the useful bound --
+/// it caps the size of any single transaction -- but it is not a cap on the pass, and both
+/// generated config artifacts said "one pass" until a review read them.
+///
 /// # Errors
 ///
 /// Only if the scope source itself cannot be read; a scope that fails is counted in the report.
@@ -276,8 +293,11 @@ pub async fn run_pass(
 ) -> Result<PassReport, StoreError> {
     let mut report = PassReport::default();
     if leads_secs.is_empty() {
-        // Alerting is off. Enumerating scopes to run a pass with no thresholds would be a
-        // database round trip per scope for a work list that is empty by construction.
+        // Alerting is off, so there is nothing to enumerate scopes FOR. One round trip is saved
+        // -- the scope listing itself -- and no more: `due()` returns immediately on an empty
+        // lead set without querying, so the per-scope passes would each have cost nothing. An
+        // earlier version of this comment claimed a database round trip per scope, which
+        // overstates the saving by the whole of it.
         return Ok(report);
     }
     for scope in scopes.scopes().await? {

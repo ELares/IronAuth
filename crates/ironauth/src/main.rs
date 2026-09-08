@@ -535,7 +535,6 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_certificate_sweep(inputs).await,
             None => None,
         };
-        let _ = &certificate_sweep;
         let retention_sweeper = if let Some(inputs) = retention_inputs {
             start_retention_sweeper(inputs).await
         } else {
@@ -592,6 +591,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // checkpoints, and a connection this tick did not reach is still due on the next boot.
         if let Some(scheduler) = scim_push_scheduler {
             scheduler.shutdown().await;
+        }
+        // AND THE CERTIFICATE SWEEP, for the same reason. It was left running when this shipped,
+        // marked only by a `let _ = &certificate_sweep;` put there to silence the unused
+        // binding -- which is what an unfinished shutdown looks like when the compiler is the
+        // only thing asking. Aborted rather than awaited: a pass has no cleanup to finish, every
+        // pair is decided by its own committed ledger row, and a certificate this tick did not
+        // reach is still due on the next boot.
+        if let Some(sweep) = certificate_sweep {
+            sweep.abort();
         }
         if let Some(shipper) = log_shipper {
             shipper.shutdown().await;
@@ -3561,9 +3569,10 @@ async fn start_certificate_sweep(
 /// config still says alerting is on.
 ///
 /// TWO WAYS TO BE OFF, and they are different. `sweep_enabled = false` means this process does
-/// not run the pass -- another replica might. An empty `lead_days` means nobody is warned at
-/// all, on any replica. Both return `None` here because neither should spawn a ticker, but only
-/// the second is worth a line in the log, which is why the caller distinguishes them.
+/// not run the pass -- another replica might, and it is what the shipped default says. A
+/// `lead_days` that yields no usable lead means nobody is warned at all, on any replica, and is
+/// something the operator did not ask for: they turned alerting ON. Both return `None`, because
+/// neither should spawn a ticker; the second WARNS on its way out.
 fn certificate_sweep_settings(config: &Config) -> Option<CertificateSweepSettings> {
     if !config.certificate_expiry.sweep_enabled {
         return None;
@@ -3571,10 +3580,25 @@ fn certificate_sweep_settings(config: &Config) -> Option<CertificateSweepSetting
     let leads =
         ironauth_admin::certificate_expiry::leads_from_days(&config.certificate_expiry.lead_days);
     if leads.is_empty() {
+        // SAID OUT LOUD, because this is the one of the two ways to be off that an operator did
+        // NOT ask for: they turned the sweep on and configured a lead set that warns nobody --
+        // an empty list, or one holding only zeros. Without this the process boots silently and
+        // no certificate is ever announced. The doc for this function claimed the caller
+        // distinguished the two cases before anything did.
+        tracing::warn!(
+            configured = ?config.certificate_expiry.lead_days,
+            "certificate expiry alerting is enabled but no usable lead time is configured, so \
+             nothing will be announced; certificate_expiry.lead_days must hold at least one \
+             positive number of days"
+        );
         return None;
     }
     Some(CertificateSweepSettings {
         leads,
+        // `.max(1)` is belt and braces, not the gate: `validate_certificate_expiry` REFUSES a
+        // zero interval at load, following the `scim_push` precedent, so a value an operator
+        // wrote and the value this process runs are the same value. This only keeps a
+        // hand-built Config in a test from spinning.
         interval: std::time::Duration::from_secs(
             config.certificate_expiry.sweep_interval_secs.max(1),
         ),
@@ -3589,7 +3613,7 @@ struct CertificateSweepSettings {
     leads: Vec<i64>,
     /// How often a pass runs.
     interval: std::time::Duration,
-    /// How many pairs one pass may announce.
+    /// How many pairs one SCOPE's pass may announce. See `CertificateExpiryConfig::sweep_batch`.
     batch: i64,
 }
 
@@ -7585,20 +7609,46 @@ mod certificate_sweep_wiring_tests {
         );
     }
 
-    /// A zero interval degrades to one second rather than spinning.
+    /// The degenerate values a sweep cannot run on are REFUSED at load.
+    ///
+    /// This test said "a zero interval degrades to one second" and asserted the floor in
+    /// `certificate_sweep_settings`. Flooring is the wrong answer and the precedent next door
+    /// says so: `validate_scim_push` REFUSES a zero interval, because a value an operator wrote
+    /// and a value the process runs must be the same value or the startup log is not reporting
+    /// their configuration.
+    ///
+    /// `sweep_batch = 0` is the worse of the two and had no check at all: an hourly ticker that
+    /// announces nothing while reporting every pass as healthy, which is indistinguishable from
+    /// a deployment with no certificates near expiry.
     #[test]
-    fn a_zero_interval_is_floored() {
-        let spin = config_with(CertificateExpiryConfig {
-            sweep_enabled: true,
-            sweep_interval_secs: 0,
-            ..CertificateExpiryConfig::default()
-        });
-        let settings = certificate_sweep_settings(&spin).expect("still starts");
-        assert_eq!(
-            settings.interval,
-            std::time::Duration::from_secs(1),
-            "a zero-second interval would tick as fast as the database can answer"
-        );
+    fn the_values_a_sweep_cannot_run_on_are_refused_at_load() {
+        // Through the REAL load path, because that is where an operator meets it.
+        for (interval, batch, key) in [
+            (0, 500, "certificate_expiry.sweep_interval_secs"),
+            (3_600, 0, "certificate_expiry.sweep_batch"),
+        ] {
+            let toml = format!(
+                "[certificate_expiry]\nsweep_enabled = true\n\
+                 sweep_interval_secs = {interval}\nsweep_batch = {batch}\n"
+            );
+            let refusal = ironauth_config::Config::from_toml_str(&toml, "<inline>")
+                .expect_err("a sweep that cannot warn anybody must not load");
+            assert!(
+                format!("{refusal}").contains(key),
+                "the refusal must name the key the operator wrote: {refusal}"
+            );
+        }
+    }
+
+    /// And the same values are accepted while the sweep is OFF.
+    ///
+    /// A deployment that is not running the sweep must not be refused for the shape of settings
+    /// it never reads, or turning a worker off becomes a reason a process will not boot.
+    #[test]
+    fn a_disabled_sweep_is_not_refused_for_its_settings() {
+        let toml = "[certificate_expiry]\nsweep_enabled = false\n\
+                    sweep_interval_secs = 0\nsweep_batch = 0\n";
+        assert!(ironauth_config::Config::from_toml_str(toml, "<inline>").is_ok());
     }
 }
 

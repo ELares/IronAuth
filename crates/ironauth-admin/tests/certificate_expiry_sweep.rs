@@ -619,10 +619,14 @@ fn configured_days_become_the_thresholds_a_pass_runs_to() {
     use ironauth_admin::certificate_expiry::leads_from_days;
 
     const D: i64 = 24 * 60 * 60;
+    // ASCENDING INPUT, deliberately. Every input this test used was already in descending
+    // order, so each expectation merely restated the input and deleting the sort left all of
+    // them green -- while `lead_days = [3, 14, 30]` is the natural way to write "warn me at
+    // three, fourteen and thirty days".
     assert_eq!(
-        leads_from_days(&[30, 14, 3]),
+        leads_from_days(&[3, 14, 30]),
         vec![30 * D, 14 * D, 3 * D],
-        "days become seconds, longest first"
+        "days become seconds, longest first, whatever order they were written in"
     );
     // A CONFIGURED ZERO IS DROPPED, and this is the case worth having a test for. It reads like
     // "warn at expiry" and is not: the event catalog declares lead_secs with minimum 1, so a
@@ -631,7 +635,10 @@ fn configured_days_become_the_thresholds_a_pass_runs_to() {
     // envelope registry rather than the setting that caused it.
     assert_eq!(leads_from_days(&[30, 0, 3]), vec![30 * D, 3 * D]);
     assert!(leads_from_days(&[0]).is_empty());
-    // Duplicates collapse, so a repeat does not double the work list the caller then bounds.
+    // NON-ADJACENT duplicates. `Vec::dedup` removes only ADJACENT equal elements, so `[7, 7, 7]`
+    // collapses whether or not the sort ran and cannot tell the two apart; `[7, 30, 7]` collapses
+    // only because the sort brought the sevens together.
+    assert_eq!(leads_from_days(&[7, 30, 7]), vec![30 * D, 7 * D]);
     assert_eq!(leads_from_days(&[7, 7, 7]), vec![7 * D]);
     assert!(leads_from_days(&[]).is_empty());
 }
@@ -646,12 +653,18 @@ async fn one_scope_failing_does_not_stop_the_others_being_warned() {
     // cannot parse, which only the schema can produce because no repository method will write
     // one. That is the same door `a_stored_id_that_will_not_parse_names_the_id_and_not_the_clock`
     // opens, used here for its effect on the OTHER scopes rather than on the message.
+    // TWO HEALTHY SCOPES, not one. With one of each, `swept` and `failed` are both 1 and no
+    // assertion can tell which counter means which: swapping them between the Ok and Err arms
+    // left the whole suite green. Those two numbers are the only thing the deployed ticker logs,
+    // and swapped, a healthy hourly pass reports every tenant as failed while a pass in which
+    // every tenant errored disappears into the quiet branch.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let broken = db.seed_scope(&env).await;
     let healthy = db.seed_scope(&env).await;
+    let also_healthy = db.seed_scope(&env).await;
 
-    for scope in [broken, healthy] {
+    for scope in [broken, healthy, also_healthy] {
         let org = seed_org(&db, &env, scope, "Contoso").await;
         let connection = connect(&db, &env, scope, &org, "https://idp.example/multi").await;
         pin_expiring(&db, &env, scope, &connection, 21, 2 * DAY).await;
@@ -670,7 +683,7 @@ async fn one_scope_failing_does_not_stop_the_others_being_warned() {
     let report = ironauth_admin::certificate_expiry::run_pass(
         db.control_store(),
         &env,
-        &ironauth_store::outbox::StaticScopes::new(vec![broken, healthy]),
+        &ironauth_store::outbox::StaticScopes::new(vec![broken, healthy, also_healthy]),
         LEADS,
         100,
     )
@@ -678,10 +691,14 @@ async fn one_scope_failing_does_not_stop_the_others_being_warned() {
     .expect("the pass itself completes");
 
     assert_eq!(report.failed, 1, "the corrupt scope is counted as failed");
-    assert_eq!(report.swept, 1, "and the healthy one is still swept");
+    assert_eq!(
+        report.swept, 2,
+        "and BOTH healthy ones are swept: a different number from `failed`, so the two counters \
+         cannot be swapped without this failing"
+    );
     assert_eq!(
         report.announced,
-        LEADS.len(),
-        "the healthy tenant is warned at every lead despite its neighbour failing"
+        2 * LEADS.len(),
+        "each healthy tenant is warned at every lead despite their neighbour failing"
     );
 }
