@@ -197,7 +197,6 @@ async fn a_pass_announces_every_crossed_lead_once_and_a_second_pass_announces_no
     // half million years out, and the registry types it as a bare `integer` so nothing else
     // would notice. The bound is generous and still a thousand times tighter than the error.
     let expected_ms = (now + 2 * DAY * 1_000_000) / 1000;
-    let a_century_ms = 100 * 365 * DAY * 1000;
     let mut leads: Vec<i64> = announced
         .iter()
         .map(|event| {
@@ -224,10 +223,17 @@ async fn a_pass_announces_every_crossed_lead_once_and_a_second_pass_announces_no
                 "the expiry is not the certificate's, in milliseconds: {not_after} against \
                  {expected_ms}"
             );
+            // AGAINST THE KNOWN VALUE, not against a ceiling. An earlier version asserted only
+            // `occurred < a_century_ms`, which a SECONDS value passes comfortably -- 1.8e9 is
+            // far under 3.2e12 -- so the assertion could not support the label it carried. It
+            // caught microseconds by luck of magnitude and nothing else. A window around the
+            // expected millisecond value rejects both directions.
             let occurred = event["occurred_at_unix_ms"].as_i64().expect("a timestamp");
             assert!(
-                occurred < a_century_ms,
-                "the envelope's occurred_at is not milliseconds: {occurred}"
+                (occurred - now / 1000).abs() < 60_000,
+                "the envelope's occurred_at is not the pass's clock in milliseconds: {occurred} \
+                 against {}",
+                now / 1000
             );
             event["payload"]["lead_secs"].as_i64().expect("a lead")
         })

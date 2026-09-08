@@ -65,7 +65,9 @@ pub enum SweepError {
 impl core::fmt::Display for SweepError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Store(error) => write!(f, "the expiry ledger could not be read or written: {error}"),
+            Self::Store(error) => {
+                write!(f, "the expiry ledger could not be read or written: {error}")
+            }
             Self::Clock => f.write_str("the clock is before the Unix epoch or out of range"),
             Self::Envelope => f.write_str("the event registry would not build an expiry notice"),
             Self::UnreadableId => f.write_str("a stored certificate id did not parse"),
