@@ -411,10 +411,11 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
     // They are not decoration: `connection_id` names the identity provider connection an
     // operator has to go and fix, and the expiry is what the notice tells them.
     //
-    // THE ORGANIZATION IS NOT ASSERTED HERE. Routing moved off `connection_id` when the work item
-    // began carrying `organization_id`, and this fixture has ONE organization, so comparing it
-    // would hold for any row returned. `the_work_item_names_the_certificates_own_organization`
-    // builds two, which is what that claim needs.
+    // THE ORGANIZATION IS NOT ASSERTED HERE. The field a sweep will route on is `organization_id`
+    // rather than `connection_id` -- neither routes today, since no sweep exists -- and this
+    // fixture has ONE organization, so comparing it would hold for any row returned.
+    // `the_work_item_names_the_certificates_own_organization` builds two, which is what that
+    // claim needs.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -827,7 +828,8 @@ async fn a_certificate_unpinned_under_the_sweep_is_not_found_rather_than_a_fault
 
 #[tokio::test]
 async fn the_work_item_names_the_certificates_own_organization() {
-    // THE SWEEP ROUTES ON THIS FIELD, so getting it wrong tells one customer about another
+    // THE SWEEP WILL ROUTE ON THIS FIELD -- no sweep exists yet, and the struct's own doc says so
+    // -- so getting it wrong would tell one customer about another
     // customer's identity provider -- and both organizations are in the same scope, so no
     // tenant fence catches it.
     //
@@ -882,10 +884,17 @@ async fn the_work_item_names_the_certificates_own_organization() {
 
 #[tokio::test]
 async fn a_certificate_of_a_removed_organization_is_not_due() {
-    // A WORK ITEM THE SWEEP CANNOT COMPLETE IS WORSE THAN NONE. `organizations` soft-deletes, and
-    // a certificate pinned on a connection whose organization is gone has no contact list to
-    // notify -- so the sweep would find the item, find nobody to tell, and find it again on every
-    // pass for ever, because nothing records a notice that was never sent.
+    // A POLICY DECISION, NOT A DERIVATION, and the store doc on `due()` says the same. An
+    // organization an operator has removed should not generate operational notices to its
+    // contacts, because the operator has said they are done with it.
+    //
+    // TWO EARLIER REASONS HERE WERE MEASURABLY FALSE, which is why this one is labelled for what
+    // it is. "Its contacts are gone": they are not. "It signs nobody in": it does -- removal
+    // writes `organizations.deleted_at` and nothing else, and the SAML sign-in path never reads
+    // that column. (The AUTHORIZATION side IS fenced -- such an organization resolves to the
+    // empty role set -- so the sign-in survives and grants nothing. The claim was wrong about
+    // sign-in, not about safety.) Both are why the filter must be explicit: nothing downstream
+    // would stop the notice going out.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -915,8 +924,8 @@ async fn a_certificate_of_a_removed_organization_is_not_due() {
     assert_eq!(
         due.len(),
         1,
-        "a certificate of a removed organization is still queued for a notice nobody can \
-         receive: {due:?}"
+        "a certificate of a removed organization is still queued for an operational notice its \
+         operator has said they are done with: {due:?}"
     );
     assert_eq!(
         due[0].certificate_id,
