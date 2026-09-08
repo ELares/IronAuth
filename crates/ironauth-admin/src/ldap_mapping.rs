@@ -21,9 +21,11 @@
 //!     assigned once and never change, including across a move or a rename.
 //!
 //! So the UUID wins wherever the directory publishes one, and the DN is the fallback for a server
-//! that publishes neither. That is the same refusal [`crate::scim_push_mapping`] makes about
-//! `externalId`, for the same reason and with the same consequence when it is got wrong: a
-//! duplicated directory nobody notices until the licence count is double.
+//! that publishes neither. [`crate::scim_push_mapping`] withholds `externalId` from the operator
+//! for the same REASON -- both are the handle a later run uses to recognise somebody it has
+//! already seen -- though by a different mechanism: that module names it on a reserved list,
+//! while here the choice is simply not expressible in the mapping. The consequence of getting it
+//! wrong is identical: a duplicated directory nobody notices until the licence count is double.
 //!
 //! # An entry is multi-valued everywhere
 //!
@@ -49,6 +51,14 @@ pub struct DirectoryEntry {
     pub dn: String,
     /// Attribute values, keyed by LOWERCASED attribute name.
     values: BTreeMap<String, Vec<String>>,
+    /// Attribute values the server returned as octet strings rather than text.
+    ///
+    /// NOT AN EDGE CASE, and the reason this map exists: Active Directory's `objectGUID` is a
+    /// raw 16-byte value, not UTF-8. It arrives in `ldap3`'s `bin_attrs` and never in `attrs`, so
+    /// a mapper that only read text would find no `objectGUID` on any AD entry and quietly fall
+    /// through to the rename-fragile DN -- which is the whole failure this module exists to
+    /// prevent, arriving on the single most important directory in the world for it.
+    binary: BTreeMap<String, Vec<Vec<u8>>>,
 }
 
 impl DirectoryEntry {
@@ -61,7 +71,26 @@ impl DirectoryEntry {
                 .into_iter()
                 .map(|(name, values)| (name.to_ascii_lowercase(), values))
                 .collect(),
+            binary: BTreeMap::new(),
         }
+    }
+
+    /// Add the attributes the server returned as octet strings.
+    #[must_use]
+    pub fn with_binary(mut self, attributes: Vec<(String, Vec<Vec<u8>>)>) -> Self {
+        self.binary = attributes
+            .into_iter()
+            .map(|(name, values)| (name.to_ascii_lowercase(), values))
+            .collect();
+        self
+    }
+
+    /// Every octet-string value of one attribute, or an empty slice.
+    #[must_use]
+    pub fn binary_values(&self, attribute: &str) -> &[Vec<u8>] {
+        self.binary
+            .get(&attribute.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Every value of one attribute, or an empty slice.
@@ -92,6 +121,16 @@ pub enum LdapMappingError {
         /// The canonical field whose source was malformed.
         field: String,
     },
+    /// The mapping tries to choose the stable identifier.
+    ///
+    /// A separate refusal from [`Self::UnknownField`] because the honest answer is different: the
+    /// field is not unknown, it is not the operator's to pick. Telling somebody who mapped
+    /// `stable_id` that "no field named `stable_id` is synced" would send them looking for a
+    /// spelling mistake.
+    StableIdNotMappable {
+        /// What they wrote.
+        field: String,
+    },
     /// The mapping names a field this build does not write.
     ///
     /// Refused rather than ignored: an operator who mapped `manager` and saw it silently
@@ -113,7 +152,7 @@ pub enum LdapMappingError {
     /// choice and can differ between two searches, so "first" would make the identity of a
     /// person depend on the order a directory happened to answer in.
     AmbiguousStableId {
-        /// The attribute, and how many values it held.
+        /// The attribute that carried them.
         attribute: String,
         /// How many values were present.
         count: usize,
@@ -127,6 +166,11 @@ impl std::fmt::Display for LdapMappingError {
             Self::NotAnAttributeName { field } => {
                 write!(f, "the mapping for {field} is not an attribute name")
             }
+            Self::StableIdNotMappable { field } => write!(
+                f,
+                "{field} cannot be mapped: the stable identifier is taken from objectGUID, then \
+                 entryUUID, then the DN, so that a rename does not create a second person"
+            ),
             Self::UnknownField { field } => write!(f, "no field named {field} is synced"),
             Self::Missing { field, attribute } => {
                 write!(f, "the entry has no {attribute} to map to {field}")
@@ -183,8 +227,18 @@ impl StableIdSource {
 /// The canonical fields a mapping may name.
 ///
 /// A CLOSED SET, so a typo is refused at mapping time rather than silently dropping a field the
-/// operator believed was synced -- which is the discipline `scim_push_mapping` applies outbound.
+/// operator believed was synced.
+///
+/// This is STRICTER than [`crate::scim_push_mapping`], which refuses a five-name reserved list
+/// and passes everything else through to the outbound body. It can afford that: an unrecognised
+/// SCIM attribute is still sent and the downstream decides. Inbound there is no downstream to
+/// decide, so a field this build cannot write has nowhere to go and refusing is the only honest
+/// answer.
 const MAPPABLE: &[&str] = &["username", "email", "display_name"];
+
+/// Names an operator might reach for to steer the stable identifier, refused by name so the
+/// message can say why rather than reporting them as typos.
+const RESERVED: &[&str] = &["stable_id", "stable_id_source", "dn"];
 
 /// The attributes searched for a stable identifier, in preference order.
 const STABLE_ID_ATTRIBUTES: &[(&str, StableIdSource)] = &[
@@ -204,6 +258,11 @@ pub fn principal_for(
 ) -> Result<MappedPrincipal, LdapMappingError> {
     let object = mapping.as_object().ok_or(LdapMappingError::NotAnObject)?;
     for field in object.keys() {
+        if RESERVED.contains(&field.as_str()) {
+            return Err(LdapMappingError::StableIdNotMappable {
+                field: field.clone(),
+            });
+        }
         if !MAPPABLE.contains(&field.as_str()) {
             return Err(LdapMappingError::UnknownField {
                 field: field.clone(),
@@ -224,11 +283,19 @@ pub fn principal_for(
     // THE STABLE IDENTIFIER, chosen by the directory rather than the operator. See the header.
     let mut stable = None;
     for (attribute, source) in STABLE_ID_ATTRIBUTES {
-        let values = entry.values(attribute);
-        match values.len() {
+        // The text and octet-string forms are the SAME attribute: `OpenLDAP` sends `entryUUID` as
+        // text, Active Directory sends `objectGUID` as sixteen raw bytes, and a server sending
+        // both would be describing one identity twice. Counting them together means two values
+        // are ambiguous whichever form they arrived in.
+        let text = entry.values(attribute);
+        let raw = entry.binary_values(attribute);
+        match text.len() + raw.len() {
             0 => {}
             1 => {
-                stable = Some((values[0].clone(), *source));
+                let value = text
+                    .first()
+                    .map_or_else(|| identifier_from_octets(attribute, &raw[0]), Clone::clone);
+                stable = Some((value, *source));
                 break;
             }
             count => {
@@ -239,12 +306,8 @@ pub fn principal_for(
             }
         }
     }
-    let (stable_id, stable_id_source) = stable.unwrap_or_else(|| {
-        (
-            entry.dn.clone(),
-            StableIdSource::DistinguishedName,
-        )
-    });
+    let (stable_id, stable_id_source) =
+        stable.unwrap_or_else(|| (entry.dn.clone(), StableIdSource::DistinguishedName));
 
     // USERNAME IS REQUIRED, because a principal with no login identifier is a row nobody can
     // sign in as -- created, counted, and useless.
@@ -270,17 +333,63 @@ pub fn principal_for(
     })
 }
 
+/// Render an octet-string identifier as the text this build stores.
+///
+/// `objectGUID` gets Active Directory's own display form, mixed-endian and all: the first three
+/// groups are little-endian and the last two big-endian (the layout of a Microsoft `GUID`
+/// struct). Matching it matters because an operator debugging a sync compares what IronAuth
+/// stored against what `Get-ADUser` prints, and a hex dump of the same bytes in memory order
+/// looks like a different person.
+///
+/// Anything else is taken as text when it is valid UTF-8 and hex-encoded when it is not, so an
+/// unexpected binary identifier is still stable rather than lossy.
+fn identifier_from_octets(attribute: &str, raw: &[u8]) -> String {
+    if attribute == "objectguid" && raw.len() == 16 {
+        return format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+             {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            raw[3],
+            raw[2],
+            raw[1],
+            raw[0],
+            raw[5],
+            raw[4],
+            raw[7],
+            raw[6],
+            raw[8],
+            raw[9],
+            raw[10],
+            raw[11],
+            raw[12],
+            raw[13],
+            raw[14],
+            raw[15]
+        );
+    }
+    std::str::from_utf8(raw).map_or_else(
+        |_| {
+            use std::fmt::Write as _;
+            raw.iter().fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+        },
+        str::to_owned,
+    )
+}
+
 /// The attributes a search must request in order for [`principal_for`] to be able to do its job.
 ///
 /// DERIVED FROM THE MAPPING, never written at the call site. The reason is a property of the
-/// protocol rather than of this code: `entryUUID` and `objectGUID` are OPERATIONAL attributes, and
-/// a search that does not name them does not receive them. Verified against a live `OpenLDAP` --
-/// `ldapsearch "(uid=ada)"` returns no `entryUUID`, `ldapsearch "(uid=ada)" entryUUID` does.
+/// protocol rather than of this code: `entryUUID` and `objectGUID` are OPERATIONAL attributes,
+/// and a search that does not name them does not receive them. Verified against a live
+/// `OpenLDAP`: `ldapsearch "(uid=ada)"` returns no `entryUUID`, `ldapsearch "(uid=ada)" entryUUID`
+/// does.
 ///
 /// A caller that hand-listed the attributes and forgot the identifier would get entries that all
 /// appear to have no UUID, so all of them would take the DN fallback. Every person in the
 /// directory would silently become rename-fragile, and nothing would report it: the mapping still
-/// succeeds, the sync still runs, and the breakage only shows up when somebody changes their name
+/// succeeds, the sync still runs, and the breakage shows up only when somebody changes their name
 /// and gets deprovisioned.
 ///
 /// The returned list is deduplicated and lowercased, matching how [`DirectoryEntry`] keys itself.
