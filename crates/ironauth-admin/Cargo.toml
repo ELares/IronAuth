@@ -161,6 +161,13 @@ name = "org_contacts"
 path = "tests/org_contacts.rs"
 required-features = ["testing"]
 
+# One PASS of the certificate expiry sweep (issue #141): what it announces, and what it does when
+# another pass or an operator's own renewal gets there first.
+[[test]]
+name = "certificate_expiry_sweep"
+path = "tests/certificate_expiry_sweep.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "project_grants"
 path = "tests/project_grants.rs"
