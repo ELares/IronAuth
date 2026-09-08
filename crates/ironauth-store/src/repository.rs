@@ -76946,6 +76946,14 @@ impl SamlCertificateAlertRepo<'_> {
     /// sweep cannot complete, and it would be retried on every pass for ever. The join requires
     /// the organization to be live.
     ///
+    /// A DISABLED ORGANIZATION STILL GETS ITS NOTICE, and that is a decision rather than an
+    /// oversight. `organizations` carries TWO lifecycle facts -- `deleted_at` and a `state` of
+    /// `active` or `disabled` -- and only the first is filtered here. Disabling is reversible and
+    /// administrative: the customer still exists, their contact list is still there, and the
+    /// certificate is still theirs. Suppressing the warning would mean an organization disabled
+    /// across its lead windows comes back with a dead certificate and no one ever told them,
+    /// which is the outage this feature exists to prevent, arrived at by a different route.
+    ///
     /// THAT SILENT DROP IS THE RIGHT ANSWER AND STILL WORTH NAMING. Such a certificate has no
     /// organization to notify, so there is nothing a work item could do with it. It is also not
     /// reachable today: `pin_certificate` refuses a cross-scope connection with its own

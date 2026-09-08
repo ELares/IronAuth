@@ -921,6 +921,32 @@ async fn a_certificate_of_a_removed_organization_is_not_due() {
         survivor.to_string(),
         "the wrong certificate survived the filter: {due:?}"
     );
+
+    // AND DISABLING IS NOT DELETING. `organizations` carries two lifecycle facts and only
+    // deletion suppresses the notice. Disabling is reversible and administrative -- the customer
+    // exists, their contacts are there, the certificate is theirs -- so an organization disabled
+    // across its lead windows must not come back with a dead certificate nobody warned them
+    // about. Pinned here so the distinction is a decision somebody made rather than the accident
+    // of having filtered one column.
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .set_state(
+            &env,
+            &living,
+            ironauth_store::OrganizationState::Disabled,
+            None,
+        )
+        .await
+        .expect("disable the organization");
+    let due = alerts.due(now, &[3 * DAY], 100).await.expect("due");
+    assert_eq!(
+        due.len(),
+        1,
+        "a disabled organization stopped being warned, so it can come back to a dead \
+         certificate: {due:?}"
+    );
 }
 
 #[tokio::test]
