@@ -806,3 +806,40 @@ async fn the_boot_paths_retention_sweeper_actually_reaps_a_retired_message() {
          window; the row was still there"
     );
 }
+
+/// The MESSAGING worker registers both of its consumers, by name.
+///
+/// `every_registered_consumer_gets_a_pool_that_actually_drains_it` proves pools match the
+/// registry, using a registry the test builds itself. It therefore says nothing about WHICH
+/// consumers the binary puts in one, and a consumer missing from that list is not a compile
+/// error and not a test failure anywhere else: its queue simply fills and nothing drains it.
+///
+/// The expected names are written out here rather than derived from `messaging_consumers`,
+/// because a check whose expectation comes from the thing it checks passes whatever that thing
+/// says.
+#[tokio::test]
+async fn messaging_consumers_are_registered_by_name() {
+    let db = TestDatabase::start().await;
+
+    let consumers = super::messaging_consumers(
+        db.store(),
+        Vec::new(),
+        Arc::new(ironauth_admin::message_composer::DefaultComposer::new(
+            "example.test",
+        )),
+    );
+    let mut names: Vec<&str> = consumers.iter().map(|c| c.name()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        // In sorted order, because `names` is sorted: "message.delivery" precedes
+        // "saml_certificate.notice". Written out rather than sorted from the constants so the
+        // expectation is a literal a reader can check against the boot path by eye.
+        vec![
+            ironauth_store::MESSAGE_DELIVERY_CONSUMER,
+            ironauth_store::CERTIFICATE_NOTICE_CONSUMER,
+        ],
+        "the messaging worker must register delivery AND the certificate-expiry notices; \
+         dropping either leaves a queue nothing drains"
+    );
+}

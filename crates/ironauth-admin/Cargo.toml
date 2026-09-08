@@ -168,6 +168,13 @@ name = "certificate_expiry_sweep"
 path = "tests/certificate_expiry_sweep.rs"
 required-features = ["testing"]
 
+# WHO a recorded expiry notice reaches (issue #141): the organization's technical contacts, the
+# ones past the first page, and nobody in a neighbouring organization.
+[[test]]
+name = "certificate_notices"
+path = "tests/certificate_notices.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "project_grants"
 path = "tests/project_grants.rs"

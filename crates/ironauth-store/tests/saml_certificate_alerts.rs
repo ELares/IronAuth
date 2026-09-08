@@ -411,10 +411,11 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
     // They are not decoration: `connection_id` names the identity provider connection an
     // operator has to go and fix, and the expiry is what the notice tells them.
     //
-    // THE ORGANIZATION IS NOT ASSERTED HERE. Routing moved off `connection_id` when the work item
-    // began carrying `organization_id`, and this fixture has ONE organization, so comparing it
-    // would hold for any row returned. `the_work_item_names_the_certificates_own_organization`
-    // builds two, which is what that claim needs.
+    // THE ORGANIZATION IS NOT ASSERTED HERE. The field a sweep will route on is `organization_id`
+    // rather than `connection_id` -- neither routes today, since no sweep exists -- and this
+    // fixture has ONE organization, so comparing it would hold for any row returned.
+    // `the_work_item_names_the_certificates_own_organization` builds two, which is what that
+    // claim needs.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -488,6 +489,37 @@ async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_
     claimed.into_iter().map(|message| message.payload).collect()
 }
 
+/// The rows queued for the CONTACT NOTICE consumer, drained.
+///
+/// A separate helper because [`queued_events`] claims one consumer name and a row addressed to
+/// another is invisible to it. That is not a detail: the notice row was added to this
+/// transaction after the atomicity test above was written, and without this the test would have
+/// gone on passing with the notice committed in a transaction of its own -- which is the exact
+/// failure it exists to rule out, moved one row along.
+async fn queued_notices(db: &TestDatabase, env: &Env, scope: Scope) -> usize {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::CERTIFICATE_NOTICE_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.len()
+}
+
 #[tokio::test]
 async fn the_notice_and_the_ledger_row_commit_together() {
     // THE ORDERING THIS API EXISTS FOR, and until now nothing measured it: every call passed
@@ -541,6 +573,15 @@ async fn the_notice_and_the_ledger_row_commit_together() {
     let announced = queued_events(&db, &env, scope).await;
     assert_eq!(announced.len(), 1, "the notice announced {announced:?}");
     assert_eq!(announced[0]["type"], "saml_certificate.expiring");
+    // AND THE MAIL, which this test is named for and did not check. `queued_events` claims one
+    // consumer name, so the contact-notice row added to this same transaction was invisible to
+    // it: the enqueue could have been deleted outright and this test -- the one whose name
+    // asserts the writes commit together -- would have stayed green.
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        1,
+        "the ledger row and the mail that tells somebody about it are one fact or neither"
+    );
     assert_eq!(
         announced[0]["payload"]["lead_secs"],
         3 * DAY,
@@ -747,6 +788,12 @@ async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
         announced.is_empty(),
         "a notice survived a rolled-back write: {announced:?}"
     );
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        0,
+        "the contact-notice row survived a rolled-back write, so the ledger would say this \
+         organization was told by mail nobody was ever asked to send"
+    );
     // ...and the pair is STILL DUE, which is the half that matters operationally: the next sweep
     // picks it up and the customer is told. A ledger row surviving here is the silent failure.
     let due = alerts.due(now, &[3 * DAY], 100).await.expect("due");
@@ -773,6 +820,12 @@ async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
         .await
         .expect("the unpoisoned write succeeds");
     assert_eq!(queued_events(&db, &env, scope).await.len(), 1);
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        1,
+        "and the mail is queued, so the emptiness above is the rollback rather than a write \
+         that never happens"
+    );
 }
 
 #[tokio::test]
@@ -827,7 +880,8 @@ async fn a_certificate_unpinned_under_the_sweep_is_not_found_rather_than_a_fault
 
 #[tokio::test]
 async fn the_work_item_names_the_certificates_own_organization() {
-    // THE SWEEP ROUTES ON THIS FIELD, so getting it wrong tells one customer about another
+    // THE SWEEP WILL ROUTE ON THIS FIELD -- no sweep exists yet, and the struct's own doc says so
+    // -- so getting it wrong would tell one customer about another
     // customer's identity provider -- and both organizations are in the same scope, so no
     // tenant fence catches it.
     //
@@ -882,10 +936,17 @@ async fn the_work_item_names_the_certificates_own_organization() {
 
 #[tokio::test]
 async fn a_certificate_of_a_removed_organization_is_not_due() {
-    // A WORK ITEM THE SWEEP CANNOT COMPLETE IS WORSE THAN NONE. `organizations` soft-deletes, and
-    // a certificate pinned on a connection whose organization is gone has no contact list to
-    // notify -- so the sweep would find the item, find nobody to tell, and find it again on every
-    // pass for ever, because nothing records a notice that was never sent.
+    // A POLICY DECISION, NOT A DERIVATION, and the store doc on `due()` says the same. An
+    // organization an operator has removed should not generate operational notices to its
+    // contacts, because the operator has said they are done with it.
+    //
+    // TWO EARLIER REASONS HERE WERE MEASURABLY FALSE, which is why this one is labelled for what
+    // it is. "Its contacts are gone": they are not. "It signs nobody in": it does -- removal
+    // writes `organizations.deleted_at` and nothing else, and the SAML sign-in path never reads
+    // that column. (The AUTHORIZATION side IS fenced -- such an organization resolves to the
+    // empty role set -- so the sign-in survives and grants nothing. The claim was wrong about
+    // sign-in, not about safety.) Both are why the filter must be explicit: nothing downstream
+    // would stop the notice going out.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -915,8 +976,8 @@ async fn a_certificate_of_a_removed_organization_is_not_due() {
     assert_eq!(
         due.len(),
         1,
-        "a certificate of a removed organization is still queued for a notice nobody can \
-         receive: {due:?}"
+        "a certificate of a removed organization is still queued for an operational notice its \
+         operator has said they are done with: {due:?}"
     );
     assert_eq!(
         due[0].certificate_id,

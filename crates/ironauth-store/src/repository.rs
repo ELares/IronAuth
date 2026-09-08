@@ -22231,6 +22231,21 @@ pub const TRAIT_MIGRATION_CONSUMER: &str = "traits.migration";
 /// a worker that executes whatever has come due.
 pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
 
+/// The consumer that turns ONE recorded expiry notice into mail for the organization's IT
+/// contacts (issue #141).
+///
+/// Two stages rather than one, for the reason [`WEBHOOK_EVENT_CONSUMER`] gives: the sweep must
+/// not enqueue a message per contact inside the transaction that records the notice, or the cost
+/// of announcing one certificate grows with how many people an organization has listed. It is
+/// also the wrong transaction to hold: [`MessageRepo::enqueue`] takes a per-recipient advisory
+/// lock, and taking N of those inside the ledger write would order two locks against each other
+/// on a path that already races with certificate rollover.
+///
+/// It rides its OWN row rather than sharing the webhook one, because a single outbox row is
+/// claimed by exactly one consumer: a second consumer named on the same row drains nothing, and
+/// does so silently.
+pub const CERTIFICATE_NOTICE_CONSUMER: &str = "saml_certificate.notice";
+
 /// The registered consumer name a DOMAIN EVENT is fanned out under (issues #105, #108).
 ///
 /// The webhook chain had every stage but its first: endpoints could be registered, secrets
@@ -76940,16 +76955,30 @@ impl SamlCertificateAlertRepo<'_> {
     /// connection is not visible in this scope stops producing a work item at all -- silently,
     /// with no row and no error.
     ///
-    /// A REMOVED ORGANIZATION PRODUCES NO WORK ITEM EITHER, though NOT because its contacts are
-    /// gone -- they are not. `org_contacts` filters each CONTACT's own `deleted_at` and never the
-    /// organization's, so a soft-deleted organization keeps a readable contact list, and an
-    /// earlier version of this paragraph was wrong to say otherwise.
+    /// A REMOVED ORGANIZATION PRODUCES NO WORK ITEM, and the reason is a POLICY DECISION
+    /// rather than a derivation -- which took three attempts to state, so it is worth being
+    /// blunt about.
     ///
-    /// The reason is that there is nothing left to warn ABOUT. A removed organization signs
-    /// nobody in, so its identity provider's certificate expiring breaks nothing, and a notice
-    /// saying "renew this or logins stop" is false on its face. That the contacts are still
-    /// reachable is exactly why this filter has to be explicit: without it the sweep would find
-    /// somebody to tell and tell them.
+    /// Two earlier justifications were measurably false. "Its contacts are gone": they are
+    /// not, `org_contacts` filters each CONTACT's own `deleted_at` and never the
+    /// organization's. "It signs nobody in": it does -- removing an organization writes
+    /// `organizations.deleted_at` and NOTHING else, and the SAML sign-in path never reads
+    /// that column (`find_active` filters on tenant/environment/id/active with no
+    /// organization join, `establish_session` fences on the USER's state, and membership
+    /// revival does not consult it either).
+    ///
+    /// THAT IS NOT A HOLE, and the distinction matters for whoever reads this next. The
+    /// AUTHORIZATION consequence is fenced where the threat model says it is: such an
+    /// organization resolves to the EMPTY set in the one closure all four
+    /// effective-resolution projections share, so the session carries none of its roles.
+    /// What survives is the sign-in itself, which is why "it signs nobody in" was the wrong
+    /// thing to say -- not that anything is unguarded.
+    ///
+    /// So the honest statement is: an organization an operator has removed should not
+    /// generate operational notices to its contacts, because the operator has said they are
+    /// done with it. That is a choice somebody made, not something the schema forces, and the
+    /// next person is free to disagree with it -- which is exactly why it must not be dressed
+    /// up as a derivation.
     ///
     /// A DISABLED ORGANIZATION STILL GETS ITS NOTICE, and that is a decision rather than an
     /// oversight. `organizations` carries TWO lifecycle facts -- `deleted_at` and a `state` of
@@ -77149,6 +77178,27 @@ impl SamlCertificateAlertRepo<'_> {
         // IN THE LEDGER ROW'S OWN TRANSACTION, so "recorded" and "announced" are one fact. The
         // conflict above returns BEFORE this, so a loser announces nothing.
         enqueue_domain_event(&mut tx, env, self.scope, event).await?;
+        // AND THE MAIL, in that same transaction and for the same reason. A notice recorded
+        // without one leaves the ledger saying an organization was told about an expiry nobody
+        // told them about, and the ledger is what stops the next pass from trying again.
+        //
+        // The row carries the envelope rather than the recipients: who is on the contact list is
+        // resolved by the consumer, at the moment it sends, so a contact added between the sweep
+        // and the send is included and one removed is not.
+        if let Some(event) = event {
+            enqueue_outbox_in_tx(
+                &mut tx,
+                env,
+                self.scope,
+                &NewOutboxMessage {
+                    consumer: CERTIFICATE_NOTICE_CONSUMER,
+                    idempotency_key: event.id,
+                    ordering_key: event.subject,
+                    payload: event.envelope.clone(),
+                },
+            )
+            .await?;
+        }
         if poison_after_enqueue {
             // Testing seam only (every production caller passes false): a guaranteed error after
             // BOTH writes are staged, so their joint rollback is what proves they share one
