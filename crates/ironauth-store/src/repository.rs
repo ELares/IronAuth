@@ -89,12 +89,12 @@ use crate::id::{
     EmailOtpCodeId, EncryptedSecretId, EnvironmentId, EnvironmentSecretId, ExternalIssuerId,
     FedcmNonceId, FederationLoginStateId, FlowId, FlowTargetId, FlowVersionId, FlowVersionPinId,
     GrantId, ImpersonationAuthorizationId, InitialAccessTokenId, InvitationId, IssuedTokenId,
-    KekId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId, MessageId,
-    MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId, OperatorId,
-    OrgAuthPolicyId, OrgConnectionId, OrgContactId, OrgGroupId, OrgGroupMemberId, OrgGroupRoleId,
-    OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId, OrganizationId,
-    OutboxMessageId, PermissionId, PortalLinkId, PortalSessionId, PowChallengeId, ProjectGrantId,
-    ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
+    KekId, LdapConnectorId, LocaleBundleId, MagicLinkTokenId, ManagementKeyId, Mds3BlobCacheId,
+    MessageId, MessageTemplateId, MigrationRunId, MigrationRunRecordId, NativeSsoDeviceSecretId,
+    OperatorId, OrgAuthPolicyId, OrgConnectionId, OrgContactId, OrgGroupId, OrgGroupMemberId,
+    OrgGroupRoleId, OrgMembershipId, OrgMembershipRoleId, OrgRoleId, OrgRolePermissionId,
+    OrganizationId, OutboxMessageId, PermissionId, PortalLinkId, PortalSessionId, PowChallengeId,
+    ProjectGrantId, ProjectGrantRoleId, PushedRequestId, RecoveryApprovalId, RecoveryCodeId,
     RecoveryContactConfirmationId, RecoveryFlowId, RecoveryIdvSessionId, RecoveryTrustedContactId,
     RefreshFamilyId, RefreshTokenId, ResourceServerId, RiskDecisionId, RiskDisavowalId,
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, SamlSpKeyId,
@@ -305,6 +305,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn scim_push_connections(&self) -> ScimPushConnectionRepo<'a> {
         ScimPushConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Reads over LDAP/AD connectors in this scope (issue #142).
+    #[must_use]
+    pub fn ldap_connectors(&self) -> LdapConnectorRepo<'a> {
+        LdapConnectorRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1797,6 +1806,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn scim_push_connections(&self) -> ActingScimPushConnectionRepo<'a> {
         ActingScimPushConnectionRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Audited writes over LDAP/AD connectors in this scope (issue #142).
+    #[must_use]
+    pub fn ldap_connectors(&self) -> ActingLdapConnectorRepo<'a> {
+        ActingLdapConnectorRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -77660,6 +77679,506 @@ impl SamlReplayRepo<'_> {
 pub struct ScimPushConnectionRepo<'a> {
     store: &'a Store,
     scope: Scope,
+}
+
+/// How a connector protects its connection to the directory (issue #142).
+///
+/// A CLOSED SET, because #142 requires LDAPS or `StartTLS` by default and an explicit flag for
+/// plaintext: the insecure choice has to be a value somebody typed, not the absence of one they
+/// forgot. The column carries the same three values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LdapTlsMode {
+    /// TLS from the first byte, on the LDAPS port. The default.
+    Ldaps,
+    /// A plaintext connection upgraded with `StartTLS` before the bind.
+    StartTls,
+    /// No transport security at all.
+    ///
+    /// Reachable only by an operator writing it. Every path that binds warns, because a bind DN
+    /// and password cross this connection and a directory is the one place an attacker who reads
+    /// them gets everybody.
+    Plaintext,
+}
+
+impl LdapTlsMode {
+    /// The wire value stored in `ldap_connectors.tls_mode`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ldaps => "ldaps",
+            Self::StartTls => "starttls",
+            Self::Plaintext => "plaintext",
+        }
+    }
+
+    /// Whether a bind over this mode sends its credential in the clear.
+    ///
+    /// Named rather than open-coded at each call site, because "is this safe" asked three
+    /// different ways is three chances to get it wrong, and the answer has to stay attached to
+    /// the enum when a fourth mode is added.
+    #[must_use]
+    pub fn is_insecure(self) -> bool {
+        matches!(self, Self::Plaintext)
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "ldaps" => Some(Self::Ldaps),
+            "starttls" => Some(Self::StartTls),
+            "plaintext" => Some(Self::Plaintext),
+            _ => None,
+        }
+    }
+}
+
+/// What a connector does with a principal that has left the directory (issue #142).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LdapAbsencePolicy {
+    /// Deactivate, keeping the record. The default, and what an employee directory wants.
+    Deactivate,
+    /// Delete outright, which a contractor directory may prefer.
+    Delete,
+}
+
+impl LdapAbsencePolicy {
+    /// The wire value stored in `ldap_connectors.absence_policy`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deactivate => "deactivate",
+            Self::Delete => "delete",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "deactivate" => Some(Self::Deactivate),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// One configured directory (issue #142).
+#[derive(Debug, Clone)]
+pub struct LdapConnector {
+    /// The `ldc_` handle.
+    pub id: LdapConnectorId,
+    /// The one organization this directory populates.
+    pub organization_id: OrganizationId,
+    /// What an operator calls it.
+    pub display_name: String,
+    /// The directory host.
+    pub host: String,
+    /// The directory port.
+    pub port: u16,
+    /// How the connection is protected.
+    pub tls_mode: LdapTlsMode,
+    /// The DN to bind as.
+    pub bind_dn: String,
+    /// The `environment_secrets` row holding the bind password. NEVER the password.
+    pub bind_secret_name: String,
+    /// Where users live.
+    pub user_base_dn: String,
+    /// Where groups live.
+    pub group_base_dn: String,
+    /// Which entries under `user_base_dn` are users.
+    pub user_filter: String,
+    /// Which entries under `group_base_dn` are groups.
+    pub group_filter: String,
+    /// How directory attributes become identity, in the shape the SCIM path uses.
+    pub attribute_mapping: serde_json::Value,
+    /// What absence from the directory means.
+    pub absence_policy: LdapAbsencePolicy,
+    /// How deep nested groups resolve before the walk stops.
+    pub max_group_depth: i32,
+    /// Whether the scheduler picks it up.
+    pub active: bool,
+}
+
+/// A connector to create.
+#[derive(Debug, Clone, Copy)]
+pub struct NewLdapConnector<'a> {
+    /// The `ldc_` handle, minted by the caller.
+    pub id: &'a LdapConnectorId,
+    /// The organization whose users and groups this directory populates.
+    pub organization_id: &'a OrganizationId,
+    /// What an operator calls it.
+    pub display_name: &'a str,
+    /// The directory host.
+    pub host: &'a str,
+    /// The directory port.
+    pub port: u16,
+    /// How the connection is protected.
+    pub tls_mode: LdapTlsMode,
+    /// The DN to bind as.
+    pub bind_dn: &'a str,
+    /// The `environment_secrets` row holding the bind password.
+    pub bind_secret_name: &'a str,
+    /// Where users live.
+    pub user_base_dn: &'a str,
+    /// Where groups live.
+    pub group_base_dn: &'a str,
+    /// Which entries under `user_base_dn` are users.
+    pub user_filter: &'a str,
+    /// Which entries under `group_base_dn` are groups.
+    pub group_filter: &'a str,
+    /// How directory attributes become identity.
+    pub attribute_mapping: &'a serde_json::Value,
+    /// What absence from the directory means.
+    pub absence_policy: LdapAbsencePolicy,
+    /// How deep nested groups resolve.
+    pub max_group_depth: i32,
+}
+
+/// Reads over [`LdapConnector`] rows in one scope.
+pub struct LdapConnectorRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl LdapConnectorRepo<'_> {
+    /// One connector, or [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a handle from another scope or one that does not exist --
+    /// the uniform answer, so a caller cannot tell the two apart.
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(&self, id: &LdapConnectorId) -> Result<LdapConnector, StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {LDAP_CONNECTOR_COLUMNS} FROM ldap_connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.ok_or(StoreError::NotFound)
+            .and_then(|row| ldap_connector_from_row(&row, self.scope))
+    }
+
+    /// Every connector in one organization, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_org(
+        &self,
+        organization_id: &OrganizationId,
+        limit: i64,
+    ) -> Result<Vec<LdapConnector>, StoreError> {
+        if organization_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {LDAP_CONNECTOR_COLUMNS} FROM ldap_connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+             ORDER BY created_at, id LIMIT $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(organization_id.to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| ldap_connector_from_row(row, self.scope))
+            .collect()
+    }
+
+    /// Every ACTIVE connector in this scope, for the scheduler.
+    ///
+    /// ACROSS ORGANIZATIONS, unlike [`Self::list_for_org`]: a sync pass sweeps a whole scope and
+    /// the organization is a property of each connector rather than an input. Inactive ones are
+    /// excluded here rather than by the caller, so a connector an operator switched off cannot
+    /// be swept by a caller that forgot to check.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn active_in_scope(&self, limit: i64) -> Result<Vec<LdapConnector>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {LDAP_CONNECTOR_COLUMNS} FROM ldap_connectors \
+             WHERE tenant_id = $1 AND environment_id = $2 AND active \
+             ORDER BY created_at, id LIMIT $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| ldap_connector_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// Audited writes over [`LdapConnector`] rows in one scope (issue #142).
+pub struct ActingLdapConnectorRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingLdapConnectorRepo<'_> {
+    /// Configure a directory.
+    ///
+    /// # The organization is checked IN THE STATEMENT
+    ///
+    /// The foreign key proves the organization exists, not that it is visible in this scope --
+    /// referential integrity bypasses row-level security, which 0205 states outright. Without
+    /// the `EXISTS`, a connector could be pointed at another scope's organization and its sync
+    /// would then write that organization's users.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle or the organization is out of scope, or the
+    /// organization does not exist; [`StoreError::Conflict`] if the handle is already used;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(
+        &self,
+        env: &Env,
+        connector: NewLdapConnector<'_>,
+    ) -> Result<(), StoreError> {
+        if connector.id.scope() != self.scope || connector.organization_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *connector.id;
+        let organization = connector.organization_id.to_string();
+        let display_name = connector.display_name.to_owned();
+        let host = connector.host.to_owned();
+        let port = i32::from(connector.port);
+        let tls_mode = connector.tls_mode.as_str();
+        let bind_dn = connector.bind_dn.to_owned();
+        let bind_secret_name = connector.bind_secret_name.to_owned();
+        let user_base_dn = connector.user_base_dn.to_owned();
+        let group_base_dn = connector.group_base_dn.to_owned();
+        let user_filter = connector.user_filter.to_owned();
+        let group_filter = connector.group_filter.to_owned();
+        let attribute_mapping = connector.attribute_mapping.clone();
+        let absence_policy = connector.absence_policy.as_str();
+        let max_group_depth = connector.max_group_depth;
+        // THE DETAIL NAMES THE HOST AND THE MODE, and neither is a secret: the bind password is
+        // an `environment_secrets` row this connector NAMES. An operator reading the audit trail
+        // for "who pointed us at that server, and did they turn TLS off" gets both here.
+        let detail = format!("host={host} tls_mode={tls_mode}");
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::LdapConnectorCreated,
+                target: &id,
+            },
+            async move |tx| {
+                let inserted = sqlx::query(
+                    "INSERT INTO ldap_connectors \
+                     (id, tenant_id, environment_id, organization_id, display_name, host, port, \
+                      tls_mode, bind_dn, bind_secret_name, user_base_dn, group_base_dn, \
+                      user_filter, group_filter, attribute_mapping, absence_policy, \
+                      max_group_depth) \
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                            $16, $17 \
+                     WHERE EXISTS (SELECT 1 FROM organizations \
+                                   WHERE tenant_id = $2 AND environment_id = $3 AND id = $4 \
+                                     AND deleted_at IS NULL)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&organization)
+                .bind(&display_name)
+                .bind(&host)
+                .bind(port)
+                .bind(tls_mode)
+                .bind(&bind_dn)
+                .bind(&bind_secret_name)
+                .bind(&user_base_dn)
+                .bind(&group_base_dn)
+                .bind(&user_filter)
+                .bind(&group_filter)
+                .bind(&attribute_mapping)
+                .bind(absence_policy)
+                .bind(max_group_depth)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        StoreError::from(error)
+                    }
+                })?;
+                if inserted.rows_affected() == 0 {
+                    // THE `EXISTS` DID NOT MATCH. No such organization in this scope -- reported
+                    // as not-found rather than as a constraint failure, because to the caller
+                    // that is what it is.
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(detail.as_str()),
+        )
+        .await
+    }
+
+    /// Turn a connector on or off without deleting its configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope or no such connector exists;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_active(
+        &self,
+        env: &Env,
+        id: &LdapConnectorId,
+        active: bool,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::LdapConnectorUpdated,
+                target: &id,
+            },
+            async move |tx| {
+                let updated = sqlx::query(
+                    "UPDATE ldap_connectors SET active = $4, updated_at = now() \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(active)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(if active {
+                "active=true"
+            } else {
+                "active=false"
+            }),
+        )
+        .await
+    }
+
+    /// Remove a connector outright.
+    ///
+    /// A HARD DELETE, unlike a contact or a grant. What the connector DID is in the audit log
+    /// and in its sync runs, neither of which this row owns, so there is no history here to
+    /// preserve -- and a soft-deleted directory configuration is one an operator has to
+    /// remember to exclude from every read.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope or no such connector exists;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(&self, env: &Env, id: &LdapConnectorId) -> Result<(), StoreError> {
+        if id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *id;
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::LdapConnectorDeleted,
+                target: &id,
+            },
+            async move |tx| {
+                let deleted = sqlx::query(
+                    "DELETE FROM ldap_connectors \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .execute(&mut **tx)
+                .await?;
+                if deleted.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await
+    }
+}
+
+/// The columns every connector read selects, in the order `ldap_connector_from_row` expects.
+const LDAP_CONNECTOR_COLUMNS: &str = "id, organization_id, display_name, host, port, tls_mode, \
+     bind_dn, bind_secret_name, user_base_dn, group_base_dn, user_filter, group_filter, \
+     attribute_mapping, absence_policy, max_group_depth, active";
+
+/// Reconstruct a typed [`LdapConnector`] from a row read within scope.
+///
+/// A `tls_mode` or `absence_policy` the enum does not know is a DECODE ERROR, not a default.
+/// Both
+/// columns carry a CHECK naming the closed set, so an unknown value means the schema and this
+/// code disagree -- and defaulting would silently pick a policy nobody configured, which for
+/// `tls_mode` could mean binding in the clear.
+fn ldap_connector_from_row(row: &PgRow, scope: Scope) -> Result<LdapConnector, StoreError> {
+    let decode = |what: &str| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("ldap_connectors.{what} holds a value this build does not know").into(),
+        ))
+    };
+    let id_text: String = row.get("id");
+    let organization_text: String = row.get("organization_id");
+    let tls_text: String = row.get("tls_mode");
+    let absence_text: String = row.get("absence_policy");
+    Ok(LdapConnector {
+        id: LdapConnectorId::parse_in_scope(&id_text, &scope).map_err(|_| decode("id"))?,
+        organization_id: OrganizationId::parse_in_scope(&organization_text, &scope)
+            .map_err(|_| decode("organization_id"))?,
+        display_name: row.get("display_name"),
+        host: row.get("host"),
+        port: u16::try_from(row.get::<i32, _>("port")).map_err(|_| decode("port"))?,
+        tls_mode: LdapTlsMode::parse(&tls_text).ok_or_else(|| decode("tls_mode"))?,
+        bind_dn: row.get("bind_dn"),
+        bind_secret_name: row.get("bind_secret_name"),
+        user_base_dn: row.get("user_base_dn"),
+        group_base_dn: row.get("group_base_dn"),
+        user_filter: row.get("user_filter"),
+        group_filter: row.get("group_filter"),
+        attribute_mapping: row.get("attribute_mapping"),
+        absence_policy: LdapAbsencePolicy::parse(&absence_text)
+            .ok_or_else(|| decode("absence_policy"))?,
+        max_group_depth: row.get("max_group_depth"),
+        active: row.get("active"),
+    })
 }
 
 impl ScimPushConnectionRepo<'_> {

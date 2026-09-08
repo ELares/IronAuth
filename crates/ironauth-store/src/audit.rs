@@ -1379,8 +1379,12 @@ pub enum Action {
     /// environment, an outbound one points a credential at somebody else's directory. An operator
     /// reading the log needs to see which happened without decoding a detail field.
     ScimPushConnectionCreated,
+    /// An LDAP/AD connector was created (issue #142).
+    LdapConnectorCreated,
     /// An outbound SCIM connection's configuration changed (issue #137).
     ScimPushConnectionUpdated,
+    /// An LDAP/AD connector was updated (issue #142).
+    LdapConnectorUpdated,
     /// An inbound SAML connection was created (issue #139).
     ///
     /// SEPARATE FROM PINNING A KEY, below. Creating the connection says which identity provider
@@ -1420,6 +1424,8 @@ pub enum Action {
     SamlCertificateUnpinned,
     /// An outbound SCIM connection was deleted (issue #137).
     ScimPushConnectionDeleted,
+    /// An LDAP/AD connector was deleted (issue #142).
+    LdapConnectorDeleted,
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
     /// authorization after checking the permission and the justification. The row targets the
     /// `imp_` authorization.
@@ -1948,7 +1954,9 @@ impl Action {
             Action::ScimConnectionTokenRevoked => "scim_connection.token_revoked",
             Action::ScimConnectionBindingsRevoked => "scim_connection.bindings.revoke",
             Action::ScimPushConnectionCreated => "scim_push_connection.created",
+            Action::LdapConnectorCreated => "ldap_connector.created",
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
+            Action::LdapConnectorUpdated => "ldap_connector.updated",
             Action::SamlConnectionCreated => "saml_connection.created",
             Action::SamlConnectionDeleted => "saml_connection.deleted",
             Action::SamlConnectionEnabled => "saml_connection.enabled",
@@ -1957,6 +1965,7 @@ impl Action {
             Action::SamlSpKeyProvisioned => "saml_sp_key.provisioned",
             Action::SamlCertificateUnpinned => "saml_certificate.unpinned",
             Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",
+            Action::LdapConnectorDeleted => "ldap_connector.deleted",
             Action::ApiKeyRevoked => "api_key.revoked",
             Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",
