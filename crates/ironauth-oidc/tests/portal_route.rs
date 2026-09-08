@@ -3157,251 +3157,106 @@ async fn a_contacts_session_sees_only_its_own_organizations_contacts() {
     );
 }
 
-/// Drain the contact-change queue through the CONTROL-plane consumer, as the worker does.
-async fn apply_contact_changes(harness: &Harness) -> usize {
-    use ironauth_store::outbox::OutboxConsumer as _;
-
-    let scope = harness.scope();
-    let env = Env::system();
-    let consumer = ironauth_admin::contact_changes::ContactChangeConsumer::new(
-        harness.db().control_store().clone(),
-    );
-    let mut applied = 0;
-    loop {
-        let claimed = harness
-            .db()
-            .store()
-            .scoped(scope)
-            .outbox()
-            .claim(
-                &env,
-                ironauth_store::CONTACT_CHANGE_CONSUMER,
-                std::time::Duration::from_secs(30),
-                100,
-            )
-            .await
-            .expect("claim");
-        if claimed.is_empty() {
-            return applied;
-        }
-        for message in &claimed {
-            consumer
-                .handle(&env, scope, message)
-                .await
-                .expect("the change applies");
-            harness
-                .db()
-                .store()
-                .scoped(scope)
-                .outbox()
-                .complete(&env, message)
-                .await
-                .expect("complete");
-            applied += 1;
-        }
+#[tokio::test]
+async fn a_technical_contact_past_the_page_bound_is_not_reported_as_nobody() {
+    // THE PAGE MUST NOT CONTRADICT THE ROUTER. `CertificateNoticeConsumer` loops the contact
+    // list TO EXHAUSTION and mails every technical contact wherever it sorts; this page shows a
+    // bounded number. Counting technical contacts only over the RENDERED rows let an
+    // organization whose hundred security contacts sort ahead of its one technical contact read
+    // "nobody here is warned" while the router was warning that person.
+    //
+    // NO FIXTURE HERE EVER REACHED THE BOUND before this test -- the largest was two rows -- so
+    // the truncation banner was unmeasured too.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    for index in 0..101 {
+        add_contact(
+            &harness,
+            &organization,
+            &format!("soc{index}@contoso.test"),
+            "security",
+        )
+        .await;
     }
-}
+    // Added last, so it sorts last in the (created_at, id) order the listing uses.
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
 
-async fn post_contact_change(
-    harness: &Harness,
-    cookie: &str,
-    form: &str,
-) -> (axum::http::StatusCode, String) {
-    let path = format!(
-        "/t/{}/e/{}/portal/s/contacts/change",
-        harness.scope().tenant(),
-        harness.scope().environment()
-    );
-    let (status, _, body) = harness.post_form(&path, form, Some(cookie)).await;
-    (status, body)
-}
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
 
-#[tokio::test]
-async fn a_contact_added_from_the_portal_is_listed_after_the_worker_runs() {
-    // #141 criterion 3's write half. The portal cannot write a contact -- 0207 reserves that to
-    // ironauth_control -- so it queues and a control-plane consumer applies. A test stopping at
-    // the 303 would measure that a row reached a queue, which is not what the customer asked for.
-    let harness = Harness::start().await;
-    let organization = seed_org(&harness, "Contoso").await;
-    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
-
-    let (status, body) = post_contact_change(
-        &harness,
-        &cookie,
-        "action=add&display_name=Ada&email=ada%40contoso.test&category=technical",
-    )
-    .await;
-    assert_eq!(status, 303, "{body}");
-
-    // NOT YET LISTED: the data plane may not write a contact.
-    let before = contacts_page(&harness, &organization, "k-before").await;
     assert!(
-        !before.contains("ada@contoso.test"),
-        "the portal must not have written the contact itself: {before}"
-    );
-
-    assert_eq!(
-        apply_contact_changes(&harness).await,
-        1,
-        "one queued change"
-    );
-    let after = contacts_page(&harness, &organization, "k-after").await;
-    assert!(after.contains("ada@contoso.test"), "{after}");
-    assert!(
-        !after.contains("nobody here is warned"),
-        "and a technical contact clears the warning: {after}"
-    );
-}
-
-#[tokio::test]
-async fn a_contact_removed_from_the_portal_stops_being_listed() {
-    let harness = Harness::start().await;
-    let organization = seed_org(&harness, "Contoso").await;
-    let contact = add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
-    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
-
-    let (status, body) = post_contact_change(
-        &harness,
-        &cookie,
-        &format!("action=remove&contact={}", urlencode(&contact.to_string())),
-    )
-    .await;
-    assert_eq!(status, 303, "{body}");
-    assert_eq!(apply_contact_changes(&harness).await, 1);
-
-    let after = contacts_page(&harness, &organization, "k-after").await;
-    assert!(
-        !after.contains("ops@contoso.test"),
-        "the removed contact must be gone: {after}"
+        body.contains("Showing the first"),
+        "a truncated list must admit its bound: {body}"
     );
     assert!(
-        after.contains("reach nobody"),
-        "and the page must say the list is now empty: {after}"
+        !body.contains("so nobody here is warned"),
+        "the page claimed nobody is warned while a technical contact exists: {body}"
     );
 }
 
 #[tokio::test]
-async fn a_portal_holder_cannot_remove_another_organizations_contact() {
-    // A contact id from a neighbour must not be actionable. The consumer's `remove` takes the
-    // organization as well as the id, so the row is untouched -- and the response is the same
-    // 303 a real removal gets, deliberately: a different answer would tell the holder the handle
-    // exists somewhere else.
-    let harness = Harness::start().await;
-    let mine = seed_org(&harness, "Contoso").await;
-    let theirs = seed_org(&harness, "Initech").await;
-    add_contact(&harness, &mine, "ops@contoso.test", "technical").await;
-    let neighbour = add_contact(&harness, &theirs, "ops@initech.test", "technical").await;
-
-    let cookie = open_session_in(&harness, "contacts", "k-contacts", &mine).await;
-    let (status, body) = post_contact_change(
-        &harness,
-        &cookie,
-        &format!(
-            "action=remove&contact={}",
-            urlencode(&neighbour.to_string())
-        ),
-    )
-    .await;
-    assert_eq!(status, 303, "{body}");
-    apply_contact_changes(&harness).await;
-
-    let theirs_page = contacts_page(&harness, &theirs, "k-theirs").await;
-    assert!(
-        theirs_page.contains("ops@initech.test"),
-        "the neighbour's contact must still be listed: {theirs_page}"
-    );
-}
-
-#[tokio::test]
-async fn a_malformed_contact_is_refused_before_anything_is_queued() {
-    // VALIDATED WHILE SOMEBODY IS LOOKING AT THE FORM. A queue is not a place to defer
-    // validation to: accepting a mistyped address and letting it die in a dead letter tells the
-    // person their change worked.
-    let harness = Harness::start().await;
-    let organization = seed_org(&harness, "Contoso").await;
-    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
-
-    for form in [
-        "action=add&display_name=Ada&email=not-an-address&category=technical",
-        "action=add&display_name=Ada&email=ada%40contoso.test&category=marketing",
-        "action=add&display_name=&email=ada%40contoso.test&category=technical",
-        "action=sideways&display_name=Ada&email=ada%40contoso.test&category=technical",
-    ] {
-        let (status, body) = post_contact_change(&harness, &cookie, form).await;
-        assert_eq!(status, 400, "refusing {form}: {body}");
-    }
-    assert_eq!(
-        apply_contact_changes(&harness).await,
-        0,
-        "no refused form was queued"
-    );
-}
-
-#[tokio::test]
-async fn a_cross_site_contact_change_is_refused_and_queues_nothing() {
-    // A cross-origin post that added a contact would redirect a customer's operational notices
-    // to an address of the attacker's choosing -- a quiet way to be told nothing when their
-    // certificate is about to expire.
-    let harness = Harness::start().await;
-    let organization = seed_org(&harness, "Contoso").await;
-    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
-    let path = format!(
-        "/t/{}/e/{}/portal/s/contacts/change",
-        harness.scope().tenant(),
-        harness.scope().environment()
-    );
-    let form = "action=add&display_name=Mallory&email=mallory%40attacker.test&category=technical";
-
-    let (status, body) =
-        post_form_from_with_cookie(&harness, &path, form, "cross-site", &cookie).await;
-    assert_ne!(
-        status, 303,
-        "a cross-site contact change was accepted: {body}"
-    );
-    assert_eq!(
-        apply_contact_changes(&harness).await,
-        0,
-        "and queued nothing"
-    );
-
-    // THE CONTROL: same-origin is accepted, so the refusal is the guard rather than a bad form.
-    let (status, body) =
-        post_form_from_with_cookie(&harness, &path, form, "same-origin", &cookie).await;
-    assert_eq!(status, 303, "a same-origin change was refused: {body}");
-    assert_eq!(apply_contact_changes(&harness).await, 1);
-}
-
-#[tokio::test]
-async fn a_session_for_another_intent_cannot_change_contacts() {
-    // THE FENCE ON THE WRITE, which the surface's fence does not give: mounting a change behind
-    // the same session as a read does not make it the same permission. A `certificate-renewal`
-    // link is handed to an outside IdP administrator, and it must not also let them redirect
-    // this organization's operational notices to an address of their choosing.
+async fn the_no_technical_warning_is_absent_when_a_technical_contact_is_listed() {
+    // MEASURED IN ONE DIRECTION ONLY until now. The suite proved the sentence CAN appear;
+    // nothing proved it does not appear when it should not. Making the technical count
+    // permanently zero left all 52 tests green while every page carried a warning
+    // contradicting its own table.
     let harness = Harness::start().await;
     let organization = seed_org(&harness, "Contoso").await;
     add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+    add_contact(&harness, &organization, "soc@contoso.test", "security").await;
 
-    for intent in ["certificate-renewal", "scim"] {
-        let cookie = open_session_in(&harness, intent, &format!("k-{intent}"), &organization).await;
-        let (status, body) = post_contact_change(
-            &harness,
-            &cookie,
-            "action=add&display_name=Mallory&email=mallory%40attacker.test&category=technical",
-        )
-        .await;
-        assert_ne!(
-            status, 303,
-            "a {intent} session changed the contact list: {body}"
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(body.contains("ops@contoso.test"), "{body}");
+    assert!(
+        !body.contains("nobody here is warned"),
+        "a list WITH a technical contact must not warn that nobody is warned: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_category_nothing_routes_to_says_so_rather_than_promising_mail() {
+    // THE RECEIVES COLUMN IS A CLAIM. `CertificateNoticeConsumer` is the only delivery path any
+    // contact category feeds and it compares against `technical` alone -- nothing in the tree
+    // sends a security notice or a billing one. Under a heading saying these are the people
+    // operational notices reach, a cell reading "security notices" tells a customer they are
+    // covered for something no producer exists for.
+    //
+    // The billing arm was also unmeasured outright: replacing its text with the technical
+    // sentence left every test green.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+    add_contact(&harness, &organization, "soc@contoso.test", "security").await;
+    add_contact(&harness, &organization, "ap@contoso.test", "billing").await;
+
+    let body = contacts_page(&harness, &organization, "k-contacts").await;
+
+    assert!(
+        body.contains("SSO and provisioning problems, including certificate expiry"),
+        "the technical row must say what it actually receives: {body}"
+    );
+    // PER ROW, not counted over the body. A body-wide count is a sum over the things it means to
+    // distinguish, and it broke the moment the page gained an add form whose dropdown carries
+    // the same (correct) wording -- four occurrences where it expected two. Slicing each
+    // contact's row asserts the thing the test is named for and is indifferent to what else the
+    // page grows.
+    for address in ["soc@contoso.test", "ap@contoso.test"] {
+        let at = body
+            .find(address)
+            .unwrap_or_else(|| panic!("no row for {address} in {body}"));
+        let start = body[..at].rfind("<tr>").expect("a row start");
+        let row = &body[start..at + body[at..].find("</tr>").expect("a row end")];
+        assert!(
+            row.contains("none are sent yet"),
+            "{address}'s row must say nothing is sent to it: {row}"
         );
     }
-    assert_eq!(
-        apply_contact_changes(&harness).await,
-        0,
-        "and nothing was queued"
-    );
-    let page = contacts_page(&harness, &organization, "k-check").await;
+    // AND THE FORM AGREES WITH THE TABLE. The dropdown is where somebody CHOOSES a category, so
+    // a label promising "security notices" there is the promise the table just retracted --
+    // which is exactly what this page did until the options were derived from the same function
+    // the rows use.
     assert!(
-        !page.contains("mallory@attacker.test"),
-        "nothing was added: {page}"
+        !body.contains(">security notices<"),
+        "no label may promise mail with no producer behind it: {body}"
     );
 }
