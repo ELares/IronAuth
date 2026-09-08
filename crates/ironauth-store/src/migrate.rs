@@ -1729,6 +1729,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0210_portal_contacts_intent.sql"),
         },
+        Migration {
+            version: 211,
+            name: "portal_audit_intent",
+            // EXPAND: it WIDENS a CHECK, so every value an older binary can write is still
+            // accepted and the only new thing is a value no older binary produces.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0211_portal_audit_intent.sql"),
+        },
     ]
 }
 
