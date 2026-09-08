@@ -408,7 +408,7 @@ async fn a_renewal_landing_mid_pass_is_counted_not_raised() {
         pinned.push(pin_expiring(&db, &env, scope, &connection, seed, 2 * DAY).await);
     }
     drain(&db, &env, scope).await;
-    let victim = pinned.last().expect("ten certificates").clone();
+    let victim = *pinned.last().expect("ten certificates");
 
     let (report, unpinned) = tokio::join!(
         ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100),
