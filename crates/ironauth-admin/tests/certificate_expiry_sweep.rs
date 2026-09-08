@@ -175,6 +175,7 @@ async fn a_pass_announces_every_crossed_lead_once_and_a_second_pass_announces_no
     let scope = db.seed_scope(&env).await;
     let org = seed_org(&db, &env, scope, "Globex").await;
     let connection = connect(&db, &env, scope, &org, "https://idp.example/sweep").await;
+    let now = now_micros(&env);
     let certificate = pin_expiring(&db, &env, scope, &connection, 80, 2 * DAY).await;
     drain(&db, &env, scope).await;
 
@@ -191,6 +192,12 @@ async fn a_pass_announces_every_crossed_lead_once_and_a_second_pass_announces_no
 
     let announced = drain(&db, &env, scope).await;
     assert_eq!(announced.len(), 3, "the pass announced {announced:?}");
+    // THE MILLISECOND FIELDS ARE CHECKED AS MILLISECONDS, not merely for presence. A value in
+    // MICROSECONDS in a field named `_ms` puts a vendor's "renew before" date roughly two and a
+    // half million years out, and the registry types it as a bare `integer` so nothing else
+    // would notice. The bound is generous and still a thousand times tighter than the error.
+    let expected_ms = (now + 2 * DAY * 1_000_000) / 1000;
+    let a_century_ms = 100 * 365 * DAY * 1000;
     let mut leads: Vec<i64> = announced
         .iter()
         .map(|event| {
@@ -201,6 +208,26 @@ async fn a_pass_announces_every_crossed_lead_once_and_a_second_pass_announces_no
             assert_eq!(
                 event["payload"]["saml_certificate_id"],
                 certificate.to_string()
+            );
+            // AND THE CONNECTION, which is the thing an operator has to go and fix. Nothing read
+            // it before, so it could have carried the certificate id instead.
+            assert_eq!(
+                event["payload"]["saml_connection_id"],
+                connection.to_string(),
+                "the notice names the wrong connection: {event}"
+            );
+            let not_after = event["payload"]["not_after_unix_ms"]
+                .as_i64()
+                .expect("an expiry");
+            assert!(
+                (not_after - expected_ms).abs() < 1000,
+                "the expiry is not the certificate's, in milliseconds: {not_after} against \
+                 {expected_ms}"
+            );
+            let occurred = event["occurred_at_unix_ms"].as_i64().expect("a timestamp");
+            assert!(
+                occurred < a_century_ms,
+                "the envelope's occurred_at is not milliseconds: {occurred}"
             );
             event["payload"]["lead_secs"].as_i64().expect("a lead")
         })
@@ -265,11 +292,32 @@ async fn two_passes_racing_over_one_certificate_announce_it_once_between_them() 
         0,
         "a pass reported a vanished certificate that was never unpinned: {left:?} {right:?}"
     );
-    let accounted = left.announced + left.already_taken + right.announced + right.already_taken;
+    // AND THE LOSER REPORTED WHAT IT LOST. This is the assertion that makes `already_taken`
+    // mean something: whichever pass ran second saw the other's rows and counted them rather
+    // than raising. An earlier version asserted `announced + already_taken >= 3`, which is
+    // implied by the line above -- `announced` already sums to 3 -- so it held whatever
+    // `already_taken` was, including zero. That is the second vacuous guard I wrote here.
+    //
+    // The passes may genuinely not overlap, in which case the second finds nothing due and
+    // reports zero of everything; what must never happen is a pass that RAISED, and both
+    // `expect`s above already forbid that.
+    // WHAT THIS TEST CAN AND CANNOT GUARANTEE, stated because two earlier versions pretended
+    // otherwise. It guarantees the invariant above: three notices between the two passes, no
+    // more and no fewer, and neither pass raising. It does NOT guarantee that the passes
+    // OVERLAP -- they may serialise, in which case the second finds nothing due and reports
+    // zero of everything, and `already_taken` is never exercised.
+    //
+    // Two earlier guards here claimed to cover that and did not. One was arithmetic that
+    // reduced to a tautology; the other asserted `announced + already_taken >= 3`, which the
+    // line above already forces since `announced` sums to exactly 3. Asserting
+    // `already_taken > 0` instead would be worse: it would be FLAKY, red whenever the runtime
+    // happened to serialise the two futures.
+    //
+    // So the count is bounded and nothing more is claimed of it.
+    let contested = left.already_taken + right.already_taken;
     assert!(
-        accounted >= 3,
-        "the two passes accounted for {accounted} of three thresholds, so a pair was silently \
-         dropped: {left:?} {right:?}"
+        contested <= 3,
+        "more pairs were reported taken than there are thresholds: {left:?} {right:?}"
     );
 
     let announced = drain(&db, &env, scope).await;
@@ -286,12 +334,13 @@ async fn an_unpinned_certificate_leaves_the_work_set_rather_than_failing_a_pass(
     // AN EXPIRY WARNING IS WHAT PROMPTS THE RENEWAL, so losing the work item to the operator
     // acting on it is a SUCCESS of the feature and must not read as a fault.
     //
-    // WHERE IT ACTUALLY DROPS OUT, measured rather than assumed: the certificate leaves `due()`
-    // the moment it is unpinned, so a pass never attempts it and `vanished` stays zero. That
-    // counter exists for the narrower interleaving where the unpin lands BETWEEN a pass reading
-    // and writing, which is not constructible from one task -- and an earlier version of this
-    // test asserted three `already_taken` from rows staged BEFORE the pass, which `due()` simply
-    // excludes, so it was asserting a state the code cannot produce.
+    // WHERE IT DROPS OUT WHEN THE UNPIN IS ALREADY DONE: the certificate leaves `due()`, so a
+    // pass never attempts it and `vanished` stays zero. The counter is for the NARROWER
+    // interleaving where the unpin lands between a pass reading and writing, which
+    // `a_renewal_landing_mid_pass_is_counted_not_raised` below constructs.
+    //
+    // An earlier version of this test asserted three `already_taken` from rows staged BEFORE the
+    // pass, which `due()` simply excludes -- a state the code cannot produce.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -332,4 +381,72 @@ async fn an_unpinned_certificate_leaves_the_work_set_rather_than_failing_a_pass(
             "a notice went out about the certificate the operator had already replaced: {event}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_renewal_landing_mid_pass_is_counted_not_raised() {
+    // THE `vanished` ARM, ACTUALLY EXERCISED. Its sibling above shows an unpin that has already
+    // happened simply removes the work item; this drives the interleaving the counter exists
+    // for -- the operator renewing WHILE a pass is running, which is the likeliest timing of all
+    // given the notice is what prompted them.
+    //
+    // AND IT WAS UNREACHED BEFORE. A review measured it: replacing the arm with
+    // `report.announced += 1`, or with a `panic!`, left every test in this file green -- so a
+    // pass that lost every work item to renewals would have reported them all as announced. The
+    // comment that explained the gap away claimed the interleaving was not constructible from
+    // one task. It is, with the same `tokio::join!` its neighbour uses.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/midpass").await;
+
+    // SEVERAL CERTIFICATES, so the pass has enough work to still be running when the unpin
+    // lands. One would be a race the sweep usually wins.
+    let mut pinned = Vec::new();
+    for seed in 90..100u8 {
+        pinned.push(pin_expiring(&db, &env, scope, &connection, seed, 2 * DAY).await);
+    }
+    drain(&db, &env, scope).await;
+    let victim = pinned.last().expect("ten certificates").clone();
+
+    let (report, unpinned) = tokio::join!(
+        ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            db.control_store()
+                .scoped(scope)
+                .acting(db.test_actor(&env), CorrelationId::generate(&env))
+                .saml_connections()
+                .unpin_certificate(&env, &victim, None)
+                .await
+        },
+    );
+    unpinned.expect("the operator's renewal succeeds");
+    let report = report.expect("a renewal under a pass is not a fault");
+
+    // THE VICTIM'S PAIRS LANDED IN THE `vanished` BUCKET, which is the assertion that gives the
+    // counter meaning. An earlier version asserted only `announced + vanished == 30`, and that
+    // sum is INSENSITIVE to which bucket a pair falls in -- counting a vanished pair as
+    // announced keeps the total at thirty, so the mutation this test exists to catch survived
+    // it. The third vacuous assertion I have written in this file, and the one that would have
+    // let a pass report every lost work item as delivered.
+    //
+    // THIS DEPENDS ON THE PASS STILL RUNNING when the unpin lands, which is why there are ten
+    // certificates rather than one: the sweep has thirty records to write and the renewal
+    // arrives after three milliseconds.
+    assert!(
+        report.vanished > 0,
+        "the renewal landed without the pass noticing, so the interleaving this test exists for \
+         did not happen: {report:?}"
+    );
+    assert_eq!(
+        report.announced + report.vanished,
+        30,
+        "pairs went missing under a mid-pass renewal: {report:?}"
+    );
+    assert_eq!(
+        report.already_taken, 0,
+        "no other pass was running, so nothing can have been taken: {report:?}"
+    );
 }
