@@ -456,3 +456,47 @@ async fn a_renewal_landing_mid_pass_is_counted_not_raised() {
         "no other pass was running, so nothing can have been taken: {report:?}"
     );
 }
+
+#[tokio::test]
+async fn a_clock_before_the_epoch_is_a_clock_fault_and_says_so() {
+    // THE `Clock` ARM, EXERCISED. Round 2 gave the sweep its own error type precisely so a
+    // failure would say what happened rather than "envelope decryption failed" -- and then left
+    // one of its four arms reached by no test, which is how the previous round's fix keeps
+    // becoming the next round's defect.
+    //
+    // NOT A HYPOTHETICAL. `Env::deterministic` takes any `SystemTime`, and a deployment whose
+    // clock is wrong before it is set is the ordinary cause; the sweep reads that clock to decide
+    // what is due, so it has to refuse rather than compute a window from a negative instant.
+    let db = TestDatabase::start().await;
+    let seeded = Env::system();
+    let scope = db.seed_scope(&seeded).await;
+    let org = seed_org(&db, &seeded, scope, "Globex").await;
+    let connection = connect(&db, &seeded, scope, &org, "https://idp.example/clock").await;
+    pin_expiring(&db, &seeded, scope, &connection, 110, 2 * DAY).await;
+
+    // A CLOCK AN HOUR BEFORE THE UNIX EPOCH.
+    let (broken, _handle) = Env::deterministic(
+        std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(3600),
+        7,
+    );
+    let outcome = ironauth_admin::certificate_expiry::run_once(
+        db.control_store(),
+        &broken,
+        scope,
+        LEADS,
+        100,
+    )
+    .await;
+
+    let message = match outcome {
+        Err(error) => error.to_string(),
+        Ok(report) => panic!("a pre-epoch clock produced a pass rather than a fault: {report:?}"),
+    };
+    // AND THE MESSAGE NAMES THE CLOCK. Whoever is paged by this is being sent somewhere; before
+    // round 2 they were told the envelope failed to decrypt, which would send them to the
+    // crypto layer for a wrong system clock.
+    assert!(
+        message.contains("clock"),
+        "the failure does not name the clock, so it sends the reader elsewhere: {message}"
+    );
+}
