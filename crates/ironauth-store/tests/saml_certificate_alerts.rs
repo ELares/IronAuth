@@ -413,7 +413,9 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
     //
     // THE ORGANIZATION IS NOT ASSERTED HERE. The field a sweep will route on is `organization_id`
     // rather than `connection_id` -- neither routes today, since no sweep exists -- and this
-    // fixture has ONE organization, so comparing it would hold for any row returned. `the_work_item_names_the_certificates_own_organization`
+    // would hold for any row returned.
+    // `the_work_item_names_the_certificates_own_organization`
+    // builds two, which is what that claim needs.
     // builds two, which is what that claim needs.
     let db = TestDatabase::start().await;
     let env = Env::system();
@@ -883,15 +885,15 @@ async fn the_work_item_names_the_certificates_own_organization() {
 
 #[tokio::test]
 async fn a_certificate_of_a_removed_organization_is_not_due() {
-    // NOTHING LEFT TO WARN ABOUT. `organizations` soft-deletes, and a removed organization signs
-    // nobody in -- so its identity provider's certificate expiring breaks nothing, and a notice
-    // saying "renew this or logins stop" would be false on its face.
+    // A POLICY DECISION, NOT A DERIVATION, and the store doc on `due()` says the same. An
+    // organization an operator has removed should not generate operational notices to its
+    // contacts, because the operator has said they are done with it.
     //
-    // NOT "there is nobody to tell", which an earlier version of this comment claimed and which
-    // is measurably wrong: `org_contacts` filters each CONTACT's own `deleted_at` and never the
-    // organization's, so a removed organization's contact list is still fully readable. That is
-    // exactly why this filter has to be explicit -- without it the sweep would find somebody to
-    // tell, and tell them.
+    // TWO EARLIER REASONS HERE WERE MEASURABLY FALSE, which is why this one is labelled for what
+    // it is. "Its contacts are gone": they are not. "It signs nobody in": it does -- removal
+    // writes `organizations.deleted_at` and nothing else, and the SAML sign-in path never reads
+    // that column. Both are exactly why the filter has to be explicit: nothing downstream would
+    // stop the notice going out.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -921,8 +923,8 @@ async fn a_certificate_of_a_removed_organization_is_not_due() {
     assert_eq!(
         due.len(),
         1,
-        "a certificate of a removed organization is still queued for a notice about logins that \
-         cannot happen: {due:?}"
+        "a certificate of a removed organization is still queued for an operational notice its \
+         operator has said they are done with: {due:?}"
     );
     assert_eq!(
         due[0].certificate_id,
