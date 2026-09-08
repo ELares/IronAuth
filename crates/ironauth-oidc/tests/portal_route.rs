@@ -3156,3 +3156,252 @@ async fn a_contacts_session_sees_only_its_own_organizations_contacts() {
         "a contacts session must not see another organization's people: {body}"
     );
 }
+
+/// Drain the contact-change queue through the CONTROL-plane consumer, as the worker does.
+async fn apply_contact_changes(harness: &Harness) -> usize {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let scope = harness.scope();
+    let env = Env::system();
+    let consumer = ironauth_admin::contact_changes::ContactChangeConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let mut applied = 0;
+    loop {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::CONTACT_CHANGE_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            return applied;
+        }
+        for message in &claimed {
+            consumer
+                .handle(&env, scope, message)
+                .await
+                .expect("the change applies");
+            harness
+                .db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+            applied += 1;
+        }
+    }
+}
+
+async fn post_contact_change(
+    harness: &Harness,
+    cookie: &str,
+    form: &str,
+) -> (axum::http::StatusCode, String) {
+    let path = format!(
+        "/t/{}/e/{}/portal/s/contacts/change",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let (status, _, body) = harness.post_form(&path, form, Some(cookie)).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn a_contact_added_from_the_portal_is_listed_after_the_worker_runs() {
+    // #141 criterion 3's write half. The portal cannot write a contact -- 0207 reserves that to
+    // ironauth_control -- so it queues and a control-plane consumer applies. A test stopping at
+    // the 303 would measure that a row reached a queue, which is not what the customer asked for.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
+
+    let (status, body) = post_contact_change(
+        &harness,
+        &cookie,
+        "action=add&display_name=Ada&email=ada%40contoso.test&category=technical",
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+
+    // NOT YET LISTED: the data plane may not write a contact.
+    let before = contacts_page(&harness, &organization, "k-before").await;
+    assert!(
+        !before.contains("ada@contoso.test"),
+        "the portal must not have written the contact itself: {before}"
+    );
+
+    assert_eq!(
+        apply_contact_changes(&harness).await,
+        1,
+        "one queued change"
+    );
+    let after = contacts_page(&harness, &organization, "k-after").await;
+    assert!(after.contains("ada@contoso.test"), "{after}");
+    assert!(
+        !after.contains("nobody here is warned"),
+        "and a technical contact clears the warning: {after}"
+    );
+}
+
+#[tokio::test]
+async fn a_contact_removed_from_the_portal_stops_being_listed() {
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let contact = add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
+
+    let (status, body) = post_contact_change(
+        &harness,
+        &cookie,
+        &format!("action=remove&contact={}", urlencode(&contact.to_string())),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    assert_eq!(apply_contact_changes(&harness).await, 1);
+
+    let after = contacts_page(&harness, &organization, "k-after").await;
+    assert!(
+        !after.contains("ops@contoso.test"),
+        "the removed contact must be gone: {after}"
+    );
+    assert!(
+        after.contains("reach nobody"),
+        "and the page must say the list is now empty: {after}"
+    );
+}
+
+#[tokio::test]
+async fn a_portal_holder_cannot_remove_another_organizations_contact() {
+    // A contact id from a neighbour must not be actionable. The consumer's `remove` takes the
+    // organization as well as the id, so the row is untouched -- and the response is the same
+    // 303 a real removal gets, deliberately: a different answer would tell the holder the handle
+    // exists somewhere else.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    add_contact(&harness, &mine, "ops@contoso.test", "technical").await;
+    let neighbour = add_contact(&harness, &theirs, "ops@initech.test", "technical").await;
+
+    let cookie = open_session_in(&harness, "contacts", "k-contacts", &mine).await;
+    let (status, body) = post_contact_change(
+        &harness,
+        &cookie,
+        &format!(
+            "action=remove&contact={}",
+            urlencode(&neighbour.to_string())
+        ),
+    )
+    .await;
+    assert_eq!(status, 303, "{body}");
+    apply_contact_changes(&harness).await;
+
+    let theirs_page = contacts_page(&harness, &theirs, "k-theirs").await;
+    assert!(
+        theirs_page.contains("ops@initech.test"),
+        "the neighbour's contact must still be listed: {theirs_page}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_contact_is_refused_before_anything_is_queued() {
+    // VALIDATED WHILE SOMEBODY IS LOOKING AT THE FORM. A queue is not a place to defer
+    // validation to: accepting a mistyped address and letting it die in a dead letter tells the
+    // person their change worked.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
+
+    for form in [
+        "action=add&display_name=Ada&email=not-an-address&category=technical",
+        "action=add&display_name=Ada&email=ada%40contoso.test&category=marketing",
+        "action=add&display_name=&email=ada%40contoso.test&category=technical",
+        "action=sideways&display_name=Ada&email=ada%40contoso.test&category=technical",
+    ] {
+        let (status, body) = post_contact_change(&harness, &cookie, form).await;
+        assert_eq!(status, 400, "refusing {form}: {body}");
+    }
+    assert_eq!(
+        apply_contact_changes(&harness).await,
+        0,
+        "no refused form was queued"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_site_contact_change_is_refused_and_queues_nothing() {
+    // A cross-origin post that added a contact would redirect a customer's operational notices
+    // to an address of the attacker's choosing -- a quiet way to be told nothing when their
+    // certificate is about to expire.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let cookie = open_session_in(&harness, "contacts", "k-contacts", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/contacts/change",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = "action=add&display_name=Mallory&email=mallory%40attacker.test&category=technical";
+
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, form, "cross-site", &cookie).await;
+    assert_ne!(
+        status, 303,
+        "a cross-site contact change was accepted: {body}"
+    );
+    assert_eq!(
+        apply_contact_changes(&harness).await,
+        0,
+        "and queued nothing"
+    );
+
+    // THE CONTROL: same-origin is accepted, so the refusal is the guard rather than a bad form.
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, form, "same-origin", &cookie).await;
+    assert_eq!(status, 303, "a same-origin change was refused: {body}");
+    assert_eq!(apply_contact_changes(&harness).await, 1);
+}
+
+#[tokio::test]
+async fn a_session_for_another_intent_cannot_change_contacts() {
+    // THE FENCE ON THE WRITE, which the surface's fence does not give: mounting a change behind
+    // the same session as a read does not make it the same permission. A `certificate-renewal`
+    // link is handed to an outside IdP administrator, and it must not also let them redirect
+    // this organization's operational notices to an address of their choosing.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    add_contact(&harness, &organization, "ops@contoso.test", "technical").await;
+
+    for intent in ["certificate-renewal", "scim"] {
+        let cookie = open_session_in(&harness, intent, &format!("k-{intent}"), &organization).await;
+        let (status, body) = post_contact_change(
+            &harness,
+            &cookie,
+            "action=add&display_name=Mallory&email=mallory%40attacker.test&category=technical",
+        )
+        .await;
+        assert_ne!(
+            status, 303,
+            "a {intent} session changed the contact list: {body}"
+        );
+    }
+    assert_eq!(
+        apply_contact_changes(&harness).await,
+        0,
+        "and nothing was queued"
+    );
+    let page = contacts_page(&harness, &organization, "k-check").await;
+    assert!(
+        !page.contains("mallory@attacker.test"),
+        "nothing was added: {page}"
+    );
+}

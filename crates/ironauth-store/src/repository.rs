@@ -22269,6 +22269,23 @@ pub const CERTIFICATE_NOTICE_CONSUMER: &str = "saml_certificate.notice";
 /// which is worth fixing and is its own change: it needs a catalogued event type.
 pub const CERTIFICATE_PIN_REQUEST_CONSUMER: &str = "saml_certificate.pin_request";
 
+/// The consumer that APPLIES a contact change made from the portal (issue #141 criterion 3).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0207 grants `org_contacts` INSERT, and the soft-delete `UPDATE (updated_at, deleted_at)`, to
+/// `ironauth_control` alone; `ironauth_app` -- the role the portal serves on -- holds SELECT.
+/// The same split `CERTIFICATE_PIN_REQUEST_CONSUMER` describes, and the same answer: the portal
+/// validates and enqueues, and this applies from the plane that may.
+///
+/// # One consumer for both directions
+///
+/// Adding and removing are one queue rather than two, because they must not overtake each other:
+/// removing a contact and adding them back is a different outcome from the reverse, and the
+/// outbox serialises per ordering key. The key is the ORGANIZATION, so one customer's changes
+/// apply in the order they were made while another's never wait behind them.
+pub const CONTACT_CHANGE_CONSUMER: &str = "org_contact.change";
+
 /// The registered consumer name a DOMAIN EVENT is fanned out under (issues #105, #108).
 ///
 /// The webhook chain had every stage but its first: endpoints could be registered, secrets
@@ -61990,6 +62007,27 @@ fn plausible_email(email: &str) -> bool {
         return false;
     };
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+/// Whether a proposed contact is one `OrgContactRepo::add` will accept.
+///
+/// # Why this is public
+///
+/// The portal cannot write a contact -- 0207 reserves that to `ironauth_control` -- so it
+/// enqueues and a control-plane consumer applies. Without this the only place a bad address is
+/// noticed is inside that consumer, which means the person who typed it is told their change was
+/// accepted and it dies later in a dead letter nobody is watching. A queue is not a place to
+/// defer validation to.
+///
+/// THIS IS NOT THE AUTHORITY. `add` re-checks all three, because a value carried across a queue
+/// is a value the writer would otherwise be trusting a previous process to have got right, and
+/// because the column constraints are the last word either way. This exists so the answer can be
+/// given while somebody is still looking at the form.
+#[must_use]
+pub fn contact_is_acceptable(display_name: &str, email: &str, category: &str) -> bool {
+    plausible_contact_name(display_name)
+        && plausible_email(email)
+        && matches!(category, "technical" | "security" | "billing")
 }
 
 /// The associated data binding a sealed recipient email on an email-factor row (issue

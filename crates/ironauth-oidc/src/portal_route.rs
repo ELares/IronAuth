@@ -993,7 +993,7 @@ async fn contacts_surface(state: &OidcState, session: &PortalSession) -> Respons
             "<p>Showing the first {limit} contacts. Ask your vendor about the rest.</p>"
         );
     }
-    body.push_str("<table><tr><th>Name</th><th>Address</th><th>Receives</th></tr>");
+    body.push_str("<table><tr><th>Name</th><th>Address</th><th>Receives</th><th></th></tr>");
     let mut technical = 0_usize;
     for contact in contacts.iter().take(limit) {
         if contact.category == "technical" {
@@ -1001,13 +1001,35 @@ async fn contacts_surface(state: &OidcState, session: &PortalSession) -> Respons
         }
         let _ = write!(
             body,
-            "<tr><td>{name}</td><td>{email}</td><td>{receives}</td></tr>",
+            "<tr><td>{name}</td><td>{email}</td><td>{receives}</td>\
+             <td><form method=\"post\" action=\"{action}\">\
+             <input type=\"hidden\" name=\"action\" value=\"remove\">\
+             <input type=\"hidden\" name=\"contact\" value=\"{id}\">\
+             <button type=\"submit\">Remove</button></form></td></tr>",
             name = escape_html(&contact.display_name),
             email = escape_html(&contact.email),
             receives = escape_html(describes_category(&contact.category)),
+            action = escape_html(&change_action(session)),
+            id = escape_html(&contact.id.to_string()),
         );
     }
     body.push_str("</table>");
+    let _ = write!(
+        body,
+        "<h2>Add a contact</h2><form method=\"post\" action=\"{action}\">\
+         <input type=\"hidden\" name=\"action\" value=\"add\">\
+         <label for=\"n\">Name</label><input id=\"n\" name=\"display_name\" required>\
+         <label for=\"e\">Address</label><input id=\"e\" name=\"email\" type=\"email\" required>\
+         <label for=\"c\">Receives</label>\
+         <select id=\"c\" name=\"category\">\
+         <option value=\"technical\">SSO and provisioning problems, including certificate \
+         expiry</option>\
+         <option value=\"security\">security notices</option>\
+         <option value=\"billing\">billing notices</option></select>\
+         <button type=\"submit\">Add</button></form>\
+         <p>A change can take a moment to appear here.</p>",
+        action = escape_html(&change_action(session)),
+    );
     if technical == 0 {
         // THE ONE ABSENCE WORTH CALLING OUT. Certificate expiry notices go to the TECHNICAL
         // contacts only, so a list with none of them looks populated and warns nobody about the
@@ -1036,6 +1058,192 @@ fn describes_category(category: &str) -> &'static str {
         // blank cell that reads as "receives nothing".
         _ => "an unrecognised category",
     }
+}
+
+/// Where the contacts forms post.
+///
+/// DERIVED ONCE and used by every form on the page. Two derivations of one path is how a page
+/// comes to carry a remove button that posts somewhere the add button does not.
+fn change_action(session: &PortalSession) -> String {
+    format!(
+        "/t/{}/e/{}/portal/s/contacts/change",
+        session.scope().tenant(),
+        session.scope().environment()
+    )
+}
+
+/// What the contacts form posts.
+#[derive(serde::Deserialize)]
+pub struct ContactChangeForm {
+    /// `add` or `remove`.
+    action: String,
+    /// The contact's name. Required for `add`, ignored for `remove`.
+    #[serde(default)]
+    display_name: String,
+    /// The address. Required for `add`, ignored for `remove`.
+    #[serde(default)]
+    email: String,
+    /// Which notices they receive. Required for `add`, ignored for `remove`.
+    #[serde(default)]
+    category: String,
+    /// The contact to remove. Required for `remove`, ignored for `add`.
+    #[serde(default)]
+    contact: String,
+}
+
+/// Add or remove an IT contact from the portal (issue #141 criterion 3).
+///
+/// # It enqueues, for the reason the certificate pin enqueues
+///
+/// 0207 reserves `org_contacts` INSERT and the soft-delete UPDATE to `ironauth_control`; the
+/// portal serves on `ironauth_app`, which holds SELECT. So this validates, then queues, and
+/// `CONTACT_CHANGE_CONSUMER` applies from the plane that may write.
+///
+/// # Validated HERE as well as there
+///
+/// `contact_is_acceptable` is checked before anything is queued, so somebody who mistypes an
+/// address is told while they are still looking at the form rather than having the change
+/// accepted and die later in a dead letter. The store re-checks; this is not the authority.
+///
+/// # One refusal for every rejection
+///
+/// A contact id from another organization, one that does not exist, and a malformed field all
+/// render the same page. The holder is frequently an outside administrator, and telling them
+/// apart "no such contact" from "that contact is not yours" turns the list into a probe.
+pub async fn contacts_change_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<ContactChangeForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    // THE SAME ORIGIN GUARD the pin and the finish take. A cross-origin post that could add a
+    // contact would redirect a customer's operational notices to an address of the attacker's
+    // choosing, which is a quiet way to be told nothing when their certificate is about to
+    // expire.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) = session.require_intent("contacts") {
+        return refusal.into_response();
+    }
+
+    let payload = match form.action.as_str() {
+        "add" => {
+            if !ironauth_store::contact_is_acceptable(
+                &form.display_name,
+                &form.email,
+                &form.category,
+            ) {
+                return contacts_refusal("the name, address or category is not acceptable");
+            }
+            serde_json::json!({
+                "action": "add",
+                "organization_id": session.organization().to_string(),
+                "display_name": form.display_name,
+                "email": form.email,
+                "category": form.category,
+            })
+        }
+        "remove" => {
+            // PARSED IN SCOPE, and the ORGANIZATION is checked by the consumer's `remove`, which
+            // takes both. Proving the tenant and environment here is what stops a handle from
+            // another deployment reaching the queue at all.
+            let Ok(contact) = ironauth_store::OrgContactId::parse_in_scope(&form.contact, &scope)
+            else {
+                return contacts_refusal("the contact identifier does not parse in this scope");
+            };
+            serde_json::json!({
+                "action": "remove",
+                "organization_id": session.organization().to_string(),
+                "contact_id": contact.to_string(),
+            })
+        }
+        _ => return contacts_refusal("the form asked for neither add nor remove"),
+    };
+
+    if queue_contact_change(&state, &session, &payload)
+        .await
+        .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/contacts",
+        scope.tenant(),
+        scope.environment()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, surface),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// The one refusal the contacts surface gives, whatever went wrong.
+fn contacts_refusal(reason: &str) -> Response {
+    tracing::info!(target: "ironauth.portal", reason, "contact change refused");
+    crate::pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        "<!doctype html><meta charset=\"utf-8\"><title>Change not accepted</title>\
+         <h1>That change was not accepted</h1>\
+         <p>Check the name, the address and which notices they should receive, then try \
+         again.</p>"
+            .to_owned(),
+    )
+}
+
+/// Queue one contact change for the control plane to apply.
+///
+/// THE ORDERING KEY IS THE ORGANIZATION, so one customer's changes apply in the order they were
+/// made -- removing a contact and adding them back is a different outcome from the reverse --
+/// while another customer's never wait behind them.
+///
+/// THE IDEMPOTENCY KEY IS THE PAYLOAD. Two identical submissions mean the same thing, so the
+/// second collapses; two DIFFERENT changes, even to the same contact, are two facts and both
+/// must land. Hashing the payload is what draws that line in the right place -- an earlier
+/// design elsewhere in this file keyed on one field and made two customers collide.
+async fn queue_contact_change(
+    state: &OidcState,
+    session: &PortalSession,
+    payload: &serde_json::Value,
+) -> Result<(), ironauth_store::StoreError> {
+    use sha2::{Digest as _, Sha256};
+
+    let scope = session.scope();
+    let digest = Sha256::digest(payload.to_string().as_bytes());
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(key, "{byte:02x}");
+    }
+    state
+        .store()
+        .scoped(scope)
+        .outbox()
+        // ALREADY QUEUED IS DONE, for the reason the pin uses this: a holder who double-submits
+        // or reloads means the same thing every time, and telling them otherwise invites another
+        // attempt and then a call to their vendor.
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::CONTACT_CHANGE_CONSUMER,
+                idempotency_key: &key,
+                ordering_key: &session.organization().to_string(),
+                payload: payload.clone(),
+            },
+        )
+        .await
+        .map(|_| ())
 }
 
 /// What the renewal form posts.

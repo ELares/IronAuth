@@ -13,6 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::certificate_notices::CertificateNoticeConsumer;
 use ironauth_admin::certificate_pin_requests::CertificatePinRequestConsumer;
+use ironauth_admin::contact_changes::ContactChangeConsumer;
 use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
 use ironauth_admin::message_composer::DefaultComposer;
@@ -2293,12 +2294,18 @@ async fn spawn_certificate_pin_pools(inputs: CertificatePinInputs) -> Vec<Outbox
     };
 
     let mut consumers = ConsumerRegistry::new();
-    if let Err(error) = consumers.register(Arc::new(CertificatePinRequestConsumer::new(
-        control_store.clone(),
-    )) as Arc<dyn OutboxConsumer>)
-    {
-        tracing::error!(%error, "certificate pin worker not started: duplicate consumer name");
-        return Vec::new();
+    for consumer in [
+        Arc::new(CertificatePinRequestConsumer::new(control_store.clone()))
+            as Arc<dyn OutboxConsumer>,
+        // CONTACT CHANGES (issue #141 criterion 3) ride the same worker: both are portal writes
+        // the data plane may not perform, both drain a data-plane queue with a control-plane
+        // store, and a deployment serving the portal serves both surfaces.
+        Arc::new(ContactChangeConsumer::new(control_store.clone())) as Arc<dyn OutboxConsumer>,
+    ] {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "portal write worker not started: duplicate consumer name");
+            return Vec::new();
+        }
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
