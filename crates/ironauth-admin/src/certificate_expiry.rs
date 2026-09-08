@@ -29,6 +29,7 @@
 //! without inventing a scheduler.
 
 use ironauth_env::Env;
+use ironauth_store::outbox::ScopeSource;
 use ironauth_store::{DomainEvent, Scope, Store, StoreError};
 
 /// Why a pass could not finish.
@@ -205,6 +206,116 @@ pub async fn run_once(
             Err(StoreError::Conflict) => report.already_taken += 1,
             Err(StoreError::NotFound) => report.vanished += 1,
             Err(error) => return Err(SweepError::Store(error)),
+        }
+    }
+    Ok(report)
+}
+
+/// The lead set a configured list of DAYS becomes, in seconds.
+///
+/// # Why this is a function and not an inline `map`
+///
+/// Three of the four things it does are corrections a `map` would not make, and each one is a
+/// configuration a deployment can actually write.
+///
+/// A ZERO LEAD IS DROPPED, because it can never match. The due query selects
+/// `not_after > now AND not_after <= now + lead`, which for a lead of zero is unsatisfiable: a
+/// zero threshold warns nobody at any time. It reads like "warn me at expiry" and is not, so
+/// keeping it would leave an operator with a configured warning that silently never fires.
+///
+/// AN EARLIER VERSION OF THIS PARAGRAPH gave a different reason -- that a zero reaches
+/// `envelope()`, fails its `minimum: 1` schema and turns every pass into a server fault. That
+/// failure cannot occur, because the row never comes back from `due()` to be announced. The
+/// behaviour was right and the justification was invented; it had been copied into five
+/// artifacts before a review checked it.
+///
+/// DUPLICATES COLLAPSE, and here the ordering step is what makes that work: `Vec::dedup` removes
+/// only ADJACENT equal elements, so `[7, 30, 7]` collapses only after sorting. `due()` also
+/// unnests DISTINCT, so a duplicate reaching it is harmless -- which makes this a tidiness of
+/// the returned vector rather than a correctness fix, and it is worth saying so rather than
+/// claiming a bug it prevents.
+///
+/// THE ORDER IS DESCENDING -- longest lead first, so the THIRTY-day threshold heads the list.
+/// An earlier version of this sentence called that "the earliest warning first", which is
+/// backwards: the thirty-day threshold is the earliest warning in TIME and the last of the three
+/// a certificate crosses. Nothing downstream depends on either reading, because `due()` orders
+/// its own rows `BY c.not_after, c.id, l.lead_secs` and announces the SHORTEST crossed lead
+/// first regardless of how this vector is arranged. What the order actually decides is the shape
+/// of the startup log line and of this function's return value.
+#[must_use]
+pub fn leads_from_days(days: &[u32]) -> Vec<i64> {
+    const SECS_PER_DAY: i64 = 24 * 60 * 60;
+
+    let mut leads: Vec<i64> = days
+        .iter()
+        .filter(|day| **day > 0)
+        .map(|day| i64::from(*day) * SECS_PER_DAY)
+        .collect();
+    leads.sort_unstable_by(|left, right| right.cmp(left));
+    leads.dedup();
+    leads
+}
+
+/// What one pass over every scope did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    /// Scopes whose pass completed, whether or not it announced anything.
+    pub swept: usize,
+    /// Scopes whose pass returned an error.
+    ///
+    /// COUNTED RATHER THAN RETURNED. One scope's failure must not end the pass: a single tenant
+    /// with a corrupt certificate id would otherwise stop every other tenant being warned, and
+    /// the tenants that lose their warning are the ones that did nothing wrong.
+    pub failed: usize,
+    /// Notices announced across every scope.
+    pub announced: usize,
+}
+
+/// Run one pass over every scope the source reports.
+///
+/// `limit` bounds ONE SCOPE's pass, not the whole sweep: it is handed to each `run_once` in
+/// turn, so a sweep over N scopes may announce up to N times it. That is the useful bound --
+/// it caps the size of any single transaction -- but it is not a cap on the pass, and both
+/// generated config artifacts said "one pass" until a review read them.
+///
+/// # Errors
+///
+/// Only if the scope source itself cannot be read; a scope that fails is counted in the report.
+/// A pass that can enumerate nothing is different in kind from one whose tenants failed: there
+/// is no work list at all, and reporting "0 swept, 0 failed" would look identical to a healthy
+/// deployment with no tenants.
+pub async fn run_pass(
+    store: &Store,
+    env: &Env,
+    scopes: &dyn ScopeSource,
+    leads_secs: &[i64],
+    limit: i64,
+) -> Result<PassReport, StoreError> {
+    let mut report = PassReport::default();
+    if leads_secs.is_empty() {
+        // Alerting is off, so there is nothing to enumerate scopes FOR. One round trip is saved
+        // -- the scope listing itself -- and no more: `due()` returns immediately on an empty
+        // lead set without querying, so the per-scope passes would each have cost nothing. An
+        // earlier version of this comment claimed a database round trip per scope, which
+        // overstates the saving by the whole of it.
+        return Ok(report);
+    }
+    for scope in scopes.scopes().await? {
+        match run_once(store, env, scope, leads_secs, limit).await {
+            Ok(one) => {
+                report.swept += 1;
+                report.announced += one.announced;
+            }
+            Err(error) => {
+                report.failed += 1;
+                tracing::error!(
+                    target: "ironauth.certificate_expiry",
+                    tenant = %scope.tenant(),
+                    environment = %scope.environment(),
+                    %error,
+                    "certificate expiry pass failed for this scope; other scopes continue"
+                );
+            }
         }
     }
     Ok(report)

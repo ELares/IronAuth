@@ -623,6 +623,20 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "certificate_expiry",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot by `certificate_sweep_inputs` (issue #141) to build the SAML \
+             certificate expiry sweep, a background ticker that answers no request. Neither \
+             plane's state holds it: the pass reads its thresholds and its cadence from the \
+             worker it starts, and what it produces are outbox rows -- a renewal webhook and \
+             mail to the organization's IT contacts -- rather than anything served in a \
+             response.\n\n\
+             IT IS CONTROL-PLANE ONLY, and not merely by convention: 0208 grants the alert \
+             ledger to `ironauth_control` alone, so a pass handed the data-plane store fails on \
+             its first read. `certificate_sweep_inputs` therefore takes the control DSN and \
+             refuses to start without one.",
+        ),
+        (
             "scim_push",
             Reach::OnePlaneOrNoState,
             "consumed once at boot by `scim_push_inputs` (issue #137) to build the outbound push \

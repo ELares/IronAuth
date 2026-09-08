@@ -246,6 +246,15 @@ pub struct Config {
     /// wants one without the other.
     pub log_streams: LogStreamsConfig,
 
+    /// SAML certificate expiry alerting (issue #141): the lead times an organization is warned
+    /// at, and the cadence of the pass that decides who has crossed one.
+    ///
+    /// A top-level section rather than a field on `[webhooks]` or `[messaging]` deliberately,
+    /// because ONE pass feeds both: the same crossing emits the renewal webhook a vendor
+    /// consumes and the mail the organization's IT contacts receive. An operator setting "warn
+    /// at thirty days" is making one decision, and it should have one name.
+    pub certificate_expiry: CertificateExpiryConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -948,6 +957,85 @@ impl Default for FlowTargetsConfig {
             delivery_enabled: false,
             // Under the 30s outbox visibility timeout, so a delivery cannot outlive its lease.
             delivery_timeout_secs: 10,
+        }
+    }
+}
+
+/// SAML certificate expiry alerting (issue #141).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct CertificateExpiryConfig {
+    /// Whether THIS process runs the sweep. OFF by default.
+    ///
+    /// OFF BY DEFAULT, because more than one process runs this binary and each pass is work that
+    /// must not be multiplied by the number of replicas. Not universal in this file --
+    /// `admin.offboarding_worker_enabled` and `outbox.reap_enabled` both default ON, each for a
+    /// reason stated where it is set -- so this is a choice about THIS worker rather than a house
+    /// style. The ledger
+    /// makes a duplicate pass harmless -- two racing passes announce once between them -- so
+    /// this is about wasted work rather than correctness.
+    pub sweep_enabled: bool,
+
+    /// How long before expiry each warning is sent, in DAYS, one entry per warning.
+    ///
+    /// CONFIGURED rather than hardcoded, for the reason `scim.token_expiry_warning_secs`
+    /// gives: the right lead depends on how long a customer's change process takes, and a
+    /// vendor selling to enterprises with change-advisory boards needs weeks where one selling
+    /// to startups needs days. Getting it wrong is silent -- logins simply stop on a date
+    /// nobody was watching.
+    ///
+    /// THIRTY, FOURTEEN AND THREE by default. Thirty is far enough out to open a ticket with an
+    /// IdP administrator who does not work for you; fourteen catches a fortnightly change
+    /// window; three is the one that means "today". These are the three migration 0208's header
+    /// already names, which until now was a claim about a value that had no configuration
+    /// source at all.
+    ///
+    /// AN EMPTY LIST DISABLES ALERTING while leaving the sweep switch alone, and that is a real
+    /// choice rather than a degenerate one: a deployment whose SAML connections are managed by
+    /// something else has nothing to warn about.
+    ///
+    /// A ZERO IS DROPPED rather than honoured. It reads like "warn me at expiry" and cannot mean
+    /// that: the due query selects certificates with `not_after > now AND not_after <= now +
+    /// lead`, which for a lead of zero is unsatisfiable, so a zero threshold matches nothing at
+    /// any time. Keeping it would leave an operator with a configured warning that silently
+    /// never fires.
+    ///
+    /// DAYS RATHER THAN SECONDS because every value an operator will ever write here is a whole
+    /// number of days, and `2_592_000` is a worse way to say thirty. The conversion happens once,
+    /// at the boot seam that reads this.
+    pub lead_days: Vec<u32>,
+
+    /// How often a pass runs, in seconds.
+    ///
+    /// HOURLY by default. The quantity being measured changes on the scale of days, so a
+    /// shorter interval buys nothing; the reason it is not daily is that a pass which fails or a
+    /// process that restarts should not cost a whole day of warning.
+    ///
+    /// ZERO IS REFUSED at load, not floored: see `validate_certificate_expiry`.
+    pub sweep_interval_secs: u64,
+
+    /// How many (certificate, lead) pairs may be announced for ONE SCOPE in one pass.
+    ///
+    /// PER SCOPE, not per sweep. It is handed to each scope's pass in turn, so a sweep over a
+    /// hundred tenants may announce up to a hundred times this number. That is the bound worth
+    /// having -- it caps any single scope's work -- but it is not a cap on the sweep, and saying
+    /// "one pass" here would tell an operator sizing this for a large estate the wrong thing.
+    ///
+    /// A BOUND, NOT A LIMIT ON THE TOTAL: pairs a pass does not reach stay due and the next pass
+    /// takes them, because every pair is decided independently by its own ledger row. It exists
+    /// so a deployment that has just enabled alerting over a large estate does not turn its
+    /// first pass into one enormous transaction. Zero is REFUSED at load rather than accepted:
+    /// see `validate_certificate_expiry`.
+    pub sweep_batch: u32,
+}
+
+impl Default for CertificateExpiryConfig {
+    fn default() -> Self {
+        Self {
+            sweep_enabled: false,
+            lead_days: vec![30, 14, 3],
+            sweep_interval_secs: 3_600,
+            sweep_batch: 500,
         }
     }
 }
@@ -5532,6 +5620,7 @@ impl Config {
         validate_admin(&self.admin)?;
         validate_scim(&self.scim)?;
         validate_scim_push(&self.scim_push)?;
+        validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
             "oidc.authorization_code_ttl_secs",
             self.oidc.authorization_code_ttl_secs,
@@ -5715,6 +5804,34 @@ fn validate_organizations(organizations: &OrganizationsConfig) -> Result<(), Con
 /// Every refusal here is a bound whose violation makes a control UNREACHABLE rather than
 /// merely large, which is the distinction that decides what belongs in this function.
 /// Refuse a `scim_push` section that would run the worker without pausing.
+/// Refuse a certificate-expiry sweep that would run forever and warn nobody (issue #141).
+///
+/// REFUSED RATHER THAN FLOORED, following `validate_scim_push` immediately below: a value an
+/// operator wrote and a value the process runs must be the same value, or the log line reporting
+/// the settings is not reporting their configuration.
+fn validate_certificate_expiry(expiry: &CertificateExpiryConfig) -> Result<(), ConfigError> {
+    if !expiry.sweep_enabled {
+        return Ok(());
+    }
+    if expiry.sweep_interval_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "certificate_expiry.sweep_interval_secs must be at least 1: the ticker \
+                      sleeps this long between passes, so zero is a busy loop issuing a \
+                      due-certificate query per scope as fast as the database will answer"
+                .to_owned(),
+        });
+    }
+    if expiry.sweep_batch == 0 {
+        return Err(ConfigError::Invalid {
+            message: "certificate_expiry.sweep_batch must be at least 1: a pass may announce \
+                      that many pairs, so zero is an hourly ticker that warns nobody while \
+                      reporting every pass as healthy"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
     if scim_push.enabled && scim_push.interval_secs == 0 {
         return Err(ConfigError::Invalid {
