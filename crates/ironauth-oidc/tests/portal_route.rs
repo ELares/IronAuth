@@ -371,6 +371,7 @@ async fn an_sso_session_cannot_reach_the_scim_surface() {
         "log-streams",
         "certificate-renewal",
         "contacts",
+        "audit",
     ] {
         let (status, body) = get_with_cookie(&harness, &surface(forbidden), Some(&cookie)).await;
         assert_eq!(
@@ -3155,4 +3156,147 @@ async fn a_contacts_session_sees_only_its_own_organizations_contacts() {
         !body.contains("ops@initech.test"),
         "a contacts session must not see another organization's people: {body}"
     );
+}
+
+/// Create a client attributed to `organization`, returning the id its audit row targets.
+async fn attributed_client(harness: &Harness, organization: &OrganizationId, name: &str) -> String {
+    let env = Env::system();
+    // THE DATA PLANE, because `clients` INSERT is granted to `ironauth_app` -- the opposite way
+    // round from `saml_connection_certificates`, whose writes are control-plane only. Which
+    // plane owns a table is per table, not a rule.
+    harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .in_organization(*organization)
+        .clients()
+        .create(&env, name)
+        .await
+        .expect("create a client in an organization")
+        .to_string()
+}
+
+async fn audit_page(
+    harness: &Harness,
+    organization: &OrganizationId,
+    key: &str,
+    query: &str,
+) -> String {
+    let cookie = open_session_in(harness, "audit", key, organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/audit{query}",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let (status, body) = get_with_cookie(harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn the_audit_page_shows_this_organizations_events_and_no_others() {
+    // #141 criterion 4, at the surface. The store test proves the query; this proves the PAGE
+    // passes the session's organization to it, which is the only thing standing between a
+    // portal holder and a neighbour's history.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    let ours = attributed_client(&harness, &mine, "ours").await;
+    let neighbour = attributed_client(&harness, &theirs, "neighbour").await;
+
+    let body = audit_page(&harness, &mine, "k-audit", "").await;
+
+    assert!(body.contains(&ours), "our own event is missing: {body}");
+    assert!(
+        !body.contains(&neighbour),
+        "a neighbour's event was shown: {body}"
+    );
+    assert!(
+        body.contains("client.create"),
+        "the action is named: {body}"
+    );
+    assert!(body.contains("service "), "and the actor's kind: {body}");
+}
+
+#[tokio::test]
+async fn the_audit_page_never_shows_the_detail_or_the_correlation_id() {
+    // BOTH ARE ON EVERY ROW AND NEITHER BELONGS HERE. `detail` is free text the vendor's own
+    // handlers write for their own operators, so publishing it on a customer-facing page ships
+    // whatever a future handler happens to put in it; the correlation id is an internal request
+    // handle. Omitted deliberately, and asserted so a later "just add the columns" cannot pass.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    attributed_client(&harness, &mine, "ours").await;
+
+    let body = audit_page(&harness, &mine, "k-audit", "").await;
+
+    let record = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .audit()
+        .search_for_organization(&mine, &ironauth_store::AuditSearch::default(), 10)
+        .await
+        .expect("search")
+        .into_iter()
+        .next()
+        .expect("an event");
+    assert!(
+        !body.contains(&record.correlation_id.to_string()),
+        "the correlation id reached a customer-facing page: {body}"
+    );
+    if let Some(detail) = &record.detail {
+        assert!(
+            !body.contains(detail.as_str()),
+            "the operator detail reached a customer-facing page: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_filter_narrows_the_audit_page_and_says_when_nothing_matches() {
+    // CRITERION 5 at the surface. The corpus holds a row the filter must EXCLUDE, and the empty
+    // message must distinguish "nothing recorded" from "nothing matching" -- one message for
+    // both leaves a reader unable to tell an over-narrow filter from a quiet month.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let first = attributed_client(&harness, &mine, "first").await;
+    let second = attributed_client(&harness, &mine, "second").await;
+
+    let both = audit_page(&harness, &mine, "k-all", "").await;
+    assert!(both.contains(&first) && both.contains(&second), "{both}");
+
+    let narrowed = audit_page(&harness, &mine, "k-one", &format!("?target={first}")).await;
+    assert!(narrowed.contains(&first), "{narrowed}");
+    assert!(
+        !narrowed.contains(&second),
+        "the target filter did not narrow: {narrowed}"
+    );
+
+    let none = audit_page(&harness, &mine, "k-none", "?action=saml_certificate.pinned").await;
+    assert!(
+        none.contains("No events match those filters"),
+        "an over-narrow filter must say so: {none}"
+    );
+    assert!(
+        !none.contains("Nothing has been recorded"),
+        "and must not read as an empty history: {none}"
+    );
+}
+
+#[tokio::test]
+async fn an_organization_with_no_events_says_so_rather_than_showing_an_empty_table() {
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+
+    let body = audit_page(&harness, &mine, "k-empty", "").await;
+    assert!(
+        body.contains("Nothing has been recorded"),
+        "an empty history must say so: {body}"
+    );
+    assert!(!body.contains("<table>"), "and render no table: {body}");
 }
