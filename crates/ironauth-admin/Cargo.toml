@@ -160,6 +160,13 @@ name = "delegated_admin"
 path = "tests/delegated_admin.rs"
 required-features = ["testing"]
 
+# Mapping a directory entry to an identity (issue #142). NO database: the mapper is a pure
+# function over an entry and a mapping, which is why this block carries no `required-features`
+# while its neighbours do.
+[[test]]
+name = "ldap_mapping"
+path = "tests/ldap_mapping.rs"
+
 # The organization contact surface (issue #141). Needs a database, like its neighbours.
 [[test]]
 name = "org_contacts"
