@@ -541,7 +541,7 @@ async fn the_notice_and_the_ledger_row_commit_together() {
 
     let envelope = ironauth_store::event_catalog::envelope(
         "evt_cert_expiring",
-        "saml_certificate.expiring",
+        "saml_certificate.expiry_announced",
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         now / 1000,
@@ -572,7 +572,7 @@ async fn the_notice_and_the_ledger_row_commit_together() {
 
     let announced = queued_events(&db, &env, scope).await;
     assert_eq!(announced.len(), 1, "the notice announced {announced:?}");
-    assert_eq!(announced[0]["type"], "saml_certificate.expiring");
+    assert_eq!(announced[0]["type"], "saml_certificate.expiry_announced");
     // AND THE MAIL, which this test is named for and did not check. `queued_events` claims one
     // consumer name, so the contact-notice row added to this same transaction was invisible to
     // it: the enqueue could have been deleted outright and this test -- the one whose name
@@ -750,7 +750,7 @@ async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
 
     let envelope = ironauth_store::event_catalog::envelope(
         "evt_cert_poisoned",
-        "saml_certificate.expiring",
+        "saml_certificate.expiry_announced",
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
         now / 1000,

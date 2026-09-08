@@ -123,6 +123,12 @@ wasm-hooks = ["ironauth-oidc/wasm-hooks"]
 # and every test input are the same eight bytes, so a wrong constant is a feature that rejects
 # every real deploy and a suite that stays green.
 ironauth-hooks = { workspace = true, features = ["testing"] }
+# TEST ONLY, and no new crate: ldap3 is already a normal dependency of this crate. The live
+# paging test needs to issue an UNPAGED search itself, so that the fixture property its result
+# depends on -- a server size limit that stops an unpaged read -- is an assertion rather than a
+# sentence in a doc comment. Review defeated the earlier version by swapping the bind to one
+# without that limit: the test passed with the RFC 2696 adapter deleted.
+ldap3.workspace = true
 
 # The reference downstream SCIM server (issue #137), test builds only. The outbound client is
 # measured against a server written from RFC 7644 BEFORE the client existed, rather than against

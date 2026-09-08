@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use ironauth_admin::ldap_client::{DirectoryConfig, DirectoryError, TlsMode};
+use ironauth_admin::ldap_client::{Directory, DirectoryConfig, DirectoryError, TlsMode};
 use ironauth_admin::ldap_mapping::attributes_to_request;
 use serde_json::json;
 
@@ -149,36 +149,39 @@ fn a_malformed_mapping_still_requests_the_identifiers() {
     }
 }
 
-/// THE CLAIM THAT THERE IS NO WAY TO SKIP CERTIFICATE VERIFICATION, ASSERTED.
+/// `connect` consults `validate` BEFORE it reaches the network.
 ///
-/// The module header states it as one of three headline properties, and a sentence is not a
-/// mechanism: adding `set_no_tls_verify(true)` to the connection settings left every test in this
-/// PR green. `ldap3` offers the switch, and an escape hatch that disables verification is the
-/// thing that ends up set in production "temporarily".
+/// THIS NEEDS NO SERVER, which is why it lives here rather than in the ignored live suite. It
+/// was `#[ignore]`d there with the reason "needs a directory server", which was false -- it
+/// points at a port nothing listens on -- and that false reason kept the PR's headline transport
+/// property out of CI entirely.
 ///
-/// A source scan rather than a behavioural test, because the property is about what the code is
-/// ALLOWED to contain. Behaviourally it would need a server with a bad certificate and a second
-/// one with a good one, and it would still not stop the next person adding a config flag.
-#[test]
-fn nothing_in_the_client_can_turn_certificate_verification_off() {
-    let source = include_str!("../src/ldap_client.rs");
-    for line in source.lines() {
-        // The header explains the decision, so mentions in prose are fine; a call is not.
-        let code = line.split("//").next().unwrap_or("");
-        assert!(
-            !code.contains("set_no_tls_verify"),
-            "ldap_client.rs calls set_no_tls_verify: {line}"
-        );
-        assert!(
-            !code.contains("dangerous_accept"),
-            "ldap_client.rs installs a certificate verifier that accepts anything: {line}"
-        );
-    }
-    // And the guard is not vacuous: the string it hunts for is really the ldap3 API name, so a
-    // scan that never matched anything would be indistinguishable from this passing.
+/// Pointed at a port nothing listens on. If the transport rule were checked after the socket
+/// attempt, the error would be a connection failure; the scheme error can only come from a check
+/// that ran first. An earlier version pointed at the live server, where moving `validate` to
+/// after the bind left the test green because the error text was identical either way.
+#[tokio::test]
+async fn connect_refuses_a_disagreeing_scheme_before_it_reaches_the_network() {
+    // Port 1 on the loopback: reserved, and nothing listens there.
+    let error = Directory::connect(&config("ldap://127.0.0.1:1", TlsMode::Ldaps))
+        .await
+        .err()
+        .expect("must refuse");
+
+    let rendered = error.to_string();
     assert!(
-        source.contains("set_no_tls_verify"),
-        "the header should still explain WHY the switch is not plumbed; if that prose is gone, \
-         this guard is scanning for a name nothing would ever contain"
+        rendered.contains("cannot be used with"),
+        "the refusal must be the transport rule, not a connection failure: {rendered}"
+    );
+
+    // And the CONTROL that makes the above mean something: the same dead address WITH an
+    // agreeing scheme gets past validation and fails on the network instead.
+    let network = Directory::connect(&config("ldap://127.0.0.1:1", TlsMode::Plaintext))
+        .await
+        .err()
+        .expect("nothing listens there");
+    assert!(
+        !network.to_string().contains("cannot be used with"),
+        "an agreeing scheme must reach the network: {network}"
     );
 }

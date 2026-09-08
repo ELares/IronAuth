@@ -2683,7 +2683,7 @@
         "type": "object"
       },
       "payload_schema_version": 1,
-      "type": "saml_certificate.expiring"
+      "type": "saml_certificate.expiry_announced"
     },
     {
       "domain": "scim_connection",
