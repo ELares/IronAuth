@@ -320,3 +320,84 @@ pub async fn run_pass(
     }
     Ok(report)
 }
+
+/// What one retirement pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RetireReport {
+    /// Certificates unpinned.
+    pub retired: usize,
+    /// Certificates that were gone by the time the pass reached them.
+    ///
+    /// NOT AN ERROR. An operator unpinning a superseded certificate by hand while a pass is
+    /// deciding to do the same thing is the ordinary case, not a rare one: they are both acting
+    /// on the same observation.
+    pub vanished: usize,
+}
+
+/// Retire certificates whose rollover window has closed, for one scope.
+///
+/// # Why this is a separate pass from the expiry sweep
+///
+/// They read opposite ends of the same lifecycle -- one warns before an expiry, the other tidies
+/// up after a replacement -- and only this one WRITES to the certificate table. Keeping them
+/// separate means a deployment that wants warnings without automatic retirement gets it by
+/// setting the window to zero, and a fault in one does not stop the other.
+///
+/// # Errors
+///
+/// [`SweepError::Store`] if reading the retirable set fails. A single certificate that cannot be
+/// unpinned stops the pass, because the same failure will meet the next one and continuing would
+/// turn one persistence fault into a log line per certificate.
+pub async fn retire_once(
+    store: &Store,
+    env: &Env,
+    scope: Scope,
+    window_secs: i64,
+    limit: i64,
+) -> Result<RetireReport, SweepError> {
+    let now = i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SweepError::Clock)?
+            .as_micros(),
+    )
+    .map_err(|_| SweepError::Clock)?;
+
+    let mut report = RetireReport::default();
+    if window_secs <= 0 {
+        // RETIREMENT IS OFF, and the guard belongs HERE rather than only at the caller. A window
+        // of zero means "keep every pin until somebody removes it"; passed straight through to
+        // the query it means "a replacement pinned zero seconds ago is old enough", which
+        // retires every superseded certificate at once -- the exact opposite of what the setting
+        // says. The boot path also skips the pass, but that is an optimisation, and a guard that
+        // lives only in one caller is a guard the next caller does not get.
+        return Ok(report);
+    }
+    let retirable = store
+        .scoped(scope)
+        .saml_connections()
+        .retirable(now, window_secs, limit)
+        .await
+        .map_err(SweepError::Store)?;
+    for certificate in retirable {
+        match store
+            .scoped(scope)
+            .acting(
+                ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(env)),
+                ironauth_store::CorrelationId::generate(env),
+            )
+            .saml_connections()
+            .unpin_certificate(env, &certificate.id, None)
+            .await
+        {
+            Ok(()) => report.retired += 1,
+            // ALREADY GONE. Counted rather than raised, for the reason `SweepReport::vanished`
+            // gives: losing a race to the operator doing the same thing by hand is the feature
+            // working, not a fault.
+            Err(ironauth_store::StoreError::NotFound) => report.vanished += 1,
+            Err(error) => return Err(SweepError::Store(error)),
+        }
+    }
+    Ok(report)
+}

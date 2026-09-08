@@ -76292,6 +76292,74 @@ impl SamlConnectionRepo<'_> {
             .collect()
     }
 
+    /// Certificates whose rollover window has closed (issue #141 criterion 2).
+    ///
+    /// # What bounds the window, and why it needs no column
+    ///
+    /// #141 asks for an overlap in which "old and new cert both accepted during a bounded
+    /// rollover window". The overlap itself is what pinning already does -- `saml_acs` verifies
+    /// against every pinned certificate. What was missing is the BOUND: nothing ever retired the
+    /// old one, so a superseded key stayed a valid trust anchor for the life of the deployment,
+    /// and a key compromised years after it stopped being used would still mint accepted
+    /// assertions.
+    ///
+    /// A row here satisfies all three of:
+    ///
+    /// 1. **It has expired.** `not_after <= now`. The identity provider has stopped issuing with
+    ///    it by its own declaration. This is the conservative half: `saml_acs` deliberately does
+    ///    not check `notAfter`, precisely so a late cutover cannot lock anyone out, so an expired
+    ///    certificate is still being ACCEPTED here -- which is exactly the state this retires.
+    /// 2. **Something newer is pinned on the same connection.** Retiring the last certificate
+    ///    would stop sign-in outright, which is the opposite of what a renewal flow is for. The
+    ///    replacement is what makes retirement safe rather than destructive.
+    /// 3. **That replacement has been pinned for at least `window_secs`.** The customer's cutover
+    ///    is not instantaneous; the window is how long they get after the new certificate lands.
+    ///
+    /// The window is therefore measured from when the REPLACEMENT was pinned, not from when the
+    /// old one expired. Those differ whenever a renewal is late, which is the case the window
+    /// exists for: a certificate replaced the day after it lapsed still gets the full window.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn retirable(
+        &self,
+        now_unix_micros: i64,
+        window_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<SamlCertificate>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SAML_CERTIFICATE_COLUMNS} FROM saml_connection_certificates c \
+             WHERE c.tenant_id = $1 AND c.environment_id = $2 \
+               AND c.not_after <= TIMESTAMPTZ 'epoch' + ($3::text || ' microseconds')::interval \
+               AND EXISTS ( \
+                     SELECT 1 FROM saml_connection_certificates r \
+                      WHERE r.tenant_id = c.tenant_id \
+                        AND r.environment_id = c.environment_id \
+                        AND r.connection_id = c.connection_id \
+                        AND r.id <> c.id \
+                        AND r.created_at > c.created_at \
+                        AND r.created_at <= TIMESTAMPTZ 'epoch' \
+                                            + ($3::text || ' microseconds')::interval \
+                                            - ($4 * INTERVAL '1 second') \
+                   ) \
+             ORDER BY c.not_after, c.id \
+             LIMIT $5"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(now_unix_micros)
+        .bind(window_secs)
+        .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| saml_certificate_from_row(row, self.scope))
+            .collect()
+    }
+
     /// The key this connection signs its own `AuthnRequest`s with, if one has been provisioned.
     ///
     /// # Errors

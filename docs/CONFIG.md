@@ -42,6 +42,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `byok.provider` | string | `"local"` | NOT IMPLEMENTED (issue #459): nothing reads it and a non-default value is refused at startup. Would select the key-management driver backing the customer root; the external drivers are owner/infra-gated. |
 | `certificate_expiry` | table | see fields | SAML certificate expiry alerting (issue #141): the lead times an organization is warned at, and the cadence of the pass that decides who has crossed one. |
 | `certificate_expiry.lead_days` | array | `[30, 14, 3]` | How long before expiry each warning is sent, in DAYS, one entry per warning. |
+| `certificate_expiry.rollover_window_days` | integer | `30` | How long after a replacement is pinned the certificate it superseded stays trusted, in DAYS. Zero disables retirement entirely. |
 | `certificate_expiry.sweep_batch` | integer | `500` | How many (certificate, lead) pairs may be announced for ONE SCOPE in one pass. |
 | `certificate_expiry.sweep_enabled` | boolean | `false` | Whether THIS process runs the sweep. OFF by default. |
 | `certificate_expiry.sweep_interval_secs` | integer | `3600` | How often a pass runs, in seconds. |

@@ -702,3 +702,235 @@ async fn one_scope_failing_does_not_stop_the_others_being_warned() {
         "each healthy tenant is warned at every lead despite their neighbour failing"
     );
 }
+
+/// Pin a certificate with an explicit `created_at`, so a test can place the replacement in the
+/// past and let the rollover window elapse without waiting for it.
+async fn pin_created_at(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    connection: &SamlConnectionId,
+    seed: u8,
+    expires_in_secs: i64,
+    created_ago_secs: i64,
+) -> SamlCertificateId {
+    let id = pin_expiring(db, env, scope, connection, seed, expires_in_secs).await;
+    // `pin_certificate` stamps `created_at` itself, which is right for production and useless
+    // for a window measured in days. Moved as the OWNER, because no repository method offers to
+    // rewrite it -- and none should.
+    sqlx::query(
+        "UPDATE saml_connection_certificates \
+         SET created_at = now() - ($1 * INTERVAL '1 second') WHERE id = $2",
+    )
+    .bind(created_ago_secs)
+    .bind(id.to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("move the pin time");
+    id
+}
+
+async fn pinned_ids(db: &TestDatabase, scope: Scope, connection: &SamlConnectionId) -> Vec<String> {
+    let mut ids: Vec<String> = db
+        .control_store()
+        .scoped(scope)
+        .saml_connections()
+        .certificates(connection)
+        .await
+        .expect("read certificates")
+        .into_iter()
+        .map(|certificate| certificate.id.to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn a_superseded_certificate_is_retired_once_its_window_closes() {
+    // #141 criterion 2's BOUND. The overlap itself is what pinning already does; what was
+    // missing is that nothing ever retired the old certificate, so a superseded key stayed a
+    // valid trust anchor for the life of the deployment -- `saml_acs` verifies against every
+    // pinned certificate and deliberately ignores `notAfter`.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/roll").await;
+
+    // Expired a day ago, and replaced sixty days back: window closed.
+    let retiring = pin_created_at(&db, &env, scope, &connection, 7, -DAY, 90 * DAY).await;
+    let replacement = pin_created_at(&db, &env, scope, &connection, 9, 300 * DAY, 60 * DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(report.retired, 1, "the superseded certificate is retired");
+    assert_eq!(
+        pinned_ids(&db, scope, &connection).await,
+        vec![replacement.to_string()],
+        "and the replacement is the only trust anchor left"
+    );
+    assert!(
+        !pinned_ids(&db, scope, &connection)
+            .await
+            .contains(&retiring.to_string())
+    );
+}
+
+#[tokio::test]
+async fn the_last_certificate_is_never_retired_however_old_it_is() {
+    // RETIRING THE ONLY CERTIFICATE WOULD STOP SIGN-IN OUTRIGHT, which is the opposite of what a
+    // renewal flow is for. The replacement is what makes retirement safe rather than
+    // destructive, so its existence is a condition and not an optimisation.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/only").await;
+    let only = pin_created_at(&db, &env, scope, &connection, 7, -400 * DAY, 900 * DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(report.retired, 0, "a lone certificate is never retired");
+    assert_eq!(
+        pinned_ids(&db, scope, &connection).await,
+        vec![only.to_string()],
+        "an expired certificate with nothing to replace it is still the only way in"
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_pinned_inside_the_window_retires_nothing_yet() {
+    // THE WINDOW IS MEASURED FROM THE REPLACEMENT, and this is the case that proves it: the old
+    // certificate expired long ago, so a rule keyed on the expiry would retire it immediately.
+    // The customer only pinned the new one yesterday and their identity provider may not have
+    // cut over.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/fresh").await;
+
+    let retiring = pin_created_at(&db, &env, scope, &connection, 7, -100 * DAY, 500 * DAY).await;
+    let replacement = pin_created_at(&db, &env, scope, &connection, 9, 300 * DAY, DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(report.retired, 0, "the window has not closed");
+    assert_eq!(
+        pinned_ids(&db, scope, &connection).await,
+        {
+            let mut both = vec![retiring.to_string(), replacement.to_string()];
+            both.sort();
+            both
+        },
+        "both stay trusted, which is the overlap the window exists to hold open"
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_still_inside_its_own_validity_is_not_retired() {
+    // EXPIRY IS A CONDITION TOO. A customer who pins next year's certificate early has two live
+    // certificates and no cutover yet; retiring the one still in use because a newer one exists
+    // would break the connection they are preparing.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/early").await;
+
+    let current = pin_created_at(&db, &env, scope, &connection, 7, 200 * DAY, 500 * DAY).await;
+    let next = pin_created_at(&db, &env, scope, &connection, 9, 900 * DAY, 60 * DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+
+    assert_eq!(
+        report.retired, 0,
+        "a certificate still in its validity stays"
+    );
+    assert_eq!(pinned_ids(&db, scope, &connection).await.len(), 2);
+    assert!(
+        pinned_ids(&db, scope, &connection)
+            .await
+            .contains(&current.to_string())
+    );
+    assert!(
+        pinned_ids(&db, scope, &connection)
+            .await
+            .contains(&next.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_zero_window_retires_nothing_at_all() {
+    // ZERO DISABLES IT, which a deployment retiring certificates by hand relies on. Checked
+    // against a fixture that WOULD be retired under any positive window, so this cannot pass by
+    // there being nothing to do.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/off").await;
+    pin_created_at(&db, &env, scope, &connection, 7, -DAY, 900 * DAY).await;
+    pin_created_at(&db, &env, scope, &connection, 9, 300 * DAY, 800 * DAY).await;
+
+    // THE ZERO CASE FIRST, on an untouched fixture.
+    let disabled =
+        ironauth_admin::certificate_expiry::retire_once(db.control_store(), &env, scope, 0, 100)
+            .await
+            .expect("the pass runs");
+    assert_eq!(disabled.retired, 0, "a zero window must retire nothing");
+    assert_eq!(
+        pinned_ids(&db, scope, &connection).await.len(),
+        2,
+        "and leave both certificates pinned"
+    );
+
+    // AND THE CONTROL, on the same fixture: with a positive window it IS retired. Without this
+    // the assertion above is satisfied by a fixture that was never retirable, which is how a
+    // zero-case test comes to pass for the wrong reason.
+    let with_window = ironauth_admin::certificate_expiry::retire_once(
+        db.control_store(),
+        &env,
+        scope,
+        30 * DAY,
+        100,
+    )
+    .await
+    .expect("the pass runs");
+    assert_eq!(
+        with_window.retired, 1,
+        "the fixture must be retirable, or the zero case proves nothing"
+    );
+}
