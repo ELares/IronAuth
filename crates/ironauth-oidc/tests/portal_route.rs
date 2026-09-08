@@ -1872,6 +1872,17 @@ async fn the_page_reports_whether_anything_has_actually_used_each_connection() {
         row(&body, "mid-cutover")
     );
 
+    the_rendered_date_is_the_stamp_and_not_its_microseconds(&body, now);
+    a_revoked_connection_reports_no_activity(&harness, &org, &env, now, &path, &cookie).await;
+}
+
+/// The date half of [`the_page_reports_whether_anything_has_actually_used_each_connection`].
+///
+/// SPLIT OUT because that test stood at 163 lines against the hundred-line ceiling clippy
+/// enforces and `cargo test` cannot see. It is a distinct claim -- how the stamp is
+/// RENDERED, rather than which rows carry one -- and it is the tail of the test, so moving
+/// it changes no ordering.
+fn the_rendered_date_is_the_stamp_and_not_its_microseconds(body: &str, now: i64) {
     // THE DATE ITSELF, which nothing asserted: the column divides microseconds to seconds before
     // formatting, and feeding microseconds straight in puts the date tens of millions of years
     // out. (An earlier version of this comment said "around fifty-five thousand", which is the
@@ -1896,16 +1907,26 @@ async fn the_page_reports_whether_anything_has_actually_used_each_connection() {
         rest % 60
     );
     assert!(
-        row(&body, "in-use").contains(&stamped),
+        row(body, "in-use").contains(&stamped),
         "the activity column does not carry the time of the request it is reporting: {}",
-        row(&body, "in-use")
+        row(body, "in-use")
     );
+}
 
+/// The revoked half of the same test: a revoked connection reports no activity at all, so
+/// nothing invites the reader to wonder whether it still works.
+async fn a_revoked_connection_reports_no_activity(
+    harness: &Harness,
+    org: &OrganizationId,
+    env: &Env,
+    now: i64,
+    path: &str,
+    cookie: &str,
+) {
     // AND A REVOKED CONNECTION REPORTS NO ACTIVITY AT ALL. Its state is explained by the
     // revocation, and a last-used time beside it would invite the reader to wonder whether it is
     // still working. Nothing drove this arm before.
-    let switched =
-        connect_with_provider(&harness, &org, "switched-off", "okta", "act-d", None).await;
+    let switched = connect_with_provider(harness, org, "switched-off", "okta", "act-d", None).await;
     assert!(
         harness
             .db()
@@ -1923,14 +1944,14 @@ async fn the_page_reports_whether_anything_has_actually_used_each_connection() {
         .control_store()
         .scoped(harness.scope())
         .acting(
-            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
-            CorrelationId::generate(&env),
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(env)),
+            CorrelationId::generate(env),
         )
         .scim_connections()
-        .revoke(&env, &switched, now)
+        .revoke(env, &switched, now)
         .await
         .expect("revoke");
-    let (_, after) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+    let (_, after) = get_with_cookie(harness, path, Some(cookie)).await;
     assert!(
         row(&after, "switched-off").contains("Revoked"),
         "the premise: the row reports the revocation: {}",
