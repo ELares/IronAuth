@@ -454,11 +454,14 @@ pub async fn surface_get(
     if intent == "scim" {
         return scim_surface(&state, &session).await;
     }
+    if intent == "certificate-renewal" {
+        return certificate_renewal_surface(&state, &session).await;
+    }
     // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER. `sso`, `domain-verification` and
     // `log-streams` land in later slices of #140 -- the closed set the `portal_links` intent
-    // CHECK constraint permits is those three plus `scim` -- and the fence above has already
-    // refused an intent this session does not carry, so what reaches here is a surface this
-    // deployment serves and has not built yet.
+    // CHECK constraint permits is those three, plus `scim` and `certificate-renewal` above --
+    // and the fence has already refused an intent this session does not carry, so what reaches
+    // here is a surface this deployment serves and has not built yet.
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>{intent}</title>\
          <h1>{intent}</h1>\
@@ -760,6 +763,152 @@ async fn scim_surface(state: &OidcState, session: &PortalSession) -> Response {
         guides = guides,
     );
     crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// The certificate-renewal surface (issue #141 criterion 2).
+///
+/// # What this page is for
+///
+/// It is handed to whoever administers the customer's IdP, usually because an expiry notice told
+/// them to replace a signing certificate. That person is frequently not the person who set SSO
+/// up, which is why this is its own intent rather than a corner of the `sso` page: a link that
+/// lands on the full configuration surface would give its holder every other setting on the
+/// connection as well.
+///
+/// # Overlap is the existing behaviour, not something this page adds
+///
+/// A connection may have several certificates pinned at once, and `saml_acs` verifies an
+/// assertion against EVERY one of them. So the rollover a renewal needs -- old and new both
+/// accepted while the IdP switches over -- is what pinning a second certificate already does.
+/// What this page owes is showing the holder which certificates are currently trusted and when
+/// each stops mattering, so they can tell whether the new one has landed.
+///
+/// # Two lists, and only one of them is unbounded
+///
+/// The CERTIFICATES on a connection are shown whole: that number is bounded by what an IdP
+/// publishes -- one, or two during a rollover -- so a page bound there would bound nothing, and
+/// truncating trust material quietly is exactly the wrong thing to do.
+///
+/// The CONNECTIONS are not. An organization can have more than a page of them, so this reads one
+/// more than it shows and SAYS SO when there are more, the way the SCIM surface does. An earlier
+/// version of this paragraph claimed the page had no bound at all, which was true of the inner
+/// list and false of the outer one it actually pages.
+async fn certificate_renewal_surface(state: &OidcState, session: &PortalSession) -> Response {
+    let now = epoch_micros(state.env().clock().now_utc());
+    let read = state
+        .store()
+        .scoped(session.scope())
+        .saml_connections()
+        .list_for_org(session.organization(), PORTAL_LIST_LIMIT + 1, None)
+        .await;
+    // THE ORGANIZATION IS THE SESSION'S, so a failure is this deployment failing to read its own
+    // row rather than an addressing mistake the holder could have made.
+    let Ok(connections) = read else {
+        return PortalRefusal::Unavailable.into_response();
+    };
+
+    let mut body = String::from(
+        "<!doctype html><meta charset=\"utf-8\"><title>Certificate renewal</title>\
+         <h1>Certificate renewal</h1>",
+    );
+    if connections.is_empty() {
+        // NOT A REFUSAL. An organization with no SAML connection has nothing to renew, and a
+        // not-found here would read to the holder as "your link is broken" when the link is fine.
+        body.push_str(
+            "<p>This organization has no SAML connection, so there is no signing certificate \
+             to replace.</p>",
+        );
+        return crate::pages::secure_html(StatusCode::OK, body);
+    }
+
+    let limit = usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
+    if connections.len() > limit {
+        // SAID, NOT SWALLOWED. A page titled with the customer's connections that quietly drops
+        // some is worse than one admitting its bound: the holder renews what they can see and
+        // believes they are finished.
+        let _ = write!(
+            body,
+            "<p>Showing the first {limit} connections. Ask your vendor about the rest.</p>"
+        );
+    }
+    for connection in connections.iter().take(limit) {
+        let _ = write!(
+            body,
+            "<h2>{name}</h2><p>Identity provider: {idp}</p>",
+            name = escape_html(&connection.display_name),
+            idp = escape_html(&connection.idp_entity_id),
+        );
+        if !connection.active {
+            // TURNED OFF BY THE VENDOR. Its certificates are still pinned and this page could
+            // list them as "in use", which would be false in the way that matters: no assertion
+            // for this connection is accepted at all, so a holder renewing its certificate would
+            // fix nothing and not know why sign-in still failed.
+            body.push_str(
+                "<p>This connection is switched off, so sign-in through it is not accepted \
+                 whatever is pinned to it. Ask your vendor to turn it back on.</p>",
+            );
+            continue;
+        }
+        let certificates = state
+            .store()
+            .scoped(session.scope())
+            .saml_connections()
+            .certificates(&connection.id)
+            .await;
+        let Ok(certificates) = certificates else {
+            return PortalRefusal::Unavailable.into_response();
+        };
+        body.push_str(&certificate_rows(&certificates, now));
+    }
+    crate::pages::secure_html(StatusCode::OK, body)
+}
+
+/// One row per pinned certificate, saying whether it is still trusted and for how long.
+///
+/// NO FINGERPRINT AND NO KEY MATERIAL. The holder of a renewal link is not necessarily an
+/// operator of this deployment, and what they need to decide "has my new certificate landed" is
+/// how many are pinned and when each expires. A fingerprint would be the one value on the page
+/// worth stealing.
+fn certificate_rows(certificates: &[ironauth_store::SamlCertificate], now: i64) -> String {
+    if certificates.is_empty() {
+        // A CONNECTION WITH NOTHING PINNED IS NOT A RENEWAL PROBLEM, it is a connection that
+        // cannot accept a login at all, and saying "no certificates expire soon" would be true
+        // and useless.
+        return "<p>No certificate is pinned to this connection, so sign-in cannot succeed \
+                until one is.</p>"
+            .to_owned();
+    }
+    let mut rows = String::from(
+        "<table><tr><th>Certificate</th><th>Valid from</th><th>Expires</th><th>State</th></tr>",
+    );
+    for certificate in certificates {
+        // EVERY PINNED CERTIFICATE IS TRUSTED, including an expired one: `saml_acs` verifies
+        // against the pinned KEY and deliberately does not check `notAfter`, because the
+        // alternative is an enterprise-wide lockout at midnight on a date nobody was watching.
+        // So "expired" here means "the IdP will have stopped using it", not "we refuse it", and
+        // the wording has to carry that or a reader will think this page is the enforcement.
+        let state = if certificate.not_after_unix_micros <= now {
+            "past its expiry; still accepted, so a rollover cannot lock anyone out"
+        } else if certificate.not_before_unix_micros > now {
+            "not yet valid at the identity provider"
+        } else {
+            "in use"
+        };
+        let _ = write!(
+            rows,
+            "<tr><td>{id}</td><td>{from}</td><td>{until}</td><td>{state}</td></tr>",
+            id = escape_html(&certificate.id.to_string()),
+            from = escape_html(&crate::saml_start::rfc3339_utc(
+                certificate.not_before_unix_micros / 1_000_000
+            )),
+            until = escape_html(&crate::saml_start::rfc3339_utc(
+                certificate.not_after_unix_micros / 1_000_000
+            )),
+            state = escape_html(state),
+        );
+    }
+    rows.push_str("</table>");
+    rows
 }
 
 /// How many connections one portal page renders.

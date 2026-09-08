@@ -54,7 +54,13 @@ use crate::state::AdminState;
 /// THE SAME CLOSED SET THE COLUMN'S CHECK PINS, restated here so a typo is a 400 naming the
 /// field rather than a 500 from a constraint violation. The database remains the authority --
 /// this list existing does not make it safe to widen one side alone.
-const INTENTS: [&str; 4] = ["sso", "scim", "domain-verification", "log-streams"];
+const INTENTS: [&str; 5] = [
+    "sso",
+    "scim",
+    "domain-verification",
+    "log-streams",
+    "certificate-renewal",
+];
 
 /// The default life of a link, in seconds.
 ///
@@ -91,7 +97,8 @@ pub struct CreatePortalLinkRequest {
     /// The `org_` organization the resulting portal session may configure. The session can see
     /// no other organization's state.
     pub organization_id: String,
-    /// What the session may configure: `sso`, `scim`, `domain-verification`, or `log-streams`.
+    /// What the session may configure: `sso`, `scim`, `domain-verification`, `log-streams`,
+    /// or `certificate-renewal`.
     /// A session cannot navigate outside the intent it was opened with.
     pub intent: String,
     /// How long the link stays redeemable, in seconds. Defaults to five minutes; an hour is the
@@ -178,7 +185,9 @@ pub async fn create_portal_link(
 
     if !INTENTS.contains(&request.intent.as_str()) {
         return Err(ApiError::BadRequest(
-            "intent must be one of sso, scim, domain-verification, log-streams".to_owned(),
+            "intent must be one of sso, scim, domain-verification, log-streams, \
+                 certificate-renewal"
+                .to_owned(),
         ));
     }
     let ttl = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECS);
