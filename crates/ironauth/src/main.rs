@@ -2223,8 +2223,11 @@ struct CertificatePinInputs {
     /// The data-plane DSN the POOL drains on. The queue is data-plane writable by design: the
     /// renewal portal that fills it runs there.
     data_plane_dsn: String,
-    /// The control-plane DSN the PIN is written through. Not for scope enumeration: 0197 grants
-    /// the certificate table's INSERT to `ironauth_control` alone.
+    /// The control-plane DSN. It carries BOTH jobs here: the pin is written through it, because
+    /// 0197 grants the certificate table's INSERT to `ironauth_control` alone, and the pool's
+    /// scope enumeration reads through it like every other worker's. An earlier version of this
+    /// line said "not for scope enumeration", which was true of the reason it is REQUIRED and
+    /// false of what the connection is then used for.
     control_dsn: Option<String>,
     /// The environment seam.
     env: Env,
