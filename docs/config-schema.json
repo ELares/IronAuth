@@ -343,6 +343,13 @@
           },
           "type": "array"
         },
+        "rollover_window_days": {
+          "default": 30,
+          "description": "How long after a replacement is pinned the certificate it superseded stays trusted, in\nDAYS. Zero disables retirement entirely.\n\n# What this bounds\n\n`saml_acs` verifies an assertion against EVERY pinned certificate and deliberately does\nnot check `notAfter`, so a superseded certificate keeps working for as long as it stays\npinned -- which, until this existed, was forever. That is what makes a renewal safe and\nalso what makes a key compromised long after it stopped being used still able to mint\naccepted assertions. This is the bound.\n\n# Measured from the REPLACEMENT, not from the expiry\n\nThe clock starts when the new certificate is pinned. Those differ whenever a renewal is\nlate, which is the case the window exists for: a certificate replaced the day after it\nlapsed still gets the full window rather than being retired immediately.\n\nA certificate is only ever retired if it has EXPIRED and something newer is pinned on the\nsame connection, so no pass can leave a connection unable to accept a login.\n\nTHIRTY DAYS BY DEFAULT: long enough that an identity provider caching metadata on a\nweekly or fortnightly refresh has certainly seen the replacement, and short enough that a\nretired key is not still a trust anchor a quarter later.\n\nZERO DISABLES IT, and that is a real choice: a deployment that wants its operators to\nretire certificates by hand keeps every pin until somebody removes it.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "sweep_batch": {
           "default": 500,
           "description": "How many (certificate, lead) pairs may be announced for ONE SCOPE in one pass.\n\nPER SCOPE, not per sweep. It is handed to each scope's pass in turn, so a sweep over a\nhundred tenants may announce up to a hundred times this number. That is the bound worth\nhaving -- it caps any single scope's work -- but it is not a cap on the sweep, and saying\n\"one pass\" here would tell an operator sizing this for a large estate the wrong thing.\n\nA BOUND, NOT A LIMIT ON THE TOTAL: pairs a pass does not reach stay due and the next pass\ntakes them, because every pair is decided independently by its own ledger row. It exists\nso a deployment that has just enabled alerting over a large estate does not turn its\nfirst pass into one enormous transaction. Zero is REFUSED at load rather than accepted:\nsee `validate_certificate_expiry`.",
@@ -2951,6 +2958,7 @@
           14,
           3
         ],
+        "rollover_window_days": 30,
         "sweep_batch": 500,
         "sweep_enabled": false,
         "sweep_interval_secs": 3600

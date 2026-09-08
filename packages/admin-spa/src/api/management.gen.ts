@@ -5138,7 +5138,8 @@ export interface components {
         /** @description A portal link to mint. */
         CreatePortalLinkRequest: {
             /**
-             * @description What the session may configure: `sso`, `scim`, `domain-verification`, or `log-streams`.
+             * @description What the session may configure: `sso`, `scim`, `domain-verification`, `log-streams`,
+             *     `certificate-renewal`, or `contacts`.
              *     A session cannot navigate outside the intent it was opened with.
              */
             intent: string;
