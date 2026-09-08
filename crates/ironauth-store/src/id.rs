@@ -1293,6 +1293,18 @@ impl ScopedKind for ScimPushConnectionKind {
     const PREFIX: &'static str = "spc";
 }
 
+/// Marker for an LDAP/AD connector (`ldc_`, issue #142).
+///
+/// The row that says WHICH directory IronAuth reads from for one organization. Safe in a log
+/// line for the reason [`ScimPushConnectionKind`] is: it names a configuration this deployment
+/// chose, not a credential -- the bind password is an `environment_secrets` row named by the
+/// connector, never a value it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LdapConnectorKind;
+impl ScopedKind for LdapConnectorKind {
+    const PREFIX: &'static str = "ldc";
+}
+
 /// Marker for an outbound SCIM push LINK (`spl_`, issue #137).
 ///
 /// The row that records what ONE downstream calls ONE subject. Not a credential and not a
@@ -2229,6 +2241,9 @@ pub type PortalLinkId = ScopedId<PortalLinkKind>;
 pub type PortalSessionId = ScopedId<PortalSessionKind>;
 /// An OUTBOUND SCIM connection identifier (`spc_...`), issue #137.
 pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
+
+/// An LDAP/AD connector handle (issue #142).
+pub type LdapConnectorId = ScopedId<LdapConnectorKind>;
 /// An inbound SAML connection identifier (`smc_...`), issue #139. The trust decision, never a key.
 pub type SamlConnectionId = ScopedId<SamlConnectionKind>;
 /// A pinned SAML signing key identifier (`smk_...`), issue #139.

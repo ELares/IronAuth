@@ -102,6 +102,7 @@ mod external_issuers;
 pub mod flow_target_delivery;
 mod flow_targets;
 pub mod ldap_groups;
+pub mod ldap_mapping;
 mod log_streams;
 mod mds3_health;
 mod memberships;
