@@ -361,7 +361,16 @@ async fn an_sso_session_cannot_reach_the_scim_surface() {
     let (status, body) = get_with_cookie(&harness, &surface("sso"), Some(&cookie)).await;
     assert_eq!(status, 200, "the session's own surface: {body}");
 
-    for forbidden in ["scim", "domain-verification", "log-streams"] {
+    // THE WHOLE CLOSED SET BAR THIS SESSION'S OWN. Enumerated by hand and therefore a list
+    // that goes stale: it had three entries when the set had four, so #141's fifth intent was
+    // added with a fence nothing checked for it. `certificate-renewal` is the one that matters
+    // most here, because its surface is the only one that leads to a write.
+    for forbidden in [
+        "scim",
+        "domain-verification",
+        "log-streams",
+        "certificate-renewal",
+    ] {
         let (status, body) = get_with_cookie(&harness, &surface(forbidden), Some(&cookie)).await;
         assert_eq!(
             status, 404,
@@ -2171,6 +2180,21 @@ async fn saml_connection(
     id
 }
 
+/// The `<tr>` for one certificate, so a state can be asserted against the row it belongs to.
+///
+/// Every state assertion in this suite was a whole-body substring check, which is a sum over the
+/// rows it claims to distinguish: reading each row's state off the FIRST certificate left all of
+/// them green. Slicing the row by its own id is what binds the two together.
+fn row_for(body: &str, id: &ironauth_store::SamlCertificateId) -> String {
+    let needle = id.to_string();
+    let at = body
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no row for {needle} in {body}"));
+    let start = body[..at].rfind("<tr>").expect("a row start");
+    let end = at + body[at..].find("</tr>").expect("a row end");
+    body[start..end].to_owned()
+}
+
 #[tokio::test]
 async fn a_renewal_link_lands_on_the_connection_whose_certificate_is_expiring() {
     // #141 criterion 2, first clause: "a certificate-renewal portal link lands on the renewal
@@ -2209,7 +2233,11 @@ async fn a_rollover_shows_both_certificates_as_trusted() {
     let harness = Harness::start().await;
     let organization = seed_org(&harness, "Contoso").await;
     let connection = saml_connection(&harness, &organization, "Okta Production").await;
-    let retiring = pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+    // TWO DIFFERENT STATES on one page, which is the state a real rollover reaches when the
+    // switchover runs late: the certificate being retired has lapsed and the replacement is
+    // live. With both "in use" the two rows are textually identical, and every assertion about
+    // them is satisfied by a page that read either row's state off the other.
+    let retiring = pin(&harness, &connection, 7, -60 * 60).await;
     let replacement = pin(&harness, &connection, 9, 400 * 24 * 60 * 60).await;
 
     let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
@@ -2221,17 +2249,21 @@ async fn a_rollover_shows_both_certificates_as_trusted() {
     let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
 
     assert_eq!(status, 200, "{body}");
-    for id in [&retiring, &replacement] {
-        assert!(
-            body.contains(&id.to_string()),
-            "both certificates must be listed during a rollover: {body}"
-        );
-    }
-    assert_eq!(
-        body.matches("in use").count(),
-        2,
-        "and both must be shown as trusted, or the holder cannot tell the new one has landed: \
-         {body}"
+    // EACH STATE AGAINST ITS OWN ROW.
+    let retiring_row = row_for(&body, &retiring);
+    let replacement_row = row_for(&body, &replacement);
+    assert!(
+        retiring_row.contains("still accepted"),
+        "the lapsed certificate must be shown as still trusted, so the holder does not read a \
+         working rollover as an outage: {retiring_row}"
+    );
+    assert!(
+        replacement_row.contains("in use"),
+        "and the replacement must be shown as live, so they can see it landed: {replacement_row}"
+    );
+    assert!(
+        !replacement_row.contains("still accepted"),
+        "the two rows must not carry each other's state: {replacement_row}"
     );
 }
 
@@ -2246,7 +2278,7 @@ async fn a_renewal_session_sees_only_its_own_organizations_connections() {
     let ours = saml_connection(&harness, &mine, "Okta Production").await;
     pin(&harness, &ours, 7, 2 * 24 * 60 * 60).await;
     let neighbour = saml_connection(&harness, &theirs, "Entra Neighbour").await;
-    pin(&harness, &neighbour, 9, 2 * 24 * 60 * 60).await;
+    let neighbour_certificate = pin(&harness, &neighbour, 9, 2 * 24 * 60 * 60).await;
 
     let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &mine).await;
     let path = format!(
@@ -2262,9 +2294,12 @@ async fn a_renewal_session_sees_only_its_own_organizations_connections() {
         !body.contains("Entra Neighbour"),
         "a renewal session must not see another organization's connection: {body}"
     );
+    // NOR ITS CERTIFICATE. The previous version of this line asserted the absence of the
+    // neighbour's CONNECTION id, which the page never prints under any input -- an assertion
+    // structurally unable to fail. The certificate id IS printed, so this one can.
     assert!(
-        !body.contains(&neighbour.to_string()),
-        "nor its identifier: {body}"
+        !body.contains(&neighbour_certificate.to_string()),
+        "nor its certificate: {body}"
     );
 }
 
@@ -2301,5 +2336,55 @@ async fn a_lapsed_certificate_is_shown_as_still_accepted() {
     assert!(
         !body.contains(">in use<"),
         "and must not be reported as current: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_switched_off_connection_is_not_reported_as_working() {
+    // A CONNECTION THE VENDOR HAS TURNED OFF accepts no assertion at all, whatever is pinned to
+    // it. Listing its certificates as "in use" tells the holder the opposite of the truth in the
+    // way that costs them the most: they renew the certificate, the page looks right, and
+    // sign-in still fails for a reason the page never mentioned.
+    //
+    // This behaviour was added in response to review and then measured by nothing -- disabling
+    // the check left every renewal test green.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    let certificate = pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&Env::system())),
+            CorrelationId::generate(&Env::system()),
+        )
+        .saml_connections()
+        .set_active(&Env::system(), &connection, false, None)
+        .await
+        .expect("switch the connection off");
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let (status, body) = get_with_cookie(&harness, &path, Some(&cookie)).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("switched off"),
+        "the page must say the connection is off: {body}"
+    );
+    assert!(
+        !body.contains("in use"),
+        "and must not report its certificates as accepted: {body}"
+    );
+    assert!(
+        !body.contains(&certificate.to_string()),
+        "nor list them as though renewing one would help: {body}"
     );
 }

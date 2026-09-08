@@ -45,7 +45,15 @@ ALTER TABLE portal_sessions
 
 -- NOT VALIDATED SEPARATELY, and worth saying why the plain ADD is right here. `ADD CONSTRAINT
 -- ... CHECK` takes ACCESS EXCLUSIVE and scans the table, which on a big table is the kind of
--- lock that stalls a deployment. Both tables here hold only live rows -- a five-minute link TTL
--- by default, a short session, both swept -- so each scan is over a table that is small by
--- construction rather than by luck. A NOT VALID / VALIDATE split would buy nothing and would leave a window
+-- lock that stalls a deployment.
+--
+-- WHAT MAKES THESE TWO SMALL IS THEIR RATE, NOT A SWEEPER. An earlier version of this paragraph
+-- said "both swept", which is false: nothing deletes from `portal_links` or `portal_sessions`
+-- anywhere in the tree, so both grow for the life of a deployment. What keeps the scan cheap is
+-- how few rows they take -- a portal link is minted by an operator, by hand, for one customer's
+-- IT admin, so the rate is human and the total after a year is thousands rather than millions.
+-- A migration is also a maintenance window, which is when an ACCESS EXCLUSIVE lock is expected.
+--
+-- A NOT VALID / VALIDATE split would buy nothing here and would leave a window in which the
+-- column accepts values the code cannot serve. A NOT VALID / VALIDATE split would buy nothing and would leave a window
 -- in which the column accepts values the code cannot serve.

@@ -1114,6 +1114,67 @@ async fn minting_a_portal_link_requires_write_config() {
     );
 }
 
+#[tokio::test]
+async fn the_management_api_mints_a_certificate_renewal_link_and_refuses_an_unknown_intent() {
+    // THE ONLY PRODUCTION PRODUCER of a `portal_links` row is this handler, and its allow-list is
+    // a hand-written `INTENTS` array separate from the two CHECK constraints the schema carries.
+    // #141 widened all three; every test of the new intent drove a HAND-WRITTEN row, so the
+    // handler's half was measured by nothing and dropping `certificate-renewal` from that array
+    // would leave the portal surface unreachable in production with the whole suite green.
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "cr-tenant").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "cr-org",
+            &serde_json::json!({ "display_name": "Contoso" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    let links = format!("/v1/tenants/{tenant}/environments/{environment}/portal-links");
+    let (status, _, body) = h
+        .post(
+            &links,
+            "cr-mint",
+            &serde_json::json!({ "organization_id": org, "intent": "certificate-renewal" })
+                .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the management API must mint the renewal intent the portal serves: {body}"
+    );
+
+    // AND THE SET IS STILL CLOSED. Widening it by one must not have widened it to anything: an
+    // intent no surface serves would mint a link whose redemption lands on a placeholder.
+    let (status, _, body) = h
+        .post(
+            &links,
+            "cr-unknown",
+            &serde_json::json!({ "organization_id": org, "intent": "certificate-renewals" })
+                .to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a near-miss intent was accepted: {body}"
+    );
+    assert!(
+        body.contains("certificate-renewal"),
+        "the refusal must list the intents that ARE served, or an operator cannot see their \
+         typo: {body}"
+    );
+}
+
 /// A credential confined to one organization cannot mint a portal link for a SIBLING.
 ///
 /// # Why this test exists, stated plainly because its absence was the defect
