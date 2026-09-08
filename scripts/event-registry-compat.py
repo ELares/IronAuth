@@ -50,6 +50,22 @@ import json
 import subprocess
 import sys
 
+# Event types deliberately retired, and why.
+#
+# The REMOVED check below refuses a vanishing event type, because a consumer subscribed to it
+# waits forever with nothing to tell it why. That is the right default and the wrong answer for a
+# type that was never released, so a retirement is written down here rather than argued in a PR
+# comment that nobody can find later. A name in this list is exempt from the REMOVED check ONLY;
+# every other rule still applies, and re-adding the name later starts its history over.
+RETIRED: dict[str, str] = {
+    "saml_certificate.expiring": (
+        "renamed to saml_certificate.expiry_announced. Present participle: an event records what "
+        "BECAME TRUE, and the catalog's own past-tense test was red on main from the day this "
+        "landed. Retired within a day of being added and never carried by a release, so no "
+        "subscriber can exist."
+    ),
+}
+
 CATALOG = "docs/events/catalog.json"
 
 
@@ -133,9 +149,12 @@ def main() -> int:
     for wire, old in sorted(before.items()):
         new = after.get(wire)
         if new is None:
+            if wire in RETIRED:
+                print(f"  ok   {wire}: retired deliberately -- {RETIRED[wire]}")
+                continue
             failures.append(
                 f"{wire}: REMOVED from the registry. A consumer subscribed to it will wait "
-                f"forever; retire it deliberately, with a note here."
+                f"forever; retire it deliberately, by adding it to RETIRED with the reason."
             )
             continue
         breaks = schema_breaks(old["payload_schema"], new["payload_schema"])

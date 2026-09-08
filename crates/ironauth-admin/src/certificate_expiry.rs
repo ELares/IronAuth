@@ -7,7 +7,7 @@
 //! #141's first criterion has two halves: a certificate entering its expiry window "triggers
 //! notifications to the org's IT contacts at each configured lead time" AND "fires the renewal
 //! webhook". This is the second half, end to end: every (certificate, lead) pair that has crossed
-//! its threshold and not been announced gets a `saml_certificate.expiring` event carrying the
+//! its threshold and not been announced gets a `saml_certificate.expiry_announced` event carrying the
 //! organization whose contacts it concerns, recorded in the same transaction so the announcement
 //! and the record are one fact.
 //!
@@ -52,7 +52,7 @@ pub enum SweepError {
     Clock,
     /// The registry would not build an envelope for a type it is supposed to carry.
     ///
-    /// Unreachable in a build whose catalog still holds `saml_certificate.expiring`. It is NOT
+    /// Unreachable in a build whose catalog still holds `saml_certificate.expiry_announced`. It is NOT
     /// caught by the catalog gate first, as an earlier comment claimed: that gate is a freshness
     /// check over the generated docs and notices the REGISTRY changing, not this call site.
     Envelope,
@@ -159,7 +159,7 @@ pub async fn run_once(
         let event_id = format!("evt_{}_{}", item.certificate_id, item.lead_secs);
         let Some(envelope) = ironauth_store::event_catalog::envelope(
             &event_id,
-            "saml_certificate.expiring",
+            "saml_certificate.expiry_announced",
             &scope.tenant().to_string(),
             &scope.environment().to_string(),
             now / 1000,

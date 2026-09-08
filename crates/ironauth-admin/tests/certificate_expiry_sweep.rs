@@ -4,7 +4,7 @@
 //!
 //! # What a pass owes
 //!
-//! Exactly one `saml_certificate.expiring` per (certificate, lead) that has crossed its
+//! Exactly one `saml_certificate.expiry_announced` per (certificate, lead) that has crossed its
 //! threshold, ever -- and the two ways a pass can lose a race are outcomes it reports rather than
 //! faults it raises. Both matter operationally: a sweep is a job an operator runs twice, and an
 //! expiry warning is precisely what prompts the certificate replacement that makes the work item
@@ -200,7 +200,7 @@ async fn a_pass_announces_every_crossed_lead_once_and_a_second_pass_announces_no
     let mut leads: Vec<i64> = announced
         .iter()
         .map(|event| {
-            assert_eq!(event["type"], "saml_certificate.expiring");
+            assert_eq!(event["type"], "saml_certificate.expiry_announced");
             // THE ORGANIZATION TRAVELS, which is what lets a per-organization consumer route it
             // without reading the connection back to learn whose certificate this is.
             assert_eq!(event["payload"]["organization_id"], org.to_string());
