@@ -1616,6 +1616,15 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
     // LINK THREE: the vendor can verify it, and it does not carry the customer's trust
     // material.
     let body = deliver_and_verify(&store, &env, scope, &deliveries[0], &secret).await;
+    assert_renewal_body_carries_no_trust_material(&body, &event_id);
+}
+
+/// The delivered body is the notice, and carries nothing a subscriber must not hold.
+///
+/// Split out to keep the chain test inside the readable-length lint, and because this is the
+/// assertion worth naming on its own: the catalog's promise that no certificate bytes and no
+/// fingerprint go on the wire was a comment with nothing behind it until this checked it.
+fn assert_renewal_body_carries_no_trust_material(body: &serde_json::Value, event_id: &str) {
     assert_eq!(body["type"], "saml_certificate.expiring", "{body}");
     assert_eq!(body["id"], event_id, "{body}");
     let mut carried: Vec<&str> = body["payload"]
@@ -1650,7 +1659,11 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
     // base64 or as a JSON byte array would pass this line and be caught by the key-set
     // assertion above instead, which is why both are here.
     let seeded = fingerprint(7);
-    let lower: String = seeded.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut lower = String::with_capacity(seeded.len() * 2);
+    for byte in &seeded {
+        use std::fmt::Write as _;
+        let _ = write!(lower, "{byte:02x}");
+    }
     let upper = lower.to_uppercase();
     let wire = body.to_string();
     for spelling in [&lower, &upper] {

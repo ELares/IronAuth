@@ -1710,6 +1710,16 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0208_saml_certificate_expiry_alerts.sql"),
         },
+        Migration {
+            version: 209,
+            name: "portal_certificate_renewal_intent",
+            // EXPAND. It WIDENS a CHECK, so every value an older binary can write is still
+            // accepted; the only new thing is a value no older binary produces. The reverse --
+            // narrowing it back -- would be the contract phase, and would first need every
+            // `certificate-renewal` link gone.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0209_portal_certificate_renewal_intent.sql"),
+        },
     ]
 }
 
