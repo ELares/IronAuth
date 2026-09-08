@@ -1437,3 +1437,152 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
         .await
         .expect("the data plane must be able to read the list it delivers to");
 }
+
+/// One removal that announces, for the racers below to run concurrently.
+///
+/// Extracted so the test itself stays under the line ceiling, and so both racers are provably
+/// running the SAME call rather than two hand-written ones that could drift apart.
+async fn remove_announcing(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    id: &OrgContactId,
+) -> bool {
+    let envelope = ironauth_store::event_catalog::envelope(
+        "evt_contact_removed",
+        "org_contact.removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros(env) / 1000,
+        &serde_json::json!({
+            "org_contact_id": id.to_string(),
+            "organization_id": organization.to_string(),
+            "category": "technical",
+        }),
+    )
+    .expect("the removed type is registered");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_contacts()
+        .remove_with_event(
+            env,
+            organization,
+            id,
+            now_micros(env),
+            Some(&ironauth_store::DomainEvent {
+                id: "evt_contact_removed",
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("remove must not error, whoever loses")
+}
+
+/// THE CONCURRENT LOSER, forced (issue #1147).
+///
+/// Two removals of the same contact race. Both settle probes read the row as live, both UPDATEs
+/// park on the row lock, and the loser re-evaluates `deleted_at IS NULL` under READ COMMITTED
+/// against the winner's committed row and matches nothing. The arm that handles that was
+/// executed by NO test: replacing it with a no-op left all sixteen store tests and the one admin
+/// test green, and so did replacing it with `panic!` -- the direct proof nothing reached it.
+///
+/// What the unmeasured arm was holding back is not a wrong return value alone. The loser would
+/// have reported `Ok(true)`, committed an `org_contact.remove` AUDIT ROW attributing another
+/// transaction's removal to this actor, and enqueued a SECOND `org_contact.removed`, so a
+/// consumer counting removals would over-count.
+///
+/// `tokio::join!` does not produce this: the two calls serialise and the second is answered by
+/// the already-removed early return before any write. The interleaving has to be FORCED with a
+/// rival transaction holding the row, the idiom `message_send.rs` uses.
+#[tokio::test]
+async fn a_forced_concurrent_double_removal_removes_once_and_audits_once() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("add");
+
+    // Drain the add's own event so the count below is about the removals.
+    let _ = queued_events(&db, &env, scope).await;
+
+    // THE BARRIER. A plain SELECT does not block on this, so both racers' settle probes still
+    // see a live row; their UPDATEs then park here.
+    let mut gate = db.owner_pool().begin().await.expect("begin the gate");
+    sqlx::query("SELECT id FROM org_contacts WHERE id = $1 FOR UPDATE")
+        .bind(id.to_string())
+        .fetch_one(&mut *gate)
+        .await
+        .expect("lock the row");
+
+    let db = std::sync::Arc::new(db);
+    let env = std::sync::Arc::new(env);
+    let org = std::sync::Arc::new(org);
+    let id = std::sync::Arc::new(id);
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let db = std::sync::Arc::clone(&db);
+        let env = std::sync::Arc::clone(&env);
+        let org = std::sync::Arc::clone(&org);
+        let id = std::sync::Arc::clone(&id);
+        handles.push(tokio::spawn(async move {
+            remove_announcing(&db, &env, scope, &org, &id).await
+        }));
+    }
+
+    // Both racers are past their probe and parked on the lock. Release it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    gate.commit().await.expect("release the gate");
+
+    let mut removed = 0_usize;
+    for handle in handles {
+        if handle.await.expect("task") {
+            removed += 1;
+        }
+    }
+    assert_eq!(
+        removed, 1,
+        "exactly one caller may report a removal, however they interleave"
+    );
+
+    // ONE AUDIT ROW. The loser's transaction rolls back, so its row must not survive: an audit
+    // trail claiming two actors each removed the same contact is worse than a missing one.
+    let audited: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE target_id = $1 AND action = 'org_contact.remove'",
+    )
+    .bind(id.to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(
+        audited.len(),
+        1,
+        "the audit log records {} removals of one contact: {audited:?}",
+        audited.len()
+    );
+
+    // AND ONE EVENT, so a consumer counting removals counts removals.
+    let announced = queued_events(&db, &env, scope).await;
+    let removals: Vec<_> = announced
+        .iter()
+        .filter(|e| e["type"] == "org_contact.removed")
+        .collect();
+    assert_eq!(
+        removals.len(),
+        1,
+        "the removal was announced {} times: {announced:?}",
+        removals.len()
+    );
+}
