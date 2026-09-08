@@ -61,6 +61,7 @@ crates/ironauth-store/src/repository.rs:enable:1
 crates/ironauth-store/src/repository.rs:enqueue:2
 crates/ironauth-store/src/repository.rs:enqueue_all:1
 crates/ironauth-store/src/repository.rs:enqueue_async_delivery:1
+crates/ironauth-store/src/repository.rs:enqueue_once:1
 crates/ironauth-store/src/repository.rs:enqueue_session_ended_event:1
 crates/ironauth-store/src/repository.rs:extend_with_event:1
 crates/ironauth-store/src/repository.rs:grant_secret:2

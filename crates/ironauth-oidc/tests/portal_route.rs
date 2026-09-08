@@ -2388,3 +2388,630 @@ async fn a_switched_off_connection_is_not_reported_as_working() {
         "nor list them as though renewing one would help: {body}"
     );
 }
+
+/// Percent-encode a form value.
+///
+/// A pasted certificate carries `+`, `/`, `=` and newlines, every one of which changes meaning
+/// in an `application/x-www-form-urlencoded` body. Encoding by hand rather than pulling a
+/// dependency into a test file, and conservative: everything outside the unreserved set goes.
+fn urlencode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 3);
+    for byte in raw.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// A well-formed X.509 certificate carrying a P-256 key derived from `seed`, PEM-armoured the
+/// way an identity provider console shows it.
+fn pem_certificate(seed: u8) -> String {
+    use base64::Engine as _;
+    let mut point = vec![0x04];
+    point.extend(std::iter::repeat_n(seed, 64));
+    let der = ironauth_saml::test_util::certificate_carrying(&point);
+    let body = base64::engine::general_purpose::STANDARD.encode(&der);
+    format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+}
+
+/// Drain the pin-request queue through the CONTROL-plane consumer, as the worker does.
+///
+/// The portal cannot write a trust anchor -- 0197 grants that INSERT to `ironauth_control`
+/// alone -- so it enqueues and this applies. A test stopping at the 303 would be measuring that
+/// a row reached a queue, which is not what the customer asked for.
+async fn apply_pin_requests(harness: &Harness) -> usize {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let scope = harness.scope();
+    let env = Env::system();
+    let consumer = ironauth_admin::certificate_pin_requests::CertificatePinRequestConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let mut applied = 0;
+    loop {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::CERTIFICATE_PIN_REQUEST_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            return applied;
+        }
+        for message in &claimed {
+            consumer
+                .handle(&env, scope, message)
+                .await
+                .expect("the pin applies");
+            harness
+                .db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+            applied += 1;
+        }
+    }
+}
+
+/// The certificates pinned to `connection`, read as the vendor.
+async fn pinned_count(harness: &Harness, connection: &ironauth_store::SamlConnectionId) -> usize {
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .saml_connections()
+        .certificates(connection)
+        .await
+        .expect("read the certificates")
+        .len()
+}
+
+#[tokio::test]
+async fn pinning_a_replacement_leaves_the_old_certificate_trusted() {
+    // #141 criterion 2's third clause: "uploading the new cert enables an overlap window and
+    // logins succeed with both old and new certs during it".
+    //
+    // The overlap is not a window this code opens; it is what pinning ADDS rather than replaces.
+    // `saml_acs` verifies against every pinned certificate, so from the moment this POST returns
+    // the identity provider may cut over whenever it likes. Replacing in place would close the
+    // window at the exact instant the customer needs it open.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+    assert_eq!(pinned_count(&harness, &connection).await, 1);
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&connection.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+    let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+
+    assert_eq!(
+        status, 303,
+        "the queued pin redirects back to the surface: {body}"
+    );
+    // NOT YET PINNED: the portal enqueued, because the data plane may not write a trust anchor.
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        1,
+        "the portal must not have written the certificate itself"
+    );
+    assert_eq!(apply_pin_requests(&harness).await, 1, "one queued request");
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        2,
+        "the replacement is pinned BESIDE the certificate being retired, not instead of it"
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_session_cannot_pin_onto_another_organizations_connection() {
+    // THE WORST THING THIS SURFACE COULD DO. A renewal link holder is frequently an outside IdP
+    // administrator; pinning a key they control onto a neighbour's connection would let them
+    // mint assertions that deployment accepts for that neighbour's organization. Parsing the id
+    // in scope proves only the tenant and environment, so the ORGANIZATION has to be checked.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    let neighbour = saml_connection(&harness, &theirs, "Entra Neighbour").await;
+    pin(&harness, &neighbour, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &mine).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&neighbour.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+    let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        pinned_count(&harness, &neighbour).await,
+        1,
+        "nothing was pinned onto the neighbour's connection"
+    );
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        0,
+        "and the refusal queued nothing either: a rejection that still enqueues is a \
+         rejection in name only"
+    );
+    // AND THE REFUSAL SAYS NOTHING. A holder must not be able to tell "that connection is not
+    // yours" from "no such connection", or the link becomes a way to enumerate the environment.
+    assert!(
+        !body.contains(&neighbour.to_string()),
+        "the refusal must not echo the identifier it refused: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_for_another_intent_cannot_pin() {
+    // Mounting a write behind the same session as a read does not make it the same permission.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "scim", "k-scim", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&connection.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+    let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+
+    assert_ne!(
+        status, 303,
+        "a scim session must not pin a certificate: {body}"
+    );
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        1,
+        "and nothing was written"
+    );
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        0,
+        "and nothing was queued"
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_that_does_not_parse_is_refused_without_writing() {
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    for pasted in [
+        "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----",
+        "not base64 at all !!!",
+        "",
+    ] {
+        let form = format!(
+            "connection={}&certificate={}",
+            urlencode(&connection.to_string()),
+            urlencode(pasted)
+        );
+        let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+        assert_eq!(status, 400, "refusing {pasted:?}: {body}");
+    }
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        1,
+        "no refused paste left anything behind"
+    );
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        0,
+        "no refused paste was queued"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_row_the_worker_cannot_read_is_dead_lettered_not_retried() {
+    // THE WORKER RE-PARSES, and until this test nothing measured that it does. The portal parses
+    // the paste before queueing -- that is how a holder learns immediately their paste is not a
+    // certificate -- so in every other test here the row the worker sees is already known good,
+    // and deleting the worker's own parse left all of them green.
+    //
+    // What reaches this branch in production is a row this build did not write: an older
+    // producer, a hand-inserted row, a payload shape that changed. The answer must be PERMANENT.
+    // A row whose DER does not parse will not parse on the fifth attempt either, and retrying
+    // burns the budget and delays the dead letter that is the only way an operator finds out.
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    let env = Env::system();
+    let scope = harness.scope();
+
+    harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .enqueue(
+            &env,
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::CERTIFICATE_PIN_REQUEST_CONSUMER,
+                idempotency_key: "a-row-this-build-did-not-write",
+                ordering_key: &connection.to_string(),
+                payload: serde_json::json!({
+                    "saml_connection_id": connection.to_string(),
+                    "portal_session_id": "pse_whatever",
+                    "certificate_der_base64": "bm90IGEgY2VydGlmaWNhdGU=",
+                }),
+            },
+        )
+        .await
+        .expect("enqueue");
+
+    let consumer = ironauth_admin::certificate_pin_requests::CertificatePinRequestConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let claimed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::CERTIFICATE_PIN_REQUEST_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+
+    let outcome = consumer.handle(&env, scope, &claimed[0]).await;
+    let error = outcome.expect_err("an unreadable certificate must not be reported as applied");
+    assert!(
+        !error.is_retryable(),
+        "an unreadable certificate must be dead-lettered on the spot, not retried five times"
+    );
+    assert_eq!(error.label(), "pin_request_certificate_unreadable");
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        0,
+        "and nothing was pinned"
+    );
+}
+
+/// Post a form with a session cookie AND a chosen `sec-fetch-site`.
+async fn post_form_from_with_cookie(
+    harness: &Harness,
+    path: &str,
+    form: &str,
+    site: &str,
+    cookie: &str,
+) -> (axum::http::StatusCode, String) {
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(axum::http::header::COOKIE, cookie)
+        .header("sec-fetch-site", site)
+        .body(axum::body::Body::from(form.to_owned()))
+        .expect("request builds");
+    let (status, _, body) = harness.send(request).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn a_cross_site_pin_is_refused_and_writes_nothing() {
+    // THE CSRF GUARD ON THE ONE PORTAL ROUTE THAT WRITES TRUST MATERIAL, and it was measured by
+    // nothing: deleting `same_origin_ok` from this handler left all 43 portal tests green, while
+    // both sibling POST routes -- redemption and finish -- have had cross-site tests since they
+    // landed.
+    //
+    // What it stops is the worst thing a portal route could do. The holder of a renewal link is
+    // signed in to this deployment in their browser; an attacker's page that could post this form
+    // on their behalf would pin an attacker-controlled key as a trust anchor for that
+    // organization, and every assertion signed with it would be accepted from then on.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&connection.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "cross-site", &cookie).await;
+    assert_ne!(status, 303, "a cross-site pin was accepted: {body}");
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        0,
+        "and it must not even have been queued"
+    );
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        1,
+        "nothing was pinned"
+    );
+
+    // THE CONTROL: the same request same-origin IS accepted, so the refusal above is the guard
+    // rather than the form being wrong.
+    let (status, body) =
+        post_form_from_with_cookie(&harness, &path, &form, "same-origin", &cookie).await;
+    assert_eq!(status, 303, "a same-origin pin was refused: {body}");
+    assert_eq!(apply_pin_requests(&harness).await, 1);
+    assert_eq!(pinned_count(&harness, &connection).await, 2);
+}
+
+#[tokio::test]
+async fn the_worker_pins_the_key_that_was_pasted() {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    // WHAT WAS PINNED, not just that something was. Every other test here counts rows, so a
+    // worker that pinned a fixed or empty key would satisfy all of them -- and the whole point of
+    // this feature is which key a future assertion is checked against.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let pasted = pem_certificate(9);
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&connection.to_string()),
+        urlencode(&pasted)
+    );
+    let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+    assert_eq!(status, 303, "{body}");
+    assert_eq!(apply_pin_requests(&harness).await, 1);
+
+    // The DER the page was given, and the key inside it.
+    let expected_der = base64::engine::general_purpose::STANDARD
+        .decode(
+            pasted
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>(),
+        )
+        .expect("the fixture is base64");
+    let expected = ironauth_saml::x509::pinned(&expected_der).expect("the fixture parses");
+
+    let stored = harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .saml_connections()
+        .certificates(&connection)
+        .await
+        .expect("read certificates")
+        .into_iter()
+        .find(|c| c.certificate_der == expected_der)
+        .expect("the pasted certificate is pinned");
+
+    let ironauth_jose::xmldsig::XmlSigKey::EcdsaP256(expected_point) = &expected.key else {
+        panic!("the fixture is a P-256 certificate");
+    };
+    assert_eq!(
+        &stored.public_key, expected_point,
+        "the key pinned is not the key inside the certificate that was pasted"
+    );
+    assert_eq!(
+        stored.not_after_unix_micros,
+        expected.not_after_unix_secs * 1_000_000,
+        "and its validity must be the certificate's own, not the clock's"
+    );
+    // THE FINGERPRINT IS OF THE WHOLE DER, which is the number an identity provider's console
+    // shows. A digest of the key alone would match nothing an operator can compare against.
+    assert_eq!(
+        stored.fingerprint_sha256,
+        Sha256::digest(&expected_der).to_vec(),
+        "the fingerprint must be of the certificate, not of the key"
+    );
+}
+
+#[tokio::test]
+async fn the_consumer_handed_the_data_plane_store_cannot_pin() {
+    // THE ONE DECISION THE WHOLE TWO-PLANE DESIGN RESTS ON: which Store the boot path gives this
+    // consumer. Swapping it to the data-plane one compiles, starts, drains, and fails on every
+    // insert -- and until this test, passed every test too, because every other test constructs
+    // the consumer with the control store by hand.
+    //
+    // This pins the GRANT, which is what actually enforces the separation. If 0197 were ever
+    // relaxed to let `ironauth_app` write a trust anchor, this goes red and says so.
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&connection.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+    let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+    assert_eq!(status, 303, "{body}");
+
+    // THE WRONG STORE: the data-plane one the portal itself runs on.
+    let wrong = ironauth_admin::certificate_pin_requests::CertificatePinRequestConsumer::new(
+        harness.db().store().clone(),
+    );
+    let env = Env::system();
+    let scope = harness.scope();
+    let claimed = harness
+        .db()
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::CERTIFICATE_PIN_REQUEST_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+
+    let outcome = wrong.handle(&env, scope, &claimed[0]).await;
+    let error = outcome.expect_err("the data plane must not be able to pin a trust anchor");
+    assert!(
+        error.is_retryable(),
+        "a permission refusal is retryable: the row must survive until the worker is wired to \
+         the plane that may write it, rather than being dead-lettered as bad input"
+    );
+    assert_eq!(
+        pinned_count(&harness, &connection).await,
+        1,
+        "and nothing was pinned"
+    );
+}
+
+#[tokio::test]
+async fn two_organizations_pasting_the_same_certificate_are_both_pinned() {
+    // THE IDEMPOTENCY KEY MUST NAME THE CONNECTION. It was the bare certificate fingerprint, and
+    // the outbox's uniqueness is per (tenant, environment, consumer, key) -- so two organizations
+    // in one environment federating with the same identity provider, which is ordinary, collided:
+    // whichever pasted second had its renewal refused as a transient fault, for ever.
+    let harness = Harness::start().await;
+    let first = seed_org(&harness, "Contoso").await;
+    let second = seed_org(&harness, "Initech").await;
+    let their_connection = saml_connection(&harness, &first, "Shared IdP").await;
+    let other_connection = saml_connection(&harness, &second, "Shared IdP").await;
+    pin(&harness, &their_connection, 7, 2 * 24 * 60 * 60).await;
+    pin(&harness, &other_connection, 7, 2 * 24 * 60 * 60).await;
+
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    // THE SAME CERTIFICATE, pasted by each organization's own link holder.
+    let shared = pem_certificate(9);
+    for (organization, connection, key) in [
+        (&first, &their_connection, "k-one"),
+        (&second, &other_connection, "k-two"),
+    ] {
+        let cookie = open_session_in(&harness, "certificate-renewal", key, organization).await;
+        let form = format!(
+            "connection={}&certificate={}",
+            urlencode(&connection.to_string()),
+            urlencode(&shared)
+        );
+        let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+        assert_eq!(status, 303, "paste for {connection}: {body}");
+    }
+
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        2,
+        "both organizations' pastes must be queued, not one"
+    );
+    assert_eq!(pinned_count(&harness, &their_connection).await, 2);
+    assert_eq!(
+        pinned_count(&harness, &other_connection).await,
+        2,
+        "the second organization's renewal must land too"
+    );
+}
+
+#[tokio::test]
+async fn pasting_the_same_certificate_twice_is_answered_as_success() {
+    // IDEMPOTENT TO THE HOLDER. The outbox refuses a duplicate key with a conflict, and letting
+    // that reach the caller answered "This did not work just now; your link has not been used"
+    // about a renewal that had in fact been accepted -- which invites them to paste again, and
+    // then to call their vendor.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+    pin(&harness, &connection, 7, 2 * 24 * 60 * 60).await;
+
+    let cookie = open_session_in(&harness, "certificate-renewal", "k-renew", &organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&connection.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+
+    for attempt in 1..=2 {
+        let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+        assert_eq!(
+            status, 303,
+            "attempt {attempt} was not answered as success: {body}"
+        );
+    }
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        1,
+        "and the certificate is queued once, not twice"
+    );
+    assert_eq!(pinned_count(&harness, &connection).await, 2);
+}

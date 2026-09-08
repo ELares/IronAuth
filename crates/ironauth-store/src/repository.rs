@@ -22246,6 +22246,29 @@ pub const OFFBOARDING_CONSUMER: &str = "users.offboarding";
 /// does so silently.
 pub const CERTIFICATE_NOTICE_CONSUMER: &str = "saml_certificate.notice";
 
+/// The consumer that PINS a certificate a renewal-portal holder pasted (issue #141).
+///
+/// # Why the portal cannot simply write it
+///
+/// 0197 grants `saml_connection_certificates` INSERT to `ironauth_control` alone and says why:
+/// "Pinning and unpinning are operator actions on the control plane, like the connection
+/// itself... The data plane READS, because the ACS verifies there. It never writes a trust
+/// anchor." The portal is a data-plane surface. Handing it the INSERT, or a control-plane
+/// connection of its own, would spend that separation to save a queue -- and the thing being
+/// written is the key every future assertion is checked against, which is exactly the write the
+/// separation exists for.
+///
+/// So the portal does what the data plane MAY do: it validates the paste, parses it, and
+/// enqueues. The row is a JOB rather than a domain event, so it carries no envelope and appears
+/// on no webhook.
+///
+/// NOTHING IS ANNOUNCED WHEN THE PIN LANDS, and an earlier version of this paragraph said
+/// otherwise -- that the pin "emits `saml_certificate.pinned` itself". It does not: the consumer
+/// calls `pin_certificate` with `event: None`, and no such type is in the catalog. A vendor
+/// subscribing to renewals would therefore see the expiry warning and never the resolution,
+/// which is worth fixing and is its own change: it needs a catalogued event type.
+pub const CERTIFICATE_PIN_REQUEST_CONSUMER: &str = "saml_certificate.pin_request";
+
 /// The registered consumer name a DOMAIN EVENT is fanned out under (issues #105, #108).
 ///
 /// The webhook chain had every stage but its first: endpoints could be registered, secrets
@@ -24586,6 +24609,44 @@ impl OutboxRepo<'_> {
         // relies on.
         signal_wakes(self.store, vec![(message.consumer.to_owned(), scope)]);
         Ok(id.to_string())
+    }
+
+    /// Enqueue, treating a repeat under the same idempotency key as ALREADY DONE.
+    ///
+    /// Returns `true` when a row was written and `false` when one was already there.
+    ///
+    /// # Why this is a separate method rather than a change to [`OutboxRepo::enqueue`]
+    ///
+    /// The raising behaviour is load-bearing and `enqueue_outbox_in_tx_ignoring_conflict`'s doc
+    /// explains for whom: a producer running INSIDE a consumer retries its enqueues by
+    /// construction, and a conflict-tolerant enqueue would hide a genuine double-fan-out from it.
+    ///
+    /// # Who wants this one
+    ///
+    /// A producer whose retry comes from a PERSON rather than a lease. The renewal portal is the
+    /// first: its holder pastes a certificate, reloads, or double-submits, and every one of those
+    /// means the same thing. Without this the second attempt raises a unique violation, which the
+    /// surface can only report as "this did not work just now" about a renewal that was in fact
+    /// accepted -- inviting another paste, and then a call to the vendor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence fault.
+    pub async fn enqueue_once(
+        &self,
+        env: &Env,
+        message: &NewOutboxMessage<'_>,
+    ) -> Result<bool, StoreError> {
+        let scope = self.scope;
+        let mut tx = begin_scoped(self.store, scope).await?;
+        let written = enqueue_outbox_in_tx_ignoring_conflict(&mut tx, env, scope, message).await?;
+        tx.commit().await?;
+        if written {
+            // ONLY WHEN A ROW LANDED. Waking a drain for a row that already existed -- and has
+            // very likely already been handled -- is a poll that finds nothing.
+            signal_wakes(self.store, vec![(message.consumer.to_owned(), scope)]);
+        }
+        Ok(written)
     }
 
     /// [`OutboxRepo::enqueue`] WITHOUT the emit-time schema assertion, for a test that has

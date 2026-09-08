@@ -859,6 +859,26 @@ async fn certificate_renewal_surface(state: &OidcState, session: &PortalSession)
             return PortalRefusal::Unavailable.into_response();
         };
         body.push_str(&certificate_rows(&certificates, now));
+        // ONE FORM PER CONNECTION, carrying that connection's id. The page can list more than
+        // one, and a single form with a dropdown would let a mis-click pin a certificate onto
+        // the wrong connection -- which breaks a working connection rather than fixing a broken
+        // one.
+        let _ = write!(
+            body,
+            "<form method=\"post\" action=\"{action}\">\
+             <input type=\"hidden\" name=\"connection\" value=\"{connection}\">\
+             <label for=\"c-{connection}\">Paste the replacement certificate</label>\
+             <textarea id=\"c-{connection}\" name=\"certificate\" rows=\"12\" required></textarea>\
+             <button type=\"submit\">Pin this certificate</button></form>\
+             <p>The certificate you are replacing stays trusted until somebody removes it, so \
+             sign-in keeps working while your identity provider switches over.</p>",
+            action = escape_html(&format!(
+                "/t/{}/e/{}/portal/s/certificate-renewal/pin",
+                session.scope().tenant(),
+                session.scope().environment()
+            )),
+            connection = escape_html(&connection.id.to_string()),
+        );
     }
     crate::pages::secure_html(StatusCode::OK, body)
 }
@@ -909,6 +929,254 @@ fn certificate_rows(certificates: &[ironauth_store::SamlCertificate], now: i64) 
     }
     rows.push_str("</table>");
     rows
+}
+
+/// What the renewal form posts.
+#[derive(serde::Deserialize)]
+pub struct RenewalPinForm {
+    /// Which connection the certificate belongs to.
+    connection: String,
+    /// The certificate, PEM-armoured or bare base64.
+    certificate: String,
+}
+
+/// Pin a replacement certificate from the renewal surface (issue #141 criterion 2).
+///
+/// # `pin_certificate` gets its first production caller, though not this one
+///
+/// The store has been able to pin a SAML certificate since 0197 and nothing outside tests ever
+/// did it, so the operational story the expiry alerting tells -- "your certificate is about to
+/// expire, here is a link, replace it" -- ended at a page that could only describe the problem.
+/// This handler is what starts the work; the caller is
+/// `ironauth_admin::certificate_pin_requests`, on the control plane, for the reason below.
+///
+/// # Pinning ADDS, and that is the overlap
+///
+/// The replacement is pinned ALONGSIDE whatever is already there rather than replacing it, and
+/// `saml_acs` verifies an assertion against every pinned certificate. So from the moment this
+/// returns, both the old and the new certificate are accepted and the identity provider may cut
+/// over whenever it likes. Unpinning the old one is a separate act, deliberately not done here:
+/// doing it in the same request would close the overlap window at the exact instant the customer
+/// needs it open.
+///
+/// # What it refuses, and why each refusal is the same page
+///
+/// A holder of a renewal link is frequently an outside administrator, so this must not become an
+/// oracle. A connection in another organization, a connection that does not exist, and a
+/// malformed certificate all render the same refusal with the same status: the distinctions are
+/// in the log, not in the response.
+pub async fn renewal_pin_post(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    axum::Form(form): axum::Form<RenewalPinForm>,
+) -> Response {
+    let Some(scope) = parse_scope(&tenant_id, &environment_id) else {
+        return refused();
+    };
+    // THE SAME ORIGIN GUARD `finish_post` TAKES. This one writes trust material, so a
+    // cross-origin form post that pinned an attacker's key would be the whole game.
+    if !interaction::same_origin_ok(&headers, state.self_origin().as_deref()) {
+        return interaction::forbidden_page();
+    }
+    let session = match resolve_session(&state, scope, &headers).await {
+        Ok(session) => session,
+        Err(refusal) => return refusal.into_response(),
+    };
+    // THE FENCE, for the same reason `surface_get` takes it: a session opened for `scim` must
+    // not be able to pin a certificate by posting to this path.
+    if let Err(refusal) = session.require_intent("certificate-renewal") {
+        return refusal.into_response();
+    }
+
+    let Ok(connection_id) =
+        ironauth_store::SamlConnectionId::parse_in_scope(&form.connection, &scope)
+    else {
+        return renewal_refusal("the connection identifier does not parse in this scope");
+    };
+    // THE CONNECTION MUST BE THIS ORGANIZATION'S. `parse_in_scope` proves the tenant and the
+    // environment, and nothing more: a link holder for one organization could otherwise pin a
+    // key onto a neighbour's connection in the same environment, which is a total compromise of
+    // that neighbour's SSO.
+    let connection = match state
+        .store()
+        .scoped(scope)
+        .saml_connections()
+        .find_in_org(session.organization(), &connection_id)
+        .await
+    {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return renewal_refusal("no such connection in this organization"),
+        Err(_) => return PortalRefusal::Unavailable.into_response(),
+    };
+
+    let Some(der) = decode_certificate(&form.certificate) else {
+        return renewal_refusal("the certificate is not base64 or is too large");
+    };
+    let Ok(parsed) = ironauth_saml::x509::pinned(&der) else {
+        return renewal_refusal("the certificate does not parse as X.509");
+    };
+
+    // PARSED, THEN QUEUED. `parsed` is discarded here on purpose: the worker parses the DER
+    // again from the row, because a value carried across a queue is a value the worker is
+    // trusting a previous process to have got right. Parsing here is what lets the holder be
+    // told NOW that their paste is not a certificate.
+    let _ = &parsed;
+    if queue_pin(&state, &session, &connection.id, &der)
+        .await
+        .is_err()
+    {
+        return PortalRefusal::Unavailable.into_response();
+    }
+    // BACK TO THE SURFACE, so the holder sees the new certificate listed beside the old one.
+    // That is the whole confirmation they need: two rows, both trusted.
+    let surface = format!(
+        "/t/{}/e/{}/portal/s/certificate-renewal",
+        scope.tenant(),
+        scope.environment()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, surface),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+    )
+        .into_response()
+}
+
+/// Queue the parsed certificate for the control plane to pin.
+///
+/// # Why this enqueues instead of writing
+///
+/// 0197 grants `saml_connection_certificates` INSERT to `ironauth_control` alone: "The data
+/// plane READS, because the ACS verifies there. It never writes a trust anchor." The portal runs
+/// on the data plane. Writing here needs either that grant widened or a control-plane connection
+/// handed to a customer-facing surface, and both spend the separation that exists precisely for
+/// the key every future assertion is checked against.
+///
+/// So this does what the data plane may do -- it validates, parses, and enqueues -- and
+/// `CERTIFICATE_PIN_REQUEST_CONSUMER` performs the pin from the plane that is allowed to.
+///
+/// # The paste is parsed BEFORE it is queued
+///
+/// A queue is not a place to defer validation to. Enqueuing an unparsed blob would answer the
+/// holder "accepted" and then fail in a worker, where nobody is looking and the only recourse is
+/// a dead letter an operator has to notice. What is queued here is known to be a certificate.
+///
+/// # What the row carries
+///
+/// The DER and the connection, and nothing else. The DER is public material -- it is what an
+/// identity provider publishes -- so it is not a secret riding a queue.
+///
+/// AN EARLIER VERSION ALSO CARRIED THE PORTAL SESSION ID, with a sentence saying it was there so
+/// the audit the pin writes could name the link this came through. Nothing read it: the pin is
+/// audited as a freshly-minted service actor either way, so the field was a durable payload
+/// column supporting a property the code did not have. Removed rather than left as decoration.
+/// Attributing the pin to the link is worth doing and is its own change: it needs an actor kind
+/// the audit layer does not currently have.
+async fn queue_pin(
+    state: &OidcState,
+    session: &PortalSession,
+    connection: &ironauth_store::SamlConnectionId,
+    der: &[u8],
+) -> Result<(), ironauth_store::StoreError> {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    let scope = session.scope();
+    // THE CONNECTION AND THE FINGERPRINT, length-prefixed. A holder who double-submits, or whose
+    // browser retries, must not queue the same certificate twice.
+    //
+    // AN EARLIER VERSION KEYED ON THE FINGERPRINT ALONE, which is wrong in a way that reaches
+    // across customers: the outbox's uniqueness is per (tenant, environment, consumer, key), so
+    // two organizations in one environment pasting the SAME certificate -- both federating with
+    // the same identity provider, which is ordinary -- collided, and the second organization's
+    // renewal could never be queued at all. Keying on the pair makes "the same paste for the same
+    // connection" the thing that collapses, which is what idempotent means here.
+    let mut hasher = Sha256::new();
+    let connection_text = connection.to_string();
+    // Length-prefixed for the reason `dedup_key` gives: joined plainly, a crafted identifier
+    // could collide with a different (connection, certificate) pair and suppress its pin.
+    hasher.update(
+        u64::try_from(connection_text.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(connection_text.as_bytes());
+    hasher.update(der);
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(key, "{byte:02x}");
+    }
+    state
+        .store()
+        .scoped(scope)
+        .outbox()
+        .enqueue_once(
+            state.env(),
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::CERTIFICATE_PIN_REQUEST_CONSUMER,
+                idempotency_key: &key,
+                // THE CONNECTION, so two pastes for one connection are applied in the order they
+                // were made and pastes for different connections never wait on each other.
+                ordering_key: &connection.to_string(),
+                payload: serde_json::json!({
+                    "saml_connection_id": connection.to_string(),
+                    "certificate_der_base64":
+                        base64::engine::general_purpose::STANDARD.encode(der),
+                }),
+            },
+        )
+        .await
+        // ALREADY QUEUED IS DONE. `enqueue_once` reports which happened; the holder is told the
+        // same thing either way, because to them both mean their certificate is on its way.
+        .map(|_| ())
+}
+
+/// The one refusal this surface gives, whatever went wrong.
+///
+/// ONE PAGE AND ONE STATUS for every rejection. The holder is often not an operator of this
+/// deployment, and telling them apart "no such connection" from "that connection is not yours"
+/// turns a renewal link into a way to enumerate an environment's connections.
+fn renewal_refusal(reason: &str) -> Response {
+    tracing::info!(target: "ironauth.portal", reason, "certificate renewal refused");
+    crate::pages::secure_html(
+        StatusCode::BAD_REQUEST,
+        "<!doctype html><meta charset=\"utf-8\"><title>Certificate not accepted</title>\
+         <h1>That certificate was not accepted</h1>\
+         <p>Check that you pasted the whole certificate, including the BEGIN and END lines, and \
+         that it is the one for this connection.</p>"
+            .to_owned(),
+    )
+}
+
+/// Decode a pasted certificate to DER, accepting PEM or bare base64.
+///
+/// PEM IS WHAT AN IDP HANDS SOMEBODY. Okta and Entra both offer a `.pem` download and their
+/// consoles show the armoured text, so requiring bare base64 would make the common case an
+/// error. The armour lines and all whitespace are stripped and the rest is decoded.
+fn decode_certificate(raw: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+
+    // A CEILING BEFORE DECODING, not after. `x509::pinned` bounds the DER it accepts, but that
+    // check happens after this function has already allocated whatever was posted.
+    const MAX_PASTED_BYTES: usize = 64 * 1024;
+    if raw.len() > MAX_PASTED_BYTES {
+        return None;
+    }
+    let body: String = raw
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .flat_map(str::chars)
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if body.is_empty() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD.decode(&body).ok()
 }
 
 /// How many connections one portal page renders.

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use ironauth_admin::certificate_notices::CertificateNoticeConsumer;
+use ironauth_admin::certificate_pin_requests::CertificatePinRequestConsumer;
 use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
 use ironauth_admin::message_composer::DefaultComposer;
@@ -361,6 +362,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
         let certificate_sweep = certificate_sweep_inputs(&config, &env);
+        let certificate_pin = certificate_pin_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
@@ -535,6 +537,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_certificate_sweep(inputs).await,
             None => None,
         };
+        // THE PIN WORKER (issue #141). The renewal surface is the only thing that fills its
+        // queue, and that surface is mounted everywhere, so this is too.
+        let certificate_pin_pools = spawn_certificate_pin_pools(certificate_pin).await;
         let retention_sweeper = if let Some(inputs) = retention_inputs {
             start_retention_sweeper(inputs).await
         } else {
@@ -575,6 +580,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             .chain(trait_migration_pools)
             .chain(offboarding_pools)
             .chain(log_stream_replay_pools)
+            .chain(certificate_pin_pools)
         {
             pool.shutdown().await;
         }
@@ -2208,6 +2214,98 @@ struct OffboardingInputs {
     control_dsn: Option<String>,
     /// The environment seam.
     env: Env,
+}
+
+/// What the certificate pin-request worker connects with (issue #141).
+struct CertificatePinInputs {
+    /// The shared `[outbox]` tuning the pool is built from.
+    outbox: OutboxConfig,
+    /// The data-plane DSN the POOL drains on. The queue is data-plane writable by design: the
+    /// renewal portal that fills it runs there.
+    data_plane_dsn: String,
+    /// The control-plane DSN. It carries BOTH jobs here: the pin is written through it, because
+    /// 0197 grants the certificate table's INSERT to `ironauth_control` alone, and the pool's
+    /// scope enumeration reads through it like every other worker's. An earlier version of this
+    /// line said "not for scope enumeration", which was true of the reason it is REQUIRED and
+    /// false of what the connection is then used for.
+    control_dsn: Option<String>,
+    /// The environment seam.
+    env: Env,
+}
+
+/// Capture the pin-request worker inputs.
+///
+/// NO SWITCH AND NO `Option`, and that is deliberate rather than an omission. The renewal
+/// surface is mounted on every deployment -- there is no `[portal] enabled` -- so its queue can
+/// receive a row anywhere, and a queue with rows and no drainer is worse than a worker with
+/// nothing to do: a customer pastes a certificate, is told it was accepted, and it is never
+/// applied. The one thing that can stop this worker is a missing control-plane DSN, which is
+/// decided in `spawn_certificate_pin_pools` where it can be logged.
+fn certificate_pin_inputs(config: &Config, env: &Env) -> CertificatePinInputs {
+    CertificatePinInputs {
+        outbox: config.outbox.clone(),
+        data_plane_dsn: config.database.url.expose().to_owned(),
+        control_dsn: select_control_dsn(config),
+        env: env.clone(),
+    }
+}
+
+/// Start the worker that pins certificates pasted into the renewal portal (issue #141).
+///
+/// # Two stores, and the split is the point
+///
+/// The POOL drains with the data-plane store, because that is where the queue lives and where
+/// the portal wrote the row. The CONSUMER holds the control-plane store, because 0197 grants
+/// `saml_connection_certificates` INSERT to `ironauth_control` alone: "The data plane READS,
+/// because the ACS verifies there. It never writes a trust anchor."
+///
+/// Handing the consumer the data-plane store instead would compile, start, drain, and fail on
+/// every insert with a permission error -- the grant working, and a worker nobody would notice
+/// was broken until a customer's renewal silently never applied.
+async fn spawn_certificate_pin_pools(inputs: CertificatePinInputs) -> Vec<OutboxWorkerPool> {
+    let CertificatePinInputs {
+        outbox,
+        data_plane_dsn,
+        control_dsn,
+        env,
+    } = inputs;
+    let Some(control_dsn) = control_dsn else {
+        tracing::error!(
+            "certificate pin worker not started: no control-plane connection is configured, and \
+             the data plane may not write a trust anchor. Pasted certificates stay queued -- \
+             they are durable outbox rows, so none is lost -- and apply once one is set."
+        );
+        return Vec::new();
+    };
+    let data_store = match Store::connect(&data_plane_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "certificate pin worker not started: data-plane connect failed");
+            return Vec::new();
+        }
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "certificate pin worker not started: control-plane connect failed");
+            return Vec::new();
+        }
+    };
+
+    let mut consumers = ConsumerRegistry::new();
+    if let Err(error) = consumers.register(Arc::new(CertificatePinRequestConsumer::new(
+        control_store.clone(),
+    )) as Arc<dyn OutboxConsumer>)
+    {
+        tracing::error!(%error, "certificate pin worker not started: duplicate consumer name");
+        return Vec::new();
+    }
+
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));
+    let observer = outbox_observer();
+    let pools = spawn_consumer_pools(&consumers, &data_store, &env, &outbox, &scopes, &observer);
+    tracing::info!(pools = pools.len(), "certificate pin worker started");
+    pools
 }
 
 /// Capture the offboarding worker inputs from config (issue #52), or `None` when it is off.
@@ -7649,6 +7747,34 @@ mod certificate_sweep_wiring_tests {
         let toml = "[certificate_expiry]\nsweep_enabled = false\n\
                     sweep_interval_secs = 0\nsweep_batch = 0\n";
         assert!(ironauth_config::Config::from_toml_str(toml, "<inline>").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod certificate_pin_shutdown_tests {
+    /// The pin pool is awaited on shutdown like every other pool.
+    ///
+    /// Modelled on the message-delivery guard below, including the reason it scopes its search:
+    /// the needle appears in this test's own source, so an unscoped `contains` finds itself and
+    /// passes however the shutdown is written.
+    ///
+    /// It matters more here than for most pools. This one applies a certificate a customer
+    /// pasted a moment ago and is watching for; dropped rather than awaited, the row stays
+    /// claimed until its lease lapses, and the renewal they were told was accepted does not
+    /// appear until then.
+    #[test]
+    fn the_pin_pool_is_chained_into_the_shutdown_loop() {
+        let source = include_str!("main.rs");
+        let marker = concat!("mod ", "certificate_pin_shutdown_tests");
+        let code = source
+            .split(marker)
+            .next()
+            .expect("the file has a first part");
+        let needle = concat!(".chain(", "certificate_pin_pools)");
+        assert!(
+            code.contains(needle),
+            "the certificate pin pool must be chained into the shutdown loop"
+        );
     }
 }
 

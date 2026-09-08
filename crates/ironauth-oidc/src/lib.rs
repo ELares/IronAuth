@@ -523,6 +523,15 @@ pub fn oidc_router(state: OidcState) -> Router {
         // ENDING A SESSION, which is what gives `PortalSessionRepo::revoke` a caller. An admin
         // who has finished should not leave a live portal session in a browser for the rest of
         // the half hour, and a revocation method nothing calls is a control nothing consults.
+        // PINNING A REPLACEMENT CERTIFICATE (issue #141 criterion 2). Its own path rather than a
+        // POST on the surface route, so the handler is reached only by the form that means to
+        // reach it and the generic surface route stays a read. The intent fence is taken again
+        // inside: mounting a write behind the same session as a read does not make it the same
+        // permission.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/certificate-renewal/pin",
+            post(portal_route::renewal_pin_post),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/portal/finish",
             post(portal_route::finish_post),
