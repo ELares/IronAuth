@@ -489,6 +489,37 @@ async fn queued_events(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<serde_
     claimed.into_iter().map(|message| message.payload).collect()
 }
 
+/// The rows queued for the CONTACT NOTICE consumer, drained.
+///
+/// A separate helper because [`queued_events`] claims one consumer name and a row addressed to
+/// another is invisible to it. That is not a detail: the notice row was added to this
+/// transaction after the atomicity test above was written, and without this the test would have
+/// gone on passing with the notice committed in a transaction of its own -- which is the exact
+/// failure it exists to rule out, moved one row along.
+async fn queued_notices(db: &TestDatabase, env: &Env, scope: Scope) -> usize {
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            env,
+            ironauth_store::CERTIFICATE_NOTICE_CONSUMER,
+            std::time::Duration::from_secs(30),
+            100,
+        )
+        .await
+        .expect("claim");
+    for message in &claimed {
+        db.store()
+            .scoped(scope)
+            .outbox()
+            .complete(env, message)
+            .await
+            .expect("complete");
+    }
+    claimed.len()
+}
+
 #[tokio::test]
 async fn the_notice_and_the_ledger_row_commit_together() {
     // THE ORDERING THIS API EXISTS FOR, and until now nothing measured it: every call passed
@@ -542,6 +573,15 @@ async fn the_notice_and_the_ledger_row_commit_together() {
     let announced = queued_events(&db, &env, scope).await;
     assert_eq!(announced.len(), 1, "the notice announced {announced:?}");
     assert_eq!(announced[0]["type"], "saml_certificate.expiring");
+    // AND THE MAIL, which this test is named for and did not check. `queued_events` claims one
+    // consumer name, so the contact-notice row added to this same transaction was invisible to
+    // it: the enqueue could have been deleted outright and this test -- the one whose name
+    // asserts the writes commit together -- would have stayed green.
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        1,
+        "the ledger row and the mail that tells somebody about it are one fact or neither"
+    );
     assert_eq!(
         announced[0]["payload"]["lead_secs"],
         3 * DAY,
@@ -748,6 +788,12 @@ async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
         announced.is_empty(),
         "a notice survived a rolled-back write: {announced:?}"
     );
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        0,
+        "the contact-notice row survived a rolled-back write, so the ledger would say this \
+         organization was told by mail nobody was ever asked to send"
+    );
     // ...and the pair is STILL DUE, which is the half that matters operationally: the next sweep
     // picks it up and the customer is told. A ledger row surviving here is the silent failure.
     let due = alerts.due(now, &[3 * DAY], 100).await.expect("due");
@@ -774,6 +820,12 @@ async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
         .await
         .expect("the unpoisoned write succeeds");
     assert_eq!(queued_events(&db, &env, scope).await.len(), 1);
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        1,
+        "and the mail is queued, so the emptiness above is the rollback rather than a write \
+         that never happens"
+    );
 }
 
 #[tokio::test]
