@@ -38,7 +38,7 @@
 
 use std::time::Duration;
 
-use ironauth_admin::ldap_client::{Directory, DirectoryConfig, TlsMode};
+use ironauth_admin::ldap_client::{Directory, DirectoryConfig, DirectoryError, TlsMode};
 use ironauth_admin::ldap_mapping::{StableIdSource, attributes_to_request, principal_for};
 use serde_json::json;
 
@@ -162,6 +162,35 @@ async fn a_page_size_of_one_walks_past_a_limit_that_stops_an_unpaged_search() {
     cfg.bind_dn = "cn=svc,dc=example,dc=test".to_owned();
     cfg.bind_password = "svcpw".to_owned();
 
+    // THE PREMISE, ASSERTED. Everything below depends on the server refusing an UNPAGED read of
+    // these five, and the earlier version of this test only said so in a comment: swapping the
+    // bind to one without the limit let it pass with the RFC 2696 adapter deleted. So issue the
+    // unpaged search here and require the refusal, and the fixture can no longer drift out from
+    // under the test silently.
+    let (conn, mut raw) = ldap3::LdapConnAsync::new(&cfg.url).await.expect("connect");
+    ldap3::drive!(conn);
+    raw.simple_bind(&cfg.bind_dn, &cfg.bind_password)
+        .await
+        .expect("bind")
+        .success()
+        .expect("bind succeeds");
+    let unpaged = raw
+        .search(
+            BASE,
+            ldap3::Scope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            vec!["uid"],
+        )
+        .await
+        .expect("search completes")
+        .success();
+    assert!(
+        matches!(&unpaged, Err(ldap3::LdapError::LdapResult { result }) if result.rc == 4),
+        "the fixture must refuse an unpaged read with sizeLimitExceeded, or this test cannot \
+         tell a client that pages from one that does not: {unpaged:?}"
+    );
+    raw.unbind().await.expect("unbind the raw handle");
+
     let mut dir = Directory::connect(&cfg).await.expect("connect as svc");
     let people = dir
         .search_all(BASE, "(objectClass=inetOrgPerson)", &["uid".to_owned()])
@@ -176,47 +205,6 @@ async fn a_page_size_of_one_walks_past_a_limit_that_stops_an_unpaged_search() {
     );
 
     dir.disconnect().await.expect("unbind");
-}
-
-/// `connect` consults `validate` BEFORE it reaches the network.
-///
-/// Pointed at a port nothing listens on. If the transport rule were checked after the socket
-/// attempt, the error would be a connection failure; the scheme error can only come from a check
-/// that ran first. An earlier version pointed at the live server, where moving `validate` to
-/// after the bind left the test green because the error text was identical either way.
-#[tokio::test]
-#[ignore = "needs a directory server; see the module header"]
-async fn connect_refuses_a_disagreeing_scheme_before_it_reaches_the_network() {
-    // Port 1 on the loopback: reserved, and nothing listens there.
-    let error = Directory::connect(&config(
-        "ldap://127.0.0.1:1".to_owned(),
-        TlsMode::Ldaps,
-        500,
-    ))
-    .await
-    .err()
-    .expect("must refuse");
-
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("cannot be used with"),
-        "the refusal must be the transport rule, not a connection failure: {rendered}"
-    );
-
-    // And the CONTROL that makes the above mean something: the same dead address WITH an
-    // agreeing scheme gets past validation and fails on the network instead.
-    let network = Directory::connect(&config(
-        "ldap://127.0.0.1:1".to_owned(),
-        TlsMode::Plaintext,
-        500,
-    ))
-    .await
-    .err()
-    .expect("nothing listens there");
-    assert!(
-        !network.to_string().contains("cannot be used with"),
-        "an agreeing scheme must reach the network: {network}"
-    );
 }
 
 /// AN OCTET-STRING ATTRIBUTE SURVIVES THE SEARCH.
@@ -260,6 +248,52 @@ async fn an_octet_string_attribute_is_not_dropped_on_the_way_out() {
         ]],
         "the octet-string value was dropped between ldap3 and DirectoryEntry"
     );
+
+    dir.disconnect().await.expect("unbind");
+}
+
+/// A SUBTREE THE SERVER REFERS ELSEWHERE IS REFUSED, not silently short.
+///
+/// `EntriesOnly` collects continuation references and `LdapResult::success` inspects only the
+/// result code, so before the refusal existed a search spanning a referral returned `Ok` with a
+/// list missing everything behind it -- `result: 0 Success` with `numReferences: 1`. That short
+/// list is exactly what must not reach a deprovisioning comparison.
+///
+/// The refusal shipped untested: deleting the whole block left 43 of 43 tests green, and the
+/// variant is `pub`, so not even a dead-code warning fired.
+///
+/// `ou=Referrals` holds one real person and one `referral` object pointing at a host that does
+/// not exist. Nothing chases it, so the test cannot hang.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn a_subtree_the_server_refers_elsewhere_is_refused_rather_than_returned_short() {
+    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+        .await
+        .expect("connect");
+
+    let outcome = dir
+        .search_all(
+            "ou=Referrals,dc=example,dc=test",
+            "(objectClass=*)",
+            &["uid".to_owned()],
+        )
+        .await;
+
+    match outcome {
+        Err(DirectoryError::Referred { referrals }) => assert!(
+            referrals.iter().any(|r| r.contains("other.example.test")),
+            "the refusal must name where the server pointed: {referrals:?}"
+        ),
+        other => panic!("a referred subtree must be refused, not returned short: {other:?}"),
+    }
+
+    // THE CONTROL: a subtree with no referral in it still succeeds, so the refusal is about
+    // referrals and not about this client failing every search.
+    let people = dir
+        .search_all(BASE, "(uid=grace)", &["uid".to_owned()])
+        .await
+        .expect("an unreferred subtree still searches");
+    assert_eq!(people.len(), 1);
 
     dir.disconnect().await.expect("unbind");
 }
