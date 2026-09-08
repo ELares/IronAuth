@@ -76940,6 +76940,12 @@ impl SamlCertificateAlertRepo<'_> {
     /// connection is not visible in this scope stops producing a work item at all -- silently,
     /// with no row and no error.
     ///
+    /// A REMOVED ORGANIZATION PRODUCES NO WORK ITEM EITHER, for the same reason and by the same
+    /// mechanism. `organizations` soft-deletes, and a certificate pinned on a connection whose
+    /// organization is gone has no contact list to notify -- so a work item for it is work the
+    /// sweep cannot complete, and it would be retried on every pass for ever. The join requires
+    /// the organization to be live.
+    ///
     /// THAT SILENT DROP IS THE RIGHT ANSWER AND STILL WORTH NAMING. Such a certificate has no
     /// organization to notify, so there is nothing a work item could do with it. It is also not
     /// reachable today: `pin_certificate` refuses a cross-scope connection with its own
@@ -76980,6 +76986,8 @@ impl SamlCertificateAlertRepo<'_> {
              JOIN saml_connections n ON n.id = c.connection_id \
                                     AND n.tenant_id = c.tenant_id \
                                     AND n.environment_id = c.environment_id \
+             JOIN organizations o ON o.id = n.organization_id \
+                                 AND o.deleted_at IS NULL \
              CROSS JOIN (SELECT DISTINCT unnest AS lead_secs \
                          FROM UNNEST($3::bigint[])) AS l \
              LEFT JOIN saml_certificate_expiry_alerts a \

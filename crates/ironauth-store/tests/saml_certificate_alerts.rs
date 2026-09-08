@@ -406,11 +406,15 @@ async fn a_recorded_notice_suppresses_only_its_own_certificate() {
 
 #[tokio::test]
 async fn every_field_the_caller_is_handed_is_the_certificates_own() {
-    // THREE OF FOUR FIELDS WERE NEVER READ. The tests matched on `certificate_id` and
-    // `lead_secs` and never looked at `connection_id` or `not_after_unix_micros`, so both could
-    // have been the wrong row's and nothing would have said. They are not decoration: the sweep
-    // finds the organization to notify THROUGH `connection_id`, and puts the expiry date in the
-    // notice it sends.
+    // FIELDS THAT NOTHING READ. The tests matched on `certificate_id` and `lead_secs` and never
+    // looked at the rest, so those could have been another row's and nothing would have said.
+    // They are not decoration: `connection_id` names the identity provider connection an
+    // operator has to go and fix, and the expiry is what the notice tells them.
+    //
+    // THE ORGANIZATION IS NOT ASSERTED HERE. Routing moved off `connection_id` when the work item
+    // began carrying `organization_id`, and this fixture has ONE organization, so comparing it
+    // would hold for any row returned. `the_work_item_names_the_certificates_own_organization`
+    // builds two, which is what that claim needs.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -440,7 +444,8 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
     assert_eq!(
         entry.connection_id,
         mine.to_string(),
-        "the entry names the wrong connection, so the sweep would notify the wrong organization"
+        "the entry names another certificate's connection, so an operator would be sent to fix \
+         the wrong identity provider"
     );
     // NOT AN ORGANIZATION ASSERTION HERE. Both connections in this fixture belong to ONE
     // organization, so comparing `organization_id` against it would hold for any row the query
@@ -870,6 +875,51 @@ async fn the_work_item_names_the_certificates_own_organization() {
         ],
         "a certificate is paired with the wrong organization, so its notice would go to the \
          wrong customer's contacts: {due:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_of_a_removed_organization_is_not_due() {
+    // A WORK ITEM THE SWEEP CANNOT COMPLETE IS WORSE THAN NONE. `organizations` soft-deletes, and
+    // a certificate pinned on a connection whose organization is gone has no contact list to
+    // notify -- so the sweep would find the item, find nobody to tell, and find it again on every
+    // pass for ever, because nothing records a notice that was never sent.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let doomed = seed_org(&db, &env, scope, "Doomed").await;
+    let living = seed_org(&db, &env, scope, "Living").await;
+    let doomed_connection = connect(&db, &env, scope, &doomed, "https://idp.example/gone").await;
+    let living_connection = connect(&db, &env, scope, &living, "https://idp.example/here").await;
+    let now = now_micros(&env);
+    pin_expiring(&db, &env, scope, &doomed_connection, 70, 2 * DAY).await;
+    let survivor = pin_expiring(&db, &env, scope, &living_connection, 71, 2 * DAY).await;
+
+    // BOTH ARE DUE WHILE BOTH ORGANIZATIONS LIVE, so the filter below is what changes the answer
+    // and not the fixture.
+    let alerts = db.control_store().scoped(scope).saml_certificate_alerts();
+    let due = alerts.due(now, &[3 * DAY], 100).await.expect("due");
+    assert_eq!(due.len(), 2, "both certificates start out due: {due:?}");
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .delete(&env, &doomed)
+        .await
+        .expect("remove the organization");
+
+    let due = alerts.due(now, &[3 * DAY], 100).await.expect("due");
+    assert_eq!(
+        due.len(),
+        1,
+        "a certificate of a removed organization is still queued for a notice nobody can \
+         receive: {due:?}"
+    );
+    assert_eq!(
+        due[0].certificate_id,
+        survivor.to_string(),
+        "the wrong certificate survived the filter: {due:?}"
     );
 }
 

@@ -433,41 +433,6 @@ impl Fixture {
     }
 
     /// Seed one environment with the entities above AND the relations between them.
-    /// The inbound SCIM connection this sweep addresses.
-    ///
-    /// Split out for the same reason as [`Self::seed_contact`]: `seed` sits against a hundred-line
-    /// ceiling, so each self-contained block it grows moves out rather than pushing it over.
-    async fn seed_scim_connection(h: &Harness, base: &str, key: &str) -> String {
-        seed_row(
-            h,
-            &format!("{base}/scim-connections"),
-            &format!("{key}-sc"),
-            &serde_json::json!({ "display_name": "Seeded Okta", "provider": "okta" }).to_string(),
-            "scim connection",
-        )
-        .await
-    }
-
-    /// The organization contact this sweep removes (issue #141).
-    ///
-    /// SPLIT OUT OF `seed` because appending it pushed that function past the crate's hundred-line
-    /// ceiling -- which `cargo test` does not see and clippy does.
-    async fn seed_contact(h: &Harness, base: &str, key: &str) -> String {
-        seed_row(
-            h,
-            &format!("{base}/contacts"),
-            &format!("{key}-oct"),
-            &serde_json::json!({
-                "display_name": "Seeded Contact",
-                "email": "seeded@acme.example",
-                "category": "technical",
-            })
-            .to_string(),
-            "organization contact",
-        )
-        .await
-    }
-
     async fn seed(h: &Harness, tenant: &str, environment: &str, key: &str) -> Self {
         let env_base = format!("/v1/tenants/{tenant}/environments/{environment}");
         let [user, other_user, spare_user, permission, spare_permission] =
@@ -571,6 +536,41 @@ impl Fixture {
         };
         fixture.seed_relations(h, key).await;
         fixture
+    }
+
+    /// The inbound SCIM connection this sweep addresses.
+    ///
+    /// Split out for the same reason as [`Self::seed_contact`]: `seed` sits against a hundred-line
+    /// ceiling, so each self-contained block it grows moves out rather than pushing it over.
+    async fn seed_scim_connection(h: &Harness, base: &str, key: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/scim-connections"),
+            &format!("{key}-sc"),
+            &serde_json::json!({ "display_name": "Seeded Okta", "provider": "okta" }).to_string(),
+            "scim connection",
+        )
+        .await
+    }
+
+    /// The organization contact this sweep removes (issue #141).
+    ///
+    /// SPLIT OUT OF `seed` because appending it pushed that function past the crate's hundred-line
+    /// ceiling -- which `cargo test` does not see and clippy does.
+    async fn seed_contact(h: &Harness, base: &str, key: &str) -> String {
+        seed_row(
+            h,
+            &format!("{base}/contacts"),
+            &format!("{key}-oct"),
+            &serde_json::json!({
+                "display_name": "Seeded Contact",
+                "email": "seeded@acme.example",
+                "category": "technical",
+            })
+            .to_string(),
+            "organization contact",
+        )
+        .await
     }
 
     /// Two applications and one live project grant (issue #102), returning the SPARE
@@ -1556,23 +1556,6 @@ impl Fixture {
     }
 
     /// The WRITES that destroy, each undoing one of the amendments above.
-    /// The contact removal, chained rather than appended.
-    ///
-    /// APPENDING A CASE TO A LIST ALREADY AT THE CEILING is what pushed this function over the
-    /// hundred-line limit, and `cargo test` does not see that -- only clippy does. A new family
-    /// gets its own function and is chained in.
-    fn contact_destructive_cases(&self) -> Vec<Case> {
-        let Self { base, contact, .. } = self;
-        vec![Case {
-            label: "org_contacts.deleteOrganizationContact",
-            method: "DELETE",
-            path: format!("{base}/contacts/{contact}"),
-            body: None,
-            intent: Intent::Write,
-            live: StatusCode::NO_CONTENT,
-        }]
-    }
-
     fn destructive_write_cases(&self) -> Vec<Case> {
         let Self {
             base,
@@ -1675,6 +1658,23 @@ impl Fixture {
             },
         ]);
         cases
+    }
+
+    /// The contact removal, chained rather than appended.
+    ///
+    /// APPENDING A CASE TO A LIST ALREADY AT THE CEILING is what pushed this function over the
+    /// hundred-line limit, and `cargo test` does not see that -- only clippy does. A new family
+    /// gets its own function and is chained in.
+    fn contact_destructive_cases(&self) -> Vec<Case> {
+        let Self { base, contact, .. } = self;
+        vec![Case {
+            label: "org_contacts.deleteOrganizationContact",
+            method: "DELETE",
+            path: format!("{base}/contacts/{contact}"),
+            body: None,
+            intent: Intent::Write,
+            live: StatusCode::NO_CONTENT,
+        }]
     }
 }
 
