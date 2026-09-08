@@ -36,6 +36,11 @@ ironauth-oidc.workspace = true
 # verify), the SAME core the OIDC data plane uses; the arm never hand-rolls JWT
 # parsing. Already in the tree (a transitive dep via ironauth-oidc); named here so
 # the arm can reach the verify entry point directly.
+# X.509 parsing for a certificate a renewal-portal holder pasted (issue #141). The portal
+# parses it too, so the holder learns immediately; this crate parses it again because a
+# value carried across a queue is a value this worker would otherwise be trusting a
+# previous process to have got right.
+ironauth-saml.workspace = true
 ironauth-jose.workspace = true
 # The ONE sanctioned outbound HTTP path (issue #34, invariant: outbound HTTP only via
 # ironauth-fetch). The webhook deliverer (issue #105) POSTs to an operator-supplied URL,

@@ -2,10 +2,11 @@
 
 //! Every outbox pool in this binary reports through ONE observer constructor (issue #104).
 //!
-//! There are five separate boot seams that spawn pools matching the spelling this scans for:
-//! session ended and offboarding, back-channel logout, webhook delivery, trait migration, and
-//! async flow-target delivery. A sixth constructs the observer under a different binding name
-//! (the log-stream replay seam), which this exact-string scan cannot see and does not count.
+//! There are seven separate boot seams that spawn pools matching the spelling this scans for:
+//! session ended and offboarding, back-channel logout, webhook delivery, trait migration, async
+//! flow-target delivery, message delivery, and the certificate pin worker. One more constructs
+//! the observer under a different binding name (the log-stream replay seam), which this
+//! exact-string scan cannot see and does not count.
 //! Each one used to build its own observer, and that is a wiring decision repeated per seam.
 //!
 //! The failure mode this pins against is silent in a way that matters. A seam that keeps
@@ -30,10 +31,11 @@ const MAIN_RS: &str = include_str!("../src/main.rs");
 /// binds it under a different name and is invisible here, which is the ceiling this file's
 /// header states.
 ///
-/// MOVED 4 -> 5 for async flow-target delivery (issue #112 criterion 2), and 5 -> 6 for
-/// message delivery (issue #111). Both are new seams rather than relaxations: the count moves
-/// WITH a seam being added, which is exactly what the assertion below says to do.
-const POOL_SEAMS: usize = 6;
+/// MOVED 4 -> 5 for async flow-target delivery (issue #112 criterion 2), 5 -> 6 for message
+/// delivery (issue #111), and 6 -> 7 for the certificate pin worker (issue #141). Each is a new
+/// seam rather than a relaxation: the count moves WITH a seam being added, which is exactly what
+/// the assertion below says to do.
+const POOL_SEAMS: usize = 7;
 
 #[test]
 fn every_pool_seam_reports_through_the_shared_observer() {
