@@ -528,6 +528,13 @@ pub fn oidc_router(state: OidcState) -> Router {
         // reach it and the generic surface route stays a read. The intent fence is taken again
         // inside: mounting a write behind the same session as a read does not make it the same
         // permission.
+        // ADDING OR REMOVING AN IT CONTACT (issue #141 criterion 3). Its own path for the reason
+        // the pin has one: the generic surface route stays a read, and a write is reached only by
+        // the form that means to reach it.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/portal/s/contacts/change",
+            post(portal_route::contacts_change_post),
+        )
         .route(
             "/t/{tenant_id}/e/{environment_id}/portal/s/certificate-renewal/pin",
             post(portal_route::renewal_pin_post),

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use axum::Router;
 use ironauth_admin::certificate_notices::CertificateNoticeConsumer;
 use ironauth_admin::certificate_pin_requests::CertificatePinRequestConsumer;
+use ironauth_admin::contact_changes::ContactChangeConsumer;
 use ironauth_admin::events::WebhookFanoutConsumer;
 use ironauth_admin::flow_target_delivery::{FlowTargetDeliveryConsumer, FlowTargetReplayConsumer};
 use ironauth_admin::message_composer::DefaultComposer;
@@ -2250,6 +2251,25 @@ fn certificate_pin_inputs(config: &Config, env: &Env) -> CertificatePinInputs {
     }
 }
 
+/// Every consumer the PORTAL WRITE worker registers.
+///
+/// A named function returning the list, for the reason [`messaging_consumers`] is one and its
+/// test states outright: a consumer missing from the list is not a compile error and not a test
+/// failure anywhere else -- its queue simply fills and nothing drains it. Adversarial review
+/// deleted the contact-change element from the array this replaces and the whole workspace
+/// stayed green, including the 145 tests this PR had offered as evidence that the wiring works.
+///
+/// BOTH RIDE ONE WORKER because both are portal writes the data plane may not perform: each
+/// drains a data-plane queue using a control-plane store, and a deployment serving the portal
+/// serves both surfaces.
+fn portal_write_consumers(control_store: &ironauth_store::Store) -> Vec<Arc<dyn OutboxConsumer>> {
+    vec![
+        Arc::new(CertificatePinRequestConsumer::new(control_store.clone()))
+            as Arc<dyn OutboxConsumer>,
+        Arc::new(ContactChangeConsumer::new(control_store.clone())) as Arc<dyn OutboxConsumer>,
+    ]
+}
+
 /// Start the worker that pins certificates pasted into the renewal portal (issue #141).
 ///
 /// # Two stores, and the split is the point
@@ -2293,12 +2313,11 @@ async fn spawn_certificate_pin_pools(inputs: CertificatePinInputs) -> Vec<Outbox
     };
 
     let mut consumers = ConsumerRegistry::new();
-    if let Err(error) = consumers.register(Arc::new(CertificatePinRequestConsumer::new(
-        control_store.clone(),
-    )) as Arc<dyn OutboxConsumer>)
-    {
-        tracing::error!(%error, "certificate pin worker not started: duplicate consumer name");
-        return Vec::new();
+    for consumer in portal_write_consumers(&control_store) {
+        if let Err(error) = consumers.register(consumer) {
+            tracing::error!(%error, "portal write worker not started: duplicate consumer name");
+            return Vec::new();
+        }
     }
 
     let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store));

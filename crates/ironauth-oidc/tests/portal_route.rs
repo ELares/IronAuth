@@ -3236,14 +3236,29 @@ async fn a_category_nothing_routes_to_says_so_rather_than_promising_mail() {
         body.contains("SSO and provisioning problems, including certificate expiry"),
         "the technical row must say what it actually receives: {body}"
     );
-    assert_eq!(
-        body.matches("none are sent yet").count(),
-        2,
-        "both the security and the billing row must say nothing is sent to them: {body}"
-    );
+    // PER ROW, not counted over the body. A body-wide count is a sum over the things it means to
+    // distinguish, and it broke the moment the page gained an add form whose dropdown carries
+    // the same (correct) wording -- four occurrences where it expected two. Slicing each
+    // contact's row asserts the thing the test is named for and is indifferent to what else the
+    // page grows.
+    for address in ["soc@contoso.test", "ap@contoso.test"] {
+        let at = body
+            .find(address)
+            .unwrap_or_else(|| panic!("no row for {address} in {body}"));
+        let start = body[..at].rfind("<tr>").expect("a row start");
+        let row = &body[start..at + body[at..].find("</tr>").expect("a row end")];
+        assert!(
+            row.contains("none are sent yet"),
+            "{address}'s row must say nothing is sent to it: {row}"
+        );
+    }
+    // AND THE FORM AGREES WITH THE TABLE. The dropdown is where somebody CHOOSES a category, so
+    // a label promising "security notices" there is the promise the table just retracted --
+    // which is exactly what this page did until the options were derived from the same function
+    // the rows use.
     assert!(
         !body.contains(">security notices<"),
-        "and neither may promise mail with no producer behind it: {body}"
+        "no label may promise mail with no producer behind it: {body}"
     );
 }
 

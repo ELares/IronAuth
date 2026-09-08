@@ -818,6 +818,33 @@ async fn the_boot_paths_retention_sweeper_actually_reaps_a_retired_message() {
 /// because a check whose expectation comes from the thing it checks passes whatever that thing
 /// says.
 #[tokio::test]
+async fn portal_write_consumers_are_registered_by_name() {
+    // THE SAME PIN `messaging_consumers_are_registered_by_name` PUTS ON THE OTHER SEAM, and this
+    // one earned it: review deleted the contact-change consumer from the boot list and the whole
+    // workspace stayed green -- 145 tests in this crate and 58 portal tests, the exact numbers
+    // the PR offered as evidence that the wiring worked.
+    //
+    // What that would ship is the failure `certificate_pin_inputs`'s own doc argues against: the
+    // portal accepts a contact change, answers 303, writes a durable outbox row, and nothing ever
+    // claims it. The holder is told "a change can take a moment to appear here" and it never
+    // does.
+    //
+    // The names are written out rather than read from the constants, because an expectation
+    // taken from the thing it checks passes whatever that thing says.
+    let db = TestDatabase::start().await;
+
+    let consumers = super::portal_write_consumers(db.control_store());
+    let mut names: Vec<&str> = consumers.iter().map(|c| c.name()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["org_contact.change", "saml_certificate.pin_request"],
+        "the portal write worker must register BOTH the certificate pin and the contact change; \
+         dropping either leaves a queue the portal fills and nothing drains"
+    );
+}
+
+#[tokio::test]
 async fn messaging_consumers_are_registered_by_name() {
     let db = TestDatabase::start().await;
 
