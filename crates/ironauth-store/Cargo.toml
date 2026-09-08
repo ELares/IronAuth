@@ -369,6 +369,13 @@ name = "org_audit_search"
 path = "tests/org_audit_search.rs"
 required-features = ["testing"]
 
+# The LDAP/AD connector configuration (issue #142): what every later slice of the sync reads,
+# and the two properties that matter more than the CRUD -- cross-scope refusal and closed sets.
+[[test]]
+name = "ldap_connectors"
+path = "tests/ldap_connectors.rs"
+required-features = ["testing"]
+
 # Same-transaction atomicity: a mid-transaction failure leaves no orphan data
 # row and no orphan audit row, and the inverse. Needs a real database.
 [[test]]

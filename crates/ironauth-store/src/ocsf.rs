@@ -263,6 +263,15 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     // signature bearing our name means, which is an access-management fact and not a
     // configuration edit.
     "saml_sp_key",
+    // `ldap_connector` (issue #142) belongs with the other directory connectors and not with
+    // configuration, for the reason `scim_push_connection` gives: this row names a directory
+    // whose contents BECOME users and group memberships in one organization, and the group
+    // memberships become roles. Pointing it somewhere else, or switching it on, changes who can
+    // sign in and what they may do -- an access-management fact, not a settings edit.
+    //
+    // It also decides whether a bind DN and password cross the network in the clear, which is
+    // the other half of why an auditor wants these rows in the access stream.
+    "ldap_connector",
     "scope",
     "admin",
     "credential_class",
