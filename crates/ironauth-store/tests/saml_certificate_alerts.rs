@@ -413,10 +413,9 @@ async fn every_field_the_caller_is_handed_is_the_certificates_own() {
     //
     // THE ORGANIZATION IS NOT ASSERTED HERE. The field a sweep will route on is `organization_id`
     // rather than `connection_id` -- neither routes today, since no sweep exists -- and this
-    // would hold for any row returned.
-    // `the_work_item_names_the_certificates_own_organization`
-    // builds two, which is what that claim needs.
-    // builds two, which is what that claim needs.
+    // fixture has ONE organization, so comparing it would hold for any row returned.
+    // `the_work_item_names_the_certificates_own_organization` builds two, which is what that
+    // claim needs.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
