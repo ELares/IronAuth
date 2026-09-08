@@ -26,7 +26,7 @@
 # crates/ironauth-store/tests/events_cursor_ordering.rs. What every producer gets is
 # completeness and replay stability, delivered by the visibility watermark in
 # `events_after` rather than by any lock.
-crates/ironauth-admin/src/certificate_notices.rs:send:1
+crates/ironauth-admin/src/certificate_notices.rs:mail_page:1
 crates/ironauth-admin/src/events.rs:explode:1
 crates/ironauth-admin/src/trait_migration_worker.rs:advance_one:1
 crates/ironauth-oidc/src/backchannel.rs:explode:1

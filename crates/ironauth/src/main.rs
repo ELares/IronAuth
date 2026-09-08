@@ -3453,17 +3453,49 @@ fn messaging_consumers(
         // the reason the webhook fan-out sits beside its delivery: a producer whose output
         // nothing drains only builds a backlog.
         //
-        // PER KIND, like the account alerts. An organization renewing several connections at
-        // once would otherwise spend one shared budget on a single kind and silence the other.
+        // ITS OWN BUDGET, not the account-alert one. See `CERTIFICATE_NOTICE_RATE_BUDGET`.
         Arc::new(CertificateNoticeConsumer::new(
             data_store.clone(),
-            ironauth_store::message_rate::RateBudget::new(
-                NOTICE_RATE_BUDGET.0,
-                NOTICE_RATE_BUDGET.1,
-            )
-            .per_kind(),
+            certificate_notice_budget(),
         )) as Arc<dyn OutboxConsumer>,
     ]
+}
+
+/// How many certificate expiry notices one recipient may be sent in an hour.
+///
+/// # Why this is not [`NOTICE_RATE_BUDGET`]
+///
+/// That budget is three an hour, chosen for account-link alerts, whose traffic is driven by one
+/// person changing their own account. This producer's traffic is driven by how many certificates
+/// an organization has pinned times how many leads are configured, and every one of those is a
+/// different thing to say. Borrowing the account budget was measured against the real consumer:
+/// an organization with two SAML connections on the three default leads announced six crossings
+/// and sent three mails.
+///
+/// TWENTY-FOUR AN HOUR, PER KIND. A POLICY DECISION rather than a derivation, and the reasoning
+/// is the part worth keeping: eight pinned certificates on three leads is a generous ceiling for
+/// one organization's first sweep, and a producer wanting to exceed it is likelier to be looping
+/// than to be right. Per kind so these never compete with a contact's other mail in either
+/// direction.
+///
+/// EXCEEDING IT NO LONGER DROPS ANYTHING. The consumer returns a retryable error on a
+/// rate-limited send, so the bound delays a notice and eventually dead-letters it where an
+/// operator can see it, rather than completing a message nobody received. That is what makes a
+/// number chosen by judgement safe here: setting it too low costs latency, not silence.
+const CERTIFICATE_NOTICE_RATE_BUDGET: (u32, u64) = (24, 3_600);
+
+/// The budget the certificate-notice consumer runs to.
+///
+/// A named function so a test can assert the SHIPPED value. That gap has been paid for here
+/// once already: every suite exercising the account-alert producer built its own
+/// `RateBudget::new(100, 3_600)`, so the budget a deployment ran was the one configuration
+/// nothing exercised.
+fn certificate_notice_budget() -> ironauth_store::message_rate::RateBudget {
+    ironauth_store::message_rate::RateBudget::new(
+        CERTIFICATE_NOTICE_RATE_BUDGET.0,
+        CERTIFICATE_NOTICE_RATE_BUDGET.1,
+    )
+    .per_kind()
 }
 
 /// How many notices one recipient may be sent in an hour.
@@ -3501,7 +3533,7 @@ fn verification_sender(
                 logging,
                 store.clone(),
                 env.clone(),
-                // PER KIND, and that is the one place in the tree that asks for it. These
+                // PER KIND. These
                 // alerts are triggered by an authenticated change to the recipient's own
                 // account, so the recipient wanted every one of them -- and cross-kind counting
                 // would let an attacker who controls the volume spend the budget on links and
@@ -7311,6 +7343,44 @@ mod tests {
                  scope's pass are different sizes of outage and must not share a series"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod certificate_notice_budget_tests {
+    use super::{CERTIFICATE_NOTICE_RATE_BUDGET, certificate_notice_budget};
+    use ironauth_store::message_rate::RateScope;
+
+    /// The SHIPPED budget is the one the consumer runs.
+    ///
+    /// This repository has already paid for the gap once: every suite exercising the
+    /// account-alert producer built its own `RateBudget::new(100, 3_600)`, so the value a
+    /// deployment ran was the one configuration nothing exercised. The same thing happened here
+    /// -- the notice suite supplied a hundred an hour while the binary supplied three, and under
+    /// three an organization with two connections on the default leads had half its notices
+    /// refused and, before the retry fix, silently discarded.
+    ///
+    /// The numbers are written out rather than read from the constant, because an expectation
+    /// taken from the thing it checks passes whatever that thing says.
+    #[test]
+    fn the_shipped_budget_is_per_kind_and_sized_for_a_first_sweep() {
+        let budget = certificate_notice_budget();
+        assert_eq!(
+            budget.limit, 24,
+            "twenty-four notices an hour per recipient"
+        );
+        assert_eq!(budget.window_seconds, 3_600);
+        assert_eq!(
+            budget.scope,
+            RateScope::SameKind,
+            "per kind: expiry notices must not compete with a contact's other mail, in either \
+             direction"
+        );
+        assert_eq!(
+            (budget.limit, budget.window_seconds),
+            CERTIFICATE_NOTICE_RATE_BUDGET,
+            "the constant and the budget the consumer is handed must not drift apart"
+        );
     }
 }
 

@@ -573,6 +573,15 @@ async fn the_notice_and_the_ledger_row_commit_together() {
     let announced = queued_events(&db, &env, scope).await;
     assert_eq!(announced.len(), 1, "the notice announced {announced:?}");
     assert_eq!(announced[0]["type"], "saml_certificate.expiring");
+    // AND THE MAIL, which this test is named for and did not check. `queued_events` claims one
+    // consumer name, so the contact-notice row added to this same transaction was invisible to
+    // it: the enqueue could have been deleted outright and this test -- the one whose name
+    // asserts the writes commit together -- would have stayed green.
+    assert_eq!(
+        queued_notices(&db, &env, scope).await,
+        1,
+        "the ledger row and the mail that tells somebody about it are one fact or neither"
+    );
     assert_eq!(
         announced[0]["payload"]["lead_secs"],
         3 * DAY,

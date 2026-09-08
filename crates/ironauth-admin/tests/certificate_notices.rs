@@ -159,6 +159,15 @@ async fn add_contact(
     id
 }
 
+/// The clock the message ledger counts rate windows in.
+fn now_secs(env: &Env) -> u64 {
+    env.clock()
+        .now_utc()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+}
+
 fn budget() -> RateBudget {
     RateBudget::new(100, 3600)
 }
@@ -200,6 +209,50 @@ async fn drain_notices(db: &TestDatabase, env: &Env, scope: Scope, page: i64) ->
                 .await
                 .expect("complete");
             handled += 1;
+        }
+    }
+}
+
+/// The BODIES queued for delivery, in order.
+///
+/// The rendered text does not live on the `messages` row; it rides the delivery job's outbox
+/// payload, which is what a provider is handed. Reading it there is reading what the contact
+/// will actually be sent.
+async fn delivered_bodies(db: &TestDatabase, env: &Env, scope: Scope) -> Vec<String> {
+    // LOOPING, for the reason `drain_notices` loops: the delivery queue's ordering key is the
+    // RECIPIENT, so every notice to one contact shares it and the second is not claimable until
+    // the first is completed. A single claim returned one body and read as "only one mail was
+    // sent" -- the same mistake this suite's sibling made, one queue along.
+    let mut bodies = Vec::new();
+    loop {
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                env,
+                ironauth_store::MESSAGE_DELIVERY_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim the deliveries");
+        if claimed.is_empty() {
+            return bodies;
+        }
+        for message in &claimed {
+            bodies.push(
+                message.payload["body"]
+                    .as_str()
+                    .expect("a rendered body")
+                    .to_owned(),
+            );
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(env, message)
+                .await
+                .expect("complete");
         }
     }
 }
@@ -270,8 +323,10 @@ async fn a_notice_reaches_the_technical_contacts_and_nobody_else() {
 #[tokio::test]
 async fn a_technical_contact_past_the_first_page_is_still_told() {
     // THE PAGING LOOP, with the boundary lowered to one so two rows prove it. Reading one page
-    // and stopping is a defect this codebase shipped once already, on the delete path for these
-    // same contacts, where it silently mis-categorised the removal event.
+    // and stopping is a defect this codebase has already written once, on the delete path for
+    // these same contacts, where it DROPPED the removal event rather than mislabelling it --
+    // caught by mutation before merge. Dropped is what would happen here too: a contact past
+    // page one is never told, while the ledger records that the organization was.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -410,10 +465,17 @@ async fn two_certificates_crossing_the_same_lead_are_two_mails() {
 
     let org = seed_org(&db, &env, scope, "Contoso").await;
     add_contact(&db, &env, scope, &org, "ops@contoso.test", "technical").await;
-    let okta = connect(&db, &env, scope, &org, "https://okta.example/e").await;
-    let entra = connect(&db, &env, scope, &org, "https://entra.example/e").await;
-    pin_expiring(&db, &env, scope, &okta, 7, 2 * DAY).await;
-    pin_expiring(&db, &env, scope, &entra, 9, 2 * DAY).await;
+    // ONE CONNECTION, TWO CERTIFICATES -- the rollover state this whole feature exists to warn
+    // about, an IdP publishing its replacement alongside the certificate it is retiring.
+    //
+    // The first version of this test used two CONNECTIONS with one certificate each, so the
+    // certificate and the connection varied together and the assertion below could not say which
+    // one the collapse key was on. Review demonstrated it: keying the discriminator on the
+    // connection instead of the certificate left all six tests green. Varying one dimension is
+    // what makes this a negative for the certificate specifically.
+    let connection = connect(&db, &env, scope, &org, "https://okta.example/e").await;
+    pin_expiring(&db, &env, scope, &connection, 7, 2 * DAY).await;
+    pin_expiring(&db, &env, scope, &connection, 9, 2 * DAY).await;
 
     let report = ironauth_admin::certificate_expiry::run_once(
         db.control_store(),
@@ -431,5 +493,300 @@ async fn two_certificates_crossing_the_same_lead_are_two_mails() {
         notified(&db, scope).await,
         vec!["ops@contoso.test".to_owned(), "ops@contoso.test".to_owned()],
         "the contact is told about BOTH certificates, not just whichever was announced first"
+    );
+}
+
+#[tokio::test]
+async fn the_mail_states_the_time_actually_left_and_not_the_lead_it_crossed() {
+    // WHAT THE CONTACT READS, which nothing measured. The body was the only part of this
+    // feature no test observed, and it was wrong: it formatted the LEAD that was crossed rather
+    // than the time remaining, and the two are equal only at the instant of crossing.
+    //
+    // The case that exposes it is the ordinary one for an existing deployment switching alerting
+    // on: a certificate already deep inside its windows crosses every lead at once. Two days
+    // from expiry, the thirty-day notice said "expires in about 30 days" -- understating the
+    // urgency by four weeks and contradicting the other two notices about the same certificate.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    add_contact(&db, &env, scope, &org, "ops@contoso.test", "technical").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/e").await;
+    pin_expiring(&db, &env, scope, &connection, 7, 2 * DAY).await;
+
+    ironauth_admin::certificate_expiry::run_once(
+        db.control_store(),
+        &env,
+        scope,
+        &[30 * DAY, 14 * DAY, 3 * DAY],
+        100,
+    )
+    .await
+    .expect("the sweep runs");
+    drain_notices(&db, &env, scope, 100).await;
+
+    let bodies = delivered_bodies(&db, &env, scope).await;
+    assert_eq!(bodies.len(), 3, "one mail per crossed lead");
+    for body in &bodies {
+        assert!(
+            body.contains(&connection.to_string()),
+            "the mail must name the connection whose certificate is expiring: {body}"
+        );
+        // TWO DAYS, in every one of the three. Under the old body these read "30", "14" and "3".
+        assert!(
+            body.contains("expires in about 2 days"),
+            "the mail must state the time actually remaining, not the lead: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_notice_that_outlives_its_certificate_says_it_has_expired() {
+    // CLOCK-CONTROLLED, and the clock is the point. `due()` refuses a certificate that has
+    // already lapsed (`not_after > now`), so a sweep never announces one -- which is why an
+    // earlier version of this test, driving the sweep against a lapsed certificate, announced
+    // nothing and proved nothing.
+    //
+    // The way production reaches an expired body is the DELAY: the notice is announced while the
+    // certificate is still valid, then sits in the queue -- retries, a backlog, a worker that
+    // was down -- past the expiry it was warning about. Then "expires in about 0 days" reads as
+    // a rounding artifact when the organization's logins are already failing.
+    // A FIXED START, not the wall clock. `invariant-lints` requires every clock to come from
+    // ironauth-env so protocol logic stays deterministic under test, and it enforces that by
+    // scanning source text -- which is why this comment describes the rule rather than quoting
+    // the call it forbids. 2026-01-01T00:00:00Z, far enough forward that a certificate's
+    // `not_before` (a year before its expiry) is still a sane timestamp.
+    let (env, clock) = Env::deterministic(
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600),
+        31,
+    );
+    let db = TestDatabase::start().await;
+    let scope = db.seed_scope(&env).await;
+
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    add_contact(&db, &env, scope, &org, "ops@contoso.test", "technical").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/e").await;
+    pin_expiring(&db, &env, scope, &connection, 7, 2 * DAY).await;
+
+    ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, &[3 * DAY], 100)
+        .await
+        .expect("the sweep runs");
+
+    // The notice is queued and the certificate lapses underneath it.
+    clock.advance(std::time::Duration::from_secs(
+        u64::try_from(3 * DAY).expect("positive"),
+    ));
+    drain_notices(&db, &env, scope, 100).await;
+
+    let bodies = delivered_bodies(&db, &env, scope).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("HAS EXPIRED"),
+        "a notice delivered after the expiry it warned about must say so: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("expires in about"),
+        "and must not also count down: {}",
+        bodies[0]
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_notice_is_retried_rather_than_silently_dropped() {
+    // THE DEFECT THIS TEST EXISTS FOR, which review found by running the SHIPPED budget instead
+    // of the generous one every test here supplied. Completing a message the rate limiter
+    // refused loses the notice permanently: the ledger row recording that this organization was
+    // told has already committed, so no later sweep re-announces it, and the outbox row would be
+    // marked done. Measured on the old budget, an organization with two connections and the
+    // three default leads had six crossings announced and three mails sent.
+    //
+    // The rate limiter's own doc says exceeding it BLOCKS rather than delays, which is right for
+    // a login code the user will ask for again, and wrong for a notice nothing re-requests. So
+    // the consumer returns a retryable error and the outbox backs off.
+    //
+    // Driven with a budget of ONE so the property is measured rather than the number: whatever
+    // the shipped budget is, exceeding it must delay and never drop.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    add_contact(&db, &env, scope, &org, "ops@contoso.test", "technical").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/e").await;
+    pin_expiring(&db, &env, scope, &connection, 7, 2 * DAY).await;
+
+    let report = ironauth_admin::certificate_expiry::run_once(
+        db.control_store(),
+        &env,
+        scope,
+        &[30 * DAY, 3 * DAY],
+        100,
+    )
+    .await
+    .expect("the sweep runs");
+    assert_eq!(
+        report.announced, 2,
+        "two leads crossed, two notices recorded"
+    );
+
+    let consumer =
+        CertificateNoticeConsumer::new(db.store().clone(), RateBudget::new(1, 3_600).per_kind());
+    let mut accepted = 0;
+    let mut retried = 0;
+    loop {
+        let claimed = db
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                CERTIFICATE_NOTICE_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            break;
+        }
+        for message in claimed {
+            match consumer.handle(&env, scope, &message).await {
+                Ok(()) => accepted += 1,
+                Err(error) => {
+                    assert!(
+                        error.is_retryable(),
+                        "a rate-limited notice must be RETRYABLE, not dead-lettered on the spot"
+                    );
+                    assert_eq!(error.label(), "notice_rate_limited", "and say why");
+                    retried += 1;
+                }
+            }
+            // Completed either way here, because this test is about what `handle` ANSWERS. In
+            // production the substrate completes only the Ok and reschedules the Err.
+            db.store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, &message)
+                .await
+                .expect("complete");
+        }
+    }
+
+    assert_eq!(accepted, 1, "the budget of one admits exactly one notice");
+    assert_eq!(
+        retried, 1,
+        "and the notice beyond it is handed back for retry rather than reported as sent"
+    );
+    assert_eq!(
+        notified(&db, scope).await,
+        vec!["ops@contoso.test".to_owned()],
+        "only the admitted notice produced mail; the other was not silently written off"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_contact_does_not_block_the_contacts_after_them() {
+    // The first version of the retry returned at the FIRST refused contact, which is a delay
+    // every later contact on the list did nothing to earn: they would go unmailed until one
+    // other recipient's window rolled. Every contact is tried, and the retry is raised after.
+    //
+    // The budget is per recipient, so this needs one contact who has already spent theirs.
+    // Enqueuing a notice-kind message to them directly is exactly that state.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    // Added first, so the contact list reaches this one first: the property is about what
+    // happens to the contacts AFTER a refusal.
+    add_contact(&db, &env, scope, &org, "spent@contoso.test", "technical").await;
+    add_contact(&db, &env, scope, &org, "fresh@contoso.test", "technical").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/e").await;
+    pin_expiring(&db, &env, scope, &connection, 7, 2 * DAY).await;
+
+    // Spend the first contact's whole budget on an unrelated notice-kind send.
+    let spent_id = MessageId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .messages()
+        .enqueue(
+            &env,
+            ironauth_store::NewMessage {
+                id: &spent_id,
+                kind: NOTICE_KIND,
+                recipient: "spent@contoso.test",
+                dedup_key: "an-earlier-unrelated-notice",
+            },
+            &serde_json::json!({ "message_id": spent_id.to_string(), "body": "earlier" }),
+            RateBudget::new(1, 3_600).per_kind(),
+            // THE SAME WINDOW the consumer will count in. Passing 0 here put the earlier send in
+            // the window that began at the Unix epoch, so it counted against nothing and the
+            // contact was not spent at all -- the setup silently did not set anything up.
+            now_secs(&env),
+        )
+        .await
+        .expect("the earlier send is accepted");
+
+    ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, &[3 * DAY], 100)
+        .await
+        .expect("the sweep runs");
+
+    let consumer =
+        CertificateNoticeConsumer::new(db.store().clone(), RateBudget::new(1, 3_600).per_kind());
+    let claimed = db
+        .store()
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            CERTIFICATE_NOTICE_CONSUMER,
+            std::time::Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1, "one notice");
+    let outcome = consumer.handle(&env, scope, &claimed[0]).await;
+
+    assert!(
+        outcome.is_err(),
+        "the refused contact must still be handed back for retry"
+    );
+    let reached = notified(&db, scope).await;
+    assert!(
+        reached.contains(&"fresh@contoso.test".to_owned()),
+        "the contact after the refused one must still have been mailed in this same pass: \
+         {reached:?}"
+    );
+}
+
+#[tokio::test]
+async fn hours_left_is_said_as_less_than_a_day_rather_than_rounded() {
+    // The sub-day branch was added as part of fixing the rounding and then measured by nothing:
+    // deleting it left every test green. Any rounding of a few hours into a whole number of days
+    // is off by up to twelve hours, and this is the one range where that decides whether
+    // somebody acts tonight.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    add_contact(&db, &env, scope, &org, "ops@contoso.test", "technical").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/e").await;
+    pin_expiring(&db, &env, scope, &connection, 7, 12 * 60 * 60).await;
+
+    ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, &[3 * DAY], 100)
+        .await
+        .expect("the sweep runs");
+    drain_notices(&db, &env, scope, 100).await;
+
+    let bodies = delivered_bodies(&db, &env, scope).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("LESS THAN A DAY"),
+        "twelve hours must not be reported as a whole number of days: {}",
+        bodies[0]
     );
 }
