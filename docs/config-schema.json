@@ -325,6 +325,46 @@
         }
       ]
     },
+    "CertificateExpiryConfig": {
+      "additionalProperties": false,
+      "description": "SAML certificate expiry alerting (issue #141).",
+      "properties": {
+        "lead_days": {
+          "default": [
+            30,
+            14,
+            3
+          ],
+          "description": "How long before expiry each warning is sent, in DAYS, one entry per warning.\n\nCONFIGURED rather than hardcoded, for the reason `scim.token_expiry_warning_lead_secs`\ngives: the right lead depends on how long a customer's change process takes, and a\nvendor selling to enterprises with change-advisory boards needs weeks where one selling\nto startups needs days. Getting it wrong is silent -- logins simply stop on a date\nnobody was watching.\n\nTHIRTY, FOURTEEN AND THREE by default. Thirty is far enough out to open a ticket with an\nIdP administrator who does not work for you; fourteen catches a fortnightly change\nwindow; three is the one that means \"today\". These are the three migration 0208's header\nalready names, which until now was a claim about a value that had no configuration\nsource at all.\n\nAN EMPTY LIST DISABLES ALERTING while leaving the sweep switch alone, and that is a real\nchoice rather than a degenerate one: a deployment whose SAML connections are managed by\nsomething else has nothing to warn about.\n\nDAYS RATHER THAN SECONDS because every value an operator will ever write here is a whole\nnumber of days, and `2_592_000` is a worse way to say thirty. The conversion happens once,\nat the boot seam that reads this.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "sweep_batch": {
+          "default": 500,
+          "description": "How many (certificate, lead) pairs one pass may announce.\n\nA BOUND ON THE PASS, not on the total: pairs it does not reach stay due and the next pass\ntakes them, because every pair is decided independently by its own ledger row. It exists\nso a deployment that has just enabled alerting over a large estate does not turn its\nfirst pass into one enormous transaction.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sweep_enabled": {
+          "default": false,
+          "description": "Whether THIS process runs the sweep. OFF by default.\n\nOff, like every other worker switch here, because more than one process runs this binary\nand each pass is work that must not be multiplied by the number of replicas. The ledger\nmakes a duplicate pass harmless -- two racing passes announce once between them -- so\nthis is about wasted work rather than correctness.",
+          "type": "boolean"
+        },
+        "sweep_interval_secs": {
+          "default": 3600,
+          "description": "How often a pass runs, in seconds.\n\nHOURLY by default. The quantity being measured changes on the scale of days, so a\nshorter interval buys nothing; the reason it is not daily is that a pass which fails or a\nprocess that restarts should not cost a whole day of warning.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ClaimsEnrichmentConfig": {
       "additionalProperties": false,
       "description": "The claims-enrichment hook (issue #100): an outbound call at TOKEN ISSUANCE that asks an\nexternal policy decision point or fine-grained-authorization service for extra claims and\nmerges them into the token.\n\nThis is the seam the `AuthZEN` work is explicitly built around. `IronAuth` answers what it\nalready indexes and deliberately does NOT ship a Zanzibar engine; a deployment whose\nauthorization model needs relationships runs `OpenFGA`, `SpiceDB` or `Cerbos` and points\nthis hook at it. The blessed architecture is coarse claims plus a fine `PDP`, and this is\nthe coarse half learning what the fine half knows.\n\n# It can only ADD, and only names it was told about\n\nA returned claim whose name is not in `allowed_claims` is DROPPED, and a returned claim\nthat collides with one `IronAuth` itself minted is dropped too. An enrichment hook that\ncould overwrite `sub`, `aud`, `exp` or the permissions claim would not be an enrichment\nhook, it would be a token forgery endpoint, and the deployment that trusts an FGA to\nanswer a relationship question has not thereby decided to let it choose subjects.\n\n# It fails OPEN, and that direction is the safe one here\n\nA hook that errors, times out, or answers malformed JSON contributes NOTHING and the\ntoken is issued without the extra claims. Failing closed would take every login in the\ndeployment down with the FGA, and the claims this adds are ADDITIVE: their absence is\nfewer permissions, never more. A relying party that requires an enriched claim to\nauthorize still refuses without it, which is the correct outcome and one it already\nimplements.",
@@ -2902,6 +2942,20 @@
         "provider": "local"
       },
       "description": "Bring-your-own-key (BYOK) customer-managed encryption settings (issue #49).\nNOT IMPLEMENTED (issue #459): no boot path reads this section, so no value in\nit changes any behaviour, and startup REFUSES a non-default value rather than\naccept one it will ignore. It WOULD let a customer-managed root key wrap a\ntenant's key-encryption key, so revoking it crypto-shreds the tenant; the store\nhalf of that exists, the config path to it does not."
+    },
+    "certificate_expiry": {
+      "$ref": "#/$defs/CertificateExpiryConfig",
+      "default": {
+        "lead_days": [
+          30,
+          14,
+          3
+        ],
+        "sweep_batch": 500,
+        "sweep_enabled": false,
+        "sweep_interval_secs": 3600
+      },
+      "description": "SAML certificate expiry alerting (issue #141): the lead times an organization is warned\nat, and the cadence of the pass that decides who has crossed one.\n\nA top-level section rather than a field on `[webhooks]` or `[messaging]` deliberately,\nbecause ONE pass feeds both: the same crossing emits the renewal webhook a vendor\nconsumes and the mail the organization's IT contacts receive. An operator setting \"warn\nat thirty days\" is making one decision, and it should have one name."
     },
     "database": {
       "$ref": "#/$defs/DatabaseConfig",

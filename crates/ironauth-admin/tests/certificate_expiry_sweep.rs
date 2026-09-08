@@ -569,3 +569,75 @@ async fn a_stored_id_that_will_not_parse_names_the_id_and_not_the_clock() {
         "the failure names the wrong cause, so it sends the reader to the wrong place: {message}"
     );
 }
+
+#[test]
+fn configured_days_become_the_thresholds_a_pass_runs_to() {
+    use ironauth_admin::certificate_expiry::leads_from_days;
+
+    const D: i64 = 24 * 60 * 60;
+    assert_eq!(
+        leads_from_days(&[30, 14, 3]),
+        vec![30 * D, 14 * D, 3 * D],
+        "days become seconds, longest first"
+    );
+    // A CONFIGURED ZERO IS DROPPED, and this is the case worth having a test for. It reads like
+    // "warn at expiry" and is not: the event catalog declares lead_secs with minimum 1, so a
+    // zero reaches `envelope()`, fails validation, and the pass reports a server fault. One
+    // plausible number in a config file would turn every pass into an error whose log names the
+    // envelope registry rather than the setting that caused it.
+    assert_eq!(leads_from_days(&[30, 0, 3]), vec![30 * D, 3 * D]);
+    assert!(leads_from_days(&[0]).is_empty());
+    // Duplicates collapse, so a repeat does not double the work list the caller then bounds.
+    assert_eq!(leads_from_days(&[7, 7, 7]), vec![7 * D]);
+    assert!(leads_from_days(&[]).is_empty());
+}
+
+#[tokio::test]
+async fn one_scope_failing_does_not_stop_the_others_being_warned() {
+    // THE PROPERTY THAT MAKES A MULTI-TENANT PASS SAFE. A pass that returned on the first error
+    // would let one tenant with a corrupt certificate id stop every other tenant's warning, and
+    // the tenants that lose theirs are the ones that did nothing wrong.
+    //
+    // The failure is induced the way the sweep actually meets it: a certificate id the type
+    // cannot parse, which only the schema can produce because no repository method will write
+    // one. That is the same door `a_stored_id_that_will_not_parse_names_the_id_and_not_the_clock`
+    // opens, used here for its effect on the OTHER scopes rather than on the message.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let broken = db.seed_scope(&env).await;
+    let healthy = db.seed_scope(&env).await;
+
+    for scope in [broken, healthy] {
+        let org = seed_org(&db, &env, scope, "Contoso").await;
+        let connection = connect(&db, &env, scope, &org, "https://idp.example/multi").await;
+        pin_expiring(&db, &env, scope, &connection, 21, 2 * DAY).await;
+    }
+    // Corrupt exactly one scope's id column, leaving the other untouched.
+    sqlx::query(
+        "UPDATE saml_connection_certificates SET id = 'not-a-certificate-id' \
+         WHERE tenant_id = $1 AND environment_id = $2",
+    )
+    .bind(broken.tenant().to_string())
+    .bind(broken.environment().to_string())
+    .execute(db.owner_pool())
+    .await
+    .expect("corrupt the one scope");
+
+    let report = ironauth_admin::certificate_expiry::run_pass(
+        db.control_store(),
+        &env,
+        &ironauth_store::outbox::StaticScopes::new(vec![broken, healthy]),
+        LEADS,
+        100,
+    )
+    .await
+    .expect("the pass itself completes");
+
+    assert_eq!(report.failed, 1, "the corrupt scope is counted as failed");
+    assert_eq!(report.swept, 1, "and the healthy one is still swept");
+    assert_eq!(
+        report.announced,
+        LEADS.len(),
+        "the healthy tenant is warned at every lead despite its neighbour failing"
+    );
+}

@@ -359,6 +359,7 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let message_delivery = message_delivery_inputs(&config, &env);
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
+        let certificate_sweep = certificate_sweep_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
         let signing_backfill_inputs = signing_backfill_inputs(&config, &env);
@@ -525,6 +526,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_scim_push_scheduler(inputs).await,
             None => None,
         };
+        // THE CERTIFICATE EXPIRY SWEEP (issue #141). Its own switch, like every other worker
+        // here: warning an organization that its IdP certificate is about to expire is a
+        // different subsystem from delivering the webhook or the mail that carries the warning,
+        // and must not require either one's configuration to run.
+        let certificate_sweep = match certificate_sweep {
+            Some(inputs) => start_certificate_sweep(inputs).await,
+            None => None,
+        };
+        let _ = &certificate_sweep;
         let retention_sweeper = if let Some(inputs) = retention_inputs {
             start_retention_sweeper(inputs).await
         } else {
@@ -3427,6 +3437,159 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
         sender_domain: sender_domain(config.server.public_url.as_deref()),
         env: env.clone(),
     })
+}
+
+/// What the certificate-expiry sweep worker connects with.
+struct CertificateSweepInputs {
+    /// The CONTROL-plane connection.
+    ///
+    /// One DSN, not two, and that is the point: 0208 grants the alert ledger to
+    /// `ironauth_control` alone, so a pass handed the data-plane store fails on its first read.
+    /// The scope enumeration reads through the control plane as well, so there is nothing here
+    /// for the data plane to do.
+    control_dsn: String,
+    /// The resolved thresholds and cadence.
+    settings: CertificateSweepSettings,
+    /// The clock the pass reads.
+    env: Env,
+}
+
+/// Capture the sweep's inputs, or [`None`] when it is switched off.
+fn certificate_sweep_inputs(config: &Config, env: &Env) -> Option<CertificateSweepInputs> {
+    let settings = certificate_sweep_settings(config)?;
+    // THE CONTROL PLANE IS REQUIRED, not optional, for two independent reasons: it is where the
+    // scopes are enumerated, and it is the only role 0208 grants the alert ledger to. Without it
+    // the ticker would run for ever over an empty scope list and look healthy.
+    let Some(control_dsn) = select_control_dsn(config) else {
+        tracing::error!(
+            "certificate expiry alerting NOT running: no control-plane connection is \
+             configured, so no scope can be enumerated and the alert ledger cannot be written"
+        );
+        return None;
+    };
+    Some(CertificateSweepInputs {
+        control_dsn,
+        settings,
+        env: env.clone(),
+    })
+}
+
+/// Start the pass ticker, or [`None`] if it cannot run.
+async fn start_certificate_sweep(
+    inputs: CertificateSweepInputs,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let CertificateSweepInputs {
+        control_dsn,
+        settings,
+        env,
+    } = inputs;
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "certificate expiry alerting NOT running: control-plane connect failed"
+            );
+            return None;
+        }
+    };
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
+    let leads = settings.leads.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(settings.interval);
+        // DELAY, not Burst. A process that was paused past several ticks must not then run that
+        // many passes back to back: each one reads the whole due set, and the ledger means the
+        // catch-up passes would announce nothing anyway.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match ironauth_admin::certificate_expiry::run_pass(
+                &control_store,
+                &env,
+                scopes.as_ref(),
+                &leads,
+                settings.batch,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if report.announced > 0 || report.failed > 0 {
+                        tracing::info!(
+                            swept = report.swept,
+                            failed = report.failed,
+                            announced = report.announced,
+                            "certificate expiry pass finished"
+                        );
+                    } else {
+                        // A pass that warned nobody still says so, for the reason the outbox
+                        // reaper's quiet branch gives: without it a healthy idle sweep and a
+                        // task that unwound an hour ago produce identical output, and the only
+                        // way to tell them apart would be to wait for a customer to complain.
+                        tracing::debug!(
+                            swept = report.swept,
+                            "certificate expiry pass finished with nothing due"
+                        );
+                    }
+                }
+                Err(error) => {
+                    // The SCOPE LIST could not be read, which is not one tenant failing; there
+                    // is no work list at all. Loud, and the ticker keeps going: a control-plane
+                    // blip must not permanently stop expiry warnings.
+                    tracing::error!(
+                        %error,
+                        "certificate expiry pass could not enumerate scopes; retrying next tick"
+                    );
+                }
+            }
+        }
+    });
+    tracing::info!(
+        interval_secs = settings.interval.as_secs(),
+        leads_secs = ?settings.leads,
+        "certificate expiry alerting started"
+    );
+    Some(handle)
+}
+
+/// What the certificate-expiry sweep worker needs, or `None` if this process must not run it
+/// (issue #141).
+///
+/// A named function returning the SETTINGS rather than a predicate the boot path branches on,
+/// for the reason [`verification_sender`] is one: a test of the answer is not a test of the
+/// wiring, and an inverted branch here means no certificate is ever warned about while the
+/// config still says alerting is on.
+///
+/// TWO WAYS TO BE OFF, and they are different. `sweep_enabled = false` means this process does
+/// not run the pass -- another replica might. An empty `lead_days` means nobody is warned at
+/// all, on any replica. Both return `None` here because neither should spawn a ticker, but only
+/// the second is worth a line in the log, which is why the caller distinguishes them.
+fn certificate_sweep_settings(config: &Config) -> Option<CertificateSweepSettings> {
+    if !config.certificate_expiry.sweep_enabled {
+        return None;
+    }
+    let leads =
+        ironauth_admin::certificate_expiry::leads_from_days(&config.certificate_expiry.lead_days);
+    if leads.is_empty() {
+        return None;
+    }
+    Some(CertificateSweepSettings {
+        leads,
+        interval: std::time::Duration::from_secs(
+            config.certificate_expiry.sweep_interval_secs.max(1),
+        ),
+        batch: i64::from(config.certificate_expiry.sweep_batch),
+    })
+}
+
+/// The resolved settings one sweep worker runs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CertificateSweepSettings {
+    /// The lead thresholds, in seconds, longest first.
+    leads: Vec<i64>,
+    /// How often a pass runs.
+    interval: std::time::Duration,
+    /// How many pairs one pass may announce.
+    batch: i64,
 }
 
 /// How many notices one recipient may be sent in an hour.
@@ -7277,6 +7440,99 @@ mod tests {
                  scope's pass are different sizes of outage and must not share a series"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod certificate_sweep_wiring_tests {
+    use super::{CertificateSweepSettings, certificate_sweep_settings};
+    use ironauth_config::{CertificateExpiryConfig, Config};
+
+    fn config_with(expiry: CertificateExpiryConfig) -> Config {
+        Config {
+            certificate_expiry: expiry,
+            ..Config::default()
+        }
+    }
+
+    /// The switch points the right way.
+    ///
+    /// The whole feature is invisible when this is inverted: no pass runs, nothing errors, and
+    /// the configuration still says alerting is on. That is the shape
+    /// `the_worker_starts_when_delivery_is_enabled_and_not_when_it_is_off` exists for one
+    /// subsystem over, where an inverted branch left the entire suite bit-identical.
+    #[test]
+    fn the_sweep_starts_when_enabled_and_not_when_it_is_off() {
+        let off = config_with(CertificateExpiryConfig::default());
+        assert!(
+            !off.certificate_expiry.sweep_enabled,
+            "the shipped default must be off, like every other worker switch"
+        );
+        assert!(
+            certificate_sweep_settings(&off).is_none(),
+            "a disabled sweep must not start a ticker"
+        );
+
+        let on = config_with(CertificateExpiryConfig {
+            sweep_enabled: true,
+            ..CertificateExpiryConfig::default()
+        });
+        let settings = certificate_sweep_settings(&on).expect("an enabled sweep starts");
+        assert_eq!(
+            settings,
+            CertificateSweepSettings {
+                // Descending, in seconds: the defaults migration 0208's header already names.
+                leads: vec![30 * 86_400, 14 * 86_400, 3 * 86_400],
+                interval: std::time::Duration::from_secs(3_600),
+                batch: 500,
+            },
+            "the shipped defaults are the ones 0208 documents"
+        );
+    }
+
+    /// An empty lead list does not start a ticker.
+    ///
+    /// Separate from the switch because it means something different: the switch is "not this
+    /// replica", an empty list is "nobody, anywhere". Both must avoid spawning, and a pass with
+    /// no thresholds would enumerate every scope to build a work list that is empty by
+    /// construction.
+    #[test]
+    fn alerting_with_no_leads_configured_does_not_start() {
+        let none = config_with(CertificateExpiryConfig {
+            sweep_enabled: true,
+            lead_days: Vec::new(),
+            ..CertificateExpiryConfig::default()
+        });
+        assert!(certificate_sweep_settings(&none).is_none());
+
+        // And a list that is non-empty but contains only values the seam drops is the same
+        // thing. A configured zero is not "warn at expiry": the catalog declares lead_secs with
+        // minimum 1, so it would make every notice fail envelope validation.
+        let zeros = config_with(CertificateExpiryConfig {
+            sweep_enabled: true,
+            lead_days: vec![0, 0],
+            ..CertificateExpiryConfig::default()
+        });
+        assert!(
+            certificate_sweep_settings(&zeros).is_none(),
+            "a list of zeros warns nobody, so it must not start a ticker either"
+        );
+    }
+
+    /// A zero interval degrades to one second rather than spinning.
+    #[test]
+    fn a_zero_interval_is_floored() {
+        let spin = config_with(CertificateExpiryConfig {
+            sweep_enabled: true,
+            sweep_interval_secs: 0,
+            ..CertificateExpiryConfig::default()
+        });
+        let settings = certificate_sweep_settings(&spin).expect("still starts");
+        assert_eq!(
+            settings.interval,
+            std::time::Duration::from_secs(1),
+            "a zero-second interval would tick as fast as the database can answer"
+        );
     }
 }
 

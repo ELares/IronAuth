@@ -246,6 +246,15 @@ pub struct Config {
     /// wants one without the other.
     pub log_streams: LogStreamsConfig,
 
+    /// SAML certificate expiry alerting (issue #141): the lead times an organization is warned
+    /// at, and the cadence of the pass that decides who has crossed one.
+    ///
+    /// A top-level section rather than a field on `[webhooks]` or `[messaging]` deliberately,
+    /// because ONE pass feeds both: the same crossing emits the renewal webhook a vendor
+    /// consumes and the mail the organization's IT contacts receive. An operator setting "warn
+    /// at thirty days" is making one decision, and it should have one name.
+    pub certificate_expiry: CertificateExpiryConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -948,6 +957,68 @@ impl Default for FlowTargetsConfig {
             delivery_enabled: false,
             // Under the 30s outbox visibility timeout, so a delivery cannot outlive its lease.
             delivery_timeout_secs: 10,
+        }
+    }
+}
+
+/// SAML certificate expiry alerting (issue #141).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct CertificateExpiryConfig {
+    /// Whether THIS process runs the sweep. OFF by default.
+    ///
+    /// Off, like every other worker switch here, because more than one process runs this binary
+    /// and each pass is work that must not be multiplied by the number of replicas. The ledger
+    /// makes a duplicate pass harmless -- two racing passes announce once between them -- so
+    /// this is about wasted work rather than correctness.
+    pub sweep_enabled: bool,
+
+    /// How long before expiry each warning is sent, in DAYS, one entry per warning.
+    ///
+    /// CONFIGURED rather than hardcoded, for the reason `scim.token_expiry_warning_lead_secs`
+    /// gives: the right lead depends on how long a customer's change process takes, and a
+    /// vendor selling to enterprises with change-advisory boards needs weeks where one selling
+    /// to startups needs days. Getting it wrong is silent -- logins simply stop on a date
+    /// nobody was watching.
+    ///
+    /// THIRTY, FOURTEEN AND THREE by default. Thirty is far enough out to open a ticket with an
+    /// IdP administrator who does not work for you; fourteen catches a fortnightly change
+    /// window; three is the one that means "today". These are the three migration 0208's header
+    /// already names, which until now was a claim about a value that had no configuration
+    /// source at all.
+    ///
+    /// AN EMPTY LIST DISABLES ALERTING while leaving the sweep switch alone, and that is a real
+    /// choice rather than a degenerate one: a deployment whose SAML connections are managed by
+    /// something else has nothing to warn about.
+    ///
+    /// DAYS RATHER THAN SECONDS because every value an operator will ever write here is a whole
+    /// number of days, and `2_592_000` is a worse way to say thirty. The conversion happens once,
+    /// at the boot seam that reads this.
+    pub lead_days: Vec<u32>,
+
+    /// How often a pass runs, in seconds.
+    ///
+    /// HOURLY by default. The quantity being measured changes on the scale of days, so a
+    /// shorter interval buys nothing; the reason it is not daily is that a pass which fails or a
+    /// process that restarts should not cost a whole day of warning.
+    pub sweep_interval_secs: u64,
+
+    /// How many (certificate, lead) pairs one pass may announce.
+    ///
+    /// A BOUND ON THE PASS, not on the total: pairs it does not reach stay due and the next pass
+    /// takes them, because every pair is decided independently by its own ledger row. It exists
+    /// so a deployment that has just enabled alerting over a large estate does not turn its
+    /// first pass into one enormous transaction.
+    pub sweep_batch: u32,
+}
+
+impl Default for CertificateExpiryConfig {
+    fn default() -> Self {
+        Self {
+            sweep_enabled: false,
+            lead_days: vec![30, 14, 3],
+            sweep_interval_secs: 3_600,
+            sweep_batch: 500,
         }
     }
 }

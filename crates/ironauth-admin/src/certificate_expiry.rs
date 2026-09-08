@@ -29,6 +29,7 @@
 //! without inventing a scheduler.
 
 use ironauth_env::Env;
+use ironauth_store::outbox::ScopeSource;
 use ironauth_store::{DomainEvent, Scope, Store, StoreError};
 
 /// Why a pass could not finish.
@@ -205,6 +206,96 @@ pub async fn run_once(
             Err(StoreError::Conflict) => report.already_taken += 1,
             Err(StoreError::NotFound) => report.vanished += 1,
             Err(error) => return Err(SweepError::Store(error)),
+        }
+    }
+    Ok(report)
+}
+
+/// The lead set a configured list of DAYS becomes, in seconds.
+///
+/// # Why this is a function and not an inline `map`
+///
+/// Three of the four things it does are corrections a `map` would not make, and each one is a
+/// configuration a deployment can actually write.
+///
+/// A ZERO LEAD IS DROPPED. The event catalog declares `lead_secs` with `minimum: 1`, so a
+/// configured `0` does not warn at expiry -- it makes `envelope()` refuse the notice, which the
+/// sweep reports as `SweepError::Envelope`, a server fault. One plausible number in a config
+/// file would turn every pass into an error, and the operator's log would name the envelope
+/// registry rather than their own setting.
+///
+/// DUPLICATES COLLAPSE. `due()` already unnests DISTINCT, so a repeat is harmless there, but a
+/// duplicate here would double the work list this function's caller bounds with `sweep_batch`.
+///
+/// THE ORDER IS DESCENDING, so a pass announces the earliest warning first when several cross
+/// together. Nothing depends on it -- each pair is decided by its own ledger row -- but a
+/// vendor reading a delivery log sees the sequence a human would expect.
+#[must_use]
+pub fn leads_from_days(days: &[u32]) -> Vec<i64> {
+    const SECS_PER_DAY: i64 = 24 * 60 * 60;
+
+    let mut leads: Vec<i64> = days
+        .iter()
+        .filter(|day| **day > 0)
+        .map(|day| i64::from(*day) * SECS_PER_DAY)
+        .collect();
+    leads.sort_unstable_by(|left, right| right.cmp(left));
+    leads.dedup();
+    leads
+}
+
+/// What one pass over every scope did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    /// Scopes whose pass completed, whether or not it announced anything.
+    pub swept: usize,
+    /// Scopes whose pass returned an error.
+    ///
+    /// COUNTED RATHER THAN RETURNED. One scope's failure must not end the pass: a single tenant
+    /// with a corrupt certificate id would otherwise stop every other tenant being warned, and
+    /// the tenants that lose their warning are the ones that did nothing wrong.
+    pub failed: usize,
+    /// Notices announced across every scope.
+    pub announced: usize,
+}
+
+/// Run one pass over every scope the source reports.
+///
+/// # Errors
+///
+/// Only if the scope source itself cannot be read; a scope that fails is counted in the report.
+/// A pass that can enumerate nothing is different in kind from one whose tenants failed: there
+/// is no work list at all, and reporting "0 swept, 0 failed" would look identical to a healthy
+/// deployment with no tenants.
+pub async fn run_pass(
+    store: &Store,
+    env: &Env,
+    scopes: &dyn ScopeSource,
+    leads_secs: &[i64],
+    limit: i64,
+) -> Result<PassReport, StoreError> {
+    let mut report = PassReport::default();
+    if leads_secs.is_empty() {
+        // Alerting is off. Enumerating scopes to run a pass with no thresholds would be a
+        // database round trip per scope for a work list that is empty by construction.
+        return Ok(report);
+    }
+    for scope in scopes.scopes().await? {
+        match run_once(store, env, scope, leads_secs, limit).await {
+            Ok(one) => {
+                report.swept += 1;
+                report.announced += one.announced;
+            }
+            Err(error) => {
+                report.failed += 1;
+                tracing::error!(
+                    target: "ironauth.certificate_expiry",
+                    tenant = %scope.tenant(),
+                    environment = %scope.environment(),
+                    %error,
+                    "certificate expiry pass failed for this scope; other scopes continue"
+                );
+            }
         }
     }
     Ok(report)
