@@ -114,7 +114,10 @@ fn mapped_attributes_are_requested_and_folded() {
         "username": "sAMAccountName",
         "email": "Mail",
     }));
-    assert!(derived.contains(&"samaccountname".to_owned()), "{derived:?}");
+    assert!(
+        derived.contains(&"samaccountname".to_owned()),
+        "{derived:?}"
+    );
     assert!(derived.contains(&"mail".to_owned()), "{derived:?}");
     // Still both identifiers, because a mapping never removes them.
     assert!(derived.contains(&"entryuuid".to_owned()));
@@ -135,7 +138,13 @@ fn the_requested_list_has_no_duplicates() {
 fn a_malformed_mapping_still_requests_the_identifiers() {
     for bad in [json!("not an object"), json!([1, 2]), json!(null)] {
         let derived = attributes_to_request(&bad);
-        assert!(derived.contains(&"entryuuid".to_owned()), "{bad} -> {derived:?}");
-        assert!(derived.contains(&"objectguid".to_owned()), "{bad} -> {derived:?}");
+        assert!(
+            derived.contains(&"entryuuid".to_owned()),
+            "{bad} -> {derived:?}"
+        );
+        assert!(
+            derived.contains(&"objectguid".to_owned()),
+            "{bad} -> {derived:?}"
+        );
     }
 }

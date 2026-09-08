@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use ironauth_admin::ldap_groups::{expand, GroupSource, Member};
+use ironauth_admin::ldap_groups::{GroupSource, Member, expand};
 
 /// A fixed group graph, which is how a cycle and a 40-deep nesting get tested at all.
 struct Graph {
@@ -134,7 +134,10 @@ fn a_depth_bound_that_cuts_the_walk_reports_an_incomplete_expansion() {
         !out.complete,
         "a truncated walk reported itself as complete: this deprovisions everybody below the cut"
     );
-    assert_eq!(out.truncated_at, ["nested".to_owned()].into_iter().collect());
+    assert_eq!(
+        out.truncated_at,
+        ["nested".to_owned()].into_iter().collect()
+    );
     assert!(
         !out.members.contains("hidden"),
         "the fixture must actually hide somebody, or the assertion above proves nothing"
@@ -221,5 +224,8 @@ fn an_unknown_root_expands_to_nobody() {
     let out = expand(&graph, &["gone".to_owned()], 5).expect("expands");
     assert!(out.members.is_empty());
     assert!(out.complete);
-    assert_eq!(out.groups_visited, ["gone".to_owned()].into_iter().collect());
+    assert_eq!(
+        out.groups_visited,
+        ["gone".to_owned()].into_iter().collect()
+    );
 }

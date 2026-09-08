@@ -108,8 +108,7 @@ pub fn expand<S: GroupSource>(
 
     // Breadth-first, so `depth_reached` means what it says and the truncation set is exactly the
     // frontier rather than whichever branch a depth-first walk happened to abandon.
-    let mut queue: VecDeque<(String, u32)> =
-        roots.iter().map(|dn| (dn.clone(), 0)).collect();
+    let mut queue: VecDeque<(String, u32)> = roots.iter().map(|dn| (dn.clone(), 0)).collect();
 
     while let Some((group_dn, depth)) = queue.pop_front() {
         // THE CYCLE GUARD. Also the diamond guard: without it an acyclic graph still blows up.

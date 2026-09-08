@@ -164,23 +164,33 @@ required-features = ["testing"]
 # Mapping a directory entry to an identity (issue #142). NO database: the mapper is a pure
 # function over an entry and a mapping, which is why this block carries no `required-features`
 # while its neighbours do.
+# Mapping a directory entry to an identity (issue #142). NO database: the mapper is a pure
+# function over an entry and a mapping, which is why this block carries no `required-features`
+# while its neighbours do.
 [[test]]
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
 
-# The organization contact surface (issue #141). Needs a database, like its neighbours.
-[[test]]
-name = "ldap_client"
-path = "tests/ldap_client.rs"
-
+# Expanding nested directory groups (issue #142). NO database: the expansion runs against a fixed
+# graph through the `GroupSource` trait.
 [[test]]
 name = "ldap_groups"
 path = "tests/ldap_groups.rs"
 
+# Directory transport rules and the derived attribute list (issue #142). NO database, and no
+# directory either: the transport decision is made before a socket is opened.
 [[test]]
-name = "ldap_mapping"
-path = "tests/ldap_mapping.rs"
+name = "ldap_client"
+path = "tests/ldap_client.rs"
 
+# The client against a REAL slapd (issue #142). Skips unless IRONAUTH_LDAP_URL is set, because
+# three of the properties it covers are properties of the PROTOCOL and a fixture asserting them
+# only asserts a belief about the protocol.
+[[test]]
+name = "ldap_live"
+path = "tests/ldap_live.rs"
+
+# The organization contact surface (issue #141). Needs a database, like its neighbours.
 [[test]]
 name = "org_contacts"
 path = "tests/org_contacts.rs"
