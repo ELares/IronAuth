@@ -21,13 +21,19 @@
 //! returned here against who is currently provisioned and treats anybody missing as departed --
 //! and under `absence_policy = delete`, deletes them.
 //!
-//! So a truncated expansion looks exactly like a mass departure. Raising a hop limit or adding a
-//! layer of nesting in the directory would deprovision everybody below the cut, which is the
-//! worst outcome this subsystem can produce and would arrive without a single error.
+//! So a truncated expansion looks exactly like a mass departure. LOWERING `max_group_depth`, or
+//! adding a layer of nesting in the directory, would deprovision everybody below the cut -- the
+//! worst outcome this subsystem can produce, arriving without a single error. Raising the bound
+//! is the SAFE direction and the remedy: the member set is monotone in the bound, so raising it
+//! can only add people and can only flip `complete` from false to true.
 //!
-//! [`Expansion::complete`] therefore reports whether the bound was reached, and the type carries
-//! no way to get the member set without it: callers destructure. A caller that means to
-//! deprovision must check it and refuse.
+//! [`Expansion::complete`] therefore reports whether the bound was reached. The type does NOT
+//! enforce that a caller looks at it -- every field is public, and nothing here can stop
+//! `expansion.members` being read on its own. The enforcement lives one layer up, in
+//! `ldap_diff::Diff::departures`, which takes this flag and refuses to name anybody as departed
+//! when it is false. That is the layer where the dangerous conclusion is actually drawn, so it
+//! is the layer worth making unavoidable; saying the type prevented it here would be a comfort
+//! rather than a mechanism.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -55,10 +61,18 @@ pub trait GroupSource {
 
     /// The DIRECT members of one group: no recursion, no transitive members.
     ///
+    /// ASYNC, because the only implementation that matters is a network client. Written
+    /// synchronously first, this trait was one no real source could implement: `ldap3` is
+    /// async throughout, and a blocking shim around it inside a Tokio worker is how a runtime
+    /// gets starved.
+    ///
     /// # Errors
     ///
     /// Whatever the underlying directory query fails with.
-    fn direct_members(&self, group_dn: &str) -> Result<Vec<Member>, Self::Error>;
+    fn direct_members(
+        &self,
+        group_dn: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<Member>, Self::Error>> + Send;
 }
 
 /// The result of expanding one or more group roots.
@@ -95,7 +109,7 @@ pub struct Expansion {
 ///
 /// Propagates the first error from the source. A partial walk is not returned alongside an error:
 /// half a member set is exactly the input that must not reach a deprovisioning comparison.
-pub fn expand<S: GroupSource>(
+pub async fn expand<S: GroupSource + Sync>(
     source: &S,
     roots: &[String],
     max_depth: u32,
@@ -105,6 +119,16 @@ pub fn expand<S: GroupSource>(
     let mut revisited = BTreeSet::new();
     let mut truncated_at = BTreeSet::new();
     let mut depth_reached = 0;
+
+    // ENQUEUED, which is not the same as visited, and the difference was a real bug. Membership
+    // is recorded in `groups_visited` only when a group is POPPED, so a group sitting in the
+    // queue was invisible to the already-reached check below: a second edge arriving at the
+    // bound fell through to the depth branch and was recorded as truncation, on a group that got
+    // read moments later. The walk then reported `complete = false` for a graph it had explored
+    // in full, and which of the two happened depended on the order the server listed members in.
+    //
+    // Seeded with the roots, because a root can also be a member of another root.
+    let mut seen: BTreeSet<String> = roots.iter().cloned().collect();
 
     // Breadth-first, so `depth_reached` means what it says and the truncation set is exactly the
     // frontier rather than whichever branch a depth-first walk happened to abandon.
@@ -118,15 +142,17 @@ pub fn expand<S: GroupSource>(
         }
         depth_reached = depth_reached.max(depth);
 
-        for member in source.direct_members(&group_dn)? {
+        for member in source.direct_members(&group_dn).await? {
             if !member.is_group {
                 members.insert(member.dn);
                 continue;
             }
-            // Already-visited groups are not truncation: they have been, or will be, expanded.
-            // Counting them would report an incomplete walk for a graph fully explored, and a
-            // caller that refuses to deprovision on incompleteness would then never converge.
-            if groups_visited.contains(&member.dn) {
+            // Already-reached groups are not truncation: they have been expanded, or they are
+            // in the queue and will be. Counting them would report an incomplete walk for a
+            // graph fully explored, and a caller that refuses to deprovision on incompleteness
+            // would then never converge. Testing `seen` rather than `groups_visited` is what
+            // makes the "or will be" half of that sentence true.
+            if !seen.insert(member.dn.clone()) {
                 revisited.insert(member.dn);
                 continue;
             }
