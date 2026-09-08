@@ -460,11 +460,16 @@ pub async fn surface_get(
     if intent == "contacts" {
         return contacts_surface(&state, &session).await;
     }
-    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER. `sso`, `domain-verification` and
-    // `log-streams` land in later slices of #140 -- the closed set the `portal_links` intent
-    // CHECK constraint permits is those three, plus `scim` and `certificate-renewal` above --
-    // and the fence has already refused an intent this session does not carry, so what reaches
-    // here is a surface this deployment serves and has not built yet.
+    // THE OTHER INTENTS STILL RENDER THEIR PLACEHOLDER: `sso`, `domain-verification` and
+    // `log-streams`, which land in later slices of #140. The fence has already refused an intent
+    // this session does not carry, so what reaches here is a surface this deployment serves and
+    // has not built yet.
+    //
+    // NO COUNT OF THE CLOSED SET HERE. This sentence used to enumerate it -- "those three, plus
+    // `scim` and `certificate-renewal` above" -- and every new intent made it false in a way
+    // nothing checks: #1151 had to rewrite it, and #1156 landed with it still naming five values
+    // for a set of six. The arms above ARE the list, and `portal_links::INTENTS` plus the two
+    // CHECK constraints are what pin it.
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>{intent}</title>\
          <h1>{intent}</h1>\
@@ -987,18 +992,24 @@ async fn contacts_surface(state: &OidcState, session: &PortalSession) -> Respons
     }
 
     let limit = usize::try_from(PORTAL_LIST_LIMIT).unwrap_or(usize::MAX);
-    if contacts.len() > limit {
+    let truncated = contacts.len() > limit;
+    if truncated {
         let _ = write!(
             body,
             "<p>Showing the first {limit} contacts. Ask your vendor about the rest.</p>"
         );
     }
     body.push_str("<table><tr><th>Name</th><th>Address</th><th>Receives</th></tr>");
-    let mut technical = 0_usize;
+    // COUNTED OVER EVERYTHING READ, not over what is shown. The notice router loops the contact
+    // list TO EXHAUSTION and mails every technical contact wherever it sorts, so counting only
+    // the rendered page lets this page tell a customer nobody is warned while the router is
+    // warning somebody -- an organization whose hundred security contacts sort ahead of its one
+    // technical contact reads "nobody here is warned" and is in fact covered.
+    let technical = contacts
+        .iter()
+        .filter(|contact| contact.category == "technical")
+        .count();
     for contact in contacts.iter().take(limit) {
-        if contact.category == "technical" {
-            technical += 1;
-        }
         let _ = write!(
             body,
             "<tr><td>{name}</td><td>{email}</td><td>{receives}</td></tr>",
@@ -1012,10 +1023,18 @@ async fn contacts_surface(state: &OidcState, session: &PortalSession) -> Respons
         // THE ONE ABSENCE WORTH CALLING OUT. Certificate expiry notices go to the TECHNICAL
         // contacts only, so a list with none of them looks populated and warns nobody about the
         // thing most likely to break this organization's sign-in.
-        body.push_str(
+        //
+        // ONLY WHEN THE WHOLE LIST WAS READ. Past the bound this page has not seen every
+        // contact, and "nobody is warned" is a claim about all of them -- so a truncated list
+        // says what it does not know instead of asserting something the router may contradict.
+        body.push_str(if truncated {
+            "<p>None of the contacts shown is a technical contact. There are more than this \
+             page lists, so ask your vendor whether anyone is warned before your SSO \
+             certificate expires.</p>"
+        } else {
             "<p>None of these is a technical contact, so nobody here is warned before your SSO \
-             certificate expires.</p>",
-        );
+             certificate expires.</p>"
+        });
     }
     crate::pages::secure_html(StatusCode::OK, body)
 }
@@ -1029,8 +1048,14 @@ async fn contacts_surface(state: &OidcState, session: &PortalSession) -> Respons
 fn describes_category(category: &str) -> &'static str {
     match category {
         "technical" => "SSO and provisioning problems, including certificate expiry",
-        "security" => "security notices",
-        "billing" => "billing notices",
+        // NOT "security notices" AND NOT "billing notices". Those read as descriptions of a
+        // routing that does not exist: `CertificateNoticeConsumer` is the only delivery path any
+        // contact category feeds, it compares against `technical` alone, and no other producer
+        // reads this table. Under a heading saying these are the people notices reach, a cell
+        // promising a category of mail nothing sends is the same defect as an empty contact list
+        // that looks populated -- it tells a customer they are covered.
+        "security" => "recorded for future security notices; none are sent yet",
+        "billing" => "recorded for future billing notices; none are sent yet",
         // A category the closed set does not hold. Unreachable through the management API, which
         // refuses anything else, and reported rather than hidden because the alternative is a
         // blank cell that reads as "receives nothing".
