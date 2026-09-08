@@ -96,9 +96,15 @@ impl TestTlsIdentity {
         let leaf_key = KeyPair::generate().expect("generate a leaf keypair");
         // Signed with the SAME root certificate and key that were just self-signed above, so
         // the certificate the leaf chains to is by construction the one the client is handed
-        // as its anchor.
+        // as its anchor. rcgen 0.14 takes an `Issuer` rather than a certificate plus a key, and
+        // this one is built from the SAME `root_params` and `root_key` the self-signed root was
+        // built from a few lines up -- so it carries the same distinguished name and the same
+        // key, and the leaf chains to the certificate handed out as `root_der`. The parsing
+        // constructor that would tie it to those exact bytes, `from_ca_cert_der`, is behind a
+        // feature this crate does not enable.
+        let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
         let leaf = leaf_params
-            .signed_by(&leaf_key, &root, &root_key)
+            .signed_by(&leaf_key, &root_issuer)
             .expect("sign the leaf under the test root");
 
         Self {
