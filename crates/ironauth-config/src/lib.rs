@@ -1014,6 +1014,34 @@ pub struct CertificateExpiryConfig {
     /// ZERO IS REFUSED at load, not floored: see `validate_certificate_expiry`.
     pub sweep_interval_secs: u64,
 
+    /// How long after a replacement is pinned the certificate it superseded stays trusted, in
+    /// DAYS. Zero disables retirement entirely.
+    ///
+    /// # What this bounds
+    ///
+    /// `saml_acs` verifies an assertion against EVERY pinned certificate and deliberately does
+    /// not check `notAfter`, so a superseded certificate keeps working for as long as it stays
+    /// pinned -- which, until this existed, was forever. That is what makes a renewal safe and
+    /// also what makes a key compromised long after it stopped being used still able to mint
+    /// accepted assertions. This is the bound.
+    ///
+    /// # Measured from the REPLACEMENT, not from the expiry
+    ///
+    /// The clock starts when the new certificate is pinned. Those differ whenever a renewal is
+    /// late, which is the case the window exists for: a certificate replaced the day after it
+    /// lapsed still gets the full window rather than being retired immediately.
+    ///
+    /// A certificate is only ever retired if it has EXPIRED and something newer is pinned on the
+    /// same connection, so no pass can leave a connection unable to accept a login.
+    ///
+    /// THIRTY DAYS BY DEFAULT: long enough that an identity provider caching metadata on a
+    /// weekly or fortnightly refresh has certainly seen the replacement, and short enough that a
+    /// retired key is not still a trust anchor a quarter later.
+    ///
+    /// ZERO DISABLES IT, and that is a real choice: a deployment that wants its operators to
+    /// retire certificates by hand keeps every pin until somebody removes it.
+    pub rollover_window_days: u32,
+
     /// How many (certificate, lead) pairs may be announced for ONE SCOPE in one pass.
     ///
     /// PER SCOPE, not per sweep. It is handed to each scope's pass in turn, so a sweep over a
@@ -1034,6 +1062,7 @@ impl Default for CertificateExpiryConfig {
         Self {
             sweep_enabled: false,
             lead_days: vec![30, 14, 3],
+            rollover_window_days: 30,
             sweep_interval_secs: 3_600,
             sweep_batch: 500,
         }

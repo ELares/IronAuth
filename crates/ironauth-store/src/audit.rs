@@ -2105,10 +2105,22 @@ impl ActingContext {
     /// row to the wrong organization delivers it to the wrong customer's SIEM, and that
     /// failure is silent: the delivery succeeds.
     ///
-    /// The TYPED id, not a string: an `OrganizationId` embeds its (tenant, environment),
-    /// so an id from another scope cannot be attached here at all. A string would let a
-    /// caller attribute a row to an organization that does not exist in this environment,
-    /// and the resulting stream would deliver it to whoever owns that id elsewhere.
+    /// The TYPED id, not a string. An `OrganizationId` embeds its (tenant, environment), so the
+    /// attribution CARRIES its scope and a reader can tell a foreign one -- which a bare string
+    /// could not, and a caller could then attribute a row to an organization that does not exist
+    /// in this environment, with the resulting stream delivering it to whoever owns that id
+    /// elsewhere.
+    ///
+    /// IT DOES NOT REFUSE ONE. An earlier version of this paragraph said "an id from another
+    /// scope cannot be attached here at all", which is not what the code does: this is a builder
+    /// returning `Self`, it compares nothing, and a caller holding a foreign handle can attach
+    /// it. What that produces is a row LIVING in this scope while ATTRIBUTED to another --
+    /// reachable, and confirmed by an adversarial review that built one.
+    ///
+    /// WHERE IT IS ACTUALLY REFUSED is the reader:
+    /// [`crate::repository::AuditRepo::search_for_organization`] returns nothing for an
+    /// organization outside its own scope, which is why that guard is load-bearing rather than
+    /// the defensive duplicate it looks like.
     #[must_use]
     pub fn in_organization(mut self, organization: crate::id::OrganizationId) -> Self {
         self.organization = Some(organization);
