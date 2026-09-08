@@ -160,11 +160,14 @@ name = "delegated_admin"
 path = "tests/delegated_admin.rs"
 required-features = ["testing"]
 
-# The organization contact surface (issue #141). Needs a database, like its neighbours.
+# Expanding nested directory groups (issue #142). NO database: the expansion runs against a
+# fixed graph through the `GroupSource` trait, which is why this block carries no
+# `required-features` while its neighbours do.
 [[test]]
 name = "ldap_groups"
 path = "tests/ldap_groups.rs"
 
+# The organization contact surface (issue #141). Needs a database, like its neighbours.
 [[test]]
 name = "org_contacts"
 path = "tests/org_contacts.rs"

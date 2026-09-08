@@ -55,10 +55,18 @@ pub trait GroupSource {
 
     /// The DIRECT members of one group: no recursion, no transitive members.
     ///
+    /// ASYNC, because the only implementation that matters is a network client. Written
+    /// synchronously first, this trait was one no real source could implement: `ldap3` is
+    /// async throughout, and a blocking shim around it inside a Tokio worker is how a runtime
+    /// gets starved.
+    ///
     /// # Errors
     ///
     /// Whatever the underlying directory query fails with.
-    fn direct_members(&self, group_dn: &str) -> Result<Vec<Member>, Self::Error>;
+    fn direct_members(
+        &self,
+        group_dn: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<Member>, Self::Error>> + Send;
 }
 
 /// The result of expanding one or more group roots.
@@ -95,7 +103,7 @@ pub struct Expansion {
 ///
 /// Propagates the first error from the source. A partial walk is not returned alongside an error:
 /// half a member set is exactly the input that must not reach a deprovisioning comparison.
-pub fn expand<S: GroupSource>(
+pub async fn expand<S: GroupSource + Sync>(
     source: &S,
     roots: &[String],
     max_depth: u32,
@@ -108,8 +116,7 @@ pub fn expand<S: GroupSource>(
 
     // Breadth-first, so `depth_reached` means what it says and the truncation set is exactly the
     // frontier rather than whichever branch a depth-first walk happened to abandon.
-    let mut queue: VecDeque<(String, u32)> =
-        roots.iter().map(|dn| (dn.clone(), 0)).collect();
+    let mut queue: VecDeque<(String, u32)> = roots.iter().map(|dn| (dn.clone(), 0)).collect();
 
     while let Some((group_dn, depth)) = queue.pop_front() {
         // THE CYCLE GUARD. Also the diamond guard: without it an acyclic graph still blows up.
@@ -119,7 +126,7 @@ pub fn expand<S: GroupSource>(
         }
         depth_reached = depth_reached.max(depth);
 
-        for member in source.direct_members(&group_dn)? {
+        for member in source.direct_members(&group_dn).await? {
             if !member.is_group {
                 members.insert(member.dn);
                 continue;
