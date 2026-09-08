@@ -307,20 +307,26 @@ async fn two_passes_racing_over_one_certificate_announce_it_once_between_them() 
     // The passes may genuinely not overlap, in which case the second finds nothing due and
     // reports zero of everything; what must never happen is a pass that RAISED, and both
     // `expect`s above already forbid that.
-    // WHAT THIS TEST CAN AND CANNOT GUARANTEE, stated because two earlier versions pretended
-    // otherwise. It guarantees the invariant above: three notices between the two passes, no
-    // more and no fewer, and neither pass raising. It does NOT guarantee that the passes
-    // OVERLAP -- they may serialise, in which case the second finds nothing due and reports
-    // zero of everything, and `already_taken` is never exercised.
+    // THE LOSER REPORTED WHAT IT LOST, which is the assertion that gives `already_taken` any
+    // meaning at all. Exactly three pairs exist and exactly three notices went out, so whatever
+    // the second pass attempted and did not win, it must have counted.
     //
-    // Two earlier guards here claimed to cover that and did not. One was arithmetic that
-    // reduced to a tautology; the other asserted `announced + already_taken >= 3`, which the
-    // line above already forces since `announced` sums to exactly 3. Asserting
-    // `already_taken > 0` instead would be worse: it would be FLAKY, red whenever the runtime
-    // happened to serialise the two futures.
+    // THREE EARLIER GUARDS HERE WERE VACUOUS, each written to fix the last. One was arithmetic
+    // that reduced to a tautology. One asserted `announced + already_taken >= 3`, implied by the
+    // sum above. The third asserted `contested <= 3`, which zero satisfies -- so deleting the
+    // counter entirely left every test green.
     //
-    // So the count is bounded and nothing more is claimed of it.
+    // I justified that third one by saying `> 0` would be FLAKY because the passes might
+    // serialise. A review measured it: they contended on six of six rounds, and each pass
+    // commits three separate transactions with a network round trip apiece, so the window is
+    // wide rather than marginal. The claim was a guess presented as a reason, which is the
+    // habit that produced the other two.
     let contested = left.already_taken + right.already_taken;
+    assert!(
+        contested > 0,
+        "neither pass reported losing a pair, so the counter is enforced by nothing: {left:?} \
+         {right:?}"
+    );
     assert!(
         contested <= 3,
         "more pairs were reported taken than there are thresholds: {left:?} {right:?}"
@@ -446,6 +452,14 @@ async fn a_renewal_landing_mid_pass_is_counted_not_raised() {
         "the renewal landed without the pass noticing, so the interleaving this test exists for \
          did not happen: {report:?}"
     );
+    // AND AT MOST THE VICTIM'S THREE. Without a ceiling this accepts `announced: 0,
+    // vanished: 30` -- a pass that lost EVERYTHING and reported it -- which is a different and
+    // much worse outcome than the one this test is about. Nine other certificates were never
+    // touched and must have been announced.
+    assert!(
+        report.vanished <= 3,
+        "more pairs vanished than the one renewed certificate has thresholds: {report:?}"
+    );
     assert_eq!(
         report.announced + report.vanished,
         30,
@@ -495,8 +509,63 @@ async fn a_clock_before_the_epoch_is_a_clock_fault_and_says_so() {
     // AND THE MESSAGE NAMES THE CLOCK. Whoever is paged by this is being sent somewhere; before
     // round 2 they were told the envelope failed to decrypt, which would send them to the
     // crypto layer for a wrong system clock.
-    assert!(
-        message.contains("clock"),
-        "the failure does not name the clock, so it sends the reader elsewhere: {message}"
+    // AND IT IS THE CLOCK'S MESSAGE, not merely a message mentioning clocks. `contains("clock")`
+    // alone cannot reject a DIFFERENT fault whose text happens to say clock, which is exactly
+    // what an unreadable certificate id did until this round -- it was mapped to the clock arm
+    // and would have satisfied this assertion while naming the wrong cause.
+    assert_eq!(
+        message, "the clock is before the Unix epoch or out of range",
+        "the failure is not the clock fault, so it sends the reader elsewhere: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_id_that_will_not_parse_names_the_id_and_not_the_clock() {
+    // THE `UnreadableId` ARM. Round 2 created the error type so a failure would say what
+    // happened; round 3 found the parse call site had never been converted, so a corrupt id
+    // reported "the clock is before the Unix epoch" and sent whoever was paged to look at NTP.
+    // Fixing the mapping without this test would leave the arm exactly as unmeasured as the bug
+    // that produced it -- which is the shape this work keeps repeating.
+    //
+    // THE ROW IS WRITTEN AS THE OWNER, because no repository method can produce it: 0197 types
+    // the column as bare `text` with no format CHECK, so the schema permits an id the type
+    // cannot read while every writer above it refuses one.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Globex").await;
+    let connection = connect(&db, &env, scope, &org, "https://idp.example/corrupt").await;
+    let now = now_micros(&env);
+
+    sqlx::query(
+        "INSERT INTO saml_connection_certificates \
+         (id, tenant_id, environment_id, connection_id, key_kind, public_key, certificate_der, \
+          fingerprint_sha256, not_before, not_after) \
+         VALUES ('not-a-certificate-id', $1, $2, $3, 'ecdsa_p256', $4, $5, $6, \
+                 TIMESTAMPTZ 'epoch' + ($7::text || ' microseconds')::interval, \
+                 TIMESTAMPTZ 'epoch' + ($8::text || ' microseconds')::interval)",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .bind(connection.to_string())
+    .bind(p256_point(120))
+    .bind(vec![0x30_u8, 0x82, 120])
+    .bind(fingerprint(120))
+    .bind(now - 365 * DAY * 1_000_000)
+    .bind(now + 2 * DAY * 1_000_000)
+    .execute(db.owner_pool())
+    .await
+    .expect("the schema accepts an id the type cannot read");
+
+    let outcome =
+        ironauth_admin::certificate_expiry::run_once(db.control_store(), &env, scope, LEADS, 100)
+            .await;
+    let message = match outcome {
+        Err(error) => error.to_string(),
+        Ok(report) => panic!("an unreadable id produced a pass rather than a fault: {report:?}"),
+    };
+    assert_eq!(
+        message, "a stored certificate id did not parse",
+        "the failure names the wrong cause, so it sends the reader to the wrong place: {message}"
     );
 }

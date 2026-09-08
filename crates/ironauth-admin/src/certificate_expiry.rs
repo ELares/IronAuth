@@ -112,22 +112,24 @@ pub struct SweepReport {
 ///
 /// # The store must be the CONTROL-plane one
 ///
-/// 0208 grants the alert ledger to `ironauth_control` alone, so a pass handed the data-plane
-/// store fails on its first insert. The type cannot say this -- both planes are a `Store` -- so
-/// it is said here, as the sibling sweeper does.
+/// 0208 grants the alert ledger to `ironauth_control` alone -- SELECT and INSERT both -- so a
+/// pass handed the data-plane store fails on its first READ, before it has anything to record.
+/// An earlier version said "on its first insert", which is wrong about where it breaks and would
+/// send somebody looking at the write path. The type cannot express the requirement, because
+/// both planes are a `Store`, so it is said here.
 ///
 /// # Errors
 ///
-/// [`StoreError::Database`] if reading the due set or recording a notice fails.
+/// [`SweepError::Store`] if reading the due set or recording a notice fails.
 ///
-/// [`StoreError::Internal`] for four states that should not arise and are not the caller's: a
-/// clock before the Unix epoch, a microsecond count that will not fit an `i64`, an envelope the
-/// registry will not build, and a certificate id in a row of this scope that will not parse as
-/// one. All four reported `Encryption` until a review pointed out that it renders as "envelope
-/// decryption failed", which none of them is.
+/// [`SweepError::Clock`] if the clock is before the Unix epoch or its microsecond count will not
+/// fit an `i64`; [`SweepError::Envelope`] if the registry will not build a notice for a type it
+/// carries; [`SweepError::UnreadableId`] if a certificate id in a row of this scope will not
+/// parse as one. All three reported `StoreError::Encryption` until a review pointed out that it
+/// renders as "envelope decryption failed", which none of them is.
 ///
-/// NOT [`StoreError::Conflict`] or [`StoreError::NotFound`]: both are races rather than faults,
-/// and both are COUNTED in the report. See [`SweepReport`].
+/// NOT a `Conflict` or a `NotFound`: both are races rather than faults, and both are COUNTED in
+/// the report rather than returned. See [`SweepReport`].
 ///
 /// A pass stops at the first genuine failure. The pairs it has already recorded stay recorded
 /// and the next pass picks up the rest, because every pair is decided independently by its own
@@ -181,7 +183,7 @@ pub async fn run_once(
         // item, which would hide it.
         let certificate =
             ironauth_store::SamlCertificateId::parse_in_scope(&item.certificate_id, &scope)
-                .map_err(|_| SweepError::Clock)?;
+                .map_err(|_| SweepError::UnreadableId)?;
 
         match alerts
             .record_sent(
