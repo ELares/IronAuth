@@ -91,6 +91,7 @@ pub mod log_shipper;
 pub mod log_stream_signature;
 
 mod agents;
+pub mod certificate_expiry;
 mod challenge_components;
 pub mod ciba_ping;
 mod claims_mappings;
