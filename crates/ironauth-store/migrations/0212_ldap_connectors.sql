@@ -51,9 +51,13 @@ CREATE TABLE ldap_connectors (
     user_filter           text        NOT NULL,
     group_filter          text        NOT NULL,
 
-    -- HOW ATTRIBUTES BECOME IDENTITY. The SAME shape `saml_connections.attribute_mapping` and
-    -- the SCIM path use, deliberately: #142 asks for one attribute-mapping mental model across
-    -- both directory paths rather than two divergent systems.
+    -- HOW ATTRIBUTES BECOME IDENTITY. A flat `{ "canonical field": "source attribute" }`
+    -- object: the shape the SCIM push path uses, and deliberately that one rather than
+    -- `saml_connections.attribute_mapping`, which is a DIFFERENT shape -- a typed
+    -- `ClaimMapping { subject, traits }` with `deny_unknown_fields`, built for pulling claims out
+    -- of an assertion. #142 asks for one attribute-mapping mental model across the two
+    -- provisioning paths, which are this column and the SCIM one; SAML sign-in is a third thing
+    -- and is not it.
     attribute_mapping     jsonb       NOT NULL DEFAULT '{}'::jsonb,
 
     -- WHAT ABSENCE MEANS. #142's deletion-propagation criterion: a user gone from the directory
@@ -138,7 +142,11 @@ CREATE POLICY ldap_connectors_scope ON ldap_connectors
 -- certificate, a connector row records no history worth keeping -- what it DID is in the audit
 -- log and in the sync runs, neither of which this row owns.
 GRANT SELECT, INSERT, DELETE ON ldap_connectors TO ironauth_control;
-GRANT UPDATE ON ldap_connectors TO ironauth_control;
+-- UPDATE is column-scoped to exactly what a statement writes, the shape 0189 uses. The only
+-- UPDATE in the tree is `set_active`, which writes these two. A privilege for a write nothing
+-- performs is one nobody can account for later, and here the withheld columns are the ones that
+-- decide which organization the sync reads and how the connection is protected.
+GRANT UPDATE (active, updated_at) ON ldap_connectors TO ironauth_control;
 
 -- The DATA plane gets NOTHING. Nothing served on a request path reads a directory connector:
 -- the sync is a background job on the control plane, and a token is minted from the users and

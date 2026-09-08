@@ -7,10 +7,12 @@
 //! The connector is what every later slice of #142 reads: the sync, the snapshot diff, the
 //! scheduler. Two properties matter more than the CRUD:
 //!
-//! - a connector can only be pointed at an organization in its OWN scope, because the foreign
-//!   key proves existence and not visibility -- referential integrity bypasses row-level
-//!   security, and a connector aimed at another scope's organization would sync that
-//!   organization's users;
+//! - a connector can only be pointed at an organization that is in its own scope, exists, and
+//!   has not been deleted. Three different mechanisms enforce those: the scope-typed
+//!   `OrganizationId` guard in `create`, the foreign key, and the `AND deleted_at IS NULL`
+//!   conjunct in the insert's `EXISTS`. Only the last of the three has no other backstop, since
+//!   the foreign key still matches a soft-deleted row -- referential integrity bypasses
+//!   row-level security, as 0205 says;
 //! - the closed sets (`tls_mode`, `absence_policy`) are closed at the DATABASE, so the insecure
 //!   choice cannot be reached by a typo.
 
@@ -53,8 +55,13 @@ fn spec<'a>(
         organization_id: organization,
         display_name: "Contoso AD",
         host: "ad.contoso.test",
-        port: 636,
-        tls_mode: LdapTlsMode::Ldaps,
+        port: 389,
+        // DELIBERATELY NOT THE COLUMN DEFAULTS. `tls_mode`, `absence_policy` and
+        // `max_group_depth` all default in 0212 to 'ldaps', 'deactivate' and 10, so a fixture
+        // carrying those values makes every round-trip assertion on them unable to tell a value
+        // that was written from a value the column supplied. Four mutations that dropped the
+        // caller's choice on the floor passed against the first version of this file.
+        tls_mode: LdapTlsMode::StartTls,
         bind_dn: "cn=svc-ironauth,ou=service,dc=contoso,dc=test",
         bind_secret_name: "contoso-ad-bind",
         user_base_dn: "ou=people,dc=contoso,dc=test",
@@ -62,8 +69,8 @@ fn spec<'a>(
         user_filter: "(objectClass=user)",
         group_filter: "(objectClass=group)",
         attribute_mapping: mapping,
-        absence_policy: LdapAbsencePolicy::Deactivate,
-        max_group_depth: 10,
+        absence_policy: LdapAbsencePolicy::Delete,
+        max_group_depth: 7,
     }
 }
 
@@ -100,8 +107,8 @@ async fn a_connector_round_trips_every_field_it_was_configured_with() {
     assert_eq!(read.organization_id, org);
     assert_eq!(read.display_name, "Contoso AD");
     assert_eq!(read.host, "ad.contoso.test");
-    assert_eq!(read.port, 636);
-    assert_eq!(read.tls_mode, LdapTlsMode::Ldaps);
+    assert_eq!(read.port, 389);
+    assert_eq!(read.tls_mode, LdapTlsMode::StartTls);
     assert_eq!(
         read.bind_dn,
         "cn=svc-ironauth,ou=service,dc=contoso,dc=test"
@@ -112,17 +119,28 @@ async fn a_connector_round_trips_every_field_it_was_configured_with() {
     assert_eq!(read.user_filter, "(objectClass=user)");
     assert_eq!(read.group_filter, "(objectClass=group)");
     assert_eq!(read.attribute_mapping, mapping);
-    assert_eq!(read.absence_policy, LdapAbsencePolicy::Deactivate);
-    assert_eq!(read.max_group_depth, 10);
+    assert_eq!(read.absence_policy, LdapAbsencePolicy::Delete);
+    assert_eq!(read.max_group_depth, 7);
     assert!(read.active, "a new connector is active");
 }
 
 #[tokio::test]
 async fn a_connector_cannot_be_pointed_at_another_scopes_organization() {
-    // THE FOREIGN KEY IS NOT ENOUGH. It proves the organization EXISTS, not that it is visible
-    // here: 0205 states outright that referential integrity bypasses row-level security. Without
-    // the `EXISTS` in the insert, a connector could be aimed at a neighbouring environment's
-    // organization and its sync would write that organization's users.
+    // A connector aimed at a neighbouring environment's organization would sync that
+    // organization's users, so this must be refused. It is worth being precise about WHAT
+    // refuses it, because the first version of this comment credited the wrong mechanism:
+    //
+    // `OrganizationId` is scope-typed, and `create` compares the handle's scope to its own
+    // before any SQL runs. So this test is stopped by that guard and never reaches the
+    // statement. Deleting the SQL `EXISTS` entirely leaves this test passing.
+    //
+    // That does not make the `EXISTS` redundant, and the two things it does are covered
+    // elsewhere: refusing an organization that does not exist at all (the next test, where
+    // dropping the clause falls through to a raw foreign-key violation rather than
+    // `NotFound`), and refusing a SOFT-DELETED one, which the foreign key still matches and
+    // the scope guard cannot see -- see
+    // `a_connector_aimed_at_a_deleted_organization_is_refused`, the only test that fails when
+    // the `AND deleted_at IS NULL` conjunct is removed.
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
@@ -330,4 +348,221 @@ async fn a_tls_mode_this_build_does_not_know_is_an_error_and_not_a_default() {
         matches!(error, StoreError::Database(_)),
         "it must surface as a decode failure rather than a silent default: {error:?}"
     );
+}
+
+/// Every variant of both closed sets survives a write and a read.
+///
+/// The shared fixture deliberately carries the NON-default variants, which is what lets the
+/// round-trip test see a write path that drops the caller's choice. This covers the other side,
+/// so the default-valued variants are not left untested by that move.
+#[tokio::test]
+async fn every_transport_and_absence_variant_round_trips() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let mapping = serde_json::json!({});
+
+    for (tls, absence, depth) in [
+        (LdapTlsMode::Ldaps, LdapAbsencePolicy::Deactivate, 0),
+        (LdapTlsMode::StartTls, LdapAbsencePolicy::Delete, 64),
+        (LdapTlsMode::Plaintext, LdapAbsencePolicy::Deactivate, 1),
+    ] {
+        let id = LdapConnectorId::generate(&env, &scope);
+        let mut new = spec(&id, &org, &mapping);
+        new.tls_mode = tls;
+        new.absence_policy = absence;
+        new.max_group_depth = depth;
+        db.control_store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .ldap_connectors()
+            .create(&env, new)
+            .await
+            .expect("create");
+
+        let read = db
+            .control_store()
+            .scoped(scope)
+            .ldap_connectors()
+            .get(&id)
+            .await
+            .expect("read back");
+        assert_eq!(read.tls_mode, tls, "tls_mode did not survive the write");
+        assert_eq!(
+            read.absence_policy, absence,
+            "absence_policy did not survive"
+        );
+        assert_eq!(
+            read.max_group_depth, depth,
+            "max_group_depth did not survive"
+        );
+    }
+}
+
+/// A connector cannot be aimed at an organization that has been deleted.
+///
+/// This is the ONLY thing the `EXISTS` in the insert does that nothing else already does. The
+/// foreign key still matches a soft-deleted organization, because the row is retained, and the
+/// typed scope guard only covers the cross-scope case. Removing the `AND deleted_at IS NULL`
+/// conjunct left the whole suite green before this existed.
+#[tokio::test]
+async fn a_connector_aimed_at_a_deleted_organization_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+
+    db.control_store()
+        .management()
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .organizations(scope)
+        .delete(&env, &org)
+        .await
+        .expect("soft-delete the organization");
+
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({});
+    let outcome = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(&env, spec(&id, &org, &mapping))
+        .await;
+
+    assert!(
+        matches!(outcome, Err(StoreError::NotFound)),
+        "a connector aimed at a deleted organization must be refused: {outcome:?}"
+    );
+}
+
+/// The twin of the `tls_mode` skew test, for the arm that had none.
+///
+/// The doc on `ldap_connector_from_row` claims BOTH closed sets decode as an error rather than a
+/// default. Only `tls_mode` was measured: replacing the `absence_policy` arm with
+/// `unwrap_or(Deactivate)` -- and, worse, with `unwrap_or(Delete)` -- left the suite green.
+/// `Delete` is the dangerous direction: a policy this build cannot read would become the one
+/// that removes accounts.
+#[tokio::test]
+async fn an_absence_policy_this_build_does_not_know_is_an_error_and_not_a_default() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({});
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(&env, spec(&id, &org, &mapping))
+        .await
+        .expect("create");
+
+    sqlx::query(
+        "ALTER TABLE ldap_connectors DROP CONSTRAINT ldap_connectors_absence_policy_known, \
+         ADD CONSTRAINT ldap_connectors_absence_policy_known \
+             CHECK (absence_policy IN ('deactivate', 'delete', 'quarantine'))",
+    )
+    .execute(db.owner_pool())
+    .await
+    .expect("widen the constraint the way a later migration would");
+    sqlx::query("UPDATE ldap_connectors SET absence_policy = 'quarantine' WHERE id = $1")
+        .bind(id.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("write the policy this build has never heard of");
+
+    let error = db
+        .control_store()
+        .scoped(scope)
+        .ldap_connectors()
+        .get(&id)
+        .await
+        .expect_err("an unknown absence_policy must not decode to anything");
+    assert!(
+        matches!(error, StoreError::Database(_)),
+        "it must surface as a decode failure rather than a silent default: {error:?}"
+    );
+}
+
+/// The isolation is the POLICY, not the repository's `WHERE` clause.
+///
+/// Every statement in `LdapConnectorRepo` carries an explicit scope predicate, so the row-level
+/// policy is pure defence in depth and no test asked the database directly. Replacing the policy
+/// body with `USING (true) WITH CHECK (true)` passed all six tests, all 47 migration tests and
+/// `scoped-table-registration.sh`, which reads the FORCE-RLS set and never a policy predicate.
+#[tokio::test]
+async fn the_isolation_policy_and_not_only_the_where_clause_refuses_a_neighbour() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let one = db.seed_scope(&env).await;
+    let two = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, one, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &one);
+    let mapping = serde_json::json!({});
+    db.control_store()
+        .scoped(one)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(&env, spec(&id, &org, &mapping))
+        .await
+        .expect("write in scope one");
+
+    let mut conn = db.control_pool().acquire().await.expect("acquire");
+    sqlx::query("SELECT set_config('ironauth.tenant_id', $1, false)")
+        .bind(two.tenant().to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("pin tenant to scope two");
+    sqlx::query("SELECT set_config('ironauth.environment_id', $1, false)")
+        .bind(two.environment().to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("pin environment to scope two");
+
+    // No WHERE clause at all: whatever comes back is what the POLICY allowed.
+    let rows = sqlx::query("SELECT id FROM ldap_connectors")
+        .fetch_all(&mut *conn)
+        .await
+        .expect("raw read");
+    assert!(
+        rows.is_empty(),
+        "a raw read pinned to another scope saw a connector, so the policy is not the boundary"
+    );
+}
+
+/// The control plane's UPDATE privilege covers exactly the columns a statement writes.
+///
+/// 0212 first granted UPDATE table-wide while its only UPDATE (`set_active`) writes two columns.
+/// The withheld ones are not incidental: `organization_id` decides whose directory is read,
+/// `tls_mode` whether the bind is encrypted, and `bind_secret_name` which credential is used.
+/// A privilege for a write nothing performs is one nobody can account for later.
+///
+/// Derived from the catalog rather than from the migration text, so editing the GRANT without
+/// editing this test is what fails.
+#[tokio::test]
+async fn the_control_update_grant_is_scoped_to_the_columns_a_statement_writes() {
+    let db = TestDatabase::start().await;
+    let granted: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.column_privileges \
+         WHERE table_name = 'ldap_connectors' AND grantee = 'ironauth_control' \
+           AND privilege_type = 'UPDATE' ORDER BY column_name",
+    )
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the catalog");
+
+    assert_eq!(
+        granted,
+        vec!["active".to_owned(), "updated_at".to_owned()],
+        "the control plane's UPDATE grant is not the set `set_active` writes"
+    );
+    for withheld in ["organization_id", "tls_mode", "bind_secret_name", "host"] {
+        assert!(
+            !granted.iter().any(|c| c == withheld),
+            "{withheld} is updatable by the control plane and no statement writes it"
+        );
+    }
 }

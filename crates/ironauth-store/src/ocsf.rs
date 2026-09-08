@@ -263,8 +263,10 @@ const ACCESS_MANAGEMENT_DOMAINS: &[&str] = &[
     // signature bearing our name means, which is an access-management fact and not a
     // configuration edit.
     "saml_sp_key",
-    // `ldap_connector` (issue #142) belongs with the other directory connectors and not with
-    // configuration, for the reason `scim_push_connection` gives: this row names a directory
+    // `ldap_connector` (issue #142) belongs here for the reason `scim_connection` does, one
+    // screen up -- NOT the reason `scim_push_connection` gives, which is the opposite one and
+    // puts that row on the entity-management list: an OUTBOUND connection is configuration for
+    // somewhere else. This is an INBOUND directory: this row names a directory
     // whose contents BECOME users and group memberships in one organization, and the group
     // memberships become roles. Pointing it somewhere else, or switching it on, changes who can
     // sign in and what they may do -- an access-management fact, not a settings edit.
