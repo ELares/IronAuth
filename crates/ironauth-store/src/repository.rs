@@ -76940,11 +76940,16 @@ impl SamlCertificateAlertRepo<'_> {
     /// connection is not visible in this scope stops producing a work item at all -- silently,
     /// with no row and no error.
     ///
-    /// A REMOVED ORGANIZATION PRODUCES NO WORK ITEM EITHER, for the same reason and by the same
-    /// mechanism. `organizations` soft-deletes, and a certificate pinned on a connection whose
-    /// organization is gone has no contact list to notify -- so a work item for it is work the
-    /// sweep cannot complete, and it would be retried on every pass for ever. The join requires
-    /// the organization to be live.
+    /// A REMOVED ORGANIZATION PRODUCES NO WORK ITEM EITHER, though NOT because its contacts are
+    /// gone -- they are not. `org_contacts` filters each CONTACT's own `deleted_at` and never the
+    /// organization's, so a soft-deleted organization keeps a readable contact list, and an
+    /// earlier version of this paragraph was wrong to say otherwise.
+    ///
+    /// The reason is that there is nothing left to warn ABOUT. A removed organization signs
+    /// nobody in, so its identity provider's certificate expiring breaks nothing, and a notice
+    /// saying "renew this or logins stop" is false on its face. That the contacts are still
+    /// reachable is exactly why this filter has to be explicit: without it the sweep would find
+    /// somebody to tell and tell them.
     ///
     /// A DISABLED ORGANIZATION STILL GETS ITS NOTICE, and that is a decision rather than an
     /// oversight. `organizations` carries TWO lifecycle facts -- `deleted_at` and a `state` of

@@ -516,6 +516,7 @@ async fn the_notice_and_the_ledger_row_commit_together() {
         &serde_json::json!({
             "saml_certificate_id": certificate.to_string(),
             "saml_connection_id": connection.to_string(),
+            "organization_id": org.to_string(),
             "lead_secs": 3 * DAY,
             "not_after_unix_ms": (now + 2 * DAY * 1_000_000) / 1000,
         }),
@@ -715,6 +716,7 @@ async fn a_failure_after_the_notice_rolls_the_ledger_row_back() {
         &serde_json::json!({
             "saml_certificate_id": certificate.to_string(),
             "saml_connection_id": connection.to_string(),
+            "organization_id": org.to_string(),
             "lead_secs": 3 * DAY,
             "not_after_unix_ms": (now + 2 * DAY * 1_000_000) / 1000,
         }),

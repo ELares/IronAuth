@@ -4214,6 +4214,10 @@ as a sentinel, so an absent one means absent.
     "not_after_unix_ms": {
       "type": "integer"
     },
+    "organization_id": {
+      "minLength": 1,
+      "type": "string"
+    },
     "saml_certificate_id": {
       "minLength": 1,
       "type": "string"
@@ -4226,6 +4230,7 @@ as a sentinel, so an absent one means absent.
   "required": [
     "saml_certificate_id",
     "saml_connection_id",
+    "organization_id",
     "lead_secs",
     "not_after_unix_ms"
   ],
@@ -4241,6 +4246,7 @@ as a sentinel, so an absent one means absent.
 {
   "saml_certificate_id": "saml_certificate_id_example",
   "saml_connection_id": "saml_connection_id_example",
+  "organization_id": "organization_id_example",
   "lead_secs": 1,
   "not_after_unix_ms": 1735689600000
 }
