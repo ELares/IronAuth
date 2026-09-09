@@ -39,6 +39,16 @@ trap cleanup EXIT
 echo "mcp-conformance: building the sample server"
 (cd packages/mcp-sample && npm install --silent >/dev/null 2>&1 && npm run build >/dev/null)
 
+# THE RUST BINARY IS BUILT BEFORE THE CLOCK, and this line is what makes the paragraph below
+# true. It used to say the clock started "AFTER the toolchain build" while nothing had built
+# the Rust binary: the first `cargo run` below compiled the whole workspace INSIDE the timed
+# window. A measured run took 166s against a 300s budget with most of that spent compiling,
+# which is exactly the "measure of CI cache state" the paragraph warns against -- and it
+# regenerated the page's bucket from "under 60s" to "under 300s", turning a run in which all
+# ten items passed into a red lane.
+echo "mcp-conformance: building the emulator, outside the timed window"
+cargo build --quiet -p ironauth --bin ironauth
+
 # THE QUICKSTART CLOCK. Started here, AFTER the toolchain build, and the boundary is the
 # point: a cold `cargo build` of this workspace can exceed five minutes on its own, on a
 # shared runner, for reasons that have nothing to do with the quickstart. Timing it would
@@ -137,9 +147,16 @@ data["items"].append(
         # within the budget" would just repeat the outcome column in words. The bucket is a
         # real measurement that is stable across ordinary runs, so the page says how much
         # headroom there was rather than merely that there was some.
+        # THE BUCKET IS KEPT, and the build it used to include is not. The drift that made this
+        # page stale was compilation inside the timed window, not the bucket, so the fix is the
+        # `cargo build` above rather than replacing a real measurement with a restatement of the
+        # outcome column -- which is what the sentence below this one already argued against.
+        #
+        # An OVER-BUDGET run says so. The evidence used to read "under 300s" beside an outcome
+        # of "fail", which is a page contradicting itself on the one run where it matters.
         "evidence": (
             f"emulator start to authorized MCP call, bucketed: "
-            f"{'under 60s' if elapsed < 60 else 'under 150s' if elapsed < 150 else 'under 300s'}"
+            f"{'under 60s' if elapsed < 60 else 'under 150s' if elapsed < 150 else 'under 300s' if elapsed <= budget else f'OVER {budget}s'}"
             f" (budget {budget}s)"
         ),
     }
