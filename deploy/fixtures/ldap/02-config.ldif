@@ -5,10 +5,24 @@
 
 # THE SERVICE ACCOUNT MUST BE ABLE TO READ THE TREE. The image's default ACL ends with
 # `to * by self read by dn="cn=admin,..." write by * none`, so a bound `cn=svc` can read its own
-# entry and nothing else -- and OpenLDAP reports a denied read as `noSuchObject` (32), not as a
-# permission error, so the symptom is a directory that looks EMPTY. An empty directory read is
-# exactly the shape `ldap_diff` refuses as "everybody vanished", so without this the live tests
-# would exercise the refusal path instead of the paging path they exist for.
+# entry and nothing else. OpenLDAP reports a denied read as `noSuchObject` (32) rather than as a
+# permission error -- back-mdb sets that result when the requester lacks ACL_DISCLOSE -- so a
+# tester reading ldapsearch output sees "No such object" for a subtree that plainly exists.
+#
+# MEASURED, by deleting this ACL from a live server and running both suites:
+#
+#   * `ldap_live` goes 6 passed / 1 failed. Only the PAGING test binds as `cn=svc` (the others
+#     bind as `cn=admin`, which the default ACL already allows), and it fails on its own fixture
+#     precondition -- "the fixture must refuse an unpaged read with sizeLimitExceeded" -- with
+#     rc=32, because a denied read and a refused-for-size read are different results.
+#   * `ldap_live_pass` goes 0 passed / 1 failed, on "the connector produced no plan": the sweep
+#     binds as `cn=svc` exactly as production does, and `search_all` ends in `result.success()?`
+#     so rc=32 becomes a `DirectoryError` rather than an empty entry list.
+#
+# Two earlier versions of this comment were wrong about that. The first said the directory would
+# "look EMPTY" and the diff would refuse it as everybody-vanished; nothing gets far enough to
+# diff anything. The second said every live test would fail; six of them bind as admin and do
+# not care.
 #
 # Inserted BEFORE the default catch-all: olcAccess is ordered and the first match wins.
 dn: olcDatabase={1}mdb,cn=config
