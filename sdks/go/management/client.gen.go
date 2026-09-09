@@ -246,6 +246,13 @@ func (c *Client) CreateInvitation(tenant_id string, environment_id string, query
 	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/invitations", query, body)
 }
 
+// CreateLdapConnector performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors.
+//
+// `POST .../ldap-connectors`.
+func (c *Client) CreateLdapConnector(tenant_id string, environment_id string, organization_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("POST", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/ldap-connectors", query, body)
+}
+
 // CreateLogStream performs POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams.
 //
 // Configure a SIEM log stream.
@@ -482,6 +489,13 @@ func (c *Client) DeleteExternalIssuer(tenant_id string, environment_id string, i
 // Deregister an HTTP flow target.
 func (c *Client) DeleteFlowTarget(tenant_id string, environment_id string, target_id string, query url.Values) (*http.Response, error) {
 	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/flow-targets/" + escape(target_id), query, nil)
+}
+
+// DeleteLdapConnector performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}.
+//
+// `DELETE .../ldap-connectors/{connector_id}`.
+func (c *Client) DeleteLdapConnector(tenant_id string, environment_id string, organization_id string, connector_id string, query url.Values) (*http.Response, error) {
+	return c.do("DELETE", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/ldap-connectors/" + escape(connector_id), query, nil)
 }
 
 // DeleteLocale performs DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}.
@@ -1175,6 +1189,20 @@ func (c *Client) ListFlowVersions(tenant_id string, environment_id string, journ
 // List invitations under an environment (cursor paginated), filterable by state.
 func (c *Client) ListInvitations(tenant_id string, environment_id string, query url.Values) (*http.Response, error) {
 	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/invitations", query, nil)
+}
+
+// ListLdapConnectorHealth performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health.
+//
+// `GET .../ldap-connectors/health`.
+func (c *Client) ListLdapConnectorHealth(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/ldap-connectors/health", query, nil)
+}
+
+// ListLdapConnectors performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors.
+//
+// `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors`.
+func (c *Client) ListLdapConnectors(tenant_id string, environment_id string, organization_id string, query url.Values) (*http.Response, error) {
+	return c.do("GET", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/ldap-connectors", query, nil)
 }
 
 // ListLogStreamDeadLetters performs GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters.
@@ -1882,6 +1910,13 @@ func (c *Client) SetClientSigningAlgorithm(tenant_id string, environment_id stri
 // Enable or disable a registered external issuer.
 func (c *Client) SetExternalIssuerEnabled(tenant_id string, environment_id string, issuer_id string, query url.Values, body any) (*http.Response, error) {
 	return c.do("PATCH", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/external-issuers/" + escape(issuer_id), query, body)
+}
+
+// SetLdapConnectorActive performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}/active.
+//
+// `PUT .../ldap-connectors/{connector_id}/active`.
+func (c *Client) SetLdapConnectorActive(tenant_id string, environment_id string, organization_id string, connector_id string, query url.Values, body any) (*http.Response, error) {
+	return c.do("PUT", "/v1/tenants/" + escape(tenant_id) + "/environments/" + escape(environment_id) + "/organizations/" + escape(organization_id) + "/ldap-connectors/" + escape(connector_id) + "/active", query, body)
 }
 
 // SetLocale performs PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}.

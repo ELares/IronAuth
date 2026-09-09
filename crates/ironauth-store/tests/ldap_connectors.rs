@@ -91,7 +91,7 @@ async fn a_connector_round_trips_every_field_it_was_configured_with() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &org, &mapping), None)
+        .create(&env, spec(&id, &org, &mapping), None, None)
         .await
         .expect("create the connector");
 
@@ -154,7 +154,7 @@ async fn a_connector_cannot_be_pointed_at_another_scopes_organization() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &theirs, &mapping), None)
+        .create(&env, spec(&id, &theirs, &mapping), None, None)
         .await
         .expect_err("a cross-scope organization must be refused");
     assert!(matches!(refusal, StoreError::NotFound), "{refusal:?}");
@@ -184,7 +184,7 @@ async fn an_organization_that_does_not_exist_is_refused() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &phantom, &mapping), None)
+        .create(&env, spec(&id, &phantom, &mapping), None, None)
         .await
         .expect_err("no such organization");
     assert!(matches!(refusal, StoreError::NotFound), "{refusal:?}");
@@ -210,7 +210,7 @@ async fn the_scheduler_sees_active_connectors_across_organizations_and_not_switc
             .scoped(scope)
             .acting(db.test_actor(&env), CorrelationId::generate(&env))
             .ldap_connectors()
-            .create(&env, spec(&id, org, &mapping), None)
+            .create(&env, spec(&id, org, &mapping), None, None)
             .await
             .expect("create");
         ids.push(id);
@@ -230,7 +230,7 @@ async fn the_scheduler_sees_active_connectors_across_organizations_and_not_switc
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .set_active(&env, &first, &ids[0], false)
+        .set_active(&env, &first, &ids[0], false, None)
         .await
         .expect("switch off");
 
@@ -277,7 +277,7 @@ async fn the_closed_sets_are_closed_at_the_database() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &org, &mapping), None)
+        .create(&env, spec(&id, &org, &mapping), None, None)
         .await
         .expect("create");
 
@@ -319,7 +319,7 @@ async fn a_tls_mode_this_build_does_not_know_is_an_error_and_not_a_default() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &org, &mapping), None)
+        .create(&env, spec(&id, &org, &mapping), None, None)
         .await
         .expect("create");
 
@@ -377,7 +377,7 @@ async fn every_transport_and_absence_variant_round_trips() {
             .scoped(scope)
             .acting(db.test_actor(&env), CorrelationId::generate(&env))
             .ldap_connectors()
-            .create(&env, new, None)
+            .create(&env, new, None, None)
             .await
             .expect("create");
 
@@ -428,7 +428,7 @@ async fn a_connector_aimed_at_a_deleted_organization_is_refused() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &org, &mapping), None)
+        .create(&env, spec(&id, &org, &mapping), None, None)
         .await;
 
     assert!(
@@ -456,7 +456,7 @@ async fn an_absence_policy_this_build_does_not_know_is_an_error_and_not_a_defaul
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &org, &mapping), None)
+        .create(&env, spec(&id, &org, &mapping), None, None)
         .await
         .expect("create");
 
@@ -506,7 +506,7 @@ async fn the_isolation_policy_and_not_only_the_where_clause_refuses_a_neighbour(
         .scoped(one)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &org, &mapping), None)
+        .create(&env, spec(&id, &org, &mapping), None, None)
         .await
         .expect("write in scope one");
 
@@ -593,6 +593,7 @@ async fn a_connector_may_sync_users_and_no_groups() {
                 ..spec(&id, &org, &mapping)
             },
             None,
+            None,
         )
         .await
         .expect("a users-only connector is storable");
@@ -638,6 +639,7 @@ async fn a_connector_with_no_user_base_is_still_refused() {
                 ..spec(&id, &org, &mapping)
             },
             None,
+            None,
         )
         .await;
     assert!(
@@ -670,6 +672,7 @@ async fn a_group_base_without_a_filter_is_refused() {
                 group_filter: "",
                 ..spec(&id, &org, &mapping)
             },
+            None,
             None,
         )
         .await;
@@ -705,6 +708,7 @@ async fn a_whitespace_group_base_is_blank_to_the_schema_too() {
                 ..spec(&id, &org, &mapping)
             },
             None,
+            None,
         )
         .await
         .expect("a whitespace group base needs no filter, because the sweep reads it as none");
@@ -734,6 +738,7 @@ async fn a_whitespace_user_base_is_refused() {
                 ..spec(&id, &org, &mapping)
             },
             None,
+            None,
         )
         .await;
     assert!(
@@ -759,7 +764,7 @@ async fn another_organizations_connector_cannot_be_paused() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &owner, &mapping), None)
+        .create(&env, spec(&id, &owner, &mapping), None, None)
         .await
         .expect("create");
 
@@ -768,7 +773,7 @@ async fn another_organizations_connector_cannot_be_paused() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .set_active(&env, &stranger, &id, false)
+        .set_active(&env, &stranger, &id, false, None)
         .await;
     assert!(
         matches!(refused, Err(StoreError::NotFound)),
@@ -790,7 +795,7 @@ async fn another_organizations_connector_cannot_be_paused() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .set_active(&env, &owner, &id, false)
+        .set_active(&env, &owner, &id, false, None)
         .await
         .expect("the owning organization pauses its own connector");
 }
@@ -809,7 +814,7 @@ async fn another_organizations_connector_cannot_be_deleted() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .create(&env, spec(&id, &owner, &mapping), None)
+        .create(&env, spec(&id, &owner, &mapping), None, None)
         .await
         .expect("create");
 
@@ -818,7 +823,7 @@ async fn another_organizations_connector_cannot_be_deleted() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .delete(&env, &stranger, &id)
+        .delete(&env, &stranger, &id, None)
         .await;
     assert!(
         matches!(refused, Err(StoreError::NotFound)),
@@ -838,7 +843,7 @@ async fn another_organizations_connector_cannot_be_deleted() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .delete(&env, &owner, &id)
+        .delete(&env, &owner, &id, None)
         .await
         .expect("the owning organization deletes its own connector");
 }

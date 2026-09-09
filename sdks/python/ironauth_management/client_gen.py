@@ -151,6 +151,10 @@ class Client:
         """Create an invitation for a new identity. POST /v1/tenants/{tenant_id}/environments/{environment_id}/invitations."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/invitations", query, body)
 
+    def create_ldap_connector(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`POST .../ldap-connectors`. POST /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors."""
+        return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/ldap-connectors", query, body)
+
     def create_log_stream(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Configure a SIEM log stream. POST /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams."""
         return self._do("POST", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/log-streams", query, body)
@@ -286,6 +290,10 @@ class Client:
     def delete_flow_target(self, tenant_id: str, environment_id: str, target_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Deregister an HTTP flow target. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/flow-targets/{target_id}."""
         return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/flow-targets/{urllib.parse.quote(target_id)}", query, None)
+
+    def delete_ldap_connector(self, tenant_id: str, environment_id: str, organization_id: str, connector_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`DELETE .../ldap-connectors/{connector_id}`. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}."""
+        return self._do("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/ldap-connectors/{urllib.parse.quote(connector_id)}", query, None)
 
     def delete_locale(self, tenant_id: str, environment_id: str, locale: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """Delete a per-environment locale bundle by tag. DELETE /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}."""
@@ -682,6 +690,14 @@ class Client:
     def list_invitations(self, tenant_id: str, environment_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List invitations under an environment (cursor paginated), filterable by state. GET /v1/tenants/{tenant_id}/environments/{environment_id}/invitations."""
         return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/invitations", query, None)
+
+    def list_ldap_connector_health(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`GET .../ldap-connectors/health`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/ldap-connectors/health", query, None)
+
+    def list_ldap_connectors(self, tenant_id: str, environment_id: str, organization_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
+        """`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors`. GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors."""
+        return self._do("GET", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/ldap-connectors", query, None)
 
     def list_log_stream_dead_letters(self, tenant_id: str, environment_id: str, stream_id: str, query: dict[str, Any] | None = None) -> tuple[int, bytes]:
         """List a stream's outstanding dead letters. GET /v1/tenants/{tenant_id}/environments/{environment_id}/log-streams/{stream_id}/dead-letters."""
@@ -1086,6 +1102,10 @@ class Client:
     def set_external_issuer_enabled(self, tenant_id: str, environment_id: str, issuer_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Enable or disable a registered external issuer. PATCH /v1/tenants/{tenant_id}/environments/{environment_id}/external-issuers/{issuer_id}."""
         return self._do("PATCH", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/external-issuers/{urllib.parse.quote(issuer_id)}", query, body)
+
+    def set_ldap_connector_active(self, tenant_id: str, environment_id: str, organization_id: str, connector_id: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
+        """`PUT .../ldap-connectors/{connector_id}/active`. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}/active."""
+        return self._do("PUT", f"/v1/tenants/{urllib.parse.quote(tenant_id)}/environments/{urllib.parse.quote(environment_id)}/organizations/{urllib.parse.quote(organization_id)}/ldap-connectors/{urllib.parse.quote(connector_id)}/active", query, body)
 
     def set_locale(self, tenant_id: str, environment_id: str, locale: str, query: dict[str, Any] | None = None, body: Any | None = None) -> tuple[int, bytes]:
         """Set (create or overwrite) a per-environment locale bundle. PUT /v1/tenants/{tenant_id}/environments/{environment_id}/locales/{locale}."""

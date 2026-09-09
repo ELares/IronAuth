@@ -638,6 +638,32 @@ pub async fn create_ldap_connector(
         display_name: display_name.clone(),
     };
     let stored_body = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
+    // The domain event (issue #108). It names the HOST and the TLS MODE beside the ids, because
+    // the question a consumer asks about a directory connector is "where is this organization's
+    // identity data now read from, and is that connection protected". Neither the bind DN nor
+    // the secret name travels: see the catalog entry.
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "ldap_connector.created",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "ldap_connector_id": subject,
+            "organization_id": org_id.to_string(),
+            "host": host,
+            "tls_mode": tls_mode.as_str(),
+        }),
+    );
+    let created_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            subject: &subject,
+            envelope,
+        });
     let result = state
         .store()
         .scoped(scope)
@@ -672,6 +698,7 @@ pub async fn create_ldap_connector(
                 response_status: 201,
                 response_body: &stored_body,
             }),
+            created_event.as_ref(),
         )
         .await;
 
@@ -748,13 +775,42 @@ pub async fn set_ldap_connector_active(
     // connector exists somewhere.
     let id =
         LdapConnectorId::parse_in_scope(&connector_id, &scope).map_err(|_| ApiError::NotFound)?;
+    // ONE event with a boolean rather than two types: a consumer's question is "is this
+    // organization's directory still being read", and two types would make that a join.
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "ldap_connector.active_changed",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "ldap_connector_id": subject,
+            "organization_id": org_id.to_string(),
+            "active": request.active,
+        }),
+    );
+    let active_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            subject: &subject,
+            envelope,
+        });
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .in_organization(org_id)
         .ldap_connectors()
-        .set_active(state.env(), &org_id, &id, request.active)
+        .set_active(
+            state.env(),
+            &org_id,
+            &id,
+            request.active,
+            active_event.as_ref(),
+        )
         .await
         .map_err(|error| match error {
             StoreError::NotFound => ApiError::NotFound,
@@ -816,13 +872,33 @@ pub async fn delete_ldap_connector(
     // THE SNAPSHOT AND THE HEALTH ROW GO WITH IT, by the cascade 0214 and 0215 declare. A set of
     // directory identifiers whose connector has been removed is PII nothing will ever read
     // again, and health describing a directory nobody syncs is noise in the listing.
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "ldap_connector.deleted",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "ldap_connector_id": subject,
+            "organization_id": org_id.to_string(),
+        }),
+    );
+    let deleted_event = envelope
+        .as_ref()
+        .map(|envelope| ironauth_store::DomainEvent {
+            id: &event_id,
+            subject: &subject,
+            envelope,
+        });
     state
         .store()
         .scoped(scope)
         .acting(actor, CorrelationId::generate(state.env()))
         .in_organization(org_id)
         .ldap_connectors()
-        .delete(state.env(), &org_id, &id)
+        .delete(state.env(), &org_id, &id, deleted_event.as_ref())
         .await
         .map_err(|error| match error {
             StoreError::NotFound => ApiError::NotFound,

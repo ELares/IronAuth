@@ -139,6 +139,7 @@ async fn seed_connector(
                 max_group_depth: 5,
             },
             None,
+            None,
         )
         .await
         .expect("create connector");

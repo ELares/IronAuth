@@ -1379,6 +1379,89 @@
       "type": "invitation.revoked"
     },
     {
+      "domain": "ldap_connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "ldap_connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "ldap_connector_id",
+          "organization_id",
+          "active"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ldap_connector.active_changed"
+    },
+    {
+      "domain": "ldap_connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "ldap_connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "tls_mode": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "ldap_connector_id",
+          "organization_id",
+          "host",
+          "tls_mode"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ldap_connector.created"
+    },
+    {
+      "domain": "ldap_connector",
+      "payload_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "ldap_connector_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "organization_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "ldap_connector_id",
+          "organization_id"
+        ],
+        "type": "object"
+      },
+      "payload_schema_version": 1,
+      "type": "ldap_connector.deleted"
+    },
+    {
       "domain": "locale_bundle",
       "payload_schema": {
         "additionalProperties": false,

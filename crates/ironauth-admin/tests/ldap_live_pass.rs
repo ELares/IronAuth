@@ -112,6 +112,7 @@ async fn the_sweeps_own_connection_carries_the_configured_ceiling() {
                 max_group_depth: 5,
             },
             None,
+            None,
         )
         .await
         .expect("configure the connector");
@@ -214,6 +215,7 @@ async fn a_pass_provisions_every_person_in_a_live_directory() {
                 absence_policy: LdapAbsencePolicy::Deactivate,
                 max_group_depth: 5,
             },
+            None,
             None,
         )
         .await
