@@ -363,6 +363,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let trait_migration = trait_migration_inputs(&config, &env);
         let offboarding = offboarding_inputs(&config, &env);
         let certificate_sweep = certificate_sweep_inputs(&config, &env);
+        // THE CONTROL PLANE IS REQUIRED for the LDAP sweep too: `ldap_connectors` grants nothing
+        // to the data plane, and the bind secrets sit behind the same role.
+        let ldap_sweep =
+            select_control_dsn(&config).and_then(|dsn| ldap_sweep_inputs(&config, &dsn));
+        // RESOLVED HERE because `config` moves into `Server::new` below, and the sweep starts
+        // after that. Pairing it with the inputs keeps the two halves of one decision together.
+        let ldap_sweep_master = ldap_sweep
+            .as_ref()
+            .and_then(|_| resolve_master_key(&config));
         let certificate_pin = certificate_pin_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
@@ -538,6 +547,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_certificate_sweep(inputs).await,
             None => None,
         };
+        // THE LDAP SWEEP (issue #142). Its own switch, like every other worker here. It PLANS
+        // only: a pass reads each configured directory and produces what a sync would do, and
+        // nothing applies it. What that buys before the applier exists is the operator signal --
+        // a connector nobody can bind to, a directory whose group walk is truncated -- which is
+        // the state that must not first be discovered by a mass deprovisioning.
+        let ldap_sweep = match ldap_sweep {
+            Some(inputs) => start_ldap_sweep(inputs, ldap_sweep_master).await,
+            None => None,
+        };
         // THE PIN WORKER (issue #141). The renewal surface is the only thing that fills its
         // queue, and that surface is mounted everywhere, so this is too.
         let certificate_pin_pools = spawn_certificate_pin_pools(certificate_pin).await;
@@ -606,6 +624,12 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         // pair is decided by its own committed ledger row, and a certificate this tick did not
         // reach is still due on the next boot.
         if let Some(sweep) = certificate_sweep {
+            sweep.abort();
+        }
+        // AND THE LDAP SWEEP. Aborted rather than awaited for the same reason and one more: it
+        // WRITES NOTHING, so a pass cut mid-tick leaves no half-applied state anywhere -- the
+        // worst case is a directory read that is thrown away.
+        if let Some(sweep) = ldap_sweep {
             sweep.abort();
         }
         if let Some(shipper) = log_shipper {
@@ -3566,6 +3590,17 @@ fn message_delivery_inputs(config: &Config, env: &Env) -> Option<MessageDelivery
 }
 
 /// What the certificate-expiry sweep worker connects with.
+/// What the LDAP sweep needs at boot (issue #142).
+struct LdapSweepInputs {
+    /// The CONTROL-plane connection: `ldap_connectors` grants nothing to the data plane, and the
+    /// bind secrets live behind the control role too.
+    control_dsn: String,
+    /// How often a pass runs.
+    interval: std::time::Duration,
+    /// How many connectors one pass reads per scope.
+    batch: i64,
+}
+
 struct CertificateSweepInputs {
     /// The CONTROL-plane connection.
     ///
@@ -3752,6 +3787,104 @@ async fn start_certificate_sweep(
 /// `lead_days` that yields no usable lead means nobody is warned at all, on any replica, and is
 /// something the operator did not ask for: they turned alerting ON. Both return `None`, because
 /// neither should spawn a ticker; the second WARNS on its way out.
+/// The LDAP sweep's inputs, or `None` when this process does not run it.
+fn ldap_sweep_inputs(config: &Config, control_dsn: &str) -> Option<LdapSweepInputs> {
+    if !config.ldap_sync.sweep_enabled {
+        return None;
+    }
+    if config.ldap_sync.sweep_batch <= 0 {
+        // SAID OUT LOUD, the way the certificate sweep says it: an operator turned the sweep on
+        // and configured a batch that reads no connectors, so the process would boot and sync
+        // nothing with nothing in the log to explain it.
+        tracing::warn!(
+            configured = config.ldap_sync.sweep_batch,
+            "ldap sync is enabled but ldap_sync.sweep_batch reads no connectors, so nothing will \
+             be swept; it must be positive"
+        );
+        return None;
+    }
+    Some(LdapSweepInputs {
+        control_dsn: control_dsn.to_owned(),
+        interval: std::time::Duration::from_secs(config.ldap_sync.sweep_interval_secs.max(1)),
+        batch: config.ldap_sync.sweep_batch,
+    })
+}
+
+/// Start the LDAP sweep, if this process runs it.
+async fn start_ldap_sweep(
+    inputs: LdapSweepInputs,
+    master: Option<std::sync::Arc<MasterKey>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let LdapSweepInputs {
+        control_dsn,
+        interval,
+        batch,
+    } = inputs;
+    // NO MASTER KEY MEANS NO BIND PASSWORD. Every connector would fail to open, so the sweep
+    // would tick forever reporting every directory unreachable. Refusing to start says the real
+    // thing once instead of hourly.
+    let Some(master) = master else {
+        tracing::error!(
+            "ldap sync NOT running: no master key is configured, so no bind secret can be opened"
+        );
+        return None;
+    };
+    let control_store = match Store::connect(&control_dsn).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "ldap sync NOT running: control-plane connect failed");
+            return None;
+        }
+    };
+    let scopes: Arc<dyn ScopeSource> = Arc::new(ControlPlaneScopes::new(control_store.clone()));
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // DELAY, for the reason the certificate sweep gives: a process paused past several ticks
+        // must not then read every customer's directory that many times in a row.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match ironauth_admin::ldap_boot::run_pass(
+                &control_store,
+                scopes.as_ref(),
+                &master,
+                batch,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if report.failed > 0 || report.refusing_departures > 0 {
+                        tracing::warn!(
+                            scopes = report.scopes,
+                            planned = report.planned,
+                            failed = report.failed,
+                            refusing_departures = report.refusing_departures,
+                            rename_fragile = report.rename_fragile,
+                            "ldap sync pass finished with connectors that need attention"
+                        );
+                    } else {
+                        tracing::info!(
+                            scopes = report.scopes,
+                            planned = report.planned,
+                            rename_fragile = report.rename_fragile,
+                            "ldap sync pass finished"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "ldap sync pass failed to read its connectors");
+                }
+            }
+        }
+    });
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        batch,
+        "ldap sync is running; it PLANS only and applies nothing"
+    );
+    Some(handle)
+}
+
 fn certificate_sweep_settings(config: &Config) -> Option<CertificateSweepSettings> {
     if !config.certificate_expiry.sweep_enabled {
         return None;

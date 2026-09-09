@@ -255,6 +255,10 @@ pub struct Config {
     /// at thirty days" is making one decision, and it should have one name.
     pub certificate_expiry: CertificateExpiryConfig,
 
+    /// Read-only LDAP/AD inbound sync (issue #142).
+    #[serde(default)]
+    pub ldap_sync: LdapSyncConfig,
+
     /// Feature toggles keyed by registered feature name. Enabling an
     /// experimental feature additionally requires `ack` equal to the
     /// feature's exact current version; see the feature reference in the
@@ -957,6 +961,40 @@ impl Default for FlowTargetsConfig {
             delivery_enabled: false,
             // Under the 30s outbox visibility timeout, so a delivery cannot outlive its lease.
             delivery_timeout_secs: 10,
+        }
+    }
+}
+
+/// Read-only LDAP/AD inbound sync (issue #142).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct LdapSyncConfig {
+    /// Whether THIS process runs the sweep. OFF by default.
+    ///
+    /// Off for the reason `certificate_expiry.sweep_enabled` is off: more than one process runs
+    /// this binary, and a pass is work that must not be multiplied by the number of replicas.
+    /// Unlike that sweep there is no ledger making a duplicate pass harmless -- two passes read
+    /// the same directories and produce the same plans -- so here it is wasted directory load on
+    /// somebody else's server rather than wasted local work.
+    pub sweep_enabled: bool,
+
+    /// How often a pass runs, in seconds.
+    ///
+    /// An hour by default. A directory sync is not a login path: the cost of learning about a
+    /// new hire an hour late is small, and the cost of hammering a customer's Active Directory is
+    /// theirs to pay.
+    pub sweep_interval_secs: u64,
+
+    /// How many connectors one pass reads per scope.
+    pub sweep_batch: i64,
+}
+
+impl Default for LdapSyncConfig {
+    fn default() -> Self {
+        Self {
+            sweep_enabled: false,
+            sweep_interval_secs: 3_600,
+            sweep_batch: 100,
         }
     }
 }
