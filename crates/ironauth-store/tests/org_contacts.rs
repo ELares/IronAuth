@@ -1437,3 +1437,191 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
         .await
         .expect("the data plane must be able to read the list it delivers to");
 }
+
+/// Block until `expected` backends are waiting on a lock, instead of sleeping and hoping.
+///
+/// Lifted from `tenant_lifecycle.rs`, whose version says it reaches "the exact interleaving,
+/// reached without guessing a sleep". Panicking here is the point: a run where the racers never
+/// both park has not tested the thing, and must say so rather than pass.
+async fn wait_until_backends_are_lock_blocked(pool: &sqlx::PgPool, expected: i64) {
+    for _ in 0..2_000 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if blocked >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{expected} backends never blocked on the row lock, so the racers did not interleave");
+}
+
+/// One removal that announces, for the racers below to run concurrently.
+///
+/// Extracted so the test itself stays under the line ceiling, and so both racers are provably
+/// running the SAME call rather than two hand-written ones that could drift apart.
+async fn remove_announcing(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+    organization: &OrganizationId,
+    id: &OrgContactId,
+) -> bool {
+    // A FRESH ID PER CALL, because that is what production does
+    // (`ironauth-admin/src/org_contacts.rs` mints one per request) and because sharing one
+    // disarmed every assertion below. The id becomes the outbox `idempotency_key`, which carries
+    // a UNIQUE index, so two racers reusing it made the loser's enqueue raise 23505 -- aborting
+    // its transaction, rolling back its audit row and its event, and leaving the database in
+    // exactly the state correct code produces. The no-op mutation "failed" on that crash with
+    // zero assertions evaluated.
+    let event_id = format!("evt_{}", CorrelationId::generate(env));
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "org_contact.removed",
+        &scope.tenant().to_string(),
+        &scope.environment().to_string(),
+        now_micros(env) / 1000,
+        &serde_json::json!({
+            "org_contact_id": id.to_string(),
+            "organization_id": organization.to_string(),
+            "category": "technical",
+        }),
+    )
+    .expect("the removed type is registered");
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(env), CorrelationId::generate(env))
+        .org_contacts()
+        .remove_with_event(
+            env,
+            organization,
+            id,
+            now_micros(env),
+            Some(&ironauth_store::DomainEvent {
+                id: &event_id,
+                subject: &id.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("remove must not error, whoever loses")
+}
+
+/// THE CONCURRENT LOSER, forced (issue #1147).
+///
+/// Two removals of the same contact race. Both settle probes read the row as live, both UPDATEs
+/// park on the row lock, and the loser re-evaluates `deleted_at IS NULL` under READ COMMITTED
+/// against the winner's committed row and matches nothing. The arm that handles that was
+/// executed by NO test: replacing it with a no-op left all sixteen store tests and the one admin
+/// test green, and so did replacing it with `panic!` -- the direct proof nothing reached it.
+///
+/// What the unmeasured arm was holding back is not a wrong return value alone. The loser would
+/// have reported `Ok(true)`, committed an `org_contact.remove` AUDIT ROW attributing another
+/// transaction's removal to this actor, and enqueued a SECOND `org_contact.removed`, so a
+/// consumer counting removals would over-count.
+///
+/// WHY THE BARRIER, stated accurately. An earlier version of this comment said `tokio::join!`
+/// cannot produce the race because the two calls serialise. That is false, and measured: a bare
+/// `join!` of two `remove_with_event` futures reaches the loser arm on every run, because the two
+/// futures interleave at every Postgres round trip and the pool has connections to spare.
+///
+/// The barrier is here for a different and better reason: it makes "both probes complete before
+/// either UPDATE commits" an ENFORCED property rather than a scheduling outcome. Without it the
+/// test still reaches the arm on this machine, but nothing says it must, and a box where one
+/// racer is slow to connect would take the already-removed early return and quietly test
+/// nothing.
+#[tokio::test]
+async fn a_forced_concurrent_double_removal_removes_once_and_audits_once() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Acme").await;
+    let id = add(
+        &db,
+        &env,
+        scope,
+        &org,
+        "Ada",
+        "ada@acme.example",
+        "technical",
+    )
+    .await
+    .expect("add");
+
+    // THE BARRIER. A plain SELECT does not block on this, so both racers' settle probes still
+    // see a live row; their UPDATEs then park here.
+    let mut gate = db.owner_pool().begin().await.expect("begin the gate");
+    sqlx::query("SELECT id FROM org_contacts WHERE id = $1 FOR UPDATE")
+        .bind(id.to_string())
+        .fetch_one(&mut *gate)
+        .await
+        .expect("lock the row");
+
+    let db = std::sync::Arc::new(db);
+    let env = std::sync::Arc::new(env);
+    let org = std::sync::Arc::new(org);
+    let id = std::sync::Arc::new(id);
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let db = std::sync::Arc::clone(&db);
+        let env = std::sync::Arc::clone(&env);
+        let org = std::sync::Arc::clone(&org);
+        let id = std::sync::Arc::clone(&id);
+        handles.push(tokio::spawn(async move {
+            remove_announcing(&db, &env, scope, &org, &id).await
+        }));
+    }
+
+    // WAIT FOR THE INTERLEAVING RATHER THAN GUESSING AT IT. The first version slept 300ms and
+    // hoped both racers had parked; on a slower box one could still have been connecting, the
+    // winner would commit alone, and the straggler would take the already-removed early return
+    // -- turning this back into the vacuous case it replaced, silently. `tenant_lifecycle.rs`
+    // already had the answer: poll `pg_stat_activity` until backends are actually blocked on a
+    // lock, which both removes the guess and ASSERTS the state the test needs.
+    wait_until_backends_are_lock_blocked(db.owner_pool(), 2).await;
+    gate.commit().await.expect("release the gate");
+
+    let mut removed = 0_usize;
+    for handle in handles {
+        if handle.await.expect("task") {
+            removed += 1;
+        }
+    }
+    assert_eq!(
+        removed, 1,
+        "exactly one caller may report a removal, however they interleave"
+    );
+
+    // ONE AUDIT ROW. The loser's transaction rolls back, so its row must not survive: an audit
+    // trail claiming two actors each removed the same contact is worse than a missing one.
+    let audited: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE target_id = $1 AND action = 'org_contact.remove'",
+    )
+    .bind(id.to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the audit log");
+    assert_eq!(
+        audited.len(),
+        1,
+        "the audit log records {} removals of one contact: {audited:?}",
+        audited.len()
+    );
+
+    // AND ONE EVENT, so a consumer counting removals counts removals.
+    let announced = queued_events(&db, &env, scope).await;
+    let removals: Vec<_> = announced
+        .iter()
+        .filter(|e| e["type"] == "org_contact.removed")
+        .collect();
+    assert_eq!(
+        removals.len(),
+        1,
+        "the removal was announced {} times: {announced:?}",
+        removals.len()
+    );
+}
