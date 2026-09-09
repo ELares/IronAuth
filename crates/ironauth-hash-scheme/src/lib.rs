@@ -927,6 +927,92 @@ mod tests {
         );
     }
 
+    /// Vectors from OTHER implementations for the four schemes that had none.
+    ///
+    /// THREE schemes already had foreign vectors: SHA-crypt (Drepper's spec vectors), the LDAP
+    /// digests, and Firebase modified scrypt, whose published vector is a real
+    /// cross-implementation check on `scrypt::scrypt` output. bcrypt, scrypt, PBKDF2 and Argon2
+    /// did not: their tests hash with this crate's own libraries and verify the result back,
+    /// which is a ROUND TRIP and passes under any self-consistent change of defaults or of PHC
+    /// interpretation.
+    ///
+    /// That is the whole reason these exist, and it is worth stating WITHOUT the tidier claim an
+    /// earlier version made. It said these four were "exactly the schemes whose libraries the
+    /// #1049 bump moves a major version each", which is false twice over: `bcrypt` is not a
+    /// `RustCrypto` crate at all (it has no `password-hash` edge and no newer major, so nothing in
+    /// that bump can move it), and Firebase runs on the same `scrypt` crate while sitting in the
+    /// already-covered column. The honest statement is the plain one -- these four had
+    /// round-trip-only coverage.
+    ///
+    /// These digests come from `CPython`'s `hashlib` and Apache `htpasswd` -- no Rust in them.
+    /// The scrypt parameters are RFC 7914 section 12's third vector; the PBKDF2 ones follow
+    /// RFC 6070's inputs with SHA-256 and SHA-512.
+    ///
+    /// `l=64` on the SHA-512 case is NOT decoration. Output length is a PHC parameter, and
+    /// omitting it makes the reader fall back to its default of 32 and compare a truncation of
+    /// the digest. The first draft left it out and this test caught it -- a third-party string
+    /// carrying a non-default length is exactly what a round trip against our own encoder never
+    /// produces.
+    #[test]
+    fn foreign_implementation_known_answer_vectors() {
+        for (stored, password, scheme) in [
+            (
+                "$scrypt$ln=14,r=8,p=1$U29kaXVtQ2hsb3JpZGU$cCO9yzr9c0hGHAbNgf046/2o+7qQT44+\
+                 qbVD9lRdofLVQylVYT8Pz2LUlwUkKpr55h6F3A1lHkDfzwF7RVdYhw",
+                "pleaseletmein",
+                Scheme::Scrypt,
+            ),
+            (
+                "$pbkdf2-sha256$i=4096$c2FsdA$xeR41ZKIyEGqUw22hFxMjZYok6ABzk4RpJY4c6qYE0o",
+                "password",
+                Scheme::Pbkdf2,
+            ),
+            (
+                "$pbkdf2-sha512$i=4096,l=64$c2FsdA$0Zexsz2wFD4BixLz0dFHnmzevcyXxcD4f2kC4HL0\
+                 V7UUPzBgJkGz1VzTNZiMs2uEN2Bg7NUy4Dm3QqI5Q0ry1Q",
+                "password",
+                Scheme::Pbkdf2,
+            ),
+            (
+                "$2y$10$yhN0d6GKbKGpH4SBhyVmY.QVTyxJJ9LQ1zdnZB.acJhkDktUCjt4u",
+                "correct horse",
+                Scheme::Bcrypt,
+            ),
+        ] {
+            let stored: String = stored.split_whitespace().collect();
+            assert_kat(&stored, password, scheme);
+        }
+    }
+
+    /// Argon2, FROZEN rather than independent.
+    ///
+    /// No Argon2 implementation outside the Rust dependency tree was available here, so these
+    /// strings were emitted by the implementation this build already uses. They are NOT evidence
+    /// that this build is correct -- they are a baseline. An upgrade that reads them differently
+    /// fails here instead of reaching an imported user.
+    ///
+    /// THE FIRST ONE CARRIES NON-DEFAULT COSTS, and that is the whole point. The original frozen
+    /// vector was `m=19456,t=2,p=1`, which is `argon2::Params::DEFAULT` exactly -- so a reader
+    /// that stopped honouring what the stored string DECLARES and substituted its own defaults
+    /// verified it green. A mutation discarding the parsed params before verifying was caught by
+    /// the scrypt and PBKDF2 vectors and sailed past this one, which is precisely the failure it
+    /// was written to catch. It is the same rule the `l=64` note above states, broken three
+    /// paragraphs later.
+    ///
+    /// The all-default string is kept as the SECOND case, because a default-configured producer
+    /// really does emit it and the digest bytes are still worth pinning; it just cannot carry the
+    /// parameter-fidelity property on its own.
+    #[test]
+    fn the_frozen_argon2_vectors_still_read_the_same_way() {
+        for stored in [
+            // m=64, t=3, p=2 -- every cost differs from the library default.
+            "$argon2id$v=19$m=64,t=3,p=2$aXJvbmF1dGhrYXYwMQ$Ea/OF4SRkXhUo4ESUkRqV5XgY4PdMegemCLFSxeBa8k",
+            "$argon2id$v=19$m=19456,t=2,p=1$aXJvbmF1dGhrYXYwMQ$Cux2Jl9MsBRRAOhVxZDiwTQAkIDpGUyI1JN7FXnmaew",
+        ] {
+            assert_kat(stored, "correct horse", Scheme::Argon2);
+        }
+    }
+
     /// The published SHA-crypt specification vectors (Drepper), asserted as CONSTANTS
     /// rather than round-tripped through this crate's own hasher.
     ///

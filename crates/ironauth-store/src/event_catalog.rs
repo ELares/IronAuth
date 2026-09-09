@@ -2890,7 +2890,7 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         // through the management API, where scope and permission are checked; putting them on the
         // wire would spread a customer's pinned trust material across every subscriber and the
         // outbox row it sits in.
-        "saml_certificate.expiring",
+        "saml_certificate.expiry_announced",
         1,
         r#"{
             "type": "object",

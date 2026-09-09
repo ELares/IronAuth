@@ -1508,7 +1508,11 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
     let (subscribed, secret, base) = register(&h, &tenant, &environment).await;
     let (uninterested, _, _) = register_as(&h, &tenant, &environment, "k-register-2").await;
     for (endpoint, wanted, key) in [
-        (&subscribed, "saml_certificate.expiring", "k-types-1"),
+        (
+            &subscribed,
+            "saml_certificate.expiry_announced",
+            "k-types-1",
+        ),
         (&uninterested, "user.created", "k-types-2"),
     ] {
         let (status, _, body) = h
@@ -1551,7 +1555,10 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
         .expect("claim the event");
     assert_eq!(events.len(), 1, "the sweep emits exactly one event");
     let envelope = &events[0].payload;
-    assert_eq!(envelope["type"], "saml_certificate.expiring", "{envelope}");
+    assert_eq!(
+        envelope["type"], "saml_certificate.expiry_announced",
+        "{envelope}"
+    );
     // THE SCOPE PAIR, which the model test above asserts and this one dropped. The producer
     // passes tenant and environment as two adjacent positional &str derived from one Scope, so
     // swapping them compiles, routes correctly (delivery reads the outbox row's own columns,
@@ -1625,7 +1632,7 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
 /// assertion worth naming on its own: the catalog's promise that no certificate bytes and no
 /// fingerprint go on the wire was a comment with nothing behind it until this checked it.
 fn assert_renewal_body_carries_no_trust_material(body: &serde_json::Value, event_id: &str) {
-    assert_eq!(body["type"], "saml_certificate.expiring", "{body}");
+    assert_eq!(body["type"], "saml_certificate.expiry_announced", "{body}");
     assert_eq!(body["id"], event_id, "{body}");
     let mut carried: Vec<&str> = body["payload"]
         .as_object()

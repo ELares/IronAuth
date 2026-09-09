@@ -17,10 +17,28 @@ doc-valid-idents = ["IronAuth", "IronCache", "IronBus", "OpenID", "OAuth", "Open
 # SILENT -- `TryFrom<&str> for Program` (cel-0.14.3/src/lib.rs:213) calls `compile` internally,
 # and a path-based lint cannot see through to a different DefId. Naming the TYPES closes the
 # constructor routes; naming `resolve` closes the one that never mentions `Program` at all.
+# TWO DOORS to an unverified TLS peer, and a text scan could not see either.
+#
+# The first guard for this was a test that read its own source file for the string
+# `set_no_tls_verify`. Review defeated it twice with compiling code: the scanner stripped
+# comments with `line.split("//").next()`, which truncates at the first double slash -- in a
+# module whose whole subject is `ldap://` URLs, so a line mentioning one hides the call after it
+# -- and it read only that one file, so the same call in a sibling module was invisible. Its
+# second literal, `dangerous_accept`, occurs ZERO times in ldap3, rustls or native-tls, so half
+# the guard was scanning for a name nothing would ever contain.
+#
+# A path lint sees the call wherever it is written and however the line is formatted.
+# `set_no_tls_verify` is the direct door; `set_config` is the other one, because a caller-supplied
+# rustls ClientConfig can carry `dangerous().set_certificate_verifier(...)` and reach the same
+# place without naming the first.
 disallowed-methods = [
     { path = "cel::Program::compile", reason = "compile through ironauth_cel::compile_within_budget, which refuses an expression whose cost exceeds the budget; calling this directly yields an unbudgeted program (issue #113 criterion 2)" },
     { path = "cel::Value::resolve", reason = "evaluate through ironauth_cel::BudgetedProgram::evaluate, which enforces the declared input shape; resolving a parsed expression directly skips both the budget and the shape (issue #113 criterion 2)" },
+    { path = "ldap3::LdapConnSettings::set_no_tls_verify", reason = "a directory bind sends the service account password, so the certificate must be verified; there is deliberately no configuration route to this (issue #142)" },
+    { path = "ldap3::LdapConnSettings::set_config", reason = "a caller-supplied rustls ClientConfig can install an accept-anything verifier and reach the same place as set_no_tls_verify; build the settings through LdapConnSettings::new (issue #142)" },
+    { path = "ironauth_admin::ldap_diff::Diff::provisional_departures", reason = "this returns the departure set with no refusal, so acting on it deprovisions people a truncated directory read merely failed to see; call Diff::departures and handle DepartureRefusal, and reach for this only on a reporting surface with an #[expect] and a reason (issue #142)" },
 ]
+
 
 disallowed-types = [
     { path = "cel::Program", reason = "hold an ironauth_cel::BudgetedProgram instead: it carries the shape it was budgeted against, and a bare Program can be evaluated against anything (issue #113 criterion 2)" },
