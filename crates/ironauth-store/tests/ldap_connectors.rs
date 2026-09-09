@@ -113,7 +113,7 @@ async fn a_connector_round_trips_every_field_it_was_configured_with() {
         read.bind_dn,
         "cn=svc-ironauth,ou=service,dc=contoso,dc=test"
     );
-    assert_eq!(read.bind_secret_name, "contoso-ad-bind");
+    assert_eq!(read.bind_secret_name, "ldap_bind_contoso_ad");
     assert_eq!(read.user_base_dn, "ou=people,dc=contoso,dc=test");
     assert_eq!(read.group_base_dn, "ou=groups,dc=contoso,dc=test");
     assert_eq!(read.user_filter, "(objectClass=user)");

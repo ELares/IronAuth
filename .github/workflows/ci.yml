@@ -1387,8 +1387,8 @@ jobs:
             --ignored --list 2>/dev/null | grep -c ': test$')
           pass=$(cargo test -p ironauth-admin --all-features --test ldap_live_pass -- \
             --ignored --list 2>/dev/null | grep -c ': test$')
-          [ "$live" = "9" ] || { echo "::error::ldap_live lists ${live} ignored tests, not 9"; exit 1; }
-          [ "$pass" = "1" ] || { echo "::error::ldap_live_pass lists ${pass} ignored tests, not 1"; exit 1; }
+          [ "$live" = "10" ] || { echo "::error::ldap_live lists ${live} ignored tests, not 10"; exit 1; }
+          [ "$pass" = "2" ] || { echo "::error::ldap_live_pass lists ${pass} ignored tests, not 2"; exit 1; }
       - name: The protocol tests
         run: cargo test -p ironauth-admin --all-features --test ldap_live -- --ignored
       - name: A whole pass, stored row to written account

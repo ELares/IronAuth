@@ -13,10 +13,16 @@
 #
 # THE MEMORY IS PROPORTIONAL, AND THAT IS INHERENT. Paging bounds what is on the wire at once, not
 # what the process holds: the diff compares the whole directory against the whole previous
-# snapshot, so the set is resident by construction. Measured at about 1.9KB per entry (a pass over
-# 20,005 people peaked at 50.5MB against 15.2MB for the same binary over five). `MAX_ENTRIES` in
-# `ldap_boot` is what turns "too big" into a refusal naming the connector rather than an allocator
-# killing the sweep.
+# snapshot, so the set is resident by construction. Measured at about 1.8KB per entry marginal
+# (see the table on `MAX_ENTRIES` in `ldap_boot`, which this script produced). `MAX_ENTRIES` is
+# what turns "too big" into a refusal naming the connector rather than an allocator killing the
+# sweep.
+#
+# WHAT THE REPORT'S PER-ENTRY FIGURE IS NOT. `raw_peak_bytes_per_entry` below divides the WHOLE
+# binary's peak by the entry count, and most of that peak is the harness -- a test database,
+# every migration, libtest -- not the directory. It is a run-to-run comparison at a FIXED size,
+# not the marginal cost; the marginal figure is a subtraction against the five-entry baseline and
+# is quoted where the table is.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -65,7 +71,12 @@ echo "ldap-load-test: ${present} people present"
 
 # THE PEAK RSS OF THE PASS ITSELF, not of cargo: the test binary is invoked directly so the
 # figure is the sweep's, and a compile does not land in the measurement.
+# `set -e` OFF FOR THE GLOB. Under `pipefail` a non-matching glob makes `ls` and then the whole
+# pipeline non-zero, so the assignment terminates the script and the friendly message below never
+# prints -- the guard was unreachable.
+set +e
 binary=$(ls -t target/debug/deps/ldap_live_pass-* 2>/dev/null | grep -v '\.d$' | head -1)
+set -e
 if [ -z "$binary" ]; then
   echo "ldap-load-test: no ldap_live_pass binary; build the tests first"
   exit 1
@@ -73,7 +84,11 @@ fi
 
 measured="$(mktemp -t ldap-load-time)"
 trap 'rm -f "$tmp" "$measured"' EXIT
-run_start=$(date +%s)
+# THE TEST IS TOLD WHAT TO EXPECT, and its EXIT STATUS is the answer. It used to be told nothing
+# and the count was scraped out of its panic message, which inverted the assertion: a pass that
+# reached every person printed no `provisioned:` line at all and the script called it incomplete.
+export IRONAUTH_LDAP_EXPECT_PEOPLE="$present"
+run_start=$(date +%s000)
 set +e
 if /usr/bin/time -v true >/dev/null 2>&1; then
   /usr/bin/time -v "$binary" --ignored >"$measured" 2>&1   # GNU time, Linux
@@ -82,7 +97,7 @@ else
 fi
 status=$?
 set -e
-run_secs=$(( $(date +%s) - run_start ))
+run_ms=$(( $(date +%s000) - run_start ))
 
 # THE PARSE FAILS LOUDLY. A silent miss would record a load test with no memory figure, which is
 # the one number the artifact exists for.
@@ -98,25 +113,28 @@ if [ -z "${peak_kb:-}" ]; then
   exit 1
 fi
 
-provisioned=$(grep -oE "provisioned: [0-9]+" "$measured" | grep -oE "[0-9]+" | head -1 || echo 0)
-
 mkdir -p "$(dirname "$REPORT")"
 {
   echo "entries_loaded=${present}"
   echo "load_seconds=${load_secs}"
-  echo "pass_seconds=${run_secs}"
+  echo "pass_milliseconds=${run_ms}"
   echo "peak_rss_kb=${peak_kb}"
-  echo "bytes_per_entry=$(( peak_kb * 1024 / present ))"
-  echo "provisioned=${provisioned}"
+  # RAW, NOT MARGINAL. This divides the WHOLE binary's peak by the entry count, and most of that
+  # peak is the harness -- a test database, every migration, libtest -- not the directory. At the
+  # fixture's five entries the same binary peaks around 15MB, so this number is dominated by the
+  # baseline at small N and only approaches the true per-entry cost at large N. A reader
+  # comparing two runs AT THE SAME N sees a real regression; a reader comparing across N does
+  # not. The marginal figure quoted in `ldap_boot`'s MAX_ENTRIES doc is this minus that baseline.
+  echo "raw_peak_bytes_per_entry=$(( peak_kb * 1024 / present ))"
+  echo "pass_exit_status=${status}"
 } | tee "$REPORT"
 
-# THE ONE ASSERTION, and it is not a measurement: the pass reached every person. `ldap_live_pass`
-# asserts five, so over a loaded directory it fails on that count while still completing -- which
-# is why the number is read out of its own panic message rather than from its exit status.
-if [ "$provisioned" -lt "$present" ]; then
-  echo "ldap-load-test: the pass provisioned ${provisioned} of ${present}; it did not complete"
+# THE ONE ASSERTION, and it is not a measurement: the pass reached every person. The test was
+# told the count above, so a non-zero exit IS that failure and nothing has to be parsed.
+if [ "$status" -ne 0 ]; then
+  echo "ldap-load-test: the pass over ${present} people did not complete (exit ${status})"
   tail -30 "$measured"
   exit 1
 fi
-echo "ldap-load-test: clean (${present} entries, ${run_secs}s, ${peak_kb}KB peak)"
+echo "ldap-load-test: clean (${present} entries, ${run_ms}ms, ${peak_kb}KB peak)"
 exit 0

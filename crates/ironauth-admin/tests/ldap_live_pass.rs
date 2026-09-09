@@ -53,6 +53,105 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope) -> OrganizationId 
     id
 }
 
+/// THE PRODUCTION FACTORY SUPPLIES A REAL CEILING. Every other test that touches `max_entries`
+/// writes its own, so none of them observes the value the SWEEP uses: setting `MAX_ENTRIES` to
+/// `usize::MAX` -- the feature switched off in production -- left the whole tree green. This
+/// opens a connection the way `run_pass` does and reads the bound back off it.
+#[tokio::test]
+#[ignore = "requires IRONAUTH_LDAP_URL and a live directory"]
+async fn the_sweeps_own_connection_carries_the_configured_ceiling() {
+    use ironauth_admin::ldap_boot::{MAX_ENTRIES, StoreSourceFactory};
+    use ironauth_admin::ldap_schedule::{Scheduled, SourceFactory};
+
+    let url = directory_url();
+    let (host, port) = split_url(&url);
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let master = db.master_key();
+    let organization = seed_org(&db, &env, scope).await;
+
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put(
+            &env,
+            &master,
+            "ldap_bind_live",
+            env_var("IRONAUTH_LDAP_BIND_PASSWORD", "svcpw").as_bytes(),
+            None,
+        )
+        .await
+        .expect("store the bind password");
+
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({ "username": "uid" });
+    store
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(
+            &env,
+            NewLdapConnector {
+                id: &id,
+                organization_id: &organization,
+                display_name: "Live directory",
+                host: &host,
+                port,
+                tls_mode: LdapTlsMode::Plaintext,
+                bind_dn: &env_var("IRONAUTH_LDAP_BIND_DN", "cn=svc,dc=example,dc=test"),
+                bind_secret_name: "ldap_bind_live",
+                user_base_dn: &env_var("IRONAUTH_LDAP_USER_BASE", "ou=People,dc=example,dc=test"),
+                group_base_dn: "",
+                user_filter: "(objectClass=inetOrgPerson)",
+                group_filter: "",
+                attribute_mapping: &mapping,
+                absence_policy: LdapAbsencePolicy::Deactivate,
+                max_group_depth: 5,
+            },
+            None,
+        )
+        .await
+        .expect("configure the connector");
+
+    let connectors = store
+        .scoped(scope)
+        .ldap_connectors()
+        .active_in_scope(10)
+        .await
+        .expect("read the connectors");
+    let factory = StoreSourceFactory {
+        store,
+        scope,
+        master: &master,
+        connectors,
+    };
+    let opened = factory
+        .open(&Scheduled {
+            id: id.to_string(),
+            previous: std::collections::BTreeSet::new(),
+            inputs: ironauth_admin::ldap_boot::inputs_for(
+                &store
+                    .scoped(scope)
+                    .ldap_connectors()
+                    .get(&id)
+                    .await
+                    .expect("read it back"),
+            ),
+        })
+        .await
+        .expect("the sweep opens its own connection");
+
+    assert_eq!(
+        opened.ceiling(),
+        MAX_ENTRIES,
+        "the sweep's connection carries no ceiling from the constant, so the bound is off in \
+         production while every test that writes its own value stays green"
+    );
+}
+
 /// THE WHOLE PASS. Five people in a real directory become five accounts, and running it twice
 /// creates nothing further.
 #[tokio::test]
@@ -132,9 +231,17 @@ async fn a_pass_provisions_every_person_in_a_live_directory() {
         "{:?}",
         first.applied.failures
     );
+    // HOW MANY PEOPLE THE DIRECTORY HOLDS: five for the committed fixture, and whatever the load
+    // test loaded when that is driving. Parameterised because the load test previously learned
+    // the count by PARSING THIS TEST'S PANIC MESSAGE -- so a pass that SUCCEEDED printed nothing
+    // and the script reported it as incomplete. The script sets this and reads an exit status.
+    let expected: usize = std::env::var("IRONAUTH_LDAP_EXPECT_PEOPLE")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(5);
     assert_eq!(
-        first.applied.provisioned, 5,
-        "five directory people must become five accounts, got {first:?}"
+        first.applied.provisioned, expected,
+        "the directory's {expected} people must become {expected} accounts, got {first:?}"
     );
     assert_eq!(
         first.applied.deactivated + first.applied.deleted,

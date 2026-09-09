@@ -184,9 +184,9 @@ pub struct DirectoryConfig {
     /// A CEILING RATHER THAN A STREAM. The diff this feeds compares the WHOLE directory against
     /// the whole previous snapshot, so the set is held in memory by construction and no amount
     /// of paging changes that: paging bounds what is on the wire at once, not what the process
-    /// holds. MEASURED on a real server at about 1.8KB per entry end to end -- passes over 5,
-    /// 20,005 and 40,005 people peaked at 15.2MB, 50.5MB and 83.7MB -- so a hundred thousand is
-    /// a couple of hundred megabytes and a million is a couple of gigabytes.
+    /// holds. MEASURED on a real server at between about 2.6KB and 1.8KB per entry, falling as
+    /// the directory grows; `ldap_boot`'s `MAX_ENTRIES` carries the four-point table and the
+    /// caveat that the large figures are extrapolations from 40,005 rather than measurements.
     ///
     /// What this buys is that the failure is a REFUSAL naming the directory, rather than an
     /// allocator killing the process mid-sweep and taking every other connector's pass with it.
@@ -240,8 +240,14 @@ impl DirectoryConfig {
 pub trait SearchProgress: Send + Sync {
     /// `read` entries have arrived so far, out of a ceiling of `ceiling`.
     ///
-    /// Called once per PAGE, not once per entry: one line per five hundred is a readable
-    /// trickle, one per entry is a flood that hides everything else.
+    /// Called every `page_size` entries AND once when the read finishes, so the last call always
+    /// carries the total. Not once per entry: one line per five hundred is a readable trickle,
+    /// one per entry is a flood that hides everything else.
+    ///
+    /// THE FINAL CALL IS WHY A SMALL DIRECTORY REPORTS AT ALL. The first version fired only on
+    /// `read % page_size == 0`, and the production page size is 500 -- so every directory of
+    /// fewer than five hundred people, which is most of them, produced no progress whatsoever
+    /// and a partial last page was never announced at any size.
     fn entries_read(&self, _base: &str, _read: usize, _ceiling: usize) {}
 }
 
@@ -301,10 +307,23 @@ impl Directory {
         })
     }
 
+    /// What this connection will refuse above, as configured.
+    ///
+    /// Exposed so a caller can assert the PRODUCTION wiring supplies a real ceiling. Setting
+    /// `ldap_boot`'s `MAX_ENTRIES` to `usize::MAX` -- the feature switched off in production --
+    /// left every test in the tree green, because each supplied its own value and none observed
+    /// the one the sweep uses.
+    #[must_use]
+    pub fn ceiling(&self) -> usize {
+        self.max_entries
+    }
+
     /// Report this search's progress somewhere other than the log.
     ///
-    /// Builder rather than a `DirectoryConfig` field, so the twenty-odd literal configs in the
-    /// tree do not each gain a `None` for a seam only one of them uses.
+    /// Builder rather than a `DirectoryConfig` field because the config is what a CONNECTOR row
+    /// says, and where progress goes is not: it is the caller's choice, and the sweep and a test
+    /// want different answers from the same row. (The three `DirectoryConfig` literals in the
+    /// tree would each have gained a field; that is a small cost, and not the reason.)
     #[must_use]
     pub fn with_progress(mut self, progress: std::sync::Arc<dyn SearchProgress>) -> Self {
         self.progress = progress;
@@ -319,8 +338,9 @@ impl Directory {
     ///
     /// # Errors
     ///
-    /// [`DirectoryError::Transport`] if any page fails, and [`DirectoryError::Referred`] if the
-    /// server referred part of the subtree elsewhere. A partial result is never returned: a short
+    /// [`DirectoryError::Transport`] if any page fails, [`DirectoryError::Referred`] if the
+    /// server referred part of the subtree elsewhere, and [`DirectoryError::TooManyEntries`] if
+    /// the directory holds more than this connector's ceiling. A partial result is never returned: a short
     /// member list reaching a deprovisioning comparison is the failure this subsystem must not
     /// have, and a dropped referral is one of the ways a list gets short.
     pub async fn search_all(
@@ -369,6 +389,14 @@ impl Directory {
                 self.progress
                     .entries_read(base, out.len(), self.max_entries);
             }
+        }
+
+        // THE FINAL COUNT, always, so a directory smaller than one page still reports and a
+        // partial last page is announced. Skipped only when the last in-loop call already said
+        // exactly this, which happens when the total is an exact multiple of the page size.
+        if out.is_empty() || out.len() % page != 0 {
+            self.progress
+                .entries_read(base, out.len(), self.max_entries);
         }
 
         // A SEARCH THAT WAS REFERRED SOMEWHERE ELSE IS NOT A COMPLETE SEARCH. `EntriesOnly`
