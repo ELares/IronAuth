@@ -38,7 +38,10 @@
 
 use std::time::Duration;
 
-use ironauth_admin::ldap_client::{Directory, DirectoryConfig, DirectoryError, TlsMode};
+use ironauth_admin::ldap_client::{
+    Directory, DirectoryConfig, DirectoryError, SearchScope, TlsMode,
+};
+use ironauth_admin::ldap_groups::{GroupSource as _, expand};
 use ironauth_admin::ldap_mapping::{StableIdSource, attributes_to_request, principal_for};
 use serde_json::json;
 
@@ -72,12 +75,17 @@ fn config(url: String, tls_mode: TlsMode, page_size: i32) -> DirectoryConfig {
 #[ignore = "needs a directory server; see the module header"]
 async fn the_derived_attribute_list_is_what_makes_the_identifier_arrive() {
     let mapping = json!({ "username": "uid", "email": "mail", "display_name": "cn" });
-    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
         .await
         .expect("connect");
 
     let asked = dir
-        .search_all(BASE, "(uid=grace)", &attributes_to_request(&mapping))
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(uid=grace)",
+            &attributes_to_request(&mapping),
+        )
         .await
         .expect("search with the derived list");
     let entry = asked.first().expect("grace is in the fixture directory");
@@ -93,7 +101,7 @@ async fn the_derived_attribute_list_is_what_makes_the_identifier_arrive() {
 
     let hand_listed = vec!["uid".to_owned(), "mail".to_owned(), "cn".to_owned()];
     let without = dir
-        .search_all(BASE, "(uid=grace)", &hand_listed)
+        .search_all(BASE, SearchScope::Subtree, "(uid=grace)", &hand_listed)
         .await
         .expect("search with a hand-listed set");
     let degraded = principal_for(without.first().expect("found"), &mapping).expect("maps");
@@ -191,9 +199,14 @@ async fn a_page_size_of_one_walks_past_a_limit_that_stops_an_unpaged_search() {
     );
     raw.unbind().await.expect("unbind the raw handle");
 
-    let mut dir = Directory::connect(&cfg).await.expect("connect as svc");
+    let dir = Directory::connect(&cfg).await.expect("connect as svc");
     let people = dir
-        .search_all(BASE, "(objectClass=inetOrgPerson)", &["uid".to_owned()])
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
         .await
         .expect("a paged search must walk past the size limit");
 
@@ -221,13 +234,14 @@ async fn a_page_size_of_one_walks_past_a_limit_that_stops_an_unpaged_search() {
 #[tokio::test]
 #[ignore = "needs a directory server; see the module header"]
 async fn an_octet_string_attribute_is_not_dropped_on_the_way_out() {
-    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
         .await
         .expect("connect");
 
     let found = dir
         .search_all(
             BASE,
+            SearchScope::Subtree,
             "(uid=grace)",
             &["uid".to_owned(), "jpegphoto".to_owned()],
         )
@@ -267,13 +281,14 @@ async fn an_octet_string_attribute_is_not_dropped_on_the_way_out() {
 #[tokio::test]
 #[ignore = "needs a directory server; see the module header"]
 async fn a_subtree_the_server_refers_elsewhere_is_refused_rather_than_returned_short() {
-    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
         .await
         .expect("connect");
 
     let outcome = dir
         .search_all(
             "ou=Referrals,dc=example,dc=test",
+            SearchScope::Subtree,
             "(objectClass=*)",
             &["uid".to_owned()],
         )
@@ -290,10 +305,104 @@ async fn a_subtree_the_server_refers_elsewhere_is_refused_rather_than_returned_s
     // THE CONTROL: a subtree with no referral in it still succeeds, so the refusal is about
     // referrals and not about this client failing every search.
     let people = dir
-        .search_all(BASE, "(uid=grace)", &["uid".to_owned()])
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(uid=grace)",
+            &["uid".to_owned()],
+        )
         .await
         .expect("an unreferred subtree still searches");
     assert_eq!(people.len(), 1);
+
+    dir.disconnect().await.expect("unbind");
+}
+
+/// THE GROUP WALK, AGAINST THE REAL SERVER, THROUGH THE LIVE CLIENT.
+///
+/// `impl GroupSource for Directory` shipped with no test of any kind. It is not a delegation: it
+/// does a base read for the member list, then one read per member to classify it, across three
+/// `objectClass` dialects. The fixture has what this needs -- `cn=all-staff` contains a person
+/// and `cn=engineering`, and `cn=engineering` contains a person and `cn=all-staff` back, a real
+/// cycle a real server accepted.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn the_live_client_walks_a_real_group_graph_and_terminates_on_its_cycle() {
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+        .await
+        .expect("connect");
+
+    // Direct members first, so a failure here is not confused with a failure in the walk.
+    let members = dir
+        .direct_members("cn=all-staff,ou=Groups,dc=example,dc=test")
+        .await
+        .expect("all-staff resolves");
+    let engineering = members
+        .iter()
+        .find(|m| m.dn.starts_with("cn=engineering,"))
+        .expect("all-staff contains engineering");
+    assert!(
+        engineering.is_group,
+        "a groupOfNames member must be classified as a group, or the walk never descends"
+    );
+    let ada = members
+        .iter()
+        .find(|m| m.dn.starts_with("uid=ada"))
+        .expect("all-staff contains ada");
+    assert!(!ada.is_group, "a person must not be classified as a group");
+
+    // Then the whole walk, over the real cycle.
+    let out = expand(
+        &dir,
+        &["cn=all-staff,ou=Groups,dc=example,dc=test".to_owned()],
+        10,
+    )
+    .await
+    .expect("expands");
+
+    assert!(out.complete, "truncated_at={:?}", out.truncated_at);
+    assert!(
+        out.revisited
+            .contains("cn=all-staff,ou=Groups,dc=example,dc=test"),
+        "the real back-edge must be reported: {:?}",
+        out.revisited
+    );
+    assert!(
+        out.members.iter().any(|m| m.starts_with("uid=grace")),
+        "grace is behind the nested group and must be reached: {:?}",
+        out.members
+    );
+
+    dir.disconnect().await.expect("unbind");
+}
+
+/// A GROUP DN THAT DOES NOT RESOLVE IS AN ERROR, not an empty group.
+///
+/// This is the bug the first version shipped. `direct_members` returned `Ok(vec![])` for a DN the
+/// server did not know, so `expand` produced an empty member set and reported `complete: true` --
+/// which means `ldap_diff` does NOT refuse, and every principal reads as departed. A typo in a
+/// connector's group DN would have deprovisioned the directory.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn a_group_dn_that_does_not_resolve_is_refused_rather_than_read_as_empty() {
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+        .await
+        .expect("connect");
+
+    let missing = "cn=no-such-group,ou=Groups,dc=example,dc=test";
+    let outcome = dir.direct_members(missing).await;
+    assert!(
+        matches!(&outcome, Err(DirectoryError::GroupNotFound { dn }) if dn == missing),
+        "a missing group must be refused: {outcome:?}"
+    );
+
+    // AND THE WALK PROPAGATES IT, which is the half that matters: the alternative was an
+    // expansion of nobody that called itself complete.
+    let walked = expand(&dir, &[missing.to_owned()], 5).await;
+    assert!(
+        walked.is_err(),
+        "an unresolvable root must abort the walk, not produce a complete empty one"
+    );
 
     dir.disconnect().await.expect("unbind");
 }

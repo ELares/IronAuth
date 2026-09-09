@@ -105,6 +105,7 @@ pub mod ldap_client;
 pub mod ldap_diff;
 pub mod ldap_groups;
 pub mod ldap_mapping;
+pub mod ldap_sync;
 mod log_streams;
 mod mds3_health;
 mod memberships;

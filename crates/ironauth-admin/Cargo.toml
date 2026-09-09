@@ -184,6 +184,12 @@ path = "tests/ldap_groups.rs"
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
 
+# One pass of a directory sync (issue #142): read, map, expand, compare. NO database and no
+# server -- the pass runs against a fake that satisfies the same two traits the live client does.
+[[test]]
+name = "ldap_sync"
+path = "tests/ldap_sync.rs"
+
 # Who joined and who left between two directory reads (issue #142). NO database: pure set
 # comparison plus the rules about when a departure may be concluded at all.
 [[test]]
