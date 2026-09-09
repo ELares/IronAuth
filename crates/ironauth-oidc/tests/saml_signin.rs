@@ -1144,10 +1144,10 @@ async fn trait_emails(harness: &Harness) -> Vec<String> {
     for (id, _) in users(harness, harness.scope()).await {
         let user_id =
             ironauth_store::UserId::parse_in_scope(&id, &harness.scope()).expect("a user id");
-        if let Ok(Some((_, traits))) = scoped.users().traits(&user_id).await
-            && let Some(email) = traits.get("email").and_then(serde_json::Value::as_str)
-        {
-            found.push(email.to_owned());
+        if let Ok(Some((_, traits))) = scoped.users().traits(&user_id).await {
+            if let Some(email) = traits.get("email").and_then(serde_json::Value::as_str) {
+                found.push(email.to_owned());
+            }
         }
     }
     found

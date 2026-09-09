@@ -1610,6 +1610,39 @@ fn org_membership_cases(base: &str, ids: &Ids) -> Vec<Case> {
             path: format!("{base}/organizations/{org}/scim-push-connections/spc_absent"),
             body: None,
         },
+        // The LDAP connector writes (issue #142). Same shape and same point: the handle is a
+        // literal that names nothing, because an absent ENVIRONMENT must be refused before the
+        // path gets far enough for a connector id to matter.
+        Case {
+            label: "ldap_connectors.createLdapConnector",
+            method: "POST",
+            path: format!("{base}/organizations/{org}/ldap-connectors"),
+            body: Some(
+                serde_json::json!({
+                    "display_name": "absent",
+                    "host": "ldap.corp.example.com",
+                    "port": 636,
+                    "bind_dn": "cn=svc,dc=example,dc=test",
+                    "bind_secret_name": "ldap_bind_absent",
+                    "user_base_dn": "ou=People,dc=example,dc=test",
+                    "user_filter": "(objectClass=inetOrgPerson)",
+                    "attribute_mapping": { "email": "mail" },
+                })
+                .to_string(),
+            ),
+        },
+        Case {
+            label: "ldap_connectors.setLdapConnectorActive",
+            method: "PUT",
+            path: format!("{base}/organizations/{org}/ldap-connectors/ldc_absent/active"),
+            body: Some(serde_json::json!({ "active": false }).to_string()),
+        },
+        Case {
+            label: "ldap_connectors.deleteLdapConnector",
+            method: "DELETE",
+            path: format!("{base}/organizations/{org}/ldap-connectors/ldc_absent"),
+            body: None,
+        },
         // The service-account surface is NOT nested under an organization, so its cases
         // address the environment directly. The principal id is a literal that names nothing;
         // the point of the sweep is that the absent ENVIRONMENT is refused before the path

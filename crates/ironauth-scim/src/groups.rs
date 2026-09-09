@@ -1233,10 +1233,10 @@ pub(crate) async fn list_groups(
             Ok(resource) => resource,
             Err(response) => return response,
         };
-        if let Some(filter) = filter.as_ref()
-            && !crate::filter_matches(filter, &resource)
-        {
-            continue;
+        if let Some(filter) = filter.as_ref() {
+            if !crate::filter_matches(filter, &resource) {
+                continue;
+            }
         }
         matched.push(resource);
     }

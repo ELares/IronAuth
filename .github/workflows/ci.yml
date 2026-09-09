@@ -400,6 +400,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: The WASM guest fixtures the admin test build needs
+        # NOT OPTIONAL AND NOT SKIPPABLE, and this job needs it even though it runs no hook
+        # test. `ironauth-hooks` is an UNCONDITIONAL dev-dependency of `ironauth-admin`, so
+        # building any of that crate's test targets runs `crates/ironauth-hooks/build.rs`,
+        # which builds the guest fixtures for `wasm32-wasip2` and asserts the build succeeded.
+        # Without the target installed that assertion fires and every cargo command in this
+        # job fails before it reaches a test.
+        run: rustup target add wasm32-wasip2
       # Built from git rather than crates.io: `ironbus-cli` (which carries the broker
       # binary) is not published, only the CLIENT is. Pinned to an exact COMMIT rather
       # than a branch or a tag: a branch lets another repository silently change what
@@ -1303,6 +1311,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: The WASM guest fixtures the admin test build needs
+        # NOT OPTIONAL AND NOT SKIPPABLE, and this job needs it even though it runs no hook
+        # test. `ironauth-hooks` is an UNCONDITIONAL dev-dependency of `ironauth-admin`, so
+        # building any of that crate's test targets runs `crates/ironauth-hooks/build.rs`,
+        # which builds the guest fixtures for `wasm32-wasip2` and asserts the build succeeded.
+        # Without the target installed that assertion fires and every cargo command in this
+        # job fails before it reaches a test.
+        run: rustup target add wasm32-wasip2
       - name: Install the LDAP client tools the seed step uses
         run: sudo apt-get update && sudo apt-get install -y ldap-utils
       - name: Start slapd
@@ -1382,13 +1398,38 @@ jobs:
         # `scripts/test-registration.sh` calls it "a check whose SCOPE can shrink silently has
         # the defect it exists to catch". These numbers rise with the suites and may not fall
         # without somebody editing this step.
+        #
+        # THE COUNT IS TAKEN FROM A BUILD THAT ALREADY SUCCEEDED, and its stderr is not
+        # discarded. The first version of this step did both of the opposite things:
+        #
+        #     live=$(cargo test ... --list 2>/dev/null | grep -c ': test$')
+        #
+        # Under `bash -e` a command substitution that fails aborts the step, and `grep -c`
+        # exits 1 when it counts zero. So any run in which cargo printed no list -- a build
+        # failure above all -- killed this step BEFORE the `[ "$live" = ... ]` line could say
+        # so, with the reason sent to /dev/null. The job then reported a red tick with no
+        # message anywhere in its log, which is the same "green tick meaning did not run"
+        # defect this floor exists to prevent, wearing the other colour. It failed this way on
+        # both of its first two runs and neither log said why -- the cause was the missing
+        # `wasm32-wasip2` target the step above now installs, which made the build fail with
+        # its reason discarded.
         run: |
-          live=$(cargo test -p ironauth-admin --all-features --test ldap_live -- \
-            --ignored --list 2>/dev/null | grep -c ': test$')
-          pass=$(cargo test -p ironauth-admin --all-features --test ldap_live_pass -- \
-            --ignored --list 2>/dev/null | grep -c ': test$')
-          [ "$live" = "10" ] || { echo "::error::ldap_live lists ${live} ignored tests, not 10"; exit 1; }
-          [ "$pass" = "2" ] || { echo "::error::ldap_live_pass lists ${pass} ignored tests, not 2"; exit 1; }
+          set -o pipefail
+          cargo test -p ironauth-admin --all-features \
+            --test ldap_live --test ldap_live_pass --no-run
+          cargo test -p ironauth-admin --all-features --test ldap_live -- \
+            --ignored --list >/tmp/ldap-live-list
+          cargo test -p ironauth-admin --all-features --test ldap_live_pass -- \
+            --ignored --list >/tmp/ldap-live-pass-list
+          live=$(grep -c ': test$' /tmp/ldap-live-list || true)
+          pass=$(grep -c ': test$' /tmp/ldap-live-pass-list || true)
+          echo "ldap_live lists ${live} ignored tests; ldap_live_pass lists ${pass}"
+          [ "$live" = "10" ] || {
+            echo "::error::ldap_live lists ${live} ignored tests, not 10"
+            cat /tmp/ldap-live-list; exit 1; }
+          [ "$pass" = "2" ] || {
+            echo "::error::ldap_live_pass lists ${pass} ignored tests, not 2"
+            cat /tmp/ldap-live-pass-list; exit 1; }
       - name: The protocol tests
         run: cargo test -p ironauth-admin --all-features --test ldap_live -- --ignored
       - name: A whole pass, stored row to written account

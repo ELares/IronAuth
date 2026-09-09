@@ -348,9 +348,17 @@ pub(crate) async fn create_user(
     // externalId at all, or carrying the OLD one, and the client had no route to the key it
     // sent. `plan_create` has already refused the case where the two disagree, so this either
     // binds a first key or finds the same one already bound.
-    if let Some(external_id) = parsed.external_id.as_deref()
-        && external_id_of(&state, &auth, &user_id).await.is_none()
-    {
+    // Written as a bound `Option` rather than a `let` chain: chained `let` is unstable below
+    // 1.88 and this workspace promises 1.85, so the MSRV lane refuses the chain even though
+    // stable compiles it.
+    let unbound_external_id = match parsed.external_id.as_deref() {
+        Some(external_id) => external_id_of(&state, &auth, &user_id)
+            .await
+            .is_none()
+            .then_some(external_id),
+        None => None,
+    };
+    if let Some(external_id) = unbound_external_id {
         let mapping_id = ScimExternalIdId::generate(&env, &scope);
         if let Err(error) = store
             .scoped(scope)
@@ -379,8 +387,8 @@ pub(crate) async fn create_user(
     // not merely wasteful, it made the upsert's INSERT branch UNREACHABLE, so the remove-key
     // expression in that branch was covered by nothing. A review found the branch untested, and
     // the test I first wrote for it did not reach it either, for exactly this reason.
-    if !enterprise.is_empty()
-        && let Err(response) = store_enterprise_attributes(
+    if !enterprise.is_empty() {
+        if let Err(response) = store_enterprise_attributes(
             &state,
             &auth,
             &user_id,
@@ -388,8 +396,9 @@ pub(crate) async fn create_user(
             EnterpriseWrite::Replace,
         )
         .await
-    {
-        return response;
+        {
+            return response;
+        }
     }
     match rendered_user(&state, &auth, &user_id).await {
         Ok(body) => created(&user_id, &body),
@@ -1800,9 +1809,14 @@ async fn collect_matches(
     auth: &Authenticated,
     filter: Option<&crate::Filter>,
 ) -> Result<Vec<Value>, Response> {
-    if let Some(filter) = filter
-        && let Some(candidate) = indexed_candidate(state, auth, filter).await?
-    {
+    // Two chained `let`s below 1.88 is the one shape the MSRV lane refuses; the index lookup
+    // is bound first instead. `None` covers both "no filter" and "no candidate", which is what
+    // the chain meant, and the fall-through below is the same either way.
+    let indexed = match filter {
+        Some(filter) => indexed_candidate(state, auth, filter).await?,
+        None => None,
+    };
+    if let Some(candidate) = indexed {
         // The index found at most one user. It still has to pass the SAME membership check the
         // single-resource path applies, and the filter is still evaluated against the rendered
         // resource rather than assumed: the index answers "who has this handle", which is not
@@ -1922,10 +1936,10 @@ async fn scan_members(
         // omitted extension would make a legitimate filter match nothing.
         let enterprise = enterprise_of(state, auth, &membership.user_id).await;
         let resource = user_resource(&record, external_id.as_deref(), active, &enterprise);
-        if let Some(filter) = filter
-            && !crate::filter_matches(filter, &resource)
-        {
-            continue;
+        if let Some(filter) = filter {
+            if !crate::filter_matches(filter, &resource) {
+                continue;
+            }
         }
         matched.push(resource);
     }

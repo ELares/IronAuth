@@ -328,6 +328,11 @@ struct Fixture {
     /// a handle that never resolved (issue #135).
     scim_connection: String,
     scim_push_connection: String,
+    /// A LIVE LDAP connector (issue #142), REAL for the reason the two SCIM handles above
+    /// are: a handle that never resolved answers the uniform not-found at a live
+    /// environment too, which would make the deleted-environment half of this sweep
+    /// indistinguishable from the live half.
+    ldap_connector: String,
     /// A real `sva_` principal, so the service-account key cases address a live owner rather
     /// than an id that never resolved (issue #99).
     service_account: String,
@@ -893,6 +898,29 @@ impl Fixture {
             "create scim push connection: {body}"
         );
         let scim_push_connection = field(&body, "/id", "seed scim push connection");
+        // And one LDAP connector (issue #142), REAL for the same reason. The bind secret is
+        // NAMED rather than created: the create handler fences the name to the `ldap_bind_`
+        // namespace but does not resolve it, so a connector row exists without one and this
+        // stays a surface sweep rather than a secret-store test.
+        let (status, _, body) = h
+            .post(
+                &format!("{base}/organizations/{organization}/ldap-connectors"),
+                "seed-ldap-connector",
+                &serde_json::json!({
+                    "display_name": "sweep directory",
+                    "host": "ldap.corp.example.com",
+                    "port": 636,
+                    "bind_dn": "cn=svc,dc=example,dc=test",
+                    "bind_secret_name": "ldap_bind_sweep",
+                    "user_base_dn": "ou=People,dc=example,dc=test",
+                    "user_filter": "(objectClass=inetOrgPerson)",
+                    "attribute_mapping": { "email": "mail" },
+                })
+                .to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "create ldap connector: {body}");
+        let ldap_connector = field(&body, "/id", "seed ldap connector");
         let session = h.seed_session(scope, &user).await;
         let family = h
             .seed_refresh_family(scope, &user, &client, &session, false)
@@ -1392,6 +1420,7 @@ impl Fixture {
             api_key,
             scim_connection,
             scim_push_connection,
+            ldap_connector,
             service_account,
             agent,
             approval,
@@ -1458,6 +1487,7 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
         api_key,
         scim_connection,
         scim_push_connection,
+        ldap_connector,
         service_account,
         agent,
         approval,
@@ -2785,6 +2815,45 @@ fn all_cases(f: &Fixture) -> Vec<Case> {
             "DELETE",
             format!("{org_base}/scim-push-connections/{scim_push_connection}"),
         ),
+        // The LDAP connector surface (issue #142), on all five of its shapes. Ordered the way
+        // this file requires: the DELETE comes last within the family, because the two cases
+        // before it address the row it removes.
+        Case::json(
+            "ldap_connectors.createLdapConnector",
+            "POST",
+            format!("{org_base}/ldap-connectors"),
+            &serde_json::json!({
+                "display_name": "sweep second directory",
+                "host": "ldap2.corp.example.com",
+                "port": 636,
+                "bind_dn": "cn=svc,dc=example,dc=test",
+                "bind_secret_name": "ldap_bind_sweep_second",
+                "user_base_dn": "ou=People,dc=example,dc=test",
+                "user_filter": "(objectClass=inetOrgPerson)",
+                "attribute_mapping": { "email": "mail" },
+            }),
+        ),
+        Case::empty(
+            "ldap_connectors.listLdapConnectors",
+            "GET",
+            format!("{org_base}/ldap-connectors"),
+        ),
+        Case::empty(
+            "ldap_connectors.listLdapConnectorHealth",
+            "GET",
+            format!("{org_base}/ldap-connectors/health"),
+        ),
+        Case::json(
+            "ldap_connectors.setLdapConnectorActive",
+            "PUT",
+            format!("{org_base}/ldap-connectors/{ldap_connector}/active"),
+            &serde_json::json!({ "active": false }),
+        ),
+        Case::empty(
+            "ldap_connectors.deleteLdapConnector",
+            "DELETE",
+            format!("{org_base}/ldap-connectors/{ldap_connector}"),
+        ),
         // The service-account surface, same four shapes. Not nested under an organization:
         // `service_accounts` has no organization column, so the path addresses the
         // environment directly.
@@ -3320,6 +3389,7 @@ fn every_documented_operation_is_driven_by_a_case() {
         api_key: "akey_0".to_owned(),
         scim_connection: "scimconn_0".to_owned(),
         scim_push_connection: "spc_0".to_owned(),
+        ldap_connector: "ldc_0".to_owned(),
         connector: "con_0".to_owned(),
         log_stream: "lgs_0".to_owned(),
         flow_target: "ftg_0".to_owned(),
