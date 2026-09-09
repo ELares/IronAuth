@@ -38,7 +38,7 @@ so the column stays readable; the untruncated value is in
 | `MCP-CALL-SUCCEEDS` The bound token is accepted by the server it names | RFC 9068 section 4 | pass | `status=200 body={"tool":"echo","resource":"http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-a","subject":"usr_<id>` |
 | `MCP-REPLAY-REFUSED` The same token replayed at another MCP server is refused | MCP authorization strict audience validation | pass | `status=401 www-authenticate=Bearer realm="http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-b", error="invalid_token", error_description="the credential is for another resource", r...` |
 | `MCP-INSUFFICIENT-SCOPE` A call missing the tool scope is a 403 naming the scope to request | RFC 6750 section 3.1; MCP authorization step-up | pass | `status=403 www-authenticate=Bearer realm="http://127.0.0.1:<port>/t/ten_<id>/e/env_<id>/mcp-a", error="insufficient_scope", scope="mcp.tools", error_description="the credential doe...` |
-| `MCP-QUICKSTART-BUDGET` Zero to a secured MCP server inside the documented budget | IronAuth MCP quickstart: 5 minutes | pass | `emulator start to authorized MCP call, within the 300s budget` |
+| `MCP-QUICKSTART-BUDGET` Zero to a secured MCP server inside the documented budget | IronAuth MCP quickstart: 5 minutes | pass | `emulator start to authorized MCP call, bucketed: under 60s (budget 300s)` |
 
 ## What this bundle does not claim
 
