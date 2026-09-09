@@ -184,6 +184,12 @@ path = "tests/ldap_groups.rs"
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
 
+# Translating a plan and a policy into the exact operations a run would perform (issue #142).
+# NO database and no server: the translation is a pure function of a plan and an absence policy.
+[[test]]
+name = "ldap_changeset"
+path = "tests/ldap_changeset.rs"
+
 # Turning stored connector rows into a runnable sweep (issue #142). NO database: the pure half,
 # what a row MEANS to the client and the pass.
 [[test]]
