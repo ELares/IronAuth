@@ -56,7 +56,10 @@ if not names:
 # Both numbers live beside the thing they count, which is the weakest kind of bound. What they
 # buy is that a change has to be made deliberately, in two files, with the diff visible.
 BLOCKS = 24
-NAMES = 80
+# OCCURRENCES, not tests. Seven names appear on more than one row, so these 82 occurrences
+# resolve to 74 distinct tests -- which is the number the success line below prints, and the
+# number the existence and #[ignore] checks actually cover, because both read the deduped set.
+NAMES = 82
 blocks = re.findall(r"Coverage::Tests\(&\[(.*?)\]\)", source, re.S)
 if len(blocks) != BLOCKS:
     print(
