@@ -634,25 +634,25 @@ fn validated_create(
     let expires_micros = request
         .expires_at_unix_ms
         .map(|millis| millis.saturating_mul(1_000));
-    if let Some(expires) = expires_micros
-        && expires <= now_micros
-    {
-        return Err(ApiError::BadRequest(
-            "invalid_expiry: expires_at_unix_ms must be in the future".to_owned(),
-        ));
+    if let Some(expires) = expires_micros {
+        if expires <= now_micros {
+            return Err(ApiError::BadRequest(
+                "invalid_expiry: expires_at_unix_ms must be in the future".to_owned(),
+            ));
+        }
     }
     // AND BOUNDED ABOVE TOO. `saturating_mul` clamps to `i64::MAX` micros, which is in the
     // future and so passed the check above, and then reached
     // `TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 microsecond')` -- outside Postgres'
     // timestamp range, which is a 500. A review drove it: `i64::MAX` answered 500 while
     // 900000000000000 answered 201. A bound with only one side is half a bound.
-    if let Some(expires) = expires_micros
-        && expires > MAX_EXPIRY_UNIX_MICROS
-    {
-        return Err(ApiError::BadRequest(
-            "invalid_expiry: expires_at_unix_ms is further ahead than this server stores"
-                .to_owned(),
-        ));
+    if let Some(expires) = expires_micros {
+        if expires > MAX_EXPIRY_UNIX_MICROS {
+            return Err(ApiError::BadRequest(
+                "invalid_expiry: expires_at_unix_ms is further ahead than this server stores"
+                    .to_owned(),
+            ));
+        }
     }
     Ok((display_name, expires_micros))
 }

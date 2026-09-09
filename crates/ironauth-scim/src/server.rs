@@ -439,10 +439,10 @@ pub(crate) async fn bulk(
     // POSTs both matched the FIRST operation and the second one was dispatched with the
     // first's body.
     for (outcome, operation) in outcomes.into_iter().zip(&request.operations) {
-        if let Some(budget) = fail_on_errors
-            && failures >= budget
-        {
-            break;
+        if let Some(budget) = fail_on_errors {
+            if failures >= budget {
+                break;
+            }
         }
         let result = match outcome {
             BulkOutcome::Refused(refused) => refused,
