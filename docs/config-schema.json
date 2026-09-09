@@ -879,6 +879,31 @@
       },
       "type": "object"
     },
+    "LdapSyncConfig": {
+      "additionalProperties": false,
+      "description": "Read-only LDAP/AD inbound sync (issue #142).",
+      "properties": {
+        "sweep_batch": {
+          "default": 100,
+          "description": "How many connectors one pass reads per scope.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "sweep_enabled": {
+          "default": false,
+          "description": "Whether THIS process runs the sweep. OFF by default.\n\nOff for the reason `certificate_expiry.sweep_enabled` is off: more than one process runs\nthis binary, and a pass is work that must not be multiplied by the number of replicas.\nUnlike that sweep there is no ledger making a duplicate pass harmless -- two passes read\nthe same directories and produce the same plans -- so here it is wasted directory load on\nsomebody else's server rather than wasted local work.",
+          "type": "boolean"
+        },
+        "sweep_interval_secs": {
+          "default": 3600,
+          "description": "How often a pass runs, in seconds.\n\nAn hour by default. A directory sync is not a login path: the cost of learning about a\nnew hire an hour late is small, and the cost of hammering a customer's Active Directory is\ntheirs to pay.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "LogFormat": {
       "description": "Structured-log output format.",
       "oneOf": [
@@ -3023,6 +3048,15 @@
         "uniqueness": "environment_wide"
       },
       "description": "Flexible-identifier settings (issue #54): the per-environment uniqueness\npolicy for typed login identifiers. Safe default: environment-wide uniqueness."
+    },
+    "ldap_sync": {
+      "$ref": "#/$defs/LdapSyncConfig",
+      "default": {
+        "sweep_batch": 100,
+        "sweep_enabled": false,
+        "sweep_interval_secs": 3600
+      },
+      "description": "Read-only LDAP/AD inbound sync (issue #142)."
     },
     "log_streams": {
       "$ref": "#/$defs/LogStreamsConfig",

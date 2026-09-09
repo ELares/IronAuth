@@ -10,6 +10,9 @@ use ironauth_admin::ldap_schedule::{Scheduled, SourceFactory, sweep};
 use ironauth_admin::ldap_sync::{EntrySource, SyncInputs};
 use serde_json::json;
 
+/// Generous, because no fixture here is slow; the deadline's own behaviour has its own test.
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A directory that can be told to fail.
 struct Fake {
     people: Vec<DirectoryEntry>,
@@ -118,7 +121,7 @@ fn factory(unopenable: &[&str], failing_read: &[&str]) -> Factory {
 #[tokio::test]
 async fn a_connector_that_cannot_be_opened_does_not_stop_the_sweep() {
     let all = [scheduled("alpha"), scheduled("broken"), scheduled("gamma")];
-    let report = sweep(&factory(&["broken"], &[]), &all).await;
+    let report = sweep(&factory(&["broken"], &[]), &all, DEADLINE).await;
 
     assert_eq!(
         report.runs.len(),
@@ -127,10 +130,10 @@ async fn a_connector_that_cannot_be_opened_does_not_stop_the_sweep() {
     );
     assert!(report.runs[0].1.is_planned(), "alpha ran");
     assert!(report.runs[2].1.is_planned(), "gamma ran after the failure");
-    assert_eq!(
-        report.failures(),
-        vec![("broken", "bind refused for broken")]
-    );
+    let failures = report.failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "broken");
+    assert_eq!(failures[0].1.as_ref(), "bind refused for broken");
     // THE OTHER DIRECTION OF THE DISTINCTION. `failures()` merges the two arms, so every
     // assertion above is variant-blind: turning this Unreachable into a Failed -- the direction
     // a simplifying refactor takes -- failed no test and passed pedantic clippy, because an
@@ -153,10 +156,11 @@ async fn a_connector_that_cannot_be_opened_does_not_stop_the_sweep() {
 #[tokio::test]
 async fn a_read_that_fails_after_a_successful_bind_is_reported_as_a_failure_not_unreachable() {
     let all = [scheduled("alpha"), scheduled("flaky")];
-    let report = sweep(&factory(&[], &["flaky"]), &all).await;
+    let report = sweep(&factory(&[], &["flaky"]), &all, DEADLINE).await;
 
     assert!(report.runs[0].1.is_planned());
-    let (id, why) = report.failures()[0];
+    let failures = report.failures();
+    let (id, why) = (failures[0].0, failures[0].1.as_ref());
     assert_eq!(id, "flaky");
     assert!(
         why.contains("stopped answering"),
@@ -179,7 +183,7 @@ async fn a_read_that_fails_after_a_successful_bind_is_reported_as_a_failure_not_
 #[tokio::test]
 async fn every_scheduled_connector_appears_in_the_report_even_when_all_of_them_fail() {
     let all = [scheduled("one"), scheduled("two")];
-    let report = sweep(&factory(&["one", "two"], &[]), &all).await;
+    let report = sweep(&factory(&["one", "two"], &[]), &all, DEADLINE).await;
 
     assert_eq!(report.runs.len(), 2);
     assert_eq!(report.failures().len(), 2);
@@ -194,7 +198,7 @@ async fn every_scheduled_connector_appears_in_the_report_even_when_all_of_them_f
 #[tokio::test]
 async fn a_healthy_sweep_plans_every_connector_in_order() {
     let all = [scheduled("alpha"), scheduled("beta"), scheduled("gamma")];
-    let report = sweep(&factory(&[], &[]), &all).await;
+    let report = sweep(&factory(&[], &[]), &all, DEADLINE).await;
 
     assert!(report.every_connector_planned());
     assert!(report.failures().is_empty());
@@ -205,7 +209,7 @@ async fn a_healthy_sweep_plans_every_connector_in_order() {
 /// An empty schedule is an empty report, not a failure.
 #[tokio::test]
 async fn a_sweep_with_nothing_scheduled_reports_nothing_and_succeeds() {
-    let report = sweep(&factory(&[], &[]), &[]).await;
+    let report = sweep(&factory(&[], &[]), &[], DEADLINE).await;
     assert!(report.runs.is_empty());
     assert!(
         report.every_connector_planned(),
@@ -260,6 +264,7 @@ async fn a_refusal_inside_a_plan_survives_the_sweep() {
             groups,
         },
         &[one],
+        DEADLINE,
     )
     .await;
 
@@ -282,5 +287,61 @@ async fn a_refusal_inside_a_plan_survives_the_sweep() {
     assert!(
         report.every_connector_planned(),
         "a refused departure set is not a failed connector: the sweep succeeded"
+    );
+}
+
+/// A CONNECTOR THAT NEVER ANSWERS DOES NOT STOP THE ONES BEHIND IT.
+///
+/// This is the isolation property's hardest case and the one that did not hold. `ldap3`'s
+/// connection timeout bounds the TCP connect and nothing after it: a directory that accepts the
+/// socket and never answers the bind leaves `open` pending indefinitely -- measured still pending
+/// at 8 seconds under a 1 second connection timeout. So "the sweep continues after a failure" was
+/// true only of failures that RETURN.
+#[tokio::test]
+async fn a_connector_that_never_answers_is_abandoned_and_the_sweep_goes_on() {
+    /// Opens by hanging for ever.
+    struct Hangs;
+
+    impl SourceFactory for Hangs {
+        type Source = Fake;
+        type Error = String;
+
+        async fn open(&self, scheduled: &Scheduled) -> Result<Fake, String> {
+            if scheduled.id == "hangs" {
+                // Never resolves. The deadline below is one second, so this test really does
+                // wait that long -- the alternative, a paused runtime, needs tokio's test-util
+                // feature and the second is cheaper than the dependency.
+                std::future::pending::<()>().await;
+            }
+            Ok(Fake {
+                people: vec![person(&format!("{}-user", scheduled.id))],
+                fail_read: false,
+                groups: BTreeMap::new(),
+            })
+        }
+    }
+
+    let all = [scheduled("hangs"), scheduled("healthy")];
+    let report = sweep(&Hangs, &all, std::time::Duration::from_secs(1)).await;
+
+    assert_eq!(report.runs.len(), 2);
+    assert!(
+        matches!(
+            report.runs[0].1,
+            ironauth_admin::ldap_schedule::Outcome::TimedOut { .. }
+        ),
+        "a connector that never answers must be abandoned: {:?}",
+        report.runs[0].1
+    );
+    assert!(
+        report.runs[1].1.is_planned(),
+        "the connector behind it must still run"
+    );
+    let failures = report.failures();
+    assert_eq!(failures[0].0, "hangs");
+    assert!(
+        failures[0].1.contains("gave up after 1s"),
+        "the reason must say it was abandoned and after how long: {}",
+        failures[0].1
     );
 }

@@ -35,7 +35,17 @@ use crate::ldap_schedule::{Scheduled, SourceFactory};
 use crate::ldap_sync::SyncInputs;
 
 /// How long to wait for a directory to answer a connect.
+///
+/// `ldap3` applies this to the TCP connect and nothing after it, which is why the sweep carries
+/// its own deadline as well: a directory that accepts the socket and never answers the bind is
+/// not caught by this.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long ONE connector gets, open and read together.
+///
+/// The bound that actually holds. Two minutes is generous for a directory of any size the paging
+/// handles, and short enough that one unresponsive server does not eat an hour's tick.
+const PER_CONNECTOR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// RFC 2696 page size for every connector's searches.
 ///
@@ -225,7 +235,7 @@ pub async fn sweep_scope(
         master,
         connectors,
     };
-    Ok(crate::ldap_schedule::sweep(&factory, &scheduled).await)
+    Ok(crate::ldap_schedule::sweep(&factory, &scheduled, PER_CONNECTOR_DEADLINE).await)
 }
 
 /// The clock is read through `Env` like every other timed thing here.
@@ -302,7 +312,7 @@ pub async fn run_pass(
                     report.failed += 1;
                     tracing::warn!(
                         connector = %id,
-                        reason = other.failure().unwrap_or("unknown"),
+                        reason = %other.failure().unwrap_or(std::borrow::Cow::Borrowed("unknown")),
                         "ldap connector did not produce a plan"
                     );
                 }

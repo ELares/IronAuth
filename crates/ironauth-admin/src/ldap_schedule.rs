@@ -60,6 +60,17 @@ pub trait SourceFactory {
 /// What one connector's pass produced.
 #[derive(Debug)]
 pub enum Outcome {
+    /// The connector took longer than the sweep's per-connector deadline.
+    ///
+    /// ITS OWN VARIANT because it is the failure that would otherwise not be one. `ldap3`'s
+    /// connection timeout bounds the TCP connect and nothing after it: a directory that accepts
+    /// the socket and never answers the bind leaves `open` pending for ever -- measured still
+    /// pending at 8s under a 1s connection timeout. Without a deadline here, one such directory
+    /// stops every connector behind it, which is exactly the isolation this module exists for.
+    TimedOut {
+        /// How long it was given.
+        after: std::time::Duration,
+    },
     /// The pass ran and produced a plan. The plan may still refuse its own departures.
     Planned(Box<crate::ldap_sync::SyncPlan>),
     /// The connector could not be opened.
@@ -80,10 +91,14 @@ impl Outcome {
 
     /// The operator-facing reason, when there is one.
     #[must_use]
-    pub fn failure(&self) -> Option<&str> {
+    pub fn failure(&self) -> Option<std::borrow::Cow<'_, str>> {
         match self {
             Self::Planned(_) => None,
-            Self::Unreachable(why) | Self::Failed(why) => Some(why),
+            Self::Unreachable(why) | Self::Failed(why) => Some(std::borrow::Cow::Borrowed(why)),
+            Self::TimedOut { after } => Some(std::borrow::Cow::Owned(format!(
+                "gave up after {}s",
+                after.as_secs()
+            ))),
         }
     }
 }
@@ -98,7 +113,7 @@ pub struct SweepReport {
 impl SweepReport {
     /// The connectors that could not produce a plan, with their reasons.
     #[must_use]
-    pub fn failures(&self) -> Vec<(&str, &str)> {
+    pub fn failures(&self) -> Vec<(&str, std::borrow::Cow<'_, str>)> {
         self.runs
             .iter()
             .filter_map(|(id, outcome)| outcome.failure().map(|why| (id.as_str(), why)))
@@ -119,21 +134,38 @@ impl SweepReport {
 ///
 /// Never returns early. A connector that cannot be opened, or whose pass fails, is recorded and
 /// the sweep continues.
-pub async fn sweep<F>(factory: &F, scheduled: &[Scheduled]) -> SweepReport
+pub async fn sweep<F>(
+    factory: &F,
+    scheduled: &[Scheduled],
+    per_connector: std::time::Duration,
+) -> SweepReport
 where
     F: SourceFactory + Sync,
     SyncError: From<<F::Source as EntrySource>::Error> + From<<F::Source as GroupSource>::Error>,
 {
     let mut runs = Vec::with_capacity(scheduled.len());
     for connector in scheduled {
-        let outcome = match factory.open(connector).await {
-            Err(why) => Outcome::Unreachable(why.to_string()),
-            Ok(source) => match plan(&source, &connector.inputs, &connector.previous).await {
-                Ok(p) => Outcome::Planned(Box::new(p)),
-                Err(why) => Outcome::Failed(why.to_string()),
-            },
-        };
-        runs.push((connector.id.clone(), outcome));
+        // THE DEADLINE COVERS OPEN AND READ TOGETHER, because either can hang. `ldap3`'s
+        // connection timeout bounds the TCP connect only -- a directory that accepts the socket
+        // and never answers the bind leaves `open` pending indefinitely -- and a search that
+        // stalls mid-page has no bound at all. Without this the isolation is a fiction: one
+        // unresponsive directory stops every connector scheduled behind it.
+        let attempt = tokio::time::timeout(per_connector, async {
+            match factory.open(connector).await {
+                Err(why) => Outcome::Unreachable(why.to_string()),
+                Ok(source) => match plan(&source, &connector.inputs, &connector.previous).await {
+                    Ok(p) => Outcome::Planned(Box::new(p)),
+                    Err(why) => Outcome::Failed(why.to_string()),
+                },
+            }
+        })
+        .await;
+        runs.push((
+            connector.id.clone(),
+            attempt.unwrap_or(Outcome::TimedOut {
+                after: per_connector,
+            }),
+        ));
     }
     SweepReport { runs }
 }

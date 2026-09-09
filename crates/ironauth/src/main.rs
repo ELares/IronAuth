@@ -7852,6 +7852,90 @@ mod tests {
 }
 
 #[cfg(test)]
+mod ldap_sweep_wiring_tests {
+    use super::ldap_sweep_inputs;
+    use ironauth_config::{Config, LdapSyncConfig};
+
+    fn config_with(ldap: LdapSyncConfig) -> Config {
+        Config {
+            ldap_sync: ldap,
+            ..Config::default()
+        }
+    }
+
+    /// THE SHIPPED DEFAULT MUST BE OFF.
+    ///
+    /// A worker that reads every tenant's directory must not start because somebody deployed the
+    /// binary. This is the assertion the sibling sweep has and this one shipped without: review
+    /// inverted the switch and no test noticed.
+    #[test]
+    fn the_shipped_default_does_not_run_the_sweep() {
+        assert!(
+            ldap_sweep_inputs(&Config::default(), "postgres://control").is_none(),
+            "the default configuration must not sweep anybody's directory"
+        );
+    }
+
+    /// And turning it on turns it on, so the test above is a discrimination rather than a
+    /// function that always returns None.
+    #[test]
+    fn enabling_it_produces_inputs() {
+        let inputs = ldap_sweep_inputs(
+            &config_with(LdapSyncConfig {
+                sweep_enabled: true,
+                ..LdapSyncConfig::default()
+            }),
+            "postgres://control",
+        )
+        .expect("enabled");
+        assert_eq!(inputs.batch, 100);
+        assert_eq!(inputs.interval.as_secs(), 3_600);
+        assert_eq!(inputs.control_dsn, "postgres://control");
+    }
+
+    /// A batch that reads no connectors is refused rather than run.
+    ///
+    /// The operator turned the sweep ON, so booting into a ticker that sweeps nothing is the
+    /// failure they would not think to look for.
+    #[test]
+    fn a_batch_that_reads_nothing_is_refused() {
+        for batch in [0, -1] {
+            assert!(
+                ldap_sweep_inputs(
+                    &config_with(LdapSyncConfig {
+                        sweep_enabled: true,
+                        sweep_batch: batch,
+                        ..LdapSyncConfig::default()
+                    }),
+                    "postgres://control",
+                )
+                .is_none(),
+                "a batch of {batch} sweeps nothing and must not start"
+            );
+        }
+    }
+
+    /// A zero interval becomes one second rather than a tick with no gap.
+    ///
+    /// `tokio::time::interval` panics on a zero period, so without the clamp an operator typo
+    /// takes the process down at boot. One second is still absurd for a directory sync, but it
+    /// is a running process an operator can see and fix.
+    #[test]
+    fn a_zero_interval_is_clamped_rather_than_panicking() {
+        let inputs = ldap_sweep_inputs(
+            &config_with(LdapSyncConfig {
+                sweep_enabled: true,
+                sweep_interval_secs: 0,
+                ..LdapSyncConfig::default()
+            }),
+            "postgres://control",
+        )
+        .expect("enabled");
+        assert_eq!(inputs.interval.as_secs(), 1);
+    }
+}
+
+#[cfg(test)]
 mod certificate_sweep_wiring_tests {
     use super::{CertificateSweepSettings, certificate_sweep_settings};
     use ironauth_config::{CertificateExpiryConfig, Config};
