@@ -184,6 +184,12 @@ path = "tests/ldap_groups.rs"
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
 
+# Running every active connector, one pass each (issue #142). NO database and no server: the
+# sweep runs against a factory that can be told which connectors refuse their bind.
+[[test]]
+name = "ldap_schedule"
+path = "tests/ldap_schedule.rs"
+
 # One pass of a directory sync (issue #142): read, map, expand, compare. NO database and no
 # server -- the pass runs against a fake that satisfies the same two traits the live client does.
 [[test]]

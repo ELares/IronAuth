@@ -34,6 +34,15 @@ allowlist_entries() {
 # untraced; see #774
 ironauth-oidc/mds3_sync
 
+# The #142 sweep, landed one slice ahead of the boot path that runs it. `ldap_sync::plan` is
+# reachable (the live ldap3 client implements both traits it reads through); what is missing is
+# the caller in `ironauth`'s main that loads active connectors for each scope, resolves each
+# bind secret from `environment_secrets`, and ticks the sweep on an interval -- the same shape
+# `start_certificate_sweep` has. Writing that here rather than discovering it a milestone later
+# is the point of this list, and this entry goes INERT the moment that wiring lands, which this
+# scan refuses -- so it cannot outlive its reason.
+ironauth-admin/ldap_schedule
+
 # `ironauth-store/token_customize` was allowlisted here as a contract landed before either
 # transport bound to it. #1005 bound one: `token_hook::PAYLOAD_VERSION` is now an alias of
 # `TOKEN_CUSTOMIZE_VERSION`, so the module has a real caller and the entry went INERT --
