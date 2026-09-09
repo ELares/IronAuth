@@ -42,7 +42,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
     CorrelationId, IdempotencyWrite, LdapAbsencePolicy, LdapConnectorId, LdapTlsMode,
-    NewLdapConnector, StoreError,
+    NewLdapConnector, OrganizationId, Scope, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -548,6 +548,123 @@ pub async fn list_ldap_connector_health(
     Ok(json(StatusCode::OK, body))
 }
 
+/// A create request with every bound already applied.
+///
+/// Destructured at the call site, so a field added to the request without being checked here
+/// does not compile rather than reaching the store unvalidated.
+struct Checked {
+    display_name: String,
+    host: String,
+    port: u16,
+    tls_mode: LdapTlsMode,
+    bind_dn: String,
+    bind_secret_name: String,
+    user_base_dn: String,
+    user_filter: String,
+    group_base_dn: String,
+    group_filter: String,
+    attribute_mapping: serde_json::Value,
+    absence_policy: LdapAbsencePolicy,
+    max_group_depth: i32,
+}
+
+/// Apply every bound a create request is held to.
+///
+/// Split out of the handler with `created_announcement`: between them they leave
+/// `create_ldap_connector` real headroom under the crate's hundred-line clippy ceiling rather
+/// than the single line the first version of this change left, which the next edit would have
+/// spent. The bounds themselves are unchanged and each still names the constant it enforces.
+fn check_create(request: CreateLdapConnectorRequest) -> Result<Checked, ApiError> {
+    let display_name = bounded(&request.display_name, "display_name", MAX_LABEL_BYTES)?;
+    let host = bounded(&request.host, "host", 255)?;
+    if request.port == 0 {
+        return Err(ApiError::BadRequest(
+            "invalid_port: port must be between 1 and 65535".to_owned(),
+        ));
+    }
+    let tls_mode = check_tls_mode(request.tls_mode.as_deref())?;
+    let bind_dn = bounded(&request.bind_dn, "bind_dn", MAX_DN_BYTES)?;
+    let bind_secret_name = check_bind_secret_name(&request.bind_secret_name)?;
+    let user_base_dn = bounded(&request.user_base_dn, "user_base_dn", MAX_DN_BYTES)?;
+    let user_filter = bounded(&request.user_filter, "user_filter", MAX_FILTER_BYTES)?;
+    let (group_base_dn, group_filter) = check_group_pair(
+        request.group_base_dn.as_deref(),
+        request.group_filter.as_deref(),
+    )?;
+    let attribute_mapping = check_attribute_mapping(request.attribute_mapping)?;
+    let absence_policy = check_absence_policy(request.absence_policy.as_deref())?;
+    let max_group_depth = check_depth(request.max_group_depth)?;
+    Ok(Checked {
+        display_name,
+        host,
+        port: request.port,
+        tls_mode,
+        bind_dn,
+        bind_secret_name,
+        user_base_dn,
+        user_filter,
+        group_base_dn,
+        group_filter,
+        attribute_mapping,
+        absence_policy,
+        max_group_depth,
+    })
+}
+
+/// The parts of an `ldap_connector.created` announcement, NAMED.
+///
+/// A struct rather than a tuple because two of the three are `String`: `(event_id, subject)`
+/// swapped at the call site would compile and would announce the event under the connector's
+/// id and the connector under the event's. Before the extraction these were two locals built
+/// in place and could not be interchanged; the field names put that back.
+struct CreatedAnnouncement {
+    /// The `evt_` id of the announcement itself.
+    event_id: String,
+    /// The connector the announcement is about.
+    subject: String,
+    /// The catalog-validated envelope, or `None` when the catalog declined it.
+    envelope: Option<serde_json::Value>,
+}
+
+/// Build the `ldap_connector.created` announcement.
+///
+/// Split out of the handler because building it inline took `create_ldap_connector` to 113
+/// lines against the crate's hundred-line clippy ceiling -- which a targeted `cargo test` does
+/// not see and only the lint does.
+///
+/// WHAT THE PAYLOAD CARRIES, AND WHAT IT DOES NOT, is decided by the catalog entry in
+/// `ironauth_store::event_catalog` and explained there; this builds the shape that entry
+/// declares rather than restating its reasoning.
+fn created_announcement(
+    state: &AdminState,
+    scope: Scope,
+    id: &LdapConnectorId,
+    organization_id: &OrganizationId,
+    host: &str,
+    tls_mode: LdapTlsMode,
+) -> CreatedAnnouncement {
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "ldap_connector.created",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "ldap_connector_id": subject,
+            "organization_id": organization_id.to_string(),
+            "host": host,
+            "tls_mode": tls_mode.as_str(),
+        }),
+    );
+    CreatedAnnouncement {
+        event_id,
+        subject,
+        envelope,
+    }
+}
+
 /// `POST .../ldap-connectors`
 ///
 /// # Errors
@@ -609,26 +726,21 @@ pub async fn create_ldap_connector(
     )
     .await?;
 
-    let request: CreateLdapConnectorRequest = parse_json(&body)?;
-    let display_name = bounded(&request.display_name, "display_name", MAX_LABEL_BYTES)?;
-    let host = bounded(&request.host, "host", 255)?;
-    if request.port == 0 {
-        return Err(ApiError::BadRequest(
-            "invalid_port: port must be between 1 and 65535".to_owned(),
-        ));
-    }
-    let tls_mode = check_tls_mode(request.tls_mode.as_deref())?;
-    let bind_dn = bounded(&request.bind_dn, "bind_dn", MAX_DN_BYTES)?;
-    let bind_secret_name = check_bind_secret_name(&request.bind_secret_name)?;
-    let user_base_dn = bounded(&request.user_base_dn, "user_base_dn", MAX_DN_BYTES)?;
-    let user_filter = bounded(&request.user_filter, "user_filter", MAX_FILTER_BYTES)?;
-    let (group_base_dn, group_filter) = check_group_pair(
-        request.group_base_dn.as_deref(),
-        request.group_filter.as_deref(),
-    )?;
-    let attribute_mapping = check_attribute_mapping(request.attribute_mapping)?;
-    let absence_policy = check_absence_policy(request.absence_policy.as_deref())?;
-    let max_group_depth = check_depth(request.max_group_depth)?;
+    let Checked {
+        display_name,
+        host,
+        port,
+        tls_mode,
+        bind_dn,
+        bind_secret_name,
+        user_base_dn,
+        user_filter,
+        group_base_dn,
+        group_filter,
+        attribute_mapping,
+        absence_policy,
+        max_group_depth,
+    } = check_create(parse_json(&body)?)?;
 
     let id = LdapConnectorId::generate(state.env(), &scope);
     // BUILT BEFORE THE WRITE, because the idempotency record stores it in the same transaction:
@@ -638,32 +750,18 @@ pub async fn create_ldap_connector(
         display_name: display_name.clone(),
     };
     let stored_body = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
-    // The domain event (issue #108). It names the HOST and the TLS MODE beside the ids, because
-    // the question a consumer asks about a directory connector is "where is this organization's
-    // identity data now read from, and is that connection protected". Neither the bind DN nor
-    // the secret name travels: see the catalog entry.
-    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
-    let subject = id.to_string();
-    let envelope = ironauth_store::event_catalog::envelope(
-        &event_id,
-        "ldap_connector.created",
-        &scope.tenant().to_string(),
-        &subject,
-        state.now_unix_micros() / 1000,
-        &serde_json::json!({
-            "ldap_connector_id": subject,
-            "organization_id": org_id.to_string(),
-            "host": host,
-            "tls_mode": tls_mode.as_str(),
-        }),
-    );
-    let created_event = envelope
-        .as_ref()
-        .map(|envelope| ironauth_store::DomainEvent {
-            id: &event_id,
-            subject: &subject,
-            envelope,
-        });
+    // The domain event (issue #108). Built by `created_announcement` above, which is where the
+    // payload's shape lives; see the catalog entry for what it carries and what it withholds.
+    let announcement = created_announcement(&state, scope, &id, &org_id, &host, tls_mode);
+    let created_event =
+        announcement
+            .envelope
+            .as_ref()
+            .map(|envelope| ironauth_store::DomainEvent {
+                id: &announcement.event_id,
+                subject: &announcement.subject,
+                envelope,
+            });
     let result = state
         .store()
         .scoped(scope)
@@ -679,7 +777,7 @@ pub async fn create_ldap_connector(
                 organization_id: &org_id,
                 display_name: &display_name,
                 host: &host,
-                port: request.port,
+                port,
                 tls_mode,
                 bind_dn: &bind_dn,
                 bind_secret_name: &bind_secret_name,
