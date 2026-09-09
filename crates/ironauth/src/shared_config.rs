@@ -623,6 +623,19 @@ mod tests {
     /// must state rather than one they can omit.
     const PLANE_LOCAL_KEYS: &[(&str, Reach, &str)] = &[
         (
+            "ldap_sync",
+            Reach::OnePlaneOrNoState,
+            "consumed once at boot by `ldap_sweep_inputs` (issue #142) to build the directory \
+             sync sweep, a background ticker that answers no request. Neither plane's state \
+             holds it: the sweep owns its own interval and batch, reads connectors through its \
+             own store handle, and PRODUCES NOTHING a response could carry -- it plans and \
+             applies nothing, so there is no per-request value for a plane to disagree about.\n\n\
+             IT IS CONTROL-PLANE ONLY, and not by convention: 0212 grants `ldap_connectors` to \
+             `ironauth_control` and nothing to the data plane, and the bind secrets sit behind \
+             the same role, so a pass handed the data-plane store fails on its first read. \
+             `ldap_sweep_inputs` therefore takes the control DSN and is not built without one.",
+        ),
+        (
             "certificate_expiry",
             Reach::OnePlaneOrNoState,
             "consumed once at boot by `certificate_sweep_inputs` (issue #141) to build the SAML \

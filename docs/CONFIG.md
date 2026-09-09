@@ -66,6 +66,10 @@ at the top of the file, or map it in `.taplo.toml`).
 | `hosted_pages.enabled` | boolean | `false` | Whether the hosted flow render app is the live browser interaction surface. Off by default: the bootstrap login, consent, and register pages stay the live UI until an operator opts in. Enabling this is independent of `flows.enabled`. |
 | `identifiers` | table | see fields | Flexible-identifier settings (issue #54): the per-environment uniqueness policy for typed login identifiers. Safe default: environment-wide uniqueness. |
 | `identifiers.uniqueness` | string | `"environment_wide"` | The uniqueness mode for login identifiers. Safe default: environment-wide. |
+| `ldap_sync` | table | see fields | Read-only LDAP/AD inbound sync (issue #142). |
+| `ldap_sync.sweep_batch` | integer | `100` | How many connectors one pass reads per scope. |
+| `ldap_sync.sweep_enabled` | boolean | `false` | Whether THIS process runs the sweep. OFF by default. |
+| `ldap_sync.sweep_interval_secs` | integer | `3600` | How often a pass runs, in seconds. |
 | `log_streams` | table | see fields | SIEM log stream shipping (issue #110): whether THIS process ships configured streams to their sinks, and how often. |
 | `log_streams.interval_secs` | integer | `60` | Seconds between shipping passes. |
 | `log_streams.shipping_enabled` | boolean | `false` | Whether THIS process ships configured log streams. OFF by default. |
