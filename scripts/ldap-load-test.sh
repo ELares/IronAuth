@@ -35,7 +35,12 @@ REPORT="${IRONAUTH_LDAP_LOAD_REPORT:-target/ldap-load-report.txt}"
 host_port() { printf '%s' "${IRONAUTH_LDAP_URL#ldap://}"; }
 
 echo "ldap-load-test: generating ${ENTRIES} entries"
-tmp="$(mktemp -t ldap-bulk)"
+# NOT `mktemp -t ldap-bulk`. BSD mktemp treats the argument as a PREFIX and appends its own
+# suffix, so that form works on macOS and fails on the GNU mktemp every CI runner has:
+# "mktemp: too few X's in template". The explicit path with a trailing run of X's is the
+# one spelling both accept, and it is why this step ran green locally for two merges while
+# the only lane that exercises it could not get past the first line.
+tmp="$(mktemp "${TMPDIR:-/tmp}/ldap-bulk.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 python3 - "$ENTRIES" > "$tmp" <<'PY'
 import sys
@@ -82,7 +87,7 @@ if [ -z "$binary" ]; then
   exit 1
 fi
 
-measured="$(mktemp -t ldap-load-time)"
+measured="$(mktemp "${TMPDIR:-/tmp}/ldap-load-time.XXXXXX")"
 trap 'rm -f "$tmp" "$measured"' EXIT
 # THE TEST IS TOLD WHAT TO EXPECT, and its EXIT STATUS is the answer. It used to be told nothing
 # and the count was scraped out of its panic message, which inverted the assertion: a pass that
