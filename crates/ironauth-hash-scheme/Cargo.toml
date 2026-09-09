@@ -18,7 +18,21 @@ categories = ["authentication", "cryptography"]
 # published on its own. Adding an ironauth-* dependency here would silently revoke that,
 # so the absence of a `[dependencies]` entry naming one is load-bearing.
 [dependencies]
-aes = "0.9"
+# HELD BELOW 0.9.3, which declares rustc 1.89 while this workspace promises 1.85.
+#
+# A caret `0.9` resolved forward to 0.9.3 in the #1155 group bump. `cargo test` and clippy are
+# blind to it, because the pinned toolchain is 1.97 and neither evaluates a declared
+# `rust-version` -- but CI IS NOT. `aes` is a non-optional dependency of a workspace member the
+# `msrv (1.85)` lane does not exclude, so its default-features step compiles it and refuses:
+# #1155's own run failed with exactly `aes@0.9.3 requires rustc 1.89`, and main stayed red on
+# that lane afterwards. The bump was merged past a red check, not past a blind spot. (An earlier
+# version of this note said the lane could not see it; that was the reasoning for the OPTIONAL,
+# test-harness-gated rcgen pin, carried across to a non-optional dependency without re-measuring.)
+#
+# `scripts/msrv-audit.sh` names the same failure locally, before CI does, which is why it is
+# worth running after any bump touching this crate. 0.9.2 and 0.9.1 both declare 1.85, so the
+# range keeps a patch available without an exact pin.
+aes = ">=0.9.1, <0.9.3"
 argon2.workspace = true
 base64.workspace = true
 bcrypt = "0.19"

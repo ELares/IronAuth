@@ -320,11 +320,28 @@ rustls-native-certs = "0.8"
 # HELD AT 0.13 ON PURPOSE, and this is not a stale pin waiting to be bumped.
 #
 # rcgen 0.14.8 raised its declared `rust-version` to 1.88, and this workspace promises
-# 1.85. That is not a local-gate quibble: CI's `msrv (1.85)` lane runs
-# `cargo check --workspace --all-features --all-targets`, so `--all-features` turns this
-# test-only feature on and the resolver refuses. Being optional buys no exemption.
+# 1.85.
 #
-# A caret `0.14` therefore cannot be used, because it resolves forward to 0.14.9. What
+# WHAT ACTUALLY CATCHES A BUMP, corrected. This used to say CI's `msrv (1.85)` lane runs
+# `cargo check --workspace --all-features --all-targets`, so `--all-features` would turn
+# this test-only feature on and the resolver would refuse. That lane no longer does. Its
+# 1.85 step is `cargo check --workspace --exclude ironauth-hooks` with DEFAULT features --
+# deliberately, because an MSRV is a promise about what a CONSUMER compiles -- and the
+# `--all-features --all-targets` step beside it runs under 1.95, where 1.88 is fine. So CI
+# would let a bump through.
+#
+# `scripts/msrv-audit.sh` is the guard that survives, and it is the one to run when
+# re-evaluating this pin. It reads `cargo metadata`, where rcgen still lands in the default
+# feature graph: six siblings dev-depend on `ironauth-fetch` with `test-harness`, so that
+# node resolves WITH the feature and its normal-kind edge to rcgen is not pruned. Measured
+# on a caret `0.14`: the audit goes from clean to `rcgen@0.14.10 requires rustc 1.88`, and
+# `RUSTUP_TOOLCHAIN=1.85 cargo check -p ironauth-fetch --features test-harness` fails at
+# the compiler with the same message. Being optional buys no exemption; being invisible to
+# CI is exactly why the audit exists.
+#
+# A caret `0.14` therefore cannot be used, because it resolves forward (0.14.10 today; an
+# earlier version of this note said 0.14.9, and 0.14.10 has since been PUBLISHED -- the lockfile
+# has never held any 0.14.x, so the registry is the thing to re-query, not Cargo.lock). What
 # WOULD work is an exact `=0.14.7`, which still declares 1.71 and passes the audit
 # (measured, not assumed). It is rejected for a different reason: an exact pin forfeits
 # every future patch release, including a security one, in exchange for a newer API this
