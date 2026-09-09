@@ -42,7 +42,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use ironauth_store::{
     CorrelationId, IdempotencyWrite, LdapAbsencePolicy, LdapConnectorId, LdapTlsMode,
-    NewLdapConnector, StoreError,
+    NewLdapConnector, OrganizationId, Scope, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -548,6 +548,43 @@ pub async fn list_ldap_connector_health(
     Ok(json(StatusCode::OK, body))
 }
 
+/// The `ldap_connector.created` envelope, its id, and its subject.
+///
+/// Split out of the handler because adding it there took `create_ldap_connector` to 113 lines
+/// against the crate's hundred-line clippy ceiling -- which a targeted `cargo test` does not
+/// see and only the lint does.
+///
+/// It names the HOST and the TLS MODE beside the ids, because the question a consumer asks
+/// about a directory connector is "where is this organization's identity data now read from,
+/// and is that connection protected". Neither the bind DN nor the secret name travels: no
+/// receiver can resolve either, and naming an environment secret on the wire only says which
+/// one to attack.
+fn created_envelope(
+    state: &AdminState,
+    scope: Scope,
+    id: &LdapConnectorId,
+    organization_id: &OrganizationId,
+    host: &str,
+    tls_mode: LdapTlsMode,
+) -> (String, String, Option<serde_json::Value>) {
+    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
+    let subject = id.to_string();
+    let envelope = ironauth_store::event_catalog::envelope(
+        &event_id,
+        "ldap_connector.created",
+        &scope.tenant().to_string(),
+        &subject,
+        state.now_unix_micros() / 1000,
+        &serde_json::json!({
+            "ldap_connector_id": subject,
+            "organization_id": organization_id.to_string(),
+            "host": host,
+            "tls_mode": tls_mode.as_str(),
+        }),
+    );
+    (event_id, subject, envelope)
+}
+
 /// `POST .../ldap-connectors`
 ///
 /// # Errors
@@ -638,25 +675,10 @@ pub async fn create_ldap_connector(
         display_name: display_name.clone(),
     };
     let stored_body = serde_json::to_string(&created).map_err(|_| ApiError::Internal)?;
-    // The domain event (issue #108). It names the HOST and the TLS MODE beside the ids, because
-    // the question a consumer asks about a directory connector is "where is this organization's
-    // identity data now read from, and is that connection protected". Neither the bind DN nor
-    // the secret name travels: see the catalog entry.
-    let event_id = format!("evt_{}", CorrelationId::generate(state.env()));
-    let subject = id.to_string();
-    let envelope = ironauth_store::event_catalog::envelope(
-        &event_id,
-        "ldap_connector.created",
-        &scope.tenant().to_string(),
-        &subject,
-        state.now_unix_micros() / 1000,
-        &serde_json::json!({
-            "ldap_connector_id": subject,
-            "organization_id": org_id.to_string(),
-            "host": host,
-            "tls_mode": tls_mode.as_str(),
-        }),
-    );
+    // The domain event (issue #108), built by the helper below so this handler stays under the
+    // crate's hundred-line ceiling.
+    let (event_id, subject, envelope) =
+        created_envelope(&state, scope, &id, &org_id, &host, tls_mode);
     let created_event = envelope
         .as_ref()
         .map(|envelope| ironauth_store::DomainEvent {
