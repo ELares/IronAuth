@@ -215,3 +215,63 @@ async fn a_provision_carries_the_resolved_login() {
     );
     assert_eq!(changes.provisions(), ["u-ada"].into_iter().collect());
 }
+
+/// THE OTHER REFUSAL, and its payload, travelling through the change set.
+///
+/// The suite only ever produced `ObservationIncomplete`, so the assertion that "the reason must
+/// travel" compared the one value the fixtures could generate: hardcoding
+/// `Some(ObservationIncomplete)` in place of the plan's reason passed everything.
+///
+/// The two refusals demand opposite responses. `ObservationIncomplete` means retry with a bigger
+/// bound. `EverybodyVanished` means STOP: the read succeeded and returned nobody, which is a base
+/// DN typo or a revoked read grant, and its `previously` count is how an operator sizes what was
+/// about to happen. Collapsing one into the other tells them to retry the thing they must not.
+#[tokio::test]
+async fn the_everybody_vanished_refusal_reaches_the_change_set_with_its_count() {
+    let p = planned(&[], &["u-a", "u-b", "u-c"]).await;
+    let changes = ChangeSet::from_plan(&p, LdapAbsencePolicy::Delete);
+
+    assert_eq!(
+        changes.withheld,
+        Some(DepartureRefusal::EverybodyVanished { previously: 3 }),
+        "the reason AND its count must be the plan's, not a constant"
+    );
+    assert!(
+        changes.removals().is_empty(),
+        "a read that returned nobody must remove nobody"
+    );
+    assert!(!changes.deletes_anybody());
+}
+
+/// `removals()` REPORTS THE REMOVALS, which nothing pinned.
+///
+/// It was queried twice: once for emptiness, once in an equality whose two sides come from the
+/// same function on the same plan. So `removals()` returning an empty set for every input passed
+/// -- and that made the refusal test's safety assertion vacuous, because the accessor it
+/// interrogates would answer "empty" while the change set carried removals an executor would run.
+/// Reporting provisions AS removals passed too, which is the list a confirmation prompt shows.
+#[tokio::test]
+async fn removals_names_exactly_the_people_being_removed() {
+    let p = planned(&[("newcomer", "u-new")], &["u-old"]).await;
+    let changes = ChangeSet::from_plan(&p, LdapAbsencePolicy::Deactivate);
+
+    assert_eq!(
+        changes.removals(),
+        ["u-old"].into_iter().collect(),
+        "removals must be the departures and nothing else"
+    );
+    assert_eq!(
+        changes.provisions(),
+        ["u-new"].into_iter().collect(),
+        "and the arrival must not appear among them"
+    );
+    // The two sets are disjoint, which is the property a confirmation prompt depends on: an
+    // operator told "these will be removed" must not be reading the list of people who joined.
+    assert!(
+        changes
+            .removals()
+            .intersection(&changes.provisions())
+            .next()
+            .is_none()
+    );
+}
