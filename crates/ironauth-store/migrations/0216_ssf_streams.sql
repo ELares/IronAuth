@@ -9,9 +9,15 @@
 -- PER RECEIVER, not per organization, and that is the difference from every other connector
 -- table here. A stream is created BY the receiver through an OAuth-protected endpoint on the
 -- public plane, so the principal that owns it is the client whose credential created it, and
--- `client_id` is what every read and every write is fenced on. #143 states the rule directly:
--- "a receiver's credentials grant access to exactly its own streams". A stream reachable by a
--- second client is the IDOR this column exists to make unrepresentable.
+-- `client_id` is what every RECEIVER-FACING read and every write is fenced on. #143 states the
+-- rule directly: "a receiver's credentials grant access to exactly its own streams". A stream
+-- reachable by a second RECEIVER is the IDOR this column exists to make unrepresentable.
+--
+-- ONE READ IS DELIBERATELY NOT FENCED, and saying so here is the point. The fan-out that turns
+-- an environment's security events into SETs reads every retaining stream in the scope, because
+-- that is what a fan-out is: it acts for the environment, not for any client, so it takes no
+-- `client_id` -- which is also what keeps it from being mistaken for a read a receiver can
+-- reach. Nothing a receiver can call reaches it.
 --
 -- THE PUSH CREDENTIAL IS NOT A COLUMN. `push_secret_name` names an `environment_secrets` row,
 -- the way 0212 and 0189 do, and the value is resolved at delivery time through the sealing
@@ -33,10 +39,14 @@ CREATE TABLE ssf_streams (
     -- principal permitted to read, update, or delete it.
     client_id             text        NOT NULL,
 
-    -- SSF 1.0 section 7.1.2. `enabled` delivers; `paused` RETAINS events without delivering
-    -- them, which is the state a receiver asks for during its own maintenance; `disabled`
-    -- delivers nothing and retains nothing. The difference between the two non-delivering
-    -- states is what a receiver gets back when it resumes, so they cannot be collapsed.
+    -- The SSF 1.0 stream-status vocabulary, cited by NAME rather than by section number: an
+    -- earlier draft of this file cited "section 7.1.2", which is not where the status vocabulary
+    -- lives, and a number nobody checked is worse than no number.
+    --
+    -- `enabled` delivers; `paused` RETAINS events without delivering them, which is the state a
+    -- receiver asks for during its own maintenance; `disabled` delivers nothing and retains
+    -- nothing. The difference between the two non-delivering states is what a receiver gets back
+    -- when it resumes, so they cannot be collapsed.
     status                text        NOT NULL DEFAULT 'enabled',
     -- Why it is in that state, when a transmitter set it (SSF 1.0 allows a reason). NULL when
     -- the receiver set the state itself and gave none.
@@ -72,8 +82,9 @@ CREATE TABLE ssf_streams (
     -- (issuer, subject) pair, another by an opaque handle it was given.
     subject_format        text        NOT NULL DEFAULT 'iss_sub',
 
-    -- The `aud` every SET on this stream carries (SSF 1.0 section 7.1.1). An array, because
-    -- the claim permits one or many and a receiver fronting several audiences is ordinary.
+    -- The `aud` every SET on this stream carries, per SSF 1.0's stream configuration. An array,
+    -- because the claim permits one or many and a receiver fronting several audiences is
+    -- ordinary.
     audience              jsonb       NOT NULL,
     -- What the receiver calls it. Operator-facing only; nothing keys on it.
     description           text,
@@ -136,8 +147,11 @@ CREATE TABLE ssf_streams (
 );
 
 -- A receiver lists ITS OWN streams, which is the only listing the surface offers.
+-- THE SORT COLUMNS ARE PART OF THE INDEX, the rule 0189 states and credits 0183 for: the
+-- listing orders by `(created_at, id)` and resumes from that pair, so without them the index
+-- serves the filter and leaves every page to a sort over all of the receiver's rows.
 CREATE INDEX ssf_streams_by_client_idx
-    ON ssf_streams (tenant_id, environment_id, client_id);
+    ON ssf_streams (tenant_id, environment_id, client_id, created_at, id);
 -- The fan-out reads every stream that RETAINS an event generated now, which is both 'enabled'
 -- and 'paused' -- a paused stream accumulates, and one omitted here is a backlog its receiver
 -- can never be given. The partial predicate therefore matches `SsfStreamStatus::retains`
@@ -165,13 +179,18 @@ CREATE POLICY ssf_streams_scope ON ssf_streams
 -- delete: a stream row records no history worth keeping -- what it DELIVERED is in the SETs
 -- and in the audit log, neither of which this row owns.
 GRANT SELECT, INSERT, DELETE ON ssf_streams TO ironauth_app;
--- UPDATE is column-scoped to exactly what the two documented updates write: the status
--- endpoint writes the first pair, and a configuration update writes the rest. The withheld
--- columns are the ones that decide WHOSE stream this is and WHERE it delivers, so a widened
--- update cannot re-point a stream at another receiver's endpoint.
+-- UPDATE is column-scoped to exactly what the ONE update statement in the tree writes.
+-- `ActingSsfStreamRepo::set_status` writes these three and there is no other; the columns
+-- withheld are the ones that decide WHOSE stream this is and WHERE it delivers, so no update
+-- can re-point a stream at another receiver's endpoint.
+--
+-- The configuration update SSF 1.0 also defines is a later slice, and its columns are granted
+-- with the statement that writes them rather than ahead of it. 0212 states the rule this
+-- follows: "A privilege for a write nothing performs is one nobody can account for later."
+-- That matters more here than usual, because this file is checksummed whole-file once applied
+-- -- a grant justified by an operation that does not exist could never have its justification
+-- corrected, only revoked by a later migration contradicting prose nobody can edit.
 GRANT UPDATE (status, status_reason, updated_at) ON ssf_streams TO ironauth_app;
-GRANT UPDATE (events_requested, events_delivered, subject_format, description, updated_at)
-    ON ssf_streams TO ironauth_app;
 -- The CONTROL plane reads them: the operator console lists an environment's streams, and the
 -- fan-out that turns a session-ended event into SETs runs there.
 GRANT SELECT ON ssf_streams TO ironauth_control;

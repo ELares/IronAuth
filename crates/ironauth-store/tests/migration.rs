@@ -8335,6 +8335,14 @@ async fn the_narrowed_tables_grant_the_data_plane_exactly_their_writers_columns(
         ("agent_vault_approvals", vec!["state", "decided_at"]),
         // `revoke_session_set` names one column; `mint` is an INSERT and `redeem` a SELECT.
         ("native_sso_device_secrets", vec!["revoked_at"]),
+        // `ActingSsfStreamRepo::set_status` names all three and is the only UPDATE on the
+        // table (issue #143). Absent: `client_id`, which decides WHOSE stream it is, and
+        // `push_endpoint_url` / `push_secret_name`, which decide where its security events go
+        // and what credential is presented -- a data plane that could write those could
+        // re-point another receiver's stream at an endpoint it chose. Also absent are the
+        // negotiation columns: SSF 1.0 defines a configuration update, this slice does not
+        // ship one, and the first version of 0216 granted them anyway.
+        ("ssf_streams", vec!["status", "status_reason", "updated_at"]),
     ] {
         let mut writable = writable_columns(pool, "ironauth_app", table).await;
         writable.sort();

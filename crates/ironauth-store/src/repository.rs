@@ -81668,7 +81668,8 @@ impl ScimConnection {
 // Shared Signals Framework: streams (issue #143).
 // ---------------------------------------------------------------------------------------
 
-/// What a stream is doing with the events it is entitled to (SSF 1.0 section 7.1.2).
+/// What a stream is doing with the events it is entitled to: the SSF 1.0 stream-status
+/// vocabulary, named rather than numbered for the reason 0216 gives.
 ///
 /// Three states rather than a boolean, because the two non-delivering ones differ in what the
 /// receiver gets back when it returns. `Paused` RETAINS: a receiver taking its endpoint down
@@ -81773,11 +81774,11 @@ pub const SSF_DELIVERY_POLL: &str = "urn:ietf:rfc:8936";
 /// this code disagree, and picking one would render subjects in a format nobody negotiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SsfSubjectFormat {
-    /// RFC 9493 section 3.2.1: an email address.
+    /// RFC 9493 section 3.2.2: an email address.
     Email,
     /// RFC 9493 section 3.2.3: the (issuer, subject) pair.
     IssSub,
-    /// RFC 9493 section 3.2.2: an opaque identifier this transmitter chose.
+    /// RFC 9493 section 3.2.4: an opaque identifier this transmitter chose.
     Opaque,
 }
 
@@ -81891,6 +81892,15 @@ fn ssf_stream_from_row(row: &PgRow, scope: Scope) -> Result<SsfStream, StoreErro
         SSF_DELIVERY_POLL => {
             if endpoint.is_some() {
                 return Err(decode("push_endpoint_url"));
+            }
+            // BOTH HALVES, not just the endpoint. 0216 makes a poll row carrying either a
+            // delivery URL or a push credential unwritable, so a row with one anyway means the
+            // schema and this build disagree. Checking only the endpoint would have mapped such
+            // a row to `Poll` and dropped the credential's NAME on the floor without a word --
+            // which reads, to anyone later asking why a secret is unreferenced, as a secret
+            // nothing uses.
+            if secret_name.is_some() {
+                return Err(decode("push_secret_name"));
             }
             SsfDelivery::Poll
         }

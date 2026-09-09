@@ -1392,13 +1392,12 @@ pub enum Action {
     /// "who started shipping our signals, and to what endpoint" needs it without decoding a
     /// detail field.
     SsfStreamCreated,
-    /// A Shared Signals stream's configuration changed (issue #143).
-    SsfStreamUpdated,
     /// A Shared Signals stream's status changed (issue #143).
     ///
-    /// Separate from [`Action::SsfStreamUpdated`] because it is the one change that alters
-    /// whether events flow at all, and a pause that nobody can distinguish from a
-    /// configuration edit is a delivery gap with no entry naming it.
+    /// The one change that alters whether events flow at all. It is its own action rather than
+    /// a configuration edit because a pause nobody can distinguish from an edit is a delivery
+    /// gap with no entry naming it. The configuration edit itself lands with the slice that
+    /// ships it: an action nothing produces is one no log can ever contain.
     SsfStreamStatusChanged,
     /// An inbound SAML connection was created (issue #139).
     ///
@@ -1975,7 +1974,6 @@ impl Action {
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
             Action::LdapConnectorUpdated => "ldap_connector.updated",
             Action::SsfStreamCreated => "ssf_stream.created",
-            Action::SsfStreamUpdated => "ssf_stream.updated",
             Action::SsfStreamStatusChanged => "ssf_stream.status_changed",
             Action::SamlConnectionCreated => "saml_connection.created",
             Action::SamlConnectionDeleted => "saml_connection.deleted",

@@ -213,9 +213,19 @@ async fn the_transmitter_cannot_agree_to_send_more_than_was_asked_for() {
             push_spec(&id, &client, &delivery, &requested, &delivered, &audience),
         )
         .await;
+    // AND IT NAMES THE CONSTRAINT THAT REFUSED IT. `is_err()` alone passes for a `NotFound`
+    // from the scope guard, for a `Conflict` on a duplicate handle, and for any future refusal
+    // on an unrelated column -- so it would keep passing on the day this stopped being the
+    // reason. The sibling IDOR test distinguishes its outcomes the same way.
+    let Err(StoreError::Database(error)) = outcome else {
+        panic!(
+            "a stream delivering more than it requested was written, or was refused for a reason that is not the database's: {outcome:?}"
+        );
+    };
+    let rendered = error.to_string();
     assert!(
-        outcome.is_err(),
-        "a stream delivering more than it requested was written"
+        rendered.contains("ssf_streams_delivered_within_requested"),
+        "the refusal came from the database but not from the subset constraint: {rendered}"
     );
 }
 
