@@ -184,6 +184,12 @@ path = "tests/ldap_groups.rs"
 name = "ldap_mapping"
 path = "tests/ldap_mapping.rs"
 
+# Who joined and who left between two directory reads (issue #142). NO database: pure set
+# comparison plus the rules about when a departure may be concluded at all.
+[[test]]
+name = "ldap_diff"
+path = "tests/ldap_diff.rs"
+
 # Directory transport rules and the derived attribute list (issue #142). NO database, and no
 # directory either: the transport decision is made before a socket is opened.
 [[test]]

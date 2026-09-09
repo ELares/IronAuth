@@ -1508,7 +1508,11 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
     let (subscribed, secret, base) = register(&h, &tenant, &environment).await;
     let (uninterested, _, _) = register_as(&h, &tenant, &environment, "k-register-2").await;
     for (endpoint, wanted, key) in [
-        (&subscribed, "saml_certificate.expiry_announced", "k-types-1"),
+        (
+            &subscribed,
+            "saml_certificate.expiry_announced",
+            "k-types-1",
+        ),
         (&uninterested, "user.created", "k-types-2"),
     ] {
         let (status, _, body) = h
@@ -1551,7 +1555,10 @@ async fn a_certificate_entering_its_lead_window_delivers_a_signed_renewal_webhoo
         .expect("claim the event");
     assert_eq!(events.len(), 1, "the sweep emits exactly one event");
     let envelope = &events[0].payload;
-    assert_eq!(envelope["type"], "saml_certificate.expiry_announced", "{envelope}");
+    assert_eq!(
+        envelope["type"], "saml_certificate.expiry_announced",
+        "{envelope}"
+    );
     // THE SCOPE PAIR, which the model test above asserts and this one dropped. The producer
     // passes tenant and environment as two adjacent positional &str derived from one Scope, so
     // swapping them compiles, routes correctly (delivery reads the outbox row's own columns,
