@@ -211,6 +211,12 @@ name = "ldap_snapshot_pass"
 path = "tests/ldap_snapshot_pass.rs"
 required-features = ["testing"]
 
+# The LDAP connector management surface and its health routes (issue #142).
+[[test]]
+name = "ldap_connectors_api"
+path = "tests/ldap_connectors_api.rs"
+required-features = ["testing"]
+
 # A whole pass, stored row to written account, against a real LDAP server and a real database
 # (issue #142). Ignored by default: it needs IRONAUTH_LDAP_URL.
 [[test]]

@@ -77786,7 +77786,10 @@ impl LdapTlsMode {
         matches!(self, Self::Plaintext)
     }
 
-    fn parse(raw: &str) -> Option<Self> {
+    /// The transport mode named by its stored spelling, or [`None`] for a value this build
+    /// does not know.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "ldaps" => Some(Self::Ldaps),
             "starttls" => Some(Self::StartTls),
@@ -77815,7 +77818,10 @@ impl LdapAbsencePolicy {
         }
     }
 
-    fn parse(raw: &str) -> Option<Self> {
+    /// The absence policy named by its stored spelling, or [`None`] for a value this build
+    /// does not know.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "deactivate" => Some(Self::Deactivate),
             "delete" => Some(Self::Delete),
@@ -77859,6 +77865,11 @@ pub struct LdapConnector {
     pub max_group_depth: i32,
     /// Whether the scheduler picks it up.
     pub active: bool,
+    /// When the connector was configured, in microseconds since the epoch.
+    ///
+    /// THE PAGINATION KEY, alongside the id: a listing that publishes a cursor needs a stable
+    /// total order to resume from, and `(created_at, id)` is the order the queries already use.
+    pub created_at_unix_micros: i64,
 }
 
 /// A connector to create.
@@ -78537,20 +78548,31 @@ impl LdapConnectorRepo<'_> {
         &self,
         organization_id: &OrganizationId,
         limit: i64,
+        after: Option<&CursorPosition>,
     ) -> Result<Vec<LdapConnector>, StoreError> {
         if organization_id.scope() != self.scope {
             return Ok(Vec::new());
         }
+        // RESUMES FROM THE CURSOR, on the same `(created_at, id)` order the query already used.
+        // Without it a surface publishing a `cursor` parameter would have it do nothing, and an
+        // organization's connectors past the first page would be unreachable -- the defect the
+        // outbound SCIM listing next door was corrected for.
+        let (after_micros, after_id) = split_cursor(after);
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(&format!(
             "SELECT {LDAP_CONNECTOR_COLUMNS} FROM ldap_connectors \
              WHERE tenant_id = $1 AND environment_id = $2 AND organization_id = $3 \
+               AND ($5::bigint IS NULL OR \
+                    (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint > $5 OR \
+                    ((EXTRACT(EPOCH FROM created_at) * 1000000)::bigint = $5 AND id > $6)) \
              ORDER BY created_at, id LIMIT $4"
         ))
         .bind(self.scope.tenant().to_string())
         .bind(self.scope.environment().to_string())
         .bind(organization_id.to_string())
         .bind(limit.clamp(0, MANAGEMENT_LIST_HARD_CAP + 1))
+        .bind(after_micros)
+        .bind(after_id)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -78614,6 +78636,7 @@ impl ActingLdapConnectorRepo<'_> {
         &self,
         env: &Env,
         connector: NewLdapConnector<'_>,
+        idempotency: Option<IdempotencyWrite<'_>>,
     ) -> Result<(), StoreError> {
         if connector.id.scope() != self.scope || connector.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -78692,6 +78715,10 @@ impl ActingLdapConnectorRepo<'_> {
                     // that is what it is.
                     return Err(StoreError::NotFound);
                 }
+                // IN THE SAME TRANSACTION as the row. A record written afterwards leaves a
+                // window in which the connector exists and the retry that created it can still
+                // create a second one, which is the hole `idempotent-write-audit` exists for.
+                insert_idempotency(tx, idempotency).await?;
                 Ok(())
             },
             false,
@@ -78709,14 +78736,16 @@ impl ActingLdapConnectorRepo<'_> {
     pub async fn set_active(
         &self,
         env: &Env,
+        organization_id: &OrganizationId,
         id: &LdapConnectorId,
         active: bool,
     ) -> Result<(), StoreError> {
-        if id.scope() != self.scope {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
         let id = *id;
+        let organization = organization_id.to_string();
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,
@@ -78727,14 +78756,20 @@ impl ActingLdapConnectorRepo<'_> {
                 target: &id,
             },
             async move |tx| {
+                // THE ORGANIZATION IS IN THE STATEMENT. A connector belongs to one organization,
+                // and an operator delegated a DIFFERENT one has a live scope and a live
+                // `management.write` -- so without this conjunct they could pause any directory
+                // in the environment. Scope alone is not the fence here; the organization is.
                 let updated = sqlx::query(
                     "UPDATE ldap_connectors SET active = $4, updated_at = now() \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND organization_id = $5",
                 )
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(id.to_string())
                 .bind(active)
+                .bind(&organization)
                 .execute(&mut **tx)
                 .await?;
                 if updated.rows_affected() == 0 {
@@ -78763,12 +78798,18 @@ impl ActingLdapConnectorRepo<'_> {
     ///
     /// [`StoreError::NotFound`] if the handle is out of scope or no such connector exists;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn delete(&self, env: &Env, id: &LdapConnectorId) -> Result<(), StoreError> {
-        if id.scope() != self.scope {
+    pub async fn delete(
+        &self,
+        env: &Env,
+        organization_id: &OrganizationId,
+        id: &LdapConnectorId,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
         }
         let scope = self.scope;
         let id = *id;
+        let organization = organization_id.to_string();
         write_audited_detailed(
             AuditedWrite {
                 store: self.store,
@@ -78780,12 +78821,17 @@ impl ActingLdapConnectorRepo<'_> {
             },
             async move |tx| {
                 let deleted = sqlx::query(
+                    // THE ORGANIZATION IS IN THE STATEMENT, for the reason `set_active` gives:
+                    // scope alone would let an operator delegated one organization delete
+                    // another's directory, and the delete cascades its snapshot and its health.
                     "DELETE FROM ldap_connectors \
-                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3",
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 \
+                       AND organization_id = $4",
                 )
                 .bind(scope.tenant().to_string())
                 .bind(scope.environment().to_string())
                 .bind(id.to_string())
+                .bind(&organization)
                 .execute(&mut **tx)
                 .await?;
                 if deleted.rows_affected() == 0 {
@@ -78803,7 +78849,8 @@ impl ActingLdapConnectorRepo<'_> {
 /// The columns every connector read selects, in the order `ldap_connector_from_row` expects.
 const LDAP_CONNECTOR_COLUMNS: &str = "id, organization_id, display_name, host, port, tls_mode, \
      bind_dn, bind_secret_name, user_base_dn, group_base_dn, user_filter, group_filter, \
-     attribute_mapping, absence_policy, max_group_depth, active";
+     attribute_mapping, absence_policy, max_group_depth, active, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us";
 
 /// Reconstruct a typed [`LdapConnector`] from a row read within scope.
 ///
@@ -78841,6 +78888,7 @@ fn ldap_connector_from_row(row: &PgRow, scope: Scope) -> Result<LdapConnector, S
             .ok_or_else(|| decode("absence_policy"))?,
         max_group_depth: row.get("max_group_depth"),
         active: row.get("active"),
+        created_at_unix_micros: row.get("created_us"),
     })
 }
 

@@ -15927,6 +15927,431 @@
         ]
       }
     },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors": {
+      "get": {
+        "tags": [
+          "ldap"
+        ],
+        "summary": "`GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors`",
+        "description": "# Errors\n\n[`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if\nthe organization does not exist here; [`ApiError::BadRequest`] on a malformed cursor or\nlimit; [`ApiError::Internal`] on a store failure.",
+        "operationId": "listLdapConnectors",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum connectors to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from a previous page",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This organization's directory connectors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LdapConnectorListView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "ldap"
+        ],
+        "summary": "`POST .../ldap-connectors`",
+        "description": "# Errors\n\n[`ApiError::BadRequest`] on any invalid field, including a bind secret outside the connector\nnamespace; [`ApiError::Forbidden`] on the wrong plane, scope or permission;\n[`ApiError::NotFound`] if the organization does not exist here; [`ApiError::Conflict`] if the\nhandle is already used; [`ApiError::Internal`] on a store failure.",
+        "operationId": "createLdapConnector",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required. Replays return the original response.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLdapConnectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The connector was configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LdapConnectorCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The handle is already used",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health": {
+      "get": {
+        "tags": [
+          "ldap"
+        ],
+        "summary": "`GET .../ldap-connectors/health`",
+        "description": "# Errors\n\n[`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if\nthe organization does not exist here; [`ApiError::Internal`] on a store failure. NOT\n`BadRequest`: this route takes no query and no body, which its `responses(...)` and the\ngenerated spec both already say.",
+        "operationId": "listLdapConnectorHealth",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "How each directory's last sync went",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LdapHealthListView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}": {
+      "delete": {
+        "tags": [
+          "ldap"
+        ],
+        "summary": "`DELETE .../ldap-connectors/{connector_id}`",
+        "description": "# Errors\n\n[`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if no\nsuch connector belongs to this organization; [`ApiError::Internal`] on a store failure. NOT\n`BadRequest`: this route takes no body.",
+        "operationId": "deleteLdapConnector",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "Connector identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The connector was removed"
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connector",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}/active": {
+      "put": {
+        "tags": [
+          "ldap"
+        ],
+        "summary": "`PUT .../ldap-connectors/{connector_id}/active`",
+        "description": "# Errors\n\n[`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if no\nsuch connector belongs to this organization; [`ApiError::BadRequest`] on a malformed body;\n[`ApiError::Internal`] on a store failure.",
+        "operationId": "setLdapConnectorActive",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "Tenant identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment_id",
+            "in": "path",
+            "description": "Environment identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "organization_id",
+            "in": "path",
+            "description": "Organization identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connector_id",
+            "in": "path",
+            "description": "Connector identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLdapConnectorActiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The connector was paused or resumed"
+          },
+          "403": {
+            "description": "Wrong plane or scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connector",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships": {
       "get": {
         "tags": [
@@ -30598,6 +31023,92 @@
           }
         }
       },
+      "CreateLdapConnectorRequest": {
+        "type": "object",
+        "description": "What a create names.",
+        "required": [
+          "display_name",
+          "host",
+          "port",
+          "bind_dn",
+          "bind_secret_name",
+          "user_base_dn",
+          "user_filter",
+          "attribute_mapping"
+        ],
+        "properties": {
+          "absence_policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`deactivate` (default) or `delete`."
+          },
+          "attribute_mapping": {
+            "type": "object",
+            "description": "How directory attributes become identity."
+          },
+          "bind_dn": {
+            "type": "string",
+            "description": "The DN to bind as."
+          },
+          "bind_secret_name": {
+            "type": "string",
+            "description": "The environment secret holding the bind password. Must begin with `ldap_bind_`."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "group_base_dn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where groups live. Omit for a connector that syncs users only."
+          },
+          "group_filter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which entries under the group base are groups. Required with a group base."
+          },
+          "host": {
+            "type": "string",
+            "description": "The directory host."
+          },
+          "max_group_depth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How deep nested groups resolve. Defaults to the column default."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The directory port.",
+            "minimum": 0
+          },
+          "tls_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ldaps` (default), `starttls` or `plaintext`."
+          },
+          "user_base_dn": {
+            "type": "string",
+            "description": "Where users live."
+          },
+          "user_filter": {
+            "type": "string",
+            "description": "Which entries under the user base are users."
+          }
+        }
+      },
       "CreateLogStreamRequest": {
         "type": "object",
         "description": "The body of a create request.",
@@ -32675,6 +33186,252 @@
           "user_id": {
             "type": "string",
             "description": "The `pending_verification` user (`usr_...`) this invitation provisions and\nactivates on accept."
+          }
+        }
+      },
+      "LdapConnectorCreated": {
+        "type": "object",
+        "description": "The 201 of a create.",
+        "required": [
+          "id",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret handle."
+          }
+        }
+      },
+      "LdapConnectorListView": {
+        "type": "object",
+        "description": "A page of connectors.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LdapConnectorView"
+            },
+            "description": "This organization's connectors."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The cursor for the next page, absent on the last one."
+          }
+        }
+      },
+      "LdapConnectorView": {
+        "type": "object",
+        "description": "One connector, as the management surface renders it.\n\nTHE SECRET NAME IS HERE AND THE SECRET IS NOT, because the row holds only the name.",
+        "required": [
+          "id",
+          "organization_id",
+          "display_name",
+          "host",
+          "port",
+          "tls_mode",
+          "bind_dn",
+          "bind_secret_name",
+          "user_base_dn",
+          "group_base_dn",
+          "user_filter",
+          "group_filter",
+          "attribute_mapping",
+          "absence_policy",
+          "max_group_depth",
+          "active",
+          "created_at_unix_ms"
+        ],
+        "properties": {
+          "absence_policy": {
+            "type": "string",
+            "description": "`deactivate` or `delete`."
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Whether the sweep serves this connector."
+          },
+          "attribute_mapping": {
+            "type": "object",
+            "description": "How directory attributes become identity."
+          },
+          "bind_dn": {
+            "type": "string",
+            "description": "The DN the sweep binds as."
+          },
+          "bind_secret_name": {
+            "type": "string",
+            "description": "The NAME of the environment secret holding the bind password."
+          },
+          "created_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was configured, in milliseconds since the epoch."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "The operator-facing label."
+          },
+          "group_base_dn": {
+            "type": "string",
+            "description": "Where groups live, empty when the connector syncs users only."
+          },
+          "group_filter": {
+            "type": "string",
+            "description": "Which entries under the group base are groups, empty with no group base."
+          },
+          "host": {
+            "type": "string",
+            "description": "The directory host."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret `ldc_` handle. Every other operation names the connector by this."
+          },
+          "max_group_depth": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How deep nested groups resolve."
+          },
+          "organization_id": {
+            "type": "string",
+            "description": "The organization whose users this directory populates."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The directory port.",
+            "minimum": 0
+          },
+          "tls_mode": {
+            "type": "string",
+            "description": "`ldaps`, `starttls` or `plaintext`."
+          },
+          "user_base_dn": {
+            "type": "string",
+            "description": "Where users live."
+          },
+          "user_filter": {
+            "type": "string",
+            "description": "Which entries under the user base are users."
+          }
+        }
+      },
+      "LdapHealthListView": {
+        "type": "object",
+        "description": "Every connector's health in one organization.",
+        "required": [
+          "items",
+          "unhealthy"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LdapHealthView"
+            },
+            "description": "One entry per connector a pass has reached, most recent first."
+          },
+          "unhealthy": {
+            "type": "integer",
+            "description": "How many of them need attention.\n\nCOUNTED HERE rather than left to the caller, because \"is anything wrong\" is the question\nan alert asks and a caller computing it from the list would each write the predicate\nagain.",
+            "minimum": 0
+          }
+        }
+      },
+      "LdapHealthView": {
+        "type": "object",
+        "description": "One connector's sync health.",
+        "required": [
+          "connector_id",
+          "healthy",
+          "outcome",
+          "last_run_at_unix_ms",
+          "duration_ms",
+          "consecutive_failures",
+          "provisioned",
+          "already_present",
+          "deactivated",
+          "deleted",
+          "apply_failures"
+        ],
+        "properties": {
+          "already_present": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Arrivals that already had an account."
+          },
+          "apply_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Per-principal failures inside an otherwise successful pass."
+          },
+          "connector_id": {
+            "type": "string",
+            "description": "The connector this describes."
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Passes in a row that did not produce a plan."
+          },
+          "deactivated": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Accounts disabled."
+          },
+          "deleted": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Accounts removed."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long that pass took."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KIND of failure, absent on a successful pass.\n\nNEVER the directory's own message: it can carry a DN, which names a person and their\nplace in an organization. The full text is in the log."
+          },
+          "healthy": {
+            "type": "boolean",
+            "description": "Whether it needs attention. FALSE for a connector that binds fine and fails to apply\nevery principal, which reports a successful outcome."
+          },
+          "last_run_at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the last pass reached this connector, in milliseconds since the epoch."
+          },
+          "last_success_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last pass that DID produce a plan.\n\nPresent so a reader can tell how STALE the view of the directory is, not merely that the\nlast attempt failed. A connector down for a day and one down for a minute report the same\noutcome and different values here."
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`planned`, `unreachable`, `failed`, `timed_out` or `skipped`."
+          },
+          "provisioned": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Accounts created on the last pass."
           }
         }
       },
@@ -36328,6 +37085,19 @@
           "timing": {
             "type": "string",
             "description": "`pre_persist` or `post_persist`."
+          }
+        }
+      },
+      "SetLdapConnectorActiveRequest": {
+        "type": "object",
+        "description": "What a pause or resume names.",
+        "required": [
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the sweep should serve this connector."
           }
         }
       },

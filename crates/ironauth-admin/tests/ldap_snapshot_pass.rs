@@ -129,7 +129,7 @@ async fn seed_connector(
                 port: 636,
                 tls_mode: LdapTlsMode::Ldaps,
                 bind_dn: "cn=svc,dc=contoso,dc=test",
-                bind_secret_name: "contoso-bind",
+                bind_secret_name: "ldap_bind_contoso",
                 user_base_dn: "ou=People,dc=example,dc=test",
                 group_base_dn: "",
                 user_filter: "(objectClass=inetOrgPerson)",
@@ -138,6 +138,7 @@ async fn seed_connector(
                 absence_policy: policy,
                 max_group_depth: 5,
             },
+            None,
         )
         .await
         .expect("create connector");
@@ -990,6 +991,73 @@ async fn a_skipped_connector_records_its_own_health() {
     assert_eq!(health.outcome, ironauth_store::LdapRunOutcome::Skipped);
     assert!(health.error.is_some(), "a skip has to say why");
     assert!(!health.is_healthy());
+}
+
+/// THE SECRET NAMESPACE IS ENFORCED AT THE READ, not only at the create route. That route is the
+/// only door the API offers, but a direct store call -- which is exactly what this test makes --
+/// a config import, a snapshot restore, or a row written before the rule existed all reach the
+/// table without passing it. A bound that only holds for rows that came through one door is a
+/// bound on that door, and what it protects is the write-only secret store: the sweep sends the
+/// named secret to a `host` the same operator chose.
+#[tokio::test]
+async fn a_connector_naming_a_secret_outside_the_namespace_is_never_opened() {
+    use ironauth_admin::ldap_boot::StoreSourceFactory;
+    use ironauth_admin::ldap_schedule::SourceFactory;
+
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let connector = seed_connector(&db, &env, scope, LdapAbsencePolicy::Deactivate).await;
+
+    // STRAIGHT INTO THE COLUMN, past the route that would have refused it. The value is real:
+    // an operator's database password, sitting in the same environment's secret store.
+    sqlx::query("UPDATE ldap_connectors SET bind_secret_name = $1 WHERE id = $2")
+        .bind("database_password")
+        .bind(connector.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("name a secret outside the namespace");
+
+    let rows = store
+        .scoped(scope)
+        .ldap_connectors()
+        .active_in_scope(10)
+        .await
+        .expect("read the connectors");
+    let factory = StoreSourceFactory {
+        store,
+        scope,
+        master: &db.master_key(),
+        connectors: rows,
+    };
+    let scheduled = ironauth_admin::ldap_schedule::Scheduled {
+        id: connector.to_string(),
+        previous: BTreeSet::new(),
+        inputs: SyncInputs {
+            user_base_dn: "ou=People,dc=example,dc=test".to_owned(),
+            user_filter: "(objectClass=inetOrgPerson)".to_owned(),
+            group_roots: Vec::new(),
+            max_group_depth: 5,
+            attribute_mapping: json!({ "username": "uid" }),
+        },
+    };
+
+    let refused = factory.open(&scheduled).await;
+    let Err(error) = refused else {
+        panic!("a connector naming an arbitrary secret was opened");
+    };
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("database_password") && rendered.contains("ldap_bind_"),
+        "the refusal must name what was asked for and what is allowed: {rendered}"
+    );
+    // REFUSED BEFORE THE SECRET IS READ, which is the point: a refusal after the open would have
+    // already pulled the value into memory.
+    assert!(
+        !rendered.contains("could not be read"),
+        "the refusal came from the secret read rather than from the namespace check: {rendered}"
+    );
 }
 
 /// THE LOOKUP KEY. A `previous_for` that missed would hand every connector an empty set and

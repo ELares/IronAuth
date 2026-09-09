@@ -52,6 +52,7 @@ crates/ironauth-admin/src/invitations.rs:resolve_scope:0
 crates/ironauth-admin/src/invitations.rs:revoke_invitation:1
 crates/ironauth-admin/src/keys.rs:create_key:1
 crates/ironauth-admin/src/keys.rs:scope_from_path:0
+crates/ironauth-admin/src/ldap_connectors.rs:create_ldap_connector:1
 crates/ironauth-admin/src/locales.rs:resolve_scope:0
 crates/ironauth-admin/src/log_shipper.rs:observe:0
 crates/ironauth-admin/src/log_streams.rs:create_log_stream:0

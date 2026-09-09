@@ -54,6 +54,15 @@ async fn seed_org(db: &TestDatabase, env: &Env, scope: Scope) -> OrganizationId 
 
 /// A connector row, because a snapshot's foreign key demands one.
 async fn seed_connector(db: &TestDatabase, env: &Env, scope: Scope) -> LdapConnectorId {
+    seed_connector_in(db, env, scope).await.1
+}
+
+/// The same, returning the organization the connector belongs to as well.
+async fn seed_connector_in(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+) -> (OrganizationId, LdapConnectorId) {
     let org = seed_org(db, env, scope).await;
     let id = LdapConnectorId::generate(env, &scope);
     let mapping = serde_json::json!({ "userName": "uid" });
@@ -71,7 +80,7 @@ async fn seed_connector(db: &TestDatabase, env: &Env, scope: Scope) -> LdapConne
                 port: 636,
                 tls_mode: LdapTlsMode::Ldaps,
                 bind_dn: "cn=svc,dc=contoso,dc=test",
-                bind_secret_name: "contoso-bind",
+                bind_secret_name: "ldap_bind_contoso",
                 user_base_dn: "ou=people,dc=contoso,dc=test",
                 group_base_dn: "",
                 user_filter: "(objectClass=user)",
@@ -80,10 +89,11 @@ async fn seed_connector(db: &TestDatabase, env: &Env, scope: Scope) -> LdapConne
                 absence_policy: LdapAbsencePolicy::Deactivate,
                 max_group_depth: 5,
             },
+            None,
         )
         .await
         .expect("create connector");
-    id
+    (org, id)
 }
 
 fn ids(items: &[&str]) -> BTreeSet<String> {
@@ -368,14 +378,14 @@ async fn removing_the_connector_removes_its_snapshot() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let connector = seed_connector(&db, &env, scope).await;
+    let (org, connector) = seed_connector_in(&db, &env, scope).await;
     record(&db, &env, scope, &connector, &ids(&["u-a"])).await;
 
     db.control_store()
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .delete(&env, &connector)
+        .delete(&env, &org, &connector)
         .await
         .expect("delete the connector");
 
