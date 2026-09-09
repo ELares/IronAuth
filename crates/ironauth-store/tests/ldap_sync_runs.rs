@@ -81,6 +81,7 @@ async fn seed_connector_in(
                 max_group_depth: 5,
             },
             None,
+            None,
         )
         .await
         .expect("create connector");
@@ -502,7 +503,7 @@ async fn removing_the_connector_removes_its_health() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .delete(&env, &org, &connector)
+        .delete(&env, &org, &connector, None)
         .await
         .expect("delete the connector");
 

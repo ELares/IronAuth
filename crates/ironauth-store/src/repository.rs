@@ -78656,6 +78656,7 @@ impl ActingLdapConnectorRepo<'_> {
         env: &Env,
         connector: NewLdapConnector<'_>,
         idempotency: Option<IdempotencyWrite<'_>>,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if connector.id.scope() != self.scope || connector.organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -78738,6 +78739,9 @@ impl ActingLdapConnectorRepo<'_> {
                 // window in which the connector exists and the retry that created it can still
                 // create a second one, which is the hole `idempotent-write-audit` exists for.
                 insert_idempotency(tx, idempotency).await?;
+                // IN THE SAME TRANSACTION as the row, so a consumer is never told a directory
+                // connector changed before it did, and never told at all if the write rolls back.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -78758,6 +78762,7 @@ impl ActingLdapConnectorRepo<'_> {
         organization_id: &OrganizationId,
         id: &LdapConnectorId,
         active: bool,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -78794,6 +78799,9 @@ impl ActingLdapConnectorRepo<'_> {
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // ONLY WHEN A ROW ACTUALLY CHANGED. The guard above returns before this, so a
+                // call naming an absent or another organization's handle announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,
@@ -78822,6 +78830,7 @@ impl ActingLdapConnectorRepo<'_> {
         env: &Env,
         organization_id: &OrganizationId,
         id: &LdapConnectorId,
+        event: Option<&DomainEvent<'_>>,
     ) -> Result<(), StoreError> {
         if id.scope() != self.scope || organization_id.scope() != self.scope {
             return Err(StoreError::NotFound);
@@ -78856,6 +78865,9 @@ impl ActingLdapConnectorRepo<'_> {
                 if deleted.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // ONLY WHEN A ROW ACTUALLY CHANGED. The guard above returns before this, so a
+                // call naming an absent or another organization's handle announces nothing.
+                enqueue_domain_event(tx, env, scope, event).await?;
                 Ok(())
             },
             false,

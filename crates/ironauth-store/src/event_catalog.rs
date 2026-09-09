@@ -3043,6 +3043,64 @@ const REGISTERED: &[(&str, u32, &str)] = &[
         }"#,
     ),
     (
+        // The LDAP/AD connector (issue #142). The id and the ORGANIZATION for the reason the
+        // SCIM entries above give, plus the HOST and the TLS MODE: the question a consumer asks
+        // about a directory connector is "where is this organization's identity data now being
+        // read from, and is that connection protected", and the id alone answers neither.
+        //
+        // NO `bind_dn` and NO `bind_secret_name`. Neither is a secret, but the DN names a
+        // privileged service account and the secret name tells a consumer which environment
+        // secret to attack; no receiver of this event can resolve either, and the one component
+        // that can already reads the row.
+        "ldap_connector.created",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "ldap_connector_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "host": {"type": "string", "minLength": 1},
+                "tls_mode": {"type": "string", "minLength": 1}
+            },
+            "required": ["ldap_connector_id", "organization_id", "host", "tls_mode"]
+        }"#,
+    ),
+    (
+        // Pausing and resuming are ONE event with a boolean, for the reason
+        // `scim_push_connection.active_changed` gives: a consumer's question is "is this
+        // organization's directory still being read", and two types would make answering it a
+        // join of two streams.
+        "ldap_connector.active_changed",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "ldap_connector_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1},
+                "active": {"type": "boolean"}
+            },
+            "required": ["ldap_connector_id", "organization_id", "active"]
+        }"#,
+    ),
+    (
+        // Emitted only when a row was actually removed, exactly as the SCIM delete above is: a
+        // delete naming an absent handle is a `NotFound` that commits nothing, so it announces
+        // nothing.
+        "ldap_connector.deleted",
+        1,
+        r#"{
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "ldap_connector_id": {"type": "string", "minLength": 1},
+                "organization_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["ldap_connector_id", "organization_id"]
+        }"#,
+    ),
+    (
         // The id and the OWNER, because an api key is the same credential kind under three
         // different owners (user, service account, organization) and a consumer routing on
         // "who gained a credential" cannot get that from the id alone.
