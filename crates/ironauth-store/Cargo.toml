@@ -374,6 +374,7 @@ required-features = ["testing"]
 [[test]]
 name = "ldap_connectors"
 path = "tests/ldap_connectors.rs"
+required-features = ["testing"]
 
 # What the last completed pass saw in a directory (issue #142): sealed, bound to its connector,
 # and "no snapshot" distinguishable from "a snapshot of nobody".

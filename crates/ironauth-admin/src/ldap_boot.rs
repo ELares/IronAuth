@@ -29,7 +29,8 @@ use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_store::outbox::ScopeSource;
 use ironauth_store::{
-    ActorRef, LdapAbsencePolicy, LdapConnector, LdapTlsMode, Scope, ServiceId, Store, StoreError,
+    ActorRef, LdapAbsencePolicy, LdapConnector, LdapTlsMode, Scope, ScopeSnapshots, ServiceId,
+    Store, StoreError,
 };
 
 use crate::ldap_changeset::ChangeSet;
@@ -224,6 +225,7 @@ pub async fn sweep_scope(
     scope: Scope,
     master: &MasterKey,
     limit: i64,
+    snapshots: &ScopeSnapshots,
     previous: &(dyn Fn(&LdapConnector) -> BTreeSet<String> + Sync),
 ) -> Result<ScopeSweep, StoreError> {
     let connectors = store
@@ -231,14 +233,7 @@ pub async fn sweep_scope(
         .ldap_connectors()
         .active_in_scope(limit)
         .await?;
-    let scheduled: Vec<Scheduled> = connectors
-        .iter()
-        .map(|connector| Scheduled {
-            id: connector.id.to_string(),
-            previous: previous(connector),
-            inputs: inputs_for(connector),
-        })
-        .collect();
+    let (scheduled, skipped) = schedule_for(&connectors, snapshots, previous);
     let terms: BTreeMap<String, ApplyTerms> = connectors
         .iter()
         .map(|connector| (connector.id.to_string(), terms_for(connector)))
@@ -250,7 +245,43 @@ pub async fn sweep_scope(
         connectors,
     };
     let report = crate::ldap_schedule::sweep(&factory, &scheduled, PER_CONNECTOR_DEADLINE).await;
-    Ok(ScopeSweep { report, terms })
+    Ok(ScopeSweep {
+        report,
+        terms,
+        skipped,
+    })
+}
+
+/// Which connectors a pass may sweep, and which it must leave alone.
+///
+/// A CONNECTOR WHOSE SNAPSHOT WILL NOT OPEN IS NOT SWEPT AT ALL. Sweeping it would hand the diff
+/// an empty previous set, which reads its whole directory as new -- and then the pass after, with
+/// a fresh snapshot in place, would conclude that nobody had ever left it. Everybody who departed
+/// while the row was unreadable would be forgotten permanently. Skipping is louder and recoverable:
+/// the connector stops syncing until the row is replaced, which an operator can see.
+///
+/// Pure, so the decision is testable without a directory or a database.
+#[must_use]
+pub fn schedule_for(
+    connectors: &[LdapConnector],
+    snapshots: &ScopeSnapshots,
+    previous: &(dyn Fn(&LdapConnector) -> BTreeSet<String> + Sync),
+) -> (Vec<Scheduled>, Vec<String>) {
+    let mut scheduled = Vec::new();
+    let mut skipped = Vec::new();
+    for connector in connectors {
+        let id = connector.id.to_string();
+        if snapshots.unreadable.contains(&id) {
+            skipped.push(id);
+            continue;
+        }
+        scheduled.push(Scheduled {
+            id,
+            previous: previous(connector),
+            inputs: inputs_for(connector),
+        });
+    }
+    (scheduled, skipped)
 }
 
 /// A sweep, plus what the applier needs about each connector that produced a plan.
@@ -264,6 +295,8 @@ pub struct ScopeSweep {
     pub report: SweepReport,
     /// Keyed by connector id, exactly as [`SweepReport::runs`] is.
     pub terms: BTreeMap<String, ApplyTerms>,
+    /// Connectors NOT swept because their stored snapshot would not open. See [`schedule_for`].
+    pub skipped: Vec<String>,
 }
 
 /// What applying a connector's plan needs, beyond the plan.
@@ -319,9 +352,19 @@ pub struct PassReport {
     pub applied: ExecuteReport,
     /// Connectors whose new snapshot was stored, so the next pass can detect absence.
     pub snapshots_recorded: usize,
-    /// Connectors whose new snapshot could NOT be stored. Each one is a directory whose next pass
-    /// will detect no departure.
+    /// Connectors whose new snapshot could NOT be stored.
+    ///
+    /// The previous row survives a failed write, so the next pass still detects departures -- it
+    /// compares against a STALER baseline and re-applies what it already applied, which is
+    /// harmless because every operation repeats without harm. The exception is a connector whose
+    /// FIRST recording failed: it has no baseline at all, so nothing can be concluded absent from
+    /// it until one is written.
     pub snapshots_unrecorded: usize,
+    /// Connectors skipped because their stored snapshot could not be opened.
+    ///
+    /// Louder than an unrecorded snapshot, not quieter: each one is a directory that is not being
+    /// swept AT ALL until the row is replaced.
+    pub snapshots_unreadable: usize,
 }
 
 /// Apply every plan a scope sweep produced.
@@ -372,7 +415,7 @@ pub async fn apply_sweep(store: &Store, scope: Scope, env: &Env, sweep: &ScopeSw
     applied
 }
 
-/// What one connector's pass produced.
+/// What one SCOPE's pass produced, over every connector in it.
 #[derive(Debug, Default)]
 pub struct Applied {
     /// The writes, summed over every connector.
@@ -390,8 +433,14 @@ pub struct Applied {
 /// departed. `departures` is already `Err` in exactly those cases -- a truncated group walk, and a
 /// directory that answered with nobody -- so the refusal the diff computed is the condition.
 ///
-/// Otherwise it is what the directory held, CORRECTED BY WHAT ACTUALLY HAPPENED, and both
-/// corrections matter:
+/// Otherwise it is what the connector's sync IS IN SCOPE FOR -- `arrivals` and `retained`, which
+/// together are the plan's in-scope set -- and NOT everything the search returned. The two differ
+/// exactly when the connector names group roots: `ldap_sync` narrows the in-scope set to the
+/// resolved membership, while `present` still holds everybody under the user base. Recording
+/// `present` would put people the connector does not sync into the snapshot, and the very next
+/// pass would compute them as departures and deprovision them.
+///
+/// It is then CORRECTED BY WHAT ACTUALLY HAPPENED, and both corrections matter:
 ///
 ///   * A principal whose provision FAILED is dropped, so the next pass sees them as an arrival
 ///     and tries again. Recording them would mean the retry never happens and they never get an
@@ -466,7 +515,7 @@ pub async fn run_pass(
             .ldap_sync_snapshots()
             .all_in_scope()
             .await?;
-        let sweep = sweep_scope(store, scope, master, batch, &|connector| {
+        let sweep = sweep_scope(store, scope, master, batch, &previous, &|connector| {
             previous_for(&previous, connector)
         })
         .await?;
@@ -482,12 +531,13 @@ pub async fn run_pass(
 /// before cannot deprovision anybody. The failure this guards against is the KEY being wrong --
 /// a lookup that missed would silently hand every connector an empty set and quietly disable
 /// absence detection for all of them while every test about the diff went on passing.
+///
+/// A connector whose snapshot is UNREADABLE also answers empty here, which is why [`run_pass`]
+/// drops those connectors from the sweep before this is ever consulted for them.
 #[must_use]
-pub fn previous_for(
-    snapshots: &BTreeMap<String, BTreeSet<String>>,
-    connector: &LdapConnector,
-) -> BTreeSet<String> {
+pub fn previous_for(snapshots: &ScopeSnapshots, connector: &LdapConnector) -> BTreeSet<String> {
     snapshots
+        .opened
         .get(&connector.id.to_string())
         .cloned()
         .unwrap_or_default()
@@ -532,10 +582,31 @@ pub async fn fold_scope(
             }
         }
     }
+    // A CONNECTOR THE SWEEP REFUSED TO RUN. Counted and logged here so a pass that skipped every
+    // directory is not an INFO line saying nothing happened.
+    for connector in &sweep.skipped {
+        report.snapshots_unreadable += 1;
+        tracing::error!(
+            connector = %connector,
+            "ldap sync cannot open what this connector's last pass recorded; it is not being \
+             swept until the row is replaced, because sweeping it against nothing would forget \
+             everybody who left while it was unreadable"
+        );
+    }
     let applied = apply_sweep(store, scope, env, sweep).await;
     let taken_at = now_micros(env);
     for (id, snapshot) in applied.snapshots {
         let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(&id, &scope) else {
+            // A REPORT KEY THAT IS NOT A CONNECTOR ID IN THIS SCOPE. Nothing in the tree produces
+            // one -- `sweep_scope` keys every run by `connector.id.to_string()` -- so this is a
+            // caller that built a sweep by hand. Counted and logged rather than dropped, because
+            // a silently unrecorded snapshot is a connector that never deprovisions.
+            report.snapshots_unrecorded += 1;
+            tracing::error!(
+                connector = %id,
+                "ldap sync cannot record a snapshot for a report key that is not a connector id \
+                 in this scope"
+            );
             continue;
         };
         // A SNAPSHOT THAT DOES NOT SAVE IS A CONNECTOR THAT NEVER DEPROVISIONS, so it is warned
@@ -557,8 +628,9 @@ pub async fn fold_scope(
                 tracing::error!(
                     connector = %id,
                     %error,
-                    "ldap sync could not record what it saw; the next pass will detect no \
-                     departure for this directory"
+                    "ldap sync could not record what it saw; the next pass compares against the \
+                     older snapshot, and against nothing at all if this connector has never \
+                     recorded one"
                 );
             }
         }
@@ -566,10 +638,14 @@ pub async fn fold_scope(
     report.applied.absorb(applied.total);
 }
 
-/// The connector's own service actor, or a generated one when the sweep has no terms for it.
+/// The connector's own service actor.
 ///
-/// The actor is only used to provision the scope's key hierarchy on a first write, so the
-/// fallback affects one audit row in a case that already logged an error.
+/// THE FALLBACK IS UNREACHABLE TODAY and is a fail-closed default rather than a path: a connector
+/// only reaches [`Applied::snapshots`] after `apply_sweep` resolved its terms, so this lookup
+/// always hits. It is written as a total function rather than an `expect` because the alternative
+/// is a panic in a background sweep, and the actor is used only to attribute the KEK and DEK
+/// provisioning of a scope's FIRST sealed write -- which, if the branch ever became live, would
+/// name a fixed all-zeros service id rather than crash the pass.
 fn terms_actor_for(sweep: &ScopeSweep, id: &str) -> ActorRef {
     sweep.terms.get(id).map_or_else(
         || ActorRef::service(ServiceId::from_seed_bytes([0_u8; 16])),

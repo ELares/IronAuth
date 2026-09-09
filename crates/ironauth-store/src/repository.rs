@@ -61330,6 +61330,14 @@ const SECRET_SEAL_LABEL: &str = "ironauth.envelope.secret.v1";
 /// envelope context. A snapshot is a set of directory identifiers, and where a
 /// server publishes no `objectGUID` or `entryUUID` those identifiers are DNs,
 /// which carry a person's name and their place in an organization.
+///
+/// It is not the ONLY separator from a sealed secret: the free-text component
+/// differs too, because a secret's is `env_secret:{name}` while a snapshot's is
+/// the bare connector id, and no connector id starts with that prefix. Two
+/// independent separators is the point -- the label alone would be enough, the
+/// prefix alone would be enough, and `bind_secret_name` is operator-chosen, so
+/// the one case where an operator could try to make the free text collide is
+/// covered by the label as well.
 const LDAP_SNAPSHOT_SEAL_LABEL: &str = "ironauth.envelope.ldap-sync-snapshot.v1";
 /// The AAD label domain-separating a sealed `users` PII payload (the login handle
 /// or the standard-claim document) from every other envelope context.
@@ -77873,11 +77881,70 @@ pub struct NewLdapConnector<'a> {
 /// What the last completed pass saw in one directory (issue #142).
 ///
 /// The set is SEALED in the row (a stable identifier can be a DN, which is PII), so reading it
-/// costs an AEAD open and needs the master key. There is no listing surface that returns the
-/// identifiers: the only consumer is the diff, which wants the whole set for one connector.
+/// costs an AEAD open and needs the master key.
+///
+/// TWO READERS RETURN IDENTIFIERS, and both are for the diff. [`Self::get`] answers for one
+/// connector; [`Self::all_in_scope`] answers for every connector in the environment at once,
+/// which is what a pass actually calls -- it needs all of them before it opens any connection,
+/// and a round trip per directory would be the wrong shape. That is a whole-environment PII read
+/// by design, so it lives behind the control-plane role and there is no request path to it. A
+/// surface that only wants to say how big a snapshot is and how old should call
+/// [`Self::meta_in_scope`], which returns no identifiers at all.
 pub struct LdapSnapshotRepo<'a> {
     store: &'a Store,
     scope: Scope,
+}
+
+/// Every snapshot a scope holds, and the ones that would not open.
+#[derive(Debug, Default, Clone)]
+pub struct ScopeSnapshots {
+    /// Connector id to the identifiers its last completed pass recorded.
+    pub opened: BTreeMap<String, BTreeSet<String>>,
+    /// Connectors whose snapshot row exists and could not be decrypted.
+    ///
+    /// SEPARATE FROM AN ABSENT ENTRY, and the difference is the whole reason this field exists:
+    /// an absent entry means no pass has ever recorded one, while this means a pass did and the
+    /// row can no longer be read. Treating the second as the first would read the directory as
+    /// entirely new and then conclude, on the pass after, that nobody had ever left it.
+    pub unreadable: BTreeSet<String>,
+}
+
+/// Why one snapshot row did not open.
+enum OpenSnapshot {
+    /// This row is unreadable. Others may still be fine.
+    Unreadable,
+    /// Something that is not about this row: the database, or a missing key hierarchy.
+    Fatal(StoreError),
+}
+
+/// Open one snapshot row, separating "this blob is bad" from "the database is".
+async fn open_snapshot_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: Scope,
+    master: &MasterKey,
+    id: &str,
+    dek_version: i32,
+    ciphertext: Vec<u8>,
+) -> Result<BTreeSet<String>, OpenSnapshot> {
+    let Ok(connector) = LdapConnectorId::parse_in_scope(id, &scope) else {
+        return Err(OpenSnapshot::Unreadable);
+    };
+    let dek = match fetch_dek_by_version(tx, scope, master, dek_version).await {
+        Ok(dek) => dek,
+        // A DEK GENERATION THAT IS GONE is a property of this row's version, not of the
+        // database: a snapshot sealed under a purged generation is unreadable and every other
+        // row still opens.
+        Err(StoreError::NotFound | StoreError::Encryption) => return Err(OpenSnapshot::Unreadable),
+        Err(error) => return Err(OpenSnapshot::Fatal(error)),
+    };
+    let sealed = Sealed::from_bytes(ciphertext).map_err(|_| OpenSnapshot::Unreadable)?;
+    let plaintext = dek
+        .open(
+            &ldap_snapshot_seal_aad(scope, &connector, dek_version),
+            &sealed,
+        )
+        .map_err(|_| OpenSnapshot::Unreadable)?;
+    serde_json::from_slice(&plaintext).map_err(|_| OpenSnapshot::Unreadable)
 }
 
 /// A snapshot's metadata, WITHOUT the identifiers it holds.
@@ -77940,18 +78007,28 @@ impl LdapSnapshotRepo<'_> {
         Ok(Some(identifiers))
     }
 
-    /// Every snapshot in this scope, opened, keyed by connector id.
+    /// Every snapshot in this scope, opened, keyed by connector id, and the ones that would not
+    /// open.
     ///
     /// ONE QUERY, because a pass needs all of them before it opens any connection and the
     /// per-connector alternative is a round trip per directory. A connector with no snapshot is
     /// ABSENT from the map rather than present with an empty set: see [`Self::get`] for why the
     /// distinction decides whether anybody is deprovisioned.
     ///
+    /// A ROW THAT WILL NOT OPEN IS NOT AN ERROR HERE. It is returned in
+    /// [`ScopeSnapshots::unreadable`] and the other connectors are returned as normal. Failing
+    /// the whole call would let one corrupt blob -- a purged DEK generation, a half-restored
+    /// backup, a ciphertext moved between rows -- stop the sweep for every directory in the
+    /// deployment, which is precisely the isolation the per-connector design exists for. The
+    /// caller decides what an unreadable snapshot means for its connector, and must not treat it
+    /// as "no snapshot": that would read the whole directory as new and then, on the pass after,
+    /// conclude that nobody had ever left it.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::Encryption`] if no master key is configured or a blob cannot be opened;
+    /// [`StoreError::Encryption`] if no master key is configured at all;
     /// [`StoreError::Database`] on a persistence failure.
-    pub async fn all_in_scope(&self) -> Result<BTreeMap<String, BTreeSet<String>>, StoreError> {
+    pub async fn all_in_scope(&self) -> Result<ScopeSnapshots, StoreError> {
         let master = self.store.master().ok_or(StoreError::Encryption)?;
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(
@@ -77962,24 +78039,24 @@ impl LdapSnapshotRepo<'_> {
         .bind(self.scope.environment().to_string())
         .fetch_all(&mut *tx)
         .await?;
-        let mut opened = BTreeMap::new();
+        let mut found = ScopeSnapshots::default();
         for row in rows {
             let id: String = row.get("connector_id");
-            let connector = LdapConnectorId::parse_in_scope(&id, &self.scope)
-                .map_err(|_| StoreError::NotFound)?;
             let dek_version: i32 = row.get("dek_version");
             let ciphertext: Vec<u8> = row.get("ciphertext");
-            let dek = fetch_dek_by_version(&mut tx, self.scope, master, dek_version).await?;
-            let plaintext = dek.open(
-                &ldap_snapshot_seal_aad(self.scope, &connector, dek_version),
-                &Sealed::from_bytes(ciphertext)?,
-            )?;
-            let identifiers: BTreeSet<String> =
-                serde_json::from_slice(&plaintext).map_err(|_| StoreError::Encryption)?;
-            opened.insert(id, identifiers);
+            match open_snapshot_row(&mut tx, self.scope, master, &id, dek_version, ciphertext).await
+            {
+                Ok(identifiers) => {
+                    found.opened.insert(id, identifiers);
+                }
+                Err(OpenSnapshot::Unreadable) => {
+                    found.unreadable.insert(id);
+                }
+                Err(OpenSnapshot::Fatal(error)) => return Err(error),
+            }
         }
         tx.commit().await?;
-        Ok(opened)
+        Ok(found)
     }
 
     /// Every connector in this scope that has a snapshot, with its size and age and NOT its
@@ -78017,11 +78094,14 @@ impl LdapSnapshotRepo<'_> {
 
 /// Writes over LDAP sync snapshots in one scope (issue #142).
 ///
-/// NOT AUDITED, deliberately, and the only write path in this file that is not. An audit row
-/// records a decision somebody is accountable for; recording the population of a directory is
-/// bookkeeping the sweep does for itself, and what it then DOES with the difference -- every
-/// create, disable and delete -- is audited where it happens. Writing an audit row per pass per
-/// connector would bury those under an hourly entry that says only "the directory was read".
+/// NOT AUDITED, deliberately, for the reason the trusted-device idle slide and the login-geo
+/// record give: an audit row records a decision somebody is accountable for, and recording the
+/// population of a directory is bookkeeping the sweep does for itself. What it then DOES with the
+/// difference -- every create, disable and delete -- is audited where it happens, and an hourly
+/// entry per connector saying only "the directory was read" would bury those.
+///
+/// The acting context is still carried, because provisioning the scope's key hierarchy on a first
+/// write IS audited.
 pub struct ActingLdapSnapshotRepo<'a> {
     store: &'a Store,
     scope: Scope,
@@ -82584,5 +82664,44 @@ impl ScimExternalIdRepo<'_> {
         .await?;
         tx.commit().await?;
         Ok(row.map(|row| row.get("external_id")))
+    }
+}
+
+#[cfg(test)]
+mod envelope_label_tests {
+    /// EVERY AAD LABEL IS DISTINCT. Two contexts sharing a label are two ciphertexts that can
+    /// authenticate in each other's place whenever their remaining AAD components also match.
+    /// Nothing in the tree enforced this, so a copy-paste that reused a neighbour's label was
+    /// invisible.
+    #[test]
+    fn no_two_envelope_contexts_share_an_aad_label() {
+        let labels = [
+            ("kek_wrap", super::KEK_WRAP_LABEL),
+            ("dek_wrap", super::DEK_WRAP_LABEL),
+            ("secret", super::SECRET_SEAL_LABEL),
+            ("ldap_snapshot", super::LDAP_SNAPSHOT_SEAL_LABEL),
+            ("user_pii", super::USER_PII_SEAL_LABEL),
+            ("credential_pii", super::CREDENTIAL_PII_SEAL_LABEL),
+            ("webauthn_nickname", super::WEBAUTHN_NICKNAME_SEAL_LABEL),
+            ("totp_seed", super::TOTP_SEED_SEAL_LABEL),
+            ("totp_name", super::TOTP_NAME_SEAL_LABEL),
+            ("email_recipient", super::EMAIL_FACTOR_RECIPIENT_SEAL_LABEL),
+            ("message_recipient", super::MESSAGE_RECIPIENT_SEAL_LABEL),
+            ("sms_recipient", super::SMS_FACTOR_RECIPIENT_SEAL_LABEL),
+            ("upstream_token", super::UPSTREAM_TOKEN_SEAL_LABEL),
+            (
+                "account_link_external_id",
+                super::ACCOUNT_LINK_EXTERNAL_ID_SEAL_LABEL,
+            ),
+        ];
+        for (i, (left_name, left)) in labels.iter().enumerate() {
+            for (right_name, right) in labels.iter().skip(i + 1) {
+                assert_ne!(
+                    left, right,
+                    "{left_name} and {right_name} share an AAD label, so their ciphertexts are \
+                     interchangeable wherever the rest of the AAD agrees"
+                );
+            }
+        }
     }
 }

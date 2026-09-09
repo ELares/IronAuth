@@ -275,13 +275,17 @@ async fn every_snapshot_in_the_scope_comes_back_keyed_by_connector() {
         .await
         .expect("read them all");
 
-    assert_eq!(all.get(&first.to_string()), Some(&ids(&["u-1"])));
-    assert_eq!(all.get(&second.to_string()), Some(&ids(&["u-2", "u-3"])));
+    assert_eq!(all.opened.get(&first.to_string()), Some(&ids(&["u-1"])));
+    assert_eq!(
+        all.opened.get(&second.to_string()),
+        Some(&ids(&["u-2", "u-3"]))
+    );
     assert!(
-        !all.contains_key(&never.to_string()),
+        !all.opened.contains_key(&never.to_string()),
         "a connector with no snapshot must not appear with an empty set"
     );
-    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all.opened.len(), 2, "{all:?}");
+    assert!(all.unreadable.is_empty(), "{all:?}");
 }
 
 /// ANOTHER ENVIRONMENT'S SNAPSHOTS ARE INVISIBLE. The same isolation every table here has, on the
@@ -302,6 +306,7 @@ async fn a_snapshot_is_invisible_from_another_scope() {
             .all_in_scope()
             .await
             .expect("read")
+            .opened
             .is_empty(),
         "another environment can see this directory's population"
     );
@@ -382,4 +387,201 @@ async fn removing_the_connector_removes_its_snapshot() {
             .expect("count")
             .get("c");
     assert_eq!(left, 0, "the snapshot outlived its directory");
+}
+
+/// A DEK ROTATION MUST NOT ORPHAN AN EXISTING SNAPSHOT. The row records the generation it was
+/// sealed under, and the reader resolves that generation rather than the active one -- so a
+/// rotation between two passes leaves the previous population readable and absence still
+/// detectable. Reading under the ACTIVE key instead would make every rotation look like a
+/// directory nobody had ever swept.
+#[tokio::test]
+async fn a_snapshot_survives_a_dek_rotation() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let connector = seed_connector(&db, &env, scope).await;
+    record(&db, &env, scope, &connector, &ids(&["u-a", "u-b"])).await;
+
+    let before: i32 =
+        sqlx::query("SELECT dek_version FROM ldap_sync_snapshots WHERE connector_id = $1")
+            .bind(connector.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("read")
+            .get("dek_version");
+
+    // AS THE OWNER: rotation writes `tenant_deks`, which neither low-privilege role may touch.
+    // In production that is a key-management action, not something a sweep does.
+    ironauth_store::Store::from_pool(db.owner_pool().clone())
+        .with_master_key(db.master_key())
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .envelope()
+        .rotate_dek(&env, &db.master_key())
+        .await
+        .expect("rotate the DEK");
+
+    let after = db
+        .control_store()
+        .scoped(scope)
+        .envelope()
+        .active_dek_version()
+        .await
+        .expect("read the active version");
+    assert_eq!(
+        after,
+        Some(before + 1),
+        "the rotation did not advance the generation, so this test proves nothing"
+    );
+
+    assert_eq!(
+        db.control_store()
+            .scoped(scope)
+            .ldap_sync_snapshots()
+            .get(&connector)
+            .await
+            .expect("the old generation still opens"),
+        Some(ids(&["u-a", "u-b"])),
+        "a rotation orphaned the previous pass's snapshot"
+    );
+    let all = db
+        .control_store()
+        .scoped(scope)
+        .ldap_sync_snapshots()
+        .all_in_scope()
+        .await
+        .expect("read them all");
+    assert!(
+        all.unreadable.is_empty(),
+        "the rotated-past snapshot reads as unreadable: {all:?}"
+    );
+    assert_eq!(
+        all.opened.get(&connector.to_string()),
+        Some(&ids(&["u-a", "u-b"]))
+    );
+}
+
+/// THE LABEL IS THE ONLY THING SEPARATING A SNAPSHOT FROM A SECRET. Both seals bind the label,
+/// the scope, one free text and the DEK version -- so if the two labels were ever equal, a
+/// secret whose NAME matched a connector id and a snapshot for that connector would become
+/// interchangeable ciphertexts. `bind_secret_name` is operator-chosen, so that collision is
+/// reachable by configuration rather than by attack.
+#[tokio::test]
+async fn a_secret_ciphertext_and_a_snapshot_ciphertext_are_not_interchangeable() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let connector = seed_connector(&db, &env, scope).await;
+    // THE COLLIDING NAME: a secret named exactly the connector id, which an operator may choose.
+    let name = connector.to_string();
+
+    record(&db, &env, scope, &connector, &ids(&["u-a"])).await;
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .environment_secrets()
+        .put(&env, &db.master_key(), &name, b"the-bind-password", None)
+        .await
+        .expect("store a secret under the connector's own id");
+
+    let snapshot_blob: Vec<u8> =
+        sqlx::query("SELECT ciphertext FROM ldap_sync_snapshots WHERE connector_id = $1")
+            .bind(connector.to_string())
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("read")
+            .get("ciphertext");
+    let secret_blob: Vec<u8> =
+        sqlx::query("SELECT ciphertext FROM environment_secrets WHERE name = $1")
+            .bind(&name)
+            .fetch_one(db.owner_pool())
+            .await
+            .expect("read")
+            .get("ciphertext");
+
+    // Swap them.
+    sqlx::query("UPDATE ldap_sync_snapshots SET ciphertext = $1 WHERE connector_id = $2")
+        .bind(&secret_blob)
+        .bind(connector.to_string())
+        .execute(db.owner_pool())
+        .await
+        .expect("swap into the snapshot");
+    sqlx::query("UPDATE environment_secrets SET ciphertext = $1 WHERE name = $2")
+        .bind(&snapshot_blob)
+        .bind(&name)
+        .execute(db.owner_pool())
+        .await
+        .expect("swap into the secret");
+
+    assert!(
+        db.control_store()
+            .scoped(scope)
+            .ldap_sync_snapshots()
+            .get(&connector)
+            .await
+            .is_err(),
+        "a secret's ciphertext authenticated as this connector's snapshot"
+    );
+    assert!(
+        db.store()
+            .scoped(scope)
+            .environment_secrets()
+            .open_value(&db.master_key(), &name)
+            .await
+            .is_err(),
+        "a snapshot's ciphertext authenticated as this secret's value, so a bind password can be \
+         replaced by a directory population"
+    );
+}
+
+/// THE RECORDED INSTANT IS THE ONE THE CALLER GAVE, read from the raw column rather than through
+/// the reader that inverts the writer. Asserting the reader against the writer only proves the
+/// two agree with each other: changing `microseconds` to `milliseconds` in the writer AND
+/// `* 1000000` to `* 1000` in the reader leaves that assertion green while the column is off by
+/// a factor of a thousand.
+#[tokio::test]
+async fn the_stored_instant_is_the_one_the_caller_gave() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let connector = seed_connector(&db, &env, scope).await;
+    // A FIXED INSTANT, not the clock: 2026-01-02T03:04:05.678901Z.
+    let taken: i64 = 1_767_323_045_678_901;
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_sync_snapshots()
+        .record(&env, &db.master_key(), &connector, &ids(&["u-a"]), taken)
+        .await
+        .expect("record");
+
+    let rendered: String = sqlx::query(
+        "SELECT to_char(taken_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') AS t \
+                     FROM ldap_sync_snapshots WHERE connector_id = $1",
+    )
+    .bind(connector.to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the raw column")
+    .get("t");
+    assert_eq!(
+        rendered, "2026-01-02T03:04:05.678901",
+        "the column does not hold the instant the caller gave"
+    );
+
+    let meta = db
+        .control_store()
+        .scoped(scope)
+        .ldap_sync_snapshots()
+        .meta_in_scope()
+        .await
+        .expect("read metadata");
+    assert_eq!(
+        meta.get(&connector.to_string())
+            .expect("present")
+            .taken_at_unix_micros,
+        taken,
+        "the reader disagrees with the column"
+    );
 }

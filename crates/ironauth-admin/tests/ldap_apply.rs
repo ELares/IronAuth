@@ -102,6 +102,7 @@ fn sweep(entries: Vec<(&str, SyncPlan, ApplyTerms)>) -> ScopeSweep {
     ScopeSweep {
         report: SweepReport { runs },
         terms,
+        skipped: Vec::new(),
     }
 }
 
@@ -490,6 +491,7 @@ async fn a_plan_whose_policy_is_missing_applies_nothing() {
             )],
         },
         terms: BTreeMap::new(),
+        skipped: Vec::new(),
     };
     let report = apply_sweep(store, scope, &env, &orphan).await;
 
@@ -737,6 +739,7 @@ async fn the_audit_row_names_the_connector_that_provisioned() {
                     actor: ActorRef::service(ServiceId::from_seed_bytes(connector.unique_bytes())),
                 },
             )]),
+            skipped: Vec::new(),
         },
     )
     .await;
@@ -1021,6 +1024,11 @@ async fn the_pass_body_counts_and_applies_the_sweep_it_is_given() {
         "the unreachable connector was not counted"
     );
     assert_eq!(
+        report.snapshots_unrecorded, 1,
+        "a snapshot the recorder could not key was dropped without a count: {report:?}"
+    );
+    assert_eq!(report.snapshots_recorded, 0);
+    assert_eq!(
         report.applied.provisioned, 1,
         "the pass counted the plan and did not apply it: {report:?}"
     );
@@ -1030,11 +1038,13 @@ async fn the_pass_body_counts_and_applies_the_sweep_it_is_given() {
     );
 }
 
-/// AND THE PASS REPEATS. `run_pass` sweeps against an empty previous snapshot every tick, so the
-/// second pass over an unchanged directory is the ordinary case; it must add nothing and report
-/// nothing needing attention.
+/// AND THE PASS REPEATS IDEMPOTENTLY. Two folds of the same sweep must create nothing the second
+/// time. This is NOT the "quiet pass" property: the sweep is hand-built with an empty previous set
+/// both times, so the second still derives an arrival and finds it already present. A real pass
+/// narrows its previous set from the snapshot and derives nothing at all -- `ldap_snapshot_pass`'s
+/// Wednesday asserts that, with real connector handles.
 #[tokio::test]
-async fn a_second_pass_over_the_same_sweep_reports_a_quiet_run() {
+async fn a_second_fold_of_the_same_sweep_creates_nothing() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;

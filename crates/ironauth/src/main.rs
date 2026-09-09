@@ -3865,6 +3865,8 @@ async fn start_ldap_sweep(
                 Ok(report) => {
                     let needs_attention = report.failed > 0
                         || report.refusing_departures > 0
+                        || report.snapshots_unrecorded > 0
+                        || report.snapshots_unreadable > 0
                         || !report.applied.everything_applied();
                     if needs_attention {
                         tracing::warn!(
@@ -3877,6 +3879,9 @@ async fn start_ldap_sweep(
                             deactivated = report.applied.deactivated,
                             deleted = report.applied.deleted,
                             apply_failures = report.applied.failures.len(),
+                            snapshots_recorded = report.snapshots_recorded,
+                            snapshots_unrecorded = report.snapshots_unrecorded,
+                            snapshots_unreadable = report.snapshots_unreadable,
                             "ldap sync pass finished with connectors that need attention"
                         );
                     } else {
@@ -3887,6 +3892,7 @@ async fn start_ldap_sweep(
                             provisioned = report.applied.provisioned,
                             deactivated = report.applied.deactivated,
                             deleted = report.applied.deleted,
+                            snapshots_recorded = report.snapshots_recorded,
                             "ldap sync pass finished"
                         );
                     }
