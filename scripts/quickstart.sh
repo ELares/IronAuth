@@ -101,7 +101,20 @@ elapsed=$((SECONDS - started))
 
 if [ "$status" != 0 ]; then
   echo "quickstart: ${NAME} FAILED after ${elapsed}s" >&2
-  [ -f "${QS_DIR}/emulator.log" ] && tail -20 "${QS_DIR}/emulator.log" >&2
+  # EVERY LOG THE DOCUMENTED STEPS WROTE, not just the emulator's. A quickstart step
+  # redirects its own noise to keep the DOC readable -- `npm ci ... > bff-install.log` is
+  # the shape -- and those files were captured and then never printed, so a failure inside
+  # one of them left the reader with the emulator's log and nothing else.
+  #
+  # What that costs is a step whose cause is written down and not shown. It is NOT what hid
+  # the missing-dependency failure this change also fixes: that step redirected only stdout,
+  # so npm's error reached the job log on inherited stderr. The two are separate defects and
+  # only one of them was invisible.
+  for log in "${QS_DIR}"/*.log; do
+    [ -f "$log" ] || continue
+    echo "quickstart: --- $(basename "$log") (last 20 lines) ---" >&2
+    tail -20 "$log" >&2
+  done
   exit "$status"
 fi
 
