@@ -132,19 +132,24 @@ data["items"].append(
         "title": "Zero to a secured MCP server inside the documented budget",
         "requirement": "IronAuth MCP quickstart: 5 minutes",
         "outcome": "pass" if elapsed <= budget else "fail",
-        # A BUCKET, not the raw seconds and not a restatement of the verdict. Raw seconds
-        # differ per machine and would make the committed page drift every run; "completed
-        # within the budget" would just repeat the outcome column in words. The bucket is a
-        # real measurement that is stable across ordinary runs, so the page says how much
-        # headroom there was rather than merely that there was some.
+        # THE BUDGET, not the measurement. This was a three-way bucket -- under 60s / 150s /
+        # 300s -- on the reasoning that raw seconds drift per machine while a bucket is
+        # "stable across ordinary runs". It is not: the buckets are far tighter than the
+        # variance between runners, and a run measuring 166s regenerated "under 300s" against
+        # a page committed at "under 60s", turning every conformance item passing into a red
+        # lane. A committed artifact must not be a function of how fast the runner was.
+        #
+        # The headroom is still MEASURED and still gates -- `elapsed > budget` fails below --
+        # and the raw seconds are printed to the job log, where a number that varies per
+        # machine belongs. What the page publishes is the claim that survives being read on
+        # any machine: this ran inside the documented budget.
         "evidence": (
-            f"emulator start to authorized MCP call, bucketed: "
-            f"{'under 60s' if elapsed < 60 else 'under 150s' if elapsed < 150 else 'under 300s'}"
-            f" (budget {budget}s)"
+            f"emulator start to authorized MCP call, within the {budget}s budget"
         ),
     }
 )
 path.write_text(json.dumps(data, indent=2) + "\n")
+print(f"mcp-conformance: quickstart took {elapsed}s of the {budget}s budget")
 if elapsed > budget:
     print(f"mcp-conformance: took {elapsed}s, over the {budget}s budget", file=sys.stderr)
     sys.exit(1)
