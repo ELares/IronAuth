@@ -101,7 +101,17 @@ elapsed=$((SECONDS - started))
 
 if [ "$status" != 0 ]; then
   echo "quickstart: ${NAME} FAILED after ${elapsed}s" >&2
-  [ -f "${QS_DIR}/emulator.log" ] && tail -20 "${QS_DIR}/emulator.log" >&2
+  # EVERY LOG THE DOCUMENTED STEPS WROTE, not just the emulator's. A quickstart step
+  # redirects its own noise to keep the DOC readable -- `npm install ... > install.log` is
+  # the shape -- so dumping one hand-named file printed the server's healthy startup while
+  # the actual error sat unread in a sibling. This lane failed that way for as long as it
+  # has been red: the log said the emulator was serving, and step 4's real message was
+  # never shown.
+  for log in "${QS_DIR}"/*.log; do
+    [ -f "$log" ] || continue
+    echo "quickstart: --- $(basename "$log") (last 20 lines) ---" >&2
+    tail -20 "$log" >&2
+  done
   exit "$status"
 fi
 

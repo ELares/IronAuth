@@ -59,7 +59,8 @@ Nothing is pre-seeded here. This is what `create-next-app` gives anybody.
 ## 4. Install the BFF
 
 ```bash quickstart
-(cd "$REPO/packages/ironauth-bff" && npm run build >/dev/null && npm pack --pack-destination "$QS_DIR" >/dev/null)
+(cd "$REPO/packages/ironauth-bff" && npm install >/dev/null 2>&1 \
+  && npm run build >/dev/null && npm pack --pack-destination "$QS_DIR" >/dev/null)
 npm install "$(ls "$QS_DIR"/ironauth-bff-*.tgz)" > "$QS_DIR/install.log" 2>&1
 ```
 
