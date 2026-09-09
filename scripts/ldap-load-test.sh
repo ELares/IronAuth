@@ -36,10 +36,13 @@ host_port() { printf '%s' "${IRONAUTH_LDAP_URL#ldap://}"; }
 
 echo "ldap-load-test: generating ${ENTRIES} entries"
 # NOT `mktemp -t ldap-bulk`. BSD mktemp treats the argument as a PREFIX and appends its own
-# suffix, so that form works on macOS and fails on the GNU mktemp every CI runner has:
-# "mktemp: too few X's in template". The explicit path with a trailing run of X's is the
-# one spelling both accept, and it is why this step ran green locally for two merges while
-# the only lane that exercises it could not get past the first line.
+# suffix, so that form works on macOS and fails on the GNU mktemp the Linux runner this job
+# uses: "mktemp: too few X's in template". The explicit path with a trailing run of X's is the
+# one spelling both accept.
+#
+# It shipped twice because nothing ran it. The `ldap live` lane never reached this script on
+# either of those merges -- it died several steps earlier, on a missing `wasm32-wasip2` target
+# -- so "green locally" was the only signal there was.
 tmp="$(mktemp "${TMPDIR:-/tmp}/ldap-bulk.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 python3 - "$ENTRIES" > "$tmp" <<'PY'
