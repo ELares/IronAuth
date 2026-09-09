@@ -94,6 +94,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "assignOrgMembershipRole",
     "assignOrgRolePermission",
     "clearOrgDefaultRole",
+    "createLdapConnector",
     "createMembership",
     "createOrgGroup",
     "createOrgRole",
@@ -105,6 +106,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "createScimPushConnection",
     "createServiceAccountMembership",
     "decideAgentVaultApproval",
+    "deleteLdapConnector",
     "deleteMembership",
     "deleteOrgGroup",
     "deleteOrgRole",
@@ -120,6 +122,7 @@ const ORG_ATTRIBUTED: &[&str] = &[
     "rotateOrganizationApiKey",
     "rotateScimConnectionToken",
     "setAgentState",
+    "setLdapConnectorActive",
     "setScimPushConnectionActive",
     "setOrgDefaultRole",
     "setOrgGroupParent",
@@ -214,6 +217,22 @@ const ATTRIBUTED_SOURCES: &[(&str, &str)] = &[
     ),
     ("decideAgentVaultApproval", include_str!("../src/agents.rs")),
     ("registerAgent", include_str!("../src/agents.rs")),
+    // The LDAP connector writes (issue #142). All three attribute through
+    // `.in_organization(org_id)`: a connector names the DIRECTORY one customer syncs from, so
+    // an unattributed row would leave that customer's own log stream blind to an operator
+    // re-pointing it, disabling it, or deleting it outright.
+    (
+        "createLdapConnector",
+        include_str!("../src/ldap_connectors.rs"),
+    ),
+    (
+        "setLdapConnectorActive",
+        include_str!("../src/ldap_connectors.rs"),
+    ),
+    (
+        "deleteLdapConnector",
+        include_str!("../src/ldap_connectors.rs"),
+    ),
     ("setAgentState", include_str!("../src/agents.rs")),
     (
         "createServiceAccountMembership",

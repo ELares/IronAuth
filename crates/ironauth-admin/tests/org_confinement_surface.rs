@@ -60,6 +60,14 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     // rows the shipper reads. This is the second module in this list added after the scan was
     // measured rather than before, and the first whose omission was hiding a live bypass.
     ("log_streams.rs", include_str!("../src/log_streams.rs")),
+    // The LDAP connector surface (issue #142): five organization-addressed operations, all
+    // five resolving through `resolve_live_org`. Added after the scan measured the gap, which
+    // is how `api_keys.rs` and `log_streams.rs` got here: the operations were fenced from the
+    // start, but a module this scan cannot read is a module whose next endpoint is unchecked.
+    (
+        "ldap_connectors.rs",
+        include_str!("../src/ldap_connectors.rs"),
+    ),
     ("memberships.rs", include_str!("../src/memberships.rs")),
     (
         "org_effective_roles.rs",
@@ -103,7 +111,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
 /// being absent from `ADMIN_SOURCES` entirely. Two numbers that are supposed to agree are
 /// worth nothing while nothing compares them, so the agreement is now asserted below
 /// rather than only claimed here.
-const ORG_ADDRESSED_OPERATIONS: usize = 61;
+const ORG_ADDRESSED_OPERATIONS: usize = 66;
 
 /// Operations that name their organization in the REQUEST BODY rather than the path.
 ///

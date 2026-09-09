@@ -2262,6 +2262,112 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors`
+         * @description # Errors
+         *
+         *     [`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if
+         *     the organization does not exist here; [`ApiError::BadRequest`] on a malformed cursor or
+         *     limit; [`ApiError::Internal`] on a store failure.
+         */
+        get: operations["listLdapConnectors"];
+        put?: never;
+        /**
+         * `POST .../ldap-connectors`
+         * @description # Errors
+         *
+         *     [`ApiError::BadRequest`] on any invalid field, including a bind secret outside the connector
+         *     namespace; [`ApiError::Forbidden`] on the wrong plane, scope or permission;
+         *     [`ApiError::NotFound`] if the organization does not exist here; [`ApiError::Conflict`] if the
+         *     handle is already used; [`ApiError::Internal`] on a store failure.
+         */
+        post: operations["createLdapConnector"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET .../ldap-connectors/health`
+         * @description # Errors
+         *
+         *     [`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if
+         *     the organization does not exist here; [`ApiError::Internal`] on a store failure. NOT
+         *     `BadRequest`: this route takes no query and no body, which its `responses(...)` and the
+         *     generated spec both already say.
+         */
+        get: operations["listLdapConnectorHealth"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE .../ldap-connectors/{connector_id}`
+         * @description # Errors
+         *
+         *     [`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if no
+         *     such connector belongs to this organization; [`ApiError::Internal`] on a store failure. NOT
+         *     `BadRequest`: this route takes no body.
+         */
+        delete: operations["deleteLdapConnector"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}/active": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * `PUT .../ldap-connectors/{connector_id}/active`
+         * @description # Errors
+         *
+         *     [`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if no
+         *     such connector belongs to this organization; [`ApiError::BadRequest`] on a malformed body;
+         *     [`ApiError::Internal`] on a store failure.
+         */
+        put: operations["setLdapConnectorActive"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/memberships": {
         parameters: {
             query?: never;
@@ -5006,6 +5112,41 @@ export interface components {
              */
             org_context?: string | null;
         };
+        /** @description What a create names. */
+        CreateLdapConnectorRequest: {
+            /** @description `deactivate` (default) or `delete`. */
+            absence_policy?: string | null;
+            /** @description How directory attributes become identity. */
+            attribute_mapping: Record<string, never>;
+            /** @description The DN to bind as. */
+            bind_dn: string;
+            /** @description The environment secret holding the bind password. Must begin with `ldap_bind_`. */
+            bind_secret_name: string;
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description Where groups live. Omit for a connector that syncs users only. */
+            group_base_dn?: string | null;
+            /** @description Which entries under the group base are groups. Required with a group base. */
+            group_filter?: string | null;
+            /** @description The directory host. */
+            host: string;
+            /**
+             * Format: int32
+             * @description How deep nested groups resolve. Defaults to the column default.
+             */
+            max_group_depth?: number | null;
+            /**
+             * Format: int32
+             * @description The directory port.
+             */
+            port: number;
+            /** @description `ldaps` (default), `starttls` or `plaintext`. */
+            tls_mode?: string | null;
+            /** @description Where users live. */
+            user_base_dn: string;
+            /** @description Which entries under the user base are users. */
+            user_filter: string;
+        };
         /** @description The body of a create request. */
         CreateLogStreamRequest: {
             /** @description The NAME of the environment secret holding the sink credential. */
@@ -5139,7 +5280,7 @@ export interface components {
         CreatePortalLinkRequest: {
             /**
              * @description What the session may configure: `sso`, `scim`, `domain-verification`, `log-streams`,
-             *     `certificate-renewal`, or `contacts`.
+             *     `certificate-renewal`, `contacts`, or `audit`.
              *     A session cannot navigate outside the intent it was opened with.
              */
             intent: string;
@@ -6235,6 +6376,151 @@ export interface components {
              *     activates on accept.
              */
             user_id: string;
+        };
+        /** @description The 201 of a create. */
+        LdapConnectorCreated: {
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description The non-secret handle. */
+            id: string;
+        };
+        /** @description A page of connectors. */
+        LdapConnectorListView: {
+            /** @description This organization's connectors. */
+            items: components["schemas"]["LdapConnectorView"][];
+            /** @description The cursor for the next page, absent on the last one. */
+            next_cursor?: string | null;
+        };
+        /**
+         * @description One connector, as the management surface renders it.
+         *
+         *     THE SECRET NAME IS HERE AND THE SECRET IS NOT, because the row holds only the name.
+         */
+        LdapConnectorView: {
+            /** @description `deactivate` or `delete`. */
+            absence_policy: string;
+            /** @description Whether the sweep serves this connector. */
+            active: boolean;
+            /** @description How directory attributes become identity. */
+            attribute_mapping: Record<string, never>;
+            /** @description The DN the sweep binds as. */
+            bind_dn: string;
+            /** @description The NAME of the environment secret holding the bind password. */
+            bind_secret_name: string;
+            /**
+             * Format: int64
+             * @description When it was configured, in milliseconds since the epoch.
+             */
+            created_at_unix_ms: number;
+            /** @description The operator-facing label. */
+            display_name: string;
+            /** @description Where groups live, empty when the connector syncs users only. */
+            group_base_dn: string;
+            /** @description Which entries under the group base are groups, empty with no group base. */
+            group_filter: string;
+            /** @description The directory host. */
+            host: string;
+            /** @description The non-secret `ldc_` handle. Every other operation names the connector by this. */
+            id: string;
+            /**
+             * Format: int32
+             * @description How deep nested groups resolve.
+             */
+            max_group_depth: number;
+            /** @description The organization whose users this directory populates. */
+            organization_id: string;
+            /**
+             * Format: int32
+             * @description The directory port.
+             */
+            port: number;
+            /** @description `ldaps`, `starttls` or `plaintext`. */
+            tls_mode: string;
+            /** @description Where users live. */
+            user_base_dn: string;
+            /** @description Which entries under the user base are users. */
+            user_filter: string;
+        };
+        /** @description Every connector's health in one organization. */
+        LdapHealthListView: {
+            /** @description One entry per connector a pass has reached, most recent first. */
+            items: components["schemas"]["LdapHealthView"][];
+            /**
+             * @description How many of them need attention.
+             *
+             *     COUNTED HERE rather than left to the caller, because "is anything wrong" is the question
+             *     an alert asks and a caller computing it from the list would each write the predicate
+             *     again.
+             */
+            unhealthy: number;
+        };
+        /** @description One connector's sync health. */
+        LdapHealthView: {
+            /**
+             * Format: int32
+             * @description Arrivals that already had an account.
+             */
+            already_present: number;
+            /**
+             * Format: int32
+             * @description Per-principal failures inside an otherwise successful pass.
+             */
+            apply_failures: number;
+            /** @description The connector this describes. */
+            connector_id: string;
+            /**
+             * Format: int32
+             * @description Passes in a row that did not produce a plan.
+             */
+            consecutive_failures: number;
+            /**
+             * Format: int32
+             * @description Accounts disabled.
+             */
+            deactivated: number;
+            /**
+             * Format: int32
+             * @description Accounts removed.
+             */
+            deleted: number;
+            /**
+             * Format: int64
+             * @description How long that pass took.
+             */
+            duration_ms: number;
+            /**
+             * @description The KIND of failure, absent on a successful pass.
+             *
+             *     NEVER the directory's own message: it can carry a DN, which names a person and their
+             *     place in an organization. The full text is in the log.
+             */
+            error?: string | null;
+            /**
+             * @description Whether it needs attention. FALSE for a connector that binds fine and fails to apply
+             *     every principal, which reports a successful outcome.
+             */
+            healthy: boolean;
+            /**
+             * Format: int64
+             * @description When the last pass reached this connector, in milliseconds since the epoch.
+             */
+            last_run_at_unix_ms: number;
+            /**
+             * Format: int64
+             * @description The last pass that DID produce a plan.
+             *
+             *     Present so a reader can tell how STALE the view of the directory is, not merely that the
+             *     last attempt failed. A connector down for a day and one down for a minute report the same
+             *     outcome and different values here.
+             */
+            last_success_at_unix_ms?: number | null;
+            /** @description `planned`, `unreachable`, `failed`, `timed_out` or `skipped`. */
+            outcome: string;
+            /**
+             * Format: int32
+             * @description Accounts created on the last pass.
+             */
+            provisioned: number;
         };
         /** @description The request body to lift a ban. */
         LiftBanRequest: {
@@ -8672,6 +8958,11 @@ export interface components {
             timeout_ms?: number | null;
             /** @description `pre_persist` or `post_persist`. */
             timing: string;
+        };
+        /** @description What a pause or resume names. */
+        SetLdapConnectorActiveRequest: {
+            /** @description Whether the sweep should serve this connector. */
+            active: boolean;
         };
         /**
          * @description The body to set (create or overwrite) a per-environment locale bundle (issue #86, PR 2).
@@ -20627,6 +20918,265 @@ export interface operations {
                 };
             };
             /** @description Not found (no such live assignment: absent, already withdrawn, another scope's, another organization's, or a pair whose two halves belong to different organizations). The environment must be live too: an absent or soft-deleted one answers this same not-found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listLdapConnectors: {
+        parameters: {
+            query?: {
+                /** @description Maximum connectors to return */
+                limit?: number;
+                /** @description Opaque cursor from a previous page */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This organization's directory connectors */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LdapConnectorListView"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    createLdapConnector: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Required. Replays return the original response. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateLdapConnectorRequest"];
+            };
+        };
+        responses: {
+            /** @description The connector was configured */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LdapConnectorCreated"];
+                };
+            };
+            /** @description Invalid configuration */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The handle is already used */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listLdapConnectorHealth: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description How each directory's last sync went */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LdapHealthListView"];
+                };
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such organization */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    deleteLdapConnector: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Connector identifier */
+                connector_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The connector was removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such connector */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    setLdapConnectorActive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tenant identifier */
+                tenant_id: string;
+                /** @description Environment identifier */
+                environment_id: string;
+                /** @description Organization identifier */
+                organization_id: string;
+                /** @description Connector identifier */
+                connector_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetLdapConnectorActiveRequest"];
+            };
+        };
+        responses: {
+            /** @description The connector was paused or resumed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Wrong plane or scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such connector */
             404: {
                 headers: {
                     [name: string]: unknown;

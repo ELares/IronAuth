@@ -393,6 +393,9 @@ struct Fixture {
     /// payload to prevent.
     scim_connection: String,
     scim_push_connection: String,
+    /// The LDAP connector (issue #142) this sweep addresses, seeded LIVE so the pause and
+    /// delete cases name a REAL handle and the two reads have rows to lose.
+    ldap_connector: String,
 }
 
 impl Fixture {
@@ -509,6 +512,7 @@ impl Fixture {
         let scim_push_connection = Self::seed_scim_push_connection(h, &base, key).await;
         let scim_push_resource =
             Self::seed_scim_push_link(h, tenant, environment, &scim_push_connection, key).await;
+        let ldap_connector = Self::seed_ldap_connector(h, tenant, environment, &base, key).await;
 
         let fixture = Self {
             base,
@@ -533,6 +537,7 @@ impl Fixture {
             service_account,
             scim_connection,
             scim_push_connection,
+            ldap_connector,
         };
         fixture.seed_relations(h, key).await;
         fixture
@@ -606,6 +611,80 @@ impl Fixture {
             "scim push connection",
         )
         .await
+    }
+
+    /// The LDAP connector this sweep addresses, AND one sync-run row for it (issue #142).
+    ///
+    /// The two are seeded together for a reason the caller cannot see: the health listing reads
+    /// `ldap_sync_runs` filtered to the organization's connectors, so a connector with no run
+    /// answers an EMPTY page. An empty page is exactly what [`Intent::Read`] exists to reject,
+    /// and a health case built on one would pass at a decommissioned environment while proving
+    /// nothing. The run goes in THROUGH THE STORE for the reason
+    /// [`Self::seed_scim_push_link`] gives: no management route writes one, the boot pass does.
+    ///
+    /// Written while the environment is LIVE, so a listing that empties afterwards is a
+    /// decommissioned environment losing its audit trail rather than one that never had rows.
+    async fn seed_ldap_connector(
+        h: &Harness,
+        tenant: &str,
+        environment: &str,
+        base: &str,
+        key: &str,
+    ) -> String {
+        let connector = seed_row(
+            h,
+            &format!("{base}/ldap-connectors"),
+            &format!("{key}-ldc"),
+            &serde_json::json!({
+                "display_name": "Seeded directory",
+                "host": "ldap.corp.example.com",
+                "port": 636,
+                "bind_dn": "cn=svc,dc=example,dc=test",
+                "bind_secret_name": "ldap_bind_seeded",
+                "user_base_dn": "ou=People,dc=example,dc=test",
+                "user_filter": "(objectClass=inetOrgPerson)",
+                "attribute_mapping": { "email": "mail" },
+            })
+            .to_string(),
+            "ldap connector",
+        )
+        .await;
+        let scope = Scope::new(
+            TenantId::parse(tenant).expect("tenant id"),
+            EnvironmentId::parse(environment).expect("environment id"),
+        );
+        let sys = Env::system();
+        let id = ironauth_store::LdapConnectorId::parse_in_scope(&connector, &scope)
+            .expect("the seeded connector id parses");
+        // THE CONTROL STORE, not `h.store()`. 0215 grants `ldap_sync_runs` to
+        // `ironauth_control` alone, deliberately -- 0212 states the reason for the sibling
+        // table: granting the token-issuance role SELECT on a connector's host and failure
+        // state would widen it for nothing. The data-plane store this file's other store-level
+        // seed uses therefore answers 42501 here.
+        h.control_store()
+            .scoped(scope)
+            .acting(
+                ActorRef::service(ServiceId::generate(&sys)),
+                CorrelationId::generate(&sys),
+            )
+            .ldap_sync_runs()
+            .record(&ironauth_store::NewLdapRun {
+                connector_id: &id,
+                started_at_unix_micros: 1_767_323_045_678_901,
+                duration_ms: 12,
+                outcome: ironauth_store::LdapRunOutcome::Planned,
+                error: None,
+                provisioned: 7,
+                already_present: 3,
+                deactivated: 2,
+                deleted: 1,
+                already_absent: 0,
+                already_removed: 0,
+                apply_failures: 0,
+            })
+            .await
+            .expect("seed a sync run");
+        connector
     }
 
     /// Record a push LINK against `connection` and return the downstream id it carries.
@@ -1054,6 +1133,7 @@ impl Fixture {
         let Self {
             base,
             scim_push_connection,
+            ldap_connector,
             ..
         } = self;
         vec![
@@ -1098,6 +1178,63 @@ impl Fixture {
                 // an empty page cannot pass for an audit.
                 intent: Intent::Read(vec!["Seeded downstream".to_owned()]),
                 live: StatusCode::OK,
+            },
+            // The LDAP connector surface (issue #142), all five shapes. The two reads name rows
+            // the seed landed WHILE THE ENVIRONMENT WAS LIVE -- the connector's own label and
+            // the connector id its health row carries -- so an empty page cannot pass for an
+            // audit at a decommissioned environment.
+            Case {
+                label: "ldap_connectors.createLdapConnector",
+                method: "POST",
+                path: format!("{base}/ldap-connectors"),
+                body: Some(
+                    serde_json::json!({
+                        "display_name": "sweep directory",
+                        "host": "ldap2.corp.example.com",
+                        "port": 636,
+                        "bind_dn": "cn=svc,dc=example,dc=test",
+                        "bind_secret_name": "ldap_bind_sweep",
+                        "user_base_dn": "ou=People,dc=example,dc=test",
+                        "user_filter": "(objectClass=inetOrgPerson)",
+                        "attribute_mapping": { "email": "mail" },
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
+                label: "ldap_connectors.listLdapConnectors",
+                method: "GET",
+                path: format!("{base}/ldap-connectors"),
+                body: None,
+                intent: Intent::Read(vec!["Seeded directory".to_owned()]),
+                live: StatusCode::OK,
+            },
+            Case {
+                label: "ldap_connectors.listLdapConnectorHealth",
+                method: "GET",
+                path: format!("{base}/ldap-connectors/health"),
+                body: None,
+                intent: Intent::Read(vec![ldap_connector.clone()]),
+                live: StatusCode::OK,
+            },
+            Case {
+                label: "ldap_connectors.setLdapConnectorActive",
+                method: "PUT",
+                // The SEEDED handle, not an absent one, for the reason the cases above state.
+                path: format!("{base}/ldap-connectors/{ldap_connector}/active"),
+                body: Some(serde_json::json!({ "active": false }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "ldap_connectors.deleteLdapConnector",
+                method: "DELETE",
+                path: format!("{base}/ldap-connectors/{ldap_connector}"),
+                body: None,
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
             },
         ]
     }
@@ -1746,6 +1883,7 @@ fn every_documented_organization_operation_is_driven_by_a_case() {
     let fixture = Fixture {
         base: "/v1/tenants/ten_x/environments/env_x/organizations/org_x".to_owned(),
         scim_push_resource: "dwn-x".to_owned(),
+        ldap_connector: "ldc_x".to_owned(),
         env_base: "/v1/tenants/ten_x/environments/env_x".to_owned(),
         org: "org_x".to_owned(),
         role: "rol_x".to_owned(),
@@ -2276,6 +2414,21 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             serde_json::json!({ "slug": "replay.group", "display_name": "Replay" }).to_string(),
         ),
         (
+            "ldap_connectors.createLdapConnector",
+            format!("{base}/ldap-connectors"),
+            serde_json::json!({
+                "display_name": "Replay directory",
+                "host": "ldap.corp.example.com",
+                "port": 636,
+                "bind_dn": "cn=svc,dc=example,dc=test",
+                "bind_secret_name": "ldap_bind_replay",
+                "user_base_dn": "ou=People,dc=example,dc=test",
+                "user_filter": "(objectClass=inetOrgPerson)",
+                "attribute_mapping": { "email": "mail" },
+            })
+            .to_string(),
+        ),
+        (
             "memberships.createMembership",
             format!("{base}/memberships"),
             serde_json::json!({ "user_id": spare_user }).to_string(),
@@ -2481,6 +2634,7 @@ fn replay_fixture() -> Fixture {
     Fixture {
         base: "/v1/tenants/ten_x/environments/env_x/organizations/org_x".to_owned(),
         scim_push_resource: "dwn-x".to_owned(),
+        ldap_connector: "ldc_x".to_owned(),
         env_base: "/v1/tenants/ten_x/environments/env_x".to_owned(),
         org: "org_x".to_owned(),
         role: "rol_x".to_owned(),
@@ -2749,8 +2903,8 @@ async fn a_soft_deleted_environments_organization_content_is_still_readable() {
 /// a change that moves them fails here rather than quietly making a paragraph wrong.
 #[test]
 fn the_case_counts_are_pinned_where_they_can_be_measured() {
-    const WRITES: usize = 42;
-    const READS: usize = 19;
+    const WRITES: usize = 45;
+    const READS: usize = 21;
 
     let cases = replay_fixture_cases();
     let writes = cases
