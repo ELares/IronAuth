@@ -58,6 +58,46 @@ const PER_CONNECTOR_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// with no source. 500 is what the directories in this space default to.
 const PAGE_SIZE: i32 = 500;
 
+/// The most entries one search may return before the connector is refused.
+///
+/// MEASURED, at four sizes against a real server, not guessed:
+///
+/// | people | peak RSS | pass | marginal vs the 5-entry row |
+/// | ---: | ---: | ---: | ---: |
+/// | 5 | 15.2 MiB | 0.4s | baseline |
+/// | 3,005 | 22.7 MiB | 4s | 2,627 B/entry |
+/// | 20,005 | 50.5 MiB | 35s | 1,852 B/entry |
+/// | 40,005 | 83.7 MiB | 43s | 1,795 B/entry |
+///
+/// THE MARGINAL COST IS NOT CONSTANT: it falls from about 2.6KB to about 1.8KB as the directory
+/// grows, because part of what the baseline row does not capture scales with the accounts being
+/// written rather than with the entries being read. Quoting a single figure would have been
+/// tidier and wrong. Taking the large-N end, 100k people is roughly 200MB and a million roughly
+/// 2GB -- and those are extrapolations from 40k, not measurements. Paging bounds what is on the
+/// wire at once, not what the process holds -- the diff compares the WHOLE directory against the
+/// whole previous snapshot, so the set is resident by construction.
+///
+/// HOW THESE WERE TAKEN, and what CI re-takes. `scripts/ldap-load-test.sh` produced the two large
+/// rows; the five-entry row is the same binary against the committed fixture, which the script
+/// cannot produce because it always ADDS its N to the fixture's five. CI runs the script at one
+/// size (20,000), so it re-takes one row and the other two are recorded here rather than
+/// re-measured on every push.
+///
+/// AND THE FIGURE IS A WHOLE-BINARY PEAK, not the sweep's alone: the process also holds a test
+/// database, every migration and libtest, which is most of the five-entry baseline. Subtracting
+/// that baseline is what makes the per-entry number marginal, and it is why the raw figure the
+/// CI artifact publishes is larger.
+///
+/// 250,000 is therefore about half a gigabyte for one connector, which is a large but survivable
+/// pass on the kind of host that runs this, and far above any directory this is pointed at in
+/// practice. What the ceiling buys is not a smaller footprint: it is that an unexpectedly huge
+/// directory becomes a REFUSAL naming that connector rather than an allocator killing the sweep
+/// and taking every other connector's pass with it.
+///
+/// Not per-connector today, for the reason the page size is not: the column does not exist, and
+/// inventing a setting with no source here would be a knob nothing can turn.
+pub const MAX_ENTRIES: usize = 250_000;
+
 /// Every active connector in one scope, as work the sweep can run.
 ///
 /// The previous snapshot is supplied by the caller rather than read here, because where a
@@ -233,6 +273,7 @@ impl SourceFactory for StoreSourceFactory<'_> {
             bind_dn: connector.bind_dn.clone(),
             bind_password: password,
             page_size: PAGE_SIZE,
+            max_entries: MAX_ENTRIES,
             connect_timeout: CONNECT_TIMEOUT,
         })
         .await

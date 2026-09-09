@@ -62,8 +62,239 @@ fn config(url: String, tls_mode: TlsMode, page_size: i32) -> DirectoryConfig {
         bind_password: std::env::var("IRONAUTH_LDAP_BIND_PASSWORD")
             .unwrap_or_else(|_| "adminpw".to_owned()),
         page_size,
+        max_entries: 250_000,
         connect_timeout: Duration::from_secs(10),
     }
+}
+
+/// PROGRESS IS OBSERVABLE WHILE THE READ RUNS, and "while" is the part that took three attempts.
+///
+/// A `tracing::info!` produced nothing (a test binary installs no subscriber). A captured
+/// subscriber passed alone and failed in the suite (`tracing` caches callsite interest globally,
+/// so a thread-local subscriber loses the race against sibling threads with none). This is the
+/// third: an explicit observer, the shape `ScimPushObserver` uses.
+///
+/// AND IT PROVES INTERLEAVING, not merely the sequence. A `Vec` compared after the search returned
+/// records WHAT was reported and never WHEN, so hoisting every call out of the loop and emitting
+/// the same numbers afterwards -- the exact regression this exists to catch -- passed. The
+/// discriminator is the CEILING: an over-ceiling read returns early from inside the loop, so a
+/// reporter that emits during the read has already said something and one that batches until
+/// afterwards never runs at all. No clock, no spawned task, nothing to race.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn a_long_search_reports_progress_while_it_runs() {
+    use ironauth_admin::ldap_client::SearchProgress;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(String, usize, usize)>>);
+    impl SearchProgress for Recorder {
+        fn entries_read(&self, base: &str, read: usize, ceiling: usize) {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((base.to_owned(), read, ceiling));
+        }
+    }
+
+    // THE WHOLE READ, at a page size of two over five people: two full pages and a partial one.
+    let recorder = Arc::new(Recorder::default());
+    let directory = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2))
+        .await
+        .expect("connect")
+        .with_progress(recorder.clone());
+    let found = directory
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await
+        .expect("search");
+    assert_eq!(found.len(), 5, "the fixture's five must still arrive");
+
+    let seen = recorder.0.lock().expect("lock").clone();
+    let counts: Vec<usize> = seen.iter().map(|(_, read, _)| *read).collect();
+    assert_eq!(
+        counts,
+        vec![2, 4, 5],
+        "a five-entry read at a page size of two must report after each full page AND once at \
+         the end, so a directory smaller than one page still reports: {counts:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(base, _, ceiling)| base == BASE && *ceiling > 0),
+        "every report must name the base being read and the ceiling it is under, or a caller \
+         watching two connectors cannot tell which is which: {seen:?}"
+    );
+
+    // THE INTERLEAVING. A read that hits its ceiling returns from INSIDE the loop, so a reporter
+    // that fires during the read has already said "2" and one that batches until the loop ends
+    // says nothing at all. This is the assertion the sequence above cannot make.
+    let midread = Arc::new(Recorder::default());
+    let mut capped = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    capped.max_entries = 2;
+    let refused = Directory::connect(&capped)
+        .await
+        .expect("connect")
+        .with_progress(midread.clone())
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await;
+    assert!(refused.is_err(), "the capped read must refuse");
+    let during: Vec<usize> = midread
+        .0
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|(_, read, _)| *read)
+        .collect();
+    assert_eq!(
+        during,
+        vec![2],
+        "a read abandoned mid-stream reported {during:?}; progress that only appears after the \
+         loop finishes is a summary, and a summary of a read that never finished is nothing"
+    );
+}
+
+/// AND THE CADENCE FOLLOWS THE PAGE SIZE. Driven at a different size from the test above, so a
+/// hardcoded modulus that happened to match one of them cannot satisfy both.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn the_progress_cadence_follows_the_page_size() {
+    use ironauth_admin::ldap_client::SearchProgress;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<usize>>);
+    impl SearchProgress for Recorder {
+        fn entries_read(&self, _base: &str, read: usize, _ceiling: usize) {
+            self.0.lock().expect("lock").push(read);
+        }
+    }
+
+    for (page, expected) in [(1, vec![1, 2, 3, 4, 5]), (3, vec![3, 5]), (500, vec![5])] {
+        let recorder = Arc::new(Recorder::default());
+        let directory =
+            Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, page))
+                .await
+                .expect("connect")
+                .with_progress(recorder.clone());
+        directory
+            .search_all(
+                BASE,
+                SearchScope::Subtree,
+                "(objectClass=inetOrgPerson)",
+                &["uid".to_owned()],
+            )
+            .await
+            .expect("search");
+        let seen = recorder.0.lock().expect("lock").clone();
+        assert_eq!(
+            seen, expected,
+            "at a page size of {page} the reports must be {expected:?}, got {seen:?}"
+        );
+    }
+}
+
+/// A CEILING, NOT A TRUNCATION. Paging bounds what is on the wire at once; it does not bound what
+/// the process holds, because the diff compares the WHOLE directory against the whole previous
+/// snapshot. So a directory larger than the connector can hold has to be REFUSED -- returning the
+/// entries that fit would reach the diff as everybody who did not fit having departed, which is
+/// the same failure the referral refusal exists for and is unrecoverable under a delete policy.
+///
+/// Driven against the real server at a ceiling of two, so the refusal is five real entries
+/// meeting a bound rather than a fixture arranged to be small.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn a_directory_larger_than_the_ceiling_is_refused_rather_than_returned_short() {
+    let mut cfg = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    cfg.max_entries = 2;
+    let directory = Directory::connect(&cfg).await.expect("connect");
+
+    let refused = directory
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await;
+
+    let Err(error) = refused else {
+        panic!("a directory over the ceiling was returned short instead of refused");
+    };
+    assert!(
+        matches!(error, DirectoryError::TooManyEntries { ceiling: 2 }),
+        "the refusal must name the ceiling it hit: {error:?}"
+    );
+
+    // THE BOUNDARY, not merely "somewhere below five". With five people and a ceiling of two, any
+    // implementation refusing at four or fewer also passes the assertion above -- a mutant using
+    // `max_entries * 2` survived it. A ceiling of FOUR against five entries pins the edge: it
+    // must still refuse, and a bound that had drifted upward by even one would return all five.
+    let mut edge = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    edge.max_entries = 4;
+    let refused_at_four = Directory::connect(&edge)
+        .await
+        .expect("connect")
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await;
+    assert!(
+        matches!(
+            refused_at_four,
+            Err(DirectoryError::TooManyEntries { ceiling: 4 })
+        ),
+        "a five-person directory must be refused at a ceiling of four: {refused_at_four:?}"
+    );
+
+    // AND EXACTLY AT THE SIZE IT HOLDS, it reads. Five people under a ceiling of five is the
+    // other side of the same edge, and it is what says the bound is `>` rather than `>=` in the
+    // direction that matters: a connector sized for its directory must not refuse it.
+    let mut exact = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    exact.max_entries = 5;
+    let at_capacity = Directory::connect(&exact)
+        .await
+        .expect("connect")
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await
+        .expect("a directory exactly at the ceiling must read");
+    assert_eq!(at_capacity.len(), 5, "{at_capacity:?}");
+
+    // AND UNDER THE CEILING IT STILL READS EVERYBODY, or the bound would be a wall: a refusal
+    // that fired for every directory would satisfy the assertion above.
+    let mut roomy = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    roomy.max_entries = 250_000;
+    let directory = Directory::connect(&roomy).await.expect("connect");
+    let everyone = directory
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await
+        .expect("a directory under the ceiling reads");
+    assert_eq!(
+        everyone.len(),
+        5,
+        "the fixture's five people must still arrive: {everyone:?}"
+    );
 }
 
 /// The derived attribute list is what makes the identifier arrive.

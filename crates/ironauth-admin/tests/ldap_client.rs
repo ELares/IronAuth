@@ -18,6 +18,7 @@ fn config(url: &str, tls_mode: TlsMode) -> DirectoryConfig {
         bind_dn: "cn=svc,dc=example,dc=test".to_owned(),
         bind_password: "pw".to_owned(),
         page_size: 500,
+        max_entries: 250_000,
         connect_timeout: Duration::from_secs(5),
     }
 }
