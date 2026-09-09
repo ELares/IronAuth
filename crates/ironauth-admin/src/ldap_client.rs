@@ -42,6 +42,30 @@ use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 
 use crate::ldap_mapping::DirectoryEntry;
 
+/// How much of the tree one search covers.
+///
+/// Explicit because the difference is not cosmetic here. Reading a GROUP to get its member list
+/// must be a base read: a subtree read rooted at the group's DN also returns that group's
+/// children, and the code then takes `first()` of a set whose order the protocol does not
+/// specify. The first version of this module hardcoded subtree and carried a comment saying
+/// "(base scope)", which was false about the call it annotated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    /// The named entry only.
+    Base,
+    /// The named entry and everything beneath it.
+    Subtree,
+}
+
+impl From<SearchScope> for Scope {
+    fn from(scope: SearchScope) -> Self {
+        match scope {
+            SearchScope::Base => Self::Base,
+            SearchScope::Subtree => Self::Subtree,
+        }
+    }
+}
+
 /// How the connection to the directory is protected. Mirrors the `tls_mode` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
@@ -73,6 +97,15 @@ pub enum DirectoryError {
         /// What was configured.
         url: String,
     },
+    /// A group DN the connector names does not resolve.
+    ///
+    /// Refused rather than treated as an empty group: an empty member set makes the expansion
+    /// report itself COMPLETE, so nothing downstream refuses, and every principal reads as
+    /// departed.
+    GroupNotFound {
+        /// The DN that did not resolve.
+        dn: String,
+    },
     /// The server referred part of the subtree to another directory, which this module does not
     /// chase.
     ///
@@ -96,6 +129,11 @@ impl std::fmt::Display for DirectoryError {
                  protected the way the connector says it is"
             ),
             Self::UnsupportedScheme { url } => write!(f, "{url} is not an ldap:// or ldaps:// URL"),
+            Self::GroupNotFound { dn } => write!(
+                f,
+                "the group {dn} does not resolve; treating it as empty would report a complete \
+                 walk over nobody"
+            ),
             Self::Referred { referrals } => write!(
                 f,
                 "the server referred part of the subtree to {}, so the result is incomplete",
@@ -220,6 +258,7 @@ impl Directory {
     pub async fn search_all(
         &self,
         base: &str,
+        scope: SearchScope,
         filter: &str,
         attributes: &[String],
     ) -> Result<Vec<DirectoryEntry>, DirectoryError> {
@@ -229,7 +268,7 @@ impl Directory {
             Box::new(ldap3::adapters::PagedResults::new(self.page_size)),
         ];
         let mut stream = ldap
-            .streaming_search_with(adapters, base, Scope::Subtree, filter, attributes)
+            .streaming_search_with(adapters, base, scope.into(), filter, attributes)
             .await?;
 
         let mut out = Vec::new();
@@ -285,7 +324,9 @@ impl crate::ldap_sync::EntrySource for Directory {
         filter: &str,
         attributes: &[String],
     ) -> Result<Vec<DirectoryEntry>, DirectoryError> {
-        self.search_all(base, filter, attributes).await
+        // SUBTREE here, deliberately: people live under the base DN, often in sub-OUs.
+        self.search_all(base, SearchScope::Subtree, filter, attributes)
+            .await
     }
 }
 
@@ -301,20 +342,56 @@ impl crate::ldap_groups::GroupSource for Directory {
         &self,
         group_dn: &str,
     ) -> Result<Vec<crate::ldap_groups::Member>, DirectoryError> {
-        // Read the group itself (base scope) for its member list, then ask what each member IS.
-        // Two round trips per group rather than one, because `member` carries only DNs and the
-        // walk has to know which of them to descend into.
-        let group = self
-            .search_all(group_dn, "(objectClass=*)", &["member".to_owned()])
-            .await?;
+        // ONE BASE READ for the group, then one per member to ask what it IS -- so the cost is
+        // 1 + N searches per group, not two. An earlier version of this comment said "two round
+        // trips", which is wrong by two orders of magnitude on a 500-member group, and said
+        // "(base scope)" while the call hardcoded a subtree read.
+        //
+        // The base read matters beyond cost: a subtree read rooted at the group's DN also returns
+        // the group's CHILDREN, and `first()` would then pick from a set whose order the protocol
+        // does not specify.
+        // TWO WAYS A GROUP FAILS TO RESOLVE, and both must land on the same refusal. A server
+        // that does not know the DN answers `noSuchObject` (32); one where an ACL hides it can
+        // instead answer success with no entries. Only the first is an error on its own, so the
+        // second needs the guard below or it becomes "an empty group".
+        let group = match self
+            .search_all(
+                group_dn,
+                SearchScope::Base,
+                "(objectClass=*)",
+                &["member".to_owned()],
+            )
+            .await
+        {
+            Ok(entries) => entries,
+            Err(DirectoryError::Transport(ldap3::LdapError::LdapResult { result }))
+                if result.rc == 32 =>
+            {
+                return Err(DirectoryError::GroupNotFound {
+                    dn: group_dn.to_owned(),
+                });
+            }
+            Err(other) => return Err(other),
+        };
         let Some(entry) = group.first() else {
-            return Ok(Vec::new());
+            // A GROUP THAT DOES NOT RESOLVE IS NOT AN EMPTY GROUP. Returning `Ok(vec![])` here
+            // made the walk report `complete: true` over a member set of nobody, so the diff did
+            // not refuse and every principal read as departed -- the exact outcome this
+            // subsystem exists to prevent, reached through a typo in a group DN.
+            return Err(DirectoryError::GroupNotFound {
+                dn: group_dn.to_owned(),
+            });
         };
 
         let mut members = Vec::new();
         for dn in entry.values("member") {
             let found = self
-                .search_all(dn, "(objectClass=*)", &["objectClass".to_owned()])
+                .search_all(
+                    dn,
+                    SearchScope::Base,
+                    "(objectClass=*)",
+                    &["objectClass".to_owned()],
+                )
                 .await?;
             // A member the search cannot resolve is carried as a NON-group: it may be a person
             // outside the base, and dropping it silently would shrink the member set, which the

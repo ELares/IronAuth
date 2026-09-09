@@ -257,3 +257,44 @@ async fn principals_identified_only_by_their_dn_are_counted_as_rename_fragile() 
     );
     assert_eq!(out.present.len(), 2);
 }
+
+/// A member DN that differs only in case is still the same person.
+///
+/// `p.dn` is what the entry search echoed; the expansion's members are raw `member` values. RFC
+/// 4514 leaves attribute-type case free and most servers match DNs case-insensitively, so a
+/// directory writing `CN=` in one place and `cn=` in the other is ordinary. An exact-string join
+/// drops that person from scope -- and out of scope reads as departed.
+#[tokio::test]
+async fn a_member_dn_that_differs_only_in_case_is_still_in_scope() {
+    let mut groups = BTreeMap::new();
+    groups.insert(
+        "cn=eng,ou=Groups,dc=example,dc=test".to_owned(),
+        vec![Member {
+            // The group lists the DN with different attribute-type case than the entry echoes.
+            dn: "UID=ada,OU=People,DC=example,DC=test".to_owned(),
+            is_group: false,
+        }],
+    );
+    let fake = Fake {
+        people: vec![person("ada", Some("u-ada"))],
+        groups,
+    };
+
+    let out = plan(
+        &fake,
+        &inputs(&["cn=eng,ou=Groups,dc=example,dc=test"], 5),
+        &set(&["u-ada"]),
+    )
+    .await
+    .expect("plans");
+
+    assert_eq!(
+        out.retained,
+        set(&["u-ada"]),
+        "the member is in scope despite the case difference"
+    );
+    assert!(
+        out.departures.expect("complete").is_empty(),
+        "an exact-string join would have dropped ada from scope and called her departed"
+    );
+}

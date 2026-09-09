@@ -207,9 +207,25 @@ where
     let in_scope: BTreeSet<String> = if inputs.group_roots.is_empty() {
         observed.clone()
     } else {
+        // THE TWO SIDES OF THIS JOIN COME FROM DIFFERENT PLACES. `p.dn` is what the server echoed
+        // on the entry; `expansion.members` holds the raw strings out of a `member` attribute.
+        // A directory that writes `CN=Ada,OU=People` in one and `cn=ada,ou=People` in the other
+        // is not misconfigured -- RFC 4514 leaves the case of attribute TYPES free, and most
+        // servers match DNs case-insensitively. An exact-string join would drop that person from
+        // scope, and a person dropped from scope reads as departed.
+        //
+        // Folding case is not full DN normalisation (it does not canonicalise spacing around
+        // commas or unescape values), so it narrows the gap rather than closing it. The
+        // alternative is a DN parser, which is a bigger dependency than this seam justifies
+        // today; when one arrives, this is the site.
+        let members: BTreeSet<String> = expansion
+            .members
+            .iter()
+            .map(|dn| dn.to_ascii_lowercase())
+            .collect();
         present
             .iter()
-            .filter(|p| expansion.members.contains(&p.dn))
+            .filter(|p| members.contains(&p.dn.to_ascii_lowercase()))
             .map(|p| p.stable_id.clone())
             .collect()
     };
