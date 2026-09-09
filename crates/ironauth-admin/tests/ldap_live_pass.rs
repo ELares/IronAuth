@@ -140,16 +140,31 @@ async fn a_pass_provisions_every_person_in_a_live_directory() {
         "a pass with no previous snapshot must remove nobody"
     );
 
+    assert_eq!(
+        first.snapshots_recorded, 1,
+        "the pass did not record what it saw, so the next one could detect no departure"
+    );
+
+    // THE SECOND PASS IS QUIET. Everybody the directory holds is now in the snapshot, so they read
+    // as retained rather than as arrivals and the change set is empty -- not five redundant
+    // lookups an hour, for ever.
     let second = ironauth_admin::ldap_boot::run_pass(store, &scopes, &env, &master, 100)
         .await
         .expect("the pass runs again");
     assert_eq!(
-        second.applied.provisioned, 0,
-        "the second pass created accounts again"
+        (
+            second.applied.provisioned,
+            second.applied.already_present,
+            second.applied.deactivated,
+            second.applied.deleted
+        ),
+        (0, 0, 0, 0),
+        "an unchanged directory must be a quiet pass: {second:?}"
     );
-    assert_eq!(
-        second.applied.already_present, 5,
-        "the second pass did not recognise the accounts the first one made"
+    assert!(
+        second.applied.everything_applied(),
+        "{:?}",
+        second.applied.failures
     );
 }
 

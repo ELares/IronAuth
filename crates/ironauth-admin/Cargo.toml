@@ -202,6 +202,12 @@ path = "tests/ldap_execute.rs"
 name = "ldap_apply"
 path = "tests/ldap_apply.rs"
 
+# Deletion propagation across two passes (issue #142): the snapshot between them is what makes an
+# absence detectable at all.
+[[test]]
+name = "ldap_snapshot_pass"
+path = "tests/ldap_snapshot_pass.rs"
+
 # A whole pass, stored row to written account, against a real LDAP server and a real database
 # (issue #142). Ignored by default: it needs IRONAUTH_LDAP_URL.
 [[test]]

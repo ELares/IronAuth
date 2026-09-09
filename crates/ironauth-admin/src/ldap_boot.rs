@@ -317,6 +317,11 @@ pub struct PassReport {
     pub rename_fragile: usize,
     /// What was written, summed over every connector in the pass.
     pub applied: ExecuteReport,
+    /// Connectors whose new snapshot was stored, so the next pass can detect absence.
+    pub snapshots_recorded: usize,
+    /// Connectors whose new snapshot could NOT be stored. Each one is a directory whose next pass
+    /// will detect no departure.
+    pub snapshots_unrecorded: usize,
 }
 
 /// Apply every plan a scope sweep produced.
@@ -328,13 +333,8 @@ pub struct PassReport {
 /// A connector whose plan carries no terms is SKIPPED rather than defaulted. The only way that
 /// happens is a report and a term map that disagree, and guessing a policy -- particularly the
 /// irreversible one -- from a disagreement is not a guess worth making.
-pub async fn apply_sweep(
-    store: &Store,
-    scope: Scope,
-    env: &Env,
-    sweep: &ScopeSweep,
-) -> ExecuteReport {
-    let mut total = ExecuteReport::default();
+pub async fn apply_sweep(store: &Store, scope: Scope, env: &Env, sweep: &ScopeSweep) -> Applied {
+    let mut applied = Applied::default();
     for (id, outcome) in &sweep.report.runs {
         let Outcome::Planned(plan) = outcome else {
             continue;
@@ -364,22 +364,84 @@ pub async fn apply_sweep(
                 "ldap sync could not apply one change; the rest of the connector continued"
             );
         }
-        total.absorb(report);
+        if let Some(snapshot) = reconciled(plan, &changes, &report) {
+            applied.snapshots.insert(id.clone(), snapshot);
+        }
+        applied.total.absorb(report);
     }
-    total
+    applied
+}
+
+/// What one connector's pass produced.
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// The writes, summed over every connector.
+    pub total: ExecuteReport,
+    /// What each connector may record as its new snapshot, keyed by connector id.
+    ///
+    /// A connector is ABSENT when nothing may be recorded for it. See [`reconciled`].
+    pub snapshots: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The set a connector may record as "what the directory held, and IronAuth agrees with".
+///
+/// [`None`] when the observation was incomplete: a pass that saw part of a directory and recorded
+/// that part silently forgets everybody it missed, and no later pass can then report them as
+/// departed. `departures` is already `Err` in exactly those cases -- a truncated group walk, and a
+/// directory that answered with nobody -- so the refusal the diff computed is the condition.
+///
+/// Otherwise it is what the directory held, CORRECTED BY WHAT ACTUALLY HAPPENED, and both
+/// corrections matter:
+///
+///   * A principal whose provision FAILED is dropped, so the next pass sees them as an arrival
+///     and tries again. Recording them would mean the retry never happens and they never get an
+///     account.
+///   * A principal whose removal FAILED is put back, so the next pass sees them as a departure
+///     and tries again. Dropping them would mean the removal never happens and the account stays
+///     alive for ever -- which is the failure this whole subsystem exists to prevent.
+///
+/// Without those two the snapshot would record intent rather than outcome, and one failed write
+/// would become permanent.
+#[must_use]
+pub fn reconciled(
+    plan: &crate::ldap_sync::SyncPlan,
+    changes: &ChangeSet,
+    report: &ExecuteReport,
+) -> Option<BTreeSet<String>> {
+    if plan.departures.is_err() {
+        return None;
+    }
+    let failed: BTreeSet<&str> = report
+        .failures
+        .iter()
+        .map(|(principal, _)| principal.as_str())
+        .collect();
+    let mut observed: BTreeSet<String> = plan
+        .arrivals
+        .union(&plan.retained)
+        .filter(|id| !failed.contains(id.as_str()))
+        .cloned()
+        .collect();
+    for removal in changes.removals() {
+        if failed.contains(removal) {
+            observed.insert(removal.to_owned());
+        }
+    }
+    Some(observed)
 }
 
 /// Run one sweep across every scope the source enumerates, and apply what it plans.
 ///
-/// # The previous snapshot is empty, so no departure is ever computed
+/// # Absence is detected against what the LAST pass saw
 ///
-/// Every connector is swept against an empty previous set, which makes every principal an arrival
-/// and leaves the departure set empty. A pass therefore PROVISIONS and never removes. That is a
-/// deliberate intermediate state, not an oversight: absence detection needs a snapshot of what the
-/// last pass saw, that snapshot is a stored artifact this pass does not yet own, and inferring one
-/// from the accounts that happen to carry an external id would deactivate every SCIM-provisioned
-/// user the moment an LDAP connector is added. Stated here rather than implied, because
-/// "0 removals" from this pass means "not asked", not "nobody left".
+/// Each connector is swept against `ldap_sync_snapshots`, the sealed set of stable identifiers
+/// its previous COMPLETED pass recorded. A connector with no snapshot -- one nothing has ever
+/// swept -- gets the empty set, which produces no departures at all, so a first pass provisions
+/// and removes nobody. That is the right first pass: a directory nobody has read before offers no
+/// evidence that anybody has left it.
+///
+/// The snapshot is written at the END of the pass and only for a COMPLETE observation, corrected
+/// by what actually applied. [`reconciled`] holds that reasoning.
 ///
 /// # Errors
 ///
@@ -396,10 +458,39 @@ pub async fn run_pass(
     let mut report = PassReport::default();
     for scope in scopes.scopes().await? {
         report.scopes += 1;
-        let sweep = sweep_scope(store, scope, master, batch, &|_| BTreeSet::new()).await?;
-        fold_scope(store, scope, env, &sweep, &mut report).await;
+        // EVERY SNAPSHOT FIRST, in one query, before any connection is opened. A connector with
+        // no snapshot gets an empty previous set, which produces no departures at all -- exactly
+        // right for a directory nothing has ever swept.
+        let previous = store
+            .scoped(scope)
+            .ldap_sync_snapshots()
+            .all_in_scope()
+            .await?;
+        let sweep = sweep_scope(store, scope, master, batch, &|connector| {
+            previous_for(&previous, connector)
+        })
+        .await?;
+        fold_scope(store, scope, env, master, &sweep, &mut report).await;
     }
     Ok(report)
+}
+
+/// What a connector's last completed pass recorded, or the empty set.
+///
+/// EMPTY FOR A CONNECTOR WITH NO SNAPSHOT, which is the right first pass rather than a fallback:
+/// with nothing previously seen, the diff computes no departures, so a directory nobody has read
+/// before cannot deprovision anybody. The failure this guards against is the KEY being wrong --
+/// a lookup that missed would silently hand every connector an empty set and quietly disable
+/// absence detection for all of them while every test about the diff went on passing.
+#[must_use]
+pub fn previous_for(
+    snapshots: &BTreeMap<String, BTreeSet<String>>,
+    connector: &LdapConnector,
+) -> BTreeSet<String> {
+    snapshots
+        .get(&connector.id.to_string())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Everything a pass does with ONE scope's sweep: count it, warn about it, and apply it.
@@ -412,6 +503,7 @@ pub async fn fold_scope(
     store: &Store,
     scope: Scope,
     env: &Env,
+    master: &MasterKey,
     sweep: &ScopeSweep,
     report: &mut PassReport,
 ) {
@@ -440,7 +532,47 @@ pub async fn fold_scope(
             }
         }
     }
-    report
-        .applied
-        .absorb(apply_sweep(store, scope, env, sweep).await);
+    let applied = apply_sweep(store, scope, env, sweep).await;
+    let taken_at = now_micros(env);
+    for (id, snapshot) in applied.snapshots {
+        let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(&id, &scope) else {
+            continue;
+        };
+        // A SNAPSHOT THAT DOES NOT SAVE IS A CONNECTOR THAT NEVER DEPROVISIONS, so it is warned
+        // about rather than swallowed -- and it is not a reason to abandon the other connectors,
+        // whose snapshots are independent rows.
+        match store
+            .scoped(scope)
+            .acting(
+                terms_actor_for(sweep, &id),
+                ironauth_store::CorrelationId::generate(env),
+            )
+            .ldap_sync_snapshots()
+            .record(env, master, &connector, &snapshot, taken_at)
+            .await
+        {
+            Ok(()) => report.snapshots_recorded += 1,
+            Err(error) => {
+                report.snapshots_unrecorded += 1;
+                tracing::error!(
+                    connector = %id,
+                    %error,
+                    "ldap sync could not record what it saw; the next pass will detect no \
+                     departure for this directory"
+                );
+            }
+        }
+    }
+    report.applied.absorb(applied.total);
+}
+
+/// The connector's own service actor, or a generated one when the sweep has no terms for it.
+///
+/// The actor is only used to provision the scope's key hierarchy on a first write, so the
+/// fallback affects one audit row in a case that already logged an error.
+fn terms_actor_for(sweep: &ScopeSweep, id: &str) -> ActorRef {
+    sweep.terms.get(id).map_or_else(
+        || ActorRef::service(ServiceId::from_seed_bytes([0_u8; 16])),
+        |terms| terms.actor,
+    )
 }

@@ -1754,6 +1754,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0213_ldap_connector_optional_groups.sql"),
         },
+        Migration {
+            version: 214,
+            name: "ldap_sync_snapshots",
+            // EXPAND. A new table with no writer on any older binary, so nothing reads or writes
+            // it during a rolling upgrade and there is nothing to backfill. An old binary sweeps
+            // against an empty previous set exactly as it did before.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0214_ldap_sync_snapshots.sql"),
+        },
     ]
 }
 

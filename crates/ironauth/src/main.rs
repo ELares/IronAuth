@@ -552,11 +552,10 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         };
         // THE LDAP SWEEP (issue #142). Its own switch, like every other worker here. A pass reads
         // each configured directory, works out what a sync would do, and APPLIES it through the
-        // user lifecycle. It provisions and does not yet remove: absence detection needs a stored
-        // snapshot of the previous pass, which this does not own, so every principal reads as an
-        // arrival (see `run_pass`). The operator signal a pass carried before the applier existed
-        // -- a connector nobody can bind to, a directory whose group walk is truncated -- is still
-        // the reason a pass that writes nothing is worth logging.
+        // user lifecycle: arrivals become accounts, and principals absent since the last pass are
+        // deactivated or deleted per the connector's policy. It detects absence against
+        // `ldap_sync_snapshots`, so a connector's FIRST pass removes nobody -- a directory nothing
+        // has read before is no evidence that anybody left it.
         let ldap_sweep = match ldap_sweep {
             Some(inputs) => start_ldap_sweep(inputs, ldap_sweep_env, ldap_sweep_master).await,
             None => None,
@@ -3901,8 +3900,8 @@ async fn start_ldap_sweep(
     tracing::info!(
         interval_secs = interval.as_secs(),
         batch,
-        "ldap sync is running; it PROVISIONS accounts for directory principals and does not yet \
-         remove any (no previous snapshot exists to detect absence against)"
+        "ldap sync is running; it creates accounts for directory principals and deprovisions \
+         those absent since the connector's last completed pass"
     );
     Some(handle)
 }

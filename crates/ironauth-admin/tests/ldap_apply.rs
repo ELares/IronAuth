@@ -135,8 +135,12 @@ async fn a_planned_connector_provisions_its_arrivals() {
     )
     .await;
 
-    assert!(report.everything_applied(), "{:?}", report.failures);
-    assert_eq!(report.provisioned, 2);
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
+    assert_eq!(report.total.provisioned, 2);
     assert_eq!(
         state_of(store, scope, "u-ada").await,
         Some(UserState::Active)
@@ -159,18 +163,26 @@ async fn a_planned_connector_provisions_its_arrivals() {
         )]),
     )
     .await;
-    assert_eq!(again.provisioned, 0, "the second pass created them again");
     assert_eq!(
-        again.already_present, 2,
+        again.total.provisioned, 0,
+        "the second pass created them again"
+    );
+    assert_eq!(
+        again.total.already_present, 2,
         "the second pass did not recognise its own accounts: {again:?}"
     );
-    assert!(again.everything_applied(), "{:?}", again.failures);
+    assert!(
+        again.total.everything_applied(),
+        "{:?}",
+        again.total.failures
+    );
 }
 
-/// THE SAME DEPARTURE, TWO PASSES. The ticker seam for the executor's repeated-deactivation bug:
-/// with no previous snapshot yet, every pass that computes a real departure computes the SAME one,
-/// so a removal that is not idempotent turns into a permanent per-principal failure and a daemon
-/// that logs "needs attention" on every tick with nothing an operator can clear.
+/// THE SAME DEPARTURE, TWO PASSES. A removal that is not idempotent turns into a permanent
+/// per-principal failure and a daemon that logs "needs attention" on every tick with nothing an
+/// operator can clear. The snapshot narrows after a successful removal, so a real pass stops
+/// re-deriving the departure -- but a snapshot that failed to record, or a directory that keeps
+/// re-listing somebody, puts the same change set in front of the applier again.
 #[tokio::test]
 async fn the_same_departure_on_two_passes_needs_attention_only_never() {
     let db = TestDatabase::start().await;
@@ -204,8 +216,12 @@ async fn the_same_departure_on_two_passes_needs_attention_only_never() {
         )]),
     )
     .await;
-    assert_eq!(first.deactivated, 1, "{first:?}");
-    assert!(first.everything_applied(), "{:?}", first.failures);
+    assert_eq!(first.total.deactivated, 1, "{first:?}");
+    assert!(
+        first.total.everything_applied(),
+        "{:?}",
+        first.total.failures
+    );
 
     let second = apply_sweep(
         store,
@@ -219,12 +235,12 @@ async fn the_same_departure_on_two_passes_needs_attention_only_never() {
     )
     .await;
     assert!(
-        second.everything_applied(),
+        second.total.everything_applied(),
         "the second pass over the same departure reported failures {:?}",
-        second.failures
+        second.total.failures
     );
-    assert_eq!(second.already_removed, 1, "{second:?}");
-    assert_eq!(second.deactivated, 0);
+    assert_eq!(second.total.already_removed, 1, "{second:?}");
+    assert_eq!(second.total.deactivated, 0);
     assert_eq!(
         state_of(store, scope, "u-leaver").await,
         Some(UserState::Disabled)
@@ -272,15 +288,15 @@ async fn a_departure_with_no_account_is_counted_absent_rather_than_failed() {
     .await;
 
     assert!(
-        report.everything_applied(),
+        report.total.everything_applied(),
         "a departure with no account was reported as a failure: {:?}",
-        report.failures
+        report.total.failures
     );
     assert_eq!(
-        report.already_absent, 1,
+        report.total.already_absent, 1,
         "the absent departure was not counted: {report:?}"
     );
-    assert_eq!(report.deactivated, 0);
+    assert_eq!(report.total.deactivated, 0);
     assert_eq!(
         state_of(store, scope, "u-real").await,
         Some(UserState::Active),
@@ -350,9 +366,16 @@ async fn two_connectors_in_one_pass_apply_their_own_policies() {
     )
     .await;
 
-    assert!(report.everything_applied(), "{:?}", report.failures);
-    assert_eq!(report.deactivated, 1, "exactly one connector deactivates");
-    assert_eq!(report.deleted, 1, "exactly one connector deletes");
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
+    assert_eq!(
+        report.total.deactivated, 1,
+        "exactly one connector deactivates"
+    );
+    assert_eq!(report.total.deleted, 1, "exactly one connector deletes");
     assert_eq!(
         state_of(store, scope, "u-soft").await,
         Some(UserState::Disabled),
@@ -415,9 +438,13 @@ async fn an_emptied_directory_removes_nobody() {
     )
     .await;
 
-    assert_eq!(report.deleted, 0);
-    assert_eq!(report.deactivated, 0);
-    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert_eq!(report.total.deleted, 0);
+    assert_eq!(report.total.deactivated, 0);
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
     assert_eq!(
         state_of(store, scope, "u-a").await,
         Some(UserState::Active),
@@ -466,10 +493,17 @@ async fn a_plan_whose_policy_is_missing_applies_nothing() {
     };
     let report = apply_sweep(store, scope, &env, &orphan).await;
 
-    assert_eq!(report.provisioned, 0, "no arrival may be written either");
-    assert_eq!(report.deleted, 0);
-    assert_eq!(report.deactivated, 0);
-    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert_eq!(
+        report.total.provisioned, 0,
+        "no arrival may be written either"
+    );
+    assert_eq!(report.total.deleted, 0);
+    assert_eq!(report.total.deactivated, 0);
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
     assert_eq!(
         state_of(store, scope, "u-victim").await,
         Some(UserState::Active),
@@ -511,19 +545,23 @@ async fn an_unreachable_connector_writes_nothing_and_does_not_stop_its_neighbour
 
     let report = apply_sweep(store, scope, &env, &mixed).await;
 
-    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
     assert_eq!(
-        report.provisioned, 1,
+        report.total.provisioned, 1,
         "the reachable connector's arrival is the whole point of the isolation"
     );
     // EVERY OTHER COUNTER IS ZERO. Asserting only the provision would let an outcome with no plan
     // contribute to the tally -- an unreachable directory reporting activity it did not have.
     assert_eq!(
         (
-            report.already_present,
-            report.deactivated,
-            report.deleted,
-            report.already_absent
+            report.total.already_present,
+            report.total.deactivated,
+            report.total.deleted,
+            report.total.already_absent
         ),
         (0, 0, 0, 0),
         "an outcome carrying no plan was counted as work: {report:?}"
@@ -589,16 +627,19 @@ async fn a_failing_change_is_named_in_the_summed_report() {
     .await;
 
     assert_eq!(
-        report.failures.len(),
+        report.total.failures.len(),
         1,
         "expected exactly the second login to clash, got {report:?}"
     );
     assert_eq!(
-        report.failures[0].0, "u-second",
+        report.total.failures[0].0, "u-second",
         "the summed report must still name the principal that failed"
     );
-    assert!(!report.everything_applied());
-    assert_eq!(report.provisioned, 1, "the first of the pair still applies");
+    assert!(!report.total.everything_applied());
+    assert_eq!(
+        report.total.provisioned, 1,
+        "the first of the pair still applies"
+    );
 }
 
 /// THE AUDIT ACTOR IS THE CONNECTOR. Seeded from the connector id rather than generated, so one
@@ -754,15 +795,20 @@ async fn a_pass_sums_two_connectors_rather_than_reporting_the_last() {
     .await;
 
     assert_eq!(
-        report.provisioned, 4,
+        report.total.provisioned, 4,
         "two connectors provisioning two each must sum to four: {report:?}"
     );
     assert_eq!(
-        report.failures.len(),
+        report.total.failures.len(),
         2,
         "each connector's clash must survive the fold: {report:?}"
     );
-    let named: BTreeSet<&str> = report.failures.iter().map(|(id, _)| id.as_str()).collect();
+    let named: BTreeSet<&str> = report
+        .total
+        .failures
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
     assert_eq!(
         named,
         BTreeSet::from(["a-3-clash", "b-3-clash"]),
@@ -859,13 +905,17 @@ async fn every_removal_counter_sums_across_two_connectors() {
     )
     .await;
 
-    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
     assert_eq!(
         (
-            report.already_present,
-            report.deactivated,
-            report.already_removed,
-            report.already_absent
+            report.total.already_present,
+            report.total.deactivated,
+            report.total.already_removed,
+            report.total.already_absent
         ),
         (2, 2, 2, 2),
         "each counter needs both connectors' contribution: {report:?}"
@@ -897,9 +947,13 @@ async fn two_deleting_connectors_sum_their_deletions() {
     )
     .await;
 
-    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert!(
+        report.total.everything_applied(),
+        "{:?}",
+        report.total.failures
+    );
     assert_eq!(
-        report.deleted, 2,
+        report.total.deleted, 2,
         "both connectors' deletions must sum: {report:?}"
     );
     assert_eq!(state_of(store, scope, "a-left").await, None);
@@ -959,7 +1013,7 @@ async fn the_pass_body_counts_and_applies_the_sweep_it_is_given() {
     ));
 
     let mut report = PassReport::default();
-    fold_scope(store, scope, &env, &mixed, &mut report).await;
+    fold_scope(store, scope, &env, &db.master_key(), &mixed, &mut report).await;
 
     assert_eq!(report.planned, 1, "the plan was not counted");
     assert_eq!(
@@ -991,6 +1045,7 @@ async fn a_second_pass_over_the_same_sweep_reports_a_quiet_run() {
         store,
         scope,
         &env,
+        &db.master_key(),
         &sweep(vec![(
             "ldc_ok",
             planned(&[("steady", "u-steady")], &[]).await,
@@ -1006,6 +1061,7 @@ async fn a_second_pass_over_the_same_sweep_reports_a_quiet_run() {
         store,
         scope,
         &env,
+        &db.master_key(),
         &sweep(vec![(
             "ldc_ok",
             planned(&[("steady", "u-steady")], &[]).await,
