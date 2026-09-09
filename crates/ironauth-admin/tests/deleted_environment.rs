@@ -2414,21 +2414,6 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             serde_json::json!({ "slug": "replay.group", "display_name": "Replay" }).to_string(),
         ),
         (
-            "ldap_connectors.createLdapConnector",
-            format!("{base}/ldap-connectors"),
-            serde_json::json!({
-                "display_name": "Replay directory",
-                "host": "ldap.corp.example.com",
-                "port": 636,
-                "bind_dn": "cn=svc,dc=example,dc=test",
-                "bind_secret_name": "ldap_bind_replay",
-                "user_base_dn": "ou=People,dc=example,dc=test",
-                "user_filter": "(objectClass=inetOrgPerson)",
-                "attribute_mapping": { "email": "mail" },
-            })
-            .to_string(),
-        ),
-        (
             "memberships.createMembership",
             format!("{base}/memberships"),
             serde_json::json!({ "user_id": spare_user }).to_string(),
@@ -2501,6 +2486,32 @@ fn keyed_writes(fixture: &Fixture) -> Vec<(&'static str, String, String)> {
             .to_string(),
         ),
     ]
+    .into_iter()
+    .chain(ldap_keyed_writes(base))
+    .collect()
+}
+
+/// The keyed LDAP writes, in a function of their own.
+///
+/// Split out rather than appended: `keyed_writes` sits against the crate's hundred-line
+/// ceiling, and one more inline entry put it at 106. A targeted `cargo test` does not see
+/// that -- only clippy does, which means the gate.
+fn ldap_keyed_writes(base: &str) -> Vec<(&'static str, String, String)> {
+    vec![(
+        "ldap_connectors.createLdapConnector",
+        format!("{base}/ldap-connectors"),
+        serde_json::json!({
+            "display_name": "Replay directory",
+            "host": "ldap.corp.example.com",
+            "port": 636,
+            "bind_dn": "cn=svc,dc=example,dc=test",
+            "bind_secret_name": "ldap_bind_replay",
+            "user_base_dn": "ou=People,dc=example,dc=test",
+            "user_filter": "(objectClass=inetOrgPerson)",
+            "attribute_mapping": { "email": "mail" },
+        })
+        .to_string(),
+    )]
 }
 
 /// The keyed-write list is measured against the CONTRACT, not asserted in prose.
