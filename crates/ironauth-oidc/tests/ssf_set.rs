@@ -41,7 +41,10 @@ fn subject() -> SubjectIdentifier {
 fn event() -> SecurityEvent {
     SecurityEvent {
         event_type: "https://example.test/event-type/probe".to_owned(),
-        payload: serde_json::json!({ "reason": "probe" }),
+        payload: serde_json::Map::from_iter([(
+            "reason".to_owned(),
+            serde_json::Value::String("probe".to_owned()),
+        )]),
     }
 }
 
@@ -72,16 +75,18 @@ fn the_claim_set_is_the_rfc_8417_shape() {
         "the event body must be an object: {claims}"
     );
     assert_eq!(body["reason"], "probe", "the caller's payload survives");
-    assert_eq!(body["subject"]["sub"], "usr_alice");
+    assert_eq!(claims["sub_id"]["sub"], "usr_alice");
 
-    // NO `exp`: RFC 8417 section 4.1 says a SET must not be rejected for age alone, and a
-    // receiver that was down through the window needs exactly the events it missed.
+    // NO `exp`: SSF 1.0 section 4.1.7 makes that a MUST NOT, and RFC 8417 section 2.2 gives the
+    // reason -- a SET is historical, and a receiver that was down through the window needs the
+    // events it missed.
     assert!(claims.get("exp").is_none(), "a SET must not expire");
-    // AND NO TOP-LEVEL `sub`. RFC 8417 section 2.2 warns that reusing it invites a receiver to
-    // read the token as an authentication statement about that principal.
+    // AND NO TOP-LEVEL `sub`. SSF 1.0 section 4.1.2 requires a SET's subject to travel as
+    // `sub_id`; `sub` is the ID-token spelling and a receiver seeing it may read the token as
+    // an authentication statement about that principal.
     assert!(
         claims.get("sub").is_none(),
-        "the subject belongs to the event, not to the token"
+        "the subject travels as sub_id, never as sub"
     );
 }
 
@@ -154,13 +159,13 @@ fn each_format_renders_its_rfc_9493_members_and_labels_itself_with_the_stored_on
 }
 
 #[test]
-fn a_payload_that_is_not_an_object_cannot_produce_a_malformed_events_member() {
-    let audience = vec!["https://receiver.example".to_owned()];
+fn the_subject_is_a_top_level_sub_id_and_not_an_in_event_member() {
+    // SSF 1.0 section 3.1.2 makes the top-level `sub_id` a MUST for a new event type and says
+    // such a type MUST NOT name its primary subject with an in-event `subject`. The carve-out
+    // in 3.1.1 is for event types already defined in CAEP or RISC; this build defines none.
+    let audience = vec!["https://receiver.example.com".to_owned()];
     let subject = subject();
-    let event = SecurityEvent {
-        event_type: "https://example.test/event-type/probe".to_owned(),
-        payload: serde_json::json!("not an object"),
-    };
+    let event = event();
     let claims = build_set_claims(
         "https://issuer.example",
         1,
@@ -171,12 +176,34 @@ fn a_payload_that_is_not_an_object_cannot_produce_a_malformed_events_member() {
             event: &event,
         },
     );
-    // RFC 8417's `events` values are objects. A scalar is dropped rather than rendered beside
-    // the subject, so the worst a bad caller produces is an event carrying only its subject --
-    // never a SET a receiver's parser rejects outright.
+    assert_eq!(claims["sub_id"]["sub"], "usr_alice");
+    assert_eq!(claims["sub_id"]["format"], "iss_sub");
+
     let body = &claims["events"]["https://example.test/event-type/probe"];
-    assert!(body.is_object(), "{claims}");
-    assert_eq!(body["subject"]["sub"], "usr_alice");
+    assert_eq!(body["reason"], "probe", "the caller's payload survives");
+    assert!(
+        body.get("subject").is_none(),
+        "the event carries an in-event subject, which 3.1.2 forbids: {claims}"
+    );
+}
+
+#[test]
+fn an_empty_audience_omits_the_claim_rather_than_minting_one_nobody_matches() {
+    // An empty `aud` array is strictly worse than its absence: no receiver's audience check can
+    // match it, so the SET would be undeliverable to everyone while looking well formed.
+    let subject = subject();
+    let event = event();
+    let claims = build_set_claims(
+        "https://issuer.example",
+        1,
+        &SetToMint {
+            audience: &[],
+            jti: "evt_0",
+            subject: &subject,
+            event: &event,
+        },
+    );
+    assert!(claims.get("aud").is_none(), "{claims}");
 }
 
 #[test]
@@ -255,7 +282,11 @@ async fn a_minted_set_verifies_against_the_environment_key_and_is_typed_secevent
     );
     let events = claims.get("events").expect("the SET carries events");
     assert_eq!(
-        events["https://example.test/event-type/probe"]["subject"]["sub"],
+        events["https://example.test/event-type/probe"]["reason"],
+        "probe"
+    );
+    assert_eq!(
+        claims.get("sub_id").expect("the SET names its subject")["sub"],
         "usr_alice"
     );
 }

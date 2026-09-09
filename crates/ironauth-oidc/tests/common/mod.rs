@@ -1721,6 +1721,18 @@ impl Harness {
     /// per-source `signal_sources` in the risk config, plus `with_risk_signals_enabled(true)`
     /// (the arming bool the boot path resolves from the feature ladder), so the ingestion
     /// endpoint answers and the engine folds fresh external signals in.
+    /// Arm the Shared Signals stream-management surface (issue #143) on the EXISTING state
+    /// and rebuild the router.
+    ///
+    /// Mutates in place rather than rebuilding from a fresh `OidcConfig`, for the reason the
+    /// organization-provisioning helper below records: a rebuild silently discards whatever the
+    /// test already installed.
+    pub fn enable_ssf(&mut self, max_streams_per_client: u32) {
+        let state = self.state.clone().with_ssf(true, max_streams_per_client);
+        self.router = oidc_router(state.clone());
+        self.state = state;
+    }
+
     pub fn enable_risk_signals(&mut self, sources: Vec<ironauth_config::RiskSignalSource>) {
         let config = OidcConfig {
             require_pkce_for_confidential_clients: false,

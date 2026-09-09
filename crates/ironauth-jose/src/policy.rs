@@ -769,16 +769,21 @@ impl VerificationPolicy {
     /// signature, algorithm allowlist, key selection, issuer, audience, `nbf` and `iat` checks
     /// are untouched.
     ///
-    /// The single legitimate caller is the RFC 8417 Security Event Token profile. A SET reports
-    /// something that ALREADY HAPPENED, so RFC 8417 section 4.1 says it is not to be treated as
-    /// an access token and carries no expiry: giving one an `exp` would make a receiver that was
-    /// down through the window discard exactly the events it most needs to see. Replay is what
-    /// the required `jti` is for, not `exp`.
+    /// The single legitimate caller is the RFC 8417 Security Event Token profile, and for a
+    /// Shared Signals SET the absence is REQUIRED: SSF 1.0 section 4.1.7 says "The \"exp\"
+    /// claim MUST NOT be used in SETs". RFC 8417 section 2.2 gives the reason -- "a SET
+    /// represents something that has already occurred and is historical in nature. Therefore,
+    /// its use is NOT RECOMMENDED." Giving one an `exp` would
+    /// make a receiver that was down through the window discard exactly the events it most
+    /// needs to see. Replay is what the required `jti` is for, not `exp`.
     ///
-    /// This exists because the check it relaxes made IronAuth unable to handle a conforming SET
-    /// in EITHER direction -- the transmitter could not validate its own output against this
-    /// core, and the third-party risk-signal receiver rejected every exp-less SET a conforming
-    /// transmitter sent it. Left OFF, `exp` is required exactly as before.
+    /// This exists because the check it relaxes makes IronAuth unable to handle a conforming
+    /// SET in either direction. The transmitter half is fixed by the caller that sets this.
+    /// THE RECEIVER HALF IS NOT: `risk_signals::ingest` builds its policy without this flag and
+    /// still rejects every exp-less SET a conforming transmitter sends it. That needs its own
+    /// change; naming it here so the gap is written down rather than discovered.
+    ///
+    /// Left OFF, `exp` is required exactly as before.
     #[must_use]
     pub fn allow_absent_exp(mut self, allow: bool) -> Self {
         self.allow_absent_exp = allow;

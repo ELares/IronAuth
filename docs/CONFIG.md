@@ -342,6 +342,9 @@ at the top of the file, or map it in `.taplo.toml`).
 | `server.management_bind` | string | `"127.0.0.1:9443"` | Socket address the management plane listens on. Liveness, readiness, and the Prometheus metrics endpoint live here so the data plane is never probed publicly; bind it to a private interface. |
 | `server.public_url` | string or unset | unset | Externally visible base URL (scheme and host) used to mint issuer and endpoint URLs. Unset means single-host development behind the bind address. The scheme, host, and issuer always derive from this value, never from request headers (see the `[proxy]` policy). |
 | `server.shutdown_grace_secs` | integer | `25` | Maximum seconds to drain in-flight requests after a shutdown signal before the process exits regardless. Zero exits without draining. |
+| `ssf` | table | see fields | The Shared Signals transmitter (issue #143). OFF by default, so the default boot mounts no stream-management surface and serves no SSF discovery document. |
+| `ssf.enabled` | boolean | `false` | Whether to serve the Shared Signals stream-management surface and its discovery document on the public plane. Off by default. |
+| `ssf.max_streams_per_client` | integer | `20` | The most streams one receiver may hold in one environment. |
 | `telemetry` | table | see fields | Observability settings: log format and trace export. |
 | `telemetry.log_format` | string | `"json"` | Structured-log output format for the process log stream. |
 | `telemetry.otlp_endpoint` | string or unset | unset | OpenTelemetry OTLP collector endpoint for trace export (for example `http://otel-collector:4317`). Trace export is compiled in only when the binary is built with the non-default `otlp` feature; setting this on a build without that feature logs a warning and is otherwise inert. |
