@@ -20,7 +20,7 @@ use ironauth_store::test_support::TestDatabase;
 use ironauth_store::{
     AuthorizationCodeId, ClientId, CorrelationId, GrantId, IssueCode, LdapAbsencePolicy,
     NewRefreshFamily, NewSession, RefreshFamilyId, RefreshTokenId, Scope, SessionId, Store,
-    StoredClientId, UserAdminRecord, UserState, refresh_token_digest,
+    StoredClientId, UserAdminRecord, UserListFilter, UserState, refresh_token_digest,
 };
 use serde_json::json;
 
@@ -110,9 +110,9 @@ async fn a_second_run_over_the_same_change_set_changes_nothing() {
     assert_eq!(second.already_present, 1);
     assert!(second.everything_applied(), "{:?}", second.failures);
     assert_eq!(
-        second.changed(),
-        0,
-        "an unchanged directory must read as a quiet pass, not a churning one"
+        (second.deactivated, second.deleted, second.already_absent),
+        (0, 0, 0),
+        "a repeat over an arrival must touch nothing else: {second:?}"
     );
 
     let after = look_up(store, scope, "u-grace").await.expect("still there");
@@ -120,6 +120,92 @@ async fn a_second_run_over_the_same_change_set_changes_nothing() {
         after.id, created.id,
         "the second run must find the same account, not shadow it with another"
     );
+}
+
+/// THE REPEATED DEPARTURE. The half of idempotency the removal side owns, and the one that was
+/// wrong: the store refuses a transition from a state to ITSELF, so a second deactivation of the
+/// same principal came back a `Conflict`. With the previous snapshot still to come, EVERY pass
+/// re-derives the same departure, so this is not an edge case -- it is every tick after the first.
+#[tokio::test]
+async fn a_repeated_departure_repeats_without_harm() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let actor = db.test_actor(&env);
+    let leaving = set(vec![Change::Deactivate {
+        stable_id: "u-twice".to_owned(),
+    }]);
+
+    execute(
+        store,
+        scope,
+        &env,
+        actor,
+        &set(vec![provision("u-twice", "twice")]),
+    )
+    .await;
+
+    let first = execute(store, scope, &env, actor, &leaving).await;
+    assert_eq!(first.deactivated, 1, "{first:?}");
+    assert!(first.everything_applied(), "{:?}", first.failures);
+
+    let second = execute(store, scope, &env, actor, &leaving).await;
+    assert!(
+        second.everything_applied(),
+        "a repeated departure must repeat without harm, got {:?}",
+        second.failures
+    );
+    assert_eq!(second.deactivated, 0, "the second pass deactivated again");
+    assert_eq!(
+        second.already_removed, 1,
+        "the repeat must be counted as already removed, not as absent: {second:?}"
+    );
+    assert_eq!(
+        second.already_absent, 0,
+        "the account still exists, so this is not the absent case"
+    );
+    assert_eq!(
+        look_up(store, scope, "u-twice").await.expect("row").state,
+        UserState::Disabled
+    );
+}
+
+/// AND THE SAME FOR DELETE, which is idempotent by a different mechanism: the row is gone, so the
+/// lookup misses. Asserted rather than assumed, because the two arms count into different fields
+/// and a reader cannot tell which one fired without being told.
+#[tokio::test]
+async fn a_repeated_deletion_repeats_without_harm() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let actor = db.test_actor(&env);
+    let purging = set(vec![Change::Delete {
+        stable_id: "u-gone".to_owned(),
+    }]);
+
+    execute(
+        store,
+        scope,
+        &env,
+        actor,
+        &set(vec![provision("u-gone", "gone")]),
+    )
+    .await;
+    assert_eq!(
+        execute(store, scope, &env, actor, &purging).await.deleted,
+        1
+    );
+
+    let second = execute(store, scope, &env, actor, &purging).await;
+    assert!(second.everything_applied(), "{:?}", second.failures);
+    assert_eq!(second.deleted, 0);
+    assert_eq!(
+        second.already_absent, 1,
+        "a deleted principal has no row, so the repeat is the absent case: {second:?}"
+    );
+    assert_eq!(second.already_removed, 0);
 }
 
 /// THE REVERSIBLE REMOVAL. `Deactivate` has to reach a state that cannot authenticate; asserting
@@ -652,6 +738,29 @@ async fn what_the_dry_run_reports_is_what_the_real_run_applies() {
         after.get("u-stays"),
         Some(&UserState::Active),
         "somebody the change set did not name was touched anyway"
+    );
+
+    // "NOTHING EXTRA", ENUMERATED. Looking up the three ids the change set names cannot see a run
+    // that ALSO wrote a fourth -- an extra provision, a retried change, two change sets merged --
+    // and a superset is exactly how the confirmation-prompt contract breaks: the operator
+    // approves one list and a longer one runs.
+    let everybody: BTreeSet<String> = store
+        .scoped(scope)
+        .users()
+        .list(UserListFilter::default(), 100, None)
+        .await
+        .expect("enumerate the scope")
+        .into_iter()
+        .filter_map(|record| record.external_id)
+        .collect();
+    assert_eq!(
+        everybody,
+        BTreeSet::from([
+            "u-stays".to_owned(),
+            "u-leaves".to_owned(),
+            "u-joins".to_owned()
+        ]),
+        "the run wrote an account the dry run never named"
     );
 }
 

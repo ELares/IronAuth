@@ -92,9 +92,11 @@ pub async fn scheduled_for_scope(
 /// person under the user base is in scope". A group base of `""` would otherwise become a root
 /// DN nothing resolves, and an unresolvable root now aborts the walk.
 ///
-/// Migration 0213 is what makes this branch reachable: 0212 required a non-empty `group_base_dn`,
-/// so until then a users-only connector could not be stored and this arm could not be taken by
-/// any row.
+/// Migration 0213 is what makes this branch reachable DELIBERATELY. 0212 demanded
+/// `group_base_dn <> ''`, which a single space satisfies -- so the arm was reachable, but only by
+/// a row whose operator meant the opposite of what the schema recorded, and who was then forced
+/// to supply a group filter nothing reads. 0213 keys both checks on `btrim`, so a users-only
+/// connector is storable and one value means one thing on both sides.
 #[must_use]
 pub fn inputs_for(connector: &LdapConnector) -> SyncInputs {
     let group_roots = if connector.group_base_dn.trim().is_empty() {
@@ -395,34 +397,50 @@ pub async fn run_pass(
     for scope in scopes.scopes().await? {
         report.scopes += 1;
         let sweep = sweep_scope(store, scope, master, batch, &|_| BTreeSet::new()).await?;
-        for (id, outcome) in &sweep.report.runs {
-            match outcome {
-                Outcome::Planned(plan) => {
-                    report.planned += 1;
-                    report.rename_fragile += plan.rename_fragile;
-                    if plan.departures.is_err() {
-                        report.refusing_departures += 1;
-                        tracing::warn!(
-                            connector = %id,
-                            truncated_at = ?plan.groups_truncated_at,
-                            "ldap sync read a directory it could not see all of; no departure \
-                             may be concluded from this pass"
-                        );
-                    }
-                }
-                other => {
-                    report.failed += 1;
+        fold_scope(store, scope, env, &sweep, &mut report).await;
+    }
+    Ok(report)
+}
+
+/// Everything a pass does with ONE scope's sweep: count it, warn about it, and apply it.
+///
+/// SEPARATE FROM [`run_pass`] because the pass's remaining three lines need a directory to reach,
+/// and this does not. Before the split, deleting the apply call from the pass left every test in
+/// the repository green -- the pass's whole reason for existing was observable only by a live
+/// directory test that CI does not run.
+pub async fn fold_scope(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    sweep: &ScopeSweep,
+    report: &mut PassReport,
+) {
+    for (id, outcome) in &sweep.report.runs {
+        match outcome {
+            Outcome::Planned(plan) => {
+                report.planned += 1;
+                report.rename_fragile += plan.rename_fragile;
+                if plan.departures.is_err() {
+                    report.refusing_departures += 1;
                     tracing::warn!(
                         connector = %id,
-                        reason = %other.failure().unwrap_or(std::borrow::Cow::Borrowed("unknown")),
-                        "ldap connector did not produce a plan"
+                        truncated_at = ?plan.groups_truncated_at,
+                        "ldap sync read a directory it could not see all of; no departure \
+                         may be concluded from this pass"
                     );
                 }
             }
+            other => {
+                report.failed += 1;
+                tracing::warn!(
+                    connector = %id,
+                    reason = %other.failure().unwrap_or(std::borrow::Cow::Borrowed("unknown")),
+                    "ldap connector did not produce a plan"
+                );
+            }
         }
-        report
-            .applied
-            .absorb(apply_sweep(store, scope, env, &sweep).await);
     }
-    Ok(report)
+    report
+        .applied
+        .absorb(apply_sweep(store, scope, env, sweep).await);
 }

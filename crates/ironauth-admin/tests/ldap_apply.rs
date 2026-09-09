@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ironauth_admin::ldap_boot::{ApplyTerms, ScopeSweep, apply_sweep, terms_for};
+use ironauth_admin::ldap_boot::{
+    ApplyTerms, PassReport, ScopeSweep, apply_sweep, fold_scope, terms_for,
+};
 use ironauth_admin::ldap_groups::{GroupSource, Member};
 use ironauth_admin::ldap_mapping::DirectoryEntry;
 use ironauth_admin::ldap_schedule::{Outcome, SweepReport};
@@ -163,6 +165,74 @@ async fn a_planned_connector_provisions_its_arrivals() {
         "the second pass did not recognise its own accounts: {again:?}"
     );
     assert!(again.everything_applied(), "{:?}", again.failures);
+}
+
+/// THE SAME DEPARTURE, TWO PASSES. The ticker seam for the executor's repeated-deactivation bug:
+/// with no previous snapshot yet, every pass that computes a real departure computes the SAME one,
+/// so a removal that is not idempotent turns into a permanent per-principal failure and a daemon
+/// that logs "needs attention" on every tick with nothing an operator can clear.
+#[tokio::test]
+async fn the_same_departure_on_two_passes_needs_attention_only_never() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+
+    apply_sweep(
+        store,
+        scope,
+        &env,
+        &sweep(vec![(
+            "ldc_one",
+            planned(&[("leaver", "u-leaver"), ("keeper", "u-keeper")], &[]).await,
+            terms(&env, LdapAbsencePolicy::Deactivate),
+        )]),
+    )
+    .await;
+
+    let departing =
+        |()| async { planned(&[("keeper", "u-keeper")], &["u-leaver", "u-keeper"]).await };
+
+    let first = apply_sweep(
+        store,
+        scope,
+        &env,
+        &sweep(vec![(
+            "ldc_one",
+            departing(()).await,
+            terms(&env, LdapAbsencePolicy::Deactivate),
+        )]),
+    )
+    .await;
+    assert_eq!(first.deactivated, 1, "{first:?}");
+    assert!(first.everything_applied(), "{:?}", first.failures);
+
+    let second = apply_sweep(
+        store,
+        scope,
+        &env,
+        &sweep(vec![(
+            "ldc_one",
+            departing(()).await,
+            terms(&env, LdapAbsencePolicy::Deactivate),
+        )]),
+    )
+    .await;
+    assert!(
+        second.everything_applied(),
+        "the second pass over the same departure reported failures {:?}",
+        second.failures
+    );
+    assert_eq!(second.already_removed, 1, "{second:?}");
+    assert_eq!(second.deactivated, 0);
+    assert_eq!(
+        state_of(store, scope, "u-leaver").await,
+        Some(UserState::Disabled)
+    );
+    assert_eq!(
+        state_of(store, scope, "u-keeper").await,
+        Some(UserState::Active)
+    );
 }
 
 /// A DEPARTURE WITH NO ACCOUNT IS ABSENT, NOT FAILED. A stable id in the previous snapshot that
@@ -574,9 +644,382 @@ fn a_connector_always_audits_under_the_same_service_actor() {
         terms_for(&other).actor,
         "two connectors must not share an actor, or the audit log cannot tell them apart"
     );
+    // BOTH DIRECTIONS. A single fixture asserted against its own constant cannot fail when the
+    // bridge is hardcoded to THAT constant, and the constant this fixture holds is the
+    // irreversible one -- so a `terms_for` that always answered Delete would have passed.
+    let deactivating = LdapConnector {
+        id: LdapConnectorId::generate(&env, &scope),
+        absence_policy: LdapAbsencePolicy::Deactivate,
+        ..row.clone()
+    };
     assert_eq!(
         terms_for(&row).policy,
         LdapAbsencePolicy::Delete,
         "the terms carry the row's own policy"
+    );
+    assert_eq!(
+        terms_for(&deactivating).policy,
+        LdapAbsencePolicy::Deactivate,
+        "a deactivating row's departures would be DELETED, which is not reversible"
+    );
+}
+
+/// THE SEEDED ACTOR REACHES THE WRITE. `terms_for` producing a stable actor proves nothing about
+/// the audit log if `apply_sweep` then hands `execute` some other actor: replacing `terms.actor`
+/// with a freshly generated one -- the exact regression the design note names -- left every
+/// assertion green. This reads the audit row.
+#[tokio::test]
+async fn the_audit_row_names_the_connector_that_provisioned() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+
+    let connector = LdapConnectorId::generate(&env, &scope);
+    let expected = ServiceId::from_seed_bytes(connector.unique_bytes()).to_string();
+
+    apply_sweep(
+        store,
+        scope,
+        &env,
+        &ScopeSweep {
+            report: SweepReport {
+                runs: vec![(
+                    connector.to_string(),
+                    Outcome::Planned(Box::new(planned(&[("audited", "u-audited")], &[]).await)),
+                )],
+            },
+            terms: BTreeMap::from([(
+                connector.to_string(),
+                ApplyTerms {
+                    policy: LdapAbsencePolicy::Deactivate,
+                    actor: ActorRef::service(ServiceId::from_seed_bytes(connector.unique_bytes())),
+                },
+            )]),
+        },
+    )
+    .await;
+
+    let actors: Vec<(String, String)> = sqlx::query_as(
+        "SELECT actor_kind::text, actor_id::text FROM audit_log          WHERE tenant_id = $1 AND environment_id = $2 AND action = 'user.create'",
+    )
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_all(db.owner_pool())
+    .await
+    .expect("read the audit log");
+
+    assert_eq!(
+        actors.len(),
+        1,
+        "expected exactly the one create: {actors:?}"
+    );
+    assert_eq!(actors[0].0, "service", "a sweep is not a human");
+    assert_eq!(
+        actors[0].1, expected,
+        "the audit row does not name the connector, so \"what has this directory done to my \
+         users\" has no answer"
+    );
+}
+
+/// TWO CONNECTORS CONTRIBUTING TO ONE COUNTER. Every other fixture gives each counter a single
+/// contributor, so a fold that ASSIGNS rather than adds reports the last connector's numbers and
+/// passes. With failures that is the dangerous shape: a connector failing on everybody followed
+/// by a clean one reads as a clean pass, and the daemon logs it as one.
+#[tokio::test]
+async fn a_pass_sums_two_connectors_rather_than_reporting_the_last() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+
+    // Each connector brings two arrivals and one login that clashes with its own first arrival.
+    let report = apply_sweep(
+        store,
+        scope,
+        &env,
+        &sweep(vec![
+            (
+                "ldc_a",
+                clashing_plan("a").await,
+                terms(&env, LdapAbsencePolicy::Deactivate),
+            ),
+            (
+                "ldc_b",
+                clashing_plan("b").await,
+                terms(&env, LdapAbsencePolicy::Deactivate),
+            ),
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        report.provisioned, 4,
+        "two connectors provisioning two each must sum to four: {report:?}"
+    );
+    assert_eq!(
+        report.failures.len(),
+        2,
+        "each connector's clash must survive the fold: {report:?}"
+    );
+    let named: BTreeSet<&str> = report.failures.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        named,
+        BTreeSet::from(["a-3-clash", "b-3-clash"]),
+        "a fold that assigned rather than added would carry only the last connector's failure"
+    );
+}
+
+/// Three principals under one prefix, so two connectors' fixtures never collide.
+async fn three_people(prefix: &str) -> SyncPlan {
+    planned(
+        &[
+            (&format!("{prefix}stay"), &format!("{prefix}-stay")),
+            (&format!("{prefix}gone"), &format!("{prefix}-gone")),
+            (&format!("{prefix}left"), &format!("{prefix}-left")),
+        ],
+        &[],
+    )
+    .await
+}
+
+/// The same directory with `-left` already departed, so a later pass sees them already removed.
+async fn without_left(prefix: &str) -> SyncPlan {
+    planned(
+        &[
+            (&format!("{prefix}stay"), &format!("{prefix}-stay")),
+            (&format!("{prefix}gone"), &format!("{prefix}-gone")),
+        ],
+        &[
+            &format!("{prefix}-stay"),
+            &format!("{prefix}-gone"),
+            &format!("{prefix}-left"),
+        ],
+    )
+    .await
+}
+
+/// One connector's four removal outcomes at once: `-stay` reads as an ARRIVAL who already has an
+/// account (the shape every pass has today, with no snapshot to remember them by), `-gone` leaves
+/// now, `-left` left last pass, `-ghost` was in the snapshot and never had an account.
+async fn all_four_outcomes(prefix: &str) -> SyncPlan {
+    planned(
+        &[(&format!("{prefix}stay"), &format!("{prefix}-stay"))],
+        &[
+            &format!("{prefix}-gone"),
+            &format!("{prefix}-left"),
+            &format!("{prefix}-ghost"),
+        ],
+    )
+    .await
+}
+
+/// A two-connector sweep built from one plan-maker, both connectors under `policy`.
+async fn both_connectors<F, Fut>(make: F, policy: LdapAbsencePolicy, env: &Env) -> ScopeSweep
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = SyncPlan>,
+{
+    sweep(vec![
+        ("ldc_a", make("a").await, terms(env, policy)),
+        ("ldc_b", make("b").await, terms(env, policy)),
+    ])
+}
+
+/// EVERY COUNTER SUMS, not just the two the clash fixture reaches. A fold that ASSIGNS reports
+/// the last connector's number for whichever field it broke, and each field needs two nonzero
+/// contributors to tell the two apart. One sweep gives each connector all four removal outcomes.
+#[tokio::test]
+async fn every_removal_counter_sums_across_two_connectors() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+
+    apply_sweep(
+        store,
+        scope,
+        &env,
+        &both_connectors(three_people, soft, &env).await,
+    )
+    .await;
+    apply_sweep(
+        store,
+        scope,
+        &env,
+        &both_connectors(without_left, soft, &env).await,
+    )
+    .await;
+    let report = apply_sweep(
+        store,
+        scope,
+        &env,
+        &both_connectors(all_four_outcomes, soft, &env).await,
+    )
+    .await;
+
+    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert_eq!(
+        (
+            report.already_present,
+            report.deactivated,
+            report.already_removed,
+            report.already_absent
+        ),
+        (2, 2, 2, 2),
+        "each counter needs both connectors' contribution: {report:?}"
+    );
+}
+
+/// AND THE IRREVERSIBLE COUNTER. `deleted` is the one field the fixture above cannot reach,
+/// because a deactivating connector never sets it.
+#[tokio::test]
+async fn two_deleting_connectors_sum_their_deletions() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let hard = LdapAbsencePolicy::Delete;
+
+    apply_sweep(
+        store,
+        scope,
+        &env,
+        &both_connectors(three_people, hard, &env).await,
+    )
+    .await;
+    let report = apply_sweep(
+        store,
+        scope,
+        &env,
+        &both_connectors(without_left, hard, &env).await,
+    )
+    .await;
+
+    assert!(report.everything_applied(), "{:?}", report.failures);
+    assert_eq!(
+        report.deleted, 2,
+        "both connectors' deletions must sum: {report:?}"
+    );
+    assert_eq!(state_of(store, scope, "a-left").await, None);
+    assert_eq!(state_of(store, scope, "b-left").await, None);
+}
+
+/// Two arrivals and a third whose login collides with the first, all under one prefix so two of
+/// these plans do not collide with each other.
+async fn clashing_plan(prefix: &str) -> SyncPlan {
+    let fake = Fake {
+        people: vec![
+            person(&format!("{prefix}one"), &format!("{prefix}-1-first")),
+            person(&format!("{prefix}two"), &format!("{prefix}-2-second")),
+            DirectoryEntry::new(
+                format!("uid={prefix}one,ou=Other,dc=example,dc=test"),
+                vec![
+                    ("uid".to_owned(), vec![format!("{prefix}one")]),
+                    ("entryUUID".to_owned(), vec![format!("{prefix}-3-clash")]),
+                ],
+            ),
+        ],
+    };
+    plan(
+        &fake,
+        &SyncInputs {
+            user_base_dn: "dc=example,dc=test".to_owned(),
+            user_filter: "(objectClass=inetOrgPerson)".to_owned(),
+            group_roots: Vec::new(),
+            max_group_depth: 5,
+            attribute_mapping: json!({ "username": "uid" }),
+        },
+        &BTreeSet::new(),
+    )
+    .await
+    .expect("plans")
+}
+
+/// THE PASS'S OWN BODY APPLIES. `run_pass` reads scopes and opens directories, so the only thing
+/// that used to observe it applying anything was a live-directory test CI does not run -- deleting
+/// the apply call left every test in the repository green. [`fold_scope`] is everything the pass
+/// does with a sweep, and it needs no directory.
+#[tokio::test]
+async fn the_pass_body_counts_and_applies_the_sweep_it_is_given() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+
+    let mut mixed = sweep(vec![(
+        "ldc_ok",
+        planned(&[("folded", "u-folded")], &[]).await,
+        terms(&env, LdapAbsencePolicy::Deactivate),
+    )]);
+    mixed.report.runs.push((
+        "ldc_down".to_owned(),
+        Outcome::Unreachable("connection refused".to_owned()),
+    ));
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &mixed, &mut report).await;
+
+    assert_eq!(report.planned, 1, "the plan was not counted");
+    assert_eq!(
+        report.failed, 1,
+        "the unreachable connector was not counted"
+    );
+    assert_eq!(
+        report.applied.provisioned, 1,
+        "the pass counted the plan and did not apply it: {report:?}"
+    );
+    assert_eq!(
+        state_of(store, scope, "u-folded").await,
+        Some(UserState::Active)
+    );
+}
+
+/// AND THE PASS REPEATS. `run_pass` sweeps against an empty previous snapshot every tick, so the
+/// second pass over an unchanged directory is the ordinary case; it must add nothing and report
+/// nothing needing attention.
+#[tokio::test]
+async fn a_second_pass_over_the_same_sweep_reports_a_quiet_run() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+
+    let mut first = PassReport::default();
+    fold_scope(
+        store,
+        scope,
+        &env,
+        &sweep(vec![(
+            "ldc_ok",
+            planned(&[("steady", "u-steady")], &[]).await,
+            terms(&env, LdapAbsencePolicy::Deactivate),
+        )]),
+        &mut first,
+    )
+    .await;
+    assert_eq!(first.applied.provisioned, 1);
+
+    let mut second = PassReport::default();
+    fold_scope(
+        store,
+        scope,
+        &env,
+        &sweep(vec![(
+            "ldc_ok",
+            planned(&[("steady", "u-steady")], &[]).await,
+            terms(&env, LdapAbsencePolicy::Deactivate),
+        )]),
+        &mut second,
+    )
+    .await;
+
+    assert_eq!(second.applied.provisioned, 0);
+    assert_eq!(second.applied.already_present, 1);
+    assert!(
+        second.applied.everything_applied(),
+        "an hourly tick over an unchanged directory must not need attention: {:?}",
+        second.applied.failures
     );
 }

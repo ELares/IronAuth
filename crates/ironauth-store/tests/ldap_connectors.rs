@@ -675,3 +675,64 @@ async fn a_group_base_without_a_filter_is_refused() {
         "a group base with no group filter was accepted"
     );
 }
+
+/// WHITESPACE IS BLANK, on both sides. 0212 keyed on `group_base_dn <> ''` while the sweep keys
+/// on `trim().is_empty()`, so a single space was storable AND read as no group scoping -- and the
+/// schema then demanded the group filter that pairs with a base, which nothing read. 0213 keys
+/// both on `btrim`, so this row is accepted with no filter and means exactly what the sweep does
+/// with it.
+#[tokio::test]
+async fn a_whitespace_group_base_is_blank_to_the_schema_too() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({ "userName": "uid" });
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(
+            &env,
+            NewLdapConnector {
+                group_base_dn: "   ",
+                group_filter: "",
+                ..spec(&id, &org, &mapping)
+            },
+        )
+        .await
+        .expect("a whitespace group base needs no filter, because the sweep reads it as none");
+}
+
+/// AND A WHITESPACE USER BASE IS NO USER BASE. The same `btrim` reasoning applied to the column
+/// that stays required: a connector whose user base is a space has nothing to read, and 0212
+/// would have accepted it.
+#[tokio::test]
+async fn a_whitespace_user_base_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({ "userName": "uid" });
+
+    let refused = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(
+            &env,
+            NewLdapConnector {
+                user_base_dn: " ",
+                ..spec(&id, &org, &mapping)
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a user base of whitespace was accepted, so a connector with nothing to read is storable"
+    );
+}

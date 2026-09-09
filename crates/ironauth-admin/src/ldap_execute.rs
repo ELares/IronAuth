@@ -19,8 +19,15 @@
 //!
 //! The sweep runs hourly and the previous snapshot may be stale, lost, or empty. So provisioning
 //! somebody who already exists is a no-op rather than a conflict, and removing somebody already
-//! gone is a no-op rather than an error. Without that, one interrupted run leaves every later run
-//! failing on the same rows.
+//! removed is a no-op rather than an error. Without that, one interrupted run leaves every later
+//! run failing on the same rows.
+//!
+//! "Already removed" is two different states and both have to be caught. A DELETED principal has
+//! no row, so the lookup misses. A DEACTIVATED one still has a row, in the state the deactivation
+//! wants -- and the store refuses a transition from a state to ITSELF
+//! (`UserState::can_transition_to` opens with `if self == to { return false }`), so passing it
+//! through would report a `Conflict` against that principal on every tick, for ever. The state
+//! check below is not an optimisation; without it the deactivate half is not idempotent at all.
 //!
 //! # One failure does not abandon the rest
 //!
@@ -48,6 +55,12 @@ pub struct ExecuteReport {
     pub deleted: usize,
     /// Removals for a principal with no account, so nothing was removed.
     pub already_absent: usize,
+    /// Removals for a principal whose account is ALREADY in the state the removal wants.
+    ///
+    /// Separate from [`Self::already_absent`] because the two are different diagnoses: no account
+    /// at all can mean last pass failed to make one, while an account already disabled means the
+    /// removal simply happened before.
+    pub already_removed: usize,
     /// Per-principal failures. The run continued past each of these.
     pub failures: Vec<(String, String)>,
 }
@@ -69,16 +82,8 @@ impl ExecuteReport {
         self.deactivated += other.deactivated;
         self.deleted += other.deleted;
         self.already_absent += other.already_absent;
+        self.already_removed += other.already_removed;
         self.failures.extend(other.failures);
-    }
-
-    /// How many accounts this run actually changed.
-    ///
-    /// Excludes the no-ops deliberately: a pass over an unchanged directory should report zero,
-    /// not the size of the directory, or a quiet run and a churning one look the same in a log.
-    #[must_use]
-    pub fn changed(&self) -> usize {
-        self.provisioned + self.deactivated + self.deleted
     }
 }
 
@@ -171,6 +176,10 @@ async fn apply_one(
                 report.already_absent += 1;
                 return Ok(());
             };
+            if existing.state == DEPARTED {
+                report.already_removed += 1;
+                return Ok(());
+            }
             store
                 .scoped(scope)
                 .acting(actor, CorrelationId::generate(env))
@@ -178,12 +187,7 @@ async fn apply_one(
                 .set_state(
                     env,
                     &existing.id,
-                    // DISABLED rather than BLOCKED. Both stop authentication and end live
-                    // sessions; the store's own doc says the difference is that the operator's
-                    // intent is legible. Somebody who left the directory was not blocked by an
-                    // administrator, and reading it back as if they were would misattribute the
-                    // decision.
-                    UserState::Disabled,
+                    DEPARTED,
                     OffboardingSchedule {
                         at_unix_micros: None,
                         wake_payload: None,
@@ -218,6 +222,18 @@ async fn apply_one(
         }
     }
 }
+
+/// The state a principal who has left the directory is put into.
+///
+/// DISABLED rather than BLOCKED. Both stop authentication and end live sessions; the store's own
+/// doc says the difference is that the operator's intent is legible. Somebody who left the
+/// directory was not blocked by an administrator, and reading it back as if they were would
+/// misattribute the decision.
+///
+/// A CONSTANT because two places need the same answer: the state to write, and the state that
+/// means the write already happened. Two literals would let those drift, and the drift is silent
+/// -- the executor would deactivate somebody who is already deactivated and take a `Conflict`.
+const DEPARTED: UserState = UserState::Disabled;
 
 /// The clock, read through `Env` like everything else timed here.
 fn now_micros(env: &Env) -> i64 {

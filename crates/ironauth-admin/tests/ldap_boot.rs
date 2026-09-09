@@ -83,9 +83,10 @@ fn every_transport_mode_maps_to_itself() {
 /// connector fail on a DN nothing resolves -- when what the operator meant is "no group scoping,
 /// everyone under the user base counts".
 ///
-/// A ROW CAN NOW HOLD THIS. Until migration 0213 the column refused a blank group base, so this
-/// test pinned behaviour no stored connector could reach; `ldap_connectors.rs` covers the storage
-/// half.
+/// A ROW CAN NOW HOLD THIS DELIBERATELY. Until migration 0213 the column demanded
+/// `group_base_dn <> ''`, which a single space satisfies -- so the arm was reachable only by an
+/// operator who meant the opposite of what the row recorded. `ldap_connectors.rs` covers the
+/// storage half, whitespace included.
 #[test]
 fn a_blank_group_base_means_no_group_scoping_rather_than_one_empty_root() {
     let inputs = inputs_for(&connector(LdapTlsMode::Ldaps, 636, "", 5));

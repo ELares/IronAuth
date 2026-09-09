@@ -631,9 +631,13 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         if let Some(sweep) = certificate_sweep {
             sweep.abort();
         }
-        // AND THE LDAP SWEEP. Aborted rather than awaited for the same reason and one more: it
-        // WRITES NOTHING, so a pass cut mid-tick leaves no half-applied state anywhere -- the
-        // worst case is a directory read that is thrown away.
+        // AND THE LDAP SWEEP. Aborted rather than awaited for the same reason, and safe to
+        // abort for a different one than it used to be: a pass now WRITES, so a tick cut short
+        // leaves the change set applied up to the principal it reached and no further. That is
+        // survivable only because every operation repeats without harm -- the next pass
+        // re-derives the same change set and the applied part reads as already done. Awaiting
+        // instead would hold shutdown for a whole directory read, which is the thing this
+        // sequence exists to avoid.
         if let Some(sweep) = ldap_sweep {
             sweep.abort();
         }
@@ -3897,7 +3901,8 @@ async fn start_ldap_sweep(
     tracing::info!(
         interval_secs = interval.as_secs(),
         batch,
-        "ldap sync is running; it PLANS only and applies nothing"
+        "ldap sync is running; it PROVISIONS accounts for directory principals and does not yet \
+         remove any (no previous snapshot exists to detect absence against)"
     );
     Some(handle)
 }
