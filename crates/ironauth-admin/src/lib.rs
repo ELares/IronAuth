@@ -102,6 +102,7 @@ mod external_issuers;
 pub mod flow_target_delivery;
 mod flow_targets;
 pub mod ldap_boot;
+pub mod ldap_changeset;
 pub mod ldap_client;
 pub mod ldap_diff;
 pub mod ldap_groups;
