@@ -950,6 +950,11 @@ impl Fixture {
                 .into_iter()
                 .filter(|case| case.method != "GET"),
         );
+        cases.extend(
+            self.ldap_connector_cases()
+                .into_iter()
+                .filter(|case| case.method != "GET"),
+        );
         cases.extend(self.destructive_write_cases());
         cases
     }
@@ -972,6 +977,11 @@ impl Fixture {
         );
         cases.extend(
             self.scim_push_connection_cases()
+                .into_iter()
+                .filter(|case| case.method == "GET"),
+        );
+        cases.extend(
+            self.ldap_connector_cases()
                 .into_iter()
                 .filter(|case| case.method == "GET"),
         );
@@ -1124,65 +1134,24 @@ impl Fixture {
         ]
     }
 
-    /// The OUTBOUND connection surface at a soft-deleted environment (issue #137).
+    /// The LDAP connector surface at a soft-deleted environment (issue #142).
     ///
-    /// Its own function rather than four more cases appended to a neighbour: those functions
-    /// are already near `clippy::too_many_lines`, and a targeted `cargo test` does not catch
-    /// that ceiling. Only clippy does, which means the gate.
-    fn scim_push_connection_cases(&self) -> Vec<Case> {
+    /// Its own function for exactly the reason the one below states about ITSELF, which the
+    /// first version of this change did not apply: appending these five to that neighbour took
+    /// it from 46 interior lines to 99, one under `clippy::too_many_lines`. A targeted
+    /// `cargo test` does not see that ceiling and only clippy does, so the next case appended
+    /// anywhere in that function would have broken the gate for a reason nobody would look for
+    /// here. It also put five #142 cases inside a function named and documented for #137.
+    fn ldap_connector_cases(&self) -> Vec<Case> {
         let Self {
             base,
-            scim_push_connection,
             ldap_connector,
             ..
         } = self;
         vec![
-            Case {
-                label: "scim_push_connections.createScimPushConnection",
-                method: "POST",
-                path: format!("{base}/scim-push-connections"),
-                body: Some(
-                    serde_json::json!({
-                        "display_name": "sweep push connection",
-                        "base_url": "https://downstream.example.com/scim/v2",
-                        "credential_secret_name": "scim_push_downstream",
-                    })
-                    .to_string(),
-                ),
-                intent: Intent::Write,
-                live: StatusCode::CREATED,
-            },
-            Case {
-                label: "scim_push_connections.setScimPushConnectionActive",
-                method: "PUT",
-                // The SEEDED handle, not an absent one, for the reason the revoke above states.
-                path: format!("{base}/scim-push-connections/{scim_push_connection}/active"),
-                body: Some(serde_json::json!({ "active": false }).to_string()),
-                intent: Intent::Write,
-                live: StatusCode::NO_CONTENT,
-            },
-            Case {
-                label: "scim_push_connections.deleteScimPushConnection",
-                method: "DELETE",
-                path: format!("{base}/scim-push-connections/{scim_push_connection}"),
-                body: None,
-                intent: Intent::Write,
-                live: StatusCode::NO_CONTENT,
-            },
-            Case {
-                label: "scim_push_connections.listScimPushConnections",
-                method: "GET",
-                path: format!("{base}/scim-push-connections"),
-                body: None,
-                // AUDITABLE at a decommissioned environment, naming the row the seed landed so
-                // an empty page cannot pass for an audit.
-                intent: Intent::Read(vec!["Seeded downstream".to_owned()]),
-                live: StatusCode::OK,
-            },
-            // The LDAP connector surface (issue #142), all five shapes. The two reads name rows
-            // the seed landed WHILE THE ENVIRONMENT WAS LIVE -- the connector's own label and
-            // the connector id its health row carries -- so an empty page cannot pass for an
-            // audit at a decommissioned environment.
+            // The two reads name rows the seed landed WHILE THE ENVIRONMENT WAS LIVE -- the
+            // connector's own label, and the connector id its health row carries -- so an
+            // empty page cannot pass for an audit at a decommissioned environment.
             Case {
                 label: "ldap_connectors.createLdapConnector",
                 method: "POST",
@@ -1235,6 +1204,63 @@ impl Fixture {
                 body: None,
                 intent: Intent::Write,
                 live: StatusCode::NO_CONTENT,
+            },
+        ]
+    }
+
+    /// The OUTBOUND connection surface at a soft-deleted environment (issue #137).
+    ///
+    /// Its own function rather than four more cases appended to a neighbour: those functions
+    /// are already near `clippy::too_many_lines`, and a targeted `cargo test` does not catch
+    /// that ceiling. Only clippy does, which means the gate.
+    fn scim_push_connection_cases(&self) -> Vec<Case> {
+        let Self {
+            base,
+            scim_push_connection,
+            ..
+        } = self;
+        vec![
+            Case {
+                label: "scim_push_connections.createScimPushConnection",
+                method: "POST",
+                path: format!("{base}/scim-push-connections"),
+                body: Some(
+                    serde_json::json!({
+                        "display_name": "sweep push connection",
+                        "base_url": "https://downstream.example.com/scim/v2",
+                        "credential_secret_name": "scim_push_downstream",
+                    })
+                    .to_string(),
+                ),
+                intent: Intent::Write,
+                live: StatusCode::CREATED,
+            },
+            Case {
+                label: "scim_push_connections.setScimPushConnectionActive",
+                method: "PUT",
+                // The SEEDED handle, not an absent one, for the reason the revoke above states.
+                path: format!("{base}/scim-push-connections/{scim_push_connection}/active"),
+                body: Some(serde_json::json!({ "active": false }).to_string()),
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "scim_push_connections.deleteScimPushConnection",
+                method: "DELETE",
+                path: format!("{base}/scim-push-connections/{scim_push_connection}"),
+                body: None,
+                intent: Intent::Write,
+                live: StatusCode::NO_CONTENT,
+            },
+            Case {
+                label: "scim_push_connections.listScimPushConnections",
+                method: "GET",
+                path: format!("{base}/scim-push-connections"),
+                body: None,
+                // AUDITABLE at a decommissioned environment, naming the row the seed landed so
+                // an empty page cannot pass for an audit.
+                intent: Intent::Read(vec!["Seeded downstream".to_owned()]),
+                live: StatusCode::OK,
             },
         ]
     }
@@ -2688,8 +2714,13 @@ async fn a_keyed_writes_replay_survives_the_environments_deletion() {
     //
     // Issue #409 established the same pin for the environment-scoped surface in
     // `tests/absent_environment.rs::a_replay_survives_the_environment_going_away`, on one
-    // route. This drives EIGHT of the fourteen organization-addressed keyed writes (the
-    // remainder is pinned by `the_keyed_write_list_is_measured_against_the_contract`), and adds
+    // route. This drives MOST of the organization-addressed keyed writes and the remainder is
+    // pinned by `the_keyed_write_list_is_measured_against_the_contract`, which prints both
+    // figures when it fails. The two numerals that stood here said EIGHT of FOURTEEN; both were
+    // written when they were true and neither was derived, and by the time a reviewer measured
+    // they were thirteen and nineteen. They are gone rather than corrected, because the
+    // sentence was also the counterexample to this file's own claim, 240 lines below, that
+    // "nothing else in this file states a count any more". This adds
     // the FRESH-key control that one has no room for: without it a replay returning 201
     // is equally consistent with there being no fence at all.
     let h = Harness::start(50).await;
