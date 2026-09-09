@@ -383,6 +383,12 @@ name = "ldap_sync_snapshots"
 path = "tests/ldap_sync_snapshots.rs"
 required-features = ["testing"]
 
+# Per-connector sync health (issue #142): the half of the isolation criterion an operator can see.
+[[test]]
+name = "ldap_sync_runs"
+path = "tests/ldap_sync_runs.rs"
+required-features = ["testing"]
+
 # Same-transaction atomicity: a mid-transaction failure leaves no orphan data
 # row and no orphan audit row, and the inverse. Needs a real database.
 [[test]]

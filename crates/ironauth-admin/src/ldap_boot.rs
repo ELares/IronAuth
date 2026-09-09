@@ -360,6 +360,10 @@ pub struct PassReport {
     /// FIRST recording failed: it has no baseline at all, so nothing can be concluded absent from
     /// it until one is written.
     pub snapshots_unrecorded: usize,
+    /// Connectors whose health row was written.
+    pub health_recorded: usize,
+    /// Connectors whose health row could NOT be written, so their reported health is stale.
+    pub health_unrecorded: usize,
     /// Connectors skipped because their stored snapshot could not be opened.
     ///
     /// Louder than an unrecorded snapshot, not quieter: each one is a directory that is not being
@@ -410,6 +414,7 @@ pub async fn apply_sweep(store: &Store, scope: Scope, env: &Env, sweep: &ScopeSw
         if let Some(snapshot) = reconciled(plan, &changes, &report) {
             applied.snapshots.insert(id.clone(), snapshot);
         }
+        applied.per_connector.insert(id.clone(), report.clone());
         applied.total.absorb(report);
     }
     applied
@@ -424,6 +429,12 @@ pub struct Applied {
     ///
     /// A connector is ABSENT when nothing may be recorded for it. See [`reconciled`].
     pub snapshots: BTreeMap<String, BTreeSet<String>>,
+    /// What was written FOR EACH connector, keyed by connector id.
+    ///
+    /// Kept alongside the sum because health is per connector: "this directory provisioned three
+    /// people and failed on one" is the operator's question, and the scope-wide total cannot
+    /// answer it.
+    pub per_connector: BTreeMap<String, ExecuteReport>,
 }
 
 /// The set a connector may record as "what the directory held, and IronAuth agrees with".
@@ -594,6 +605,7 @@ pub async fn fold_scope(
         );
     }
     let applied = apply_sweep(store, scope, env, sweep).await;
+    record_health(store, scope, env, sweep, &applied, report).await;
     let taken_at = now_micros(env);
     for (id, snapshot) in applied.snapshots {
         let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(&id, &scope) else {
@@ -636,6 +648,126 @@ pub async fn fold_scope(
         }
     }
     report.applied.absorb(applied.total);
+}
+
+/// Write one health row per connector the sweep touched, including the ones it could not read.
+///
+/// EVERY CONNECTOR, not only the ones that worked. A directory nobody can bind to is exactly the
+/// row an operator needs, and a health surface that only records successes answers "is this
+/// syncing" with silence.
+async fn record_health(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    sweep: &ScopeSweep,
+    applied: &Applied,
+    report: &mut PassReport,
+) {
+    let started = now_micros(env);
+    for (id, outcome) in &sweep.report.runs {
+        let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(id, &scope) else {
+            continue;
+        };
+        let counts = applied.per_connector.get(id).cloned().unwrap_or_default();
+        let reason = outcome.failure().map(std::borrow::Cow::into_owned);
+        let run = ironauth_store::NewLdapRun {
+            connector_id: &connector,
+            started_at_unix_micros: started,
+            duration_ms: 0,
+            outcome: outcome_of(outcome),
+            error: reason.as_deref().map(truncate_reason),
+            provisioned: clamp(counts.provisioned),
+            already_present: clamp(counts.already_present),
+            deactivated: clamp(counts.deactivated),
+            deleted: clamp(counts.deleted),
+            already_absent: clamp(counts.already_absent),
+            already_removed: clamp(counts.already_removed),
+            apply_failures: clamp(counts.failures.len()),
+        };
+        write_run(store, scope, env, &run, report).await;
+    }
+    for id in &sweep.skipped {
+        let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(id, &scope) else {
+            continue;
+        };
+        let run = ironauth_store::NewLdapRun {
+            connector_id: &connector,
+            started_at_unix_micros: started,
+            duration_ms: 0,
+            outcome: ironauth_store::LdapRunOutcome::Skipped,
+            error: Some("the stored snapshot could not be opened"),
+            provisioned: 0,
+            already_present: 0,
+            deactivated: 0,
+            deleted: 0,
+            already_absent: 0,
+            already_removed: 0,
+            apply_failures: 0,
+        };
+        write_run(store, scope, env, &run, report).await;
+    }
+}
+
+/// One health row, counted whichever way it goes.
+async fn write_run(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    run: &ironauth_store::NewLdapRun<'_>,
+    report: &mut PassReport,
+) {
+    match store
+        .scoped(scope)
+        .acting(
+            ActorRef::service(ServiceId::from_seed_bytes(run.connector_id.unique_bytes())),
+            ironauth_store::CorrelationId::generate(env),
+        )
+        .ldap_sync_runs()
+        .record(run)
+        .await
+    {
+        Ok(()) => report.health_recorded += 1,
+        Err(error) => {
+            report.health_unrecorded += 1;
+            tracing::error!(
+                connector = %run.connector_id,
+                %error,
+                "ldap sync could not record this connector's health; an operator asking whether \
+                 it is syncing will read the previous pass's answer"
+            );
+        }
+    }
+}
+
+/// The health vocabulary for a sweep outcome.
+fn outcome_of(outcome: &Outcome) -> ironauth_store::LdapRunOutcome {
+    match outcome {
+        Outcome::Planned(_) => ironauth_store::LdapRunOutcome::Planned,
+        Outcome::Unreachable(_) => ironauth_store::LdapRunOutcome::Unreachable,
+        Outcome::Failed(_) => ironauth_store::LdapRunOutcome::Failed,
+        Outcome::TimedOut { .. } => ironauth_store::LdapRunOutcome::TimedOut,
+    }
+}
+
+/// The stored reason, cut to the column's ceiling on a character boundary.
+///
+/// A CEILING RATHER THAN A REFUSAL: a server that returns a long diagnostic must not cost the
+/// connector its health row, which is the row saying that server is the problem.
+fn truncate_reason(reason: &str) -> &str {
+    const CEILING: usize = 512;
+    if reason.len() <= CEILING {
+        return reason;
+    }
+    let mut end = CEILING;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
+/// A count as the health column holds it.
+fn clamp(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 /// The connector's own service actor.

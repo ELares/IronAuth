@@ -620,6 +620,114 @@ async fn a_skipped_connector_is_counted_by_the_pass() {
     );
 }
 
+/// THE PASS WRITES HEALTH FOR EVERY CONNECTOR IT TOUCHED, including the one it could not reach.
+/// A health surface that only records successes answers "is this directory syncing" with silence,
+/// which is exactly the question the isolation criterion is about.
+#[tokio::test]
+async fn a_pass_records_health_for_the_reachable_and_the_unreachable_alike() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let live = seed_connector(&db, &env, scope, soft).await;
+    let dead = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &live,
+        planned(&[("a", "u-a"), ("b", "u-b")], &BTreeSet::new()).await,
+        terms(&live, soft),
+    );
+    sweep.report.runs.push((
+        dead.to_string(),
+        Outcome::Unreachable("connection refused".to_owned()),
+    ));
+    sweep.terms.insert(dead.to_string(), terms(&dead, soft));
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+
+    assert_eq!(
+        report.health_recorded, 2,
+        "health must be written for both, not only the one that worked: {report:?}"
+    );
+    assert_eq!(report.health_unrecorded, 0);
+
+    let healthy = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&live)
+        .await
+        .expect("read")
+        .expect("the reachable connector has health");
+    assert_eq!(healthy.outcome, ironauth_store::LdapRunOutcome::Planned);
+    assert_eq!(
+        healthy.provisioned, 2,
+        "the counts must be this connector's, not the scope's sum: {healthy:?}"
+    );
+    assert!(healthy.is_healthy());
+
+    let broken = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&dead)
+        .await
+        .expect("read")
+        .expect("the unreachable connector has health");
+    assert_eq!(broken.outcome, ironauth_store::LdapRunOutcome::Unreachable);
+    assert_eq!(broken.error.as_deref(), Some("connection refused"));
+    assert_eq!(broken.consecutive_failures, 1);
+    assert_eq!(
+        broken.provisioned, 0,
+        "a connector that never opened cannot have provisioned anybody"
+    );
+    assert!(!broken.is_healthy());
+
+    let unhealthy = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .unhealthy_in_scope()
+        .await
+        .expect("read");
+    assert_eq!(unhealthy.len(), 1, "{unhealthy:?}");
+    assert_eq!(unhealthy[0].connector_id, dead.to_string());
+}
+
+/// AND A SKIPPED CONNECTOR SAYS SO. A directory not being swept at all is the loudest state
+/// there is; recording nothing for it would leave the previous pass's answer standing.
+#[tokio::test]
+async fn a_skipped_connector_records_its_own_health() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let live = seed_connector(&db, &env, scope, soft).await;
+    let skipped = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &live,
+        planned(&[("a", "u-a")], &BTreeSet::new()).await,
+        terms(&live, soft),
+    );
+    sweep.skipped.push(skipped.to_string());
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+
+    assert_eq!(report.health_recorded, 2, "{report:?}");
+    let health = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&skipped)
+        .await
+        .expect("read")
+        .expect("the skipped connector has health");
+    assert_eq!(health.outcome, ironauth_store::LdapRunOutcome::Skipped);
+    assert!(health.error.is_some(), "a skip has to say why");
+    assert!(!health.is_healthy());
+}
+
 /// THE LOOKUP KEY. A `previous_for` that missed would hand every connector an empty set and
 /// disable absence detection everywhere, silently, while every test about the diff went on
 /// passing.
