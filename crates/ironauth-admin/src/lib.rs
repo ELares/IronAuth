@@ -104,6 +104,7 @@ mod flow_targets;
 pub mod ldap_boot;
 pub mod ldap_changeset;
 pub mod ldap_client;
+pub mod ldap_connectors;
 pub mod ldap_diff;
 pub mod ldap_execute;
 pub mod ldap_groups;
@@ -627,6 +628,30 @@ pub fn management_router(state: AdminState) -> Router {
         // lets somebody write INTO an organization, these point IronAuth at somebody else's SCIM
         // server. Nothing here returns a secret: the connection NAMES an environment secret, so
         // the create response has nothing to leak.
+        // THE INBOUND DIRECTORY SURFACE (issue #142). Where the SCIM routes above let somebody
+        // else write INTO an organization, and the push routes below write OUT to somebody
+        // else's server, these point IronAuth at a directory it READS on a schedule. Nothing
+        // here returns a secret: a connector NAMES an environment secret, and the name must sit
+        // in the connector namespace so configuring one cannot read a secret it did not supply.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors",
+            axum::routing::get(ldap_connectors::list_ldap_connectors)
+                .post(ldap_connectors::create_ldap_connector),
+        )
+        // HEALTH BEFORE THE PARAMETERISED SIBLING, because `/health` would otherwise be captured
+        // as a connector id by the route below and answer 404 for every request.
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health",
+            axum::routing::get(ldap_connectors::list_ldap_connector_health),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}",
+            delete(ldap_connectors::delete_ldap_connector),
+        )
+        .route(
+            "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}/active",
+            axum::routing::put(ldap_connectors::set_ldap_connector_active),
+        )
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/scim-push-connections",
             axum::routing::get(scim_push_connections::list_scim_push_connections)

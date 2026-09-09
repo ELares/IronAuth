@@ -38,6 +38,15 @@ fn now(env: &Env) -> i64 {
 }
 
 async fn seed_connector(db: &TestDatabase, env: &Env, scope: Scope) -> LdapConnectorId {
+    seed_connector_in(db, env, scope).await.1
+}
+
+/// The same, returning the organization the connector belongs to as well.
+async fn seed_connector_in(
+    db: &TestDatabase,
+    env: &Env,
+    scope: Scope,
+) -> (OrganizationId, LdapConnectorId) {
     let org = OrganizationId::generate(env, &scope);
     db.control_store()
         .management()
@@ -71,10 +80,11 @@ async fn seed_connector(db: &TestDatabase, env: &Env, scope: Scope) -> LdapConne
                 absence_policy: LdapAbsencePolicy::Deactivate,
                 max_group_depth: 5,
             },
+            None,
         )
         .await
         .expect("create connector");
-    id
+    (org, id)
 }
 
 fn run<'a>(
@@ -479,7 +489,7 @@ async fn removing_the_connector_removes_its_health() {
     let db = TestDatabase::start().await;
     let env = Env::system();
     let scope = db.seed_scope(&env).await;
-    let connector = seed_connector(&db, &env, scope).await;
+    let (org, connector) = seed_connector_in(&db, &env, scope).await;
     record(
         &db,
         &env,
@@ -492,7 +502,7 @@ async fn removing_the_connector_removes_its_health() {
         .scoped(scope)
         .acting(db.test_actor(&env), CorrelationId::generate(&env))
         .ldap_connectors()
-        .delete(&env, &connector)
+        .delete(&env, &org, &connector)
         .await
         .expect("delete the connector");
 

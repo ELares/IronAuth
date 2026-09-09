@@ -35,6 +35,7 @@ fn connector(tls: LdapTlsMode, port: u16, group_base: &str, depth: i32) -> LdapC
         absence_policy: LdapAbsencePolicy::Deactivate,
         max_group_depth: depth,
         active: true,
+        created_at_unix_micros: 0,
     }
 }
 

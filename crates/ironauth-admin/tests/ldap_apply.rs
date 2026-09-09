@@ -674,6 +674,7 @@ fn a_connector_always_audits_under_the_same_service_actor() {
         absence_policy: LdapAbsencePolicy::Delete,
         max_group_depth: 5,
         active: true,
+        created_at_unix_micros: 0,
     };
 
     let other = LdapConnector {
