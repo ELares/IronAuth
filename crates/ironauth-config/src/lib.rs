@@ -973,9 +973,11 @@ pub struct LdapSyncConfig {
     ///
     /// Off for the reason `certificate_expiry.sweep_enabled` is off: more than one process runs
     /// this binary, and a pass is work that must not be multiplied by the number of replicas.
-    /// Unlike that sweep there is no ledger making a duplicate pass harmless -- two passes read
-    /// the same directories and produce the same plans -- so here it is wasted directory load on
-    /// somebody else's server rather than wasted local work.
+    /// Here it costs more than wasted work. A pass WRITES, and there is no ledger serialising
+    /// two of them: two replicas reading the same directory both see the same arrival, both find
+    /// no account for it, and both create one -- so one takes a uniqueness violation and records
+    /// a failure against a principal nothing is actually wrong with. On top of that it is
+    /// duplicated read load on somebody else's directory server.
     pub sweep_enabled: bool,
 
     /// How often a pass runs, in seconds.

@@ -105,6 +105,7 @@ pub mod ldap_boot;
 pub mod ldap_changeset;
 pub mod ldap_client;
 pub mod ldap_diff;
+pub mod ldap_execute;
 pub mod ldap_groups;
 pub mod ldap_mapping;
 pub mod ldap_schedule;
