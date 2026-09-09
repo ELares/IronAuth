@@ -167,7 +167,13 @@ impl DirectoryConfig {
 
 /// A bound connection to a directory.
 pub struct Directory {
-    ldap: ldap3::Ldap,
+    /// Behind a mutex so the sync's traits can take `&self`.
+    ///
+    /// `ldap3::Ldap` needs `&mut` for every operation, but `ldap_sync::plan` holds ONE source and
+    /// asks it two different questions (enumerate people, walk groups) through two traits. Taking
+    /// `&mut` in both would mean either two connections or threading a mutable borrow through the
+    /// walk. One connection, serialised, is what a directory expects anyway: a bind is a session.
+    ldap: tokio::sync::Mutex<ldap3::Ldap>,
     /// Carried from the config so a caller cannot pass a page size that disagrees with the
     /// connector's. The first version took it as a `search_all` argument while the config field
     /// went unread, which made the field decoration.
@@ -194,7 +200,7 @@ impl Directory {
             .await?
             .success()?;
         Ok(Self {
-            ldap,
+            ldap: tokio::sync::Mutex::new(ldap),
             page_size: config.page_size,
         })
     }
@@ -212,17 +218,17 @@ impl Directory {
     /// member list reaching a deprovisioning comparison is the failure this subsystem must not
     /// have, and a dropped referral is one of the ways a list gets short.
     pub async fn search_all(
-        &mut self,
+        &self,
         base: &str,
         filter: &str,
         attributes: &[String],
     ) -> Result<Vec<DirectoryEntry>, DirectoryError> {
+        let mut ldap = self.ldap.lock().await;
         let adapters: Vec<Box<dyn ldap3::adapters::Adapter<_, _>>> = vec![
             Box::new(ldap3::adapters::EntriesOnly::new()),
             Box::new(ldap3::adapters::PagedResults::new(self.page_size)),
         ];
-        let mut stream = self
-            .ldap
+        let mut stream = ldap
             .streaming_search_with(adapters, base, Scope::Subtree, filter, attributes)
             .await?;
 
@@ -260,8 +266,70 @@ impl Directory {
     /// # Errors
     ///
     /// [`DirectoryError::Transport`] if the unbind fails.
-    pub async fn disconnect(&mut self) -> Result<(), DirectoryError> {
-        self.ldap.unbind().await?;
+    pub async fn disconnect(&self) -> Result<(), DirectoryError> {
+        self.ldap.lock().await.unbind().await?;
         Ok(())
+    }
+}
+
+/// The live client is what `ldap_sync::plan` enumerates people with.
+///
+/// Without this impl the sync would be generic over a trait no shipped type satisfies, which is
+/// the shape `scripts/dormant-module-scan.sh` exists to catch.
+impl crate::ldap_sync::EntrySource for Directory {
+    type Error = DirectoryError;
+
+    async fn search(
+        &self,
+        base: &str,
+        filter: &str,
+        attributes: &[String],
+    ) -> Result<Vec<DirectoryEntry>, DirectoryError> {
+        self.search_all(base, filter, attributes).await
+    }
+}
+
+/// And the same connection walks the groups.
+///
+/// A member is a group when its entry carries one of the group object classes. The class differs
+/// by server -- `group` on Active Directory, `groupOfNames` and `groupOfUniqueNames` on
+/// `OpenLDAP` -- so all three are accepted rather than baking one dialect in.
+impl crate::ldap_groups::GroupSource for Directory {
+    type Error = DirectoryError;
+
+    async fn direct_members(
+        &self,
+        group_dn: &str,
+    ) -> Result<Vec<crate::ldap_groups::Member>, DirectoryError> {
+        // Read the group itself (base scope) for its member list, then ask what each member IS.
+        // Two round trips per group rather than one, because `member` carries only DNs and the
+        // walk has to know which of them to descend into.
+        let group = self
+            .search_all(group_dn, "(objectClass=*)", &["member".to_owned()])
+            .await?;
+        let Some(entry) = group.first() else {
+            return Ok(Vec::new());
+        };
+
+        let mut members = Vec::new();
+        for dn in entry.values("member") {
+            let found = self
+                .search_all(dn, "(objectClass=*)", &["objectClass".to_owned()])
+                .await?;
+            // A member the search cannot resolve is carried as a NON-group: it may be a person
+            // outside the base, and dropping it silently would shrink the member set, which the
+            // diff reads as a departure.
+            let is_group = found.first().is_some_and(|e| {
+                e.values("objectclass").iter().any(|c| {
+                    let c = c.to_ascii_lowercase();
+                    c == "group" || c == "groupofnames" || c == "groupofuniquenames"
+                })
+            });
+            members.push(crate::ldap_groups::Member {
+                dn: dn.clone(),
+                is_group,
+            });
+        }
+        Ok(members)
     }
 }

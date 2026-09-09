@@ -72,7 +72,7 @@ fn config(url: String, tls_mode: TlsMode, page_size: i32) -> DirectoryConfig {
 #[ignore = "needs a directory server; see the module header"]
 async fn the_derived_attribute_list_is_what_makes_the_identifier_arrive() {
     let mapping = json!({ "username": "uid", "email": "mail", "display_name": "cn" });
-    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
         .await
         .expect("connect");
 
@@ -191,7 +191,7 @@ async fn a_page_size_of_one_walks_past_a_limit_that_stops_an_unpaged_search() {
     );
     raw.unbind().await.expect("unbind the raw handle");
 
-    let mut dir = Directory::connect(&cfg).await.expect("connect as svc");
+    let dir = Directory::connect(&cfg).await.expect("connect as svc");
     let people = dir
         .search_all(BASE, "(objectClass=inetOrgPerson)", &["uid".to_owned()])
         .await
@@ -221,7 +221,7 @@ async fn a_page_size_of_one_walks_past_a_limit_that_stops_an_unpaged_search() {
 #[tokio::test]
 #[ignore = "needs a directory server; see the module header"]
 async fn an_octet_string_attribute_is_not_dropped_on_the_way_out() {
-    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
         .await
         .expect("connect");
 
@@ -267,7 +267,7 @@ async fn an_octet_string_attribute_is_not_dropped_on_the_way_out() {
 #[tokio::test]
 #[ignore = "needs a directory server; see the module header"]
 async fn a_subtree_the_server_refers_elsewhere_is_refused_rather_than_returned_short() {
-    let mut dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
+    let dir = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 500))
         .await
         .expect("connect");
 
