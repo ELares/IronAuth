@@ -58,6 +58,32 @@ const PER_CONNECTOR_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// with no source. 500 is what the directories in this space default to.
 const PAGE_SIZE: i32 = 500;
 
+/// The most entries one search may return before the connector is refused.
+///
+/// MEASURED, at three sizes against a real server, not guessed:
+///
+/// | people | peak RSS | pass |
+/// | --- | --- | --- |
+/// | 5 | 15.2MB | 0.4s |
+/// | 20,005 | 50.5MB | 35s |
+/// | 40,005 | 83.7MB | 43s |
+///
+/// The marginal cost is about 1.8KB per entry across both large points (1,852 and 1,795 bytes),
+/// so 100k people is roughly 200MB and a million is roughly 2GB. Paging bounds what is on the
+/// wire at once, not what the process holds -- the diff compares the WHOLE directory against the
+/// whole previous snapshot, so the set is resident by construction. `scripts/ldap-load-test.sh`
+/// is what produced these and re-produces them in CI.
+///
+/// 250,000 is therefore about half a gigabyte for one connector, which is a large but survivable
+/// pass on the kind of host that runs this, and far above any directory this is pointed at in
+/// practice. What the ceiling buys is not a smaller footprint: it is that an unexpectedly huge
+/// directory becomes a REFUSAL naming that connector rather than an allocator killing the sweep
+/// and taking every other connector's pass with it.
+///
+/// Not per-connector today, for the reason the page size is not: the column does not exist, and
+/// inventing a setting with no source here would be a knob nothing can turn.
+const MAX_ENTRIES: usize = 250_000;
+
 /// Every active connector in one scope, as work the sweep can run.
 ///
 /// The previous snapshot is supplied by the caller rather than read here, because where a
@@ -233,6 +259,7 @@ impl SourceFactory for StoreSourceFactory<'_> {
             bind_dn: connector.bind_dn.clone(),
             bind_password: password,
             page_size: PAGE_SIZE,
+            max_entries: MAX_ENTRIES,
             connect_timeout: CONNECT_TIMEOUT,
         })
         .await

@@ -1271,7 +1271,11 @@ jobs:
     # during its own bootstrap.
     name: "ldap live (real slapd, issue #142)"
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # THE LOAD TEST IS THE LONG PART. Loading twenty thousand entries one LDAP add at a time took
+    # about three minutes against a real server, and the pass over them another forty seconds;
+    # the protocol tests are seconds. Thirty rather than twenty so a slower runner does not turn
+    # a green lane into a timeout that reads like a directory fault.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -1383,12 +1387,28 @@ jobs:
             --ignored --list 2>/dev/null | grep -c ': test$')
           pass=$(cargo test -p ironauth-admin --all-features --test ldap_live_pass -- \
             --ignored --list 2>/dev/null | grep -c ': test$')
-          [ "$live" = "7" ] || { echo "::error::ldap_live lists ${live} ignored tests, not 7"; exit 1; }
+          [ "$live" = "9" ] || { echo "::error::ldap_live lists ${live} ignored tests, not 9"; exit 1; }
           [ "$pass" = "1" ] || { echo "::error::ldap_live_pass lists ${pass} ignored tests, not 1"; exit 1; }
       - name: The protocol tests
         run: cargo test -p ironauth-admin --all-features --test ldap_live -- --ignored
       - name: A whole pass, stored row to written account
         run: cargo test -p ironauth-admin --all-features --test ldap_live_pass -- --ignored
+      - name: The large-directory load test
+        # #142's verification asks for "a load test with a synthetic large directory; memory and
+        # duration recorded as CI artifacts". RECORDED, not asserted: a wall-clock budget or a
+        # megabyte ceiling on a shared runner is a flake generator, and a threshold tuned until
+        # it stops failing has stopped meaning anything. The one thing the script DOES assert is
+        # the property that is not a measurement -- that the pass reached every person.
+        run: |
+          cargo build -p ironauth-admin --all-features --tests
+          IRONAUTH_LDAP_LOAD_ENTRIES=20000 bash scripts/ldap-load-test.sh
+      - name: Record the load-test figures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ldap-load-report
+          path: target/ldap-load-report.txt
+          if-no-files-found: warn
       - name: slapd logs on failure
         if: failure()
         run: docker logs ironauth-ldap; docker logs ironauth-ldap-plain

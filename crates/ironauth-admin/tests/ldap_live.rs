@@ -62,8 +62,114 @@ fn config(url: String, tls_mode: TlsMode, page_size: i32) -> DirectoryConfig {
         bind_password: std::env::var("IRONAUTH_LDAP_BIND_PASSWORD")
             .unwrap_or_else(|_| "adminpw".to_owned()),
         page_size,
+        max_entries: 250_000,
         connect_timeout: Duration::from_secs(10),
     }
+}
+
+/// PROGRESS IS OBSERVABLE WHILE THE READ RUNS. A pass over twenty thousand people takes half a
+/// minute against a real server and reported NOTHING until it finished, so an operator could not
+/// tell a slow directory from a wedged one. The search now reports per page.
+///
+/// THROUGH AN OBSERVER, not a log line, and the reason is this test. The first version emitted
+/// `tracing::info!` and asserted on a captured subscriber: it passed alone, failed in the suite,
+/// and passed again under `--test-threads=1`. `tracing` caches callsite interest globally, so a
+/// thread-local subscriber loses the race against sibling threads running with none -- and a
+/// progress signal whose test is a coin flip is not a signal. `LogProgress` still writes the log
+/// line an operator reads; this asserts the calls that produce it.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn a_long_search_reports_progress_while_it_runs() {
+    use ironauth_admin::ldap_client::SearchProgress;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<usize>>);
+    impl SearchProgress for Recorder {
+        fn entries_read(&self, _base: &str, read: usize, _ceiling: usize) {
+            self.0.lock().expect("lock").push(read);
+        }
+    }
+
+    let recorder = Arc::new(Recorder::default());
+    // A PAGE SIZE OF TWO over five people, so the read spans three pages and a per-page report
+    // has something to say.
+    let directory = Directory::connect(&config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2))
+        .await
+        .expect("connect")
+        .with_progress(recorder.clone());
+
+    let found = directory
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await
+        .expect("search");
+    assert_eq!(found.len(), 5, "the fixture's five must still arrive");
+
+    let seen = recorder.0.lock().expect("lock").clone();
+    assert_eq!(
+        seen,
+        vec![2, 4],
+        "a five-entry read at a page size of two must report after each full page, and say HOW \
+         FAR it has got rather than merely that it is alive: {seen:?}"
+    );
+}
+
+/// A CEILING, NOT A TRUNCATION. Paging bounds what is on the wire at once; it does not bound what
+/// the process holds, because the diff compares the WHOLE directory against the whole previous
+/// snapshot. So a directory larger than the connector can hold has to be REFUSED -- returning the
+/// entries that fit would reach the diff as everybody who did not fit having departed, which is
+/// the same failure the referral refusal exists for and is unrecoverable under a delete policy.
+///
+/// Driven against the real server at a ceiling of two, so the refusal is five real entries
+/// meeting a bound rather than a fixture arranged to be small.
+#[tokio::test]
+#[ignore = "needs a directory server; see the module header"]
+async fn a_directory_larger_than_the_ceiling_is_refused_rather_than_returned_short() {
+    let mut cfg = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    cfg.max_entries = 2;
+    let directory = Directory::connect(&cfg).await.expect("connect");
+
+    let refused = directory
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await;
+
+    let Err(error) = refused else {
+        panic!("a directory over the ceiling was returned short instead of refused");
+    };
+    assert!(
+        matches!(error, DirectoryError::TooManyEntries { ceiling: 2 }),
+        "the refusal must name the ceiling it hit: {error:?}"
+    );
+
+    // AND UNDER THE CEILING IT STILL READS EVERYBODY, or the bound would be a wall: a refusal
+    // that fired for every directory would satisfy the assertion above.
+    let mut roomy = config(url("IRONAUTH_LDAP_URL"), TlsMode::Plaintext, 2);
+    roomy.max_entries = 250_000;
+    let directory = Directory::connect(&roomy).await.expect("connect");
+    let everyone = directory
+        .search_all(
+            BASE,
+            SearchScope::Subtree,
+            "(objectClass=inetOrgPerson)",
+            &["uid".to_owned()],
+        )
+        .await
+        .expect("a directory under the ceiling reads");
+    assert_eq!(
+        everyone.len(),
+        5,
+        "the fixture's five people must still arrive: {everyone:?}"
+    );
 }
 
 /// The derived attribute list is what makes the identifier arrive.
