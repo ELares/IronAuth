@@ -1385,6 +1385,21 @@ pub enum Action {
     ScimPushConnectionUpdated,
     /// An LDAP/AD connector was updated (issue #142).
     LdapConnectorUpdated,
+    /// A Shared Signals stream was created by its receiver (issue #143).
+    ///
+    /// Distinct from the two below for the reason the SCIM pair above is: creation names WHERE
+    /// this environment's security events will be sent, and an operator reading the log for
+    /// "who started shipping our signals, and to what endpoint" needs it without decoding a
+    /// detail field.
+    SsfStreamCreated,
+    /// A Shared Signals stream's configuration changed (issue #143).
+    SsfStreamUpdated,
+    /// A Shared Signals stream's status changed (issue #143).
+    ///
+    /// Separate from [`Action::SsfStreamUpdated`] because it is the one change that alters
+    /// whether events flow at all, and a pause that nobody can distinguish from a
+    /// configuration edit is a delivery gap with no entry naming it.
+    SsfStreamStatusChanged,
     /// An inbound SAML connection was created (issue #139).
     ///
     /// SEPARATE FROM PINNING A KEY, below. Creating the connection says which identity provider
@@ -1426,6 +1441,8 @@ pub enum Action {
     ScimPushConnectionDeleted,
     /// An LDAP/AD connector was deleted (issue #142).
     LdapConnectorDeleted,
+    /// A Shared Signals stream was deleted by its receiver (issue #143).
+    SsfStreamDeleted,
     /// An impersonation was AUTHORIZED (issue #101): the control plane issued a single-use
     /// authorization after checking the permission and the justification. The row targets the
     /// `imp_` authorization.
@@ -1957,6 +1974,9 @@ impl Action {
             Action::LdapConnectorCreated => "ldap_connector.created",
             Action::ScimPushConnectionUpdated => "scim_push_connection.updated",
             Action::LdapConnectorUpdated => "ldap_connector.updated",
+            Action::SsfStreamCreated => "ssf_stream.created",
+            Action::SsfStreamUpdated => "ssf_stream.updated",
+            Action::SsfStreamStatusChanged => "ssf_stream.status_changed",
             Action::SamlConnectionCreated => "saml_connection.created",
             Action::SamlConnectionDeleted => "saml_connection.deleted",
             Action::SamlConnectionEnabled => "saml_connection.enabled",
@@ -1966,6 +1986,7 @@ impl Action {
             Action::SamlCertificateUnpinned => "saml_certificate.unpinned",
             Action::ScimPushConnectionDeleted => "scim_push_connection.deleted",
             Action::LdapConnectorDeleted => "ldap_connector.deleted",
+            Action::SsfStreamDeleted => "ssf_stream.deleted",
             Action::ApiKeyRevoked => "api_key.revoked",
             Action::ImpersonationAuthorized => "impersonation.authorized",
             Action::ImpersonationStarted => "impersonation.started",

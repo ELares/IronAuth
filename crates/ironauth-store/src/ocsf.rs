@@ -312,6 +312,17 @@ const ENTITY_MANAGEMENT_DOMAINS: &[&str] = &[
     // classifier keys on the text before the first dot, and the worker actions later slices add
     // (`scim_push.user_pushed`) are a different shape. Wire strings freeze into the audit trail.
     "scim_push_connection",
+    // `ssf_stream` (issue #143) belongs here for the reason `scim_push_connection` does and
+    // NOT the reason `ldap_connector` gives: a Shared Signals stream is OUTBOUND. It grants
+    // nobody a way into this environment and changes nothing about who may sign in or what
+    // they may do -- it says where security events this environment has ALREADY decided are
+    // sent, which is configuration for somewhere else.
+    //
+    // The one thing that gives pause is that those events describe users, so a stream is an
+    // egress decision as well as a configuration one. That is a reason for the create to be
+    // audited with its endpoint in the detail, which it is; it is not a reason to file it as
+    // access management, because no right is granted or revoked by writing this row.
+    "ssf_stream",
     "flow_version",
     "locale",
     "mds3",
