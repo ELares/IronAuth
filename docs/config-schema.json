@@ -891,7 +891,7 @@
         },
         "sweep_enabled": {
           "default": false,
-          "description": "Whether THIS process runs the sweep. OFF by default.\n\nOff for the reason `certificate_expiry.sweep_enabled` is off: more than one process runs\nthis binary, and a pass is work that must not be multiplied by the number of replicas.\nUnlike that sweep there is no ledger making a duplicate pass harmless -- two passes read\nthe same directories and produce the same plans -- so here it is wasted directory load on\nsomebody else's server rather than wasted local work.",
+          "description": "Whether THIS process runs the sweep. OFF by default.\n\nOff for the reason `certificate_expiry.sweep_enabled` is off: more than one process runs\nthis binary, and a pass is work that must not be multiplied by the number of replicas.\nHere it costs more than wasted work. A pass WRITES, and there is no ledger serialising\ntwo of them: two replicas reading the same directory both see the same arrival, both find\nno account for it, and both create one -- so one takes a uniqueness violation and records\na failure against a principal nothing is actually wrong with. On top of that it is\nduplicated read load on somebody else's directory server.",
           "type": "boolean"
         },
         "sweep_interval_secs": {

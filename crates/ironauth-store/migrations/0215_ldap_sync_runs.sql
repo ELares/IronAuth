@@ -17,10 +17,13 @@
 -- sync without manual intervention" observable: the counter returns to zero on the first pass
 -- that succeeds, with nobody clearing anything.
 --
--- NO ERROR DETAIL BEYOND ONE STRING, and it is bounded. A bind failure's message can carry a DN
--- and a server-supplied diagnostic; that belongs in the log, where retention and access are
--- already decided. Here it is the short reason an operator reads first, and the length ceiling
--- keeps a chatty server from turning a health row into a log sink.
+-- THE REASON IS A CATEGORY, NOT THE MESSAGE. A failure's Display can carry a DN, a URL, or a
+-- server-supplied diagnostic -- `SyncError::Mapping { dn, .. }` and `DuplicateStableId { dns }`
+-- both interpolate one -- and a DN carries a person's name and their place in an organization.
+-- The sibling snapshot table seals identifiers for exactly that reason, and an unsealed column
+-- beside it holding the same text would give that seal away. So the writer maps the failure to a
+-- fixed phrase naming its KIND, and the full message goes to the log, where retention and access
+-- are already decided. The length ceiling then bounds what a future writer can put here at all.
 --
 -- Expand-only: a new table with no writer on any older binary.
 
@@ -80,12 +83,16 @@ CREATE TABLE ldap_sync_runs (
     FOREIGN KEY (connector_id) REFERENCES ldap_connectors (id) ON DELETE CASCADE
 );
 
--- An operator asks "which of my directories is unhealthy", which is a scope read filtered on the
--- failure counter, and the console lists them all.
+-- The console lists every connector in a scope.
 CREATE INDEX ldap_sync_runs_by_scope_idx
     ON ldap_sync_runs (tenant_id, environment_id);
+-- And "which of my directories is unhealthy" is its own read. THE PREDICATE IS BOTH HALVES: a
+-- connector that binds fine and fails to apply every principal is unhealthy too, and an index on
+-- `consecutive_failures` alone would silently omit exactly that case -- which is the one the
+-- health surface exists to make visible.
 CREATE INDEX ldap_sync_runs_unhealthy_idx
-    ON ldap_sync_runs (tenant_id, environment_id) WHERE consecutive_failures > 0;
+    ON ldap_sync_runs (tenant_id, environment_id)
+    WHERE consecutive_failures > 0 OR apply_failures > 0;
 
 ALTER TABLE ldap_sync_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ldap_sync_runs FORCE ROW LEVEL SECURITY;

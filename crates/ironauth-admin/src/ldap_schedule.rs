@@ -23,7 +23,8 @@
 
 use crate::ldap_groups::GroupSource;
 use crate::ldap_sync::{EntrySource, SyncError, SyncInputs, plan};
-use std::collections::BTreeSet;
+use ironauth_env::Env;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One connector the sweep should run.
 pub struct Scheduled {
@@ -108,6 +109,22 @@ impl Outcome {
 pub struct SweepReport {
     /// One entry per SCHEDULED connector. Never shorter than the input.
     pub runs: Vec<(String, Outcome)>,
+    /// When each connector's attempt began and how long it took, keyed as [`Self::runs`] is.
+    ///
+    /// MEASURED HERE because this is the only place that knows: the deadline wraps open and read
+    /// together, so the elapsed time of that future IS the connector's sync duration. A caller
+    /// timing the whole scope could only divide, and a caller timing nothing at all would have to
+    /// invent the number -- which is what the health row carried before this existed.
+    pub timings: BTreeMap<String, RunTiming>,
+}
+
+/// When one connector's attempt began, and how long it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunTiming {
+    /// Microseconds since the Unix epoch, read just before the attempt started.
+    pub started_at_unix_micros: i64,
+    /// Wall-clock milliseconds the attempt took, deadline included.
+    pub duration_ms: i64,
 }
 
 impl SweepReport {
@@ -138,13 +155,17 @@ pub async fn sweep<F>(
     factory: &F,
     scheduled: &[Scheduled],
     per_connector: std::time::Duration,
+    env: &Env,
 ) -> SweepReport
 where
     F: SourceFactory + Sync,
     SyncError: From<<F::Source as EntrySource>::Error> + From<<F::Source as GroupSource>::Error>,
 {
     let mut runs = Vec::with_capacity(scheduled.len());
+    let mut timings = BTreeMap::new();
     for connector in scheduled {
+        let started_at_unix_micros = now_micros(env);
+        let began = env.clock().monotonic();
         // THE DEADLINE COVERS OPEN AND READ TOGETHER, because either can hang. `ldap3`'s
         // connection timeout bounds the TCP connect only -- a directory that accepts the socket
         // and never answers the bind leaves `open` pending indefinitely -- and a search that
@@ -160,6 +181,23 @@ where
             }
         })
         .await;
+        // THE MONOTONIC CLOCK FOR THE DURATION, the wall clock for the instant, both through
+        // `Env` like every other time read here. A duration measured from two wall-clock samples
+        // goes backwards across an NTP step, and a negative duration is refused by the health
+        // column.
+        timings.insert(
+            connector.id.clone(),
+            RunTiming {
+                started_at_unix_micros,
+                duration_ms: i64::try_from(
+                    env.clock()
+                        .monotonic()
+                        .saturating_duration_since(began)
+                        .as_millis(),
+                )
+                .unwrap_or(i64::MAX),
+            },
+        );
         runs.push((
             connector.id.clone(),
             attempt.unwrap_or(Outcome::TimedOut {
@@ -167,5 +205,17 @@ where
             }),
         ));
     }
-    SweepReport { runs }
+    SweepReport { runs, timings }
+}
+
+/// The wall clock, read through `Env` like every other timed thing here.
+fn now_micros(env: &Env) -> i64 {
+    i64::try_from(
+        env.clock()
+            .now_utc()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(i64::MAX)
 }

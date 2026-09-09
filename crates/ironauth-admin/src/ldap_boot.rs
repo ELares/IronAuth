@@ -223,6 +223,7 @@ impl SourceFactory for StoreSourceFactory<'_> {
 pub async fn sweep_scope(
     store: &Store,
     scope: Scope,
+    env: &Env,
     master: &MasterKey,
     limit: i64,
     snapshots: &ScopeSnapshots,
@@ -244,7 +245,8 @@ pub async fn sweep_scope(
         master,
         connectors,
     };
-    let report = crate::ldap_schedule::sweep(&factory, &scheduled, PER_CONNECTOR_DEADLINE).await;
+    let report =
+        crate::ldap_schedule::sweep(&factory, &scheduled, PER_CONNECTOR_DEADLINE, env).await;
     Ok(ScopeSweep {
         report,
         terms,
@@ -392,6 +394,7 @@ pub async fn apply_sweep(store: &Store, scope: Scope, env: &Env, sweep: &ScopeSw
                 "ldap sync produced a plan for a connector whose policy it does not have; nothing \
                  applied for it"
             );
+            applied.declined.insert(id.clone());
             continue;
         };
         let changes = ChangeSet::from_plan(plan, terms.policy);
@@ -435,6 +438,12 @@ pub struct Applied {
     /// people and failed on one" is the operator's question, and the scope-wide total cannot
     /// answer it.
     pub per_connector: BTreeMap<String, ExecuteReport>,
+    /// Connectors whose plan the applier DECLINED, because their terms were missing.
+    ///
+    /// Unreachable from any production sweep -- `sweep_scope` builds the runs and the terms from
+    /// one connector list -- and carried anyway, because the alternative is recording a fresh
+    /// success for a connector that synced nobody.
+    pub declined: BTreeSet<String>,
 }
 
 /// The set a connector may record as "what the directory held, and IronAuth agrees with".
@@ -526,7 +535,7 @@ pub async fn run_pass(
             .ldap_sync_snapshots()
             .all_in_scope()
             .await?;
-        let sweep = sweep_scope(store, scope, master, batch, &previous, &|connector| {
+        let sweep = sweep_scope(store, scope, env, master, batch, &previous, &|connector| {
             previous_for(&previous, connector)
         })
         .await?;
@@ -663,19 +672,33 @@ async fn record_health(
     applied: &Applied,
     report: &mut PassReport,
 ) {
-    let started = now_micros(env);
+    let fallback = now_micros(env);
     for (id, outcome) in &sweep.report.runs {
         let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(id, &scope) else {
+            unkeyable(id, report);
             continue;
         };
         let counts = applied.per_connector.get(id).cloned().unwrap_or_default();
-        let reason = outcome.failure().map(std::borrow::Cow::into_owned);
+        // A CONNECTOR THE APPLIER DECLINED IS NOT A SUCCESS, whatever the sweep made of it.
+        // Writing `planned` for it would zero its failure counter and refresh `last_success_at`
+        // -- a fresh success for a pass that synced nobody.
+        let declined = applied.declined.contains(id);
+        let reason = if declined {
+            Some(DECLINED_REASON)
+        } else {
+            category_of(outcome)
+        };
+        let timing = sweep.report.timings.get(id);
         let run = ironauth_store::NewLdapRun {
             connector_id: &connector,
-            started_at_unix_micros: started,
-            duration_ms: 0,
-            outcome: outcome_of(outcome),
-            error: reason.as_deref().map(truncate_reason),
+            started_at_unix_micros: timing.map_or(fallback, |t| t.started_at_unix_micros),
+            duration_ms: timing.map_or(0, |t| t.duration_ms),
+            outcome: if declined {
+                ironauth_store::LdapRunOutcome::Skipped
+            } else {
+                outcome_of(outcome)
+            },
+            error: reason,
             provisioned: clamp(counts.provisioned),
             already_present: clamp(counts.already_present),
             deactivated: clamp(counts.deactivated),
@@ -688,11 +711,12 @@ async fn record_health(
     }
     for id in &sweep.skipped {
         let Ok(connector) = ironauth_store::LdapConnectorId::parse_in_scope(id, &scope) else {
+            unkeyable(id, report);
             continue;
         };
         let run = ironauth_store::NewLdapRun {
             connector_id: &connector,
-            started_at_unix_micros: started,
+            started_at_unix_micros: fallback,
             duration_ms: 0,
             outcome: ironauth_store::LdapRunOutcome::Skipped,
             error: Some("the stored snapshot could not be opened"),
@@ -706,6 +730,19 @@ async fn record_health(
         };
         write_run(store, scope, env, &run, report).await;
     }
+}
+
+/// A report key that is not a connector id in this scope.
+///
+/// COUNTED AND LOGGED rather than dropped, for the reason the snapshot recorder gives next door:
+/// a connector with no health row leaves the previous pass's answer standing, and a counter that
+/// does not move keeps the boot loop quiet about it.
+fn unkeyable(id: &str, report: &mut PassReport) {
+    report.health_unrecorded += 1;
+    tracing::error!(
+        connector = %id,
+        "ldap sync cannot record health for a report key that is not a connector id in this scope"
+    );
 }
 
 /// One health row, counted whichever way it goes.
@@ -749,20 +786,27 @@ fn outcome_of(outcome: &Outcome) -> ironauth_store::LdapRunOutcome {
     }
 }
 
-/// The stored reason, cut to the column's ceiling on a character boundary.
+/// What the health row says when the applier declined a connector's plan.
+const DECLINED_REASON: &str =
+    "the connector's absence policy could not be resolved, so nothing was applied";
+
+/// The KIND of failure, as a fixed phrase, for the health row.
 ///
-/// A CEILING RATHER THAN A REFUSAL: a server that returns a long diagnostic must not cost the
-/// connector its health row, which is the row saying that server is the problem.
-fn truncate_reason(reason: &str) -> &str {
-    const CEILING: usize = 512;
-    if reason.len() <= CEILING {
-        return reason;
+/// NOT THE MESSAGE. A failure's `Display` interpolates whatever the directory or the mapper had
+/// to hand -- `SyncError::Mapping` carries a DN, `DuplicateStableId` carries two, `Referred`
+/// carries URLs -- and a DN carries a person's name and their place in an organization. The
+/// sibling snapshot table seals identifiers for exactly that reason; an unsealed column beside it
+/// holding the same text would give that seal away. The full message still reaches the log, where
+/// retention and access are already decided, and an operator who needs the detail looks there.
+///
+/// A FIXED SET, so the column is something a console can switch on rather than render raw.
+fn category_of(outcome: &Outcome) -> Option<&'static str> {
+    match outcome {
+        Outcome::Planned(_) => None,
+        Outcome::Unreachable(_) => Some("the directory could not be opened; see the log"),
+        Outcome::Failed(_) => Some("the directory read failed; see the log"),
+        Outcome::TimedOut { .. } => Some("the connector exceeded its deadline"),
     }
-    let mut end = CEILING;
-    while end > 0 && !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    &reason[..end]
 }
 
 /// A count as the health column holds it.

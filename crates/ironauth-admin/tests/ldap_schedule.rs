@@ -8,6 +8,7 @@ use ironauth_admin::ldap_groups::{GroupSource, Member};
 use ironauth_admin::ldap_mapping::DirectoryEntry;
 use ironauth_admin::ldap_schedule::{Scheduled, SourceFactory, sweep};
 use ironauth_admin::ldap_sync::{EntrySource, SyncInputs};
+use ironauth_env::Env;
 use serde_json::json;
 
 /// Generous, because no fixture here is slow; the deadline's own behaviour has its own test.
@@ -121,7 +122,7 @@ fn factory(unopenable: &[&str], failing_read: &[&str]) -> Factory {
 #[tokio::test]
 async fn a_connector_that_cannot_be_opened_does_not_stop_the_sweep() {
     let all = [scheduled("alpha"), scheduled("broken"), scheduled("gamma")];
-    let report = sweep(&factory(&["broken"], &[]), &all, DEADLINE).await;
+    let report = sweep(&factory(&["broken"], &[]), &all, DEADLINE, &Env::system()).await;
 
     assert_eq!(
         report.runs.len(),
@@ -156,7 +157,7 @@ async fn a_connector_that_cannot_be_opened_does_not_stop_the_sweep() {
 #[tokio::test]
 async fn a_read_that_fails_after_a_successful_bind_is_reported_as_a_failure_not_unreachable() {
     let all = [scheduled("alpha"), scheduled("flaky")];
-    let report = sweep(&factory(&[], &["flaky"]), &all, DEADLINE).await;
+    let report = sweep(&factory(&[], &["flaky"]), &all, DEADLINE, &Env::system()).await;
 
     assert!(report.runs[0].1.is_planned());
     let failures = report.failures();
@@ -183,7 +184,13 @@ async fn a_read_that_fails_after_a_successful_bind_is_reported_as_a_failure_not_
 #[tokio::test]
 async fn every_scheduled_connector_appears_in_the_report_even_when_all_of_them_fail() {
     let all = [scheduled("one"), scheduled("two")];
-    let report = sweep(&factory(&["one", "two"], &[]), &all, DEADLINE).await;
+    let report = sweep(
+        &factory(&["one", "two"], &[]),
+        &all,
+        DEADLINE,
+        &Env::system(),
+    )
+    .await;
 
     assert_eq!(report.runs.len(), 2);
     assert_eq!(report.failures().len(), 2);
@@ -198,7 +205,7 @@ async fn every_scheduled_connector_appears_in_the_report_even_when_all_of_them_f
 #[tokio::test]
 async fn a_healthy_sweep_plans_every_connector_in_order() {
     let all = [scheduled("alpha"), scheduled("beta"), scheduled("gamma")];
-    let report = sweep(&factory(&[], &[]), &all, DEADLINE).await;
+    let report = sweep(&factory(&[], &[]), &all, DEADLINE, &Env::system()).await;
 
     assert!(report.every_connector_planned());
     assert!(report.failures().is_empty());
@@ -209,7 +216,7 @@ async fn a_healthy_sweep_plans_every_connector_in_order() {
 /// An empty schedule is an empty report, not a failure.
 #[tokio::test]
 async fn a_sweep_with_nothing_scheduled_reports_nothing_and_succeeds() {
-    let report = sweep(&factory(&[], &[]), &[], DEADLINE).await;
+    let report = sweep(&factory(&[], &[]), &[], DEADLINE, &Env::system()).await;
     assert!(report.runs.is_empty());
     assert!(
         report.every_connector_planned(),
@@ -265,6 +272,7 @@ async fn a_refusal_inside_a_plan_survives_the_sweep() {
         },
         &[one],
         DEADLINE,
+        &Env::system(),
     )
     .await;
 
@@ -322,7 +330,13 @@ async fn a_connector_that_never_answers_is_abandoned_and_the_sweep_goes_on() {
     }
 
     let all = [scheduled("hangs"), scheduled("healthy")];
-    let report = sweep(&Hangs, &all, std::time::Duration::from_secs(1)).await;
+    let report = sweep(
+        &Hangs,
+        &all,
+        std::time::Duration::from_secs(1),
+        &Env::system(),
+    )
+    .await;
 
     assert_eq!(report.runs.len(), 2);
     assert!(

@@ -78098,6 +78098,11 @@ impl LdapRunRepo<'_> {
     ///
     /// As [`Self::in_scope`].
     pub async fn unhealthy_in_scope(&self) -> Result<Vec<LdapRunRecord>, StoreError> {
+        // FILTERED IN RUST, over the same rows the listing already fetches. The partial index
+        // exists for the day a scope holds enough connectors that the console wants the narrow
+        // read; today a scope holds a handful and a second query would cost more than the filter.
+        // The predicate here and the index's are the same two clauses, and
+        // `the_unhealthy_predicate_matches_the_index` pins that they stay so.
         Ok(self
             .in_scope()
             .await?

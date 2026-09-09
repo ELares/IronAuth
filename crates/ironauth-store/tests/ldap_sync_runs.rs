@@ -157,9 +157,10 @@ async fn a_successful_run_round_trips_with_its_counts() {
             health.deactivated,
             health.deleted,
             health.already_absent,
-            health.already_removed
+            health.already_removed,
+            health.apply_failures
         ),
-        (3, 40, 2, 1, 5, 6),
+        (3, 40, 2, 1, 5, 6, 0),
         "a count was lost or crossed with another"
     );
     assert_eq!(health.duration_ms, 1_200);
@@ -279,6 +280,11 @@ async fn a_reachable_connector_that_fails_every_principal_is_unhealthy() {
         .expect("present");
     assert_eq!(health.outcome, LdapRunOutcome::Planned, "it did bind");
     assert_eq!(health.consecutive_failures, 0, "and it did produce a plan");
+    assert_eq!(
+        health.apply_failures, 12,
+        "the failure COUNT is what an operator reads; a boolean satisfies is_healthy just as well \
+         and says nothing"
+    );
     assert!(
         !health.is_healthy(),
         "a connector failing every principal reads as healthy"
@@ -358,12 +364,34 @@ async fn an_outcome_outside_the_closed_set_is_refused() {
     )
     .await;
 
-    let refused =
-        sqlx::query("UPDATE ldap_sync_runs SET outcome = 'weird' WHERE connector_id = $1")
-            .bind(connector.to_string())
-            .execute(db.owner_pool())
-            .await;
+    // AND AN ERROR ALONGSIDE IT, so the row satisfies `ldap_sync_runs_error_matches_outcome`.
+    // Without that clause the UPDATE breaks two constraints at once and the OTHER one rejects it,
+    // which left this assertion green with the closed set deleted.
+    let refused = sqlx::query(
+        "UPDATE ldap_sync_runs SET outcome = 'weird', error = 'x' WHERE connector_id = $1",
+    )
+    .bind(connector.to_string())
+    .execute(db.owner_pool())
+    .await;
     assert!(refused.is_err(), "an unrenderable health state was stored");
+
+    // Every spelling the writer can produce IS in the set, so the constraint cannot be tightened
+    // out from under it either.
+    for spelling in ["planned", "unreachable", "failed", "timed_out", "skipped"] {
+        let error = if spelling == "planned" {
+            "NULL"
+        } else {
+            "'why'"
+        };
+        sqlx::query(&format!(
+            "UPDATE ldap_sync_runs SET outcome = '{spelling}', error = {error} \
+             WHERE connector_id = $1"
+        ))
+        .bind(connector.to_string())
+        .execute(db.owner_pool())
+        .await
+        .unwrap_or_else(|e| panic!("the writer's own spelling {spelling} was refused: {e}"));
+    }
 }
 
 /// AND AN OUTCOME AND ITS REASON CANNOT DISAGREE. A failure with no reason is a row an operator
@@ -475,4 +503,65 @@ async fn removing_the_connector_removes_its_health() {
         .expect("count")
         .get("c");
     assert_eq!(left, 0, "health outlived its directory");
+}
+
+/// THE UNHEALTHY PREDICATE AND ITS INDEX SAY THE SAME THING. `is_healthy` reads both the failure
+/// counter and the apply-failure count; an index on the counter alone would silently omit the
+/// connector that binds fine and fails to apply every principal -- the case this whole surface
+/// exists to make visible -- and the first author to build a listing from the index would ship
+/// that omission.
+#[tokio::test]
+async fn the_unhealthy_predicate_matches_the_index() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let connector = seed_connector(&db, &env, scope).await;
+
+    // The row the mismatch loses: reachable, planned, and failing every principal.
+    record(
+        &db,
+        &env,
+        scope,
+        &NewLdapRun {
+            apply_failures: 12,
+            ..run(&connector, now(&env), LdapRunOutcome::Planned, None)
+        },
+    )
+    .await;
+
+    let by_code = db
+        .control_store()
+        .scoped(scope)
+        .ldap_sync_runs()
+        .unhealthy_in_scope()
+        .await
+        .expect("read")
+        .len();
+    // The index's own predicate, read from the catalog rather than restated here, so a change to
+    // the migration moves this test rather than sliding past it.
+    let predicate: String = sqlx::query(
+        "SELECT pg_get_expr(i.indpred, i.indrelid) AS p FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'ldap_sync_runs_unhealthy_idx'",
+    )
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("read the index predicate")
+    .get("p");
+    let by_index: i64 = sqlx::query(&format!(
+        "SELECT count(*) AS c FROM ldap_sync_runs \
+         WHERE tenant_id = $1 AND environment_id = $2 AND ({predicate})"
+    ))
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_one(db.owner_pool())
+    .await
+    .expect("count by the index predicate")
+    .get("c");
+
+    assert_eq!(by_code, 1, "the code's unhealthy set missed it");
+    assert_eq!(
+        by_index, 1,
+        "the index predicate ({predicate}) disagrees with is_healthy, so a listing built on the \
+         index omits a connector the code calls unhealthy"
+    );
 }

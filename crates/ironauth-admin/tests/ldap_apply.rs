@@ -100,7 +100,10 @@ fn sweep(entries: Vec<(&str, SyncPlan, ApplyTerms)>) -> ScopeSweep {
         terms.insert(id.to_owned(), term);
     }
     ScopeSweep {
-        report: SweepReport { runs },
+        report: SweepReport {
+            runs,
+            timings: BTreeMap::new(),
+        },
         terms,
         skipped: Vec::new(),
     }
@@ -489,6 +492,7 @@ async fn a_plan_whose_policy_is_missing_applies_nothing() {
                     planned(&[("newby", "u-newby")], &["u-victim"]).await,
                 )),
             )],
+            timings: BTreeMap::new(),
         },
         terms: BTreeMap::new(),
         skipped: Vec::new(),
@@ -731,6 +735,7 @@ async fn the_audit_row_names_the_connector_that_provisioned() {
                     connector.to_string(),
                     Outcome::Planned(Box::new(planned(&[("audited", "u-audited")], &[]).await)),
                 )],
+                timings: BTreeMap::new(),
             },
             terms: BTreeMap::from([(
                 connector.to_string(),
