@@ -2,7 +2,7 @@
 
 //! Running every active connector, one pass each (issue #142).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ironauth_admin::ldap_groups::{GroupSource, Member};
 use ironauth_admin::ldap_mapping::DirectoryEntry;
@@ -14,6 +14,7 @@ use serde_json::json;
 struct Fake {
     people: Vec<DirectoryEntry>,
     fail_read: bool,
+    groups: BTreeMap<String, Vec<Member>>,
 }
 
 impl EntrySource for Fake {
@@ -35,8 +36,8 @@ impl EntrySource for Fake {
 impl GroupSource for Fake {
     type Error = ReadFailed;
 
-    async fn direct_members(&self, _group_dn: &str) -> Result<Vec<Member>, ReadFailed> {
-        Ok(Vec::new())
+    async fn direct_members(&self, group_dn: &str) -> Result<Vec<Member>, ReadFailed> {
+        Ok(self.groups.get(group_dn).cloned().unwrap_or_default())
     }
 }
 
@@ -62,6 +63,7 @@ impl From<ReadFailed> for ironauth_admin::ldap_sync::SyncError {
 struct Factory {
     unopenable: BTreeSet<String>,
     failing_read: BTreeSet<String>,
+    groups: BTreeMap<String, Vec<Member>>,
 }
 
 impl SourceFactory for Factory {
@@ -73,8 +75,9 @@ impl SourceFactory for Factory {
             return Err(format!("bind refused for {}", scheduled.id));
         }
         Ok(Fake {
-            people: vec![person(&format!("{}-user", scheduled.id))],
+            people: vec![person(&format!("{}-user", scheduled.id)), person("hidden")],
             fail_read: self.failing_read.contains(&scheduled.id),
+            groups: self.groups.clone(),
         })
     }
 }
@@ -107,6 +110,7 @@ fn factory(unopenable: &[&str], failing_read: &[&str]) -> Factory {
     Factory {
         unopenable: unopenable.iter().map(|s| (*s).to_owned()).collect(),
         failing_read: failing_read.iter().map(|s| (*s).to_owned()).collect(),
+        groups: BTreeMap::new(),
     }
 }
 
@@ -126,6 +130,17 @@ async fn a_connector_that_cannot_be_opened_does_not_stop_the_sweep() {
     assert_eq!(
         report.failures(),
         vec![("broken", "bind refused for broken")]
+    );
+    // THE OTHER DIRECTION OF THE DISTINCTION. `failures()` merges the two arms, so every
+    // assertion above is variant-blind: turning this Unreachable into a Failed -- the direction
+    // a simplifying refactor takes -- failed no test and passed pedantic clippy, because an
+    // unconstructed pub variant of a pub enum raises no dead_code.
+    assert!(
+        matches!(
+            report.runs[1].1,
+            ironauth_admin::ldap_schedule::Outcome::Unreachable(_)
+        ),
+        "a refused bind is Unreachable, not Failed"
     );
     assert!(!report.every_connector_planned());
 }
@@ -195,5 +210,77 @@ async fn a_sweep_with_nothing_scheduled_reports_nothing_and_succeeds() {
     assert!(
         report.every_connector_planned(),
         "vacuously true, and it must not be reported as a failure"
+    );
+}
+
+/// THE SWEEP MUST NOT LAUNDER A PLAN'S REFUSAL.
+///
+/// Every other assertion in this file stops at `is_planned()`, a boolean over the variant tag.
+/// Nothing read the plan itself, so a sweep that rebuilt each `SyncPlan` -- or replaced its
+/// `departures` with `Ok(default)` -- passed all five tests while discarding the one signal the
+/// whole chain exists to carry.
+///
+/// Here the connector's group walk is cut by its depth bound, so the pass produces a plan whose
+/// departures are REFUSED, and the sweep has to hand that refusal through untouched.
+#[tokio::test]
+async fn a_refusal_inside_a_plan_survives_the_sweep() {
+    let mut groups = BTreeMap::new();
+    groups.insert(
+        "cn=all,ou=Groups,dc=example,dc=test".to_owned(),
+        vec![
+            Member {
+                dn: "uid=truncating-user,ou=People,dc=example,dc=test".to_owned(),
+                is_group: false,
+            },
+            Member {
+                dn: "cn=nested,ou=Groups,dc=example,dc=test".to_owned(),
+                is_group: true,
+            },
+        ],
+    );
+    groups.insert(
+        "cn=nested,ou=Groups,dc=example,dc=test".to_owned(),
+        vec![Member {
+            dn: "uid=hidden,ou=People,dc=example,dc=test".to_owned(),
+            is_group: false,
+        }],
+    );
+
+    let mut one = scheduled("truncating");
+    one.inputs.group_roots = vec!["cn=all,ou=Groups,dc=example,dc=test".to_owned()];
+    one.inputs.max_group_depth = 0;
+    one.previous = ["u-truncating-user".to_owned(), "u-hidden".to_owned()]
+        .into_iter()
+        .collect();
+
+    let report = sweep(
+        &Factory {
+            unopenable: BTreeSet::new(),
+            failing_read: BTreeSet::new(),
+            groups,
+        },
+        &[one],
+    )
+    .await;
+
+    let ironauth_admin::ldap_schedule::Outcome::Planned(plan) = &report.runs[0].1 else {
+        panic!(
+            "the connector should have produced a plan: {:?}",
+            report.runs[0].1
+        );
+    };
+    assert!(
+        !plan.groups_complete,
+        "the fixture must actually truncate, or this test pins nothing"
+    );
+    assert_eq!(
+        plan.departures
+            .as_ref()
+            .expect_err("a truncated walk cannot name departures"),
+        &ironauth_admin::ldap_diff::DepartureRefusal::ObservationIncomplete
+    );
+    assert!(
+        report.every_connector_planned(),
+        "a refused departure set is not a failed connector: the sweep succeeded"
     );
 }
