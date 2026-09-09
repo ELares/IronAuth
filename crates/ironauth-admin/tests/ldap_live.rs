@@ -22,8 +22,9 @@
 //! cargo test -p ironauth-admin --all-features --test ldap_live -- --ignored
 //! ```
 //!
-//! CI does not set these yet: the containerised directory fixture is a separate criterion of
-//! #142 and is not claimed here.
+//! CI SETS THEM, in the `ldap-live` job, against the committed fixture in `deploy/fixtures/ldap`.
+//! They remain `#[ignore]`d so every other lane reports them as not-run rather than green, which
+//! is the same reasoning: a tick that means "did not run" is worse than a missing test.
 //!
 //! # What the fixture has to provide
 //!

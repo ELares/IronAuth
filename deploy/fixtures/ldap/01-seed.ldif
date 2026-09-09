@@ -1,0 +1,96 @@
+# The directory fixture for issue #142's live tests. See README.md for why each entry exists.
+#
+# Loaded by the image's bootstrap, which has already created `dc=example,dc=test` and
+# `cn=admin,dc=example,dc=test` from LDAP_DOMAIN and LDAP_ADMIN_PASSWORD.
+
+# THE BIND IDENTITY the sweep uses. Its search limits are in 02-limits.ldif, because they are
+# `cn=config` rather than data and the two are applied by different mechanisms.
+dn: cn=svc,dc=example,dc=test
+objectClass: person
+cn: svc
+sn: svc
+userPassword: svcpw
+
+dn: ou=People,dc=example,dc=test
+objectClass: organizationalUnit
+ou: People
+
+dn: ou=Groups,dc=example,dc=test
+objectClass: organizationalUnit
+ou: Groups
+
+dn: ou=Referrals,dc=example,dc=test
+objectClass: organizationalUnit
+ou: Referrals
+
+# FIVE PEOPLE, which is three more than `cn=svc`'s soft size limit: an unpaged search of this
+# subtree is refused and a paged one succeeds, and that asymmetry is what makes the paging test
+# able to fail.
+dn: uid=alan,ou=People,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: alan
+cn: Alan Turing
+sn: Turing
+mail: alan@example.test
+
+# THE NON-TEXT ATTRIBUTE. Sixteen bytes that are not valid UTF-8, so the mapper's octet-string
+# path is exercised by a real server rather than by a belief about one.
+dn: uid=grace,ou=People,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: grace
+cn: Grace Hopper
+sn: Hopper
+mail: grace@example.test
+jpegPhoto:: ABEiM0RVZneImaq7zN3u/w==
+
+dn: uid=edsger,ou=People,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: edsger
+cn: Edsger Dijkstra
+sn: Dijkstra
+mail: edsger@example.test
+
+dn: uid=barbara,ou=People,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: barbara
+cn: Barbara Liskov
+sn: Liskov
+mail: barbara@example.test
+
+# THE LOGIN IS NOT THE DISPLAY NAME. `uid` and `cn` differ here, so a mapper that read the wrong
+# attribute would provision "Ada Byron" as a login.
+dn: uid=ada.lovelace,ou=People,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: ada.lovelace
+cn: Ada Byron
+sn: Byron
+mail: ada@example.test
+
+# A REAL MEMBERSHIP CYCLE: each group is a member of the other. The walk must terminate and say
+# it revisited, and a fixture without one cannot tell a cycle detector from its absence.
+dn: cn=engineering,ou=Groups,dc=example,dc=test
+objectClass: groupOfNames
+cn: engineering
+member: uid=grace,ou=People,dc=example,dc=test
+member: cn=all-staff,ou=Groups,dc=example,dc=test
+
+dn: cn=all-staff,ou=Groups,dc=example,dc=test
+objectClass: groupOfNames
+cn: all-staff
+member: uid=ada.lovelace,ou=People,dc=example,dc=test
+member: cn=engineering,ou=Groups,dc=example,dc=test
+
+dn: uid=here,ou=Referrals,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: here
+cn: Here Person
+sn: Person
+
+# A CONTINUATION REFERENCE. A subtree search under ou=Referrals returns this alongside the entry
+# above, so a client that treated a partial answer as a complete one would read the directory as
+# smaller than it is -- which, on the departure path, reads as people having left.
+dn: ou=Elsewhere,ou=Referrals,dc=example,dc=test
+objectClass: referral
+objectClass: extensibleObject
+ou: Elsewhere
+ref: ldap://other.example.test/ou=Elsewhere,ou=Referrals,dc=example,dc=test??sub

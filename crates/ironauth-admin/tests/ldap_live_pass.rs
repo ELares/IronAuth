@@ -9,7 +9,8 @@
 //! stand in for it, because the thing under test is precisely that those parts are connected.
 //!
 //! `#[ignore]`d for the reason [`ldap_live`](../ldap_live.rs) states: a green tick meaning "did
-//! not run" is worse than a missing test, and the harness already has a word for not-run.
+//! not run" is worse than a missing test, and the harness already has a word for not-run. CI runs
+//! it in the `ldap-live` job, against the committed fixture in `deploy/fixtures/ldap`.
 //!
 //! ```text
 //! export IRONAUTH_LDAP_URL=ldap://<host>:<port>

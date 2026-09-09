@@ -1252,6 +1252,126 @@ jobs:
         working-directory: packages/ironauth-bff
         run: npm test
 
+  ldap-live:
+    # Issue #142's first criterion: the sync runs against a REAL directory, not a fake.
+    #
+    # ITS OWN LANE, and the reason is the same one the experimental-prototypes lane gives. These
+    # tests are `#[ignore]`d in every other job because they need a server; a failure here means
+    # "the directory, or our reading of the LDAP protocol, moved", which is a different question
+    # from "IronAuth regressed" and belongs under a name that says so.
+    #
+    # THE FIXTURE IS COMMITTED, in deploy/fixtures/ldap. Every entry in it exists because a test
+    # cannot fail without it -- the size limit that makes an unpaged search fail while a paged
+    # one succeeds, the two groups that are members of each other, the non-UTF-8 photo, the
+    # referral. That file is the fixture's definition; this job is only the wiring.
+    #
+    # NOT SERVICE CONTAINERS. Service containers start before the checkout, so they cannot be
+    # given a seed from the repository. The seed is applied after the server is up instead, which
+    # also means a bad LDIF fails as a loud ldapadd error rather than as a container that exits
+    # during its own bootstrap.
+    name: ldap live (real slapd, issue #142)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --shm-size=1g
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      IRONAUTH_TEST_DB_DISPOSABLE: "1"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # The TLS-capable server, and a SECOND one built with TLS switched off. The second is not a
+      # duplicate: one of the properties under test is that a StartTLS upgrade a server DECLINES
+      # does not fall back to binding in the clear, and only a server with no TLS at all answers
+      # that request with `protocolError`.
+      IRONAUTH_LDAP_URL: ldap://127.0.0.1:3389
+      IRONAUTH_LDAP_PLAINTEXT_URL: ldap://127.0.0.1:3390
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the LDAP client tools the seed step uses
+        run: sudo apt-get update && sudo apt-get install -y ldap-utils
+      - name: Start slapd
+        run: |
+          docker run -d --name ironauth-ldap -p 3389:389 \
+            -e LDAP_ORGANISATION=Example \
+            -e LDAP_DOMAIN=example.test \
+            -e LDAP_ADMIN_PASSWORD=adminpw \
+            osixia/openldap:1.5.0
+          # AND ONE WITH NO TLS MATERIAL AT ALL, which is what makes it answer StartTLS with
+          # protocolError rather than upgrading.
+          docker run -d --name ironauth-ldap-plain -p 3390:389 \
+            -e LDAP_ORGANISATION=Example \
+            -e LDAP_DOMAIN=example.test \
+            -e LDAP_ADMIN_PASSWORD=adminpw \
+            -e LDAP_TLS=false \
+            osixia/openldap:1.5.0
+      - name: Wait for both servers
+        # A FIXED SLEEP WOULD BE A FLAKE. The image bootstraps its database on first start, and
+        # how long that takes depends on the runner; polling the bind is the only signal that
+        # says the server is actually answering.
+        run: |
+          for port in 3389 3390; do
+            ready=""
+            for _ in $(seq 1 60); do
+              if ldapwhoami -x -H "ldap://127.0.0.1:${port}" \
+                   -D "cn=admin,dc=example,dc=test" -w adminpw >/dev/null 2>&1; then
+                ready=yes; break
+              fi
+              sleep 2
+            done
+            if [ -z "$ready" ]; then
+              echo "::error::slapd on ${port} never accepted a bind"
+              docker logs ironauth-ldap; docker logs ironauth-ldap-plain
+              exit 1
+            fi
+          done
+      - name: Seed the fixture
+        # The DATA over a normal bind, then the cn=config half over ldapi:/// as EXTERNAL, which
+        # has to run inside the container because that socket is not exposed.
+        run: |
+          ldapadd -x -H ldap://127.0.0.1:3389 \
+            -D "cn=admin,dc=example,dc=test" -w adminpw \
+            -f deploy/fixtures/ldap/01-seed.ldif
+          docker cp deploy/fixtures/ldap/02-config.ldif ironauth-ldap:/tmp/02-config.ldif
+          docker exec ironauth-ldap ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02-config.ldif
+      - name: The fixture is the fixture
+        # ASSERTED BEFORE THE SUITE RUNS. Both halves of the paging asymmetry are properties of
+        # the fixture rather than of IronAuth, and if the seed ever stops producing them the
+        # paging test starts passing for the wrong reason -- a client that never sends the
+        # control would satisfy it. This fails the job with a message naming the fixture instead.
+        run: |
+          set +e
+          ldapsearch -x -H ldap://127.0.0.1:3389 -D "cn=svc,dc=example,dc=test" -w svcpw \
+            -b "ou=People,dc=example,dc=test" "(objectClass=inetOrgPerson)" dn >/tmp/unpaged 2>&1
+          set -e
+          grep -q "^result: 4 Size limit exceeded" /tmp/unpaged || {
+            echo "::error::the unpaged search was not refused; the fixture's size limit is gone"
+            cat /tmp/unpaged; exit 1; }
+          paged=$(ldapsearch -x -E pr=2/noprompt -H ldap://127.0.0.1:3389 \
+            -D "cn=svc,dc=example,dc=test" -w svcpw \
+            -b "ou=People,dc=example,dc=test" "(objectClass=inetOrgPerson)" dn \
+            | grep -c "^dn: uid" || true)
+          [ "$paged" = "5" ] || {
+            echo "::error::a paged search returned ${paged} people, not the fixture's five"; exit 1; }
+      - name: The protocol tests
+        run: cargo test -p ironauth-admin --all-features --test ldap_live -- --ignored
+      - name: A whole pass, stored row to written account
+        run: cargo test -p ironauth-admin --all-features --test ldap_live_pass -- --ignored
+      - name: slapd logs on failure
+        if: failure()
+        run: docker logs ironauth-ldap; docker logs ironauth-ldap-plain
+
   experimental-prototypes:
     # Issue #133: the version-tagged draft prototypes, in their OWN lane.
     #

@@ -1,0 +1,28 @@
+# The `cn=config` half of the fixture (issue #142): what `cn=svc` may READ, and how much of it.
+#
+# Applied with ldapmodify over ldapi:/// as EXTERNAL after the server is up, because the
+# bootstrap directory the image reads holds DATA only -- these are server configuration.
+
+# THE SERVICE ACCOUNT MUST BE ABLE TO READ THE TREE. The image's default ACL ends with
+# `to * by self read by dn="cn=admin,..." write by * none`, so a bound `cn=svc` can read its own
+# entry and nothing else -- and OpenLDAP reports a denied read as `noSuchObject` (32), not as a
+# permission error, so the symptom is a directory that looks EMPTY. An empty directory read is
+# exactly the shape `ldap_diff` refuses as "everybody vanished", so without this the live tests
+# would exercise the refusal path instead of the paging path they exist for.
+#
+# Inserted BEFORE the default catch-all: olcAccess is ordered and the first match wins.
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcAccess
+olcAccess: {2}to dn.subtree="dc=example,dc=test" by dn.exact="cn=svc,dc=example,dc=test" read by * break
+
+# THE SEARCH LIMITS that make the paging test able to fail.
+#
+# size.soft=2 with five people under ou=People means an UNPAGED search is refused with
+# `sizeLimitExceeded` (LDAP result 4), while size.prtotal=unlimited lets a PAGED one walk the
+# whole set. Without the asymmetry a client that never sends the RFC 2696 control would pass the
+# paging test, which is the defect that test exists to catch.
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcLimits
+olcLimits: dn.exact="cn=svc,dc=example,dc=test" size.soft=2 size.hard=2 size.prtotal=unlimited size.pr=unlimited
