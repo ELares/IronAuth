@@ -82,6 +82,10 @@ fn every_transport_mode_maps_to_itself() {
 /// expansion. A blank `group_base_dn` turned into `vec![""]` would make every pass for that
 /// connector fail on a DN nothing resolves -- when what the operator meant is "no group scoping,
 /// everyone under the user base counts".
+///
+/// A ROW CAN NOW HOLD THIS. Until migration 0213 the column refused a blank group base, so this
+/// test pinned behaviour no stored connector could reach; `ldap_connectors.rs` covers the storage
+/// half.
 #[test]
 fn a_blank_group_base_means_no_group_scoping_rather_than_one_empty_root() {
     let inputs = inputs_for(&connector(LdapTlsMode::Ldaps, 636, "", 5));

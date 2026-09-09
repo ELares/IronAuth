@@ -1745,6 +1745,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0212_ldap_connectors.sql"),
         },
+        Migration {
+            version: 213,
+            name: "ldap_connector_optional_groups",
+            // EXPAND. It widens what an existing column accepts and changes no row. An older
+            // binary reading a blank group base already takes the no-roots branch, which
+            // predates this migration.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0213_ldap_connector_optional_groups.sql"),
+        },
     ]
 }
 

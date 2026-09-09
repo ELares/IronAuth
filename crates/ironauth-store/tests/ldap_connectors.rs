@@ -566,3 +566,112 @@ async fn the_control_update_grant_is_scoped_to_the_columns_a_statement_writes() 
         );
     }
 }
+
+/// A USERS-ONLY CONNECTOR IS REPRESENTABLE (0213). 0212 required a group base and a group filter,
+/// which made the commonest first rollout -- sync the people, map groups to roles later --
+/// impossible to store. Inventing a group base to satisfy the constraint is worse than leaving it
+/// out: a DN with no groups under it reads as a group with no members, and the sync then finds
+/// nobody, which is the empty-directory shape the diff exists to refuse.
+#[tokio::test]
+async fn a_connector_may_sync_users_and_no_groups() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({ "userName": "uid" });
+
+    db.control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(
+            &env,
+            NewLdapConnector {
+                group_base_dn: "",
+                group_filter: "",
+                ..spec(&id, &org, &mapping)
+            },
+        )
+        .await
+        .expect("a users-only connector is storable");
+
+    let read = db
+        .control_store()
+        .scoped(scope)
+        .ldap_connectors()
+        .get(&id)
+        .await
+        .expect("read the connector");
+    assert_eq!(
+        read.group_base_dn, "",
+        "the blank group base did not survive"
+    );
+    assert_eq!(read.group_filter, "");
+    assert_eq!(
+        read.user_base_dn, "ou=people,dc=contoso,dc=test",
+        "relaxing the group columns must not relax the user base"
+    );
+}
+
+/// AND THE USER BASE STAYS REQUIRED. A connector with nothing to read is not a configuration,
+/// and 0213 relaxed only the group half.
+#[tokio::test]
+async fn a_connector_with_no_user_base_is_still_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({ "userName": "uid" });
+
+    let refused = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(
+            &env,
+            NewLdapConnector {
+                user_base_dn: "",
+                ..spec(&id, &org, &mapping)
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a connector with no user base was accepted"
+    );
+}
+
+/// A GROUP BASE WITH NO FILTER IS STILL REFUSED. The two travel together: a base says where to
+/// look and the filter says what counts, so a base with an empty filter is half a configuration.
+/// Without this half of 0213's check, relaxing the filter would have silently permitted it.
+#[tokio::test]
+async fn a_group_base_without_a_filter_is_refused() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let org = seed_org(&db, &env, scope, "Contoso").await;
+    let id = LdapConnectorId::generate(&env, &scope);
+    let mapping = serde_json::json!({ "userName": "uid" });
+
+    let refused = db
+        .control_store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ldap_connectors()
+        .create(
+            &env,
+            NewLdapConnector {
+                group_base_dn: "ou=groups,dc=contoso,dc=test",
+                group_filter: "",
+                ..spec(&id, &org, &mapping)
+            },
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a group base with no group filter was accepted"
+    );
+}

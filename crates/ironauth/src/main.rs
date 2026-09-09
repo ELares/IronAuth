@@ -372,6 +372,9 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
         let ldap_sweep_master = ldap_sweep
             .as_ref()
             .and_then(|_| resolve_master_key(&config));
+        // AND THE ENVIRONMENT, for the same reason: `env` moves into `Server::new` too, and the
+        // applier needs a clock and entropy to mint the user ids it writes.
+        let ldap_sweep_env = env.clone();
         let certificate_pin = certificate_pin_inputs(&config, &env);
         // Capture what the one-shot signing-algorithm backfill (issue #93) needs before
         // config moves into the server (only when its switch is on). Runs before serving.
@@ -547,13 +550,15 @@ fn serve(args: &mut impl Iterator<Item = String>) -> ExitCode {
             Some(inputs) => start_certificate_sweep(inputs).await,
             None => None,
         };
-        // THE LDAP SWEEP (issue #142). Its own switch, like every other worker here. It PLANS
-        // only: a pass reads each configured directory and produces what a sync would do, and
-        // nothing applies it. What that buys before the applier exists is the operator signal --
-        // a connector nobody can bind to, a directory whose group walk is truncated -- which is
-        // the state that must not first be discovered by a mass deprovisioning.
+        // THE LDAP SWEEP (issue #142). Its own switch, like every other worker here. A pass reads
+        // each configured directory, works out what a sync would do, and APPLIES it through the
+        // user lifecycle. It provisions and does not yet remove: absence detection needs a stored
+        // snapshot of the previous pass, which this does not own, so every principal reads as an
+        // arrival (see `run_pass`). The operator signal a pass carried before the applier existed
+        // -- a connector nobody can bind to, a directory whose group walk is truncated -- is still
+        // the reason a pass that writes nothing is worth logging.
         let ldap_sweep = match ldap_sweep {
-            Some(inputs) => start_ldap_sweep(inputs, ldap_sweep_master).await,
+            Some(inputs) => start_ldap_sweep(inputs, ldap_sweep_env, ldap_sweep_master).await,
             None => None,
         };
         // THE PIN WORKER (issue #141). The renewal surface is the only thing that fills its
@@ -3813,6 +3818,7 @@ fn ldap_sweep_inputs(config: &Config, control_dsn: &str) -> Option<LdapSweepInpu
 /// Start the LDAP sweep, if this process runs it.
 async fn start_ldap_sweep(
     inputs: LdapSweepInputs,
+    env: Env,
     master: Option<std::sync::Arc<MasterKey>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let LdapSweepInputs {
@@ -3847,19 +3853,27 @@ async fn start_ldap_sweep(
             match ironauth_admin::ldap_boot::run_pass(
                 &control_store,
                 scopes.as_ref(),
+                &env,
                 &master,
                 batch,
             )
             .await
             {
                 Ok(report) => {
-                    if report.failed > 0 || report.refusing_departures > 0 {
+                    let needs_attention = report.failed > 0
+                        || report.refusing_departures > 0
+                        || !report.applied.everything_applied();
+                    if needs_attention {
                         tracing::warn!(
                             scopes = report.scopes,
                             planned = report.planned,
                             failed = report.failed,
                             refusing_departures = report.refusing_departures,
                             rename_fragile = report.rename_fragile,
+                            provisioned = report.applied.provisioned,
+                            deactivated = report.applied.deactivated,
+                            deleted = report.applied.deleted,
+                            apply_failures = report.applied.failures.len(),
                             "ldap sync pass finished with connectors that need attention"
                         );
                     } else {
@@ -3867,6 +3881,9 @@ async fn start_ldap_sweep(
                             scopes = report.scopes,
                             planned = report.planned,
                             rename_fragile = report.rename_fragile,
+                            provisioned = report.applied.provisioned,
+                            deactivated = report.applied.deactivated,
+                            deleted = report.applied.deleted,
                             "ldap sync pass finished"
                         );
                     }

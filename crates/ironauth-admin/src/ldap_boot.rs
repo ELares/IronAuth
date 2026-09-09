@@ -23,15 +23,19 @@
 //! What must never happen is a failure that renders as an empty directory, because an empty
 //! directory is read as everybody having left.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ironauth_env::Env;
 use ironauth_jose::MasterKey;
 use ironauth_store::outbox::ScopeSource;
-use ironauth_store::{LdapConnector, LdapTlsMode, Scope, Store, StoreError};
+use ironauth_store::{
+    ActorRef, LdapAbsencePolicy, LdapConnector, LdapTlsMode, Scope, ServiceId, Store, StoreError,
+};
 
+use crate::ldap_changeset::ChangeSet;
 use crate::ldap_client::{Directory, DirectoryConfig, TlsMode};
-use crate::ldap_schedule::{Scheduled, SourceFactory};
+use crate::ldap_execute::{ExecuteReport, execute};
+use crate::ldap_schedule::{Outcome, Scheduled, SourceFactory, SweepReport};
 use crate::ldap_sync::SyncInputs;
 
 /// How long to wait for a directory to answer a connect.
@@ -87,6 +91,10 @@ pub async fn scheduled_for_scope(
 /// `group_roots` is empty when the connector names no group base, which the sync reads as "every
 /// person under the user base is in scope". A group base of `""` would otherwise become a root
 /// DN nothing resolves, and an unresolvable root now aborts the walk.
+///
+/// Migration 0213 is what makes this branch reachable: 0212 required a non-empty `group_base_dn`,
+/// so until then a users-only connector could not be stored and this arm could not be taken by
+/// any row.
 #[must_use]
 pub fn inputs_for(connector: &LdapConnector) -> SyncInputs {
     let group_roots = if connector.group_base_dn.trim().is_empty() {
@@ -215,7 +223,7 @@ pub async fn sweep_scope(
     master: &MasterKey,
     limit: i64,
     previous: &(dyn Fn(&LdapConnector) -> BTreeSet<String> + Sync),
-) -> Result<crate::ldap_schedule::SweepReport, StoreError> {
+) -> Result<ScopeSweep, StoreError> {
     let connectors = store
         .scoped(scope)
         .ldap_connectors()
@@ -229,13 +237,54 @@ pub async fn sweep_scope(
             inputs: inputs_for(connector),
         })
         .collect();
+    let terms: BTreeMap<String, ApplyTerms> = connectors
+        .iter()
+        .map(|connector| (connector.id.to_string(), terms_for(connector)))
+        .collect();
     let factory = StoreSourceFactory {
         store,
         scope,
         master,
         connectors,
     };
-    Ok(crate::ldap_schedule::sweep(&factory, &scheduled, PER_CONNECTOR_DEADLINE).await)
+    let report = crate::ldap_schedule::sweep(&factory, &scheduled, PER_CONNECTOR_DEADLINE).await;
+    Ok(ScopeSweep { report, terms })
+}
+
+/// A sweep, plus what the applier needs about each connector that produced a plan.
+///
+/// The two travel together because the connector rows are read ONCE, in the sweep. Reading them a
+/// second time in the applier would be two reads of a table an operator can edit between them,
+/// and the pass would apply one connector's plan under another connector's policy.
+#[derive(Debug)]
+pub struct ScopeSweep {
+    /// One entry per scheduled connector.
+    pub report: SweepReport,
+    /// Keyed by connector id, exactly as [`SweepReport::runs`] is.
+    pub terms: BTreeMap<String, ApplyTerms>,
+}
+
+/// What applying a connector's plan needs, beyond the plan.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyTerms {
+    /// Deactivate (the default) or delete, per the connector row.
+    pub policy: LdapAbsencePolicy,
+    /// Who the audit log names for the writes.
+    pub actor: ActorRef,
+}
+
+/// The apply terms of one connector row.
+///
+/// THE ACTOR IS SEEDED FROM THE CONNECTOR ID, not generated. Every write this connector ever makes
+/// then carries one service actor, so the audit log answers "what has this directory done to my
+/// users" with a single filter. A freshly generated id per pass would scatter one connector's
+/// history across as many actors as it has run passes.
+#[must_use]
+pub fn terms_for(connector: &LdapConnector) -> ApplyTerms {
+    ApplyTerms {
+        policy: connector.absence_policy,
+        actor: ActorRef::service(ServiceId::from_seed_bytes(connector.id.unique_bytes())),
+    }
 }
 
 /// The clock is read through `Env` like every other timed thing here.
@@ -252,7 +301,7 @@ pub fn now_micros(env: &Env) -> i64 {
 }
 
 /// What one pass over every scope observed.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct PassReport {
     /// Scopes read.
     pub scopes: usize,
@@ -264,19 +313,71 @@ pub struct PassReport {
     pub refusing_departures: usize,
     /// Principals identified only by their DN, across every plan.
     pub rename_fragile: usize,
+    /// What was written, summed over every connector in the pass.
+    pub applied: ExecuteReport,
 }
 
-/// Run one sweep across every scope the source enumerates.
+/// Apply every plan a scope sweep produced.
 ///
-/// WRITES NOTHING, and that is not a placeholder: the applier is a separate decision with
-/// different authority, and the connector's `absence_policy` belongs to it. A pass today produces
-/// plans, counts them, and drops them. What it buys before the applier exists is the operator
-/// signal -- a connector nobody can bind to, a directory whose group walk is truncated -- which
-/// is exactly the state that must not be discovered later by a mass deprovisioning.
+/// Separate from [`run_pass`] because this half needs no directory: a caller can hand it a sweep
+/// it built, which is the only way the applied-versus-planned properties are testable without a
+/// live LDAP server.
 ///
-/// The previous snapshot is empty for every connector until the applier owns one, so every
-/// principal reads as an arrival and no departure is ever computed. Stated here rather than
-/// implied, because "0 departures" from this pass means "not asked", not "nobody left".
+/// A connector whose plan carries no terms is SKIPPED rather than defaulted. The only way that
+/// happens is a report and a term map that disagree, and guessing a policy -- particularly the
+/// irreversible one -- from a disagreement is not a guess worth making.
+pub async fn apply_sweep(
+    store: &Store,
+    scope: Scope,
+    env: &Env,
+    sweep: &ScopeSweep,
+) -> ExecuteReport {
+    let mut total = ExecuteReport::default();
+    for (id, outcome) in &sweep.report.runs {
+        let Outcome::Planned(plan) = outcome else {
+            continue;
+        };
+        let Some(terms) = sweep.terms.get(id) else {
+            tracing::error!(
+                connector = %id,
+                "ldap sync produced a plan for a connector whose policy it does not have; nothing \
+                 applied for it"
+            );
+            continue;
+        };
+        let changes = ChangeSet::from_plan(plan, terms.policy);
+        if let Some(refusal) = &changes.withheld {
+            tracing::warn!(
+                connector = %id,
+                reason = %refusal,
+                "ldap sync withheld every removal for this connector"
+            );
+        }
+        let report = execute(store, scope, env, terms.actor, &changes).await;
+        for (principal, error) in &report.failures {
+            tracing::warn!(
+                connector = %id,
+                principal = %principal,
+                %error,
+                "ldap sync could not apply one change; the rest of the connector continued"
+            );
+        }
+        total.absorb(report);
+    }
+    total
+}
+
+/// Run one sweep across every scope the source enumerates, and apply what it plans.
+///
+/// # The previous snapshot is empty, so no departure is ever computed
+///
+/// Every connector is swept against an empty previous set, which makes every principal an arrival
+/// and leaves the departure set empty. A pass therefore PROVISIONS and never removes. That is a
+/// deliberate intermediate state, not an oversight: absence detection needs a snapshot of what the
+/// last pass saw, that snapshot is a stored artifact this pass does not yet own, and inferring one
+/// from the accounts that happen to carry an external id would deactivate every SCIM-provisioned
+/// user the moment an LDAP connector is added. Stated here rather than implied, because
+/// "0 removals" from this pass means "not asked", not "nobody left".
 ///
 /// # Errors
 ///
@@ -286,6 +387,7 @@ pub struct PassReport {
 pub async fn run_pass(
     store: &Store,
     scopes: &dyn ScopeSource,
+    env: &Env,
     master: &MasterKey,
     batch: i64,
 ) -> Result<PassReport, StoreError> {
@@ -293,9 +395,9 @@ pub async fn run_pass(
     for scope in scopes.scopes().await? {
         report.scopes += 1;
         let sweep = sweep_scope(store, scope, master, batch, &|_| BTreeSet::new()).await?;
-        for (id, outcome) in &sweep.runs {
+        for (id, outcome) in &sweep.report.runs {
             match outcome {
-                crate::ldap_schedule::Outcome::Planned(plan) => {
+                Outcome::Planned(plan) => {
                     report.planned += 1;
                     report.rename_fragile += plan.rename_fragile;
                     if plan.departures.is_err() {
@@ -318,6 +420,9 @@ pub async fn run_pass(
                 }
             }
         }
+        report
+            .applied
+            .absorb(apply_sweep(store, scope, env, &sweep).await);
     }
     Ok(report)
 }
