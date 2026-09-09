@@ -376,6 +376,13 @@ name = "ldap_connectors"
 path = "tests/ldap_connectors.rs"
 required-features = ["testing"]
 
+# What the last completed pass saw in a directory (issue #142): sealed, bound to its connector,
+# and "no snapshot" distinguishable from "a snapshot of nobody".
+[[test]]
+name = "ldap_sync_snapshots"
+path = "tests/ldap_sync_snapshots.rs"
+required-features = ["testing"]
+
 # Same-transaction atomicity: a mid-transaction failure leaves no orphan data
 # row and no orphan audit row, and the inverse. Needs a real database.
 [[test]]

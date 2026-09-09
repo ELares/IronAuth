@@ -195,18 +195,28 @@ path = "tests/ldap_changeset.rs"
 [[test]]
 name = "ldap_execute"
 path = "tests/ldap_execute.rs"
+required-features = ["testing"]
 
 # Applying what a sweep planned (issue #142): each connector under its own policy, a plan with no
 # policy applied under neither, and an unreachable connector not stopping its neighbour.
 [[test]]
 name = "ldap_apply"
 path = "tests/ldap_apply.rs"
+required-features = ["testing"]
+
+# Deletion propagation across two passes (issue #142): the snapshot between them is what makes an
+# absence detectable at all.
+[[test]]
+name = "ldap_snapshot_pass"
+path = "tests/ldap_snapshot_pass.rs"
+required-features = ["testing"]
 
 # A whole pass, stored row to written account, against a real LDAP server and a real database
 # (issue #142). Ignored by default: it needs IRONAUTH_LDAP_URL.
 [[test]]
 name = "ldap_live_pass"
 path = "tests/ldap_live_pass.rs"
+required-features = ["testing"]
 
 # Turning stored connector rows into a runnable sweep (issue #142). NO database: the pure half,
 # what a row MEANS to the client and the pass.
