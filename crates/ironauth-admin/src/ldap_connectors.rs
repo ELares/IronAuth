@@ -21,11 +21,20 @@
 //! rather than an allowlist because operators name their own secrets; what it buys is that a
 //! connector can only reach a secret somebody deliberately put in the connector namespace.
 //!
+//! ENFORCED AT THE READ AS WELL AS AT THE WRITE, which is the half that makes it a bound rather
+//! than a bound on one door. This POST is the only door the API offers, but a direct store call,
+//! a config import, a snapshot restore, or a row written before the rule existed all reach the
+//! table without passing it -- so `ldap_boot::StoreSourceFactory::open` checks the prefix again
+//! before opening the secret, exactly as the outbound SCIM scheduler does.
+//!
 //! # Nothing here returns a secret, and there is nothing to return
 //!
-//! The connector row holds a secret NAME. A create response, a listing and an idempotency replay
-//! all render the same row, and none of them has plaintext to leak -- a property of the model
-//! rather than of care taken in this file.
+//! The connector row holds a secret NAME, so there is no plaintext for any response to leak --
+//! a property of the model rather than of care taken in this file. The shapes differ: the create
+//! and its idempotency replay return two fields (the handle and the label), while the listing
+//! renders the row. Named here because the safety argument is about the ROW holding no secret,
+//! not about the three responses being alike -- a create later extended to echo the full row
+//! inherits the same guarantee for the same reason.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -429,8 +438,8 @@ pub async fn list_ldap_connectors(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
-    // READ, not WriteConfig: a listing carries no credential, so it is a strictly smaller
-    // capability than pointing a connector somewhere.
+    // Delegated administration (issue #102): classified `management.read`. A listing carries no
+    // credential, so it is a strictly smaller capability than pointing a connector somewhere.
     principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(
         &state,
@@ -463,7 +472,10 @@ pub async fn list_ldap_connectors(
 ///
 /// # Errors
 ///
-/// As [`list_ldap_connectors`].
+/// [`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if
+/// the organization does not exist here; [`ApiError::Internal`] on a store failure. NOT
+/// `BadRequest`: this route takes no query and no body, which its `responses(...)` and the
+/// generated spec both already say.
 #[utoipa::path(
     get,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health",
@@ -486,6 +498,8 @@ pub async fn list_ldap_connector_health(
     Path((tenant_id, environment_id, organization_id)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (scope, _actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.read`. Health names no
+    // secret and no host; it is strictly smaller than the writes below.
     principal.require_permission(ManagementPermission::Read)?;
     let org_id = resolve_live_org(
         &state,
@@ -501,6 +515,11 @@ pub async fn list_ldap_connector_health(
     // connector rather than to the org. So the org's connectors are read first and the health
     // rows filtered to them. Without this an operator delegated one organization would read
     // every directory in the environment -- host names and failure states included.
+    // THE CAP IS THE STORE'S, stated rather than left to be discovered: `list_for_org` clamps to
+    // `MANAGEMENT_LIST_HARD_CAP + 1`, so an organization past ~1000 connectors would have the
+    // tail of its health silently omitted and `unhealthy` would under-count. No deployment is
+    // near that, and the honest fix when one is is a cursor on this route rather than a bigger
+    // number here.
     let mine: std::collections::BTreeSet<String> = state
         .store()
         .scoped(scope)
@@ -566,6 +585,10 @@ pub async fn create_ldap_connector(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`. Sharper here
+    // than for a plain configuration write: the sweep sends the named secret to a HOST the same
+    // principal chose, so a caller who could do this with `management.read` could read the
+    // write-only secret store.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     // BEFORE THE ORGANIZATION RESOLVES, like every sibling: a retry whose organization has since
     // been deleted returns the original response rather than a 404 for work that succeeded.
@@ -707,6 +730,10 @@ pub async fn set_ldap_connector_active(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`. Sharper here
+    // than for a plain configuration write: the sweep sends the named secret to a HOST the same
+    // principal chose, so a caller who could do this with `management.read` could read the
+    // write-only secret store.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     let org_id = resolve_live_org(
         &state,
@@ -740,7 +767,9 @@ pub async fn set_ldap_connector_active(
 ///
 /// # Errors
 ///
-/// As [`set_ldap_connector_active`].
+/// [`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if no
+/// such connector belongs to this organization; [`ApiError::Internal`] on a store failure. NOT
+/// `BadRequest`: this route takes no body.
 #[utoipa::path(
     delete,
     path = "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/{connector_id}",
@@ -769,6 +798,10 @@ pub async fn delete_ldap_connector(
     )>,
 ) -> Result<Response, ApiError> {
     let (scope, actor) = resolve_scope(&state, &principal, &tenant_id, &environment_id).await?;
+    // Delegated administration (issue #102): classified `management.write_config`. Sharper here
+    // than for a plain configuration write: the sweep sends the named secret to a HOST the same
+    // principal chose, so a caller who could do this with `management.read` could read the
+    // write-only secret store.
     principal.require_permission(ManagementPermission::WriteConfig)?;
     let org_id = resolve_live_org(
         &state,

@@ -63,7 +63,7 @@ fn spec<'a>(
         // caller's choice on the floor passed against the first version of this file.
         tls_mode: LdapTlsMode::StartTls,
         bind_dn: "cn=svc-ironauth,ou=service,dc=contoso,dc=test",
-        bind_secret_name: "contoso-ad-bind",
+        bind_secret_name: "ldap_bind_contoso_ad",
         user_base_dn: "ou=people,dc=contoso,dc=test",
         group_base_dn: "ou=groups,dc=contoso,dc=test",
         user_filter: "(objectClass=user)",

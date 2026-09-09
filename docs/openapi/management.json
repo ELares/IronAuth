@@ -16131,7 +16131,7 @@
           "ldap"
         ],
         "summary": "`GET .../ldap-connectors/health`",
-        "description": "# Errors\n\nAs [`list_ldap_connectors`].",
+        "description": "# Errors\n\n[`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if\nthe organization does not exist here; [`ApiError::Internal`] on a store failure. NOT\n`BadRequest`: this route takes no query and no body, which its `responses(...)` and the\ngenerated spec both already say.",
         "operationId": "listLdapConnectorHealth",
         "parameters": [
           {
@@ -16202,7 +16202,7 @@
           "ldap"
         ],
         "summary": "`DELETE .../ldap-connectors/{connector_id}`",
-        "description": "# Errors\n\nAs [`set_ldap_connector_active`].",
+        "description": "# Errors\n\n[`ApiError::Forbidden`] on the wrong plane, scope or permission; [`ApiError::NotFound`] if no\nsuch connector belongs to this organization; [`ApiError::Internal`] on a store failure. NOT\n`BadRequest`: this route takes no body.",
         "operationId": "deleteLdapConnector",
         "parameters": [
           {

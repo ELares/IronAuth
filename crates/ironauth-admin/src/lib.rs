@@ -638,8 +638,11 @@ pub fn management_router(state: AdminState) -> Router {
             axum::routing::get(ldap_connectors::list_ldap_connectors)
                 .post(ldap_connectors::create_ldap_connector),
         )
-        // HEALTH BEFORE THE PARAMETERISED SIBLING, because `/health` would otherwise be captured
-        // as a connector id by the route below and answer 404 for every request.
+        // HEALTH BESIDE THE PARAMETERISED SIBLING. Registration order does NOT decide this:
+        // axum's router prefers a static segment over a `{param}` capture however the two are
+        // registered, so `/health` resolves here and not as a connector id. Written adjacently
+        // because a reader comparing the two paths should see the overlap, not because the order
+        // is load-bearing.
         .route(
             "/v1/tenants/{tenant_id}/environments/{environment_id}/organizations/{organization_id}/ldap-connectors/health",
             axum::routing::get(ldap_connectors::list_ldap_connector_health),

@@ -5579,6 +5579,126 @@ async fn the_agent_vault_surface_splits_deciding_from_reading_the_queue() {
     );
 }
 
+/// THE INBOUND DIRECTORY SURFACE (issue #142). The classification table says what permission an
+/// operation SHOULD need; only a credential meeting the surface says what it DOES need, and the
+/// two disagree exactly when somebody writes the table from the handler they meant to write.
+///
+/// BOTH READS are driven, so a downgrade of either to "any permission" is refused as well as an
+/// upgrade, and all three writes are driven separately because they are separate handlers -- a
+/// fence on one door is a fence with a door beside it.
+#[tokio::test]
+async fn a_read_only_credential_can_read_ldap_connectors_and_cannot_change_one() {
+    let h = Harness::start(50).await;
+    let (tenant, environment) = h.create_tenant("acme", "k-tenant").await;
+    let (key_id, secret) = mint_key(&h, &tenant, &environment, "ldap-mint").await;
+
+    let orgs = format!("/v1/tenants/{tenant}/environments/{environment}/organizations");
+    let (status, _, body) = h
+        .post(
+            &orgs,
+            "ldap-org",
+            &serde_json::json!({ "display_name": "Acme" }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create org: {body}");
+    let org = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let base = format!("{orgs}/{org}/ldap-connectors");
+
+    // Seeded while the credential is still unrestricted: the restriction below is what the test
+    // is about, and the fixture has to exist before it applies.
+    let seed = serde_json::json!({
+        "display_name": "seed",
+        "host": "ad.contoso.test",
+        "port": 636,
+        "bind_dn": "cn=svc,dc=contoso,dc=test",
+        "bind_secret_name": "ldap_bind_contoso",
+        "user_base_dn": "ou=people,dc=contoso,dc=test",
+        "user_filter": "(objectClass=user)",
+        "attribute_mapping": { "username": "sAMAccountName" }
+    })
+    .to_string();
+    let (status, _, body) = h.post(&base, "ldap-seed", &seed).await;
+    assert_eq!(status, StatusCode::CREATED, "seed connector: {body}");
+    let seeded = serde_json::from_str::<serde_json::Value>(&body).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    restrict(&h, &tenant, &environment, &key_id, &["management.read"]).await;
+
+    // BOTH READS still work, which is what makes the three refusals a narrowing rather than a
+    // credential locked out of the surface entirely.
+    let (status, _, body) = h.get_as(&base, &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the listing it holds: {body}"
+    );
+    let (status, _, body) = h.get_as(&format!("{base}/health"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-granted key was refused the health listing it holds: {body}"
+    );
+
+    // CREATE is refused, and the refusal NAMES write_config rather than any other write. This is
+    // the one that matters most here: the sweep sends the named secret to a host the same
+    // principal chose, so a create reachable with `management.read` would make the write-only
+    // secret store readable.
+    let (status, _, body) = h.post_as(&base, &secret, "ldap-denied", &seed).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential pointed IronAuth at a directory: {body}"
+    );
+    assert!(
+        body.contains("management.write_config"),
+        "the refusal does not name write_config, so the handler may demand a different \
+         permission than the classification records: {body}"
+    );
+
+    // PAUSE is refused, and names the same permission.
+    let (status, _, body) = h
+        .put_as(
+            &format!("{base}/{seeded}/active"),
+            &secret,
+            &serde_json::json!({ "active": false }).to_string(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential PAUSED a connector: {body}"
+    );
+    assert!(body.contains("management.write_config"), "pause: {body}");
+
+    // DELETE is refused, and names the same permission.
+    let (status, _, body) = h.delete_as(&format!("{base}/{seeded}"), &secret).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only credential DELETED a connector: {body}"
+    );
+    assert!(body.contains("management.write_config"), "delete: {body}");
+
+    // And NOTHING LANDED: still exactly one connector, and still ACTIVE. Presence alone would
+    // pass while the refused pause had gone through.
+    let (_, _, listed) = h.get(&base).await;
+    let parsed = serde_json::from_str::<serde_json::Value>(&listed).expect("json");
+    assert_eq!(
+        parsed["items"].as_array().map(Vec::len),
+        Some(1),
+        "a refused write changed the connector list: {listed}"
+    );
+    assert_eq!(
+        parsed["items"][0]["active"], true,
+        "the refused pause went through anyway: {listed}"
+    );
+}
+
 /// A read-only credential may LIST outbound SCIM connections and may not create, pause or
 /// delete one (issue #137).
 ///

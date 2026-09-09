@@ -77,7 +77,7 @@ async fn a_pass_provisions_every_person_in_a_live_directory() {
         .put(
             &env,
             &master,
-            "live-bind",
+            "ldap_bind_live",
             env_var("IRONAUTH_LDAP_BIND_PASSWORD", "svcpw").as_bytes(),
             None,
         )
@@ -102,7 +102,7 @@ async fn a_pass_provisions_every_person_in_a_live_directory() {
                 // test's, and pretending otherwise would make this test about two things.
                 tls_mode: LdapTlsMode::Plaintext,
                 bind_dn: &env_var("IRONAUTH_LDAP_BIND_DN", "cn=svc,dc=example,dc=test"),
-                bind_secret_name: "live-bind",
+                bind_secret_name: "ldap_bind_live",
                 user_base_dn: &env_var("IRONAUTH_LDAP_USER_BASE", "ou=People,dc=example,dc=test"),
                 // USERS ONLY. A blank group base means no group scoping at all, which is the
                 // configuration a first rollout has; pointing it at an OU that merely CONTAINS

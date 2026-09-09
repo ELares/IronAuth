@@ -80,7 +80,7 @@ async fn seed_connector_in(
                 port: 636,
                 tls_mode: LdapTlsMode::Ldaps,
                 bind_dn: "cn=svc,dc=contoso,dc=test",
-                bind_secret_name: "contoso-bind",
+                bind_secret_name: "ldap_bind_contoso",
                 user_base_dn: "ou=people,dc=contoso,dc=test",
                 group_base_dn: "",
                 user_filter: "(objectClass=user)",

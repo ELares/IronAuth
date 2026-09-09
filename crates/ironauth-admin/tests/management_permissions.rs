@@ -484,6 +484,18 @@ const CLASSIFIED: &[(&str, ManagementPermission)] = &[
         "deleteScimPushConnection",
         ManagementPermission::WriteConfig,
     ),
+    // THE INBOUND DIRECTORY SURFACE (issue #142), on the same line as the outbound one above and
+    // for the same reason. A connector NAMES an `environment_secrets` row that somebody with the
+    // credential permission already created; pointing one at an existing secret is
+    // configuration. What makes the three writes `write_config` rather than `read` is sharper
+    // here than next door: the sweep sends the named secret to a HOST the same principal chose,
+    // so a caller who could configure a connector with only `management.read` could read the
+    // write-only secret store.
+    ("listLdapConnectors", ManagementPermission::Read),
+    ("listLdapConnectorHealth", ManagementPermission::Read),
+    ("createLdapConnector", ManagementPermission::WriteConfig),
+    ("setLdapConnectorActive", ManagementPermission::WriteConfig),
+    ("deleteLdapConnector", ManagementPermission::WriteConfig),
     (
         "revokeOrganizationApiKey",
         ManagementPermission::WriteCredentials,
@@ -922,6 +934,16 @@ const PERMISSION_PROVEN: &[&str] = &[
     "createScimPushConnection",
     "setScimPushConnectionActive",
     "deleteScimPushConnection",
+    // Proven in `a_read_only_credential_can_read_ldap_connectors_and_cannot_change_one`, which
+    // drives create, pause and delete with a read-only credential and asserts each refusal NAMES
+    // write_config, then drives BOTH reads with a `write_config` credential so the reads are
+    // checked in both directions too. It also asserts the seeded connector is still there AND
+    // still active, so a refusal that half-applied would fail it.
+    "listLdapConnectors",
+    "listLdapConnectorHealth",
+    "createLdapConnector",
+    "setLdapConnectorActive",
+    "deleteLdapConnector",
     // Proven in `a_read_only_credential_cannot_mint_or_kill_a_service_accounts_key`. The
     // listing is here too, and only here: that test checks it in BOTH directions, so a
     // downgrade of the read to "any permission" is refused as well as an upgrade of it.
@@ -1049,12 +1071,12 @@ fn classification_is_not_proof_and_the_unproven_gap_is_counted() {
     }
     assert_eq!(
         CLASSIFIED.len(),
-        231,
+        236,
         "the classified set changed size; update the unproven count below with it"
     );
     assert_eq!(
         PERMISSION_PROVEN.len(),
-        87,
+        92,
         "the permission-proven set changed size; update the doc comment above with it"
     );
     let unproven = CLASSIFIED.len() - PERMISSION_PROVEN.len();
@@ -1082,6 +1104,14 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     (
         "scim_push_connections.rs",
         include_str!("../src/scim_push_connections.rs"),
+    ),
+    // The inbound directory surface (issue #142). Listed the moment it existed, for the reason
+    // the neighbours state: a file NOT enumerated here is one this gate never reads, so a
+    // mutation deleting a `require_permission` call inside it SURVIVES while the classification
+    // above still looks like enforcement.
+    (
+        "ldap_connectors.rs",
+        include_str!("../src/ldap_connectors.rs"),
     ),
     ("api_keys.rs", include_str!("../src/api_keys.rs")),
     (

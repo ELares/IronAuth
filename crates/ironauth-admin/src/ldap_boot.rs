@@ -161,6 +161,11 @@ pub enum OpenError {
     Secret(StoreError),
     /// The secret is not UTF-8, so it is not a bind password.
     SecretNotText,
+    /// The row names a secret outside the namespace a connector may read.
+    SecretOutsideNamespace {
+        /// What it named. Safe to log: it is a NAME an operator chose, not a value.
+        named: String,
+    },
     /// Connecting or binding failed.
     Connect(crate::ldap_client::DirectoryError),
 }
@@ -171,6 +176,12 @@ impl std::fmt::Display for OpenError {
             Self::Unknown(id) => write!(f, "no connector {id} in this sweep"),
             Self::Secret(e) => write!(f, "the bind secret could not be read: {e}"),
             Self::SecretNotText => write!(f, "the bind secret is not text"),
+            Self::SecretOutsideNamespace { named } => write!(
+                f,
+                "this connector names the secret {named:?}, which is outside the {:?} namespace \
+                 a connector may read",
+                crate::ldap_connectors::BIND_SECRET_PREFIX
+            ),
             Self::Connect(e) => write!(f, "{e}"),
         }
     }
@@ -186,6 +197,24 @@ impl SourceFactory for StoreSourceFactory<'_> {
             .iter()
             .find(|c| c.id.to_string() == scheduled.id)
             .ok_or_else(|| OpenError::Unknown(scheduled.id.clone()))?;
+
+        // THE CONFINEMENT IS ENFORCED AT THE READ, not only at the write.
+        //
+        // `ldap_connectors::check_bind_secret_name` refuses a name outside the connector
+        // namespace when one is configured, and that door is the only one the API offers. It is
+        // not the only way a row arrives: a direct store call, a config import, a snapshot
+        // restore, or a row written before the rule existed all reach this table without passing
+        // it. A bound that only holds for rows that came through one door is a bound on that
+        // door -- and what it protects, the write-only secret store, is read HERE. The outbound
+        // SCIM scheduler makes the same check at its own read for the same reason.
+        if !connector
+            .bind_secret_name
+            .starts_with(crate::ldap_connectors::BIND_SECRET_PREFIX)
+        {
+            return Err(OpenError::SecretOutsideNamespace {
+                named: connector.bind_secret_name.clone(),
+            });
+        }
 
         // THE ONE PRIVILEGED STEP. The row holds a NAME; the password is opened here and lives
         // only as long as the connect.

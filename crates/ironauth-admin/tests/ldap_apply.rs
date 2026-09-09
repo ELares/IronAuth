@@ -665,7 +665,7 @@ fn a_connector_always_audits_under_the_same_service_actor() {
         port: 636,
         tls_mode: LdapTlsMode::Ldaps,
         bind_dn: "cn=svc,dc=contoso,dc=test".to_owned(),
-        bind_secret_name: "contoso-bind".to_owned(),
+        bind_secret_name: "ldap_bind_contoso".to_owned(),
         user_base_dn: "ou=people,dc=contoso,dc=test".to_owned(),
         group_base_dn: String::new(),
         user_filter: "(objectClass=user)".to_owned(),
