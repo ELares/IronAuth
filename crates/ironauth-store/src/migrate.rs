@@ -1763,6 +1763,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0214_ldap_sync_snapshots.sql"),
         },
+        Migration {
+            version: 215,
+            name: "ldap_sync_runs",
+            // EXPAND. A new table with no writer on any older binary; an old binary simply
+            // records no health, exactly as it did before.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0215_ldap_sync_runs.sql"),
+        },
     ]
 }
 

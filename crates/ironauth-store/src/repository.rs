@@ -328,6 +328,15 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// How each directory connector's last sync went (issue #142).
+    #[must_use]
+    pub fn ldap_sync_runs(&self) -> LdapRunRepo<'a> {
+        LdapRunRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// What each downstream calls the subjects this scope pushes (issue #137).
     #[must_use]
     pub fn scim_push_links(&self) -> ScimPushLinkRepo<'a> {
@@ -1828,6 +1837,15 @@ impl<'a> ActingStore<'a> {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
+        }
+    }
+
+    /// Writes over LDAP sync health in this scope (issue #142).
+    #[must_use]
+    pub fn ldap_sync_runs(&self) -> ActingLdapRunRepo<'a> {
+        ActingLdapRunRepo {
+            store: self.store,
+            scope: self.scope,
         }
     }
 
@@ -77876,6 +77894,297 @@ pub struct NewLdapConnector<'a> {
     pub absence_policy: LdapAbsencePolicy,
     /// How deep nested groups resolve.
     pub max_group_depth: i32,
+}
+
+/// How a connector's last sync ended.
+///
+/// The sweep's own vocabulary, closed at the database. A health state nothing renders is worse
+/// than a missing one, so a value that is not one of these cannot be stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LdapRunOutcome {
+    /// The connector was read and produced a plan.
+    Planned,
+    /// The connection could not be opened.
+    Unreachable,
+    /// It opened and the pass then failed.
+    Failed,
+    /// It exceeded the sweep's per-connector deadline.
+    TimedOut,
+    /// The pass declined to sweep it -- today, an unreadable snapshot.
+    Skipped,
+}
+
+impl LdapRunOutcome {
+    /// The stored spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Unreachable => "unreachable",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    /// Parse a stored spelling.
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "planned" => Some(Self::Planned),
+            "unreachable" => Some(Self::Unreachable),
+            "failed" => Some(Self::Failed),
+            "timed_out" => Some(Self::TimedOut),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+
+    /// Whether this outcome means the directory was actually read.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Planned)
+    }
+}
+
+/// What a pass did to one connector, as the health row records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLdapRun<'a> {
+    /// The connector this run belongs to.
+    pub connector_id: &'a LdapConnectorId,
+    /// When the pass reached it.
+    pub started_at_unix_micros: i64,
+    /// End to end, in milliseconds.
+    pub duration_ms: i64,
+    /// How it ended.
+    pub outcome: LdapRunOutcome,
+    /// The short reason, required for every outcome that is not `Planned` and refused for it.
+    pub error: Option<&'a str>,
+    /// Accounts created.
+    pub provisioned: i32,
+    /// Arrivals that already had an account.
+    pub already_present: i32,
+    /// Accounts disabled.
+    pub deactivated: i32,
+    /// Accounts removed.
+    pub deleted: i32,
+    /// Removals for a principal with no account.
+    pub already_absent: i32,
+    /// Removals for a principal already in the removed state.
+    pub already_removed: i32,
+    /// Per-principal failures inside an otherwise successful pass.
+    pub apply_failures: i32,
+}
+
+/// A connector's health as an operator reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LdapRunRecord {
+    /// The connector.
+    pub connector_id: String,
+    /// When the last pass reached it.
+    pub started_at_unix_micros: i64,
+    /// How long that pass took.
+    pub duration_ms: i64,
+    /// How it ended.
+    pub outcome: LdapRunOutcome,
+    /// The short reason, when it is not `Planned`.
+    pub error: Option<String>,
+    /// Accounts created.
+    pub provisioned: i32,
+    /// Arrivals that already had an account.
+    pub already_present: i32,
+    /// Accounts disabled.
+    pub deactivated: i32,
+    /// Accounts removed.
+    pub deleted: i32,
+    /// Removals for a principal with no account.
+    pub already_absent: i32,
+    /// Removals for a principal already in the removed state.
+    pub already_removed: i32,
+    /// Per-principal failures.
+    pub apply_failures: i32,
+    /// Passes in a row that did not produce a plan.
+    pub consecutive_failures: i32,
+    /// The last pass that DID produce a plan, so the staleness of the view is legible.
+    pub last_success_at_unix_micros: Option<i64>,
+}
+
+impl LdapRunRecord {
+    /// Whether this connector needs attention.
+    ///
+    /// UNREACHABLE IS NOT THE ONLY UNHEALTHY. A connector that binds fine and fails to apply
+    /// every principal is broken too, and it reports `Planned`, so the failure count is part of
+    /// the question.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.consecutive_failures == 0 && self.apply_failures == 0
+    }
+}
+
+/// Reads over LDAP sync health in one scope (issue #142).
+pub struct LdapRunRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl LdapRunRepo<'_> {
+    /// One connector's health, or [`None`] when no pass has ever reached it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get(
+        &self,
+        connector: &LdapConnectorId,
+    ) -> Result<Option<LdapRunRecord>, StoreError> {
+        if connector.scope() != self.scope {
+            return Ok(None);
+        }
+        Ok(self
+            .in_scope()
+            .await?
+            .into_iter()
+            .find(|record| record.connector_id == connector.to_string()))
+    }
+
+    /// Every connector in this scope that a pass has reached, most recently started first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure; [`StoreError::Invalid`] if a stored
+    /// outcome is not one the closed set permits, which the CHECK constraint makes unreachable
+    /// through this crate and does not through a manual write.
+    pub async fn in_scope(&self) -> Result<Vec<LdapRunRecord>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT connector_id, \
+             (EXTRACT(EPOCH FROM started_at) * 1000000)::bigint AS started_us, \
+             duration_ms, outcome, error, provisioned, already_present, deactivated, deleted, \
+             already_absent, already_removed, apply_failures, consecutive_failures, \
+             (EXTRACT(EPOCH FROM last_success_at) * 1000000)::bigint AS success_us \
+             FROM ldap_sync_runs WHERE tenant_id = $1 AND environment_id = $2 \
+             ORDER BY started_at DESC, connector_id",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| {
+                let raw: String = row.get("outcome");
+                Ok(LdapRunRecord {
+                    connector_id: row.get("connector_id"),
+                    started_at_unix_micros: row.get("started_us"),
+                    duration_ms: row.get("duration_ms"),
+                    outcome: LdapRunOutcome::from_str(&raw).ok_or(StoreError::Invalid)?,
+                    error: row.get("error"),
+                    provisioned: row.get("provisioned"),
+                    already_present: row.get("already_present"),
+                    deactivated: row.get("deactivated"),
+                    deleted: row.get("deleted"),
+                    already_absent: row.get("already_absent"),
+                    already_removed: row.get("already_removed"),
+                    apply_failures: row.get("apply_failures"),
+                    consecutive_failures: row.get("consecutive_failures"),
+                    last_success_at_unix_micros: row.get("success_us"),
+                })
+            })
+            .collect()
+    }
+
+    /// The connectors in this scope that need attention.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::in_scope`].
+    pub async fn unhealthy_in_scope(&self) -> Result<Vec<LdapRunRecord>, StoreError> {
+        // FILTERED IN RUST, over the same rows the listing already fetches. The partial index
+        // exists for the day a scope holds enough connectors that the console wants the narrow
+        // read; today a scope holds a handful and a second query would cost more than the filter.
+        // The predicate here and the index's are the same two clauses, and
+        // `the_unhealthy_predicate_matches_the_index` pins that they stay so.
+        Ok(self
+            .in_scope()
+            .await?
+            .into_iter()
+            .filter(|record| !record.is_healthy())
+            .collect())
+    }
+}
+
+/// Writes over LDAP sync health in one scope (issue #142).
+///
+/// NOT AUDITED, for the reason [`ActingLdapSnapshotRepo`] gives: this is the sweep's own
+/// bookkeeping, and what it DID is audited where it happened.
+pub struct ActingLdapRunRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl ActingLdapRunRepo<'_> {
+    /// Record how a pass went for one connector, replacing the pass before it.
+    ///
+    /// THE FAILURE COUNTER IS COMPUTED IN THE STATEMENT, not read and written back. Two passes
+    /// racing on one connector -- two replicas with the switch on, which the config warns about
+    /// but does not prevent -- would otherwise both read the same count and both write the same
+    /// increment, so a directory down for ten passes could report a single failure.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the connector is out of scope; [`StoreError::Database`] on a
+    /// persistence failure, which includes an `error` that disagrees with the outcome.
+    pub async fn record(&self, run: &NewLdapRun<'_>) -> Result<(), StoreError> {
+        if run.connector_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let succeeded = run.outcome.is_success();
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        sqlx::query(
+            "INSERT INTO ldap_sync_runs \
+             (connector_id, tenant_id, environment_id, started_at, duration_ms, outcome, error, \
+              provisioned, already_present, deactivated, deleted, already_absent, \
+              already_removed, apply_failures, consecutive_failures, last_success_at) \
+             VALUES ($1, $2, $3, \
+                     TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval, \
+                     $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                     CASE WHEN $15 THEN 0 ELSE 1 END, \
+                     CASE WHEN $15 \
+                          THEN TIMESTAMPTZ 'epoch' + ($4::text || ' microseconds')::interval \
+                          ELSE NULL END) \
+             ON CONFLICT (connector_id) DO UPDATE \
+             SET started_at = EXCLUDED.started_at, duration_ms = EXCLUDED.duration_ms, \
+                 outcome = EXCLUDED.outcome, error = EXCLUDED.error, \
+                 provisioned = EXCLUDED.provisioned, \
+                 already_present = EXCLUDED.already_present, \
+                 deactivated = EXCLUDED.deactivated, deleted = EXCLUDED.deleted, \
+                 already_absent = EXCLUDED.already_absent, \
+                 already_removed = EXCLUDED.already_removed, \
+                 apply_failures = EXCLUDED.apply_failures, \
+                 consecutive_failures = CASE WHEN $15 THEN 0 \
+                                             ELSE ldap_sync_runs.consecutive_failures + 1 END, \
+                 last_success_at = CASE WHEN $15 THEN EXCLUDED.started_at \
+                                        ELSE ldap_sync_runs.last_success_at END",
+        )
+        .bind(run.connector_id.to_string())
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(run.started_at_unix_micros)
+        .bind(run.duration_ms)
+        .bind(run.outcome.as_str())
+        .bind(run.error)
+        .bind(run.provisioned)
+        .bind(run.already_present)
+        .bind(run.deactivated)
+        .bind(run.deleted)
+        .bind(run.already_absent)
+        .bind(run.already_removed)
+        .bind(run.apply_failures)
+        .bind(succeeded)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// What the last completed pass saw in one directory (issue #142).

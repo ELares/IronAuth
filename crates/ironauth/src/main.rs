@@ -3867,6 +3867,7 @@ async fn start_ldap_sweep(
                         || report.refusing_departures > 0
                         || report.snapshots_unrecorded > 0
                         || report.snapshots_unreadable > 0
+                        || report.health_unrecorded > 0
                         || !report.applied.everything_applied();
                     if needs_attention {
                         tracing::warn!(
@@ -3882,6 +3883,8 @@ async fn start_ldap_sweep(
                             snapshots_recorded = report.snapshots_recorded,
                             snapshots_unrecorded = report.snapshots_unrecorded,
                             snapshots_unreadable = report.snapshots_unreadable,
+                            health_recorded = report.health_recorded,
+                            health_unrecorded = report.health_unrecorded,
                             "ldap sync pass finished with connectors that need attention"
                         );
                     } else {

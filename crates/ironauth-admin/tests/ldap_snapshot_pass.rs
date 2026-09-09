@@ -155,6 +155,7 @@ fn sweep_of(connector: &LdapConnectorId, plan: SyncPlan, terms: ApplyTerms) -> S
     ScopeSweep {
         report: SweepReport {
             runs: vec![(connector.to_string(), Outcome::Planned(Box::new(plan)))],
+            timings: BTreeMap::new(),
         },
         terms: BTreeMap::from([(connector.to_string(), terms)]),
         skipped: Vec::new(),
@@ -620,6 +621,377 @@ async fn a_skipped_connector_is_counted_by_the_pass() {
     );
 }
 
+/// THE PASS WRITES HEALTH FOR EVERY CONNECTOR IT TOUCHED, including the one it could not reach.
+/// A health surface that only records successes answers "is this directory syncing" with silence,
+/// which is exactly the question the isolation criterion is about.
+#[tokio::test]
+async fn a_pass_records_health_for_the_reachable_and_the_unreachable_alike() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let live = seed_connector(&db, &env, scope, soft).await;
+    let dead = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &live,
+        planned(&[("a", "u-a"), ("b", "u-b")], &BTreeSet::new()).await,
+        terms(&live, soft),
+    );
+    sweep.report.runs.push((
+        dead.to_string(),
+        Outcome::Unreachable("connection refused".to_owned()),
+    ));
+    sweep.terms.insert(dead.to_string(), terms(&dead, soft));
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+
+    assert_eq!(
+        report.health_recorded, 2,
+        "health must be written for both, not only the one that worked: {report:?}"
+    );
+    assert_eq!(report.health_unrecorded, 0);
+
+    let healthy = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&live)
+        .await
+        .expect("read")
+        .expect("the reachable connector has health");
+    assert_eq!(healthy.outcome, ironauth_store::LdapRunOutcome::Planned);
+    assert_eq!(
+        healthy.provisioned, 2,
+        "the counts must be this connector's, not the scope's sum: {healthy:?}"
+    );
+    assert!(
+        healthy.duration_ms >= 0,
+        "a measured duration cannot be negative: {healthy:?}"
+    );
+    assert!(healthy.is_healthy());
+
+    let broken = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&dead)
+        .await
+        .expect("read")
+        .expect("the unreachable connector has health");
+    assert_eq!(broken.outcome, ironauth_store::LdapRunOutcome::Unreachable);
+    // A CATEGORY, NOT THE SERVER'S MESSAGE. The raw text can carry a DN, and the sibling snapshot
+    // table seals identifiers for exactly that reason.
+    assert_eq!(
+        broken.error.as_deref(),
+        Some("the directory could not be opened; see the log")
+    );
+    assert!(
+        !broken
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("connection refused"),
+        "the directory's own message reached the health column"
+    );
+    assert_eq!(broken.consecutive_failures, 1);
+    assert_eq!(
+        broken.provisioned, 0,
+        "a connector that never opened cannot have provisioned anybody"
+    );
+    assert!(!broken.is_healthy());
+
+    let unhealthy = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .unhealthy_in_scope()
+        .await
+        .expect("read");
+    assert_eq!(unhealthy.len(), 1, "{unhealthy:?}");
+    assert_eq!(unhealthy[0].connector_id, dead.to_string());
+}
+
+/// TWO SUCCESSFUL CONNECTORS WITH DIFFERENT COUNTS. With only one connector producing counts,
+/// its own number and the scope-wide sum are the same value, so "these are this connector's
+/// counts" cannot fail -- and neither can a mix-up that gives every planned connector the first
+/// one's counts. Two successes with different sizes is the fixture that separates them.
+#[tokio::test]
+async fn each_connector_gets_its_own_counts_not_its_neighbours() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let small = seed_connector(&db, &env, scope, soft).await;
+    let large = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &small,
+        planned(&[("s1", "u-s1")], &BTreeSet::new()).await,
+        terms(&small, soft),
+    );
+    sweep.report.runs.push((
+        large.to_string(),
+        Outcome::Planned(Box::new(
+            planned(
+                &[("l1", "u-l1"), ("l2", "u-l2"), ("l3", "u-l3")],
+                &BTreeSet::new(),
+            )
+            .await,
+        )),
+    ));
+    sweep.terms.insert(large.to_string(), terms(&large, soft));
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+    assert_eq!(report.applied.provisioned, 4, "the scope-wide sum");
+
+    let one = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&small)
+        .await
+        .expect("read")
+        .expect("present");
+    let three = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&large)
+        .await
+        .expect("read")
+        .expect("present");
+
+    assert_eq!(
+        (one.provisioned, three.provisioned),
+        (1, 3),
+        "one connector's counts landed on the other's health row, or both got the scope sum"
+    );
+}
+
+/// A CONNECTOR THE APPLIER DECLINED IS NOT A FRESH SUCCESS. Writing `planned` for it would zero
+/// its failure counter and advance `last_success_at` -- the staleness signal the recovery story
+/// leans on -- for a pass that synced nobody.
+#[tokio::test]
+async fn a_connector_the_applier_declined_is_not_recorded_healthy() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let connector = seed_connector(&db, &env, scope, LdapAbsencePolicy::Deactivate).await;
+
+    let orphan = ScopeSweep {
+        report: SweepReport {
+            runs: vec![(
+                connector.to_string(),
+                Outcome::Planned(Box::new(
+                    planned(&[("nobody", "u-nobody")], &BTreeSet::new()).await,
+                )),
+            )],
+            timings: BTreeMap::new(),
+        },
+        terms: BTreeMap::new(),
+        skipped: Vec::new(),
+    };
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &orphan, &mut report).await;
+
+    let health = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&connector)
+        .await
+        .expect("read")
+        .expect("a declined connector still gets a health row");
+    assert_eq!(
+        health.outcome,
+        ironauth_store::LdapRunOutcome::Skipped,
+        "a connector nothing was applied for was recorded as a success: {health:?}"
+    );
+    assert!(health.error.is_some(), "a decline has to say why");
+    assert!(!health.is_healthy());
+    assert_eq!(
+        health.last_success_at_unix_micros, None,
+        "a pass that synced nobody advanced the last-success instant"
+    );
+}
+
+/// A REPORT KEY THAT IS NOT A CONNECTOR ID IS COUNTED. A connector with no health row leaves the
+/// previous pass's answer standing, and a counter that does not move keeps the boot loop quiet.
+#[tokio::test]
+async fn an_unkeyable_report_entry_is_counted_rather_than_dropped() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let real = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &real,
+        planned(&[("a", "u-a")], &BTreeSet::new()).await,
+        terms(&real, soft),
+    );
+    sweep.report.runs.push((
+        "not-a-connector-id".to_owned(),
+        Outcome::Unreachable("nowhere".to_owned()),
+    ));
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+
+    assert_eq!(report.health_recorded, 1, "{report:?}");
+    assert_eq!(
+        report.health_unrecorded, 1,
+        "the entry with no usable key was dropped without a count: {report:?}"
+    );
+}
+
+/// THE MEASURED TIMING REACHES THE ROW. `duration_ms` and `started_at` were both invented at the
+/// writer -- a literal 0 and one scope-wide clock read -- behind a column comment promising an
+/// end-to-end measurement. The sweep measures them per connector now; this pins that the health
+/// row carries what the sweep measured rather than anything the writer made up.
+#[tokio::test]
+async fn the_health_row_carries_the_timing_the_sweep_measured() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let connector = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &connector,
+        planned(&[("a", "u-a")], &BTreeSet::new()).await,
+        terms(&connector, soft),
+    );
+    // Values no clock in this test could produce, so a writer that ignored them is visible.
+    sweep.report.timings.insert(
+        connector.to_string(),
+        ironauth_admin::ldap_schedule::RunTiming {
+            started_at_unix_micros: 1_767_323_045_678_901,
+            duration_ms: 4_242,
+        },
+    );
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+
+    let health = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&connector)
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(
+        (health.started_at_unix_micros, health.duration_ms),
+        (1_767_323_045_678_901, 4_242),
+        "the health row invented its own timing instead of carrying the sweep's: {health:?}"
+    );
+    assert_eq!(
+        health.last_success_at_unix_micros,
+        Some(1_767_323_045_678_901),
+        "the last-success instant must be when the connector was actually reached"
+    );
+}
+
+/// AND THE SWEEP REALLY MEASURES. A timing map the sweep never filled would make the test above
+/// pass on hand-built input while every real pass still wrote zeros.
+#[tokio::test]
+async fn the_sweep_measures_a_timing_for_every_connector_it_ran() {
+    use ironauth_admin::ldap_schedule::{Scheduled, SourceFactory, sweep};
+
+    /// A directory that takes a measurable moment to refuse. Without the wait, a real
+    /// measurement and a hardcoded zero are the same number.
+    struct SlowToRefuse;
+    impl SourceFactory for SlowToRefuse {
+        type Source = Fake;
+        type Error = std::io::Error;
+        async fn open(&self, _s: &Scheduled) -> Result<Self::Source, Self::Error> {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            Err(std::io::Error::other("no directory here"))
+        }
+    }
+
+    let env = Env::system();
+    let scheduled: Vec<Scheduled> = ["ldc_a", "ldc_b"]
+        .iter()
+        .map(|id| Scheduled {
+            id: (*id).to_owned(),
+            previous: BTreeSet::new(),
+            inputs: SyncInputs {
+                user_base_dn: "ou=People,dc=example,dc=test".to_owned(),
+                user_filter: "(objectClass=inetOrgPerson)".to_owned(),
+                group_roots: Vec::new(),
+                max_group_depth: 5,
+                attribute_mapping: json!({ "username": "uid" }),
+            },
+        })
+        .collect();
+
+    let report = sweep(
+        &SlowToRefuse,
+        &scheduled,
+        std::time::Duration::from_secs(5),
+        &env,
+    )
+    .await;
+
+    assert_eq!(
+        report.timings.len(),
+        2,
+        "a connector ran without being timed"
+    );
+    for id in ["ldc_a", "ldc_b"] {
+        let timing = report.timings.get(id).expect("timed");
+        assert!(
+            timing.started_at_unix_micros > 1_700_000_000_000_000,
+            "the start instant is not a real clock read: {timing:?}"
+        );
+        // THE DURATION IS MEASURED, not defaulted. Each attempt waits 60ms before failing, so a
+        // writer that reports zero -- which is what shipped before this -- is visible here.
+        assert!(
+            timing.duration_ms >= 40,
+            "the duration is not a measurement: {timing:?}"
+        );
+    }
+}
+
+/// AND A SKIPPED CONNECTOR SAYS SO. A directory not being swept at all is the loudest state
+/// there is; recording nothing for it would leave the previous pass's answer standing.
+#[tokio::test]
+async fn a_skipped_connector_records_its_own_health() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let store = db.control_store();
+    let soft = LdapAbsencePolicy::Deactivate;
+    let live = seed_connector(&db, &env, scope, soft).await;
+    let skipped = seed_connector(&db, &env, scope, soft).await;
+
+    let mut sweep = sweep_of(
+        &live,
+        planned(&[("a", "u-a")], &BTreeSet::new()).await,
+        terms(&live, soft),
+    );
+    sweep.skipped.push(skipped.to_string());
+
+    let mut report = PassReport::default();
+    fold_scope(store, scope, &env, &db.master_key(), &sweep, &mut report).await;
+
+    assert_eq!(report.health_recorded, 2, "{report:?}");
+    let health = store
+        .scoped(scope)
+        .ldap_sync_runs()
+        .get(&skipped)
+        .await
+        .expect("read")
+        .expect("the skipped connector has health");
+    assert_eq!(health.outcome, ironauth_store::LdapRunOutcome::Skipped);
+    assert!(health.error.is_some(), "a skip has to say why");
+    assert!(!health.is_healthy());
+}
+
 /// THE LOOKUP KEY. A `previous_for` that missed would hand every connector an empty set and
 /// disable absence detection everywhere, silently, while every test about the diff went on
 /// passing.
@@ -821,6 +1193,7 @@ async fn a_plan_whose_policy_is_missing_records_no_snapshot() {
                     planned(&[("nobody", "u-nobody")], &BTreeSet::new()).await,
                 )),
             )],
+            timings: BTreeMap::new(),
         },
         terms: BTreeMap::new(),
         skipped: Vec::new(),
