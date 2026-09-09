@@ -1438,6 +1438,28 @@ async fn the_grants_and_the_one_way_policy_are_enforced() {
         .expect("the data plane must be able to read the list it delivers to");
 }
 
+/// Block until `expected` backends are waiting on a lock, instead of sleeping and hoping.
+///
+/// Lifted from `tenant_lifecycle.rs`, whose version says it reaches "the exact interleaving,
+/// reached without guessing a sleep". Panicking here is the point: a run where the racers never
+/// both park has not tested the thing, and must say so rather than pass.
+async fn wait_until_backends_are_lock_blocked(pool: &sqlx::PgPool, expected: i64) {
+    for _ in 0..2_000 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if blocked >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{expected} backends never blocked on the row lock, so the racers did not interleave");
+}
+
 /// One removal that announces, for the racers below to run concurrently.
 ///
 /// Extracted so the test itself stays under the line ceiling, and so both racers are provably
@@ -1449,8 +1471,16 @@ async fn remove_announcing(
     organization: &OrganizationId,
     id: &OrgContactId,
 ) -> bool {
+    // A FRESH ID PER CALL, because that is what production does
+    // (`ironauth-admin/src/org_contacts.rs` mints one per request) and because sharing one
+    // disarmed every assertion below. The id becomes the outbox `idempotency_key`, which carries
+    // a UNIQUE index, so two racers reusing it made the loser's enqueue raise 23505 -- aborting
+    // its transaction, rolling back its audit row and its event, and leaving the database in
+    // exactly the state correct code produces. The no-op mutation "failed" on that crash with
+    // zero assertions evaluated.
+    let event_id = format!("evt_{}", CorrelationId::generate(env));
     let envelope = ironauth_store::event_catalog::envelope(
-        "evt_contact_removed",
+        &event_id,
         "org_contact.removed",
         &scope.tenant().to_string(),
         &scope.environment().to_string(),
@@ -1472,7 +1502,7 @@ async fn remove_announcing(
             id,
             now_micros(env),
             Some(&ironauth_store::DomainEvent {
-                id: "evt_contact_removed",
+                id: &event_id,
                 subject: &id.to_string(),
                 envelope: &envelope,
             }),
@@ -1494,9 +1524,16 @@ async fn remove_announcing(
 /// transaction's removal to this actor, and enqueued a SECOND `org_contact.removed`, so a
 /// consumer counting removals would over-count.
 ///
-/// `tokio::join!` does not produce this: the two calls serialise and the second is answered by
-/// the already-removed early return before any write. The interleaving has to be FORCED with a
-/// rival transaction holding the row, the idiom `message_send.rs` uses.
+/// WHY THE BARRIER, stated accurately. An earlier version of this comment said `tokio::join!`
+/// cannot produce the race because the two calls serialise. That is false, and measured: a bare
+/// `join!` of two `remove_with_event` futures reaches the loser arm on every run, because the two
+/// futures interleave at every Postgres round trip and the pool has connections to spare.
+///
+/// The barrier is here for a different and better reason: it makes "both probes complete before
+/// either UPDATE commits" an ENFORCED property rather than a scheduling outcome. Without it the
+/// test still reaches the arm on this machine, but nothing says it must, and a box where one
+/// racer is slow to connect would take the already-removed early return and quietly test
+/// nothing.
 #[tokio::test]
 async fn a_forced_concurrent_double_removal_removes_once_and_audits_once() {
     let db = TestDatabase::start().await;
@@ -1514,9 +1551,6 @@ async fn a_forced_concurrent_double_removal_removes_once_and_audits_once() {
     )
     .await
     .expect("add");
-
-    // Drain the add's own event so the count below is about the removals.
-    let _ = queued_events(&db, &env, scope).await;
 
     // THE BARRIER. A plain SELECT does not block on this, so both racers' settle probes still
     // see a live row; their UPDATEs then park here.
@@ -1542,8 +1576,13 @@ async fn a_forced_concurrent_double_removal_removes_once_and_audits_once() {
         }));
     }
 
-    // Both racers are past their probe and parked on the lock. Release it.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // WAIT FOR THE INTERLEAVING RATHER THAN GUESSING AT IT. The first version slept 300ms and
+    // hoped both racers had parked; on a slower box one could still have been connecting, the
+    // winner would commit alone, and the straggler would take the already-removed early return
+    // -- turning this back into the vacuous case it replaced, silently. `tenant_lifecycle.rs`
+    // already had the answer: poll `pg_stat_activity` until backends are actually blocked on a
+    // lock, which both removes the guess and ASSERTS the state the test needs.
+    wait_until_backends_are_lock_blocked(db.owner_pool(), 2).await;
     gate.commit().await.expect("release the gate");
 
     let mut removed = 0_usize;
