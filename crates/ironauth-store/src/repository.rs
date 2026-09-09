@@ -100,10 +100,10 @@ use crate::id::{
     RiskLoginGeoId, RiskSignalId, RoutingRuleId, SamlCertificateId, SamlConnectionId, SamlSpKeyId,
     ScimConnectionId, ScimEnterpriseId, ScimExternalIdId, ScimPushConnectionId, ScimPushLinkId,
     ScopeStepUpPolicyId, ServiceAccountId, SessionId, SessionTokenKeyId, SigningKeyId,
-    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, StoredClientId, TenantId,
-    TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId, UpstreamTokenGrantId,
-    UpstreamTokenId, UserId, UserIdentifierId, VariableId, WebauthnChallengeId,
-    WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
+    SignupFormId, SignupQuarantineId, SmsOtpCodeId, SmsRouteStatId, SsfStreamId, StoredClientId,
+    TenantId, TotpCredentialId, TraitMigrationJobId, TraitSchemaId, TrustedDeviceId,
+    UpstreamTokenGrantId, UpstreamTokenId, UserId, UserIdentifierId, VariableId,
+    WebauthnChallengeId, WebauthnCredentialId, WebhookDeliveryAttemptId, WebhookEndpointId,
 };
 use crate::identifier::{
     CanonicalIdentifier, IdentifierType, UniquenessMode, canonicalize_identifier,
@@ -314,6 +314,15 @@ impl<'a> ScopedStore<'a> {
     #[must_use]
     pub fn ldap_connectors(&self) -> LdapConnectorRepo<'a> {
         LdapConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
+    /// Reads over Shared Signals streams in this scope (issue #143).
+    #[must_use]
+    pub fn ssf_streams(&self) -> SsfStreamRepo<'a> {
+        SsfStreamRepo {
             store: self.store,
             scope: self.scope,
         }
@@ -1834,6 +1843,16 @@ impl<'a> ActingStore<'a> {
     #[must_use]
     pub fn ldap_connectors(&self) -> ActingLdapConnectorRepo<'a> {
         ActingLdapConnectorRepo {
+            store: self.store,
+            scope: self.scope,
+            acting: self.acting,
+        }
+    }
+
+    /// Audited writes over Shared Signals streams in this scope (issue #143).
+    #[must_use]
+    pub fn ssf_streams(&self) -> ActingSsfStreamRepo<'a> {
+        ActingSsfStreamRepo {
             store: self.store,
             scope: self.scope,
             acting: self.acting,
@@ -81642,6 +81661,609 @@ impl ScimConnection {
     #[must_use]
     pub fn no_live_credential(&self) -> bool {
         !self.revoked && self.live_token_count == 0
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Shared Signals Framework: streams (issue #143).
+// ---------------------------------------------------------------------------------------
+
+/// What a stream is doing with the events it is entitled to: the SSF 1.0 stream-status
+/// vocabulary, named rather than numbered for the reason 0216 gives.
+///
+/// Three states rather than a boolean, because the two non-delivering ones differ in what the
+/// receiver gets back when it returns. `Paused` RETAINS: a receiver taking its endpoint down
+/// for maintenance pauses, and expects the backlog afterwards. `Disabled` retains nothing.
+/// Collapsing them would silently turn one into the other, and the direction that loses events
+/// is the one a receiver cannot detect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsfStreamStatus {
+    /// Events are delivered as they occur.
+    Enabled,
+    /// Events accumulate and are delivered when the stream is enabled again.
+    Paused,
+    /// Events are neither delivered nor retained.
+    Disabled,
+}
+
+impl SsfStreamStatus {
+    /// The wire spelling, which is also the stored one.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Paused => "paused",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// Parse the wire spelling, or `None` for anything else.
+    ///
+    /// Named `parse` rather than `from_str` because a public inherent `from_str` shadows
+    /// `std::str::FromStr` at the call site while answering a different type, which is what
+    /// `clippy::should_implement_trait` is about.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enabled" => Some(Self::Enabled),
+            "paused" => Some(Self::Paused),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    /// Whether a SET generated now is DELIVERED to this stream.
+    #[must_use]
+    pub fn delivers(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    /// Whether a SET generated now is KEPT for this stream, delivered now or later.
+    ///
+    /// Distinct from [`Self::delivers`] on purpose: `paused` answers false to the first and
+    /// true to this one, and a fan-out that consulted only the first would drop exactly the
+    /// events a pause exists to preserve.
+    #[must_use]
+    pub fn retains(self) -> bool {
+        matches!(self, Self::Enabled | Self::Paused)
+    }
+}
+
+/// How a stream's SETs reach its receiver.
+///
+/// The push endpoint lives INSIDE the push variant rather than beside the enum, so a poll
+/// stream carrying a delivery URL is unrepresentable in this crate exactly as migration 0216's
+/// CHECK makes it unrepresentable in the table. The two say the same thing in the two places a
+/// value can be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsfDelivery {
+    /// RFC 8935: this transmitter POSTs each SET to the receiver's endpoint.
+    Push {
+        /// The receiver's endpoint. Customer-supplied, so every POST goes through the
+        /// SSRF-hardened fetcher.
+        endpoint_url: String,
+        /// Names an `environment_secrets` row holding the bearer the receiver wants presented,
+        /// or `None` when the SET signature is the only authentication (which RFC 8935 allows).
+        secret_name: Option<String>,
+    },
+    /// RFC 8936: the receiver fetches SETs from this transmitter and acknowledges them.
+    Poll,
+}
+
+impl SsfDelivery {
+    /// The SSF 1.0 method URN, which is what the configuration document publishes.
+    #[must_use]
+    pub fn method_urn(&self) -> &'static str {
+        match self {
+            Self::Push { .. } => SSF_DELIVERY_PUSH,
+            Self::Poll => SSF_DELIVERY_POLL,
+        }
+    }
+}
+
+/// The RFC 8935 (push) delivery method URN, spelled as SSF 1.0 spells it.
+pub const SSF_DELIVERY_PUSH: &str = "urn:ietf:rfc:8935";
+/// The RFC 8936 (poll) delivery method URN, spelled as SSF 1.0 spells it.
+pub const SSF_DELIVERY_POLL: &str = "urn:ietf:rfc:8936";
+
+/// The RFC 9493 subject identifier format a stream's subjects are rendered in.
+///
+/// #143 requires at least these three. A format this build does not know is a DECODE error
+/// rather than a default, for the reason [`ldap_connector_from_row`] gives about `tls_mode`:
+/// the column carries a CHECK naming the closed set, so an unknown value means the schema and
+/// this code disagree, and picking one would render subjects in a format nobody negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsfSubjectFormat {
+    /// RFC 9493 section 3.2.2: an email address.
+    Email,
+    /// RFC 9493 section 3.2.3: the (issuer, subject) pair.
+    IssSub,
+    /// RFC 9493 section 3.2.4: an opaque identifier this transmitter chose.
+    Opaque,
+}
+
+impl SsfSubjectFormat {
+    /// The RFC 9493 `format` value, which is also the stored spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Email => "email",
+            Self::IssSub => "iss_sub",
+            Self::Opaque => "opaque",
+        }
+    }
+
+    /// Parse the RFC 9493 `format` value, or `None` for one this build does not render.
+    ///
+    /// Named `parse` for the reason [`SsfStreamStatus::parse`] is.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "email" => Some(Self::Email),
+            "iss_sub" => Some(Self::IssSub),
+            "opaque" => Some(Self::Opaque),
+            _ => None,
+        }
+    }
+}
+
+/// One receiver's stream, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsfStream {
+    /// The `sst_` handle.
+    pub id: SsfStreamId,
+    /// The receiver: the client whose credential created it, and the only one that may read
+    /// or mutate it.
+    pub client_id: ClientId,
+    /// Delivering, retaining, or neither.
+    pub status: SsfStreamStatus,
+    /// Why, when a transmitter set the state and said.
+    pub status_reason: Option<String>,
+    /// Push (with its endpoint) or poll.
+    pub delivery: SsfDelivery,
+    /// What the receiver ASKED to receive.
+    pub events_requested: Vec<String>,
+    /// What this transmitter agreed to send: always a subset of the above.
+    pub events_delivered: Vec<String>,
+    /// The RFC 9493 format subjects render in for this stream.
+    pub subject_format: SsfSubjectFormat,
+    /// The `aud` every SET on this stream carries.
+    pub audience: Vec<String>,
+    /// What the receiver calls it.
+    pub description: Option<String>,
+    /// When it was created.
+    pub created_at_unix_micros: i64,
+    /// When it was last changed.
+    pub updated_at_unix_micros: i64,
+}
+
+/// A stream to create.
+#[derive(Debug, Clone)]
+pub struct NewSsfStream<'a> {
+    /// The `sst_` handle the caller minted.
+    pub id: &'a SsfStreamId,
+    /// The receiver that will own it.
+    pub client_id: &'a ClientId,
+    /// Push or poll.
+    pub delivery: &'a SsfDelivery,
+    /// What the receiver asked for.
+    pub events_requested: &'a [String],
+    /// What this transmitter agreed to: the caller has already intersected it against what
+    /// this build emits, and 0216 refuses a value that is not a subset.
+    pub events_delivered: &'a [String],
+    /// The negotiated subject format.
+    pub subject_format: SsfSubjectFormat,
+    /// The `aud` for its SETs. Non-empty; 0216 refuses an empty array.
+    pub audience: &'a [String],
+    /// The receiver's label, if it gave one.
+    pub description: Option<&'a str>,
+}
+
+const SSF_STREAM_COLUMNS: &str = "id, client_id, status, status_reason, delivery_method, \
+     push_endpoint_url, push_secret_name, events_requested, events_delivered, subject_format, \
+     audience, description, \
+     (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_us, \
+     (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_us";
+
+/// Reconstruct a typed [`SsfStream`] from a row read within scope.
+fn ssf_stream_from_row(row: &PgRow, scope: Scope) -> Result<SsfStream, StoreError> {
+    let decode = |what: &str| {
+        StoreError::Database(sqlx::Error::Decode(
+            format!("ssf_streams.{what} holds a value this build does not know").into(),
+        ))
+    };
+    let id_text: String = row.get("id");
+    let client_text: String = row.get("client_id");
+    let status_text: String = row.get("status");
+    let method_text: String = row.get("delivery_method");
+    let format_text: String = row.get("subject_format");
+    let endpoint: Option<String> = row.get("push_endpoint_url");
+    let secret_name: Option<String> = row.get("push_secret_name");
+
+    // THE PAIRING IS RE-ESTABLISHED HERE, not assumed. 0216's CHECK makes a push row without an
+    // endpoint unwritable, so a row that has one anyway means the schema and this build
+    // disagree -- and the failure mode of assuming is a poll stream silently constructed from a
+    // push row, which would then never be polled and never be pushed.
+    let delivery = match method_text.as_str() {
+        SSF_DELIVERY_PUSH => SsfDelivery::Push {
+            endpoint_url: endpoint.ok_or_else(|| decode("push_endpoint_url"))?,
+            secret_name,
+        },
+        SSF_DELIVERY_POLL => {
+            if endpoint.is_some() {
+                return Err(decode("push_endpoint_url"));
+            }
+            // BOTH HALVES, not just the endpoint. 0216 makes a poll row carrying either a
+            // delivery URL or a push credential unwritable, so a row with one anyway means the
+            // schema and this build disagree. Checking only the endpoint would have mapped such
+            // a row to `Poll` and dropped the credential's NAME on the floor without a word --
+            // which reads, to anyone later asking why a secret is unreferenced, as a secret
+            // nothing uses.
+            if secret_name.is_some() {
+                return Err(decode("push_secret_name"));
+            }
+            SsfDelivery::Poll
+        }
+        _ => return Err(decode("delivery_method")),
+    };
+
+    let events_requested: serde_json::Value = row.get("events_requested");
+    let events_delivered: serde_json::Value = row.get("events_delivered");
+    let audience: serde_json::Value = row.get("audience");
+    let strings = |value: &serde_json::Value, what: &str| -> Result<Vec<String>, StoreError> {
+        value
+            .as_array()
+            .ok_or_else(|| decode(what))?
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| decode(what))
+            })
+            .collect()
+    };
+
+    Ok(SsfStream {
+        id: SsfStreamId::parse_in_scope(&id_text, &scope).map_err(|_| decode("id"))?,
+        client_id: ClientId::parse_in_scope(&client_text, &scope)
+            .map_err(|_| decode("client_id"))?,
+        status: SsfStreamStatus::parse(&status_text).ok_or_else(|| decode("status"))?,
+        status_reason: row.get("status_reason"),
+        delivery,
+        events_requested: strings(&events_requested, "events_requested")?,
+        events_delivered: strings(&events_delivered, "events_delivered")?,
+        subject_format: SsfSubjectFormat::parse(&format_text)
+            .ok_or_else(|| decode("subject_format"))?,
+        audience: strings(&audience, "audience")?,
+        description: row.get("description"),
+        created_at_unix_micros: row.get("created_us"),
+        updated_at_unix_micros: row.get("updated_us"),
+    })
+}
+
+/// Reads over one scope's Shared Signals streams.
+///
+/// # Every read takes the receiver
+///
+/// There is no `get(id)` here, only [`Self::get_for_client`]. #143 requires that "a receiver's
+/// credentials grant access to exactly its own streams", and a read that took only the handle
+/// would leave that fence to each caller to remember. The one place it can be forgotten is the
+/// place it must not be, so the receiver is a PARAMETER of the read rather than a check
+/// around it.
+pub struct SsfStreamRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SsfStreamRepo<'_> {
+    /// One stream belonging to one receiver, or [`StoreError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a handle from another scope, a handle that does not exist,
+    /// or -- and this is the case that matters -- a real handle belonging to a DIFFERENT
+    /// receiver. All three answer identically, so a receiver cannot probe for the existence of
+    /// another's stream.
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn get_for_client(
+        &self,
+        id: &SsfStreamId,
+        client_id: &ClientId,
+    ) -> Result<SsfStream, StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let row = sqlx::query(&format!(
+            "SELECT {SSF_STREAM_COLUMNS} FROM ssf_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND client_id = $4"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(client_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.ok_or(StoreError::NotFound)
+            .and_then(|row| ssf_stream_from_row(&row, self.scope))
+    }
+
+    /// Every stream one receiver owns, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn list_for_client(
+        &self,
+        client_id: &ClientId,
+        limit: i64,
+        after: Option<&CursorPosition>,
+    ) -> Result<Vec<SsfStream>, StoreError> {
+        if client_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let (after_micros, after_id) = split_cursor(after);
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SSF_STREAM_COLUMNS} FROM ssf_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND client_id = $3 \
+               AND ($4::bigint IS NULL \
+                    OR (created_at, id) > (to_timestamp($4::double precision / 1000000), $5)) \
+             ORDER BY created_at, id LIMIT $6"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(client_id.to_string())
+        .bind(after_micros)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| ssf_stream_from_row(row, self.scope))
+            .collect()
+    }
+
+    /// Every stream in the scope that would KEEP an event generated now, oldest first.
+    ///
+    /// This is the fan-out's read, and it is deliberately [`SsfStreamStatus::retains`] rather
+    /// than `delivers`: a paused stream accumulates, so an event omitted here is one the
+    /// receiver can never be given when it resumes. The filter is in the statement rather than
+    /// applied afterwards so `ssf_streams_retaining_idx` can serve it: 0216's partial predicate
+    /// is the same set this reads, so the two cannot drift into a sequential scan.
+    ///
+    /// NOT FENCED ON A RECEIVER, and that is the one read here which is not: the fan-out acts
+    /// for the environment rather than for any client, and it reaches every stream by
+    /// definition. It takes no `client_id` so that it cannot be mistaken for one that does.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn retaining_in_scope(&self, limit: i64) -> Result<Vec<SsfStream>, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SSF_STREAM_COLUMNS} FROM ssf_streams \
+             WHERE tenant_id = $1 AND environment_id = $2 AND status IN ('enabled', 'paused') \
+             ORDER BY created_at, id LIMIT $3"
+        ))
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|row| ssf_stream_from_row(row, self.scope))
+            .collect()
+    }
+}
+
+/// Writes over one scope's Shared Signals streams, attributed to an actor.
+pub struct ActingSsfStreamRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+    acting: ActingContext,
+}
+
+impl ActingSsfStreamRepo<'_> {
+    /// Create a stream for one receiver.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle or the client is out of scope;
+    /// [`StoreError::Conflict`] if the handle is already used;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn create(&self, env: &Env, stream: NewSsfStream<'_>) -> Result<(), StoreError> {
+        if stream.id.scope() != self.scope || stream.client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let id = *stream.id;
+        let client = stream.client_id.to_string();
+        let (method, endpoint, secret_name) = match stream.delivery {
+            SsfDelivery::Push {
+                endpoint_url,
+                secret_name,
+            } => (
+                SSF_DELIVERY_PUSH,
+                Some(endpoint_url.clone()),
+                secret_name.clone(),
+            ),
+            SsfDelivery::Poll => (SSF_DELIVERY_POLL, None, None),
+        };
+        let requested = serde_json::Value::from(stream.events_requested.to_vec());
+        let delivered = serde_json::Value::from(stream.events_delivered.to_vec());
+        let audience = serde_json::Value::from(stream.audience.to_vec());
+        let subject_format = stream.subject_format.as_str();
+        let description = stream.description.map(ToOwned::to_owned);
+        // THE DETAIL NAMES THE METHOD AND THE ENDPOINT, and neither is a secret: the push
+        // bearer, when a receiver asks for one, is an `environment_secrets` row this stream
+        // NAMES. An operator reading the log for "who started shipping our signals, and where
+        // to" gets both here.
+        let detail = match &endpoint {
+            Some(url) => format!("delivery={method} endpoint={url}"),
+            None => format!("delivery={method}"),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SsfStreamCreated,
+                target: &id,
+            },
+            async move |tx| {
+                sqlx::query(
+                    "INSERT INTO ssf_streams \
+                     (id, tenant_id, environment_id, client_id, delivery_method, \
+                      push_endpoint_url, push_secret_name, events_requested, events_delivered, \
+                      subject_format, audience, description) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                )
+                .bind(id.to_string())
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(&client)
+                .bind(method)
+                .bind(&endpoint)
+                .bind(&secret_name)
+                .bind(&requested)
+                .bind(&delivered)
+                .bind(subject_format)
+                .bind(&audience)
+                .bind(&description)
+                .execute(&mut **tx)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    if is_unique_violation(&error) {
+                        StoreError::Conflict
+                    } else {
+                        StoreError::Database(error)
+                    }
+                })
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// Move a stream between the three statuses.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a handle out of scope, absent, or belonging to another
+    /// receiver -- the same uniform answer the read gives, for the same reason;
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn set_status(
+        &self,
+        env: &Env,
+        id: &SsfStreamId,
+        client_id: &ClientId,
+        status: SsfStreamStatus,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client = client_id.to_string();
+        let stored = status.as_str();
+        let reason_owned = reason.map(ToOwned::to_owned);
+        let detail = match reason {
+            Some(reason) => format!("status={stored} reason={reason}"),
+            None => format!("status={stored}"),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SsfStreamStatusChanged,
+                target: id,
+            },
+            async move |tx| {
+                // THE CLIENT IS A CONJUNCT OF THE UPDATE, not a check before it. A read then a
+                // write leaves a window, and more importantly it puts the fence somewhere a
+                // future caller can skip; here the statement itself matches no row for another
+                // receiver's stream, so the write cannot land.
+                let updated = sqlx::query(
+                    "UPDATE ssf_streams \
+                     SET status = $1, status_reason = $2, updated_at = now() \
+                     WHERE tenant_id = $3 AND environment_id = $4 AND id = $5 AND client_id = $6",
+                )
+                .bind(stored)
+                .bind(&reason_owned)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(&client)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await
+    }
+
+    /// Delete a stream.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for a handle out of scope, absent, or belonging to another
+    /// receiver; [`StoreError::Database`] on a persistence failure.
+    pub async fn delete(
+        &self,
+        env: &Env,
+        id: &SsfStreamId,
+        client_id: &ClientId,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let client = client_id.to_string();
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SsfStreamDeleted,
+                target: id,
+            },
+            async move |tx| {
+                let deleted = sqlx::query(
+                    "DELETE FROM ssf_streams \
+                     WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND client_id = $4",
+                )
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(id.to_string())
+                .bind(&client)
+                .execute(&mut **tx)
+                .await?;
+                if deleted.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            None,
+        )
+        .await
     }
 }
 

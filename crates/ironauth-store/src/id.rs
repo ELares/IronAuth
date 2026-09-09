@@ -1305,6 +1305,18 @@ impl ScopedKind for LdapConnectorKind {
     const PREFIX: &'static str = "ldc";
 }
 
+/// Marker for a Shared Signals stream (`sst_`, issue #143).
+///
+/// The row that says WHERE one receiver's security event tokens go and WHICH events it agreed
+/// to receive. Safe in a log line for the reason [`LdapConnectorKind`] is: it names a
+/// subscription the receiver created, not a credential -- the push bearer, when a receiver
+/// asks for one at all, is an `environment_secrets` row the stream names rather than carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SsfStreamKind;
+impl ScopedKind for SsfStreamKind {
+    const PREFIX: &'static str = "sst";
+}
+
 /// Marker for an outbound SCIM push LINK (`spl_`, issue #137).
 ///
 /// The row that records what ONE downstream calls ONE subject. Not a credential and not a
@@ -2244,6 +2256,8 @@ pub type ScimPushConnectionId = ScopedId<ScimPushConnectionKind>;
 
 /// An LDAP/AD connector handle (issue #142).
 pub type LdapConnectorId = ScopedId<LdapConnectorKind>;
+/// A Shared Signals stream handle (`sst_...`), issue #143.
+pub type SsfStreamId = ScopedId<SsfStreamKind>;
 /// An inbound SAML connection identifier (`smc_...`), issue #139. The trust decision, never a key.
 pub type SamlConnectionId = ScopedId<SamlConnectionKind>;
 /// A pinned SAML signing key identifier (`smk_...`), issue #139.
