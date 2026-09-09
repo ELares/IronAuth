@@ -16,12 +16,16 @@
 //! event types it cannot produce would publish that list in its discovery document, which is
 //! the one place a receiver reads to decide what to ask for.
 //!
-//! # The subject is an RFC 9493 identifier, rendered per stream
+//! # The subject is an RFC 9493 identifier, rendered per stream, at the TOP LEVEL
 //!
 //! A receiver keys its users its own way, so SSF negotiates the identifier FORMAT per stream.
 //! [`SubjectIdentifier`] is the rendered side of the same three formats
 //! [`ironauth_store::SsfSubjectFormat`] stores, and the two are kept honest by
 //! [`SubjectIdentifier::format`], which answers the stored enum rather than a string literal.
+//!
+//! It travels as the top-level `sub_id` claim, which SSF 1.0 section 3.1.2 makes a MUST for a
+//! new event type -- the same section forbids naming the primary subject with an in-event
+//! `subject` member instead.
 //!
 //! # `jti` comes from the caller
 //!
@@ -117,9 +121,13 @@ impl SubjectIdentifier {
 pub struct SecurityEvent {
     /// The event type URI, which is the KEY under `events`.
     pub event_type: String,
-    /// The event's own members. Rendered as the value under that key, with the subject
-    /// inserted, so the payload a caller supplies never has to spell `subject` itself.
-    pub payload: serde_json::Value,
+    /// The event's own members, rendered as the value under that key.
+    ///
+    /// A `Map` rather than a `Value`, so an event body that is not a JSON object cannot be
+    /// built. RFC 8417's `events` values are objects; the first version of this took a `Value`
+    /// and silently DROPPED a scalar, which turned a caller's mistake into a SET that reported
+    /// the event with none of its detail.
+    pub payload: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Everything one SET says, before it is signed.
@@ -150,24 +158,22 @@ pub enum MintError {
 /// the claims back through a verifier would be comparing this code to itself.
 #[must_use]
 pub fn build_set_claims(issuer: &str, iat: i64, spec: &SetToMint<'_>) -> serde_json::Value {
-    // THE SUBJECT GOES IN THE EVENT PAYLOAD, per SSF 1.0, rather than in a top-level `sub`.
-    // RFC 8417 section 2.2 warns that a SET's subject is the subject OF THE EVENT and that
-    // reusing `sub` invites a receiver to treat the token as an authentication statement about
-    // that principal. The event object is the unambiguous place.
-    let mut event_body = match spec.event.payload.clone() {
-        serde_json::Value::Object(map) => map,
-        // A caller handing a non-object payload gets it dropped rather than rendered beside the
-        // subject as a stray member: `events`' values are objects in RFC 8417, and a scalar
-        // there would be a malformed SET.
-        _ => serde_json::Map::new(),
+    // THE SUBJECT IS A TOP-LEVEL `sub_id`, which SSF 1.0 section 3.1.2 makes a MUST for a new
+    // event type -- and the same section says such a type MUST NOT use the `subject` member
+    // inside `events` to name its primary subject. The carve-out in section 3.1.1, which lets
+    // an event type defined in CAEP or RISC ALSO carry an in-event `subject`, does not reach
+    // anything here: this build defines no event types at all (see `EVENTS_SUPPORTED`).
+    //
+    // An earlier version of this put the subject only in the event payload and cited SSF 1.0
+    // for it. SSF says the reverse.
+    let events = {
+        let mut events = serde_json::Map::new();
+        events.insert(
+            spec.event.event_type.clone(),
+            serde_json::Value::Object(spec.event.payload.clone()),
+        );
+        events
     };
-    event_body.insert("subject".to_owned(), spec.subject.render());
-
-    let mut events = serde_json::Map::new();
-    events.insert(
-        spec.event.event_type.clone(),
-        serde_json::Value::Object(event_body),
-    );
 
     let mut claims = serde_json::Map::new();
     claims.insert(
@@ -183,20 +189,30 @@ pub fn build_set_claims(issuer: &str, iat: i64, spec: &SetToMint<'_>) -> serde_j
     // receivers differ on which they accept; the array is the shape every one of them parses,
     // and a transmitter that switched shapes on the audience COUNT would work against a
     // receiver until the day a second audience was configured.
-    claims.insert(
-        "aud".to_owned(),
-        serde_json::Value::Array(
-            spec.audience
-                .iter()
-                .map(|entry| serde_json::Value::String(entry.clone()))
-                .collect(),
-        ),
-    );
+    // OMITTED WHEN EMPTY, not rendered as `[]`. RFC 8417 makes `aud` optional, and an empty
+    // array is strictly worse than its absence: no receiver's audience check can ever match it,
+    // so the SET would be undeliverable to everyone while looking well formed. The stream that
+    // supplies this cannot be created with an empty audience -- 0216 refuses it and the surface
+    // refuses it first -- so this arm is a floor under a caller that bypassed both.
+    if !spec.audience.is_empty() {
+        claims.insert(
+            "aud".to_owned(),
+            serde_json::Value::Array(
+                spec.audience
+                    .iter()
+                    .map(|entry| serde_json::Value::String(entry.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    claims.insert("sub_id".to_owned(), spec.subject.render());
     claims.insert("events".to_owned(), serde_json::Value::Object(events));
-    // NO `exp`. RFC 8417 section 4.1 says a SET MUST NOT be rejected for age alone: it reports
-    // something that HAPPENED, and an expiry would make a receiver that was down through the
-    // window discard the events it most needs. Freshness is the delivery layer's problem, and
-    // replay is what `jti` is for.
+    // NO `exp`, and for SSF that is a MUST NOT rather than a preference: SSF 1.0 section 4.1.7
+    // says "The \"exp\" claim MUST NOT be used in SETs". RFC 8417 section 2.2 gives the reason
+    // -- "a SET represents something that has already occurred and is historical in nature.
+    // Therefore, its use is NOT RECOMMENDED" -- and an expiry would make a receiver that was
+    // down through the window discard the events it most needs. Freshness is the delivery
+    // layer's problem, and replay is what `jti` is for.
     serde_json::Value::Object(claims)
 }
 

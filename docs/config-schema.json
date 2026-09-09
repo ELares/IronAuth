@@ -2760,6 +2760,25 @@
       },
       "type": "object"
     },
+    "SsfConfig": {
+      "additionalProperties": false,
+      "description": "The Shared Signals Framework transmitter (issue #143).\n\nSSF 1.0, CAEP 1.0 and RISC 1.0 are FINAL specifications, so this is not on the experimental\nfeature ladder the way `global-token-revocation` is -- that gate exists for an unadopted\ndraft whose wire format may still move. What this switch is for is what `scim.enabled` is\nfor: a deployment opts into a protocol surface, and one that has not opted in should be\nindistinguishable from one that does not implement it.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether to serve the Shared Signals stream-management surface and its discovery\ndocument on the public plane. Off by default.\n\nOff is a uniform 404 on every `/ssf/` path AND on `/.well-known/ssf-configuration`,\nnot a 501 and not a document advertising nothing: a receiver probing a deployment that\nhas not enabled SSF learns that it does not implement it, which is true.",
+          "type": "boolean"
+        },
+        "max_streams_per_client": {
+          "default": 20,
+          "description": "The most streams one receiver may hold in one environment.\n\nA stream is cheap to create and permanent until deleted, and each one multiplies the\nwork every emitted event costs, so an unbounded count is a client-chosen amount of\nserver work on every signal this environment produces. Reaching it REFUSES the create\nrather than evicting an existing stream: a receiver silently losing the stream it has\nbeen polling is a delivery gap it cannot detect, which is the failure this subsystem\nexists to prevent.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "TelemetryConfig": {
       "additionalProperties": false,
       "description": "Observability settings.",
@@ -3422,6 +3441,14 @@
         "shutdown_grace_secs": 25
       },
       "description": "HTTP server settings."
+    },
+    "ssf": {
+      "$ref": "#/$defs/SsfConfig",
+      "default": {
+        "enabled": false,
+        "max_streams_per_client": 20
+      },
+      "description": "The Shared Signals transmitter (issue #143). OFF by default, so the default boot\nmounts no stream-management surface and serves no SSF discovery document."
     },
     "telemetry": {
       "$ref": "#/$defs/TelemetryConfig",

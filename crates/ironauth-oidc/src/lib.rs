@@ -192,6 +192,8 @@ mod session_mgmt;
 pub mod session_tokenizer;
 mod sms_conversion;
 mod sms_otp;
+/// Shared Signals stream management and discovery (#143).
+pub mod ssf;
 /// Security Event Tokens: the RFC 8417 framing a Shared Signals transmitter mints (#143).
 pub mod ssf_set;
 mod state;
@@ -1137,6 +1139,25 @@ pub fn oidc_router(state: OidcState) -> Router {
             global_revocation::GLOBAL_TOKEN_REVOCATION_PATH,
             post(global_revocation::global_token_revocation),
         );
+    }
+
+    // The Shared Signals stream-management surface (issue #143), mounted ONLY when
+    // `ssf.enabled` is set. Off is a uniform 404 on every `/ssf/` path and on the discovery
+    // document, so a deployment that has not opted in is indistinguishable from one that does
+    // not implement SSF -- the same shape `scim.enabled` gives its own surface.
+    if state.ssf_enabled() {
+        router = router
+            .route(
+                ssf::STREAMS_PATH,
+                post(ssf::create_stream)
+                    .get(ssf::read_streams)
+                    .delete(ssf::delete_stream),
+            )
+            .route(
+                ssf::STATUS_PATH,
+                get(ssf::read_status).post(ssf::update_status),
+            )
+            .route(ssf::CONFIGURATION_PATH, get(ssf::configuration));
     }
 
     router.with_state(state)

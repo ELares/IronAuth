@@ -119,6 +119,10 @@ pub struct Config {
     /// boot mounts nothing under `/scim/v2` and every such path is a uniform 404.
     pub scim: ScimConfig,
 
+    /// The Shared Signals transmitter (issue #143). OFF by default, so the default boot
+    /// mounts no stream-management surface and serves no SSF discovery document.
+    pub ssf: SsfConfig,
+
     /// OUTBOUND SCIM provisioning (issue #137): whether THIS process runs the push
     /// worker, and how often.
     ///
@@ -928,6 +932,47 @@ impl Default for ScimPushConfig {
             // person is still walking out, long enough that an idle environment is not issuing
             // a query per scope per second.
             interval_secs: 30,
+        }
+    }
+}
+
+/// The Shared Signals Framework transmitter (issue #143).
+///
+/// SSF 1.0, CAEP 1.0 and RISC 1.0 are FINAL specifications, so this is not on the experimental
+/// feature ladder the way `global-token-revocation` is -- that gate exists for an unadopted
+/// draft whose wire format may still move. What this switch is for is what `scim.enabled` is
+/// for: a deployment opts into a protocol surface, and one that has not opted in should be
+/// indistinguishable from one that does not implement it.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct SsfConfig {
+    /// Whether to serve the Shared Signals stream-management surface and its discovery
+    /// document on the public plane. Off by default.
+    ///
+    /// Off is a uniform 404 on every `/ssf/` path AND on `/.well-known/ssf-configuration`,
+    /// not a 501 and not a document advertising nothing: a receiver probing a deployment that
+    /// has not enabled SSF learns that it does not implement it, which is true.
+    pub enabled: bool,
+
+    /// The most streams one receiver may hold in one environment.
+    ///
+    /// A stream is cheap to create and permanent until deleted, and each one multiplies the
+    /// work every emitted event costs, so an unbounded count is a client-chosen amount of
+    /// server work on every signal this environment produces. Reaching it REFUSES the create
+    /// rather than evicting an existing stream: a receiver silently losing the stream it has
+    /// been polling is a delivery gap it cannot detect, which is the failure this subsystem
+    /// exists to prevent.
+    pub max_streams_per_client: u32,
+}
+
+impl Default for SsfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // A receiver needs one stream per delivery method it uses and SSF defines two, so
+            // twenty is generous by an order of magnitude rather than a limit anybody meets by
+            // accident.
+            max_streams_per_client: 20,
         }
     }
 }
@@ -5688,6 +5733,7 @@ impl Config {
         check_byok_unconsumed(&self.byok)?;
         validate_admin(&self.admin)?;
         validate_scim(&self.scim)?;
+        validate_ssf(&self.ssf)?;
         validate_scim_push(&self.scim_push)?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
@@ -5921,6 +5967,24 @@ fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
 pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 
 /// Refuse a scim section whose page bounds cannot be satisfied.
+/// The Shared Signals transmitter's bounds (issue #143).
+///
+/// A ceiling of zero would refuse EVERY create while discovery still advertised the surface,
+/// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
+/// streams, `ssf.enabled = false` says so and answers 404.
+fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
+    if ssf.enabled && ssf.max_streams_per_client == 0 {
+        return Err(ConfigError::Invalid {
+            message: "ssf.max_streams_per_client must be at least 1 when ssf.enabled is true: \
+                      zero refuses every stream a receiver tries to create while discovery \
+                      still advertises the surface. Set ssf.enabled = false to serve no \
+                      streams at all"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
         return Err(ConfigError::Invalid {

@@ -239,6 +239,8 @@ pub struct OidcState {
     // resolves it from the strict config feature ladder (feature enabled AND acked)
     // and sets it here. Default: false (the endpoint is unmounted).
     global_token_revocation_enabled: bool,
+    ssf_enabled: bool,
+    ssf_max_streams_per_client: u32,
     // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
     // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
@@ -1058,6 +1060,8 @@ impl OidcState {
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
+            ssf_enabled: false,
+            ssf_max_streams_per_client: 20,
             fedcm_enabled: false,
             agent_vault_enabled: false,
             cimd_enabled: false,
@@ -1286,6 +1290,26 @@ impl OidcState {
     #[must_use]
     pub fn global_token_revocation_enabled(&self) -> bool {
         self.global_token_revocation_enabled
+    }
+
+    /// Arm (or not) the Shared Signals stream-management surface (issue #143).
+    #[must_use]
+    pub fn with_ssf(mut self, enabled: bool, max_streams_per_client: u32) -> Self {
+        self.ssf_enabled = enabled;
+        self.ssf_max_streams_per_client = max_streams_per_client;
+        self
+    }
+
+    /// Whether the Shared Signals surface is mounted.
+    #[must_use]
+    pub fn ssf_enabled(&self) -> bool {
+        self.ssf_enabled
+    }
+
+    /// The most streams one receiver may hold here.
+    #[must_use]
+    pub fn ssf_max_streams_per_client(&self) -> u32 {
+        self.ssf_max_streams_per_client
     }
 
     /// Arm (or not) the experimental IdP-side FedCM surface (issue #83).
