@@ -546,6 +546,15 @@ token_profiles! {
     /// declaration. The draft's media type carries no `+jwt` suffix, which is the draft's
     /// choice and not a typo.
     TransactionToken => "txn_token",
+    /// A SECURITY EVENT TOKEN: `secevent+jwt` (RFC 8417 section 2.3).
+    ///
+    /// The profile a Shared Signals transmitter mints (issue #143). RFC 8417 registers this
+    /// media type and section 2.3 makes stamping it a SHOULD; the receiving half of this
+    /// system already reads it, in `ironauth_oidc::risk_signals`, which notes that transmitters
+    /// vary and accepts a SET without it. This declaration is what stops IronAuth being one of
+    /// the transmitters that vary: the spelling stamped here and the spelling a verifier
+    /// requires come from one place.
+    SecurityEventToken => "secevent+jwt",
 }
 
 /// Whether a protected header's `typ` names `expected`, for a media type IronAuth does NOT mint.
@@ -654,6 +663,7 @@ pub struct VerificationPolicy {
     pub(crate) caps: VerificationCaps,
     pub(crate) require_iat: bool,
     pub(crate) allow_expired: bool,
+    pub(crate) allow_absent_exp: bool,
 }
 
 impl VerificationPolicy {
@@ -708,6 +718,7 @@ impl VerificationPolicy {
             caps: VerificationCaps::DEFAULT,
             require_iat: false,
             allow_expired: false,
+            allow_absent_exp: false,
         })
     }
 
@@ -747,6 +758,30 @@ impl VerificationPolicy {
     #[must_use]
     pub fn allow_expired(mut self, allow: bool) -> Self {
         self.allow_expired = allow;
+        self
+    }
+
+    /// Accept a token that carries NO `exp` at all (opt-in, default OFF).
+    ///
+    /// Distinct from [`Self::allow_expired`], which relaxes the "now is past `exp`" rejection
+    /// while still REQUIRING the claim to be present. This relaxes presence, and nothing else:
+    /// an `exp` that IS present is still parsed and still enforced against the clock, and the
+    /// signature, algorithm allowlist, key selection, issuer, audience, `nbf` and `iat` checks
+    /// are untouched.
+    ///
+    /// The single legitimate caller is the RFC 8417 Security Event Token profile. A SET reports
+    /// something that ALREADY HAPPENED, so RFC 8417 section 4.1 says it is not to be treated as
+    /// an access token and carries no expiry: giving one an `exp` would make a receiver that was
+    /// down through the window discard exactly the events it most needs to see. Replay is what
+    /// the required `jti` is for, not `exp`.
+    ///
+    /// This exists because the check it relaxes made IronAuth unable to handle a conforming SET
+    /// in EITHER direction -- the transmitter could not validate its own output against this
+    /// core, and the third-party risk-signal receiver rejected every exp-less SET a conforming
+    /// transmitter sent it. Left OFF, `exp` is required exactly as before.
+    #[must_use]
+    pub fn allow_absent_exp(mut self, allow: bool) -> Self {
+        self.allow_absent_exp = allow;
         self
     }
 
@@ -847,6 +882,8 @@ mod tests {
                 // draft-ietf-oauth-transaction-tokens-09 section 6. No `+jwt` suffix: that is
                 // the draft's spelling, transcribed rather than tidied.
                 TokenTyp::TransactionToken => "txn_token",
+                // RFC 8417 section 2.3.
+                TokenTyp::SecurityEventToken => "secevent+jwt",
             };
             assert_eq!(typ.media_type(), expected, "{typ:?}");
         }

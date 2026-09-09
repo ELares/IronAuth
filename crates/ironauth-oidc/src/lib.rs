@@ -192,6 +192,8 @@ mod session_mgmt;
 pub mod session_tokenizer;
 mod sms_conversion;
 mod sms_otp;
+/// Security Event Tokens: the RFC 8417 framing a Shared Signals transmitter mints (#143).
+pub mod ssf_set;
 mod state;
 mod step_up;
 mod subject;
