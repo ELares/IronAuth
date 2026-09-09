@@ -5,6 +5,47 @@
 use std::collections::BTreeSet;
 
 use ironauth_admin::ldap_diff::{DepartureRefusal, Diff};
+use ironauth_admin::ldap_groups::{GroupSource, Member, expand};
+
+struct Graph {
+    edges: std::collections::BTreeMap<String, Vec<Member>>,
+}
+
+impl Graph {
+    fn new(edges: &[(&str, &[(&str, bool)])]) -> Self {
+        Self {
+            edges: edges
+                .iter()
+                .map(|(g, ms)| {
+                    (
+                        (*g).to_owned(),
+                        ms.iter()
+                            .map(|(dn, is_group)| Member {
+                                dn: (*dn).to_owned(),
+                                is_group: *is_group,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl GroupSource for Graph {
+    type Error = String;
+
+    async fn direct_members(&self, group_dn: &str) -> Result<Vec<Member>, String> {
+        Ok(self.edges.get(group_dn).cloned().unwrap_or_default())
+    }
+}
+
+fn person(dn: &str) -> (&str, bool) {
+    (dn, false)
+}
+fn group(dn: &str) -> (&str, bool) {
+    (dn, true)
+}
 
 fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
@@ -19,6 +60,11 @@ fn a_complete_read_yields_arrivals_and_departures() {
     assert_eq!(*diff.retained(), set(&["grace"]));
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "asserting on the provisional set is exactly what these tests are for: the lint \
+              exists to keep a deprovisioning caller off it, not a test that pins its contents"
+)]
 /// THE ASYMMETRY. An incomplete read still yields arrivals and refuses departures.
 ///
 /// A short read can only under-report an arrival, and a late joiner signs in tomorrow. A leaver
@@ -37,12 +83,25 @@ fn an_incomplete_read_gives_arrivals_but_refuses_departures() {
         diff.departures().expect_err("must refuse"),
         DepartureRefusal::ObservationIncomplete
     );
+    // THE OTHER DIRECTION. The only other mention of this accessor asserts `true` about a diff
+    // built with `complete = true`, so replacing the body with a constant `true` left the whole
+    // suite green. A health page has to call this to say "12 would be deprovisioned once the
+    // bound is raised", and an accessor stuck at true means that banner never fires.
+    assert!(
+        !diff.observation_was_complete(),
+        "the accessor must report the incompleteness this diff was built with"
+    );
 
     // The set still EXISTS for reporting -- an operator wants to know what is pending -- it is
     // simply not reachable through the accessor a deprovisioning cascade would call.
     assert_eq!(*diff.provisional_departures(), set(&["ada"]));
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "asserting on the provisional set is exactly what these tests are for: the lint \
+              exists to keep a deprovisioning caller off it, not a test that pins its contents"
+)]
 /// A read that returns NOBODY is a failed read, not a company that fired everybody.
 ///
 /// A base DN typo, a revoked read grant and a renamed group all produce a technically successful
@@ -118,4 +177,53 @@ fn an_unchanged_directory_produces_no_movement() {
     assert!(diff.arrivals().is_empty());
     assert!(diff.departures().expect("complete").is_empty());
     assert_eq!(*diff.retained(), people);
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "asserting on the provisional set is exactly what these tests are for: the lint \
+              exists to keep a deprovisioning caller off it, not a test that pins its contents"
+)]
+/// The expansion and its completeness travel together.
+///
+/// `Diff::between` takes a bare `bool`, so `Diff::between(&previous, &members, true)` compiled
+/// fine and silently disabled the refusal on a truncated walk. `against` takes the
+/// [`Expansion`] itself, so the flag cannot be supplied separately from the member set it
+/// describes -- which is also what finally makes `Expansion::complete` read by something other
+/// than its own tests.
+#[tokio::test]
+async fn a_truncated_expansion_refuses_departures_through_the_real_connection() {
+    let graph = Graph::new(&[
+        ("root", &[person("stays"), group("nested")]),
+        ("nested", &[person("hidden")]),
+    ]);
+    let truncated = expand(&graph, &["root".to_owned()], 0)
+        .await
+        .expect("expands");
+    assert!(!truncated.complete, "the fixture must actually truncate");
+
+    let previously = set(&["stays", "hidden"]);
+    let diff = Diff::against(&previously, &truncated);
+
+    assert_eq!(
+        diff.departures()
+            .expect_err("a truncated walk cannot name departures"),
+        DepartureRefusal::ObservationIncomplete
+    );
+    assert!(!diff.observation_was_complete());
+    // `hidden` is behind the cut, so it LOOKS departed and must not be reported as one.
+    assert!(diff.provisional_departures().contains("hidden"));
+
+    // AND THE CONTRAST: the same graph fully expanded names nobody as departed.
+    let whole = expand(&graph, &["root".to_owned()], 5)
+        .await
+        .expect("expands");
+    assert!(whole.complete);
+    let diff = Diff::against(&previously, &whole);
+    assert!(
+        diff.departures()
+            .expect("a complete walk is actionable")
+            .is_empty(),
+        "nobody left; the fixture only hid them behind the bound"
+    );
 }

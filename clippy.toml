@@ -36,6 +36,7 @@ disallowed-methods = [
     { path = "cel::Value::resolve", reason = "evaluate through ironauth_cel::BudgetedProgram::evaluate, which enforces the declared input shape; resolving a parsed expression directly skips both the budget and the shape (issue #113 criterion 2)" },
     { path = "ldap3::LdapConnSettings::set_no_tls_verify", reason = "a directory bind sends the service account password, so the certificate must be verified; there is deliberately no configuration route to this (issue #142)" },
     { path = "ldap3::LdapConnSettings::set_config", reason = "a caller-supplied rustls ClientConfig can install an accept-anything verifier and reach the same place as set_no_tls_verify; build the settings through LdapConnSettings::new (issue #142)" },
+    { path = "ironauth_admin::ldap_diff::Diff::provisional_departures", reason = "this returns the departure set with no refusal, so acting on it deprovisions people a truncated directory read merely failed to see; call Diff::departures and handle DepartureRefusal, and reach for this only on a reporting surface with an #[expect] and a reason (issue #142)" },
 ]
 
 

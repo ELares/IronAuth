@@ -13,10 +13,15 @@
 //! tomorrow instead of today. A leaver concluded wrongly is a person deactivated, or under
 //! `absence_policy = delete`, removed. So this module will compute joiners from an incomplete
 //! read and REFUSES to compute leavers from one -- [`Diff::departures`] is not a field, it is a
-//! method that returns [`None`] when the read that produced it was short.
+//! method returning [`Err`]`(`[`DepartureRefusal`]`)` when the read that produced it was short.
 //!
-//! There is no way to get the departures out without handling that case, which is deliberate: a
-//! boolean beside the data is a boolean somebody forgets to check.
+//! THE TYPE DOES NOT MAKE THAT UNAVOIDABLE, and an earlier version of this paragraph claimed it
+//! did ("there is no way to get the departures out without handling that case"). That was false:
+//! [`Diff::provisional_departures`] returns the same set infallibly, which is the whole point of
+//! having it, and a three-line caller can reach it. What stops the sync from using it is a
+//! `disallowed-methods` entry in `clippy.toml`, so the rule is enforced by the same mechanism
+//! the workspace uses for the CEL budget and the LDAP TLS switches -- a lint that fires wherever
+//! the call is written, rather than a comment asking nicely.
 //!
 //! # A run that finds nothing is the shape to fear
 //!
@@ -28,6 +33,8 @@
 //! it was.
 
 use std::collections::BTreeSet;
+
+use crate::ldap_groups::Expansion;
 
 /// What a previous run recorded, and what this one saw.
 #[derive(Debug, Clone)]
@@ -77,9 +84,23 @@ impl std::fmt::Display for DepartureRefusal {
 }
 
 impl Diff {
-    /// Compare a previous snapshot against what this run observed.
+    /// Compare a previous snapshot against a group expansion.
     ///
-    /// `complete` comes from the group expansion: false means the walk was cut short.
+    /// THIS IS THE CONNECTION, and it needs to be a function rather than a sentence. The first
+    /// version of this module took a bare `bool` and its doc said the flag "comes from the group
+    /// expansion" -- which nothing enforced, so `Diff::between(&previous, &members, true)`
+    /// compiled fine and silently disabled the refusal on exactly the truncated walk it exists
+    /// for. Taking the [`Expansion`] means the completeness travels with the member set it
+    /// describes and a caller cannot supply one without the other.
+    #[must_use]
+    pub fn against(previous: &BTreeSet<String>, observed: &Expansion) -> Self {
+        Self::between(previous, &observed.members, observed.complete)
+    }
+
+    /// Compare a previous snapshot against a member set and a completeness flag.
+    ///
+    /// Prefer [`Self::against`], which takes the two together. This exists for a caller that
+    /// assembled the member set from something other than one expansion.
     #[must_use]
     pub fn between(
         previous: &BTreeSet<String>,
@@ -125,9 +146,11 @@ impl Diff {
 
     /// The would-be departures, for REPORTING only.
     ///
-    /// Named to be unusable by accident. A health page saying "12 principals would be
-    /// deprovisioned once the depth bound is raised" is worth showing an operator; the same set
-    /// fed to the deprovisioning cascade is the outage this module exists to prevent.
+    /// Named to be unusable by accident, and REFUSED BY CLIPPY outside a reporting surface: the
+    /// name alone is not a barrier, and this returns exactly what [`Self::departures`] guards.
+    /// A health page saying "12 principals would be deprovisioned once the depth bound is
+    /// raised" is worth showing an operator; the same set fed to the deprovisioning cascade is
+    /// the outage this module exists to prevent.
     #[must_use]
     pub fn provisional_departures(&self) -> &BTreeSet<String> {
         &self.left
