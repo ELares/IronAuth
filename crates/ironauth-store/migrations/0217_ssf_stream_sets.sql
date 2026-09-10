@@ -17,9 +17,25 @@
 --
 -- BOUNDED, because a receiver that never polls must not grow without limit. Two bounds, and
 -- they answer different failures: `ssf_stream_sets_jws_bounded` stops one enormous token, and
--- the per-stream count the surface enforces stops a slow receiver accumulating forever. A
--- deployment reaching either has a receiver that has stopped collecting, which is a fact an
--- operator wants surfaced rather than absorbed.
+-- a per-stream row count stops a slow receiver accumulating forever.
+--
+-- THE COUNT IS ENFORCED ON THE WAY IN, BY THE QUEUE -- NOT BY THE POLL SURFACE. It is a
+-- conjunct of `SsfStreamSetRepo::queue`, supplied by `ssf.max_owed_sets_per_stream`, and it
+-- REFUSES rather than evicting: silently dropping the oldest events is the failure this whole
+-- subsystem exists to prevent. A deployment reaching either bound has a receiver that has
+-- stopped collecting, which is a fact an operator wants surfaced rather than absorbed.
+--
+-- WHAT REMOVES ROWS, exhaustively, because nothing sweeps this table by age: an acknowledgement
+-- (`acknowledge`, the RFC 8936 delete), deleting the stream (CASCADE), and setting the stream
+-- to `disabled` -- which 0216 defines as retaining nothing, so `set_status` discards what the
+-- stream owed in the same transaction as the status change. `paused` deliberately keeps them;
+-- that retention is the entire difference between the two states.
+--
+-- SO A ROW'S LIFETIME IS ITS RECEIVER'S. A SET names a subject, and for `subject_format` of
+-- `email` it names one in the clear inside the signed token, which cannot be sealed at rest
+-- without changing the bytes the receiver must be handed on every redelivery. An abandoned
+-- ENABLED stream therefore holds up to the count bound indefinitely; disabling or deleting it
+-- is what discards them, and either is one management call.
 
 CREATE TABLE ssf_stream_sets (
     tenant_id      text        NOT NULL,
@@ -55,7 +71,10 @@ CREATE TABLE ssf_stream_sets (
     FOREIGN KEY (stream_id) REFERENCES ssf_streams (id) ON DELETE CASCADE
 );
 
--- The poll reads one stream's oldest unacknowledged tokens; the retention sweep reads by age.
+-- ONE STREAM'S OLDEST UNACKNOWLEDGED TOKENS, which is the only read there is. `queued_at`
+-- sits behind `stream_id` so the poll's oldest-first page is an index-order scan of one
+-- stream's rows; that prefix order deliberately cannot serve a cross-stream scan by age,
+-- because no such sweep exists to serve.
 CREATE INDEX ssf_stream_sets_by_stream_idx
     ON ssf_stream_sets (tenant_id, environment_id, stream_id, queued_at, jti);
 

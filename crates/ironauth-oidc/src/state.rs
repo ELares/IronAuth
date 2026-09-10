@@ -241,6 +241,7 @@ pub struct OidcState {
     global_token_revocation_enabled: bool,
     ssf_enabled: bool,
     ssf_max_streams_per_client: u32,
+    ssf_max_owed_sets_per_stream: u32,
     // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
     // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
@@ -1066,6 +1067,8 @@ impl OidcState {
             ssf_enabled: ironauth_config::SsfConfig::default().enabled,
             ssf_max_streams_per_client: ironauth_config::SsfConfig::default()
                 .max_streams_per_client,
+            ssf_max_owed_sets_per_stream: ironauth_config::SsfConfig::default()
+                .max_owed_sets_per_stream,
             fedcm_enabled: false,
             agent_vault_enabled: false,
             cimd_enabled: false,
@@ -1298,9 +1301,10 @@ impl OidcState {
 
     /// Arm (or not) the Shared Signals stream-management surface (issue #143).
     #[must_use]
-    pub fn with_ssf(mut self, enabled: bool, max_streams_per_client: u32) -> Self {
-        self.ssf_enabled = enabled;
-        self.ssf_max_streams_per_client = max_streams_per_client;
+    pub fn with_ssf(mut self, config: &ironauth_config::SsfConfig) -> Self {
+        self.ssf_enabled = config.enabled;
+        self.ssf_max_streams_per_client = config.max_streams_per_client;
+        self.ssf_max_owed_sets_per_stream = config.max_owed_sets_per_stream;
         self
     }
 
@@ -1314,6 +1318,12 @@ impl OidcState {
     #[must_use]
     pub fn ssf_max_streams_per_client(&self) -> u32 {
         self.ssf_max_streams_per_client
+    }
+
+    /// The most unacknowledged SETs one poll stream may hold.
+    #[must_use]
+    pub fn ssf_max_owed_sets_per_stream(&self) -> u32 {
+        self.ssf_max_owed_sets_per_stream
     }
 
     /// Arm (or not) the experimental IdP-side FedCM surface (issue #83).

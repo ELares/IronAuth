@@ -82488,6 +82488,24 @@ impl ActingSsfStreamRepo<'_> {
                 if updated.rows_affected() == 0 {
                     return Err(StoreError::NotFound);
                 }
+                // `disabled` RETAINS NOTHING, which 0216 states and which nothing enforced: a
+                // stream dropped to it kept everything it owed, so re-enabling replayed a
+                // backlog the receiver had been told was discarded -- and until then the rows
+                // sat at rest naming subjects. Dropped IN THE SAME TRANSACTION as the status,
+                // so the two can never disagree.
+                //
+                // `paused` keeps them, which is the whole difference between the two states.
+                if stored == SsfStreamStatus::Disabled.as_str() {
+                    sqlx::query(
+                        "DELETE FROM ssf_stream_sets \
+                         WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3",
+                    )
+                    .bind(scope.tenant().to_string())
+                    .bind(scope.environment().to_string())
+                    .bind(id.to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                }
                 Ok(())
             },
             false,

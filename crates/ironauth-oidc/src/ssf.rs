@@ -615,6 +615,17 @@ pub async fn poll(
     if !matches!(stream.delivery, SsfDelivery::Poll) {
         return invalid_request("this stream is delivered by push; it has nothing to collect");
     }
+    // A STREAM THAT IS NOT DELIVERING DOES NOT DELIVER HERE EITHER, and this is checked BEFORE
+    // the acknowledgement so a stopped stream cannot be drained by one.
+    //
+    // POLL IS DELIVERY. The push consumer has always refused a non-delivering stream; this
+    // surface did not, so `paused` handed its whole backlog over on the next poll and
+    // `disabled` -- documented as retaining nothing -- both served its queue AND let the caller
+    // destroy it with an `ack`. The same status word enforced on one delivery method and
+    // ignored on the other is worse than either answer applied to both.
+    if !stream.status.delivers() {
+        return not_delivering(stream.status);
+    }
 
     let sets = state.store().scoped(scope).ssf_stream_sets();
     if !request.ack.is_empty() {
@@ -866,6 +877,31 @@ fn no_content() -> Response {
     (
         StatusCode::NO_CONTENT,
         [(header::CACHE_CONTROL, "no-store")],
+    )
+        .into_response()
+}
+
+/// The stream exists and belongs to the caller, and it is not delivering.
+///
+/// NOT the uniform not-found the receiver fence uses, and deliberately: this receiver owns the
+/// stream, so telling it the state it set itself reveals nothing it does not already know, and
+/// an operator debugging a silent poll needs to be told the difference between "your stream is
+/// paused" and "your stream is gone".
+fn not_delivering(status: SsfStreamStatus) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::json!({
+            "error": "access_denied",
+            "error_description": format!(
+                "this stream is {} and is not delivering; set it to enabled to collect",
+                status.as_str()
+            ),
+        })
+        .to_string(),
     )
         .into_response()
 }

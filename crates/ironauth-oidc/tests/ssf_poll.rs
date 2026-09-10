@@ -24,7 +24,8 @@ use base64::engine::general_purpose::STANDARD;
 use common::Harness;
 use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::{
-    ClientId, CorrelationId, NewSsfStream, SsfDelivery, SsfStreamId, SsfSubjectFormat,
+    ClientId, CorrelationId, NewSsfStream, SsfDelivery, SsfStreamId, SsfStreamStatus,
+    SsfSubjectFormat,
 };
 
 fn basic(client_id: &ClientId, secret: &str) -> String {
@@ -91,7 +92,10 @@ async fn poll_stream(harness: &Harness, client: &ClientId, count: usize) -> SsfS
                 &id,
                 &format!("evt_{n}"),
                 &format!("header.payload{n}.sig"),
-                100,
+                // FROM THE CONFIGURED CEILING, not a literal. `ssf.max_owed_sets_per_stream` is
+                // what supplies this conjunct in production, so a test passing its own number
+                // would keep passing after the config key stopped reaching the queue.
+                harness.state().ssf_max_owed_sets_per_stream(),
             )
             .await
             .expect("queue a SET");
@@ -341,4 +345,158 @@ async fn the_configuration_publishes_the_poll_address_for_the_stream_it_describe
         "{}",
         created.1
     );
+}
+
+/// Set `stream` to `status` as its owner would, and report what it still owes.
+async fn set_status_then_owed(
+    harness: &Harness,
+    client: &ClientId,
+    stream: &SsfStreamId,
+    status: SsfStreamStatus,
+) -> i64 {
+    let env = harness.state().env().clone();
+    let scope = harness.scope();
+    harness
+        .db()
+        .store()
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .ssf_streams()
+        .set_status(&env, stream, client, status, None)
+        .await
+        .expect("set the stream status");
+    harness
+        .db()
+        .store()
+        .scoped(scope)
+        .ssf_stream_sets()
+        .owed_count(stream)
+        .await
+        .expect("count what is owed")
+}
+
+/// POLL IS DELIVERY, so a stream that is not delivering does not deliver here either.
+///
+/// Both non-default statuses, and both halves of each: what the poll answers, and what the
+/// stream still owes afterwards. The second half is the one that matters, because the
+/// acknowledgement is a DELETE -- a refusal that arrived after the delete would read as a
+/// refusal while having destroyed the backlog it claimed to protect.
+///
+/// The two statuses differ in exactly that retention, which is their whole distinction in 0216:
+/// `paused` RETAINS what it cannot deliver, `disabled` retains nothing.
+#[tokio::test]
+async fn a_stream_that_is_not_delivering_serves_no_poll_and_cannot_be_drained_by_one() {
+    for (status, owed_after_status_change, label) in [
+        (SsfStreamStatus::Paused, 3, "paused"),
+        (SsfStreamStatus::Disabled, 0, "disabled"),
+    ] {
+        let mut harness = Harness::start_store_backed().await;
+        harness.enable_ssf(20);
+        let (client, secret) = harness
+            .create_confidential_client(ClientAuthMethod::Basic)
+            .await;
+        let auth = basic(&client, &secret);
+        let stream = poll_stream(&harness, &client, 3).await;
+
+        // The receiver collects once while the stream is enabled, so it holds three real `jti`s
+        // to acknowledge with. An ack of invented ones would be refused for the wrong reason.
+        let (status_code, body) = send(
+            &harness,
+            &poll_uri(&harness, &stream),
+            Some(&auth),
+            Some(r#"{"maxEvents":3,"returnImmediately":true}"#.to_owned()),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK, "the enabled poll: {body}");
+        let sets: serde_json::Value = serde_json::from_str(&body).expect("a poll document");
+        let jtis: Vec<String> = sets["sets"]
+            .as_object()
+            .expect("sets is an object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(jtis.len(), 3, "the enabled poll handed over three SETs");
+
+        let owed = set_status_then_owed(&harness, &client, &stream, status).await;
+        assert_eq!(
+            owed, owed_after_status_change,
+            "{label} kept the wrong number of SETs at the moment its status changed"
+        );
+
+        // The ack rides along, because a receiver retrying a failed acknowledgement is exactly
+        // when this happens: if the refusal came after the delete, the SETs would be gone.
+        let acknowledgement = serde_json::json!({
+            "maxEvents": 3,
+            "returnImmediately": true,
+            "ack": jtis,
+        })
+        .to_string();
+        let (status_code, body) = send(
+            &harness,
+            &poll_uri(&harness, &stream),
+            Some(&auth),
+            Some(acknowledgement),
+        )
+        .await;
+        assert_eq!(
+            status_code,
+            StatusCode::FORBIDDEN,
+            "a {label} stream served a poll: {body}"
+        );
+        assert!(
+            body.contains("access_denied") && body.contains(label),
+            "the refusal did not name the {label} status: {body}"
+        );
+
+        let still_owed = harness
+            .db()
+            .store()
+            .scoped(harness.scope())
+            .ssf_stream_sets()
+            .owed_count(&stream)
+            .await
+            .expect("count what is owed");
+        assert_eq!(
+            still_owed, owed_after_status_change,
+            "the refused poll's acknowledgement still drained a {label} stream"
+        );
+    }
+}
+
+/// Re-enabling a paused stream redelivers what it held; re-enabling a disabled one has nothing.
+///
+/// This is the pair above read from the receiver's side, and it is what makes the retention
+/// difference observable through the API rather than only in a row count.
+#[tokio::test]
+async fn re_enabling_redelivers_what_paused_held_and_nothing_of_what_disabled_discarded() {
+    for (status, expected, label) in [
+        (SsfStreamStatus::Paused, 3, "paused"),
+        (SsfStreamStatus::Disabled, 0, "disabled"),
+    ] {
+        let mut harness = Harness::start_store_backed().await;
+        harness.enable_ssf(20);
+        let (client, secret) = harness
+            .create_confidential_client(ClientAuthMethod::Basic)
+            .await;
+        let auth = basic(&client, &secret);
+        let stream = poll_stream(&harness, &client, 3).await;
+
+        set_status_then_owed(&harness, &client, &stream, status).await;
+        set_status_then_owed(&harness, &client, &stream, SsfStreamStatus::Enabled).await;
+
+        let (status_code, body) = send(
+            &harness,
+            &poll_uri(&harness, &stream),
+            Some(&auth),
+            Some(r#"{"maxEvents":10,"returnImmediately":true}"#.to_owned()),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK, "the re-enabled poll: {body}");
+        let sets: serde_json::Value = serde_json::from_str(&body).expect("a poll document");
+        assert_eq!(
+            sets["sets"].as_object().expect("sets is an object").len(),
+            expected,
+            "a re-enabled stream redelivered the wrong number of SETs after {label}"
+        );
+    }
 }

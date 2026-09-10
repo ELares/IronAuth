@@ -963,6 +963,15 @@ pub struct SsfConfig {
     /// been polling is a delivery gap it cannot detect, which is the failure this subsystem
     /// exists to prevent.
     pub max_streams_per_client: u32,
+
+    /// The most UNACKNOWLEDGED SETs one poll stream may hold.
+    ///
+    /// A poll receiver collects on its own schedule, so the transmitter holds what it owes
+    /// until an acknowledgement. A receiver that stops collecting therefore accumulates, and
+    /// this is what stops that being unbounded: past it the queue REFUSES rather than evicting,
+    /// because dropping the oldest events silently is the failure the whole subsystem exists to
+    /// prevent, and a refusal is visible to the producer and to an operator.
+    pub max_owed_sets_per_stream: u32,
 }
 
 impl Default for SsfConfig {
@@ -973,6 +982,9 @@ impl Default for SsfConfig {
             // twenty is generous by an order of magnitude rather than a limit anybody meets by
             // accident.
             max_streams_per_client: 20,
+            // A receiver polling even once an hour drains far more than this per interval, so
+            // reaching it means collection has stopped rather than fallen behind.
+            max_owed_sets_per_stream: 1000,
         }
     }
 }
@@ -5972,6 +5984,14 @@ pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 /// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
 /// streams, `ssf.enabled = false` says so and answers 404.
 fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
+    if ssf.enabled && ssf.max_owed_sets_per_stream == 0 {
+        return Err(ConfigError::Invalid {
+            message: "ssf.max_owed_sets_per_stream must be at least 1 when ssf.enabled is true: \
+                      zero refuses every SET a poll stream is owed, so a receiver could create \
+                      a stream and never be given anything to collect"
+                .to_owned(),
+        });
+    }
     if ssf.enabled && ssf.max_streams_per_client == 0 {
         return Err(ConfigError::Invalid {
             message: "ssf.max_streams_per_client must be at least 1 when ssf.enabled is true: \
@@ -8331,31 +8351,49 @@ mod tests {
     /// an unread number.
     #[test]
     fn a_zero_stream_ceiling_is_refused_only_when_the_surface_is_on() {
-        let on = SsfConfig {
-            enabled: true,
-            max_streams_per_client: 0,
-        };
-        assert!(
-            validate_ssf(&on).is_err(),
-            "an enabled surface that can hold no streams was accepted"
-        );
-
-        let off = SsfConfig {
-            enabled: false,
-            max_streams_per_client: 0,
-        };
-        assert!(
-            validate_ssf(&off).is_ok(),
-            "a disabled surface's unread ceiling was refused"
-        );
+        // ONE DIMENSION PER CASE. Each of these differs from the all-defaults baseline in
+        // exactly one field, so a refusal names the field that caused it. A case zeroing both
+        // ceilings at once would pass while only one of them was checked.
+        for (label, ssf) in [
+            (
+                "a surface that can hold no streams",
+                SsfConfig {
+                    enabled: true,
+                    max_streams_per_client: 0,
+                    ..SsfConfig::default()
+                },
+            ),
+            (
+                "a poll stream that may be owed nothing",
+                SsfConfig {
+                    enabled: true,
+                    max_owed_sets_per_stream: 0,
+                    ..SsfConfig::default()
+                },
+            ),
+        ] {
+            assert!(
+                validate_ssf(&ssf).is_err(),
+                "an enabled surface was accepted with {label}"
+            );
+            assert!(
+                validate_ssf(&SsfConfig {
+                    enabled: false,
+                    ..ssf
+                })
+                .is_ok(),
+                "a disabled surface's unread ceiling was refused: {label}"
+            );
+        }
 
         assert!(
             validate_ssf(&SsfConfig {
                 enabled: true,
                 max_streams_per_client: 1,
+                max_owed_sets_per_stream: 1,
             })
             .is_ok(),
-            "one stream is a usable ceiling"
+            "one stream owed one SET is a usable pair of ceilings"
         );
     }
 

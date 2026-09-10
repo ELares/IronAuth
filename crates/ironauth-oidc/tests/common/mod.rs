@@ -1727,7 +1727,12 @@ impl Harness {
     /// that the `jwks_uri` the SSF configuration document advertises resolves to anything, which
     /// is exactly the field that was wrong.
     pub fn enable_ssf(&mut self, max_streams_per_client: u32) {
-        let state = self.state.clone().with_ssf(true, max_streams_per_client);
+        let ssf = ironauth_config::SsfConfig {
+            enabled: true,
+            max_streams_per_client,
+            ..ironauth_config::SsfConfig::default()
+        };
+        let state = self.state.clone().with_ssf(&ssf);
         let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
         let discovery_state = DiscoveryState::new(
             ISSUER_BASE,
