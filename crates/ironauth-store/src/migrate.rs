@@ -1832,6 +1832,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0222_trusted_device_upstream_compromise.sql"),
         },
+        Migration {
+            version: 223,
+            name: "risc_received_sets",
+            // EXPAND. A new table with no writer on any older binary: an old binary mounts
+            // no RISC receiver, so nothing reads or writes it during a rolling upgrade.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0223_risc_received_sets.sql"),
+        },
     ]
 }
 

@@ -381,7 +381,7 @@ pub use repository::{
     DomainEvent, Enqueued, LOG_STREAM_REPLAY_CONSUMER, MESSAGE_DELIVERY_CONSUMER, MessageRecord,
     MessageRepo, NewDeliveryAttempt, NewMessage, NewWebhookEndpoint, OFFBOARDING_CONSUMER,
     OUTBOX_MAX_BACKOFF_SECS, OffboardingSchedule, OwnedDomainEvent, Resent, Resolution,
-    SSF_LIFECYCLE_CONSUMER, SSF_LIFECYCLE_EVENT_TYPES, SSF_PUSH_CONSUMER,
+    RiscReceivedSetRepo, SSF_LIFECYCLE_CONSUMER, SSF_LIFECYCLE_EVENT_TYPES, SSF_PUSH_CONSUMER,
     SSF_SESSION_FANOUT_CONSUMER, TRAIT_MIGRATION_CONSUMER, TraitMigrationStart,
     WEBHOOK_DELIVERY_CONSUMER, WEBHOOK_EVENT_CONSUMER, WEBHOOK_REPLAY_CONSUMER,
     WebhookDeliveryAttemptRepo, WebhookDeliveryTarget, WebhookEndpointRecord, WebhookEndpointRepo,

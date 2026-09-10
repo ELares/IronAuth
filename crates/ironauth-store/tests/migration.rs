@@ -105,7 +105,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      Shared Signals verification budget, \
      Shared Signals stream configuration update, \
      Shared Signals stream subjects, \
-     trusted-device upstream-compromise revoke reason";
+     trusted-device upstream-compromise revoke reason, \
+     inbound RISC SET replay";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -736,7 +737,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        222,
+        223,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -779,7 +780,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
-            211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222
+            211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223
         ]
     );
     let phase_of = |version: i64| async move {

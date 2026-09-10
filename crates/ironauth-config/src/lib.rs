@@ -123,6 +123,10 @@ pub struct Config {
     /// mounts no stream-management surface and serves no SSF discovery document.
     pub ssf: SsfConfig,
 
+    /// The Google Cross-Account Protection RISC receiver (issue #144). OFF by default, so
+    /// the default boot mounts no receiver endpoint and accepts no inbound SET.
+    pub risc_receiver: RiscReceiverConfig,
+
     /// OUTBOUND SCIM provisioning (issue #137): whether THIS process runs the push
     /// worker, and how often.
     ///
@@ -993,6 +997,109 @@ pub struct SsfConfig {
     /// It is ADVERTISED as well as enforced, in the SSF configuration document, so a receiver
     /// can pace itself rather than discovering the limit by being refused.
     pub min_verification_interval_secs: u32,
+}
+
+/// The Google Cross-Account Protection receiver (issue #144).
+///
+/// Google Cross-Account Protection is a RISC transmitter: when a Google account is believed
+/// compromised, disabled or purged, Google pushes a signed Security Event Token to receivers
+/// that have registered for it. For a deployment whose users sign in WITH Google, consuming
+/// that stream closes a real account-takeover path -- the attacker holds the upstream
+/// account, and without this the local sessions minted from it keep working.
+///
+/// # Why this is its own section and not a third-party signal source
+///
+/// Issue #144 puts the general-purpose case out of scope on purpose: "only the Google
+/// Cross-Account Protection consumer ships here", and "this receiver deliberately applies
+/// its own fixed, per-environment configured action set so the Google consumer never depends
+/// on an experimental feature." The typed third-party risk-signal seam is
+/// experimental-flagged; a protection that ends sessions must not be reachable only when an
+/// experiment is switched on.
+///
+/// # Nothing here has a usable default
+///
+/// Every field that names the transmitter -- the issuer, its keys, the algorithms, the
+/// connector its subjects belong to -- is empty by default and validated when `enabled` is
+/// set. A receiver with a default issuer would either accept nothing or, worse, accept
+/// something.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RiscReceiverConfig {
+    /// Whether to mount the receiver endpoint. Off by default, and off is a uniform 404 on
+    /// the receiver path rather than a 501: a transmitter probing a deployment that has not
+    /// enabled it learns that it does not implement it, which is true.
+    pub enabled: bool,
+
+    /// The transmitter's issuer, which is BOTH the `iss` an inbound SET must carry and the
+    /// value its signature is verified under.
+    ///
+    /// For Google Cross-Account Protection this is `https://accounts.google.com`. It is
+    /// operator-configured rather than read off the token, because a value read off an
+    /// unverified token selects the key that will check it, which is no check at all.
+    pub issuer: String,
+
+    /// The transmitter's registered PUBLIC keys, as a JWKS JSON document.
+    ///
+    /// The ONLY key source. A key from the token header is never consulted, and the JOSE
+    /// core reads only public JWK members.
+    pub jwks: String,
+
+    /// The JWS algorithm allowlist an inbound SET may be signed with, as JOSE `alg` names.
+    ///
+    /// Google signs with `RS256`. Taken from configuration rather than from the token
+    /// header, so an attacker cannot pick the algorithm that checks their own signature;
+    /// `alg=none` and the HMAC families are structurally inexpressible in the core anyway.
+    pub algorithms: Vec<String>,
+
+    /// The federation connector whose subjects this transmitter speaks about.
+    ///
+    /// An inbound SET names a subject in the transmitter's own namespace, and this is what
+    /// turns that into a LOCAL user: the connector plus the composite of the SET's issuer
+    /// and subject is the key `account_links` is resolved on. Without it a signal could only
+    /// be matched by guessing, and matching the wrong user would end a stranger's sessions.
+    pub connector_id: String,
+
+    /// How old an inbound SET's `iat` may be, in seconds, before it is refused.
+    ///
+    /// THIS IS A REPLAY BOUND AND NOT AN EXPIRY, and the distinction matters because this
+    /// codebase holds that SETs must not expire (SSF 1.0 section 4.1.7; see
+    /// `VerificationPolicy::allow_absent_exp`). The durable defence against replay here is
+    /// the `jti` table, which never forgets. This bound exists because issue #144 criterion
+    /// 5 asks for it explicitly, and it is generous by default so that a receiver recovering
+    /// from an outage still accepts the backlog it most needs.
+    pub max_issuance_age_secs: u64,
+
+    /// Whether a protective signal ends the linked user's sessions.
+    pub revoke_sessions: bool,
+
+    /// Whether a protective signal revokes the linked user's remembered devices.
+    ///
+    /// THIS IS THE STEP-UP HALF. A remembered device is precisely what lets the next sign-in
+    /// skip the strong factor, so revoking sessions while leaving trust in place invites
+    /// whoever holds the upstream account back in with one password.
+    pub revoke_trusted_devices: bool,
+}
+
+impl Default for RiscReceiverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            jwks: String::new(),
+            algorithms: Vec::new(),
+            connector_id: String::new(),
+            // An hour. Long enough that a receiver down for a maintenance window still
+            // accepts what queued up behind it, which is the case SSF 1.0 section 4.1.7
+            // cares about; short enough that a token hoarded for a day is refused.
+            max_issuance_age_secs: 3600,
+            // BOTH PROTECTIONS ON when the receiver is enabled, because a deployment that
+            // has gone to the trouble of registering for a compromise stream wants the
+            // compromise acted on. They are separable so an operator can stage the rollout,
+            // not because leaving one off is a sensible destination.
+            revoke_sessions: true,
+            revoke_trusted_devices: true,
+        }
+    }
 }
 
 impl Default for SsfConfig {
@@ -5774,6 +5881,7 @@ impl Config {
         validate_admin(&self.admin)?;
         validate_scim(&self.scim)?;
         validate_ssf(&self.ssf)?;
+        validate_risc_receiver(&self.risc_receiver)?;
         validate_scim_push(&self.scim_push)?;
         validate_certificate_expiry(&self.certificate_expiry)?;
         check_oidc_lifetime(
@@ -6011,6 +6119,76 @@ pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 /// A ceiling of zero would refuse EVERY create while discovery still advertised the surface,
 /// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
 /// streams, `ssf.enabled = false` says so and answers 404.
+/// Refuse a RISC receiver that is switched on but cannot decide anything (issue #144).
+///
+/// Every check here is about a field WITHOUT a usable default. A receiver missing its issuer
+/// or its keys does not fail safe by accepting nothing: it fails by looking healthy, mounted
+/// and reachable, while every genuine compromise signal Google sends is refused and nobody
+/// is told. Refusing to boot is the only outcome an operator notices.
+fn validate_risc_receiver(cfg: &RiscReceiverConfig) -> Result<(), ConfigError> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    for (value, field, why) in [
+        (
+            cfg.issuer.trim(),
+            "risc_receiver.issuer",
+            "the transmitter's `iss` is what an inbound SET is verified under, and an empty \
+             one matches no token",
+        ),
+        (
+            cfg.jwks.trim(),
+            "risc_receiver.jwks",
+            "the transmitter's registered keys are the ONLY key source, and with none of \
+             them every signature check fails",
+        ),
+        (
+            cfg.connector_id.trim(),
+            "risc_receiver.connector_id",
+            "it is what turns the transmitter's subject into a local user through \
+             `account_links`, and without it no signal can be attributed to anybody",
+        ),
+    ] {
+        if value.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: format!(
+                    "{field} must be set when risc_receiver.enabled is true: {why}, so the \
+                     receiver would answer every genuine compromise signal with a refusal \
+                     while appearing healthy"
+                ),
+            });
+        }
+    }
+    if cfg.algorithms.is_empty() {
+        return Err(ConfigError::Invalid {
+            message: "risc_receiver.algorithms must name at least one JWS algorithm when \
+                      risc_receiver.enabled is true: the allowlist is taken from \
+                      configuration rather than the token header precisely so an attacker \
+                      cannot choose it, and an empty list rejects every token"
+                .to_owned(),
+        });
+    }
+    if cfg.max_issuance_age_secs == 0 {
+        return Err(ConfigError::Invalid {
+            message: "risc_receiver.max_issuance_age_secs must be at least 1 when \
+                      risc_receiver.enabled is true: zero refuses every SET, including one \
+                      minted this instant"
+                .to_owned(),
+        });
+    }
+    if !cfg.revoke_sessions && !cfg.revoke_trusted_devices {
+        return Err(ConfigError::Invalid {
+            message: "risc_receiver.revoke_sessions or risc_receiver.revoke_trusted_devices \
+                      must be set when risc_receiver.enabled is true: with both off the \
+                      receiver verifies a compromise signal, records that it saw it, and \
+                      protects nothing, which is worse than not consuming the stream because \
+                      the audit trail says the signal was handled"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
     if ssf.enabled && ssf.max_subjects_per_stream == 0 {
         return Err(ConfigError::Invalid {
