@@ -40,6 +40,12 @@ const GOOGLE_SUB: &str = "1147890123456789";
 const CONNECTOR: &str = "con_google";
 const CREDENTIAL_COMPROMISE: &str =
     "https://schemas.openid.net/secevent/risc/event-type/credential-compromise";
+/// Google's own event set does NOT include `credential-compromise`; this is the one its
+/// documentation lists that means "the credential must be replaced".
+const CREDENTIAL_CHANGE_REQUIRED: &str =
+    "https://schemas.openid.net/secevent/risc/event-type/account-credential-change-required";
+/// THE `aud` GOOGLE STAMPS: the receiving app's OAuth client id, not a URL.
+const CLIENT_ID: &str = "123456789-abcdefg.apps.googleusercontent.com";
 
 fn transmitter_key(seed_byte: u8) -> SigningKey {
     SigningKey::ed25519_from_seed(Some(GOOGLE_KID.to_owned()), &[seed_byte; 32])
@@ -59,6 +65,7 @@ fn receiver_config(key: &SigningKey) -> RiscReceiverConfig {
         issuer: GOOGLE_ISS.to_owned(),
         jwks: jwks_of(key),
         algorithms: vec!["EdDSA".to_owned()],
+        audience: CLIENT_ID.to_owned(),
         connector_id: CONNECTOR.to_owned(),
         ..RiscReceiverConfig::default()
     }
@@ -88,15 +95,27 @@ fn signed_set(
     subject_iss: &str,
     subject_sub: &str,
 ) -> String {
-    // NO `exp`: SSF 1.0 section 4.1.7 makes its absence a MUST, and this is the shape a
-    // conforming transmitter actually sends.
+    // THE SHAPE GOOGLE ACTUALLY SENDS, taken from its Cross-Account Protection
+    // documentation: the subject lives INSIDE the event as `subject` with a `subject_type`
+    // of `iss-sub` (hyphen), and there is NO `exp` -- the docs say expiry is not verified
+    // because these are historical events, which is also SSF 1.0 section 4.1.7's rule.
+    //
+    // Writing the tests in the SSF 1.0 top-level `sub_id` shape is how the first version
+    // of this suite passed against a receiver that would have refused every real token.
     let claims = json!({
         "iss": iss,
         "aud": aud,
         "iat": iat,
         "jti": jti,
-        "sub_id": { "format": "iss_sub", "iss": subject_iss, "sub": subject_sub },
-        "events": { event_type: {} }
+        "events": {
+            event_type: {
+                "subject": {
+                    "subject_type": "iss-sub",
+                    "iss": subject_iss,
+                    "sub": subject_sub
+                }
+            }
+        }
     });
     let payload = serde_json::to_vec(&claims).expect("claims serialize");
     sign_jws(key, &payload, &EmissionOptions::new()).expect("sign the SET")
@@ -111,11 +130,15 @@ fn push(path_scope: &str, set: String) -> Request<Body> {
         .expect("request")
 }
 
+/// The scope path and the audience an inbound token must carry.
+///
+/// The audience is the configured OAUTH CLIENT ID, which is what Google stamps, not this
+/// environment's issuer URL.
 fn scope_path_and_audience(harness: &Harness) -> (String, String) {
     let scope = harness.scope();
     (
         format!("{}/e/{}", scope.tenant(), scope.environment()),
-        harness.state().issuer_for(&scope),
+        CLIENT_ID.to_owned(),
     )
 }
 
@@ -677,4 +700,132 @@ async fn a_subject_at_another_issuer_is_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(live_sessions(&harness, &user).await, 1);
     assert_eq!(live_devices(&harness, &user).await, 1);
+}
+
+#[tokio::test]
+async fn a_token_shaped_like_googles_own_example_drives_the_protection() {
+    // THE TEST THAT DECIDES WHETHER THIS FEATURE EXISTS. Every other test here mints
+    // through one helper, so a helper written from the same wrong assumption as the code
+    // would let the whole suite pass against a receiver no real transmitter can reach.
+    // This one is built claim by claim from Google's own Cross-Account Protection
+    // documentation, and it deliberately differs from the helper in all four ways the
+    // first version of this receiver got wrong:
+    //
+    //   - `aud` is the app's OAUTH CLIENT ID, not this environment's issuer URL;
+    //   - the subject is INSIDE the event, as `subject` with `subject_type: "iss-sub"`;
+    //   - the issuer carries a TRAILING SLASH, as Google's example does, while the
+    //     configured issuer does not;
+    //   - the event type is one Google actually sends. It does not send
+    //     `credential-compromise` at all.
+    //
+    // There is no `exp`, which Google's docs call out and SSF 1.0 section 4.1.7 requires.
+    let mut harness = Harness::start_store_backed().await;
+    let key = transmitter_key(1);
+    let user = seed_linked_user(&harness, "googleshape@example.test").await;
+    seed_session_and_device(&harness, &user, 50).await;
+    harness.enable_risc_receiver(&receiver_config(&key));
+    let (path, _audience) = scope_path_and_audience(&harness);
+    let now = epoch_secs(harness.state().now());
+
+    let claims = json!({
+        "iss": GOOGLE_ISS,
+        "aud": CLIENT_ID,
+        "iat": now,
+        "jti": "756E69717565206964656E746966696572",
+        "events": {
+            CREDENTIAL_CHANGE_REQUIRED: {
+                "subject": {
+                    "subject_type": "iss-sub",
+                    // WITH THE TRAILING SLASH, exactly as Google's example writes it.
+                    "iss": "https://accounts.google.com/",
+                    "sub": GOOGLE_SUB
+                }
+            }
+        }
+    });
+    let payload = serde_json::to_vec(&claims).expect("claims serialize");
+    let set = sign_jws(&key, &payload, &EmissionOptions::new()).expect("sign the SET");
+
+    let (status, _headers, body) = harness.send(push(&path, set)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(
+        live_sessions(&harness, &user).await,
+        0,
+        "a token in Google's own documented shape did not reach the protection"
+    );
+    assert_eq!(live_devices(&harness, &user).await, 0);
+}
+
+#[tokio::test]
+async fn a_verification_ping_is_acknowledged_and_protects_nothing() {
+    // Google sends `verification` to prove the delivery path works. Acting on it would
+    // sign every linked user out every time the transmitter tested its own plumbing.
+    let mut harness = Harness::start_store_backed().await;
+    let key = transmitter_key(1);
+    let user = seed_linked_user(&harness, "ping@example.test").await;
+    seed_session_and_device(&harness, &user, 51).await;
+    harness.enable_risc_receiver(&receiver_config(&key));
+    let (path, audience) = scope_path_and_audience(&harness);
+    let now = epoch_secs(harness.state().now());
+
+    let set = signed_set(
+        &key,
+        GOOGLE_ISS,
+        &audience,
+        now,
+        "jti-verification",
+        "https://schemas.openid.net/secevent/risc/event-type/verification",
+        GOOGLE_ISS,
+        GOOGLE_SUB,
+    );
+    let (status, _headers, body) = harness.send(push(&path, set)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(live_sessions(&harness, &user).await, 1);
+    assert_eq!(live_devices(&harness, &user).await, 1);
+}
+
+#[tokio::test]
+async fn each_protection_knob_acts_alone() {
+    // THE KNOBS ARE SEPARABLE so an operator can stage a rollout, and every other test
+    // here runs with BOTH on -- which means a receiver that ignored the configuration and
+    // always did both would pass the whole suite. Each half is driven with the other off.
+    for (label, revoke_sessions, revoke_devices, expect_sessions, expect_devices) in [
+        ("sessions only", true, false, 0, 1),
+        ("devices only", false, true, 1, 0),
+    ] {
+        let mut harness = Harness::start_store_backed().await;
+        let key = transmitter_key(1);
+        let user = seed_linked_user(&harness, &format!("{revoke_sessions}@example.test")).await;
+        seed_session_and_device(&harness, &user, 60).await;
+        harness.enable_risc_receiver(&RiscReceiverConfig {
+            revoke_sessions,
+            revoke_trusted_devices: revoke_devices,
+            ..receiver_config(&key)
+        });
+        let (path, audience) = scope_path_and_audience(&harness);
+        let now = epoch_secs(harness.state().now());
+
+        let set = signed_set(
+            &key,
+            GOOGLE_ISS,
+            &audience,
+            now,
+            "jti-knob",
+            CREDENTIAL_COMPROMISE,
+            GOOGLE_ISS,
+            GOOGLE_SUB,
+        );
+        let (status, _headers, body) = harness.send(push(&path, set)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{label}: {body}");
+        assert_eq!(
+            live_sessions(&harness, &user).await,
+            expect_sessions,
+            "{label} got the wrong session outcome"
+        );
+        assert_eq!(
+            live_devices(&harness, &user).await,
+            expect_devices,
+            "{label} got the wrong device outcome"
+        );
+    }
 }

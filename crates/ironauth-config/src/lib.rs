@@ -1051,6 +1051,19 @@ pub struct RiscReceiverConfig {
     /// `alg=none` and the HMAC families are structurally inexpressible in the core anyway.
     pub algorithms: Vec<String>,
 
+    /// The `aud` an inbound SET must carry.
+    ///
+    /// FOR GOOGLE THIS IS THE APP'S OAUTH CLIENT ID, not a URL. Google Cross-Account
+    /// Protection stamps the receiving app's client id
+    /// (`123456789-abcdefg.apps.googleusercontent.com`), which is what its own
+    /// documentation shows and what a real token carries. An earlier version of this
+    /// receiver pinned `aud` to this environment's issuer URL, which is the SSF 1.0 shape
+    /// and would have refused every genuine Google token.
+    ///
+    /// It is configured rather than derived because only the operator knows which of
+    /// their OAuth clients is registered with the transmitter.
+    pub audience: String,
+
     /// The federation connector whose subjects this transmitter speaks about.
     ///
     /// An inbound SET names a subject in the transmitter's own namespace, and this is what
@@ -1087,6 +1100,7 @@ impl Default for RiscReceiverConfig {
             issuer: String::new(),
             jwks: String::new(),
             algorithms: Vec::new(),
+            audience: String::new(),
             connector_id: String::new(),
             // An hour. Long enough that a receiver down for a maintenance window still
             // accepts what queued up behind it, which is the case SSF 1.0 section 4.1.7
@@ -6114,11 +6128,6 @@ fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
 /// which is a warning that carries no information and teaches an operator to ignore the column.
 pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 
-/// The Shared Signals transmitter's bounds (issue #143).
-///
-/// A ceiling of zero would refuse EVERY create while discovery still advertised the surface,
-/// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
-/// streams, `ssf.enabled = false` says so and answers 404.
 /// Refuse a RISC receiver that is switched on but cannot decide anything (issue #144).
 ///
 /// Every check here is about a field WITHOUT a usable default. A receiver missing its issuer
@@ -6143,6 +6152,12 @@ fn validate_risc_receiver(cfg: &RiscReceiverConfig) -> Result<(), ConfigError> {
              them every signature check fails",
         ),
         (
+            cfg.audience.trim(),
+            "risc_receiver.audience",
+            "it is the `aud` an inbound SET must carry -- for Google, the app's OAuth \
+             client id -- and an empty one matches no token",
+        ),
+        (
             cfg.connector_id.trim(),
             "risc_receiver.connector_id",
             "it is what turns the transmitter's subject into a local user through \
@@ -6159,12 +6174,23 @@ fn validate_risc_receiver(cfg: &RiscReceiverConfig) -> Result<(), ConfigError> {
             });
         }
     }
+    // EMPTINESS IS CHECKED HERE; PARSEABILITY IS CHECKED AT BOOT.
+    //
+    // A list of `["RS-256"]` or `["rsa256"]` is not empty and still reaches the handler as
+    // no algorithms at all, because the receiver builds its policy with
+    // `JwsAlgorithm::from_jose_name`, which silently drops what it does not know. That
+    // check needs the JOSE core, and this crate is deliberately the workspace leaf with no
+    // internal dependencies, so it lives in the boot path instead
+    // (`risc_receiver_algorithms_are_recognised` in the binary), which is the other place
+    // an operator finds out before serving traffic.
     if cfg.algorithms.is_empty() {
         return Err(ConfigError::Invalid {
-            message: "risc_receiver.algorithms must name at least one JWS algorithm when \
-                      risc_receiver.enabled is true: the allowlist is taken from \
-                      configuration rather than the token header precisely so an attacker \
-                      cannot choose it, and an empty list rejects every token"
+            message: "risc_receiver.algorithms must name at least one JWS algorithm this \
+                      build recognises (for example RS256, which is what Google signs \
+                      with) when risc_receiver.enabled is true: the allowlist is taken \
+                      from configuration rather than the token header precisely so an \
+                      attacker cannot choose it, and a list this build cannot parse \
+                      rejects every token while looking populated"
                 .to_owned(),
         });
     }
@@ -6189,6 +6215,11 @@ fn validate_risc_receiver(cfg: &RiscReceiverConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The Shared Signals transmitter's bounds (issue #143).
+///
+/// A ceiling of zero would refuse EVERY create while discovery still advertised the surface,
+/// which is a deployment that looks enabled and works for nobody. If the intent is to serve no
+/// streams, `ssf.enabled = false` says so and answers 404.
 fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
     if ssf.enabled && ssf.max_subjects_per_stream == 0 {
         return Err(ConfigError::Invalid {
@@ -8635,6 +8666,147 @@ mod tests {
             .is_ok(),
             "one stream owed one SET a second apart is a usable set of floors"
         );
+    }
+
+    /// A RISC receiver switched on without what it needs is refused at boot.
+    ///
+    /// Every branch of `validate_risc_receiver` is driven, because the failure they all
+    /// prevent is the same and it is invisible: a receiver that mounts, answers, looks
+    /// healthy, and refuses every genuine compromise signal Google sends. Nothing about
+    /// that shows up in a health check, so refusing to boot is the only outcome an
+    /// operator notices.
+    ///
+    /// The disabled case is asserted for each, because a validator that refused a
+    /// half-filled section even when the feature is OFF would stop a deployment booting
+    /// over a stanza it is not using.
+    #[test]
+    fn a_risc_receiver_switched_on_without_what_it_needs_is_refused() {
+        let usable = RiscReceiverConfig {
+            enabled: true,
+            issuer: "https://accounts.google.com".to_owned(),
+            jwks: "{\"keys\":[]}".to_owned(),
+            algorithms: vec!["RS256".to_owned()],
+            audience: "123-abc.apps.googleusercontent.com".to_owned(),
+            connector_id: "con_google".to_owned(),
+            max_issuance_age_secs: 3600,
+            revoke_sessions: true,
+            revoke_trusted_devices: true,
+        };
+        assert!(
+            validate_risc_receiver(&usable).is_ok(),
+            "a fully configured receiver was refused"
+        );
+
+        for (label, broken) in [
+            (
+                "no issuer",
+                RiscReceiverConfig {
+                    issuer: String::new(),
+                    ..usable.clone()
+                },
+            ),
+            (
+                "no keys",
+                RiscReceiverConfig {
+                    jwks: "   ".to_owned(),
+                    ..usable.clone()
+                },
+            ),
+            (
+                "no audience",
+                RiscReceiverConfig {
+                    audience: String::new(),
+                    ..usable.clone()
+                },
+            ),
+            (
+                "no connector",
+                RiscReceiverConfig {
+                    connector_id: String::new(),
+                    ..usable.clone()
+                },
+            ),
+            (
+                "no algorithms",
+                RiscReceiverConfig {
+                    algorithms: Vec::new(),
+                    ..usable.clone()
+                },
+            ),
+            (
+                "a zero issuance window",
+                RiscReceiverConfig {
+                    max_issuance_age_secs: 0,
+                    ..usable.clone()
+                },
+            ),
+            (
+                // A receiver that verifies a compromise signal, records that it saw it,
+                // and protects nothing is worse than not consuming the stream at all,
+                // because the audit trail then says the signal was handled.
+                "both protections off",
+                RiscReceiverConfig {
+                    revoke_sessions: false,
+                    revoke_trusted_devices: false,
+                    ..usable.clone()
+                },
+            ),
+        ] {
+            assert!(
+                validate_risc_receiver(&broken).is_err(),
+                "an enabled receiver was accepted with {label}"
+            );
+            assert!(
+                validate_risc_receiver(&RiscReceiverConfig {
+                    enabled: false,
+                    ..broken
+                })
+                .is_ok(),
+                "a DISABLED receiver was refused over {label}, which stops a deployment \
+                 booting over a stanza it is not using"
+            );
+        }
+    }
+
+    /// ONE protection is enough; the refusal beside this is about having NEITHER.
+    ///
+    /// Separated so the pair reads as what it is: an operator staging a rollout turns one
+    /// half on first, and a validator that refused that would make the staged path
+    /// impossible while claiming to prevent an inert receiver.
+    #[test]
+    fn one_protection_is_a_legitimate_staged_rollout() {
+        let usable = RiscReceiverConfig {
+            enabled: true,
+            issuer: "https://accounts.google.com".to_owned(),
+            jwks: "{\"keys\":[]}".to_owned(),
+            algorithms: vec!["RS256".to_owned()],
+            audience: "123-abc.apps.googleusercontent.com".to_owned(),
+            connector_id: "con_google".to_owned(),
+            max_issuance_age_secs: 3600,
+            revoke_sessions: true,
+            revoke_trusted_devices: true,
+        };
+        for (label, one) in [
+            (
+                "sessions only",
+                RiscReceiverConfig {
+                    revoke_trusted_devices: false,
+                    ..usable.clone()
+                },
+            ),
+            (
+                "devices only",
+                RiscReceiverConfig {
+                    revoke_sessions: false,
+                    ..usable.clone()
+                },
+            ),
+        ] {
+            assert!(
+                validate_risc_receiver(&one).is_ok(),
+                "{label} is a legitimate staged rollout and was refused"
+            );
+        }
     }
 
     /// A zero flow-target delivery budget is refused whether or not the worker is enabled.

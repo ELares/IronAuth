@@ -331,6 +331,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `quota.usage_thresholds_percent` | array | `[80, 100]` | The usage percentages (1 to 100) at which a saturation webhook fires per dimension, so operators see pressure before the hard limit. The default (`[80, 100]`) warns at 80 percent and again at the limit. An empty list disables saturation webhooks. At most `QUOTA_MAX_USAGE_THRESHOLDS` entries; each must be between 1 and 100. |
 | `risc_receiver` | table | see fields | The Google Cross-Account Protection RISC receiver (issue #144). OFF by default, so the default boot mounts no receiver endpoint and accepts no inbound SET. |
 | `risc_receiver.algorithms` | array | empty | The JWS algorithm allowlist an inbound SET may be signed with, as JOSE `alg` names. |
+| `risc_receiver.audience` | string | `""` | The `aud` an inbound SET must carry. |
 | `risc_receiver.connector_id` | string | `""` | The federation connector whose subjects this transmitter speaks about. |
 | `risc_receiver.enabled` | boolean | `false` | Whether to mount the receiver endpoint. Off by default, and off is a uniform 404 on the receiver path rather than a 501: a transmitter probing a deployment that has not enabled it learns that it does not implement it, which is true. |
 | `risc_receiver.issuer` | string | `""` | The transmitter's issuer, which is BOTH the `iss` an inbound SET must carry and the value its signature is verified under. |

@@ -22286,6 +22286,30 @@ pub struct RiscReceivedSetRepo<'a> {
 }
 
 impl RiscReceivedSetRepo<'_> {
+    /// Whether this `(issuer, jti)` has already been acted on.
+    ///
+    /// A READ, taken before the work. The WRITE is [`Self::claim`], taken after it
+    /// succeeds; see the receiver for why that ordering is the safe one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn seen(&self, issuer: &str, jti: &str) -> Result<bool, StoreError> {
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::bigint FROM risc_received_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND issuer = $3 AND jti = $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(issuer)
+        .bind(jti)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Database)?;
+        Ok(found.is_some())
+    }
+
     /// Claim one `(issuer, jti)` for this environment.
     ///
     /// `Ok(true)` means this token had not been seen and the caller may act on it.

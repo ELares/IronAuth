@@ -1312,8 +1312,6 @@ impl OidcState {
         self.global_token_revocation_enabled
     }
 
-    /// Arm (or not) the Shared Signals stream-management surface (issue #143).
-    #[must_use]
     /// Install the Google Cross-Account Protection receiver settings (issue #144).
     ///
     /// A builder like [`Self::with_ssf`] rather than a field read off `OidcConfig`,
@@ -1325,6 +1323,8 @@ impl OidcState {
         self
     }
 
+    /// Arm (or not) the Shared Signals stream-management surface (issue #143).
+    #[must_use]
     pub fn with_ssf(mut self, config: &ironauth_config::SsfConfig) -> Self {
         self.ssf_enabled = config.enabled;
         self.ssf_max_streams_per_client = config.max_streams_per_client;

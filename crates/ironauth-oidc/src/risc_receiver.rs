@@ -32,9 +32,17 @@
 //! - the `iat` is within the configured window;
 //! - and the `jti` has not been seen before.
 //!
-//! Every refusal is the same `400` with no detail. A receiver that said WHICH check failed
-//! would tell an attacker whether they had guessed a real subject, a real connector, or a
-//! live `jti`.
+
+//! Every VALIDATION refusal is the same `400` with no detail. A receiver that said WHICH
+//! check failed would tell an attacker whether they had guessed a real subject, a real
+//! connector, or a live `jti`.
+//!
+//! The endpoint does answer other statuses, and each says something deliberately: `404`
+//! when the receiver is not enabled at all (a transmitter probing an unconfigured
+//! deployment learns it does not implement this, which is true), `202` for a token that
+//! was handled -- including one that resolved to nobody or asked for nothing -- and `500`
+//! for a fault on our side that the transmitter SHOULD retry. None of those distinguish
+//! one failed check from another.
 //!
 //! # Why the replay check is durable and the issuance check is not the same thing
 //!
@@ -74,11 +82,36 @@ const MAX_SET_BYTES: usize = 16 * 1024;
 
 /// The RISC event types this receiver ACTS on.
 ///
-/// Both are "this account is no longer safe to trust". `account-purged` and
-/// `identifier-changed` are deliberately absent: a purge upstream does not mean the local
-/// account is compromised, and an identifier change is a fact to re-read rather than a
-/// reason to end sessions. Issue #144 names these two.
-const PROTECTIVE_EVENTS: [&str; 2] = [risc::CREDENTIAL_COMPROMISE, risc::ACCOUNT_DISABLED];
+/// TAKEN FROM WHAT GOOGLE ACTUALLY SENDS, not from what the vocabulary defines. Google
+/// Cross-Account Protection documents its event set as `sessions-revoked`,
+/// `tokens-revoked`, `token-revoked`, `account-disabled`, `account-enabled`,
+/// `account-credential-change-required` and `verification`. It does NOT send
+/// `credential-compromise`, though issue #144 names that type and RISC 1.0 defines it, so
+/// it is accepted here for any other RISC transmitter and for the issue's own wording.
+///
+/// Every entry means "what this deployment holds for that account can no longer be
+/// trusted":
+///
+/// - `sessions-revoked` and `tokens-revoked`/`token-revoked`: the upstream ended its own
+///   sessions, so ours were minted against something that is gone;
+/// - `account-disabled`: the upstream account cannot be used, so neither should the local
+///   one;
+/// - `account-credential-change-required`: Google's phrasing for a credential that must
+///   be replaced, which is the closest thing it sends to a compromise;
+/// - `credential-compromise`: the RISC 1.0 type, for transmitters that do send it.
+///
+/// DELIBERATELY ABSENT: `account-enabled` (a restoration, not a threat), `account-purged`
+/// (an upstream deletion does not make the local account compromised),
+/// `identifier-changed` (a fact to re-read), and `verification` (the stream ping, which is
+/// acknowledged and does nothing).
+const PROTECTIVE_EVENTS: [&str; 6] = [
+    "https://schemas.openid.net/secevent/risc/event-type/sessions-revoked",
+    "https://schemas.openid.net/secevent/risc/event-type/tokens-revoked",
+    "https://schemas.openid.net/secevent/risc/event-type/token-revoked",
+    "https://schemas.openid.net/secevent/risc/event-type/account-credential-change-required",
+    risc::CREDENTIAL_COMPROMISE,
+    risc::ACCOUNT_DISABLED,
+];
 
 /// The uniform refusal: a plain `400` disclosing nothing about which check failed.
 ///
@@ -144,11 +177,15 @@ pub(crate) async fn receive(
         algorithms,
         keys,
         cfg.issuer.clone(),
-        state.issuer_for(&scope),
+        cfg.audience.clone(),
         // A SET from a FOREIGN issuer: `secevent+jwt` is only RECOMMENDED by RFC 8417
         // section 2.2 and transmitters vary, so requiring the media type would refuse
         // conforming tokens for no gain. The registered keys and the pinned `iss` and `aud`
         // are what separate this token from every other.
+        //
+        // THE `aud` IS THE OAUTH CLIENT ID, from configuration. Google stamps the
+        // receiving app's client id rather than a URL; pinning this environment's issuer
+        // here, which is the SSF 1.0 shape, refused every genuine Google token.
         ExpectedTyp::ForeignIssuer,
     ) else {
         return rejected();
@@ -176,22 +213,35 @@ pub(crate) async fn receive(
         return rejected();
     };
 
-    // THE REPLAY CLAIM, taken BEFORE anything is acted on and never after. Claiming after
-    // acting would leave a window in which two concurrent deliveries both revoke.
+    // THE REPLAY CHECK, which is a READ here and a WRITE only after the work succeeds.
+    //
+    // The ordering was the other way round and it was wrong. Claiming first makes a
+    // TRANSIENT failure permanent: the row commits, the revocation then fails on a dropped
+    // connection, the transmitter retries, and the retry is refused as a replay. The
+    // compromise signal is lost for good, and the audit trail shows the token as handled.
+    //
+    // Recording afterwards trades that for a much smaller risk: two deliveries of one
+    // token arriving CONCURRENTLY can both act. That is harmless in a way the other
+    // failure is not, because the two are microseconds apart -- there is no interval in
+    // which the user could have re-established anything for a second pass to destroy. The
+    // failure the table exists to prevent is a token replayed HOURS later, after recovery,
+    // and recording on success closes that just as completely.
     match state
         .store()
         .scoped(scope)
         .risc_received_sets()
-        .claim(state.env(), &cfg.issuer, &signal.jti)
+        .seen(&cfg.issuer, &signal.jti)
         .await
     {
-        // ALREADY SEEN. A 202 rather than a 400: the transmitter did nothing wrong and must
-        // not retry, and RFC 8935 treats a 2xx as delivered.
-        Ok(false) => return accepted(),
-        Ok(true) => {}
+        // ALREADY ACTED ON. A 202 rather than a 400: the transmitter did nothing wrong and
+        // must not retry, and RFC 8935 treats a 2xx as delivered.
+        Ok(true) => return accepted(),
+        Ok(false) => {}
         Err(_) => return server_error(),
     }
 
+    // NOT PROTECTIVE, so there is nothing to do and nothing to remember. Recording it
+    // would fill the table with every `verification` ping the transmitter ever sends.
     if !PROTECTIVE_EVENTS.contains(&signal.event_type.as_str()) {
         return accepted();
     }
@@ -208,6 +258,15 @@ pub(crate) async fn receive(
     if apply_protections(&state, scope, &cfg, &user).await.is_err() {
         return server_error();
     }
+    // RECORDED ONLY NOW. A failure to record is not a failure of the protection, which has
+    // already happened; the cost is that a later replay would revoke again, which is the
+    // safe direction.
+    let _ = state
+        .store()
+        .scoped(scope)
+        .risc_received_sets()
+        .claim(state.env(), &cfg.issuer, &signal.jti)
+        .await;
     accepted()
 }
 
@@ -219,23 +278,35 @@ fn server_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
 }
 
-/// Read the RFC 8417 `events` map and the RFC 9493 `sub_id`, after verification.
+/// Read the RFC 8417 `events` map and the subject, after verification.
 ///
 /// EXACTLY ONE EVENT. RFC 8417 permits several in one SET, and this refuses that shape
 /// rather than acting on the first: a token carrying a protective event alongside others
 /// would have this deployment act on one and silently drop the rest, and "we acted on part
 /// of it" is not a state the audit trail can express.
 ///
-/// THE SUBJECT'S DECLARED FORMAT IS CHECKED, not merely the members it happens to carry.
-/// Only RFC 9493 `iss_sub` is accepted, which is what Google sends and what `account_links`
-/// is keyed on.
+/// # The subject is read from where the transmitter actually puts it
 ///
-/// Reading `iss` and `sub` while ignoring the label would accept a subject declaring
-/// `email` that also carried them, and resolve it as though the transmitter had named an
-/// account pair. A receiver that trusts members while ignoring the label put on them is
-/// reading a different subject from the one that was sent. It also keeps address-matching
-/// structurally out of reach: nothing here ever resolves a local user from an email, so a
-/// transmitter cannot end the sessions of everyone whose address it can name.
+/// Google Cross-Account Protection carries the subject INSIDE the event object, as
+/// `subject` with a `subject_type` of `iss-sub` -- the older RISC shape, with a hyphen.
+/// SSF 1.0 section 3.1.2 instead puts an RFC 9493 `sub_id` at the TOP level with a `format`
+/// of `iss_sub`, with an underscore, which is what this deployment's own transmitter emits.
+///
+/// Both are accepted, and the in-event form is tried first because it is the one the only
+/// transmitter in scope sends. An earlier version of this receiver read only the top-level
+/// form and would have refused every genuine Google token while passing its own tests,
+/// because those tests were written from the same wrong assumption as the code.
+///
+/// # The subject's issuer must be the transmitter
+///
+/// Whichever shape carries it, `iss` is a value inside the token, so it is chosen by
+/// whoever minted it, and it feeds straight into the account-link lookup that decides
+/// WHOSE sessions end. A transmitter may speak only about its own subjects.
+///
+/// The comparison ignores a trailing slash: Google's documented example issues tokens with
+/// `iss` as `https://accounts.google.com/` while its OpenID discovery document uses
+/// `https://accounts.google.com`, and an operator who configured either spelling means the
+/// same transmitter.
 fn parse_signal(verified: &VerifiedToken, transmitter: &str) -> Option<Signal> {
     let claims = verified.claims();
     let jti = claims
@@ -248,38 +319,67 @@ fn parse_signal(verified: &VerifiedToken, transmitter: &str) -> Option<Signal> {
     if events.len() != 1 {
         return None;
     }
-    let (event_type, _body) = events.iter().next()?;
-    let sub_id = claims.get("sub_id").and_then(Value::as_object)?;
-    if sub_id.get("format").and_then(Value::as_str)? != "iss_sub" {
-        return None;
-    }
-    // THE SUBJECT'S ISSUER MUST BE THE TRANSMITTER. `sub_id.iss` is a value inside the
-    // token, so it is chosen by whoever minted it, and it feeds straight into the
-    // account-link lookup that decides WHOSE sessions end. Pinning it says a transmitter
-    // may speak only about its own subjects: Google may tell us about Google accounts,
-    // and a Google-signed token naming a subject at some other issuer is refused rather
-    // than resolved against whatever connector happens to be configured.
-    //
-    // It is also the real wire format. Google Cross-Account Protection sets `sub_id.iss`
-    // to its own issuer, so nothing conforming is lost.
-    let subject_issuer = sub_id
-        .get("iss")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|iss| !iss.is_empty() && *iss == transmitter)?
-        .to_owned();
-    let subject = sub_id
-        .get("sub")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|sub| !sub.is_empty())?
-        .to_owned();
+    let (event_type, body) = events.iter().next()?;
+    let (subject_issuer, subject) = read_subject(body, claims.get("sub_id"), transmitter)?;
     Some(Signal {
         event_type: event_type.clone(),
         subject_issuer,
         subject,
         jti,
     })
+}
+
+/// Whether two issuer spellings name the same transmitter, ignoring a trailing slash.
+fn same_issuer(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// The `(issuer, subject)` pair, from the in-event Google shape or the top-level SSF one.
+///
+/// The DECLARED type is checked in both shapes, not merely the members present. Reading
+/// `iss` and `sub` while ignoring the label would accept a subject declaring `email` that
+/// also carried them, and resolve it as though an account pair had been named. It also
+/// keeps address-matching structurally out of reach: nothing here ever resolves a local
+/// user from an email, so a transmitter cannot end the sessions of everyone whose address
+/// it can name.
+fn read_subject(
+    event_body: &Value,
+    top_level: Option<&Value>,
+    transmitter: &str,
+) -> Option<(String, String)> {
+    // GOOGLE'S SHAPE FIRST: `events[type].subject` with `subject_type: "iss-sub"`.
+    if let Some(subject) = event_body.get("subject").and_then(Value::as_object)
+        && subject.get("subject_type").and_then(Value::as_str) == Some("iss-sub")
+    {
+        return issuer_and_subject(subject, transmitter);
+    }
+    // THE SSF 1.0 SHAPE: a top-level RFC 9493 `sub_id` with `format: "iss_sub"`.
+    let sub_id = top_level?.as_object()?;
+    if sub_id.get("format").and_then(Value::as_str) != Some("iss_sub") {
+        return None;
+    }
+    issuer_and_subject(sub_id, transmitter)
+}
+
+/// Pull `iss` and `sub` out of either subject object, refusing an issuer that is not the
+/// transmitter's own.
+fn issuer_and_subject(
+    subject: &serde_json::Map<String, Value>,
+    transmitter: &str,
+) -> Option<(String, String)> {
+    let iss = subject
+        .get("iss")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|iss| !iss.is_empty() && same_issuer(iss, transmitter))?
+        .to_owned();
+    let sub = subject
+        .get("sub")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|sub| !sub.is_empty())?
+        .to_owned();
+    Some((iss, sub))
 }
 
 /// Find the local user who signs in with the upstream account this signal names.
@@ -293,16 +393,36 @@ async fn resolve_linked_user(
     connector_id: &str,
     signal: &Signal,
 ) -> Result<Option<UserId>, ()> {
-    let external_id =
-        crate::federation::federated_external_id(&signal.subject_issuer, &signal.subject);
-    let link = state
-        .store()
-        .scoped(scope)
-        .account_links()
-        .resolve(connector_id, &external_id)
-        .await
-        .map_err(|_| ())?;
-    let Some(link) = link else {
+    // BOTH ISSUER SPELLINGS ARE TRIED, and this is not belt-and-braces.
+    //
+    // Google's tokens write `iss` as `https://accounts.google.com/` while its discovery
+    // document uses `https://accounts.google.com`, so the composite the LOGIN path stored
+    // when the user linked their account may carry either. `same_issuer` already treats
+    // the two as one transmitter for the fence above; doing that for the fence and NOT for
+    // the lookup is what made the first version of this accept a genuine Google token and
+    // then silently resolve nobody -- a 202, no protection, and no way to tell from the
+    // outside that anything was wrong.
+    //
+    // At most two indexed reads, and only for an event that is actually protective.
+    let trimmed = signal.subject_issuer.trim_end_matches('/');
+    let spellings = [trimmed.to_owned(), format!("{trimmed}/")];
+
+    let mut found = None;
+    for issuer in spellings {
+        let external_id = crate::federation::federated_external_id(&issuer, &signal.subject);
+        if let Some(link) = state
+            .store()
+            .scoped(scope)
+            .account_links()
+            .resolve(connector_id, &external_id)
+            .await
+            .map_err(|_| ())?
+        {
+            found = Some(link);
+            break;
+        }
+    }
+    let Some(link) = found else {
         return Ok(None);
     };
     Ok(state
@@ -315,13 +435,40 @@ async fn resolve_linked_user(
 
 /// Apply the configured protections to the linked user.
 ///
-/// BOTH HALVES MATTER. Ending sessions removes what the attacker already holds; revoking
-/// remembered devices is what stops them walking back in, because a remembered device is
-/// precisely the thing that lets the next sign-in skip the strong factor. The pair is
-/// criterion 4's "session revocation and step-up flag".
+/// BOTH HALVES MATTER, and it is worth being exact about what the second one buys, because
+/// the obvious claim overreaches for the very users this receiver serves.
+///
+/// Ending sessions removes what the attacker already holds. Revoking remembered devices
+/// removes this deployment's standing assertion that the device is known, which is what
+/// lets a sign-in skip the strong factor and what a step-up policy consults.
+///
+/// It does NOT by itself prevent re-entry for a purely federated user. Someone who signs
+/// in only through Google re-enters by satisfying GOOGLE, and whether they still can is
+/// Google's decision, not ours -- which is the whole reason the signal arrives. What the
+/// pair guarantees locally is that nothing minted before the compromise is still honoured
+/// and that the next sign-in is treated as untrusted rather than familiar. For an account
+/// that ALSO carries local credentials or a step-up policy, that second half is a real
+/// barrier; for one that does not, it is correct hygiene rather than a lock.
 ///
 /// Each write is audited by the store under a synthetic service actor: the SET's signature
 /// IS the authorization, and there is no human or client principal to attribute it to.
+///
+/// # The two writes are separate transactions, and the half-state is transient
+///
+/// `revoke_all_for_user` and `self_revoke_all` each commit on their own, so the second
+/// can fail with the first already done: sessions ended, device trust intact, which is
+/// exactly the combination the config doc calls dangerous.
+///
+/// It does not survive, and the reason is the ORDER the caller records the `jti` in. An
+/// `Err` here returns a 500 BEFORE anything is recorded, so no replay row exists, the
+/// transmitter retries, and the retry re-runs BOTH writes. Each is idempotent -- revoking
+/// an already-ended session and an already-revoked device are both no-ops -- so the
+/// second attempt completes the pair and leaves the audit trail describing what actually
+/// happened.
+///
+/// This is worth writing down because it is not visible from here: a reader looking at
+/// these two calls alone sees an un-atomic pair and no compensation, and a reviewer did.
+/// The compensation is the caller's ordering, not a transaction.
 async fn apply_protections(
     state: &OidcState,
     scope: Scope,

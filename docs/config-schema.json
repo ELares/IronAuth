@@ -2375,6 +2375,11 @@
           },
           "type": "array"
         },
+        "audience": {
+          "default": "",
+          "description": "The `aud` an inbound SET must carry.\n\nFOR GOOGLE THIS IS THE APP'S OAUTH CLIENT ID, not a URL. Google Cross-Account\nProtection stamps the receiving app's client id\n(`123456789-abcdefg.apps.googleusercontent.com`), which is what its own\ndocumentation shows and what a real token carries. An earlier version of this\nreceiver pinned `aud` to this environment's issuer URL, which is the SSF 1.0 shape\nand would have refused every genuine Google token.\n\nIt is configured rather than derived because only the operator knows which of\ntheir OAuth clients is registered with the transmitter.",
+          "type": "string"
+        },
         "connector_id": {
           "default": "",
           "description": "The federation connector whose subjects this transmitter speaks about.\n\nAn inbound SET names a subject in the transmitter's own namespace, and this is what\nturns that into a LOCAL user: the connector plus the composite of the SET's issuer\nand subject is the key `account_links` is resolved on. Without it a signal could only\nbe matched by guessing, and matching the wrong user would end a stranger's sessions.",
@@ -3491,6 +3496,7 @@
       "$ref": "#/$defs/RiscReceiverConfig",
       "default": {
         "algorithms": [],
+        "audience": "",
         "connector_id": "",
         "enabled": false,
         "issuer": "",

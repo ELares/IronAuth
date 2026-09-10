@@ -1,4 +1,5 @@
--- A seventh trusted-device revoke reason: an upstream account compromise (issue #144).
+
+-- A FIFTH trusted-device revoke reason: an upstream account compromise (issue #144).
 --
 -- Google Cross-Account Protection tells this deployment that a Google account one of its
 -- users signs in with is believed compromised. The configured protection revokes that user's
