@@ -53,7 +53,8 @@
 //!   and remove-subject endpoints shipped with the transmitter and this producer is the
 //!   first place their list can take effect. An empty list means no filter and admits
 //!   everything, which is why the count is asked before the membership. See
-//!   [`Self::stream_wants`](SsfSessionFanOutConsumer::stream_wants).
+
+//!   [`StreamFanOut::stream_wants`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -349,7 +350,10 @@ impl StreamFanOut {
             Err(StoreError::QuotaExceeded) => {
                 tracing::warn!(
                     stream = %stream.id,
-                    "session revocation not queued: this receiver is holding the ceiling                      in unacknowledged events"
+
+                    event_type = %event.event_type,
+                    "event not queued: this receiver is holding the ceiling in \
+                     unacknowledged events"
                 );
                 Ok(())
             }

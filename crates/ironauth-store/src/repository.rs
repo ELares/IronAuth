@@ -22285,11 +22285,30 @@ pub const SSF_LIFECYCLE_CONSUMER: &str = "ssf.lifecycle";
 /// It is a WHITELIST rather than a `user.` prefix test. `user.signed_in` and
 /// `user.created` are user events and neither is an account lifecycle transition, and a
 /// prefix test would turn every sign-in into a RISC fan-out.
+///
+/// # Every entry is ACCOUNT grain, and that is the whole selection rule
+///
+/// This deployment announces membership changes and account changes SEPARATELY, and
+/// `reconcile_account_state` says why: "a receiver that keeps its own copy of the
+/// directory acts on the organization event; a receiver that gates on 'can this person
+/// sign in at all' acts on this one, and the two are different questions whenever a
+/// person belongs to more than one organization."
+///
+/// RISC asks the second question. `account-disabled` means the owner cannot use the
+/// account, so only an event that moves the ACCOUNT may produce it.
+/// `user.deactivated` and `user.deprovisioned` are the organization grain and are
+/// deliberately ABSENT: one organization deactivating a person who is still active in
+/// another leaves them able to sign in, and
+/// `a_deactivate_by_one_organization_announces_no_account_change` pins that the account
+/// state does not move. Mapping those would tell every receiver in the environment that
+/// an account was disabled while its owner kept using it, with no later `account-enabled`
+/// to undo it, because a reactivation announces only the organization grain too.
+///
+/// Nothing is lost by their absence. When a SCIM deactivation IS the last one,
+/// `reconcile_account_state` emits `user.state_changed`, which is on this list.
 pub const SSF_LIFECYCLE_EVENT_TYPES: &[&str] = &[
-    "user.deactivated",
     "user.state_changed",
     "user.deleted",
-    "user.deprovisioned",
     "user.identifier_added",
     "user.identifier_removed",
 ];
@@ -22886,8 +22905,13 @@ pub(crate) async fn enqueue_domain_event(
 /// surface was mounted, so its presence is exactly the condition under which the consumer
 /// has work to do.
 ///
-/// The read is bounded to ONE row and hits the `(tenant_id, environment_id, status)`
-/// index, and it runs INSIDE the caller's transaction rather than opening its own,
+/// The read is bounded to ONE row and is served by `ssf_streams_retaining_idx`, 0216's
+/// PARTIAL index on `(tenant_id, environment_id) WHERE status <> 'disabled'`. The
+/// partial predicate is what is load-bearing: this statement's
+/// `status IN ('enabled', 'paused')` is a subset of it, which is what lets the planner
+/// use the index at all. A fourth status value, or a rewritten predicate, turns this
+/// into a sequential scan on the path of every lifecycle write. It runs INSIDE the
+/// caller's transaction rather than opening its own,
 /// because a separate connection could see a different snapshot and because the trigger
 /// must commit with the event it describes or not at all.
 ///

@@ -546,9 +546,25 @@ async fn no_stream_means_no_trigger_at_all() {
         1,
         "the session still explodes for the back-channel path"
     );
-    assert_eq!(
-        fanout_pass(&harness, scope).await.completed,
-        0,
+    // CLAIMED DIRECTLY, not read off a drain's `completed` count. A drain reports 0 both
+    // when there was no message and when there WAS one that failed, and those are
+    // opposite outcomes for a test about whether the producer wrote anything. The
+    // lifecycle suite hit exactly that: a mutant that wrote a trigger for an event whose
+    // payload the consumer could not read failed the message, kept `completed` at 0, and
+    // survived. The same ambiguity was latent here.
+    let triggers = store
+        .scoped(scope)
+        .outbox()
+        .claim(
+            &env,
+            ironauth_store::SSF_SESSION_FANOUT_CONSUMER,
+            Duration::from_secs(30),
+            10,
+        )
+        .await
+        .expect("claim the fan-out queue");
+    assert!(
+        triggers.is_empty(),
         "a trigger row was written with no stream to fan out to"
     );
 }

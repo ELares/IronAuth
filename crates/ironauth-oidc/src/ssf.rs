@@ -350,7 +350,9 @@ pub async fn create_stream(
     // THE INTERSECTION GROWS WITH `EVENTS_SUPPORTED` AND NOWHERE ELSE. It was empty while that
     // list was, gained SSF's verification event with the verification endpoint, and gains
     // CAEP's `session-revoked` with the session-end fan-out (issue #144). Every event type
-    // without a producer -- the rest of CAEP, all of RISC -- is still refused by omission. The
+
+    // without a producer -- the rest of CAEP, and RISC's inbound-only credential-compromise --
+    // is still refused by omission. The
     // `a_receiver_is_told_which_of_its_requested_events_will_arrive` test drives both halves.
     //
     // AND IT IS NARROWED BY THIS STREAM'S SUBJECT FORMAT, because `events_delivered` is a

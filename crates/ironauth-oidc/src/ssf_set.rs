@@ -12,7 +12,9 @@
 //! It does not decide WHAT happened. [`SecurityEvent`] carries an event type URI and an opaque
 //! payload, and this module never inspects either. Which URI means "the session was revoked",
 //! and what belongs in its payload, is the CAEP vocabulary's answer and lives in
-//! [`crate::caep`]; RISC has no producer here yet. [`EVENTS_SUPPORTED`] names only the types
+
+//! [`crate::caep`], and the account-lifecycle vocabulary lives in [`crate::risc`].
+//! [`EVENTS_SUPPORTED`] names only the types
 //! something in this build actually emits, because a transmitter that named event types it
 //! cannot produce would publish that list in its discovery document, which is the one place a
 //! receiver reads to decide what to ask for.

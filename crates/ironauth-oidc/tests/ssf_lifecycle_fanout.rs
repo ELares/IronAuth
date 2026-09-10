@@ -8,10 +8,12 @@
 //! mapping itself is pinned in `risc`'s unit tests; what is pinned HERE is that a REAL
 //! lifecycle write reaches a receiver as the documented RISC type.
 //!
-//! Every test drives an actual `users().set_state_with_event(..)` or `delete_with_event(..)`
-//! rather than hand-building an outbox message, because the producer that writes the
-//! trigger lives inside those store calls. A trigger that is never written, or written
-//! under a consumer name nothing drains, looks exactly like a fan-out with nothing to do.
+
+//! Every test drives an actual store write that emits the domain event -- a state change,
+//! a deletion, an identifier change -- rather than hand-building an outbox message,
+//! because the producer that writes the trigger lives inside those store calls. A trigger
+//! that is never written, or written under a consumer name nothing drains, looks exactly
+//! like a fan-out with nothing to do.
 //!
 //! # The admin and SCIM halves
 //!
@@ -493,5 +495,109 @@ async fn a_stream_filtered_to_another_subject_is_not_told() {
     assert!(
         owed_claims(&harness, &stream).await.is_empty(),
         "a stream filtered to a different subject was told about this one"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_user_reaches_a_stream_as_risc_account_purged() {
+    // `account-purged` had NO end-to-end coverage: every other test in this suite drives
+    // a state change, so the whole `user.deleted` arm of the mapping was reachable only
+    // through a unit assertion. A producer that never wrote a trigger for a deletion, or
+    // a mapping that lost this arm, would have shipped green.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let env = harness.state().env().clone();
+    let client = a_client(&harness).await;
+    let stream = seed_stream(&harness, &client, &all_risc()).await;
+    let user = seed_user(&harness, "purged@example.test").await;
+
+    let id = format!("evt_delete_{user}");
+    let payload = serde_json::json!({ "user_id": user.to_string(), "hard_kill": false });
+    let envelope =
+        ironauth_admin::events::envelope(&id, "user.deleted", scope, 1_700_000_000_000, &payload);
+    let store = store_of(&harness);
+    store
+        .scoped(scope)
+        .acting(harness.db().test_actor(&env), CorrelationId::generate(&env))
+        .users()
+        .delete(
+            &env,
+            &user,
+            false,
+            None,
+            Some(&DomainEvent {
+                id: &id,
+                subject: &user.to_string(),
+                envelope: &envelope,
+            }),
+        )
+        .await
+        .expect("delete the user");
+
+    assert_eq!(lifecycle_pass(&harness, scope).await.completed, 1);
+    let owed = owed_claims(&harness, &stream).await;
+    assert_eq!(owed.len(), 1, "a deletion produced no SET");
+    assert_eq!(sole_event_type(&owed[0]), risc::ACCOUNT_PURGED);
+    assert_eq!(
+        owed[0]["sub_id"]["id"].as_str(),
+        Some(user.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn an_added_identifier_reaches_a_stream_without_the_identifier_in_it() {
+    // `identifier-changed` had no end-to-end coverage either, and it is the arm with a
+    // privacy property to protect: RISC's `new-value` is optional and this build declines
+    // it, because a SET sits in a poll queue and is POSTed to an address the receiver
+    // chose. The unit test pins the body; this pins that the body a RECEIVER actually
+    // gets, after minting and sealing and reading back out of the queue, still has no
+    // address in it.
+    let harness = Harness::start_store_backed().await;
+    provision_envelope(&harness).await;
+    let scope = harness.scope();
+    let env = harness.state().env().clone();
+    let client = a_client(&harness).await;
+    let stream = seed_stream(&harness, &client, &all_risc()).await;
+    let user = seed_user(&harness, "identifier@example.test").await;
+
+    let secret_address = "new.address@example.test";
+    let id = format!("evt_ident_{user}");
+    let payload = serde_json::json!({
+        "user_id": user.to_string(),
+        "identifier_id": "uid_probe",
+        "identifier_type": "email",
+    });
+    let envelope = ironauth_admin::events::envelope(
+        &id,
+        "user.identifier_added",
+        scope,
+        1_700_000_000_000,
+        &payload,
+    );
+    let store = store_of(&harness);
+    store
+        .scoped(scope)
+        .outbox()
+        .append_event(
+            &env,
+            &ironauth_store::NewOutboxMessage {
+                consumer: ironauth_store::SSF_LIFECYCLE_CONSUMER,
+                idempotency_key: &id,
+                ordering_key: &user.to_string(),
+                payload: envelope,
+            },
+        )
+        .await
+        .expect("enqueue the identifier change");
+
+    assert_eq!(lifecycle_pass(&harness, scope).await.completed, 1);
+    let owed = owed_claims(&harness, &stream).await;
+    assert_eq!(owed.len(), 1, "an identifier change produced no SET");
+    assert_eq!(sole_event_type(&owed[0]), risc::IDENTIFIER_CHANGED);
+    let delivered = serde_json::to_string(&owed[0]).expect("serialise");
+    assert!(
+        !delivered.contains(secret_address) && !delivered.contains("new-value"),
+        "the SET a receiver is handed republishes the changed identifier: {delivered}"
     );
 }
