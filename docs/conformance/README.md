@@ -89,3 +89,40 @@ GENERATED from measured results by `scripts/gen-mcp-conformance.py`; run
 `scripts/mcp-conformance.sh` to remeasure and regenerate it. It is linked from here
 because `docs/llms.txt` excludes this whole directory as generated fixtures, so a page
 nothing links to is a page nothing can find.
+
+## Shared Signals: SETs judged by a second implementation
+
+`scripts/ssf-set-external-validation.sh` is issue #143's third acceptance
+criterion, and it is the one obligation this repository cannot meet with its own
+code: emitted Security Event Tokens must "validate with an external, independent
+JWT/SET library against the environment JWKS". Verifying an `ironauth-jose`
+signature with `ironauth-jose` is one implementation agreeing with itself, and a
+shared misreading of RFC 8417 or RFC 7515 passes in both directions.
+
+Two steps. `crates/ironauth-oidc/tests/ssf_set_corpus.rs` mints one SET per
+algorithm a provisioned environment holds (EdDSA, ES256, RS256 -- what
+`DayOneSigningKeys` provisions) and writes each beside the JWKS that environment
+publishes and an `expect.json` recording what the minting side believes it
+produced. `scripts/validate-set-external.py` then judges that corpus with PyJWT,
+hash-pinned in
+[`requirements-set.txt`](../../deploy/conformance/requirements-set.txt). Every
+expectation comes from the corpus rather than from constants the validator keeps
+its own copy of: a validator holding its own expected issuer would keep passing
+after the issuer stopped matching.
+
+It is deliberately NOT stdlib-only, which is the opposite of the rule the other
+gates follow. A stdlib-only second implementation would be a JOSE implementation
+this repository wrote, which is the thing the criterion rules out.
+
+The negative controls are the other half. A validator misconfigured into
+accepting anything prints the same "all valid" a working one does, so five
+mutations are applied to every token and each must be REJECTED: a flipped
+signature bit, each other algorithm's key, a declared algorithm that is not the
+one it was signed with, and a wrong audience. One accepted control fails the
+run. (The first version flipped the last base64url CHARACTER of the signature
+and that control passed for RS256, because a 256-byte signature ends in a
+one-byte group whose final character carries four bits the decoder discards --
+so the "tampered" token was the original. It flips a decoded byte now.)
+
+This lane runs on every PR, in the `invariants` job. Unlike the OIDF profiles
+above it needs no provisioned runner and no owner action.

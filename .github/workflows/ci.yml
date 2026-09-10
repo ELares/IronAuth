@@ -971,6 +971,13 @@ jobs:
           python-version: "3.12"
       - name: provision the conformance static-check python deps (hash pinned)
         run: python3 -m pip install --require-hashes -r deploy/conformance/requirements.txt
+      # THE SECOND JOSE IMPLEMENTATION, for the external SET validation step at the end of this
+      # job. A separate file from the conformance requirements because the packages answer
+      # separate needs: that harness wants a YAML parser and an HTTP client, this wants a JOSE
+      # library and its crypto backend, and folding them together would make every conformance
+      # job install a cryptography wheel it never imports.
+      - name: provision the independent JOSE library (hash pinned)
+        run: python3 -m pip install --require-hashes -r deploy/conformance/requirements-set.txt
       - name: dormant module scan (a public surface nothing calls)
         run: scripts/dormant-module-scan.sh
       - name: invariant lints
@@ -1200,6 +1207,18 @@ jobs:
               sys.exit(f'security.txt Expires more than ~13 months out: {expires}')
           print('security.txt: valid, expires', expires)
           EOF
+      - name: external SET validation (issue #143 criterion 3)
+        # Emitted Security Event Tokens are validated by PyJWT, which shares no line of code
+        # with this repository, against the JWKS the environment publishes. IronAuth's own
+        # suite already verifies a minted SET, but it verifies through ironauth-jose -- the
+        # code that signed it -- and one implementation checked against itself agrees with
+        # itself. A shared misreading of RFC 8417 or RFC 7515 passes in both directions, and a
+        # receiver built on any other library would be the first to find out.
+        #
+        # It builds a test binary rather than running a static check, which is why it sits last
+        # in this lane: the invariant scripts above have already compiled ironauth-oidc's
+        # dependency graph, so the marginal cost is one test target.
+        run: scripts/ssf-set-external-validation.sh
 
   # The standalone TypeScript reference app (packages/reference-app, issue #85):
   # build and typecheck it so it cannot rot. It is a SEPARATE deployable that
