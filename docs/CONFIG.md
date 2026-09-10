@@ -346,6 +346,7 @@ at the top of the file, or map it in `.taplo.toml`).
 | `ssf.enabled` | boolean | `false` | Whether to serve the Shared Signals stream-management surface and its discovery document on the public plane. Off by default. |
 | `ssf.max_owed_sets_per_stream` | integer | `1000` | The most UNACKNOWLEDGED SETs one poll stream may hold. |
 | `ssf.max_streams_per_client` | integer | `20` | The most streams one receiver may hold in one environment. |
+| `ssf.min_verification_interval_secs` | integer | `60` | The shortest interval between two verification requests for one stream. |
 | `telemetry` | table | see fields | Observability settings: log format and trace export. |
 | `telemetry.log_format` | string | `"json"` | Structured-log output format for the process log stream. |
 | `telemetry.otlp_endpoint` | string or unset | unset | OpenTelemetry OTLP collector endpoint for trace export (for example `http://otel-collector:4317`). Trace export is compiled in only when the binary is built with the non-default `otlp` feature; setting this on a build without that feature logs a warning and is otherwise inert. |

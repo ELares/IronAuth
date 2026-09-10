@@ -1788,6 +1788,15 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0217_ssf_stream_sets.sql"),
         },
+        Migration {
+            version: 218,
+            name: "ssf_stream_verification",
+            // EXPAND. A NULLABLE column added to a table only the SSF surface reads, and an old
+            // binary mounts no SSF surface at all, so nothing during a rolling upgrade reads or
+            // writes it.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0218_ssf_stream_verification.sql"),
+        },
     ]
 }
 

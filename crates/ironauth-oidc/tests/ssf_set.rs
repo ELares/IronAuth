@@ -206,16 +206,26 @@ fn an_empty_audience_omits_the_claim_rather_than_minting_one_nobody_matches() {
     assert!(claims.get("aud").is_none(), "{claims}");
 }
 
+/// The advertised event list is exactly what the surface emits, and nothing from a vocabulary.
+///
+/// The list was empty while nothing produced a SET. The verification endpoint changed that, so
+/// this pins the new shape from BOTH sides: the verification type is present, and no CAEP or
+/// RISC type is, because those vocabularies are the next issue's. Asserting only that the list
+/// is non-empty would pass the day somebody advertised a type nothing emits, which is the
+/// failure the original empty assertion existed to prevent.
 #[test]
-fn no_event_type_is_advertised_before_a_vocabulary_can_emit_one() {
-    // #143 ships the framing and the delivery machinery; the CAEP and RISC vocabularies are the
-    // next issue's. An advertised event type nothing emits tells a receiver to request a signal
-    // it will never be sent, and a receiver cannot tell that from a quiet period. When the
-    // vocabularies land this list grows WITH the emitter, and this test changes with it.
-    assert!(
-        EVENTS_SUPPORTED.is_empty(),
-        "an event type is advertised that nothing emits: {EVENTS_SUPPORTED:?}"
+fn the_advertised_events_are_exactly_the_ones_this_build_emits() {
+    assert_eq!(
+        EVENTS_SUPPORTED,
+        [ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE],
+        "the advertised event list is not the set this build can produce"
     );
+    for advertised in EVENTS_SUPPORTED {
+        assert!(
+            !advertised.contains("/caep/") && !advertised.contains("/risc/"),
+            "a CAEP or RISC event type is advertised before its vocabulary lands: {advertised}"
+        );
+    }
 }
 
 #[tokio::test]

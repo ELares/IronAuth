@@ -100,7 +100,8 @@ const CHAIN_SUBJECTS: &str = "isolation, audit log, \
      LDAP sync snapshots, \
      LDAP sync runs, \
      Shared Signals streams, \
-     Shared Signals stream SETs";
+     Shared Signals stream SETs, \
+     Shared Signals stream verification";
 
 /// A throwaway migration with the given version, phase, and SQL text.
 fn step(version: i64, phase: Phase, sql: &'static str) -> Migration {
@@ -731,7 +732,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
     );
     assert_eq!(
         report.already_applied(),
-        217,
+        218,
         "a migration was added to or removed from the production chain; this count is a \
          deliberate checkpoint, not a bug, so read the new migration, satisfy yourself that it \
          belongs in the shipped chain, then update this number and CHAIN_SUBJECTS and the \
@@ -774,7 +775,7 @@ async fn production_chain_is_only_the_real_migrations_and_ships_no_demo_object()
             160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176,
             177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193,
             194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
-            211, 212, 213, 214, 215, 216, 217
+            211, 212, 213, 214, 215, 216, 217, 218
         ]
     );
     let phase_of = |version: i64| async move {
@@ -8341,9 +8342,23 @@ async fn the_narrowed_tables_grant_the_data_plane_exactly_their_writers_columns(
         // `push_endpoint_url` / `push_secret_name`, which decide where its security events go
         // and what credential is presented -- a data plane that could write those could
         // re-point another receiver's stream at an endpoint it chose. Also absent are the
-        // negotiation columns: SSF 1.0 defines a configuration update, this slice does not
+        // negotiation columns: SSF 1.0 defines a configuration update, this build does not
         // ship one, and the first version of 0216 granted them anyway.
-        ("ssf_streams", vec!["status", "status_reason", "updated_at"]),
+        //
+        // `last_verification_at` joined them in 0218: `claim_verification` is the second UPDATE
+        // on this table, and it names that column alone. It is a rate-limit instant rather than
+        // part of the stream's configuration, which is why it is safe here while the columns
+        // above it are not -- the worst a data plane that could write it can do is let one
+        // receiver ask for verification more often than the interval allows.
+        (
+            "ssf_streams",
+            vec![
+                "status",
+                "status_reason",
+                "updated_at",
+                "last_verification_at",
+            ],
+        ),
     ] {
         let mut writable = writable_columns(pool, "ironauth_app", table).await;
         writable.sort();

@@ -100,6 +100,12 @@ pub const STATUS_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/status";
 /// is collecting for, so a credential holding several poll streams names the one it means
 /// instead of the transmitter guessing.
 pub const POLL_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/poll/{stream_id}";
+/// The SSF 1.0 section 7.1.4 verification endpoint, per environment.
+///
+/// Per environment rather than per stream, unlike the poll endpoint, because the request body
+/// names the stream: section 7.1.4 makes `stream_id` a REQUIRED member, so putting it in the
+/// path as well would give a receiver two places to say it and this surface two to disagree.
+pub const VERIFICATION_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/verify";
 /// The discovery document, per environment, in the RFC 8414 host-inserted form the rest of
 /// this surface uses.
 pub const CONFIGURATION_PATH: &str =
@@ -691,6 +697,268 @@ pub async fn poll(
     )
 }
 
+/// What a receiver posts to ask for a verification event.
+///
+/// SSF 1.0 section 7.1.4. `stream_id` is REQUIRED and `state` is OPTIONAL; there are no other
+/// members, and an unknown one is ignored rather than refused, because a receiver built against
+/// a later revision of the spec must not be locked out by a member this build has not learned.
+#[derive(Debug, Deserialize)]
+struct VerificationRequest {
+    stream_id: String,
+    /// An opaque value the receiver chose, echoed back inside the event.
+    ///
+    /// The receiver's way of matching the SET it collects to the request it made, which matters
+    /// because the answer to the request itself is a bare 204 that names nothing.
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// `POST {issuer}/ssf/verify` -- SSF 1.0 section 7.1.4 stream verification.
+///
+/// # 204, and what it does and does not promise
+///
+/// Section 7.1.4 is explicit that a success "does not indicate that the Verification Event was
+/// transmitted successfully, only that the Event Transmitter has transmitted the event or will
+/// do so at some point in the future". So this returns 204 once the SET is DURABLE -- queued for
+/// a poll receiver, or enqueued on the outbox for a push one -- and never waits for delivery.
+///
+/// # The subject is the stream, and it is always opaque
+///
+/// Section 7.1.4 requires the top-level `sub_id` of a verification event to be an `opaque`
+/// identifier whose `id` is the stream being verified, REGARDLESS of the subject format that
+/// stream negotiated. A verification event is about the stream rather than about a person, so
+/// rendering it as the stream's `email` format would name a subject that does not exist.
+///
+/// # A disabled stream is refused
+///
+/// The spec does not say to, and this does. A 204 promises the transmitter has transmitted the
+/// event "or will do so at some point in the future", and a `disabled` stream can do neither:
+/// 0216 defines it as delivering nothing and retaining nothing, so the SET would be dropped on
+/// the floor or, worse, left as a row the stream is documented not to hold. A `paused` stream is
+/// ACCEPTED, because retaining is exactly what it does and the receiver collects on resume.
+///
+/// # Rate limited, because the work is not the request
+///
+/// One small POST mints a signed SET and either queues a row or enqueues an outbox message.
+/// Section 7.1.4 anticipates this, defining 429 and naming `min_verification_interval` as the
+/// advertised floor. The slot is taken ATOMICALLY, so a burst of concurrent requests cannot all
+/// pass the same stale instant.
+pub async fn verification(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let Some((client, scope)) = authenticated(&state, &headers, &tenant_id, &environment_id).await
+    else {
+        return unauthorized();
+    };
+    let Ok(request) = serde_json::from_str::<VerificationRequest>(&body) else {
+        return invalid_request("the verification request is not a JSON object with a stream_id");
+    };
+    let Ok(id) = SsfStreamId::parse_in_scope(&request.stream_id, &scope) else {
+        return not_found();
+    };
+    // THE RECEIVER FENCE, and everything below addresses the stream by handle alone. Section
+    // 7.1.4 gives 404 for "stream not found for this receiver", which is the same answer an
+    // absent stream gets, so a client cannot probe for another receiver's streams.
+    let stream = match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(StoreError::NotFound) => return not_found(),
+        Err(_) => return server_error(),
+    };
+    if !stream.status.retains() {
+        return not_delivering(stream.status);
+    }
+
+    // THE SLOT BEFORE THE WORK. Taken first so a refused request costs a single UPDATE rather
+    // than a signature, and taken atomically so a burst cannot all pass one stale instant.
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .claim_verification(&id, &client, state.ssf_min_verification_interval_secs())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return too_many_verifications(state.ssf_min_verification_interval_secs()),
+        Err(_) => return server_error(),
+    }
+
+    let mut payload = serde_json::Map::new();
+    if let Some(echoed) = &request.state {
+        // ECHOED VERBATIM AND BOUNDED. Section 7.1.4 says the transmitter returns the value the
+        // receiver supplied, so it is not interpreted; it is bounded because it lands inside a
+        // signed token this transmitter stores and delivers.
+        if echoed.len() > MAX_TEXT_BYTES {
+            return invalid_request("state is longer than this transmitter will echo");
+        }
+        payload.insert(
+            "state".to_owned(),
+            serde_json::Value::String(echoed.clone()),
+        );
+    }
+    let event = crate::ssf_set::SecurityEvent {
+        event_type: crate::ssf_set::VERIFICATION_EVENT_TYPE.to_owned(),
+        payload,
+    };
+    // OPAQUE, AND THE STREAM. Not `stream.subject_format`: see the doc above.
+    let subject = crate::ssf_set::SubjectIdentifier::Opaque { id: id.to_string() };
+    let jti = verification_jti(state.env());
+
+    let queued = match deliver_verification(&state, scope, &stream, &id, &jti, &subject, &event)
+        .await
+    {
+        Ok(queued) => queued,
+        Err(response) => return response,
+    };
+    let _ = queued;
+    no_content()
+}
+
+/// Make the verification SET durable by the method its stream negotiated.
+///
+/// THE TWO METHODS STORE DIFFERENT THINGS, which is why this is a match rather than one call.
+/// Poll stores the SIGNED TOKEN, because RFC 8936 redelivers an unacknowledged SET and a
+/// receiver comparing two deliveries must see the same bytes; push stores the INGREDIENTS on the
+/// outbox, which is the shape `enqueue_push` already had.
+///
+/// The `Err` arm is a response rather than an error type because every failure here has exactly
+/// one right answer and the caller would only re-derive it.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_verification(
+    state: &OidcState,
+    scope: Scope,
+    stream: &SsfStream,
+    id: &SsfStreamId,
+    jti: &str,
+    subject: &crate::ssf_set::SubjectIdentifier,
+    event: &crate::ssf_set::SecurityEvent,
+) -> Result<bool, Response> {
+    match &stream.delivery {
+        SsfDelivery::Poll => {
+            let Ok(token) = crate::ssf_set::mint_set(
+                state.issuers(),
+                state.env(),
+                scope,
+                &crate::ssf_set::SetToMint {
+                    audience: &stream.audience,
+                    jti,
+                    subject,
+                    event,
+                },
+            )
+            .await
+            else {
+                return Err(server_error());
+            };
+            state
+                .store()
+                .scoped(scope)
+                .ssf_stream_sets()
+                .queue(
+                    state.env(),
+                    id,
+                    jti,
+                    &token,
+                    state.ssf_max_owed_sets_per_stream(),
+                )
+                .await
+                .map(|()| true)
+                .map_err(|error| queue_refusal(&error))
+        }
+        SsfDelivery::Push { .. } => crate::ssf_push::enqueue_push(
+            state.store(),
+            state.env(),
+            scope,
+            &crate::ssf_push::QueuedPush {
+                stream_id: id,
+                jti,
+                subject,
+                event,
+            },
+        )
+        .await
+        .map_err(|error| queue_refusal(&error)),
+    }
+}
+
+/// Turn a queue failure into the answer it deserves.
+///
+/// A FULL QUEUE IS NOT A SERVER FAULT. It means the receiver has stopped collecting, so it gets
+/// the same 429 the rate limit gives rather than a 500 that would send an operator looking at
+/// the transmitter.
+fn queue_refusal(error: &StoreError) -> Response {
+    match error {
+        StoreError::QuotaExceeded => owed_queue_full(),
+        _ => server_error(),
+    }
+}
+
+/// A fresh `jti` for one verification event.
+///
+/// FROM ENTROPY, not from the stream or the clock. The `jti` is what a receiver deduplicates on
+/// and what an acknowledgement names, so two verification requests for one stream must not
+/// collide: deriving it from the stream would make the second request a `Conflict` against the
+/// first, and deriving it from the clock would do the same for two within one tick.
+fn verification_jti(env: &ironauth_env::Env) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut bytes = [0_u8; 16];
+    env.entropy().fill_bytes(&mut bytes);
+    format!("evt_verify_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// The stream already holds every unacknowledged SET this environment will keep for it.
+///
+/// 429 AND NOT 500, because this is a receiver that has stopped collecting rather than a
+/// transmitter fault: sending a 500 would put an operator to work on the wrong side. It is a
+/// DIFFERENT 429 from the rate limit and says so, since the two are fixed by different actions
+/// -- wait, versus collect what you are already owed.
+fn owed_queue_full() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::json!({
+            "error": "too_many_requests",
+            "error_description":
+                "this stream already holds every SET it may be owed; acknowledge what you have \
+                 been given before asking for more",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// The receiver asked for a verification event again too soon.
+fn too_many_verifications(min_interval_secs: u32) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::RETRY_AFTER, "0"),
+        ],
+        serde_json::json!({
+            "error": "too_many_requests",
+            "error_description": format!(
+                "this stream may be verified once every {min_interval_secs} seconds"
+            ),
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// The most SETs one poll returns, and the most `jti`s one may acknowledge.
 ///
 /// A receiver may ask for fewer. It may not ask for more: `maxEvents` is receiver-chosen work
@@ -722,9 +990,10 @@ pub async fn configuration(
     }
     let issuer = state.issuers().issuer_for(&scope);
     let base = format!("{issuer}/ssf");
-    // IT ADVERTISES ONLY WHAT IS MOUNTED. SSF 1.0 also defines add-subject, remove-subject and
-    // verification endpoints; this slice serves none of them, so naming them would tell a
-    // receiver to call a 404. They appear here in the slice that mounts them.
+    // IT ADVERTISES ONLY WHAT IS MOUNTED. SSF 1.0 also defines add-subject and remove-subject
+    // endpoints; this build serves neither, so naming them would tell a receiver to call a 404.
+    // They appear here in the slice that mounts them, which is what just happened to
+    // `verification_endpoint`.
     json(
         StatusCode::OK,
         &serde_json::json!({
@@ -737,6 +1006,11 @@ pub async fn configuration(
             "jwks_uri": state.issuers().jwks_uri_for(&scope),
             "configuration_endpoint": format!("{base}/streams"),
             "status_endpoint": format!("{base}/status"),
+            "verification_endpoint": format!("{base}/verify"),
+            // ADVERTISED BECAUSE IT IS ENFORCED. Section 7.1.4 pairs `min_verification_interval`
+            // with the 429 a receiver gets for asking too often, and publishing it is what lets
+            // a receiver pace itself instead of discovering the floor by being refused.
+            "min_verification_interval": state.ssf_min_verification_interval_secs(),
             "delivery_methods_supported": DELIVERY_METHODS_SUPPORTED,
             // WHAT A POLL RECEIVER CANNOT LEARN FROM A RESPONSE. RFC 8936 defaults
             // `returnImmediately` to false, meaning "hold the request open", and this

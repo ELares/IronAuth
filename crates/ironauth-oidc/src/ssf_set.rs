@@ -12,7 +12,8 @@
 //! It does not decide WHAT happened. [`SecurityEvent`] carries an event type URI and an opaque
 //! payload, and this module never inspects either: the CAEP and RISC vocabularies -- which URI
 //! means "the session was revoked" and what its payload must contain -- are the next issue's,
-//! and [`EVENTS_SUPPORTED`] is deliberately empty until they land. A transmitter that named
+//! and [`EVENTS_SUPPORTED`] names only SSF's own verification event until they land. A
+//! transmitter that named
 //! event types it cannot produce would publish that list in its discovery document, which is
 //! the one place a receiver reads to decide what to ask for.
 //!
@@ -41,13 +42,25 @@ use ironauth_store::{Scope, SsfSubjectFormat};
 
 use crate::issuer::IssuerRegistry;
 
+/// The SSF 1.0 verification event, which a receiver asks for to prove its delivery path works.
+///
+/// SSF'S OWN EVENT TYPE rather than a CAEP or RISC one, which is why it can be here while the
+/// vocabularies are still the next issue's: section 7.1.4 defines it as part of stream
+/// management, so a transmitter that serves a verification endpoint emits exactly this and
+/// nothing about it waits on #144.
+pub const VERIFICATION_EVENT_TYPE: &str =
+    "https://schemas.openid.net/secevent/ssf/event-type/verification";
+
 /// The event type URIs this build can transmit.
 ///
-/// EMPTY, and that is a statement rather than a placeholder. #143 ships the SSF framing and the
-/// delivery machinery; the CAEP and RISC vocabularies are the next issue's. A discovery document
-/// advertising an event type nothing emits would tell a receiver to request a signal it will
-/// never be sent, and a receiver cannot distinguish that from a quiet period.
-pub const EVENTS_SUPPORTED: &[&str] = &[];
+/// ONE ENTRY, and it is the one the surface actually emits. This was empty while nothing
+/// produced a SET at all; the verification endpoint changed that, so the list changed with it. A
+/// discovery document advertising an event type nothing emits would tell a receiver to request a
+/// signal it will never be sent, and a receiver cannot distinguish that from a quiet period.
+///
+/// STILL NO CAEP OR RISC TYPE. Those vocabularies are the next issue's, and this list must grow
+/// when they land rather than in anticipation of them.
+pub const EVENTS_SUPPORTED: &[&str] = &[VERIFICATION_EVENT_TYPE];
 
 /// One subject, in the RFC 9493 format its stream negotiated.
 ///
@@ -187,7 +200,8 @@ pub fn build_set_claims(issuer: &str, iat: i64, spec: &SetToMint<'_>) -> serde_j
     // event type -- and the same section says such a type MUST NOT use the `subject` member
     // inside `events` to name its primary subject. The carve-out in section 3.1.1, which lets
     // an event type defined in CAEP or RISC ALSO carry an in-event `subject`, does not reach
-    // anything here: this build defines no event types at all (see `EVENTS_SUPPORTED`).
+    // anything here: the one type this build emits is SSF's own verification event, which is
+    // defined in neither (see `EVENTS_SUPPORTED`).
     //
     // An earlier version of this put the subject only in the event payload and cited SSF 1.0
     // for it. SSF says the reverse.

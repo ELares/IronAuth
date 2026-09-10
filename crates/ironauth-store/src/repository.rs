@@ -82348,6 +82348,57 @@ impl SsfStreamRepo<'_> {
             .and_then(|row| ssf_stream_from_row(&row, self.scope))
     }
 
+    /// Take this stream's verification slot, or report that it is too soon.
+    ///
+    /// SSF 1.0 section 7.1.4 defines 429 as the answer to a receiver asking for a verification
+    /// event too often, and this is what makes that answer possible: `true` means the slot was
+    /// taken and the caller may mint, `false` means one interval has not passed.
+    ///
+    /// ATOMIC, and it has to be. A read-then-act would let a burst of concurrent requests all
+    /// see the same stale instant and all pass, which is exactly the shape a rate limit is
+    /// attacked with. The instant is compared and written in ONE statement, so the second
+    /// request in a burst matches no row.
+    ///
+    /// FENCED ON THE RECEIVER, like every other read here: a client asking to verify another
+    /// receiver's stream matches no row and gets `false`, which the surface answers as the
+    /// uniform not-found rather than as a rate limit. The two are distinguished by the caller
+    /// having already resolved the stream through [`Self::get_for_client`].
+    ///
+    /// NOT AUDITED, unlike the status write. This records the instant of a rate-limit decision,
+    /// not a change to what the stream IS, and one audit row per verification request would be
+    /// the same traffic the interval exists to bound. The durable trail of a verification is the
+    /// SET the transmitter emits.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn claim_verification(
+        &self,
+        id: &SsfStreamId,
+        client_id: &ClientId,
+        min_interval_secs: u32,
+    ) -> Result<bool, StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Ok(false);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let updated = sqlx::query(
+            "UPDATE ssf_streams SET last_verification_at = now() \
+             WHERE tenant_id = $1 AND environment_id = $2 AND id = $3 AND client_id = $4 \
+               AND (last_verification_at IS NULL \
+                    OR last_verification_at <= now() - ($5::text || ' seconds')::interval)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(id.to_string())
+        .bind(client_id.to_string())
+        .bind(i64::from(min_interval_secs).to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     /// Every stream in the scope that would KEEP an event generated now, oldest first.
     ///
     /// This is the fan-out's read, and it is deliberately [`SsfStreamStatus::retains`] rather
