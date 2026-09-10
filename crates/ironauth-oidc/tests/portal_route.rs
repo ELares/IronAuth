@@ -2145,6 +2145,25 @@ async fn saml_connection(
     organization: &OrganizationId,
     display_name: &str,
 ) -> ironauth_store::SamlConnectionId {
+    saml_connection_from(
+        harness,
+        organization,
+        display_name,
+        "https://idp.example/entity",
+    )
+    .await
+}
+
+/// [`saml_connection`] with the identity provider's own published entity id chosen by the test.
+///
+/// The SSO page keys its setup guide on that string, because `saml_connections` has no provider
+/// column to key on, so a test of the guide has to be able to set it.
+async fn saml_connection_from(
+    harness: &Harness,
+    organization: &OrganizationId,
+    display_name: &str,
+    idp_entity_id: &str,
+) -> ironauth_store::SamlConnectionId {
     let env = Env::system();
     let scope = harness.scope();
     let id = ironauth_store::SamlConnectionId::generate(&env, &scope);
@@ -2163,7 +2182,7 @@ async fn saml_connection(
                 id: &id,
                 organization_id: organization,
                 display_name,
-                idp_entity_id: "https://idp.example/entity",
+                idp_entity_id,
                 idp_sso_url: "https://idp.example/sso",
                 sp_entity_id: "https://ironauth.example/saml/metadata",
                 acs_url: "https://ironauth.example/saml/acs",
@@ -3704,5 +3723,374 @@ async fn a_neighbours_contact_is_not_removed_and_answers_as_a_success_does() {
             .any(|email| email == "it@contoso.test"),
         "the control failed: this session cannot remove its OWN contact either, so the \
          neighbour's survival above proves nothing about the organization fence"
+    );
+}
+
+/// Open an `sso` session for `organization` and fetch its single sign-on page.
+async fn sso_page(harness: &Harness, organization: &OrganizationId, key: &str) -> String {
+    let cookie = open_session_in(harness, "sso", key, organization).await;
+    let path = format!(
+        "/t/{}/e/{}/portal/s/sso",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let (status, body) = get_with_cookie(harness, &path, Some(&cookie)).await;
+    assert_eq!(status, 200, "the single sign-on page: {body}");
+    body
+}
+
+/// The slice of the page belonging to ONE connection, from its heading to the next.
+///
+/// A whole-body substring check is a sum over the sections it claims to distinguish: with two
+/// connections rendered, asserting that the page contains "Okta" is satisfied by either one of
+/// them, so a build that gave every connection the same guide would stay green. Slicing by the
+/// heading is what binds an assertion to the connection it is about, exactly as `row_for` does
+/// for certificate rows.
+fn section_for(body: &str, heading: &str) -> String {
+    let needle = format!("<h2>{heading}</h2>");
+    let at = body
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no section headed {heading} in {body}"));
+    let rest = &body[at + needle.len()..];
+    let end = rest.find("<h2>").unwrap_or(rest.len());
+    rest[..end].to_owned()
+}
+
+/// An OIDC upstream for `organization`: a connector, and the binding that points at it.
+async fn oidc_upstream(harness: &Harness, organization: &OrganizationId, slug: &str) {
+    upstream_with_protocol(harness, organization, slug, "oidc").await;
+}
+
+/// [`oidc_upstream`] with the protocol the connector declares chosen by the test.
+///
+/// `Protocol::Oauth2` upstreams (issue #74) bind through the same table, and the page's label
+/// and guide key on this string, so a test of that has to be able to set it.
+async fn upstream_with_protocol(
+    harness: &Harness,
+    organization: &OrganizationId,
+    slug: &str,
+    protocol: &str,
+) {
+    let env = Env::system();
+    let scope = harness.scope();
+    let control = harness.db().control_store();
+    let actor = || ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env));
+    let connector_id = ironauth_store::ConnectorId::generate(&env, &scope);
+    let definition = format!(
+        r#"{{"connector_id":"{slug}","display_name":"Upstream","protocol":"{protocol}","endpoints":{{"issuer":"https://upstream.example"}},"scopes":["openid","email"],"client_id":"upstream-client"}}"#
+    );
+    control
+        .scoped(scope)
+        .acting(actor(), CorrelationId::generate(&env))
+        .connectors()
+        .create(
+            &env,
+            &connector_id,
+            1_000_000,
+            ironauth_store::NewConnector {
+                slug,
+                definition_json: &definition,
+                client_secret: b"upstream-secret",
+                capabilities: ironauth_store::ConnectorCapabilities {
+                    refresh: false,
+                    groups: false,
+                    logout_propagation: false,
+                    email_verified_trust: "untrusted",
+                },
+                enabled: true,
+            },
+            None,
+        )
+        .await
+        .expect("create the connector");
+
+    let binding = ironauth_store::OrgConnectionId::generate(&env, &scope);
+    control
+        .scoped(scope)
+        .acting(actor(), CorrelationId::generate(&env))
+        .org_connections()
+        .create(
+            &env,
+            &binding,
+            1_000_000,
+            ironauth_store::NewOrgConnection {
+                organization_id: organization,
+                upstream: ironauth_store::OrgConnectionUpstream::Connector(&connector_id),
+                overlay_min_acr: None,
+                max_age_secs: None,
+                overlay_min_class: None,
+                capture_upstream_tokens: false,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("bind the connector to the organization");
+}
+
+#[tokio::test]
+async fn the_sso_page_hands_over_the_values_a_saml_console_asks_for() {
+    // #140 CRITERION 4, the "correct copy-paste values for the specific connection being
+    // configured" half. The three values are the entire reason an IT admin opens this page:
+    // the ACS URL and the audience go into their provider's console by hand, and the metadata
+    // document is the import that saves them typing either.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+
+    let body = sso_page(&harness, &organization, "k-sso").await;
+    let section = section_for(&body, "Okta Production");
+
+    assert!(
+        section.contains("https://ironauth.example/saml/acs"),
+        "the ACS URL is missing, which is the value the page exists to hand over: {section}"
+    );
+    assert!(
+        section.contains("https://ironauth.example/saml/metadata"),
+        "the audience (SP entity id) is missing: {section}"
+    );
+    // TIED TO THIS DEPLOYMENT AND THIS CONNECTION, not merely present. A metadata URL naming
+    // another connection, or another deployment, is pasted successfully and fails later with
+    // nothing on this page to blame.
+    let scope_path = format!(
+        "/t/{}/e/{}",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    );
+    let deployment_base = harness
+        .issuer()
+        .strip_suffix(&scope_path)
+        .expect("the per-environment issuer is the deployment base plus the scope path")
+        .to_owned();
+    let expected = format!("{deployment_base}{scope_path}/saml/metadata/{connection}");
+    assert!(
+        section.contains(&expected),
+        "the metadata URL must name this deployment and this connection, expected {expected}: \
+         {section}"
+    );
+}
+
+#[tokio::test]
+async fn the_sso_guide_follows_the_provider_each_connection_names() {
+    // #140 CRITERION 4, the "per IdP" half. `saml_connections` has no provider column, so the
+    // page keys on the entity id the identity provider itself publishes. What has to be true is
+    // that the keying REACHES the right section: two connections on one page, each getting its
+    // own provider's steps.
+    //
+    // BOTH DIRECTIONS, because either alone is satisfied by a page that always renders the same
+    // guide. The Okta section proves the match fires; the unrecognized section proves it does
+    // not fire for everything, and that the fallback is a usable guide rather than a blank.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    saml_connection_from(
+        &harness,
+        &organization,
+        "Okta Production",
+        "http://www.okta.com/exk1fake",
+    )
+    .await;
+    saml_connection_from(
+        &harness,
+        &organization,
+        "In House",
+        "https://sso.contoso.test/entity",
+    )
+    .await;
+
+    let body = sso_page(&harness, &organization, "k-sso-guides").await;
+
+    let okta = section_for(&body, "Okta Production");
+    assert!(
+        okta.contains("Okta"),
+        "the Okta connection did not get Okta's guide: {okta}"
+    );
+    assert!(
+        okta.contains("Audience URI"),
+        "and it must name the field Okta's own console calls it: {okta}"
+    );
+
+    let generic = section_for(&body, "In House");
+    assert!(
+        !generic.contains("Audience URI"),
+        "an unrecognized provider was given Okta's console wording: {generic}"
+    );
+    assert!(
+        generic.contains("assertion consumer service URL"),
+        "the fallback has to be a usable guide, not a blank section: {generic}"
+    );
+}
+
+#[tokio::test]
+async fn the_sso_page_hands_over_the_redirect_uri_the_oidc_console_asks_for() {
+    // The OIDC half of criterion 4. One value matters upstream and this is it, and it has to be
+    // the URL the callback route actually serves: a second spelling is pasted successfully and
+    // fails at the first sign-in, with the portal's own page as the evidence it was right.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    oidc_upstream(&harness, &organization, "contoso-entra").await;
+
+    let body = sso_page(&harness, &organization, "k-sso-oidc").await;
+    let section = section_for(&body, "contoso-entra");
+
+    let expected = format!(
+        "{}/federation/contoso-entra/callback",
+        harness.issuer().trim_end_matches('/')
+    );
+    assert!(
+        section.contains(&expected),
+        "the redirect URI must be the one the callback route serves, expected {expected}: \
+         {section}"
+    );
+    assert!(
+        section.contains("client secret"),
+        "the guide has to say the application must be the confidential kind: {section}"
+    );
+}
+
+#[tokio::test]
+async fn an_sso_session_sees_only_its_own_organizations_connections() {
+    // #140 criterion 3, for the panel this slice adds. Every other panel that lists
+    // organization state has this test, and the page reads TWO tables, so it needs a
+    // neighbour in each: a SAML connection and an OIDC binding that both belong elsewhere.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    saml_connection(&harness, &mine, "Contoso Okta").await;
+    saml_connection(&harness, &theirs, "Initech Okta").await;
+    oidc_upstream(&harness, &mine, "contoso-upstream").await;
+    oidc_upstream(&harness, &theirs, "initech-upstream").await;
+
+    let body = sso_page(&harness, &mine, "k-sso-isolation").await;
+
+    // THE CONTROLS FIRST, one per table: "the neighbour is absent" is also true of a page that
+    // lists nothing, and this page has a legitimate empty state.
+    assert!(
+        body.contains("Contoso Okta"),
+        "our own SAML connection is missing, so the absences below prove nothing: {body}"
+    );
+    assert!(
+        body.contains("contoso-upstream"),
+        "our own OIDC upstream is missing, so the absences below prove nothing: {body}"
+    );
+    assert!(
+        !body.contains("Initech Okta"),
+        "a portal session for one organization was shown another's SAML connection: {body}"
+    );
+    assert!(
+        !body.contains("initech-upstream"),
+        "a portal session for one organization was shown another's OIDC upstream: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_organization_with_no_sign_on_connection_says_so() {
+    // NOT A REFUSAL. The link is fine and nothing is configured yet, and the two are different
+    // things to an admin holding a link they were told would work.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+
+    let body = sso_page(&harness, &organization, "k-sso-empty").await;
+
+    assert!(
+        body.contains("no sign-on connection yet"),
+        "an unconfigured organization must be told so: {body}"
+    );
+    assert!(
+        body.contains("Ask your vendor"),
+        "and told who can fix it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_oauth2_upstream_is_not_described_as_openid_connect() {
+    // `Protocol::Oauth2` (issue #74, GitHub being the example) binds through the same
+    // `org_connections` table as an OIDC connector. An earlier version of this page labelled
+    // every binding "OpenID Connect" and told its admin to grant an `openid` scope.
+    //
+    // THAT IS THE ONE FAILURE A GUIDE MUST NOT HAVE. A generic guide is a degraded answer; a
+    // guide naming a field the provider does not have sends the admin hunting, and when they
+    // give up they ask the vendor -- which is the support call this whole surface exists to
+    // remove. The SAML classifier is allowed a substring test precisely because its misses
+    // degrade instead of misdirecting, and this one has to meet the same bar.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    upstream_with_protocol(&harness, &organization, "contoso-github", "oauth2").await;
+
+    let body = sso_page(&harness, &organization, "k-sso-oauth2").await;
+    let section = section_for(&body, "contoso-github");
+
+    // ASSERTED ON THE LABEL, not on the section. The corrected guide says "there is no
+    // OpenID Connect here", which contains the phrase while meaning the opposite -- a bare
+    // substring check over the whole section fails against correct output, which is how the
+    // first version of this test read.
+    assert!(
+        !section.contains("Type: OpenID Connect"),
+        "an OAuth 2.0 upstream was labelled OpenID Connect: {section}"
+    );
+    assert!(
+        section.contains("Type: OAuth 2.0"),
+        "and it has to say what it actually is: {section}"
+    );
+    assert!(
+        !section.contains("Grant the openid"),
+        "the admin must not be told to grant a scope this protocol has no concept of: \
+         {section}"
+    );
+    // THE CONTROL: the value that IS the same for both protocols is still handed over, so
+    // this is a corrected guide rather than a blank one.
+    let expected = format!(
+        "{}/federation/contoso-github/callback",
+        harness.issuer().trim_end_matches('/')
+    );
+    assert!(
+        section.contains(&expected),
+        "the redirect URI is the same either way and must still be here: {section}"
+    );
+}
+
+#[tokio::test]
+async fn a_switched_off_saml_connection_says_so_and_offers_no_metadata_url() {
+    // `saml_metadata::metadata_get` reads through `find_active`, and the page's own listing
+    // read does not filter on `active` -- so a switched-off connection is listed here while
+    // its metadata document 404s.
+    //
+    // PRINTING IT ANYWAY IS THE WORST OF THE THREE OPTIONS. Hiding the connection tells an
+    // admin a connection they have does not exist. Printing a URL that answers nothing sends
+    // them to configure an import that fails, and the failure arrives days later reading as
+    // "your metadata is broken", with this page as the evidence it should have worked. Saying
+    // it is off is the only answer that is both true and actionable.
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let connection = saml_connection(&harness, &organization, "Okta Production").await;
+
+    let env = Env::system();
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .acting(
+            ironauth_store::ActorRef::service(ironauth_store::ServiceId::generate(&env)),
+            CorrelationId::generate(&env),
+        )
+        .saml_connections()
+        .set_active(&env, &connection, false, None)
+        .await
+        .expect("switch the connection off");
+
+    let body = sso_page(&harness, &organization, "k-sso-off").await;
+    let section = section_for(&body, "Okta Production");
+
+    assert!(
+        section.contains("switched off"),
+        "a connection nobody can sign in through must say so: {section}"
+    );
+    assert!(
+        !section.contains("/saml/metadata/"),
+        "the metadata URL 404s while the connection is off and must not be offered: {section}"
+    );
+    // THE TWO STABLE VALUES STAY, so this is a warning rather than a blanked page: an admin
+    // can still configure their side before the vendor switches it on.
+    assert!(
+        section.contains("https://ironauth.example/saml/acs"),
+        "the ACS URL is a stable property and should still be handed over: {section}"
     );
 }
