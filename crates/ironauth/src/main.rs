@@ -41,9 +41,9 @@ use ironauth_oidc::ssf_push::{FetchSsfPushSender, SsfPushConsumer};
 use ironauth_oidc::{
     BackChannelLogoutConsumer, CredentialClass, DiscoveryCapabilities, DiscoveryState,
     FederationKeyResolver, FederationRuntime, FetchLogoutSender, IssuerRegistry, IssuerState,
-    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, SsfSessionFanOutConsumer,
-    canonical_login_identifier, canonical_step_up_acr, discovery_router, is_known_step_up_acr,
-    issuer_router, known_step_up_acrs, oidc_router,
+    JwksCacheWindow, OidcState, SessionEndedExplodeConsumer, SsfLifecycleFanOutConsumer,
+    SsfSessionFanOutConsumer, canonical_login_identifier, canonical_step_up_acr, discovery_router,
+    is_known_step_up_acr, issuer_router, known_step_up_acrs, oidc_router,
 };
 use ironauth_quota::QuotaEnforcer;
 use ironauth_scim::{ScimLimits, ScimState, scim_router};
@@ -4612,6 +4612,14 @@ fn ssf_consumers<S: ironauth_oidc::ssf_push::SsfPushSender + Send + Sync + 'stat
     vec![
         Arc::new(SsfPushConsumer::new(data_store.clone(), master, sender)),
         Arc::new(SsfSessionFanOutConsumer::new(
+            data_store.clone(),
+            Arc::clone(registry),
+            owed_ceiling,
+        )),
+        // The RISC half (issue #144 criterion 3). Its producer is `enqueue_domain_event`
+        // in the store, which every lifecycle write already rides, so unlike the session
+        // fan-out it needs no explode consumer registered beside it.
+        Arc::new(SsfLifecycleFanOutConsumer::new(
             data_store.clone(),
             Arc::clone(registry),
             owed_ceiling,

@@ -53,7 +53,8 @@
 //!   and remove-subject endpoints shipped with the transmitter and this producer is the
 //!   first place their list can take effect. An empty list means no filter and admits
 //!   everything, which is why the count is asked before the membership. See
-//!   [`Self::stream_wants`](SsfSessionFanOutConsumer::stream_wants).
+
+//!   [`StreamFanOut::stream_wants`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -141,22 +142,21 @@ fn render_subject(
     }
 }
 
-/// The fan-out consumer: one ended session becomes one SET per interested stream.
-pub struct SsfSessionFanOutConsumer {
+/// Deliver ONE security event about ONE subject to every stream that should receive it.
+///
+/// Shared by every producer in this subsystem rather than reimplemented per event type.
+/// The selection rules, the per-stream subject rendering, the subject filter and the
+/// poll-versus-push routing are identical whatever happened; only the decision of WHAT
+/// happened differs, and that is the producer's own. Two copies of this would be two
+/// places for a receiver's filter to be forgotten.
+pub(crate) struct StreamFanOut {
     store: Store,
     issuers: Arc<IssuerRegistry>,
     owed_ceiling: u32,
 }
 
-impl SsfSessionFanOutConsumer {
-    /// Build the fan-out over the data store, the shared issuer registry, and the
-    /// per-stream owed-set ceiling.
-    ///
-    /// `owed_ceiling` is `ssf.max_owed_sets_per_stream`, threaded in rather than read
-    /// here, so this consumer and the verification endpoint enforce the SAME number: two
-    /// readers of one setting can disagree, two callers passing one value cannot.
-    #[must_use]
-    pub fn new(store: Store, issuers: Arc<IssuerRegistry>, owed_ceiling: u32) -> Self {
+impl StreamFanOut {
+    pub(crate) fn new(store: Store, issuers: Arc<IssuerRegistry>, owed_ceiling: u32) -> Self {
         Self {
             store,
             issuers,
@@ -164,43 +164,20 @@ impl SsfSessionFanOutConsumer {
         }
     }
 
-    async fn fan_out(
+    /// Every stream that is retaining, agreed to `event`'s type, and whose subject filter
+    /// admits `subject`, gets one SET.
+    ///
+    /// `trigger_jti` is the handle the per-stream `jti` is derived from, so a re-run
+    /// offers the same handle for the same (event, stream) pair.
+    pub(crate) async fn deliver_to_streams(
         &self,
         env: &Env,
         scope: Scope,
-        message: &OutboxMessage,
+        subject: &str,
+        event: &crate::ssf_set::SecurityEvent,
+        trigger_jti: &str,
     ) -> Result<(), ConsumerError> {
-        let text = |key: &str| {
-            message
-                .payload
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))
-        };
-        let subject = text(PAYLOAD_SUBJECT)?;
-        let trigger_jti = text(PAYLOAD_JTI)?;
-        // A cause this build cannot parse can never become parseable, so it is permanent:
-        // retrying would burn the attempts budget to reach the same dead letter.
-        let cause = SessionEndCause::from_wire(text(PAYLOAD_CAUSE)?)
-            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
-        let occurred = message
-            .payload
-            .get(PAYLOAD_OCCURRED_AT)
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
-
-        // A message written before this key existed has no actor, and an empty kind reaches
-        // `initiating_entity` as "not a service and not an agent", which yields `None`.
-        // That is the same answer a human gets, and it is the right one: an unknown
-        // principal is exactly what must not be reported as a known one.
-        let actor_kind = message
-            .payload
-            .get(PAYLOAD_ACTOR_KIND)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let event = caep::session_end_event(cause, actor_kind, occurred);
         let issuer = self.issuers.issuer_for(&scope);
-
         let streams = self
             .store
             .scoped(scope)
@@ -211,9 +188,10 @@ impl SsfSessionFanOutConsumer {
         if i64::try_from(streams.len()).unwrap_or(i64::MAX) >= MAX_STREAMS_PER_EVENT {
             tracing::error!(
                 bound = MAX_STREAMS_PER_EVENT,
-                "session revocation fan-out reached its stream bound: this environment has \
-                 at least this many retaining streams and any beyond the bound were NOT \
-                 sent this event"
+                event_type = %event.event_type,
+                "Shared Signals fan-out reached its stream bound: this environment has at \
+                 least this many retaining streams and any beyond the bound were NOT sent \
+                 this event"
             );
         }
 
@@ -221,7 +199,7 @@ impl SsfSessionFanOutConsumer {
             if !stream
                 .events_delivered
                 .iter()
-                .any(|delivered| delivered == caep::SESSION_REVOKED)
+                .any(|delivered| delivered == &event.event_type)
             {
                 continue;
             }
@@ -229,8 +207,9 @@ impl SsfSessionFanOutConsumer {
                 tracing::warn!(
                     stream = %stream.id,
                     format = stream.subject_format.as_str(),
-                    "session revocation not delivered: this producer cannot render the \
-                     stream's negotiated subject format"
+                    event_type = %event.event_type,
+                    "event not delivered: this producer cannot render the stream's \
+                     negotiated subject format"
                 );
                 continue;
             };
@@ -238,7 +217,7 @@ impl SsfSessionFanOutConsumer {
                 continue;
             }
             let jti = stream_jti(trigger_jti, &stream.id);
-            self.deliver(env, scope, stream, &jti, &rendered, &event)
+            self.deliver(env, scope, stream, &jti, &rendered, event)
                 .await?;
         }
         Ok(())
@@ -371,7 +350,10 @@ impl SsfSessionFanOutConsumer {
             Err(StoreError::QuotaExceeded) => {
                 tracing::warn!(
                     stream = %stream.id,
-                    "session revocation not queued: this receiver is holding the ceiling                      in unacknowledged events"
+
+                    event_type = %event.event_type,
+                    "event not queued: this receiver is holding the ceiling in \
+                     unacknowledged events"
                 );
                 Ok(())
             }
@@ -385,9 +367,156 @@ impl SsfSessionFanOutConsumer {
     }
 }
 
+/// The fan-out consumer: one ended session becomes one CAEP `session-revoked` per
+/// interested stream.
+///
+/// It decides WHAT happened; [`StreamFanOut`] decides who hears about it.
+pub struct SsfSessionFanOutConsumer {
+    core: StreamFanOut,
+}
+
+impl SsfSessionFanOutConsumer {
+    /// Build the fan-out over the data store, the shared issuer registry, and the
+    /// per-stream owed-set ceiling.
+    ///
+    /// `owed_ceiling` is `ssf.max_owed_sets_per_stream`, threaded in rather than read
+    /// here, so this consumer and the verification endpoint enforce the SAME number: two
+    /// readers of one setting can disagree, two callers passing one value cannot.
+    #[must_use]
+    pub fn new(store: Store, issuers: Arc<IssuerRegistry>, owed_ceiling: u32) -> Self {
+        Self {
+            core: StreamFanOut::new(store, issuers, owed_ceiling),
+        }
+    }
+
+    async fn fan_out(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &OutboxMessage,
+    ) -> Result<(), ConsumerError> {
+        let text = |key: &str| {
+            message
+                .payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))
+        };
+        let subject = text(PAYLOAD_SUBJECT)?;
+        let trigger_jti = text(PAYLOAD_JTI)?;
+        // A cause this build cannot parse can never become parseable, so it is permanent:
+        // retrying would burn the attempts budget to reach the same dead letter.
+        let cause = SessionEndCause::from_wire(text(PAYLOAD_CAUSE)?)
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+        let occurred = message
+            .payload
+            .get(PAYLOAD_OCCURRED_AT)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+
+        // A message written before this key existed has no actor, and an empty kind reaches
+        // `initiating_entity` as "not a service and not an agent", which yields `None`.
+        // That is the same answer a human gets, and it is the right one: an unknown
+        // principal is exactly what must not be reported as a known one.
+        let actor_kind = message
+            .payload
+            .get(PAYLOAD_ACTOR_KIND)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let event = caep::session_end_event(cause, actor_kind, occurred);
+        self.core
+            .deliver_to_streams(env, scope, subject, &event, trigger_jti)
+            .await
+    }
+}
+
 impl OutboxConsumer for SsfSessionFanOutConsumer {
     fn name(&self) -> &str {
         SSF_SESSION_FANOUT_CONSUMER
+    }
+
+    fn handle<'a>(
+        &'a self,
+        env: &'a Env,
+        scope: Scope,
+        message: &'a OutboxMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ConsumerError>> + Send + 'a>> {
+        Box::pin(async move { self.fan_out(env, scope, message).await })
+    }
+}
+
+/// The lifecycle fan-out consumer: one user lifecycle change becomes one RISC SET per
+/// interested stream (issue #144 criterion 3).
+///
+/// A SIBLING OF [`SsfSessionFanOutConsumer`], not a branch inside it. The two drain
+/// different queues so that a RISC event this build cannot mint does not hold up a
+/// session revocation, which is the more urgent of the two signals: a receiver that
+/// learns late that an account was disabled is behind, while one that learns late that a
+/// session was revoked is still honouring a token it should have dropped.
+///
+/// They share [`StreamFanOut`], which is everything about WHO hears an event. Only the
+/// decision of what happened differs.
+pub struct SsfLifecycleFanOutConsumer {
+    core: StreamFanOut,
+}
+
+impl SsfLifecycleFanOutConsumer {
+    /// Build the lifecycle fan-out. See
+    /// [`SsfSessionFanOutConsumer::new`] for what `owed_ceiling` is.
+    #[must_use]
+    pub fn new(store: Store, issuers: Arc<IssuerRegistry>, owed_ceiling: u32) -> Self {
+        Self {
+            core: StreamFanOut::new(store, issuers, owed_ceiling),
+        }
+    }
+
+    async fn fan_out(
+        &self,
+        env: &Env,
+        scope: Scope,
+        message: &OutboxMessage,
+    ) -> Result<(), ConsumerError> {
+        // THE PAYLOAD IS THE DOMAIN EVENT ENVELOPE, forwarded verbatim by the producer
+        // rather than re-shaped, so this reads the same members the webhook fan-out reads
+        // from the same bytes.
+        let envelope = &message.payload;
+        let event_type = envelope
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+        let payload = envelope
+            .get("payload")
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+        let occurred = envelope
+            .get("occurred_at_unix_ms")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+        // The envelope's own id, minted once by the domain producer. Every per-stream
+        // `jti` derives from it, so a re-run after a lapsed lease offers the same handle.
+        let trigger_jti = envelope
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+        let subject = crate::risc::subject_of(payload)
+            .ok_or_else(|| ConsumerError::permanent(MALFORMED_PAYLOAD_LABEL))?;
+
+        // NOTHING TO SAY IS A SUCCESS, not a failure. The producer's whitelist is coarser
+        // than the mapping: `user.state_changed` is on it because SOME of its transitions
+        // are RISC events, and the ones that are not must complete the message rather
+        // than dead-letter it. Failing here would retry a transition that will never map
+        // until the attempts budget ran out.
+        let Some(event) = crate::risc::map_domain_event(event_type, payload, occurred) else {
+            return Ok(());
+        };
+        self.core
+            .deliver_to_streams(env, scope, subject, &event, trigger_jti)
+            .await
+    }
+}
+
+impl OutboxConsumer for SsfLifecycleFanOutConsumer {
+    fn name(&self) -> &str {
+        ironauth_store::SSF_LIFECYCLE_CONSUMER
     }
 
     fn handle<'a>(

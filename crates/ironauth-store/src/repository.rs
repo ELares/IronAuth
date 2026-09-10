@@ -22264,6 +22264,67 @@ pub const SSF_PUSH_CONSUMER: &str = "ssf.push";
 /// still exist is the one case that accumulates, and it is the operator's own act.
 pub const SSF_SESSION_FANOUT_CONSUMER: &str = "ssf.session_fanout";
 
+/// The registered consumer name the USER LIFECYCLE to Shared Signals fan-out drains under
+/// (issue #144 criterion 3).
+///
+/// One message is ONE domain event, and the handler explodes it into one RISC SET per
+/// stream that should hear about it. It is a sibling of [`SSF_SESSION_FANOUT_CONSUMER`]
+/// and separate from it for the same reason that one is separate from the back-channel
+/// fan-out: a failure minting a RISC event must not hold up a session revocation, which
+/// is the more urgent of the two.
+pub const SSF_LIFECYCLE_CONSUMER: &str = "ssf.lifecycle";
+
+/// The SQL predicate for a stream that is RETAINING, in ONE place.
+///
+/// Two readers ask this question: `retaining_in_scope`, which the fan-out consumers use
+/// to find every stream that should hear an event, and `enqueue_ssf_lifecycle_trigger`,
+/// which asks only whether at least one exists. They were two hand-written copies, and a
+/// predicate that drifted would be silent in the worst direction: the producer deciding
+/// no stream is interested while the consumer would have delivered to several.
+///
+/// It also names exactly the set 0216's partial `ssf_streams_retaining_idx` indexes
+/// (`status <> 'disabled'`), which is what lets both reads use that index.
+pub(crate) const SSF_RETAINING_PREDICATE: &str = "status IN ('enabled', 'paused')";
+
+/// The domain event types that become a RISC signal (issue #144 criterion 3).
+///
+/// THE PRODUCER'S SET, and the reason it lives in the store rather than beside the
+/// mapping that consumes it: [`enqueue_domain_event`] writes the trigger, and it runs
+/// here. `ironauth_oidc::risc` re-exports this rather than keeping a second list, because
+/// a type in one list and not the other is either a trigger no consumer can use or a
+/// lifecycle signal that never leaves.
+///
+/// It is a WHITELIST rather than a `user.` prefix test. `user.signed_in` and
+/// `user.created` are user events and neither is an account lifecycle transition, and a
+/// prefix test would turn every sign-in into a RISC fan-out.
+///
+/// # Every entry is ACCOUNT grain, and that is the whole selection rule
+///
+/// This deployment announces membership changes and account changes SEPARATELY, and
+/// `reconcile_account_state` says why: "a receiver that keeps its own copy of the
+/// directory acts on the organization event; a receiver that gates on 'can this person
+/// sign in at all' acts on this one, and the two are different questions whenever a
+/// person belongs to more than one organization."
+///
+/// RISC asks the second question. `account-disabled` means the owner cannot use the
+/// account, so only an event that moves the ACCOUNT may produce it.
+/// `user.deactivated` and `user.deprovisioned` are the organization grain and are
+/// deliberately ABSENT: one organization deactivating a person who is still active in
+/// another leaves them able to sign in, and
+/// `a_deactivate_by_one_organization_announces_no_account_change` pins that the account
+/// state does not move. Mapping those would tell every receiver in the environment that
+/// an account was disabled while its owner kept using it, with no later `account-enabled`
+/// to undo it, because a reactivation announces only the organization grain too.
+///
+/// Nothing is lost by their absence. When a SCIM deactivation IS the last one,
+/// `reconcile_account_state` emits `user.state_changed`, which is on this list.
+pub const SSF_LIFECYCLE_EVENT_TYPES: &[&str] = &[
+    "user.state_changed",
+    "user.deleted",
+    "user.identifier_added",
+    "user.identifier_removed",
+];
+
 /// The registered consumer name a dead-letter REPLAY COMMAND drains under (issue #106).
 ///
 /// A separate consumer from [`WEBHOOK_DELIVERY_CONSUMER`] rather than a special message on
@@ -22832,7 +22893,92 @@ pub(crate) async fn enqueue_domain_event(
             },
         )
         .await?;
+        enqueue_ssf_lifecycle_trigger(tx, env, scope, event).await?;
     }
+    Ok(())
+}
+
+/// Write the Shared Signals trigger for a domain event that is an account lifecycle
+/// transition (issue #144 criterion 3).
+///
+/// # This is on the path of EVERY domain write, so it does as little as possible
+///
+/// The first thing it does is a lookup against [`SSF_LIFECYCLE_EVENT_TYPES`], which is
+/// false for all but six of the catalog's types. Every other domain write pays one string
+/// comparison per entry and returns, and in particular pays no query: a sign-in, a token
+/// issuance and a client update never reach the read below.
+///
+/// # Why it asks whether a stream exists
+///
+/// The consumer that drains this runs only where `ssf.enabled` is set, because that is
+/// the switch its worker pool rides. A discriminator row written where no consumer runs
+/// stays in `outbox_messages` forever: nothing reaps unclaimed work and the application
+/// role has no DELETE on that table. A stream can only exist where the receiver-facing
+/// surface was mounted, so its presence is exactly the condition under which the consumer
+/// has work to do.
+///
+/// The read is bounded to ONE row and is served by `ssf_streams_retaining_idx`, 0216's
+/// PARTIAL index on `(tenant_id, environment_id) WHERE status <> 'disabled'`. The
+/// partial predicate is what is load-bearing: this statement's
+/// `status IN ('enabled', 'paused')` is a subset of it, which is what lets the planner
+/// use the index at all. A fourth status value, or a rewritten predicate, turns this
+/// into a sequential scan on the path of every lifecycle write. It runs INSIDE the
+/// caller's transaction rather than opening its own,
+/// because a separate connection could see a different snapshot and because the trigger
+/// must commit with the event it describes or not at all.
+///
+/// WHAT STILL ACCUMULATES, stated properly. The gate makes the common case impossible,
+/// not every case. Any condition that leaves the receiver-facing surface mounted while
+/// the worker pool does not run will pile rows up, and turning `ssf.enabled` off with
+/// live streams is only the most obvious: `spawn_ssf_push_pools` also returns without
+/// pools when there is no control-plane DSN, no master key, no data-plane connection, or
+/// a fetcher that will not build, and in each of those the surface is still up and still
+/// accepting streams.
+///
+/// That is a real limit and not a new hazard class: the pre-existing
+/// [`WEBHOOK_EVENT_CONSUMER`] row has the identical property whenever
+/// `webhooks.delivery_enabled` is off, and it is written for EVERY domain event rather
+/// than the six this one filters to.
+async fn enqueue_ssf_lifecycle_trigger(
+    tx: &mut Transaction<'_, Postgres>,
+    env: &Env,
+    scope: Scope,
+    event: &DomainEvent<'_>,
+) -> Result<(), StoreError> {
+    let Some(event_type) = event.envelope.get("type").and_then(|t| t.as_str()) else {
+        return Ok(());
+    };
+    if !SSF_LIFECYCLE_EVENT_TYPES.contains(&event_type) {
+        return Ok(());
+    }
+    let any_stream: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT 1::bigint FROM ssf_streams \
+         WHERE tenant_id = $1 AND environment_id = $2 AND {SSF_RETAINING_PREDICATE} \
+         LIMIT 1"
+    ))
+    .bind(scope.tenant().to_string())
+    .bind(scope.environment().to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(StoreError::Database)?;
+    if any_stream.is_none() {
+        return Ok(());
+    }
+    enqueue_outbox_in_tx(
+        tx,
+        env,
+        scope,
+        &NewOutboxMessage {
+            consumer: SSF_LIFECYCLE_CONSUMER,
+            // THE DOMAIN EVENT'S OWN ID, which its producer minted once. It is the same
+            // handle the webhook row uses, so a redelivery of either carries the same
+            // identity, and it is what the per-stream `jti` is derived from.
+            idempotency_key: event.id,
+            ordering_key: event.subject,
+            payload: event.envelope.clone(),
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -82881,7 +83027,7 @@ impl SsfStreamRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(&format!(
             "SELECT {SSF_STREAM_COLUMNS} FROM ssf_streams \
-             WHERE tenant_id = $1 AND environment_id = $2 AND status IN ('enabled', 'paused') \
+             WHERE tenant_id = $1 AND environment_id = $2 AND {SSF_RETAINING_PREDICATE} \
              ORDER BY created_at, id LIMIT $3"
         ))
         .bind(self.scope.tenant().to_string())
