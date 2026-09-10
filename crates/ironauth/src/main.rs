@@ -4622,13 +4622,11 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec
         }
     };
 
-    // THE SAME STORE-BACKED REGISTRY the mint, the JWKS and discovery read (issue #194), so a
-    // SET is signed by the key the environment publishes and never by a divergent one.
-    let registry = Arc::new(IssuerRegistry::store_backed(
-        issuer_base,
-        JwksCacheWindow::clamped(oidc.jwks_cache_max_age_secs),
-        data_store.clone(),
-    ));
+    // NO ISSUER REGISTRY HERE ANY MORE (issue #1200). The worker used to hold one because it
+    // minted the SET on every delivery attempt; the token is minted once, at enqueue, on the
+    // request path that already has the registry it needs. A worker that cannot sign cannot
+    // re-sign, which is the property the fix is about.
+    let _ = (&issuer_base, oidc.jwks_cache_max_age_secs);
     let timeout = std::time::Duration::from_secs(oidc.backchannel_logout_request_timeout_secs);
     let sender = match FetchSsfPushSender::with_timeout(timeout) {
         Ok(sender) => sender,
@@ -4641,7 +4639,6 @@ async fn spawn_ssf_push_pools(inputs: SsfPushInputs, issuer_base: String) -> Vec
     let mut consumers = ConsumerRegistry::new();
     if let Err(error) = consumers.register(Arc::new(SsfPushConsumer::new(
         data_store.clone(),
-        registry,
         master,
         sender,
     )) as Arc<dyn OutboxConsumer>)

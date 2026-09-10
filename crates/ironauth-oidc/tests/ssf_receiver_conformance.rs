@@ -91,6 +91,9 @@ struct Receiver {
     keys: Vec<TrustedKey>,
     seen: Arc<Mutex<Vec<String>>>,
     verdicts: Arc<Mutex<Vec<Verdict>>>,
+    /// The raw token of every delivery, in order. What `verdicts` cannot answer: two
+    /// deliveries can carry one `jti` and different BYTES.
+    tokens: Arc<Mutex<Vec<String>>>,
     /// How many more delivery attempts to refuse before accepting again.
     outage: Arc<Mutex<u32>>,
 }
@@ -141,12 +144,17 @@ impl Receiver {
             keys,
             seen: Arc::new(Mutex::new(Vec::new())),
             verdicts: Arc::new(Mutex::new(Vec::new())),
+            tokens: Arc::new(Mutex::new(Vec::new())),
             outage: Arc::new(Mutex::new(0)),
         }
     }
 
     /// Take delivery of one SET, exactly as a receiver would.
     fn accept(&self, set: &str) -> Verdict {
+        self.tokens
+            .lock()
+            .expect("not poisoned")
+            .push(set.to_owned());
         let verdict = self.judge(set);
         self.verdicts
             .lock()
@@ -215,6 +223,11 @@ impl Receiver {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every token this receiver was handed, in order, byte for byte.
+    fn tokens(&self) -> Vec<String> {
+        self.tokens.lock().expect("not poisoned").clone()
     }
 
     /// Every `jti` this receiver was handed, in order, redeliveries included.
@@ -405,7 +418,6 @@ async fn drain_push(harness: &Harness, receiver: &Receiver, rounds: usize) -> us
     let scope = harness.scope();
     let consumer = SsfPushConsumer::new(
         harness.db().store().clone(),
-        harness.state().issuers().clone(),
         harness.db().master_key(),
         receiver.clone(),
     );
@@ -719,6 +731,24 @@ async fn a_receiver_outage_delays_delivery_and_loses_nothing() {
         handled.windows(2).all(|pair| pair[0] == pair[1]),
         "the attempts carried different events, so the one queued before the outage was not \
          the one delivered after it: {handled:?}"
+    );
+
+    // AND BYTE FOR BYTE THE SAME TOKEN, which the `jti` comparison above cannot see (issue
+    // #1200). The consumer used to mint on every attempt, so a retry re-sent a DIFFERENT token
+    // under the same `jti`: a fresh `iat`, and a fresh signature for any algorithm that is not
+    // deterministic. A receiver that caches by `jti` and compares what it was sent -- which is
+    // the dedup strategy 0217 assumes for poll -- would see two tokens claiming to be one
+    // event and have no way to explain the difference.
+    let tokens = receiver.tokens();
+    assert_eq!(tokens.len(), 4, "the receiver did not see four deliveries");
+    assert!(
+        tokens.windows(2).all(|pair| pair[0] == pair[1]),
+        "the retries re-signed the event instead of re-sending it: the four deliveries carry \
+         {} distinct tokens",
+        tokens
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     );
     assert_eq!(
         receiver.accepted().len(),

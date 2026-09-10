@@ -1442,6 +1442,7 @@ async fn deliver_verification(
         }
         SsfDelivery::Push { .. } => crate::ssf_push::enqueue_push(
             state.store(),
+            state.issuers(),
             state.env(),
             scope,
             &crate::ssf_push::QueuedPush {
@@ -1449,10 +1450,16 @@ async fn deliver_verification(
                 jti,
                 subject,
                 event,
+                audience: &stream.audience,
             },
         )
         .await
-        .map_err(|error| queue_refusal(&error)),
+        .map_err(|error| match error {
+            // A QUEUE THAT IS FULL IS THE RECEIVER'S DOING; anything else here is ours,
+            // including an environment that cannot sign.
+            crate::ssf_push::PushEnqueueError::Store(error) => queue_refusal(&error),
+            crate::ssf_push::PushEnqueueError::Mint(_) => server_error(),
+        }),
     }
 }
 
