@@ -1153,11 +1153,19 @@ pub struct ContactChangeForm {
 /// address is told while they are still looking at the form rather than having the change
 /// accepted and die later in a dead letter. The store re-checks; this is not the authority.
 ///
-/// # One refusal for every rejection
+/// # The two a holder could probe with are the two that match
 ///
-/// A contact id from another organization, one that does not exist, and a malformed field all
-/// render the same page. The holder is frequently an outside administrator, and telling them
-/// apart "no such contact" from "that contact is not yours" turns the list into a probe.
+/// This said "a contact id from another organization, one that does not exist, and a malformed
+/// field all render the same page", and that was wrong in a way worth correcting rather than
+/// softening. The remove branch parses in scope and nothing more: the ORGANIZATION is checked by
+/// the consumer, so a foreign handle and an absent one are both enqueued and both answered with
+/// the same `303` a real removal gets. A malformed field is the odd one out, at `400`.
+///
+/// The anti-enumeration property still holds, and it is the grouping that was backwards: the two
+/// indistinguishable answers are the SUCCESS-shaped ones, which is exactly the pair that matters.
+/// The holder is frequently an outside administrator, and telling "no such contact" apart from
+/// "that contact is not yours" is what would turn the form into a probe for handles in other
+/// organizations. A malformed field being distinguishable reveals nothing about who exists.
 pub async fn contacts_change_post(
     State(state): State<OidcState>,
     Path((tenant_id, environment_id)): Path<(String, String)>,

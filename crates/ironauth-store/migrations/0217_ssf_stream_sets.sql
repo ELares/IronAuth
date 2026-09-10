@@ -31,11 +31,20 @@
 -- stream owed in the same transaction as the status change. `paused` deliberately keeps them;
 -- that retention is the entire difference between the two states.
 --
--- SO A ROW'S LIFETIME IS ITS RECEIVER'S. A SET names a subject, and for `subject_format` of
--- `email` it names one in the clear inside the signed token, which cannot be sealed at rest
--- without changing the bytes the receiver must be handed on every redelivery. An abandoned
--- ENABLED stream therefore holds up to the count bound indefinitely; disabling or deleting it
--- is what discards them, and either is one management call.
+-- SO A ROW'S LIFETIME IS ITS RECEIVER'S, and that is why the token is SEALED. A SET names a
+-- subject, and for `subject_format` of `email` it names one in the clear inside the signed
+-- token; an abandoned ENABLED stream holds up to the count bound indefinitely, because
+-- disabling or deleting the stream is what discards its rows and neither is something an
+-- absent receiver does. A plaintext column would put a real address in every dump and every
+-- replica for as long as that lasts.
+--
+-- SEALING COSTS NOTHING THE RECEIVER CAN SEE. An earlier version of this header claimed the
+-- token "cannot be sealed at rest without changing the bytes the receiver must be handed on
+-- every redelivery", and that is simply false: the ciphertext is what is stored, the plaintext
+-- is what is read, and the bytes handed over are identical either way. `set_jws` is a PURE
+-- PAYLOAD in 0028's sense -- never a lookup key, since every read, every ORDER BY and every
+-- DELETE here keys on (tenant, environment, stream, jti) -- so it takes the same simple seal
+-- 0028 gives `claims_sealed`.
 
 CREATE TABLE ssf_stream_sets (
     tenant_id      text        NOT NULL,
@@ -47,8 +56,16 @@ CREATE TABLE ssf_stream_sets (
     -- The SET's `jti`, which is also what the receiver acknowledges by. Minted once by the
     -- producer, so a redelivery and an acknowledgement name the same thing.
     jti            text        NOT NULL,
-    -- The compact JWS, exactly as it will be handed to the receiver.
-    set_jws        text        NOT NULL,
+    -- The compact JWS the receiver will be handed, sealed under the environment's active DEK.
+    --
+    -- The seal is AAD-bound to (tenant, environment, stream, jti) and the DEK version, which is
+    -- this row's whole primary key: a ciphertext lifted out of one row cannot be opened in
+    -- another, so a row rewritten under a neighbour's identity fails to open rather than
+    -- delivering the wrong subject's event to the wrong receiver.
+    set_jws_sealed bytea       NOT NULL,
+    -- Which DEK sealed it. A rotation writes new rows under the new version while what is
+    -- already owed stays openable, so a rotation mid-backlog cannot strand a receiver's queue.
+    pii_dek_version integer    NOT NULL,
     -- When it was queued. The poll returns oldest first, so a receiver draining a backlog gets
     -- its events in the order they happened.
     queued_at      timestamptz NOT NULL DEFAULT now(),
@@ -60,11 +77,15 @@ CREATE TABLE ssf_stream_sets (
 
     CONSTRAINT ssf_stream_sets_jti_shaped
         CHECK (btrim(jti) <> '' AND octet_length(jti) <= 252),
-    -- A compact JWS three segments long, and bounded: a SET carrying an event payload larger
-    -- than this is a producer defect, and storing it would let one event fill a receiver's
-    -- queue.
-    CONSTRAINT ssf_stream_sets_jws_bounded
-        CHECK (octet_length(set_jws) BETWEEN 1 AND 16384),
+    -- A BOUND ON THE STORED BLOB, and that is all it is. It does not and cannot say the value
+    -- is a three-segment compact JWS: a CHECK cannot see through a seal. The token's own
+    -- length bound lives in `SsfStreamSetRepo::queue`, which refuses a SET over 16384 bytes
+    -- before sealing it, for the reason `StoreError::Invalid` documents -- the schema cannot
+    -- express a rule about plaintext it never sees. The ceiling here is that bound plus room
+    -- for the AEAD nonce, tag and framing, so it catches a corrupt or absurd blob reaching the
+    -- column by some path that skipped the repository, and nothing finer.
+    CONSTRAINT ssf_stream_sets_sealed_bounded
+        CHECK (octet_length(set_jws_sealed) BETWEEN 1 AND 17408),
 
     FOREIGN KEY (tenant_id) REFERENCES tenants (id),
     FOREIGN KEY (environment_id, tenant_id) REFERENCES environments (id, tenant_id),
@@ -99,7 +120,8 @@ CREATE POLICY ssf_stream_sets_scope ON ssf_stream_sets
 --
 -- NO UPDATE, and that is the point: a stored SET is immutable. The token a receiver collects on
 -- its second poll is byte-identical to the one it collected on its first, which is what makes a
--- redelivery indistinguishable from the original.
+-- redelivery indistinguishable from the original. Sealing does not weaken that: the seal is
+-- deterministic in what it protects, so opening the same row twice yields the same token.
 GRANT SELECT, INSERT, DELETE ON ssf_stream_sets TO ironauth_app;
 -- The CONTROL plane reads them: an operator asking why a receiver is behind wants the depth.
 GRANT SELECT ON ssf_stream_sets TO ironauth_control;

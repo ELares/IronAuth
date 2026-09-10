@@ -547,10 +547,19 @@ struct PollRequest {
     /// which is how a receiver acknowledges without collecting.
     #[serde(rename = "maxEvents")]
     max_events: Option<u32>,
-    /// When false, the transmitter may hold the request open waiting for an event. This
-    /// transmitter always returns immediately and SAYS SO in the response, rather than
-    /// long-polling: a held request occupies a connection for a benefit a receiver polling on
-    /// its own schedule already has.
+    /// When false -- which RFC 8936 section 2.2 makes the DEFAULT -- the receiver is asking the
+    /// transmitter to hold the request open until an event arrives.
+    ///
+    /// THIS TRANSMITTER NEVER HOLDS, and the value is read and discarded. A held request
+    /// occupies a connection for a benefit a receiver polling on its own schedule already has.
+    ///
+    /// AND THE RESPONSE DOES NOT SAY SO. An earlier version of this comment claimed it did; it
+    /// does not. Section 2.3 gives the response exactly two members, `sets` and `moreAvailable`,
+    /// and `moreAvailable` reports the backlog rather than the hold policy, so a receiver that
+    /// asked to be held and got an empty page cannot tell that from a long poll that timed out
+    /// empty. There is no field in the protocol to tell it otherwise, so the policy is published
+    /// where a receiver can actually read it before it depends on it: `long_poll_supported` is
+    /// `false` in the SSF configuration document.
     #[serde(rename = "returnImmediately")]
     return_immediately: Option<bool>,
     /// The `jti`s the receiver has processed. Acknowledged BEFORE the new page is chosen, so
@@ -672,6 +681,9 @@ pub async fn poll(
     // `moreAvailable` COUNTS WHAT IS STILL OWED AFTER THIS PAGE, which is what tells a receiver
     // to poll again immediately rather than wait out its interval.
     let more = remaining > i64::try_from(owed.len()).unwrap_or(i64::MAX);
+    // READ AND DISCARDED. See `PollRequest::return_immediately`: this transmitter never holds a
+    // request open, and RFC 8936 section 2.3 gives the response no member that could say so, so
+    // the policy is advertised in the configuration document instead of being implied here.
     let _ = request.return_immediately;
     json(
         StatusCode::OK,
@@ -726,6 +738,13 @@ pub async fn configuration(
             "configuration_endpoint": format!("{base}/streams"),
             "status_endpoint": format!("{base}/status"),
             "delivery_methods_supported": DELIVERY_METHODS_SUPPORTED,
+            // WHAT A POLL RECEIVER CANNOT LEARN FROM A RESPONSE. RFC 8936 defaults
+            // `returnImmediately` to false, meaning "hold the request open", and this
+            // transmitter never does. The response carries only `sets` and `moreAvailable`, so
+            // a receiver that asked to be held and got an empty page cannot distinguish that
+            // from a long poll that timed out. Publishing it here is the only place it can
+            // learn the policy BEFORE it builds a client around waiting.
+            "long_poll_supported": false,
             // EMPTY UNTIL SOMETHING EMITS. See `ssf_set::EVENTS_SUPPORTED`: advertising a type
             // nothing produces tells a receiver to request a signal it will never be sent.
             "events_supported": EVENTS_SUPPORTED,

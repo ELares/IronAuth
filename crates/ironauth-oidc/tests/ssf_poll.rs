@@ -24,7 +24,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::Harness;
 use ironauth_oidc::ClientAuthMethod;
 use ironauth_store::{
-    ClientId, CorrelationId, NewSsfStream, SsfDelivery, SsfStreamId, SsfStreamStatus,
+    ClientId, CorrelationId, NewSsfStream, SsfDelivery, SsfStreamId, SsfStreamStatus, StoreError,
     SsfSubjectFormat,
 };
 
@@ -52,10 +52,44 @@ async fn send(
     (status, text)
 }
 
+/// Provision the scope's envelope keys, which a queued SET is sealed under.
+///
+/// The management plane does this when it creates an environment (0028), so production always
+/// has them; this harness stands a scope up directly and so has to do it itself. Without it
+/// `queue` fails closed with `StoreError::Encryption` rather than storing a token in the clear,
+/// which is the right failure and a confusing one to debug in a test.
+///
+/// IDEMPOTENT, because a test that seeds two streams calls this twice. `provision_kek` answers
+/// `Conflict` when the scope already has one, which `ensure_scope_keys` in the repository treats
+/// as success for the same reason.
+async fn provision_envelope(harness: &Harness, env: &ironauth_env::Env) {
+    let acting = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .acting(harness.db().test_actor(env), CorrelationId::generate(env));
+    for (label, outcome) in [
+        (
+            "kek",
+            acting.envelope().provision_kek(env, &harness.db().master_key()).await.map(|_| ()),
+        ),
+        (
+            "dek",
+            acting.envelope().provision_dek(env, &harness.db().master_key()).await.map(|_| ()),
+        ),
+    ] {
+        match outcome {
+            Ok(()) | Err(StoreError::Conflict) => {}
+            Err(error) => panic!("provision the scope {label}: {error:?}"),
+        }
+    }
+}
+
 /// A poll stream owned by `client`, with `count` SETs already owed to it.
 async fn poll_stream(harness: &Harness, client: &ClientId, count: usize) -> SsfStreamId {
     let env = harness.state().env().clone();
     let scope = harness.scope();
+    provision_envelope(harness, &env).await;
     let id = SsfStreamId::generate(&env, &scope);
     let audience = vec!["https://receiver.example.com".to_owned()];
     let none: Vec<String> = Vec::new();
@@ -89,6 +123,7 @@ async fn poll_stream(harness: &Harness, client: &ClientId, count: usize) -> SsfS
             .scoped(scope)
             .ssf_stream_sets()
             .queue(
+                &env,
                 &id,
                 &format!("evt_{n}"),
                 &format!("header.payload{n}.sig"),
@@ -499,4 +534,143 @@ async fn re_enabling_redelivers_what_paused_held_and_nothing_of_what_disabled_di
             "a re-enabled stream redelivered the wrong number of SETs after {label}"
         );
     }
+}
+
+/// Both receiver-chosen bounds actually bind.
+///
+/// The RFC 9700 row credits `maxEvents` and the `ack` array as bounded "since each is
+/// receiver-chosen work on a request path", and neither had a test: across the suite `maxEvents`
+/// was only ever 2, 3 or 10 against a ceiling of 100, and `ack` never carried more than three
+/// entries, so deleting either guard left everything green. A bound no test approaches is a
+/// bound nobody has measured.
+///
+/// ONE STREAM, BOTH BOUNDS, because the expensive part is seeding past the page size and the two
+/// assertions are independent of each other.
+#[tokio::test]
+async fn a_receiver_cannot_ask_for_a_bigger_page_or_acknowledge_a_longer_list_than_the_ceiling() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    // ONE MORE THAN THE PAGE, so a clamp that is off by one is still caught: at exactly the
+    // ceiling an unclamped handler and a clamped one return the same page.
+    let stream = poll_stream(&harness, &client, 101).await;
+
+    let (status, body) = send(
+        &harness,
+        &poll_uri(&harness, &stream),
+        Some(&auth),
+        Some(r#"{"maxEvents":100000,"returnImmediately":true}"#.to_owned()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page: serde_json::Value = serde_json::from_str(&body).expect("a poll document");
+    assert_eq!(
+        page["sets"].as_object().expect("sets is an object").len(),
+        100,
+        "a receiver asking for a hundred thousand events was not clamped to the page ceiling"
+    );
+    assert_eq!(
+        page["moreAvailable"],
+        serde_json::json!(true),
+        "the clamped page did not say more was owed, so the receiver would stop collecting"
+    );
+
+    // THE ACK LIST IS BOUNDED TOO, and refused rather than truncated: silently ignoring the
+    // tail would tell a receiver its events were acknowledged when they were still owed.
+    let too_many: Vec<String> = (0..101).map(|n| format!("evt_{n}")).collect();
+    let (status, body) = send(
+        &harness,
+        &poll_uri(&harness, &stream),
+        Some(&auth),
+        Some(serde_json::json!({ "maxEvents": 1, "ack": too_many }).to_string()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an ack naming more events than one page can contain was accepted: {body}"
+    );
+    // AND IT ACKNOWLEDGED NOTHING. A refusal that had already deleted the first hundred would
+    // read as a refusal while having done most of the work.
+    let still_owed = harness
+        .db()
+        .store()
+        .scoped(harness.scope())
+        .ssf_stream_sets()
+        .owed_count(&stream)
+        .await
+        .expect("count what is owed");
+    assert_eq!(
+        still_owed, 101,
+        "the refused acknowledgement deleted rows anyway"
+    );
+}
+
+/// The transmitter never holds a request open, and it PUBLISHES that.
+///
+/// RFC 8936 section 2.2 defaults `returnImmediately` to false, which asks the transmitter to
+/// wait. This one never does, and section 2.3 gives the response no member that could say so:
+/// `moreAvailable` reports the backlog, so a receiver that asked to be held and got an empty
+/// page cannot tell that from a long poll that timed out empty.
+///
+/// So the two things this pins are that the empty poll ANSWERS rather than hanging, and that the
+/// configuration document says `long_poll_supported: false`. The pair is the point: the document
+/// going stale while the handler kept its policy is the failure a test of either half alone
+/// would miss.
+#[tokio::test]
+async fn a_receiver_asking_to_be_held_is_answered_immediately_and_told_so_in_advance() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let stream = poll_stream(&harness, &client, 0).await;
+
+    let (status, body) = send(
+        &harness,
+        &poll_uri(&harness, &stream),
+        Some(&auth),
+        Some(r#"{"returnImmediately":false}"#.to_owned()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page: serde_json::Value = serde_json::from_str(&body).expect("a poll document");
+    assert!(
+        page["sets"].as_object().expect("sets is an object").is_empty(),
+        "an empty queue returned events: {body}"
+    );
+    assert_eq!(page["moreAvailable"], serde_json::json!(false));
+
+    let scope = harness.scope();
+    let (status, body) = send_get(
+        &harness,
+        &format!(
+            "/.well-known/ssf-configuration/t/{}/e/{}",
+            scope.tenant(),
+            scope.environment()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("a configuration document");
+    assert_eq!(
+        doc["long_poll_supported"],
+        serde_json::json!(false),
+        "the handler never holds a request open and the document does not say so: {body}"
+    );
+}
+
+/// A plain GET, for the discovery document the poll policy is published in.
+async fn send_get(harness: &Harness, uri: &str) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request builds");
+    let (status, _headers, text) = harness.send(request).await;
+    (status, text)
 }

@@ -550,6 +550,12 @@ async fn discovery_advertises_only_what_is_mounted() {
     // AND NO EVENT TYPE, because nothing emits one yet.
     assert_eq!(doc["events_supported"], serde_json::json!([]));
 
+    // THE HOLD POLICY IS PUBLISHED, because the poll response cannot carry it. RFC 8936 makes
+    // `returnImmediately: false` the default -- "hold the request open" -- and this transmitter
+    // never does; section 2.3 gives the response only `sets` and `moreAvailable`, so this
+    // document is the one place a receiver can learn the policy before depending on it.
+    assert_eq!(doc["long_poll_supported"], serde_json::json!(false));
+
     // THE ADVERTISED JWKS IS FETCHED, not eyeballed. This field named
     // `{issuer}/.well-known/jwks.json`, which nothing mounts -- and every other assertion in
     // this test passed while it did. A receiver bootstraps from this document to get the keys

@@ -3404,3 +3404,203 @@ async fn an_organization_with_no_events_says_so_rather_than_showing_an_empty_tab
     );
     assert!(!body.contains("<table>"), "and render no table: {body}");
 }
+
+/// Drain the contact-change queue, as the control plane's worker does.
+///
+/// The portal cannot write a contact -- 0207 grants `org_contacts` INSERT and the soft-delete
+/// UPDATE to `ironauth_control` alone -- so it enqueues and this applies. A test stopping at the
+/// 303 would be measuring that a row reached a queue, which is not what the customer asked for.
+async fn apply_contact_changes(harness: &Harness) -> usize {
+    use ironauth_store::outbox::OutboxConsumer as _;
+
+    let scope = harness.scope();
+    let env = Env::system();
+    let consumer = ironauth_admin::contact_changes::ContactChangeConsumer::new(
+        harness.db().control_store().clone(),
+    );
+    let mut applied = 0;
+    loop {
+        let claimed = harness
+            .db()
+            .store()
+            .scoped(scope)
+            .outbox()
+            .claim(
+                &env,
+                ironauth_store::CONTACT_CHANGE_CONSUMER,
+                std::time::Duration::from_secs(30),
+                100,
+            )
+            .await
+            .expect("claim");
+        if claimed.is_empty() {
+            return applied;
+        }
+        for message in &claimed {
+            consumer
+                .handle(&env, scope, message)
+                .await
+                .expect("the contact change applies");
+            harness
+                .db()
+                .store()
+                .scoped(scope)
+                .outbox()
+                .complete(&env, message)
+                .await
+                .expect("complete");
+            applied += 1;
+        }
+    }
+}
+
+/// The live contacts of `organization`, read as the vendor.
+async fn contacts_of(harness: &Harness, organization: &OrganizationId) -> Vec<String> {
+    harness
+        .db()
+        .control_store()
+        .scoped(harness.scope())
+        .org_contacts()
+        .list_for_organization(organization, 50, None)
+        .await
+        .expect("list the contacts")
+        .into_iter()
+        .map(|contact| contact.email)
+        .collect()
+}
+
+fn change_path(harness: &Harness) -> String {
+    format!(
+        "/t/{}/e/{}/portal/s/contacts/change",
+        harness.scope().tenant(),
+        harness.scope().environment()
+    )
+}
+
+/// The customer's own administrator adds and removes a contact, end to end.
+///
+/// #141 criterion 3's write half. It is asserted THROUGH THE CONSUMER rather than at the 303,
+/// because the portal only enqueues: a test that stopped at the redirect would pass while the
+/// change never reached `org_contacts`.
+#[tokio::test]
+async fn a_contacts_session_adds_and_removes_a_contact_through_the_form() {
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let cookie = open_session_in(&harness, "contacts", "k-add", &organization).await;
+
+    let form = format!(
+        "action=add&display_name={}&email={}&category=technical",
+        urlencode("Dana Ops"),
+        urlencode("dana@contoso.test")
+    );
+    let (status, _, body) = harness
+        .post_form(&change_path(&harness), &form, Some(&cookie))
+        .await;
+    assert_eq!(status, 303, "{body}");
+    assert_eq!(apply_contact_changes(&harness).await, 1);
+    assert!(
+        contacts_of(&harness, &organization)
+            .await
+            .iter()
+            .any(|email| email == "dana@contoso.test"),
+        "the added contact never reached org_contacts"
+    );
+
+    let added = add_contact(&harness, &organization, "soc@contoso.test", "security").await;
+    let form = format!("action=remove&contact={}", urlencode(&added.to_string()));
+    let (status, _, body) = harness
+        .post_form(&change_path(&harness), &form, Some(&cookie))
+        .await;
+    assert_eq!(status, 303, "{body}");
+    assert_eq!(apply_contact_changes(&harness).await, 1);
+    assert!(
+        !contacts_of(&harness, &organization)
+            .await
+            .iter()
+            .any(|email| email == "soc@contoso.test"),
+        "the removed contact is still live"
+    );
+}
+
+/// A session opened for another surface cannot change contacts.
+///
+/// Mounting a write behind the same session as a read does not make it the same permission, and
+/// this is the fence that says so: `require_intent("contacts")`.
+#[tokio::test]
+async fn a_session_for_another_intent_cannot_change_contacts() {
+    let harness = Harness::start().await;
+    let organization = seed_org(&harness, "Contoso").await;
+    let cookie = open_session_in(&harness, "scim", "k-scim-contacts", &organization).await;
+
+    let form = format!(
+        "action=add&display_name={}&email={}&category=technical",
+        urlencode("Mallory"),
+        urlencode("mallory@evil.test")
+    );
+    let (status, _, body) = harness
+        .post_form(&change_path(&harness), &form, Some(&cookie))
+        .await;
+    assert_ne!(status, 303, "a scim session changed contacts: {body}");
+    assert_eq!(
+        apply_contact_changes(&harness).await,
+        0,
+        "the refusal queued a change anyway, which is a refusal in name only"
+    );
+    assert!(
+        contacts_of(&harness, &organization).await.is_empty(),
+        "a contact was added by a session that has no business adding one"
+    );
+}
+
+/// A contact in another organization is not removed, and the answer does not say which case it
+/// was.
+///
+/// THE GROUPING IS NOT WHAT IT LOOKS LIKE, and it is worth stating exactly because the obvious
+/// phrasing is wrong. A foreign-organization handle and an absent one both PARSE, are both
+/// enqueued, and both get the same `303` a real removal gets -- the consumer is what checks the
+/// organization, and it finds nothing to do. So the two indistinguishable answers are the
+/// SUCCESS-shaped ones; a malformed field is the odd one out, and it is a `400`. That is still
+/// the anti-enumeration property the surface needs, because the two a link holder could use to
+/// probe are the two that match.
+#[tokio::test]
+async fn a_neighbours_contact_is_not_removed_and_answers_as_a_success_does() {
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    let neighbour = add_contact(&harness, &theirs, "ops@initech.test", "technical").await;
+    let cookie = open_session_in(&harness, "contacts", "k-probe", &mine).await;
+
+    let form = format!("action=remove&contact={}", urlencode(&neighbour.to_string()));
+    let (foreign_status, _, body) = harness
+        .post_form(&change_path(&harness), &form, Some(&cookie))
+        .await;
+    assert_eq!(foreign_status, 303, "{body}");
+    apply_contact_changes(&harness).await;
+    assert!(
+        contacts_of(&harness, &theirs)
+            .await
+            .iter()
+            .any(|email| email == "ops@initech.test"),
+        "a link holder for one organization removed a neighbour's contact"
+    );
+
+    // AN ABSENT HANDLE ANSWERS IDENTICALLY. This is the pair that matters: if the two differed,
+    // the form would tell a holder which handles exist in other organizations.
+    let absent = ironauth_store::OrgContactId::generate(&Env::system(), &harness.scope());
+    let form = format!("action=remove&contact={}", urlencode(&absent.to_string()));
+    let (absent_status, _, body) = harness
+        .post_form(&change_path(&harness), &form, Some(&cookie))
+        .await;
+    assert_eq!(
+        absent_status, foreign_status,
+        "an absent contact answered differently from a neighbour's, which makes the form a \
+         probe for handles in other organizations: {body}"
+    );
+
+    // AND A MALFORMED FIELD IS THE ONE THAT DIFFERS, which is fine: it reveals nothing about
+    // who exists, only that the request was not well formed.
+    let (status, _, body) = harness
+        .post_form(&change_path(&harness), "action=remove&contact=not-a-handle", Some(&cookie))
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
