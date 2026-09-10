@@ -440,6 +440,31 @@ jobs:
       # is evidence, and the cost is one already-cached test binary.
       - name: webhook delivery (ironbus mode)
         run: cargo test -p ironauth-admin --features testing --test webhook_delivery
+      # Shared Signals delivery under the SAME broker (issue #143, criterion 7).
+      #
+      # > The full suite passes with IronBus absent (Postgres-only) and with IronBus attached.
+      #
+      # SSF PUSH RIDES THE OUTBOX. `spawn_ssf_push_pools` goes through `spawn_consumer_pools`,
+      # which resolves the backbone once and spawns every pool with it, so in a running process
+      # the bus wakes the SSF drain exactly as it wakes the webhook drain.
+      #
+      # WHAT THIS STEP PROVES, AND WHAT IT DOES NOT. These suites drive `claim` and `handle`
+      # directly; none of them spawns a pool, so the broker does not wake anything here. What
+      # this shows is that an attached backbone does not CHANGE the SSF consumer, which is the
+      # half of criterion 7 about the suite passing in both modes. The wake path itself is
+      # `outbox_ironbus`'s subject, in the step above, and this step is not a second copy of it.
+      # Saying so matters because the obvious reading of a green broker-mode SSF job is that a
+      # bus-woken delivery was tested, and it was not.
+      #
+      # THE RECEIVER FIXTURE IS THE ONE WORTH RUNNING TWICE of the three. `ssf_push` substitutes
+      # a recording sender and asserts what the consumer handed it; the fixture bootstraps from
+      # discovery, fetches the advertised JWKS, verifies every SET against the published key,
+      # and drives an outage through the retry path. `ssf_poll` shares the queue and the seal
+      # with the push path, and the cost is one already-cached binary.
+      - name: shared signals delivery (ironbus mode)
+        run: >-
+          cargo test -p ironauth-oidc --features testing
+          --test ssf_receiver_conformance --test ssf_push --test ssf_poll
 
   msrv:
     name: msrv (1.85)

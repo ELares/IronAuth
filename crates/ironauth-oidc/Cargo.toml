@@ -641,6 +641,11 @@ name = "ssf_subjects"
 path = "tests/ssf_subjects.rs"
 required-features = ["testing"]
 
+[[test]]
+name = "ssf_receiver_conformance"
+path = "tests/ssf_receiver_conformance.rs"
+required-features = ["testing"]
+
 # Signup fraud review queue (issue #82, PR 2): a quarantined user re-consents on every
 # authorization and never receives a sensitive scope, and a risky signup is quarantined
 # (recoverable) instead of blocked when the flag is on. Needs a real database.
