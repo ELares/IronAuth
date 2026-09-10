@@ -2571,6 +2571,31 @@ async fn a_renewal_session_cannot_pin_onto_another_organizations_connection() {
         !body.contains(&neighbour.to_string()),
         "the refusal must not echo the identifier it refused: {body}"
     );
+
+    // THE CONTROL, in the SAME session against a connection that is ours. Every assertion
+    // above is equally satisfied by a surface that refuses every pin -- the happy path lives
+    // in its own test, so without this one a page broken outright would still report a working
+    // organization fence here.
+    let ours = saml_connection(&harness, &mine, "Okta Ours").await;
+    pin(&harness, &ours, 7, 2 * 24 * 60 * 60).await;
+    let form = format!(
+        "connection={}&certificate={}",
+        urlencode(&ours.to_string()),
+        urlencode(&pem_certificate(9))
+    );
+    let (status, _, body) = harness.post_form(&path, &form, Some(&cookie)).await;
+    assert_eq!(status, 303, "the control was refused: {body}");
+    assert_eq!(
+        apply_pin_requests(&harness).await,
+        1,
+        "the control queued nothing, so the zero asserted above is not evidence of a refusal"
+    );
+    assert_eq!(
+        pinned_count(&harness, &ours).await,
+        2,
+        "the control failed: this session cannot pin onto its OWN connection either, so the \
+         refusal above proves nothing about the organization fence"
+    );
 }
 
 #[tokio::test]
@@ -3393,6 +3418,49 @@ async fn a_filter_narrows_the_audit_page_and_says_when_nothing_matches() {
 }
 
 #[tokio::test]
+async fn a_target_filter_naming_another_organizations_object_matches_nothing() {
+    // CRITERION 3 OF #140 ON THE READ SIDE, at the one combination the other audit tests leave
+    // open. `the_audit_page_shows_this_organizations_events_and_no_others` drives the
+    // UNFILTERED page, and `a_filter_narrows_the_audit_page_and_says_when_nothing_matches`
+    // drives a filter whose two subjects both belong to the caller. Neither asks what happens
+    // when a filter names an object of ANOTHER organization -- which is the request a holder
+    // probing this surface actually sends, because the filter is the only caller-supplied
+    // value that reaches the query.
+    //
+    // The organization comes off the session and the filter is meant to narrow WITHIN it. A
+    // filter that instead widened -- a second statement that forgot the organization, an OR
+    // where an AND belongs -- would hand a neighbour's configuration history to anyone holding
+    // a link, and every other test on this surface would still pass.
+    let harness = Harness::start().await;
+    let mine = seed_org(&harness, "Contoso").await;
+    let theirs = seed_org(&harness, "Initech").await;
+    let ours = attributed_client(&harness, &mine, "ours").await;
+    let neighbour = attributed_client(&harness, &theirs, "neighbour").await;
+
+    let probed = audit_page(&harness, &mine, "k-probe", &format!("?target={neighbour}")).await;
+    assert!(
+        !probed.contains(&neighbour),
+        "a portal session filtered on another organization's object and was shown it: {probed}"
+    );
+    assert!(
+        probed.contains("No events match those filters"),
+        "the page has to answer the narrowed question rather than fall back to the unfiltered \
+         list: {probed}"
+    );
+
+    // THE CONTROL, a second session for the SAME organization against our own object.
+    // Without it the assertion above
+    // is equally satisfied by a target filter that matches nothing at all, and this test would
+    // pass against a surface whose filtering is broken outright.
+    let own = audit_page(&harness, &mine, "k-own", &format!("?target={ours}")).await;
+    assert!(
+        own.contains(&ours),
+        "the control failed: the target filter matches nothing even for our own object, so \
+         the neighbour's absence above proves nothing: {own}"
+    );
+}
+
+#[tokio::test]
 async fn an_organization_with_no_events_says_so_rather_than_showing_an_empty_table() {
     let harness = Harness::start().await;
     let mine = seed_org(&harness, "Contoso").await;
@@ -3564,6 +3632,13 @@ async fn a_session_for_another_intent_cannot_change_contacts() {
 /// probe are the two that match.
 #[tokio::test]
 async fn a_neighbours_contact_is_not_removed_and_answers_as_a_success_does() {
+    // THE ORGANIZATION FILTER SITS AT TWO SITES, which is worth knowing before reading a
+    // mutation result off this test. `remove_with_event` probes for the live row and then
+    // updates it, and both statements carry `organization_id`. Take it off the probe alone and
+    // the update still matches nothing, which the store reports as the ordinary already-gone
+    // answer, so this test passes. Only removing both lets a neighbour's row through, and then
+    // this test fails. A single-site mutant surviving here is the second filter doing its job,
+    // not a hole in this test.
     let harness = Harness::start().await;
     let mine = seed_org(&harness, "Contoso").await;
     let theirs = seed_org(&harness, "Initech").await;
@@ -3610,4 +3685,24 @@ async fn a_neighbours_contact_is_not_removed_and_answers_as_a_success_does() {
         )
         .await;
     assert_eq!(status, 400, "{body}");
+
+    // THE CONTROL, in the SAME session against a contact that is ours. The three answers above
+    // are all "nothing happened", and a consumer that removed nothing for anybody would give
+    // all three. The happy path lives in its own test, so only this line ties the neighbour's
+    // survival to the organization fence rather than to a surface that does not work.
+    let own = add_contact(&harness, &mine, "it@contoso.test", "technical").await;
+    let form = format!("action=remove&contact={}", urlencode(&own.to_string()));
+    let (status, _, body) = harness
+        .post_form(&change_path(&harness), &form, Some(&cookie))
+        .await;
+    assert_eq!(status, 303, "the control was refused: {body}");
+    apply_contact_changes(&harness).await;
+    assert!(
+        !contacts_of(&harness, &mine)
+            .await
+            .iter()
+            .any(|email| email == "it@contoso.test"),
+        "the control failed: this session cannot remove its OWN contact either, so the \
+         neighbour's survival above proves nothing about the organization fence"
+    );
 }

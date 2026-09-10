@@ -226,6 +226,12 @@ name = "notice_enqueues"
 path = "tests/notice_enqueues.rs"
 required-features = ["testing"]
 
+# Issue #140 criterion 3's denominator: every portal panel that reads organization state has a
+# cross-organization test. A text scan with no database, so no `required-features`.
+[[test]]
+name = "portal_confinement_surface"
+path = "tests/portal_confinement_surface.rs"
+
 # Metering stays OFF the issuance path (issue #107 acceptance criterion 5): a token
 # exchange under a tracing capture executes no query that READS the event feed.
 # ALONE in its binary by necessity, not by preference: it installs a global tracing
