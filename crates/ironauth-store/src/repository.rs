@@ -22274,6 +22274,18 @@ pub const SSF_SESSION_FANOUT_CONSUMER: &str = "ssf.session_fanout";
 /// is the more urgent of the two.
 pub const SSF_LIFECYCLE_CONSUMER: &str = "ssf.lifecycle";
 
+/// The SQL predicate for a stream that is RETAINING, in ONE place.
+///
+/// Two readers ask this question: `retaining_in_scope`, which the fan-out consumers use
+/// to find every stream that should hear an event, and `enqueue_ssf_lifecycle_trigger`,
+/// which asks only whether at least one exists. They were two hand-written copies, and a
+/// predicate that drifted would be silent in the worst direction: the producer deciding
+/// no stream is interested while the consumer would have delivered to several.
+///
+/// It also names exactly the set 0216's partial `ssf_streams_retaining_idx` indexes
+/// (`status <> 'disabled'`), which is what lets both reads use that index.
+pub(crate) const SSF_RETAINING_PREDICATE: &str = "status IN ('enabled', 'paused')";
+
 /// The domain event types that become a RISC signal (issue #144 criterion 3).
 ///
 /// THE PRODUCER'S SET, and the reason it lives in the store rather than beside the
@@ -22915,10 +22927,18 @@ pub(crate) async fn enqueue_domain_event(
 /// because a separate connection could see a different snapshot and because the trigger
 /// must commit with the event it describes or not at all.
 ///
-/// A deployment that turns `ssf.enabled` OFF while streams still exist is the one case
-/// that accumulates, and it is the operator's own act. It is also exactly what the
-/// pre-existing [`WEBHOOK_EVENT_CONSUMER`] row does when `webhooks.delivery_enabled` is
-/// off, which is why this is not a new hazard class.
+/// WHAT STILL ACCUMULATES, stated properly. The gate makes the common case impossible,
+/// not every case. Any condition that leaves the receiver-facing surface mounted while
+/// the worker pool does not run will pile rows up, and turning `ssf.enabled` off with
+/// live streams is only the most obvious: `spawn_ssf_push_pools` also returns without
+/// pools when there is no control-plane DSN, no master key, no data-plane connection, or
+/// a fetcher that will not build, and in each of those the surface is still up and still
+/// accepting streams.
+///
+/// That is a real limit and not a new hazard class: the pre-existing
+/// [`WEBHOOK_EVENT_CONSUMER`] row has the identical property whenever
+/// `webhooks.delivery_enabled` is off, and it is written for EVERY domain event rather
+/// than the six this one filters to.
 async fn enqueue_ssf_lifecycle_trigger(
     tx: &mut Transaction<'_, Postgres>,
     env: &Env,
@@ -22931,9 +22951,11 @@ async fn enqueue_ssf_lifecycle_trigger(
     if !SSF_LIFECYCLE_EVENT_TYPES.contains(&event_type) {
         return Ok(());
     }
-    let any_stream: Option<i64> = sqlx::query_scalar(
-        "SELECT 1::bigint FROM ssf_streams          WHERE tenant_id = $1 AND environment_id = $2 AND status IN ('enabled', 'paused')          LIMIT 1",
-    )
+    let any_stream: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT 1::bigint FROM ssf_streams \
+         WHERE tenant_id = $1 AND environment_id = $2 AND {SSF_RETAINING_PREDICATE} \
+         LIMIT 1"
+    ))
     .bind(scope.tenant().to_string())
     .bind(scope.environment().to_string())
     .fetch_optional(&mut **tx)
@@ -83005,7 +83027,7 @@ impl SsfStreamRepo<'_> {
         let mut tx = begin_scoped(self.store, self.scope).await?;
         let rows = sqlx::query(&format!(
             "SELECT {SSF_STREAM_COLUMNS} FROM ssf_streams \
-             WHERE tenant_id = $1 AND environment_id = $2 AND status IN ('enabled', 'paused') \
+             WHERE tenant_id = $1 AND environment_id = $2 AND {SSF_RETAINING_PREDICATE} \
              ORDER BY created_at, id LIMIT $3"
         ))
         .bind(self.scope.tenant().to_string())
