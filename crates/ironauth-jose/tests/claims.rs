@@ -78,9 +78,10 @@ fn expired_within_skew_is_accepted() {
 
 #[test]
 fn allow_absent_exp_admits_a_set_that_omits_it_and_relaxes_nothing_else() {
-    // RFC 8417 section 4.1: a Security Event Token reports something that ALREADY HAPPENED and
-    // carries no expiry, so a receiver that was down through the window is not made to discard
-    // exactly the events it needs. `allow_absent_exp` admits that shape and only that shape.
+    // SSF 1.0 section 4.1.7 makes a SET's absent `exp` a MUST NOT; RFC 8417 section 2.2 gives
+    // the reason -- a SET is historical in nature, so an expiry would make a receiver that was
+    // down through the window discard exactly the events it needs. `allow_absent_exp` admits
+    // that shape and only that shape.
     let signer = common::Ed25519Signer::new();
     let key = TrustedKey::ed25519(None, signer.public_key()).expect("valid key");
     let base = || {
@@ -170,6 +171,66 @@ fn allow_absent_exp_admits_a_set_that_omits_it_and_relaxes_nothing_else() {
         )
         .map(|_| ())
         .map_err(|e| e.reason()),
+        Err(RejectReason::IssuerMismatch),
+        "allow_absent_exp relaxes exp presence and nothing else"
+    );
+}
+
+/// `allow_absent_exp` relaxes the PRESENCE of `exp` and nothing that runs after it.
+///
+/// Its own test rather than more lines on the one above, which sits against the crate's
+/// hundred-line clippy ceiling. What it adds is the direction that was untested: `iss` and
+/// `aud` are checked BEFORE the expiry, so a policy that had skipped the whole claim stage
+/// would still have failed them. `nbf` runs after, so this is the assertion that separates
+/// "relaxes exp presence" from "skips what follows it".
+#[test]
+fn allow_absent_exp_leaves_every_neighbouring_check_enforced() {
+    let signer = common::Ed25519Signer::new();
+    let key = TrustedKey::ed25519(None, signer.public_key()).expect("valid key");
+    let relaxed = || {
+        VerificationPolicy::new(
+            vec![JwsAlgorithm::EdDsa],
+            vec![key.clone()],
+            common::ISS,
+            common::AUD,
+            common::TYP_NOT_UNDER_TEST,
+        )
+        .expect("valid policy")
+        .with_skew(Duration::from_secs(60))
+        .allow_absent_exp(true)
+    };
+
+    let not_yet = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"{}","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::ISS,
+            common::AUD,
+            NOW_I + 100_000,
+            NOW_I - 60
+        ),
+    );
+    assert_eq!(
+        verify(&not_yet, &relaxed(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
+        Err(RejectReason::NotYetValid),
+        "nbf runs after exp and must still be enforced"
+    );
+
+    let wrong_iss = token(
+        &signer,
+        &format!(
+            r#"{{"iss":"https://evil.example","aud":"{}","nbf":{},"iat":{}}}"#,
+            common::AUD,
+            NOW_I - 60,
+            NOW_I - 60
+        ),
+    );
+    assert_eq!(
+        verify(&wrong_iss, &relaxed(), &common::now_clock())
+            .map(|_| ())
+            .map_err(|e| e.reason()),
         Err(RejectReason::IssuerMismatch),
         "allow_absent_exp relaxes exp presence and nothing else"
     );

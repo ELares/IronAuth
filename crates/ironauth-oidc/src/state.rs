@@ -1060,8 +1060,12 @@ impl OidcState {
             revocation_sink: default_sink(),
             introspection_serializer: default_serializer(),
             global_token_revocation_enabled: false,
-            ssf_enabled: false,
-            ssf_max_streams_per_client: 20,
+            // FROM THE CONFIG TYPE, not repeated literals. These were `false` and `20` written
+            // again here, so a test asserting "off by default" pinned this copy and would have
+            // kept passing if `SsfConfig::default()` had changed underneath it.
+            ssf_enabled: ironauth_config::SsfConfig::default().enabled,
+            ssf_max_streams_per_client: ironauth_config::SsfConfig::default()
+                .max_streams_per_client,
             fedcm_enabled: false,
             agent_vault_enabled: false,
             cimd_enabled: false,

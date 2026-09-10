@@ -5966,7 +5966,6 @@ fn validate_scim_push(scim_push: &ScimPushConfig) -> Result<(), ConfigError> {
 /// which is a warning that carries no information and teaches an operator to ignore the column.
 pub const SCIM_MAX_TOKEN_EXPIRY_WARNING_SECS: u64 = 366 * 24 * 60 * 60;
 
-/// Refuse a scim section whose page bounds cannot be satisfied.
 /// The Shared Signals transmitter's bounds (issue #143).
 ///
 /// A ceiling of zero would refuse EVERY create while discovery still advertised the surface,
@@ -5985,6 +5984,7 @@ fn validate_ssf(ssf: &SsfConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Refuse a scim section whose page bounds cannot be satisfied.
 fn validate_scim(scim: &ScimConfig) -> Result<(), ConfigError> {
     if scim.max_scan > MANAGEMENT_LIST_HARD_CAP {
         return Err(ConfigError::Invalid {
@@ -8311,6 +8311,53 @@ impl std::error::Error for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Shared Signals surface is OFF by default, and its ceiling is usable when it is on.
+    ///
+    /// Asserted on `SsfConfig::default()` itself, which is the value `OidcState::new` now reads.
+    /// A test that pinned the state's own literals would have kept passing if this default had
+    /// changed underneath it, which is the shape it was written in first.
+    #[test]
+    fn the_shared_signals_surface_is_off_by_default() {
+        let ssf = SsfConfig::default();
+        assert!(!ssf.enabled, "a default boot must serve no SSF surface");
+        assert_eq!(ssf.max_streams_per_client, 20);
+    }
+
+    /// A ceiling of zero is refused while the surface is ON, and tolerated while it is off.
+    ///
+    /// The split is the point: zero streams with discovery still advertising the surface is a
+    /// deployment that looks enabled and works for nobody, while zero on a disabled surface is
+    /// an unread number.
+    #[test]
+    fn a_zero_stream_ceiling_is_refused_only_when_the_surface_is_on() {
+        let on = SsfConfig {
+            enabled: true,
+            max_streams_per_client: 0,
+        };
+        assert!(
+            validate_ssf(&on).is_err(),
+            "an enabled surface that can hold no streams was accepted"
+        );
+
+        let off = SsfConfig {
+            enabled: false,
+            max_streams_per_client: 0,
+        };
+        assert!(
+            validate_ssf(&off).is_ok(),
+            "a disabled surface's unread ceiling was refused"
+        );
+
+        assert!(
+            validate_ssf(&SsfConfig {
+                enabled: true,
+                max_streams_per_client: 1,
+            })
+            .is_ok(),
+            "one stream is a usable ceiling"
+        );
+    }
 
     /// A zero flow-target delivery budget is refused whether or not the worker is enabled.
     ///

@@ -244,10 +244,10 @@ pub async fn mint_set(
     .map_err(|_| MintError::Signing)?;
     let claims = build_set_claims(&issuer, iat, spec);
     let payload = serde_json::to_vec(&claims).map_err(|_| MintError::Signing)?;
-    // THE `typ` COMES FROM THE PROFILE LIST, not a literal here. RFC 8417 section 2.3 makes
-    // stamping `secevent+jwt` a SHOULD, and `ironauth_jose::TokenTyp` is the one declaration
-    // binding a profile to its media type, so the spelling a verifier requires and the spelling
-    // stamped here cannot drift.
+    // THE `typ` COMES FROM THE PROFILE LIST, not a literal here. SSF 1.0 section 4.1.1 requires
+    // a SET to be explicitly typed with the media type RFC 8417 section 2.3 registers, and
+    // `ironauth_jose::TokenTyp` is the one declaration binding a profile to its media type, so
+    // the spelling a verifier requires and the spelling stamped here cannot drift.
     sign_jws_with_policy(
         policy,
         signer,

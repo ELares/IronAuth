@@ -1715,24 +1715,39 @@ impl Harness {
         self.state = state;
     }
 
-    /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1) for
-    /// the harness scope and rebuild the protocol router. Builds a fresh state over the SAME
-    /// master-key-wired store, env, and registry, with the risk engine ENABLED and the given
-    /// per-source `signal_sources` in the risk config, plus `with_risk_signals_enabled(true)`
-    /// (the arming bool the boot path resolves from the feature ladder), so the ingestion
-    /// endpoint answers and the engine folds fresh external signals in.
     /// Arm the Shared Signals stream-management surface (issue #143) on the EXISTING state
     /// and rebuild the router.
     ///
     /// Mutates in place rather than rebuilding from a fresh `OidcConfig`, for the reason the
     /// organization-provisioning helper below records: a rebuild silently discards whatever the
     /// test already installed.
+    ///
+    /// AND IT KEEPS THE ISSUER AND DISCOVERY ROUTERS. The first version rebuilt
+    /// `oidc_router(..)` alone, which dropped the JWKS route -- so a test could not have proven
+    /// that the `jwks_uri` the SSF configuration document advertises resolves to anything, which
+    /// is exactly the field that was wrong.
     pub fn enable_ssf(&mut self, max_streams_per_client: u32) {
         let state = self.state.clone().with_ssf(true, max_streams_per_client);
-        self.router = oidc_router(state.clone());
+        let issuer_state = IssuerState::new(Arc::clone(&self.registry), self.env.clone());
+        let discovery_state = DiscoveryState::new(
+            ISSUER_BASE,
+            JwksCacheWindow::clamped(OidcConfig::default().jwks_cache_max_age_secs),
+            DiscoveryCapabilities::from_config(&OidcConfig::default()),
+            Arc::clone(&self.registry),
+            self.env.clone(),
+        );
+        self.router = oidc_router(state.clone())
+            .merge(issuer_router(issuer_state))
+            .merge(discovery_router(discovery_state));
         self.state = state;
     }
 
+    /// Arm the experimental third-party risk-signal ingestion surface (issue #82, PR 1) for
+    /// the harness scope and rebuild the protocol router. Builds a fresh state over the SAME
+    /// master-key-wired store, env, and registry, with the risk engine ENABLED and the given
+    /// per-source `signal_sources` in the risk config, plus `with_risk_signals_enabled(true)`
+    /// (the arming bool the boot path resolves from the feature ladder), so the ingestion
+    /// endpoint answers and the engine folds fresh external signals in.
     pub fn enable_risk_signals(&mut self, sources: Vec<ironauth_config::RiskSignalSource>) {
         let config = OidcConfig {
             require_pkce_for_confidential_clients: false,

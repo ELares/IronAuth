@@ -51,6 +51,9 @@ fn push_body() -> String {
         "delivery": {
             "method": "urn:ietf:rfc:8935",
             "endpoint_url": "https://receiver.example.com/events",
+            // SET ON THE REQUEST so the response can be scanned for it. Without this the
+            // "not echoed" assertion below passed against a string that was never sent.
+            "authorization_secret_name": "receiver-bearer",
         },
         "events_requested": ["https://schemas.openid.net/secevent/caep/event-type/session-revoked"],
         "aud": ["https://receiver.example.com"],
@@ -108,8 +111,8 @@ async fn a_receiver_creates_reads_and_deletes_its_own_stream() {
     );
     // THE PUSH CREDENTIAL'S NAME IS NOT ECHOED BACK.
     assert!(
-        !body.contains("authorization_secret_name"),
-        "the response repeats the credential name: {body}"
+        !body.contains("authorization_secret_name") && !body.contains("receiver-bearer"),
+        "the response repeats the credential the receiver supplied: {body}"
     );
 
     let one = format!("{path}?stream_id={stream_id}");
@@ -289,9 +292,9 @@ async fn the_delivery_object_is_validated_before_anything_is_written() {
             }),
         ),
         (
-            "poll carrying an endpoint",
+            "poll, which this deployment does not serve yet",
             serde_json::json!({
-                "delivery": { "method": "urn:ietf:rfc:8936", "endpoint_url": "https://receiver.example.com/e" },
+                "delivery": { "method": "urn:ietf:rfc:8936" },
                 "aud": ["https://receiver.example.com"],
             }),
         ),
@@ -305,7 +308,7 @@ async fn the_delivery_object_is_validated_before_anything_is_written() {
         (
             "a format this transmitter does not render",
             serde_json::json!({
-                "delivery": { "method": "urn:ietf:rfc:8936" },
+                "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
                 "aud": ["https://receiver.example.com"],
                 "format": "phone_number",
             }),
@@ -313,8 +316,23 @@ async fn the_delivery_object_is_validated_before_anything_is_written() {
         (
             "no audience",
             serde_json::json!({
-                "delivery": { "method": "urn:ietf:rfc:8936" },
+                "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
                 "aud": [],
+            }),
+        ),
+        (
+            "more audiences than a stream may name",
+            serde_json::json!({
+                "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
+                "aud": (0..9).map(|n| format!("https://r{n}.example.com")).collect::<Vec<_>>(),
+            }),
+        ),
+        (
+            "a description longer than the column stores",
+            serde_json::json!({
+                "delivery": { "method": "urn:ietf:rfc:8935", "endpoint_url": "https://r.example.com/e" },
+                "aud": ["https://receiver.example.com"],
+                "description": "d".repeat(253),
             }),
         ),
     ];
@@ -434,9 +452,12 @@ async fn discovery_advertises_only_what_is_mounted() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
 
+    // ONLY WHAT IS SERVED. Poll is modelled by 0216 and refused by the create until RFC 8936
+    // is mounted, so advertising it would tell a receiver to configure delivery that never
+    // happens.
     assert_eq!(
         doc["delivery_methods_supported"],
-        serde_json::json!(["urn:ietf:rfc:8935", "urn:ietf:rfc:8936"])
+        serde_json::json!(["urn:ietf:rfc:8935"])
     );
     assert!(
         doc["configuration_endpoint"]
@@ -464,6 +485,28 @@ async fn discovery_advertises_only_what_is_mounted() {
     }
     // AND NO EVENT TYPE, because nothing emits one yet.
     assert_eq!(doc["events_supported"], serde_json::json!([]));
+
+    // THE ADVERTISED JWKS IS FETCHED, not eyeballed. This field named
+    // `{issuer}/.well-known/jwks.json`, which nothing mounts -- and every other assertion in
+    // this test passed while it did. A receiver bootstraps from this document to get the keys
+    // that verify a SET, so an unreachable `jwks_uri` makes the transmitter unusable.
+    let jwks_uri = doc["jwks_uri"].as_str().expect("jwks_uri");
+    let path = jwks_uri
+        .strip_prefix("https://issuer.test")
+        .or_else(|| jwks_uri.strip_prefix("http://issuer.test"))
+        .unwrap_or(jwks_uri);
+    let (status, keys) = send(&harness, "GET", path, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the advertised jwks_uri 404s: {jwks_uri}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&keys).expect("jwks json")["keys"]
+            .as_array()
+            .is_some_and(|keys| !keys.is_empty()),
+        "the advertised jwks_uri served no keys: {keys}"
+    );
 }
 
 #[tokio::test]

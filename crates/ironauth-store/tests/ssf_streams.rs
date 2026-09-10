@@ -26,6 +26,10 @@ use ironauth_store::{
     SsfSubjectFormat, StoreError,
 };
 
+/// A ceiling every test here is comfortably under, so the limit is not what any of them
+/// measures -- except the one that measures it.
+const CEILING: u32 = 50;
+
 async fn seed_client(db: &TestDatabase, env: &Env, scope: Scope, name: &str) -> ClientId {
     db.store()
         .scoped(scope)
@@ -88,6 +92,8 @@ async fn a_stream_round_trips_every_field_it_was_configured_with() {
         .create(
             &env,
             push_spec(&id, &client, &delivery, &requested, &delivered, &audience),
+            CEILING,
+            None,
         )
         .await
         .expect("create the stream");
@@ -134,6 +140,8 @@ async fn a_second_receiver_reaches_none_of_the_four_operations() {
         .create(
             &env,
             push_spec(&id, &owner, &delivery, &requested, &requested, &audience),
+            CEILING,
+            None,
         )
         .await
         .expect("create the stream");
@@ -211,6 +219,8 @@ async fn the_transmitter_cannot_agree_to_send_more_than_was_asked_for() {
         .create(
             &env,
             push_spec(&id, &client, &delivery, &requested, &delivered, &audience),
+            CEILING,
+            None,
         )
         .await;
     // AND IT NAMES THE CONSTRAINT THAT REFUSED IT. `is_err()` alone passes for a `NotFound`
@@ -251,6 +261,8 @@ async fn a_paused_stream_still_retains_and_a_disabled_one_does_not() {
             .create(
                 &env,
                 push_spec(&id, &client, &delivery, &requested, &requested, &audience),
+                CEILING,
+                None,
             )
             .await
             .expect("create");
@@ -302,6 +314,88 @@ async fn a_paused_stream_still_retains_and_a_disabled_one_does_not() {
     assert_eq!(paused.status, SsfStreamStatus::Paused);
     assert_eq!(paused.status_reason.as_deref(), Some("maintenance"));
     assert!(paused.status.retains() && !paused.status.delivers());
+}
+
+#[tokio::test]
+async fn the_ceiling_is_a_conjunct_of_the_insert() {
+    // THE COUNT IS EVALUATED INSIDE THE STATEMENT, not read first by the caller. A read-then-
+    // write across two transactions lets N concurrent creates all see the same under-limit
+    // count and all commit, so a receiver could exceed the bound by the number of requests it
+    // sent at once. This drives the sequential case; what it pins is that the store refuses on
+    // its own rather than trusting a count somebody else took.
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let client = seed_client(&db, &env, scope, "receiver").await;
+    let requested = events();
+    let audience = vec!["https://receiver.example.com".to_owned()];
+    let delivery = SsfDelivery::Poll;
+
+    for _ in 0..2 {
+        let id = SsfStreamId::generate(&env, &scope);
+        db.store()
+            .scoped(scope)
+            .acting(db.test_actor(&env), CorrelationId::generate(&env))
+            .ssf_streams()
+            .create(
+                &env,
+                push_spec(&id, &client, &delivery, &requested, &requested, &audience),
+                2,
+                None,
+            )
+            .await
+            .expect("under the ceiling");
+    }
+
+    let third = SsfStreamId::generate(&env, &scope);
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ssf_streams()
+        .create(
+            &env,
+            push_spec(
+                &third, &client, &delivery, &requested, &requested, &audience,
+            ),
+            2,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::QuotaExceeded)),
+        "the third create was not refused: {outcome:?}"
+    );
+
+    // AND NOTHING WAS WRITTEN. A refusal that still inserted would leave the receiver holding a
+    // stream it was told it did not get.
+    let held = db
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .list_for_client(&client, 50, None)
+        .await
+        .expect("list");
+    assert_eq!(held.len(), 2, "the refused create left a row behind");
+
+    // A SECOND RECEIVER IS UNAFFECTED: the ceiling counts one receiver's streams, not the
+    // environment's.
+    let other = seed_client(&db, &env, scope, "other receiver").await;
+    let theirs = SsfStreamId::generate(&env, &scope);
+    db.store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ssf_streams()
+        .create(
+            &env,
+            push_spec(
+                &theirs, &other, &delivery, &requested, &requested, &audience,
+            ),
+            2,
+            None,
+        )
+        .await
+        .expect("another receiver has its own ceiling");
 }
 
 #[tokio::test]

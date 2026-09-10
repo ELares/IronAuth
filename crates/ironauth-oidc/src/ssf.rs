@@ -19,6 +19,20 @@
 //! which decides where this environment's security events are sent -- must never be creatable
 //! by presenting one.
 //!
+//! # Two deliberate deviations, named here rather than discovered
+//!
+//! SSF 1.0 section 8.1.1 marks `aud` a Transmitter-Supplied member. This surface takes it from
+//! the receiver's create request instead, because a transmitter has no registered audience
+//! identifier for a receiver in this deployment's model -- the receiver is an OAuth client and
+//! its audience is whatever its own infrastructure answers to. It is validated and bounded like
+//! any other receiver input, and the day clients carry a registered audience this should read
+//! it from there.
+//!
+//! And only `client_secret_basic` reaches these endpoints, because that is what the shared
+//! client-authentication door reads from the Authorization header. Discovery advertises exactly
+//! that rather than an unqualified RFC 6749, so a `private_key_jwt` receiver is not told to try
+//! a body parameter nothing reads.
+//!
 //! # Every answer is the receiver's own
 //!
 //! The store's reads take the receiver as a parameter and its writes take it as a conjunct
@@ -41,6 +55,16 @@ use crate::error::TokenError;
 use crate::ssf_set::EVENTS_SUPPORTED;
 use crate::state::OidcState;
 use crate::util::client_service_actor;
+
+/// The delivery methods this deployment can actually perform.
+///
+/// ONE list, read by both [`validate`] and [`configuration`]. It held both SSF methods while
+/// neither delivery path was mounted, so discovery advertised poll, a poll stream could be
+/// created, and the configuration handed the receiver a `{issuer}/ssf/poll` URL that nothing
+/// serves -- three sites free to disagree, and all three wrong. Poll returns when RFC 8936 is
+/// mounted, and it returns by being added HERE, which makes the advertisement and the
+/// acceptance move together.
+pub const DELIVERY_METHODS_SUPPORTED: &[&str] = &[SSF_DELIVERY_PUSH];
 
 /// The stream-management (configuration) endpoint, per environment.
 pub const STREAMS_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/streams";
@@ -116,20 +140,28 @@ fn validate(
                 secret_name: request.delivery.authorization_secret_name.clone(),
             }
         }
+        // POLL IS MODELLED AND NOT YET SERVED. The stream row can express it (0216) and the
+        // delivery slice will mount RFC 8936; until then accepting one would create a stream
+        // whose events nobody can ever collect, which a receiver cannot distinguish from a
+        // quiet period.
         SSF_DELIVERY_POLL => {
-            if request.delivery.endpoint_url.is_some() {
-                return Err(Box::new(invalid_request(
-                    "a poll stream names no endpoint: the receiver fetches from this transmitter",
-                )));
-            }
-            SsfDelivery::Poll
+            return Err(Box::new(invalid_request(
+                "urn:ietf:rfc:8936 (poll) is not served by this deployment yet; \
+                 delivery_methods_supported in the SSF configuration document is the list \
+                 this transmitter accepts",
+            )));
         }
         _ => {
             return Err(Box::new(invalid_request(
-                "delivery.method must be urn:ietf:rfc:8935 (push) or urn:ietf:rfc:8936 (poll)",
+                "delivery.method must be one of the methods \
+                 delivery_methods_supported advertises",
             )));
         }
     };
+    debug_assert!(
+        DELIVERY_METHODS_SUPPORTED.contains(&delivery.method_urn()),
+        "a delivery method was accepted that discovery does not advertise"
+    );
 
     let format = match request.format.as_deref() {
         None => SsfSubjectFormat::IssSub,
@@ -141,12 +173,86 @@ fn validate(
         })?,
     };
 
+    // EVERY BOUND 0216 DECLARES IS MIRRORED HERE, and that is what lets the handler treat a
+    // `StoreError::Database` as a FAULT rather than as bad input. It used to answer 400 for any
+    // database error, which turned a dropped connection into "your request was invalid".
+    bounded(&request.aud, MAX_AUDIENCES, "aud")?;
+    bounded(
+        &request.events_requested,
+        MAX_EVENTS_REQUESTED,
+        "events_requested",
+    )?;
     if request.aud.is_empty() {
         return Err(Box::new(invalid_request(
             "aud must name at least one audience",
         )));
     }
+    if let Some(description) = request.description.as_deref() {
+        if description.trim().is_empty() || description.len() > MAX_TEXT_BYTES {
+            return Err(Box::new(invalid_request(
+                "description must be non-empty and at most 252 bytes",
+            )));
+        }
+    }
+    if let SsfDelivery::Push {
+        endpoint_url,
+        secret_name,
+    } = &delivery
+    {
+        if endpoint_url.len() > MAX_ENDPOINT_BYTES {
+            return Err(Box::new(invalid_request(
+                "delivery.endpoint_url is longer than this transmitter stores",
+            )));
+        }
+        if let Some(name) = secret_name {
+            if name.trim().is_empty() || name.len() > MAX_TEXT_BYTES {
+                return Err(Box::new(invalid_request(
+                    "delivery.authorization_secret_name must be non-empty and at most 252 bytes",
+                )));
+            }
+        }
+    }
     Ok((delivery, format))
+}
+
+/// The most streams one listing returns.
+///
+/// Deliberately NOT `max_streams_per_client`: that bounds what a receiver may CREATE, and
+/// reusing it for the read meant an operator lowering the config made existing streams
+/// invisible -- and a stream a receiver cannot see is one it cannot delete. Well above any
+/// plausible ceiling, so the listing is complete in practice; a cursor lands with the first
+/// deployment that needs one.
+const MAX_STREAMS_LISTED: u32 = 1000;
+
+/// The most audiences one stream's SETs may name.
+///
+/// `aud` is copied verbatim into EVERY SET this stream carries, so an unbounded list is a
+/// receiver-chosen multiplier on the size of every signal the environment produces.
+const MAX_AUDIENCES: usize = 8;
+
+/// The most event types one stream may ask for. Bounded for the same reason.
+const MAX_EVENTS_REQUESTED: usize = 64;
+
+/// The longest operator-facing string 0216 stores (`description`, `push_secret_name`).
+const MAX_TEXT_BYTES: usize = 252;
+
+/// The longest receiver endpoint 0216 stores.
+const MAX_ENDPOINT_BYTES: usize = 2048;
+
+/// Refuse a list that is too long, or one whose entries are.
+fn bounded(values: &[String], max: usize, what: &str) -> Result<(), Box<Response>> {
+    if values.len() > max {
+        return Err(Box::new(invalid_request(&format!(
+            "{what} names more than {max} entries"
+        ))));
+    }
+    if let Some(entry) = values.iter().find(|entry| entry.len() > MAX_TEXT_BYTES) {
+        return Err(Box::new(invalid_request(&format!(
+            "an entry in {what} is longer than {MAX_TEXT_BYTES} bytes: {} bytes",
+            entry.len()
+        ))));
+    }
+    Ok(())
 }
 
 /// `POST {issuer}/ssf/streams`.
@@ -183,36 +289,6 @@ pub async fn create_stream(
         .cloned()
         .collect();
 
-    // THE CEILING IS CHECKED BEFORE THE WRITE, and reaching it REFUSES rather than evicting:
-    // a receiver silently losing the stream it has been polling is a delivery gap it cannot
-    // detect.
-    let existing = state
-        .store()
-        .scoped(scope)
-        .ssf_streams()
-        .list_for_client(
-            &client_id,
-            i64::from(state.ssf_max_streams_per_client()) + 1,
-            None,
-        )
-        .await;
-    let Ok(existing) = existing else {
-        return server_error();
-    };
-    if existing.len() >= state.ssf_max_streams_per_client() as usize {
-        return (
-            StatusCode::CONFLICT,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({
-                "error": "conflict",
-                "error_description": "this receiver already holds the most streams this \
-                                      environment allows",
-            })
-            .to_string(),
-        )
-            .into_response();
-    }
-
     let id = SsfStreamId::generate(state.env(), &scope);
     let actor = client_service_actor(ironauth_store::StoredClientId::Registered(&client_id));
     let outcome = state
@@ -232,17 +308,23 @@ pub async fn create_stream(
                 audience: &request.aud,
                 description: request.description.as_deref(),
             },
+            state.ssf_max_streams_per_client(),
+            None,
         )
         .await;
     match outcome {
         Ok(()) => {}
         Err(StoreError::Conflict) => return invalid_request("that stream already exists"),
-        // A CHECK the validators above did not anticipate lands here rather than as a 500 with
-        // no explanation: every bound 0216 declares is one a receiver can hit with a legal-
-        // looking body (an over-long description, an audience entry that is not a string).
-        Err(StoreError::Database(_)) => {
-            return invalid_request("the stream configuration was refused by a stored constraint");
-        }
+        // THE CEILING, enforced as a conjunct of the INSERT rather than by a count this handler
+        // took first: N concurrent creates cannot all see the same under-limit count and all
+        // commit. Reaching it REFUSES rather than evicting -- a receiver silently losing the
+        // stream it has been polling is a delivery gap it cannot detect.
+        Err(StoreError::QuotaExceeded) => return quota_exceeded(),
+        // A DATABASE ERROR IS A FAULT, not a bad request. `validate` mirrors every bound 0216
+        // declares, so a rejected write here is a disagreement between this code and the schema,
+        // or a transport failure -- neither of which the receiver caused or can fix by editing
+        // its request. This used to answer 400, which reported a dropped connection as the
+        // receiver's mistake.
         Err(_) => return server_error(),
     }
 
@@ -282,7 +364,10 @@ pub async fn read_streams(
             Err(_) => server_error(),
         }
     } else {
-        let limit = i64::from(state.ssf_max_streams_per_client()) + 1;
+        // BOUNDED INDEPENDENTLY OF THE WRITE CEILING. Reading at `max_streams_per_client + 1`
+        // meant lowering the config hid streams a receiver already owned -- rows it could then
+        // neither see nor delete. This cap is fixed, so the listing shows what exists.
+        let limit = i64::from(MAX_STREAMS_LISTED);
         match repo
             .ssf_streams()
             .list_for_client(&client_id, limit, None)
@@ -411,9 +496,6 @@ pub async fn update_status(
             Err(_) => server_error(),
         },
         Err(StoreError::NotFound) => not_found(),
-        Err(StoreError::Database(_)) => {
-            invalid_request("the status change was refused by a stored constraint")
-        }
         Err(_) => server_error(),
     }
 }
@@ -449,14 +531,27 @@ pub async fn configuration(
         StatusCode::OK,
         &serde_json::json!({
             "issuer": issuer,
-            "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+            // THE HELPER, not a hand-written path. This said
+            // `{issuer}/.well-known/jwks.json`, which nothing mounts: the served route is
+            // `{issuer}/jwks.json`. A receiver bootstraps from this document to fetch the keys
+            // that verify a SET, so the one wrong field made the transmitter unusable to
+            // anyone who followed it.
+            "jwks_uri": state.issuers().jwks_uri_for(&scope),
             "configuration_endpoint": format!("{base}/streams"),
             "status_endpoint": format!("{base}/status"),
-            "delivery_methods_supported": [SSF_DELIVERY_PUSH, SSF_DELIVERY_POLL],
+            "delivery_methods_supported": DELIVERY_METHODS_SUPPORTED,
             // EMPTY UNTIL SOMETHING EMITS. See `ssf_set::EVENTS_SUPPORTED`: advertising a type
             // nothing produces tells a receiver to request a signal it will never be sent.
             "events_supported": EVENTS_SUPPORTED,
-            "authorization_schemes": [{ "spec_urn": "urn:ietf:rfc:6749" }],
+            // NARROWED TO WHAT IS ACCEPTED. `authenticate_client_self_scoped` reads the
+            // Authorization header, so `client_secret_basic` is the method that reaches these
+            // endpoints; an unqualified RFC 6749 advertisement would tell a `private_key_jwt`
+            // receiver to try a body parameter no handler reads. The other methods land with
+            // the change that accepts them.
+            "authorization_schemes": [{
+                "spec_urn": "urn:ietf:rfc:6749",
+                "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+            }],
         }),
     )
 }
@@ -475,17 +570,12 @@ fn render_stream(state: &OidcState, scope: Scope, stream: &SsfStream) -> serde_j
                 serde_json::Value::String(endpoint_url.clone()),
             );
         }
-        // THE POLL ENDPOINT IS OURS, so the receiver is told where to fetch from rather than
-        // being handed back a field it supplied.
-        SsfDelivery::Poll => {
-            delivery.insert(
-                "endpoint_url".to_owned(),
-                serde_json::Value::String(format!(
-                    "{}/ssf/poll",
-                    state.issuers().issuer_for(&scope)
-                )),
-            );
-        }
+        // NO ENDPOINT FOR A POLL STREAM. The poll endpoint is the TRANSMITTER's, so this used
+        // to synthesise `{issuer}/ssf/poll` -- a URL nothing serves. A stored poll stream is
+        // unreachable through this surface today (the validator refuses one), so this arm is
+        // for rows an earlier or later build wrote; it names no address rather than inventing
+        // one. The delivery slice fills it in when the route exists.
+        SsfDelivery::Poll => {}
     }
     // THE PUSH CREDENTIAL'S NAME IS NOT ECHOED. The receiver supplied it and can look it up;
     // putting it in a response body only widens where it appears.
@@ -567,6 +657,24 @@ fn json(status: StatusCode, body: &serde_json::Value) -> Response {
             (header::CACHE_CONTROL, "no-store"),
         ],
         body.to_string(),
+    )
+        .into_response()
+}
+
+/// The receiver already holds the most streams this environment allows.
+fn quota_exceeded() -> Response {
+    (
+        StatusCode::CONFLICT,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::json!({
+            "error": "conflict",
+            "error_description":
+                "this receiver already holds the most streams this environment allows",
+        })
+        .to_string(),
     )
         .into_response()
 }

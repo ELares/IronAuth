@@ -10,6 +10,7 @@
 /.well-known/oauth-protected-resource
 /.well-known/oauth-protected-resource/{*resource_path}
 /.well-known/openid-configuration/t/{tenant_id}/e/{environment_id}
+/.well-known/ssf-configuration/t/{tenant_id}/e/{environment_id}
 /.well-known/web-identity
 /.well-known/webauthn
 /agent/vault/exchange
@@ -97,6 +98,8 @@
 /t/{tenant_id}/e/{environment_id}/session-tokens/{template}/jwks.json
 /t/{tenant_id}/e/{environment_id}/session/token-mode
 /t/{tenant_id}/e/{environment_id}/session/tokenize
+/t/{tenant_id}/e/{environment_id}/ssf/status
+/t/{tenant_id}/e/{environment_id}/ssf/streams
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/options
 /t/{tenant_id}/e/{environment_id}/webauthn/authenticate/verify
 /t/{tenant_id}/e/{environment_id}/webauthn/credentials

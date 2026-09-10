@@ -549,7 +549,9 @@ token_profiles! {
     /// A SECURITY EVENT TOKEN: `secevent+jwt` (RFC 8417 section 2.3).
     ///
     /// The profile a Shared Signals transmitter mints (issue #143). RFC 8417 registers this
-    /// media type and section 2.3 makes stamping it a SHOULD; the receiving half of this
+    /// media type, and SSF 1.0 section 4.1.1 requires a SET to be explicitly typed with it;
+    /// RFC 8417 section 2.3 adds that the `typ` value SHOULD omit the `application/` prefix.
+    /// The receiving half of this
     /// system already reads it, in `ironauth_oidc::risk_signals`, which notes that transmitters
     /// vary and accepts a SET without it. This declaration is what stops IronAuth being one of
     /// the transmitters that vary: the spelling stamped here and the spelling a verifier
