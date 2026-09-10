@@ -81893,6 +81893,27 @@ pub struct SsfStream {
     pub updated_at_unix_micros: i64,
 }
 
+/// The three properties SSF 1.0 lets a receiver change on its own stream.
+///
+/// EXACTLY THE RECEIVER-SUPPLIED SET, and no more. `stream_id`, `iss`, `aud`, `events_supported`,
+/// `events_delivered`, `min_verification_interval` and `inactivity_timeout` are all
+/// Transmitter-Supplied: the spec says a request MAY carry them but they MUST match, so the
+/// surface refuses a mismatch and never reaches this type with one.
+///
+/// `events_delivered` is computed by the caller from `events_requested` and written here,
+/// because it is the transmitter's ANSWER rather than the receiver's request.
+#[derive(Debug, Clone)]
+pub struct SsfStreamUpdate<'a> {
+    /// Where its SETs go, and how.
+    pub delivery: &'a SsfDelivery,
+    /// What the receiver is asking for now.
+    pub events_requested: &'a [String],
+    /// What this transmitter agrees to send, already intersected against what it emits.
+    pub events_delivered: &'a [String],
+    /// The receiver's label. `None` DELETES it, which is what a PUT omitting it means.
+    pub description: Option<&'a str>,
+}
+
 /// A stream to create.
 #[derive(Debug, Clone)]
 pub struct NewSsfStream<'a> {
@@ -82616,6 +82637,99 @@ impl ActingSsfStreamRepo<'_> {
             Some(&detail),
         )
         .await
+    }
+
+    /// Replace the three properties SSF 1.0 lets a receiver change on its own stream.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle or the client is out of scope, or the stream is
+    /// not this receiver's; [`StoreError::Database`] on a persistence failure.
+    pub async fn update_configuration(
+        &self,
+        env: &Env,
+        id: &SsfStreamId,
+        client_id: &ClientId,
+        update: SsfStreamUpdate<'_>,
+        event: Option<&DomainEvent<'_>>,
+    ) -> Result<(), StoreError> {
+        if id.scope() != self.scope || client_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let scope = self.scope;
+        let stream = *id;
+        let client = client_id.to_string();
+        let (method, endpoint, secret_name) = match update.delivery {
+            SsfDelivery::Push {
+                endpoint_url,
+                secret_name,
+            } => (
+                SSF_DELIVERY_PUSH,
+                Some(endpoint_url.clone()),
+                secret_name.clone(),
+            ),
+            SsfDelivery::Poll => (SSF_DELIVERY_POLL, None, None),
+        };
+        let requested = serde_json::Value::from(update.events_requested.to_vec());
+        let delivered = serde_json::Value::from(update.events_delivered.to_vec());
+        let description = update.description.map(ToOwned::to_owned);
+        // THE DETAIL NAMES THE METHOD AND THE ENDPOINT, for the reason `create` gives: an
+        // operator reading the log for "where are our signals going" needs the edit that MOVED
+        // an endpoint as much as the create that first named one.
+        let detail = match &endpoint {
+            Some(url) => format!("delivery={method} endpoint={url}"),
+            None => format!("delivery={method}"),
+        };
+        write_audited_detailed(
+            AuditedWrite {
+                store: self.store,
+                scope,
+                acting: &self.acting,
+                env,
+                action: Action::SsfStreamConfigurationUpdated,
+                target: &stream,
+            },
+            async move |tx| {
+                // THE CLIENT IS A CONJUNCT, exactly as it is on `set_status`, and here it is
+                // load-bearing in a way it was not before: 0220 grants the data plane UPDATE on
+                // the columns that decide WHERE a stream delivers, so this conjunct is the only
+                // thing between one receiver and re-pointing another's endpoint.
+                //
+                // EVERY WRITABLE COLUMN IS WRITTEN, including back to NULL. SSF 1.0 makes a PUT
+                // that omits a receiver-supplied property a request to DELETE it, and the
+                // surface turns a PATCH into a full value set by reading the stream first, so
+                // one statement serves both and neither can leave a stale half behind.
+                let updated = sqlx::query(
+                    "UPDATE ssf_streams \
+                     SET delivery_method = $1, push_endpoint_url = $2, push_secret_name = $3, \
+                         events_requested = $4, events_delivered = $5, description = $6, \
+                         updated_at = now() \
+                     WHERE tenant_id = $7 AND environment_id = $8 AND id = $9 \
+                       AND client_id = $10",
+                )
+                .bind(method)
+                .bind(&endpoint)
+                .bind(&secret_name)
+                .bind(&requested)
+                .bind(&delivered)
+                .bind(&description)
+                .bind(scope.tenant().to_string())
+                .bind(scope.environment().to_string())
+                .bind(stream.to_string())
+                .bind(&client)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(StoreError::NotFound);
+                }
+                Ok(())
+            },
+            false,
+            Some(&detail),
+        )
+        .await?;
+        let _ = event;
+        Ok(())
     }
 
     /// Move a stream between the three statuses.

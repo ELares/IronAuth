@@ -358,7 +358,7 @@ pub use repository::{
     SigningKeyMaterial, SigningKeyMaterialKind, SigningKeyRecord, SigningKeyRepo,
     SignupQuarantineReason, SignupQuarantineRepo, SignupQuarantineState, SignupQuarantineView,
     MAX_SET_JWS_BYTES, SmsOtpRepo, SpentRequest, SsfDelivery, SsfStream, SsfStreamRepo,
-    SsfStreamSetRepo,
+    SsfStreamSetRepo, SsfStreamUpdate,
     SsfStreamStatus, SsfSubjectFormat, StoredIdempotentResponse, TOKEN_HOOK_VERSION_RETENTION,
     TenantRecord, TenantRepo, TenantStatus, TokenFormat, TokenKind, TokenSizeEventRecord,
     TokenSizeEventsRepo, TokenSizeKind, TokenSizeReason, TokenStatus, TotpActivateOutcome,

@@ -1805,6 +1805,14 @@ fn registry() -> Vec<Migration> {
             phase: Phase::Expand,
             sql: include_str!("../migrations/0219_ssf_verification_budget.sql"),
         },
+        Migration {
+            version: 220,
+            name: "ssf_stream_configuration_update",
+            // EXPAND. A widened column-level GRANT adds a privilege and removes none, so an
+            // older binary keeps working: it simply never exercises what it was just given.
+            phase: Phase::Expand,
+            sql: include_str!("../migrations/0220_ssf_stream_configuration_update.sql"),
+        },
     ]
 }
 

@@ -1153,6 +1153,12 @@ pub fn oidc_router(state: OidcState) -> Router {
                 ssf::STREAMS_PATH,
                 post(ssf::create_stream)
                     .get(ssf::read_streams)
+                    // SSF 1.0 sections 8.1.2 and 8.1.3. Two verbs and not one with a flag: an
+                    // omitted property means "leave it" to PATCH and "delete it" to PUT, so a
+                    // receiver that sends a partial body to the wrong one loses what it left
+                    // out. That must not be reachable by a query parameter.
+                    .patch(ssf::patch_stream)
+                    .put(ssf::put_stream)
                     .delete(ssf::delete_stream),
             )
             .route(

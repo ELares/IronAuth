@@ -1399,6 +1399,14 @@ pub enum Action {
     /// gap with no entry naming it. The configuration edit itself lands with the slice that
     /// ships it: an action nothing produces is one no log can ever contain.
     SsfStreamStatusChanged,
+    /// A Shared Signals stream's configuration was updated (issue #143).
+    ///
+    /// THE SLICE THAT SHIPS IT, which the note above promised. SSF 1.0 lets a receiver change
+    /// three properties of its own stream, and one of them is `delivery`: an operator reading
+    /// the log for "who started shipping our signals, and to what endpoint" needs the edit that
+    /// MOVED an endpoint as much as the create that first named one. Distinct from the status
+    /// change because a pause and a re-point are different questions asked of the same log.
+    SsfStreamConfigurationUpdated,
     /// An inbound SAML connection was created (issue #139).
     ///
     /// SEPARATE FROM PINNING A KEY, below. Creating the connection says which identity provider
@@ -1975,6 +1983,7 @@ impl Action {
             Action::LdapConnectorUpdated => "ldap_connector.updated",
             Action::SsfStreamCreated => "ssf_stream.created",
             Action::SsfStreamStatusChanged => "ssf_stream.status_changed",
+            Action::SsfStreamConfigurationUpdated => "ssf_stream.configuration_updated",
             Action::SamlConnectionCreated => "saml_connection.created",
             Action::SamlConnectionDeleted => "saml_connection.deleted",
             Action::SamlConnectionEnabled => "saml_connection.enabled",

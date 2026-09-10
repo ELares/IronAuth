@@ -616,3 +616,81 @@ async fn a_sealed_set_does_not_open_under_another_streams_identity() {
         "a ciphertext moved between streams opened anyway: {outcome:?}"
     );
 }
+
+/// The configuration update matches no row for another receiver, at the STORE layer.
+///
+/// The HTTP surface refuses an intruder at `get_for_client` before `update_configuration` is
+/// reached, so the conjunct inside the statement is a second fence that no request can drive.
+/// That makes it exactly the kind of control that rots: measured, deleting `AND client_id = $10`
+/// left every test in the `ssf_streams_api` suite green.
+///
+/// It matters more than a second fence usually would, because 0220 grants the data plane UPDATE
+/// on the columns that decide WHERE a stream delivers. Before that migration the privilege was
+/// the backstop; now the conjunct is.
+#[tokio::test]
+async fn a_configuration_update_for_another_receiver_matches_no_row() {
+    let db = TestDatabase::start().await;
+    let env = Env::system();
+    let scope = db.seed_scope(&env).await;
+    let owner = seed_client(&db, &env, scope, "owner").await;
+    let intruder = seed_client(&db, &env, scope, "intruder").await;
+    let id = poll_stream(&db, &env, scope, &owner).await;
+    // READ FIRST, and compare against THIS rather than against a value written here. The seeded
+    // stream carries a description already, and an assertion of `None` passed the mutation it
+    // was written to catch by failing for its own reason.
+    let before = db
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &owner)
+        .await
+        .expect("read the stream before");
+
+    let moved = SsfDelivery::Push {
+        endpoint_url: "https://attacker.example/collect".to_owned(),
+        secret_name: None,
+    };
+    let none: Vec<String> = Vec::new();
+    let outcome = db
+        .store()
+        .scoped(scope)
+        .acting(db.test_actor(&env), CorrelationId::generate(&env))
+        .ssf_streams()
+        .update_configuration(
+            &env,
+            &id,
+            &intruder,
+            ironauth_store::SsfStreamUpdate {
+                delivery: &moved,
+                events_requested: &none,
+                events_delivered: &none,
+                description: Some("moved"),
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(outcome, Err(StoreError::NotFound)),
+        "a second receiver's update reached another receiver's stream: {outcome:?}"
+    );
+
+    // AND NOTHING MOVED. A statement that matched no row must also have written nothing, which
+    // an implementation returning NotFound after the write would fail.
+    let after = db
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &owner)
+        .await
+        .expect("the owner still has its stream");
+    assert!(
+        matches!(after.delivery, SsfDelivery::Poll),
+        "the refused update re-pointed the owner's stream: {:?}",
+        after.delivery
+    );
+    assert_eq!(
+        after.description, before.description,
+        "the refused update rewrote the owner's description"
+    );
+    assert_eq!(after.events_requested, before.events_requested);
+}

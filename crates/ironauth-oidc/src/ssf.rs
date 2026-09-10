@@ -153,13 +153,18 @@ struct StatusRequest {
 ///
 /// Split out of the handler because it sits against the crate's hundred-line ceiling, which a
 /// targeted test does not see and only clippy does.
-fn validate(
-    request: &CreateStreamRequest,
+/// The delivery object a receiver asked for, or the 400 that says why not.
+///
+/// SHARED BY CREATE AND UPDATE, because SSF 1.0 makes `delivery` receiver-supplied on both and
+/// a second copy of these rules is how the two come to disagree about what an acceptable
+/// endpoint is.
+fn validate_delivery(
+    request: &DeliveryRequest,
     client_id: &ClientId,
-) -> Result<(SsfDelivery, SsfSubjectFormat), Box<Response>> {
-    let delivery = match request.delivery.method.as_str() {
+) -> Result<SsfDelivery, Box<Response>> {
+    let delivery = match request.method.as_str() {
         SSF_DELIVERY_PUSH => {
-            let Some(endpoint) = request.delivery.endpoint_url.clone() else {
+            let Some(endpoint) = request.endpoint_url.clone() else {
                 return Err(Box::new(invalid_request(
                     "a push stream must carry delivery.endpoint_url",
                 )));
@@ -174,11 +179,11 @@ fn validate(
             }
             SsfDelivery::Push {
                 endpoint_url: endpoint,
-                secret_name: request.delivery.authorization_secret_name.clone(),
+                secret_name: request.authorization_secret_name.clone(),
             }
         }
         SSF_DELIVERY_POLL => {
-            if request.delivery.endpoint_url.is_some() {
+            if request.endpoint_url.is_some() {
                 return Err(Box::new(invalid_request(
                     "a poll stream names no endpoint: the receiver collects from THIS \
                      transmitter, and the address is published in the stream configuration",
@@ -197,6 +202,40 @@ fn validate(
         DELIVERY_METHODS_SUPPORTED.contains(&delivery.method_urn()),
         "a delivery method was accepted that discovery does not advertise"
     );
+    if let SsfDelivery::Push {
+        endpoint_url,
+        secret_name,
+    } = &delivery
+    {
+        if endpoint_url.len() > MAX_ENDPOINT_BYTES {
+            return Err(Box::new(invalid_request(
+                "delivery.endpoint_url is longer than this transmitter stores",
+            )));
+        }
+        if let Some(name) = secret_name {
+            if name.trim().is_empty() || name.len() > MAX_TEXT_BYTES {
+                return Err(Box::new(invalid_request(
+                    "delivery.authorization_secret_name must be non-empty and at most 252 bytes",
+                )));
+            }
+            // THE NAMESPACE, and it names THIS receiver. See `push_secret_prefix`.
+            let prefix = push_secret_prefix(client_id);
+            if !name.starts_with(&prefix) {
+                return Err(Box::new(invalid_request(&format!(
+                    "invalid_authorization_secret_name: it must begin with {prefix:?}, which is \
+                     the namespace this receiver's own push credentials live in"
+                ))));
+            }
+        }
+    }
+    Ok(delivery)
+}
+
+fn validate(
+    request: &CreateStreamRequest,
+    client_id: &ClientId,
+) -> Result<(SsfDelivery, SsfSubjectFormat), Box<Response>> {
+    let delivery = validate_delivery(&request.delivery, client_id)?;
 
     let format = match request.format.as_deref() {
         None => SsfSubjectFormat::IssSub,
@@ -227,32 +266,6 @@ fn validate(
             return Err(Box::new(invalid_request(
                 "description must be non-empty and at most 252 bytes",
             )));
-        }
-    }
-    if let SsfDelivery::Push {
-        endpoint_url,
-        secret_name,
-    } = &delivery
-    {
-        if endpoint_url.len() > MAX_ENDPOINT_BYTES {
-            return Err(Box::new(invalid_request(
-                "delivery.endpoint_url is longer than this transmitter stores",
-            )));
-        }
-        if let Some(name) = secret_name {
-            if name.trim().is_empty() || name.len() > MAX_TEXT_BYTES {
-                return Err(Box::new(invalid_request(
-                    "delivery.authorization_secret_name must be non-empty and at most 252 bytes",
-                )));
-            }
-            // THE NAMESPACE, and it names THIS receiver. See `push_secret_prefix`.
-            let prefix = push_secret_prefix(client_id);
-            if !name.starts_with(&prefix) {
-                return Err(Box::new(invalid_request(&format!(
-                    "invalid_authorization_secret_name: it must begin with {prefix:?}, which is \
-                     the namespace this receiver's own push credentials live in"
-                ))));
-            }
         }
     }
     Ok((delivery, format))
@@ -386,6 +399,245 @@ pub async fn create_stream(
         Ok(stream) => json(StatusCode::CREATED, &render_stream(&state, scope, &stream)),
         Err(_) => server_error(),
     }
+}
+
+/// The body a receiver sends to change its stream configuration.
+///
+/// EVERY MEMBER IS OPTIONAL EXCEPT `stream_id`, including the ones a PUT requires, because the
+/// difference between PATCH and PUT is what an ABSENT member MEANS and not whether it parses.
+/// Section 8.1.2 has a PATCH leave an omitted property unchanged; section 8.1.3 has a PUT treat
+/// the same omission as a request to delete. One type, two readings, chosen by the method.
+///
+/// THE TRANSMITTER-SUPPLIED PROPERTIES ARE PARSED, not ignored. The spec lets a request carry
+/// them and requires them to MATCH, so they have to be readable to be compared; a handler that
+/// dropped them would silently accept a receiver trying to change its own `aud`.
+#[derive(Debug, Deserialize)]
+struct UpdateStreamRequest {
+    stream_id: String,
+    delivery: Option<DeliveryRequest>,
+    events_requested: Option<Vec<String>>,
+    description: Option<String>,
+    // The read-only half. Present is allowed, different is a 400.
+    aud: Option<Vec<String>>,
+    format: Option<String>,
+    events_supported: Option<Vec<String>>,
+    events_delivered: Option<Vec<String>>,
+    iss: Option<String>,
+    min_verification_interval: Option<u32>,
+}
+
+/// `PATCH {issuer}/ssf/streams` -- SSF 1.0 section 8.1.2, update some properties.
+///
+/// An omitted receiver-supplied property is left ALONE, which is the whole difference from the
+/// PUT below.
+pub async fn patch_stream(
+    State(state): State<OidcState>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    update_stream(state, path, headers, &body, Merge::KeepOmitted).await
+}
+
+/// `PUT {issuer}/ssf/streams` -- SSF 1.0 section 8.1.3, replace the configuration.
+///
+/// An omitted receiver-supplied property is a request to DELETE it. The spec says so in as many
+/// words, and it is the reason this is a separate method rather than a flag: a receiver that
+/// sends a partial body to the wrong verb loses the properties it left out, so the two must not
+/// be reachable by accident.
+pub async fn put_stream(
+    State(state): State<OidcState>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    update_stream(state, path, headers, &body, Merge::DeleteOmitted).await
+}
+
+/// What an omitted receiver-supplied property means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Merge {
+    /// PATCH: leave it as it is.
+    KeepOmitted,
+    /// PUT: delete it.
+    DeleteOmitted,
+}
+
+/// The shared body of PATCH and PUT.
+///
+/// # Read-only properties are compared, not ignored
+///
+/// SSF 1.0 says a Transmitter-Supplied property "MAY be present, but they MUST match the
+/// expected value". So each one the request carries is compared against the stream as it
+/// stands, and a difference is a 400 naming the property. Silently dropping them would let a
+/// receiver believe it had changed its own `aud`.
+///
+/// # `events_delivered` is recomputed, never accepted
+///
+/// It is the transmitter's ANSWER to `events_requested`, so it is intersected against what this
+/// build emits on every update. A receiver that renegotiates down to nothing this build
+/// produces gets an empty array back and can SEE that nothing is coming.
+async fn update_stream(
+    state: OidcState,
+    Path((tenant_id, environment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: &[u8],
+    merge: Merge,
+) -> Response {
+    let Some((client_id, scope)) =
+        authenticated(&state, &headers, &tenant_id, &environment_id).await
+    else {
+        return unauthorized();
+    };
+    let Ok(request) = serde_json::from_slice::<UpdateStreamRequest>(body) else {
+        return invalid_request("the request body must be a JSON stream configuration");
+    };
+    let Ok(id) = SsfStreamId::parse_in_scope(&request.stream_id, &scope) else {
+        return not_found();
+    };
+    // THE FENCE, and also the source of every value the merge keeps: PATCH is defined against
+    // the stream AS IT STANDS, so the read has to happen before anything is decided.
+    let current = match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client_id)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(StoreError::NotFound) => return not_found(),
+        Err(_) => return server_error(),
+    };
+
+    if let Some(response) = read_only_mismatch(&state, scope, &request, &current) {
+        return response;
+    }
+
+    let delivery = match request.delivery.as_ref() {
+        Some(requested) => match validate_delivery(requested, &client_id) {
+            Ok(delivery) => delivery,
+            Err(response) => return *response,
+        },
+        // A PUT WITHOUT `delivery` IS REFUSED rather than deleting it. Section 8.1.3 makes an
+        // omitted receiver-supplied property a deletion request, and a stream with no delivery
+        // method is not a thing this schema can hold or this transmitter can serve: 0216's
+        // CHECK ties the method to the endpoint, and there is no third state. So the honest
+        // answer is that the request is invalid, not that the stream is now undeliverable.
+        None if merge == Merge::DeleteOmitted => {
+            return invalid_request(
+                "a replacement must carry delivery; a stream cannot exist without one",
+            );
+        }
+        None => current.delivery.clone(),
+    };
+
+    let requested = match (request.events_requested, merge) {
+        (Some(requested), _) => requested,
+        (None, Merge::DeleteOmitted) => Vec::new(),
+        (None, Merge::KeepOmitted) => current.events_requested.clone(),
+    };
+    if requested.len() > MAX_EVENTS_REQUESTED {
+        return invalid_request("events_requested names more event types than this transmitter accepts");
+    }
+    let description = match (request.description, merge) {
+        (Some(description), _) => {
+            if description.len() > MAX_TEXT_BYTES {
+                return invalid_request("description is longer than this transmitter stores");
+            }
+            Some(description)
+        }
+        (None, Merge::DeleteOmitted) => None,
+        (None, Merge::KeepOmitted) => current.description.clone(),
+    };
+    let delivered: Vec<String> = requested
+        .iter()
+        .filter(|event| EVENTS_SUPPORTED.contains(&event.as_str()))
+        .cloned()
+        .collect();
+
+    let actor = client_service_actor(ironauth_store::StoredClientId::Registered(&client_id));
+    let outcome = state
+        .store()
+        .scoped(scope)
+        .acting(actor, CorrelationId::generate(state.env()))
+        .ssf_streams()
+        .update_configuration(
+            state.env(),
+            &id,
+            &client_id,
+            ironauth_store::SsfStreamUpdate {
+                delivery: &delivery,
+                events_requested: &requested,
+                events_delivered: &delivered,
+                description: description.as_deref(),
+            },
+            None,
+        )
+        .await;
+    match outcome {
+        Ok(()) => {}
+        Err(StoreError::NotFound) => return not_found(),
+        Err(_) => return server_error(),
+    }
+
+    // READ BACK, not rendered from the request. Section 8.1.2 returns "the complete updated
+    // configuration", and the only version of that this transmitter can vouch for is the one
+    // the database holds.
+    match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client_id)
+        .await
+    {
+        Ok(stream) => json(StatusCode::OK, &render_stream(&state, scope, &stream)),
+        Err(_) => server_error(),
+    }
+}
+
+/// The 400 for a Transmitter-Supplied property the request tried to change, if there is one.
+fn read_only_mismatch(
+    state: &OidcState,
+    scope: Scope,
+    request: &UpdateStreamRequest,
+    current: &SsfStream,
+) -> Option<Response> {
+    let mismatched = |property: &str| {
+        Some(invalid_request(&format!(
+            "{property} is supplied by the transmitter and cannot be changed"
+        )))
+    };
+    if let Some(aud) = &request.aud
+        && *aud != current.audience
+    {
+        return mismatched("aud");
+    }
+    if let Some(format) = &request.format
+        && format.as_str() != current.subject_format.as_str()
+    {
+        return mismatched("format");
+    }
+    if let Some(supported) = &request.events_supported
+        && supported.iter().map(String::as_str).ne(EVENTS_SUPPORTED.iter().copied())
+    {
+        return mismatched("events_supported");
+    }
+    if let Some(delivered) = &request.events_delivered
+        && *delivered != current.events_delivered
+    {
+        return mismatched("events_delivered");
+    }
+    if let Some(iss) = &request.iss
+        && iss.as_str() != state.issuers().issuer_for(&scope)
+    {
+        return mismatched("iss");
+    }
+    if let Some(interval) = request.min_verification_interval
+        && interval != state.ssf_min_verification_interval_secs()
+    {
+        return mismatched("min_verification_interval");
+    }
+    None
 }
 
 /// `GET {issuer}/ssf/streams` -- one stream with `?stream_id=`, or every stream this receiver

@@ -592,21 +592,502 @@ async fn every_path_is_a_uniform_404_while_the_surface_is_off() {
         .create_confidential_client(ClientAuthMethod::Basic)
         .await;
     let auth = basic(&client, &secret);
-    let paths = [
-        format!(
-            "/t/{}/e/{}/ssf/streams",
-            scope.tenant(),
-            scope.environment()
-        ),
-        format!("/t/{}/e/{}/ssf/status", scope.tenant(), scope.environment()),
-        format!(
-            "/.well-known/ssf-configuration/t/{}/e/{}",
-            scope.tenant(),
-            scope.environment()
+    // EVERY MOUNTED PATH, WITH THE VERB IT ACTUALLY SERVES. This drove GET against three paths,
+    // which left the writes and the two delivery endpoints unasserted: a route mounted outside
+    // the `ssf_enabled` block would have answered a PATCH or a poll on a deployment that never
+    // turned SSF on, and every assertion here would still have passed.
+    let base = format!("/t/{}/e/{}", scope.tenant(), scope.environment());
+    let cases = [
+        ("GET", format!("{base}/ssf/streams")),
+        ("POST", format!("{base}/ssf/streams")),
+        ("PATCH", format!("{base}/ssf/streams")),
+        ("PUT", format!("{base}/ssf/streams")),
+        ("DELETE", format!("{base}/ssf/streams?stream_id=sst_x")),
+        ("GET", format!("{base}/ssf/status?stream_id=sst_x")),
+        ("POST", format!("{base}/ssf/status")),
+        ("POST", format!("{base}/ssf/poll/sst_x")),
+        ("POST", format!("{base}/ssf/verify")),
+        (
+            "GET",
+            format!(
+                "/.well-known/ssf-configuration/t/{}/e/{}",
+                scope.tenant(),
+                scope.environment()
+            ),
         ),
     ];
-    for path in paths {
-        let (status, body) = send(&harness, "GET", &path, Some(&auth), None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    for (method, path) in cases {
+        let body = (method != "GET" && method != "DELETE").then(|| "{}".to_owned());
+        let (status, text) = send(&harness, method, &path, Some(&auth), body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {path} answered on a deployment with SSF off: {text}"
+        );
     }
+}
+
+/// Create a poll stream with a description and one requested event, and return its object.
+async fn seeded_stream(harness: &Harness, auth: &str) -> serde_json::Value {
+    let body = serde_json::json!({
+        "delivery": { "method": "urn:ietf:rfc:8936" },
+        "events_requested": [ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE],
+        "aud": ["https://receiver.example.com"],
+        "format": "iss_sub",
+        "description": "the original label",
+    })
+    .to_string();
+    let (status, text) = send(
+        harness,
+        "POST",
+        &streams_path(harness),
+        Some(auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    serde_json::from_str(&text).expect("a stream object")
+}
+
+/// PATCH changes what it names and leaves out what it does not.
+///
+/// SSF 1.0 section 8.1.2: "Any properties missing in the request MUST NOT be changed by the
+/// Transmitter." Both halves are asserted, because a handler that rebuilt the whole
+/// configuration from the request would pass a test that only checked the changed property and
+/// would silently drop the description of every receiver that patched its delivery.
+#[tokio::test]
+async fn a_patch_changes_the_named_property_and_leaves_the_rest() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    let body = serde_json::json!({
+        "stream_id": stream_id,
+        "description": "the new label",
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let patched: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(patched["description"], serde_json::json!("the new label"));
+    // UNTOUCHED, because the request did not name them.
+    assert_eq!(patched["delivery"], created["delivery"]);
+    assert_eq!(
+        patched["events_requested"],
+        created["events_requested"],
+        "a patch that named only the description changed the event negotiation"
+    );
+    assert_eq!(patched["events_delivered"], created["events_delivered"]);
+    // AND THE RESPONSE IS THE STORED STATE, not the request echoed: a re-read must agree.
+    let (status, text) = send(
+        &harness,
+        "GET",
+        &format!("{}?stream_id={stream_id}", streams_path(&harness)),
+        Some(&auth),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let read_back: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(read_back, patched, "the PATCH response is not what was stored");
+}
+
+/// PUT deletes what it omits.
+///
+/// SSF 1.0 section 8.1.3: "Missing Receiver-Supplied properties MUST be interpreted as requested
+/// to be deleted." This is the whole reason PATCH and PUT are separate verbs rather than one
+/// handler with a flag, so it is the property most worth pinning: a PUT carrying only the
+/// delivery must clear the description and the event negotiation.
+#[tokio::test]
+async fn a_put_deletes_the_receiver_properties_it_omits() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+    assert_eq!(
+        created["events_delivered"],
+        serde_json::json!([ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE]),
+        "the fixture did not start with something to delete"
+    );
+
+    let body = serde_json::json!({
+        "stream_id": stream_id,
+        "delivery": { "method": "urn:ietf:rfc:8936" },
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PUT",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let replaced: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        replaced["description"],
+        serde_json::Value::Null,
+        "a PUT that omitted the description did not delete it"
+    );
+    assert_eq!(replaced["events_requested"], serde_json::json!([]));
+    assert_eq!(
+        replaced["events_delivered"],
+        serde_json::json!([]),
+        "the transmitter still agrees to send an event the receiver stopped asking for"
+    );
+}
+
+/// An update RECOMPUTES what the transmitter agreed to send; it does not echo the request.
+///
+/// `events_delivered` is Transmitter-Supplied: it is the intersection of what the receiver asked
+/// for with what this build emits, so a receiver that renegotiates towards something not
+/// produced here must SEE that it is not coming.
+///
+/// THE REQUESTED SET HAS TO CONTAIN SOMETHING UNSUPPORTED for this to bite, which is the whole
+/// point of the case. Measured: with `events_delivered = events_requested.clone()` substituted
+/// for the intersection, every other test in this file still passed, because each of them
+/// happens to end with an empty set either way.
+#[tokio::test]
+async fn an_update_recomputes_what_the_transmitter_agreed_to_send() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    let unsupported = "https://schemas.openid.net/secevent/risc/event-type/account-disabled";
+    let body = serde_json::json!({
+        "stream_id": stream_id,
+        "events_requested": [
+            ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE,
+            unsupported,
+        ],
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let updated: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+
+    // WHAT THE RECEIVER ASKED FOR is kept verbatim, including the part it will not get: SSF has
+    // the transmitter record the request and answer it, not silently rewrite it.
+    assert_eq!(
+        updated["events_requested"],
+        serde_json::json!([ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE, unsupported])
+    );
+    // WHAT IT WILL ACTUALLY BE SENT excludes the type this build does not emit.
+    assert_eq!(
+        updated["events_delivered"],
+        serde_json::json!([ironauth_oidc::ssf_set::VERIFICATION_EVENT_TYPE]),
+        "the transmitter agreed to send an event type it cannot produce"
+    );
+}
+
+/// A receiver can re-point its own push stream, and only its own.
+///
+/// `delivery` is receiver-supplied, so re-pointing is the feature. 0220 grants the data plane
+/// UPDATE on the endpoint columns to allow it, which means the SQL conjunct on `client_id` is
+/// now the only thing standing between one receiver and another's endpoint. Both directions are
+/// driven here for that reason.
+#[tokio::test]
+async fn a_receiver_repoints_its_own_stream_and_reaches_no_others() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (owner, owner_secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let (intruder, intruder_secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let owner_auth = basic(&owner, &owner_secret);
+    let intruder_auth = basic(&intruder, &intruder_secret);
+    let created = seeded_stream(&harness, &owner_auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    let repoint = serde_json::json!({
+        "stream_id": stream_id,
+        "delivery": {
+            "method": "urn:ietf:rfc:8935",
+            "endpoint_url": "https://receiver.example.com/moved",
+        },
+    })
+    .to_string();
+
+    // THE INTRUDER FIRST, so a handler that wrote before checking is caught by the owner's
+    // assertion below rather than being masked by the owner's own successful edit.
+    let (status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&intruder_auth),
+        Some(repoint.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a second receiver re-pointed a stream it does not own: {text}"
+    );
+
+    let (status, text) = send(
+        &harness,
+        "GET",
+        &format!("{}?stream_id={stream_id}", streams_path(&harness)),
+        Some(&owner_auth),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let untouched: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        untouched["delivery"], created["delivery"],
+        "the refused request moved the endpoint anyway"
+    );
+
+    let (status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&owner_auth),
+        Some(repoint),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let moved: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        moved["delivery"]["endpoint_url"],
+        serde_json::json!("https://receiver.example.com/moved"),
+        "the owner could not re-point its own stream"
+    );
+}
+
+/// A second receiver gets the uniform not-found even when its request would be a 400.
+///
+/// THE FENCE COMES BEFORE THE VALIDATION, and this is what pins the order. The read-only
+/// comparison needs the stream as it stands, so it runs after a read; if that read were not
+/// receiver-fenced, an intruder sending a deliberately WRONG `aud` for somebody else's stream
+/// would get a `400 aud is supplied by the transmitter` and learn the stream exists, while an
+/// absent handle still answered `404`. The update would still be refused -- the store's conjunct
+/// catches it -- so the leak would be in the status code alone, which is exactly the kind of
+/// difference no test of the happy path can see.
+#[tokio::test]
+async fn a_second_receivers_invalid_update_is_still_the_uniform_not_found() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (owner, owner_secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let (intruder, intruder_secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let owner_auth = basic(&owner, &owner_secret);
+    let intruder_auth = basic(&intruder, &intruder_secret);
+    let created = seeded_stream(&harness, &owner_auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    // A request that WOULD be a 400 if the intruder owned the stream: it tries to change a
+    // transmitter-supplied property.
+    let body = serde_json::json!({
+        "stream_id": stream_id,
+        "aud": ["https://somebody-else.example"],
+    })
+    .to_string();
+    let (owned_status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&intruder_auth),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        owned_status,
+        StatusCode::NOT_FOUND,
+        "an intruder learned a stream exists by sending an invalid update: {text}"
+    );
+
+    // AN ABSENT HANDLE ANSWERS IDENTICALLY, which is the half that makes the first one mean
+    // something: two different answers here would be the enumeration oracle.
+    let absent = serde_json::json!({
+        "stream_id": ironauth_store::SsfStreamId::generate(
+            harness.state().env(),
+            &harness.scope(),
+        )
+        .to_string(),
+        "aud": ["https://somebody-else.example"],
+    })
+    .to_string();
+    let (absent_status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&intruder_auth),
+        Some(absent),
+    )
+    .await;
+    assert_eq!(
+        absent_status, owned_status,
+        "an absent stream answered differently from another receiver's: {text}"
+    );
+}
+
+/// A transmitter-supplied property may be PRESENT, but it must MATCH.
+///
+/// SSF 1.0: "Transmitter-Supplied properties besides the `stream_id` MAY be present, but they MUST
+/// match the expected value." Both halves matter and both are driven: echoing the current value
+/// back is fine, and changing it is a 400 that names the property. A handler that simply ignored
+/// these members would pass the first half and silently accept the second, leaving a receiver
+/// believing it had changed its own audience.
+#[tokio::test]
+async fn a_transmitter_supplied_property_may_be_echoed_but_not_changed() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    // ECHOED: every read-only property sent back exactly as the transmitter supplied it.
+    let echo = serde_json::json!({
+        "stream_id": stream_id,
+        "aud": created["aud"],
+        "iss": created["iss"],
+        "format": created["format"],
+        "events_supported": created["events_supported"],
+        "events_delivered": created["events_delivered"],
+        "min_verification_interval": created["min_verification_interval"],
+        "description": "still fine",
+    })
+    .to_string();
+    let (status, text) = send(
+        &harness,
+        "PATCH",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(echo),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "echoing the transmitter's own values back was refused: {text}"
+    );
+
+    // CHANGED: one property at a time, so a refusal names the property that caused it.
+    for (property, value) in [
+        ("aud", serde_json::json!(["https://somebody-else.example"])),
+        ("iss", serde_json::json!("https://issuer.example/t/x/e/y")),
+        ("format", serde_json::json!("email")),
+        ("events_supported", serde_json::json!(["https://made.up/event"])),
+        ("events_delivered", serde_json::json!(["https://made.up/event"])),
+        ("min_verification_interval", serde_json::json!(9999)),
+    ] {
+        let mut body = serde_json::Map::new();
+        body.insert("stream_id".to_owned(), serde_json::json!(stream_id));
+        body.insert(property.to_owned(), value);
+        let (status, text) = send(
+            &harness,
+            "PATCH",
+            &streams_path(&harness),
+            Some(&auth),
+            Some(serde_json::Value::Object(body).to_string()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "changing the transmitter-supplied {property} was accepted: {text}"
+        );
+        assert!(
+            text.contains(property),
+            "the refusal does not name {property}: {text}"
+        );
+    }
+
+    // AND NOTHING MOVED. Six refusals must leave the stream exactly as the echo left it.
+    let (status, text) = send(
+        &harness,
+        "GET",
+        &format!("{}?stream_id={stream_id}", streams_path(&harness)),
+        Some(&auth),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let after: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(after["aud"], created["aud"]);
+    assert_eq!(after["format"], created["format"]);
+    assert_eq!(after["description"], serde_json::json!("still fine"));
+}
+
+/// A replacement without a delivery is refused rather than leaving the stream undeliverable.
+///
+/// A PUT treats an omitted receiver-supplied property as a deletion, and `delivery` is one. But
+/// a stream with no delivery method is not a state this schema can hold -- 0216's CHECK ties the
+/// method to the endpoint and there is no third value -- so the honest answer is that the
+/// request is invalid, not that the stream is now unreachable.
+#[tokio::test]
+async fn a_replacement_without_a_delivery_is_refused() {
+    let mut harness = Harness::start_store_backed().await;
+    harness.enable_ssf(20);
+    let (client, secret) = harness
+        .create_confidential_client(ClientAuthMethod::Basic)
+        .await;
+    let auth = basic(&client, &secret);
+    let created = seeded_stream(&harness, &auth).await;
+    let stream_id = created["stream_id"].as_str().expect("stream_id").to_owned();
+
+    let body = serde_json::json!({ "stream_id": stream_id }).to_string();
+    let (status, text) = send(
+        &harness,
+        "PUT",
+        &streams_path(&harness),
+        Some(&auth),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+
+    let (status, text) = send(
+        &harness,
+        "GET",
+        &format!("{}?stream_id={stream_id}", streams_path(&harness)),
+        Some(&auth),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let after: serde_json::Value = serde_json::from_str(&text).expect("a stream object");
+    assert_eq!(
+        after["delivery"], created["delivery"],
+        "the refused replacement changed the delivery anyway"
+    );
 }
