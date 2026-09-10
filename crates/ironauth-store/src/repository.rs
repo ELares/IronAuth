@@ -328,6 +328,15 @@ impl<'a> ScopedStore<'a> {
         }
     }
 
+    /// The SETs each Shared Signals stream owes its receiver (issue #143).
+    #[must_use]
+    pub fn ssf_stream_sets(&self) -> SsfStreamSetRepo<'a> {
+        SsfStreamSetRepo {
+            store: self.store,
+            scope: self.scope,
+        }
+    }
+
     /// What the last completed sync pass saw in each directory (issue #142).
     #[must_use]
     pub fn ldap_sync_snapshots(&self) -> LdapSnapshotRepo<'a> {
@@ -81961,6 +81970,195 @@ fn ssf_stream_from_row(row: &PgRow, scope: Scope) -> Result<SsfStream, StoreErro
         created_at_unix_micros: row.get("created_us"),
         updated_at_unix_micros: row.get("updated_us"),
     })
+}
+
+/// One Security Event Token a stream owes its receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedSet {
+    /// The `jti` the receiver acknowledges by.
+    pub jti: String,
+    /// The compact JWS, byte-identical to every earlier delivery of it.
+    pub set_jws: String,
+    /// When it was queued.
+    pub queued_at_unix_micros: i64,
+}
+
+/// The SETs a stream owes, for RFC 8936 poll delivery.
+///
+/// # No receiver appears in this type
+///
+/// Every method takes a [`SsfStreamId`], and the SURFACE is what proves the caller owns that
+/// stream -- it resolves the stream through [`SsfStreamRepo::get_for_client`] first, which is
+/// fenced. Putting a second fence here would be a fence on a value the caller just proved, and
+/// leaving it out of the type is what stops it being mistaken for the one that matters.
+pub struct SsfStreamSetRepo<'a> {
+    store: &'a Store,
+    scope: Scope,
+}
+
+impl SsfStreamSetRepo<'_> {
+    /// Queue one SET for one stream.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::Conflict`] if this
+    /// stream has already been queued a SET with this `jti`, which for an at-least-once producer
+    /// means the event is already owed and must not be owed twice;
+    /// [`StoreError::QuotaExceeded`] when the stream is already holding `ceiling` unacknowledged
+    /// SETs; [`StoreError::Database`] on a persistence failure.
+    pub async fn queue(
+        &self,
+        stream_id: &SsfStreamId,
+        jti: &str,
+        set_jws: &str,
+        ceiling: u32,
+    ) -> Result<(), StoreError> {
+        if stream_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // THE CEILING IS A CONJUNCT OF THE INSERT, the shape `ssf_streams` uses for its own: a
+        // count taken first lets N concurrent producers all see the same under-limit total and
+        // all commit. A receiver that has stopped collecting stops being queued for rather
+        // than growing without bound, and the refusal is visible to the producer.
+        let inserted = sqlx::query(
+            "INSERT INTO ssf_stream_sets (tenant_id, environment_id, stream_id, jti, set_jws) \
+             SELECT $1, $2, $3, $4, $5 \
+             WHERE (SELECT count(*) FROM ssf_stream_sets \
+                    WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3) < $6",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(jti)
+        .bind(set_jws)
+        .bind(i64::from(ceiling))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                StoreError::Conflict
+            } else {
+                StoreError::Database(error)
+            }
+        })?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::QuotaExceeded);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The oldest unacknowledged SETs this stream owes, up to `limit`.
+    ///
+    /// OLDEST FIRST, so a receiver draining a backlog reads its events in the order they
+    /// happened. Nothing is claimed or hidden: RFC 8936 redelivers an unacknowledged SET, so a
+    /// second poll before an acknowledgement returns the same tokens, byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn owed(
+        &self,
+        stream_id: &SsfStreamId,
+        limit: i64,
+    ) -> Result<Vec<QueuedSet>, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let rows = sqlx::query(
+            "SELECT jti, set_jws, \
+                    (EXTRACT(EPOCH FROM queued_at) * 1000000)::bigint AS queued_us \
+             FROM ssf_stream_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+             ORDER BY queued_at, jti LIMIT $4",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| QueuedSet {
+                jti: row.get("jti"),
+                set_jws: row.get("set_jws"),
+                queued_at_unix_micros: row.get("queued_us"),
+            })
+            .collect())
+    }
+
+    /// How many SETs this stream still owes.
+    ///
+    /// What RFC 8936's `moreAvailable` is computed from, and what an operator reads to see a
+    /// receiver falling behind.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] on a persistence failure.
+    pub async fn owed_count(&self, stream_id: &SsfStreamId) -> Result<i64, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ssf_stream_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Acknowledge SETs by `jti`, returning how many this stream actually owed.
+    ///
+    /// An acknowledgement of something never owed is not an error: RFC 8936 lets a receiver
+    /// repeat an `ack` it already sent, and a retry of a poll whose response was lost carries
+    /// exactly that. The COUNT is returned so a caller can see the difference without the
+    /// receiver being told it -- telling a receiver which of its acks matched would report on
+    /// state it does not otherwise see.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the handle is out of scope; [`StoreError::Database`] on a
+    /// persistence failure.
+    pub async fn acknowledge(
+        &self,
+        stream_id: &SsfStreamId,
+        jtis: &[String],
+    ) -> Result<u64, StoreError> {
+        if stream_id.scope() != self.scope {
+            return Err(StoreError::NotFound);
+        }
+        if jtis.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = begin_scoped(self.store, self.scope).await?;
+        // THE STREAM IS A CONJUNCT, so a receiver cannot acknowledge -- and therefore discard --
+        // a SET owed to a different stream by naming its `jti`. The `jti` is not a secret and a
+        // fan-out gives several streams the same one, so without this an ack would delete
+        // another receiver's undelivered event.
+        let deleted = sqlx::query(
+            "DELETE FROM ssf_stream_sets \
+             WHERE tenant_id = $1 AND environment_id = $2 AND stream_id = $3 \
+               AND jti = ANY($4)",
+        )
+        .bind(self.scope.tenant().to_string())
+        .bind(self.scope.environment().to_string())
+        .bind(stream_id.to_string())
+        .bind(jtis)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected())
+    }
 }
 
 /// Reads over one scope's Shared Signals streams.

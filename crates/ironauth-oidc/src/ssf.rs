@@ -82,17 +82,24 @@ pub fn push_secret_prefix(client_id: &ClientId) -> String {
 /// The delivery methods this deployment can actually perform.
 ///
 /// ONE list, read by both [`validate`] and [`configuration`]. It held both SSF methods while
-/// neither delivery path was mounted, so discovery advertised poll, a poll stream could be
+/// NEITHER delivery path was mounted, so discovery advertised poll, a poll stream could be
 /// created, and the configuration handed the receiver a `{issuer}/ssf/poll` URL that nothing
-/// serves -- three sites free to disagree, and all three wrong. Poll returns when RFC 8936 is
-/// mounted, and it returns by being added HERE, which makes the advertisement and the
-/// acceptance move together.
-pub const DELIVERY_METHODS_SUPPORTED: &[&str] = &[SSF_DELIVERY_PUSH];
+/// served -- three sites free to disagree, and all three wrong. It then held push alone until
+/// RFC 8936 was served. Poll is back because [`poll`] now mounts it, which is the only way a
+/// method gets on this list.
+pub const DELIVERY_METHODS_SUPPORTED: &[&str] = &[SSF_DELIVERY_PUSH, SSF_DELIVERY_POLL];
 
 /// The stream-management (configuration) endpoint, per environment.
 pub const STREAMS_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/streams";
 /// The stream-status endpoint, per environment.
 pub const STATUS_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/status";
+
+/// The RFC 8936 poll endpoint, per STREAM.
+///
+/// Per stream rather than per environment: the URL is what identifies which stream a receiver
+/// is collecting for, so a credential holding several poll streams names the one it means
+/// instead of the transmitter guessing.
+pub const POLL_PATH: &str = "/t/{tenant_id}/e/{environment_id}/ssf/poll/{stream_id}";
 /// The discovery document, per environment, in the RFC 8414 host-inserted form the rest of
 /// this surface uses.
 pub const CONFIGURATION_PATH: &str =
@@ -164,16 +171,14 @@ fn validate(
                 secret_name: request.delivery.authorization_secret_name.clone(),
             }
         }
-        // POLL IS MODELLED AND NOT YET SERVED. The stream row can express it (0216) and the
-        // delivery slice will mount RFC 8936; until then accepting one would create a stream
-        // whose events nobody can ever collect, which a receiver cannot distinguish from a
-        // quiet period.
         SSF_DELIVERY_POLL => {
-            return Err(Box::new(invalid_request(
-                "urn:ietf:rfc:8936 (poll) is not served by this deployment yet; \
-                 delivery_methods_supported in the SSF configuration document is the list \
-                 this transmitter accepts",
-            )));
+            if request.delivery.endpoint_url.is_some() {
+                return Err(Box::new(invalid_request(
+                    "a poll stream names no endpoint: the receiver collects from THIS \
+                     transmitter, and the address is published in the stream configuration",
+                )));
+            }
+            SsfDelivery::Poll
         }
         _ => {
             return Err(Box::new(invalid_request(
@@ -532,6 +537,144 @@ pub async fn update_status(
     }
 }
 
+/// The RFC 8936 poll request body.
+///
+/// Every member is optional, which is section 2.4's shape: a receiver that sends `{}` is asking
+/// for whatever is owed, and one that sends only `ack` is acknowledging without collecting.
+#[derive(Debug, Deserialize)]
+struct PollRequest {
+    /// The most SETs to return. Clamped to the transmitter's own ceiling; `0` means "none",
+    /// which is how a receiver acknowledges without collecting.
+    #[serde(rename = "maxEvents")]
+    max_events: Option<u32>,
+    /// When false, the transmitter may hold the request open waiting for an event. This
+    /// transmitter always returns immediately and SAYS SO in the response, rather than
+    /// long-polling: a held request occupies a connection for a benefit a receiver polling on
+    /// its own schedule already has.
+    #[serde(rename = "returnImmediately")]
+    return_immediately: Option<bool>,
+    /// The `jti`s the receiver has processed. Acknowledged BEFORE the new page is chosen, so
+    /// one round trip both clears the last page and collects the next.
+    #[serde(default)]
+    ack: Vec<String>,
+    /// SETs the receiver could not accept, by `jti`. Read and NOT acted on; see the handler.
+    #[serde(rename = "setErrs", default)]
+    set_errs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST {issuer}/ssf/poll/{stream_id}` -- RFC 8936 poll delivery.
+///
+/// One round trip acknowledges the previous page and collects the next, which is the shape
+/// section 2.4 describes and the reason `ack` is processed first.
+pub async fn poll(
+    State(state): State<OidcState>,
+    Path((tenant_id, environment_id, stream_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some((client_id, scope)) =
+        authenticated(&state, &headers, &tenant_id, &environment_id).await
+    else {
+        return unauthorized();
+    };
+    // AN EMPTY BODY IS A VALID POLL. RFC 8936's members are all optional, and a receiver that
+    // sends nothing is asking for whatever is owed.
+    let request: PollRequest = if body.is_empty() {
+        PollRequest {
+            max_events: None,
+            return_immediately: None,
+            ack: Vec::new(),
+            set_errs: serde_json::Map::new(),
+        }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(_) => return invalid_request("the request body must be an RFC 8936 poll request"),
+        }
+    };
+
+    let Ok(id) = SsfStreamId::parse_in_scope(&stream_id, &scope) else {
+        return not_found();
+    };
+    // THE STREAM IS RESOLVED THROUGH THE FENCED READ, which is what proves this receiver owns
+    // it. Everything below addresses the stream by handle alone, and this is the only thing
+    // standing between a receiver and another's queue.
+    let stream = match state
+        .store()
+        .scoped(scope)
+        .ssf_streams()
+        .get_for_client(&id, &client_id)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(StoreError::NotFound) => return not_found(),
+        Err(_) => return server_error(),
+    };
+    // A PUSH STREAM IS NOT POLLED. Its events are delivered to it; letting it also collect
+    // would hand the same SET out twice under two delivery methods.
+    if !matches!(stream.delivery, SsfDelivery::Poll) {
+        return invalid_request("this stream is delivered by push; it has nothing to collect");
+    }
+
+    let sets = state.store().scoped(scope).ssf_stream_sets();
+    if !request.ack.is_empty() {
+        // BOUNDED. An unbounded `ack` array is a receiver-chosen amount of work on a request
+        // path, and no honest one exceeds the page it was just given.
+        if request.ack.len() > MAX_POLL_EVENTS as usize {
+            return invalid_request("ack names more events than one page can contain");
+        }
+        if sets.acknowledge(&id, &request.ack).await.is_err() {
+            return server_error();
+        }
+    }
+    // `setErrs` IS READ AND NOT ACTED ON, and that is a decision rather than an oversight.
+    // Section 2.4 lets a receiver report a SET it could not accept; deleting one on that basis
+    // would let a receiver discard its own security events by claiming it could not parse them,
+    // and re-minting cannot fix a SET the transmitter believes is correct. It is logged so an
+    // operator sees a receiver rejecting events, and the SET stays owed.
+    if !request.set_errs.is_empty() {
+        tracing::warn!(
+            stream = %id,
+            count = request.set_errs.len(),
+            "a Shared Signals receiver reported SETs it could not accept; they remain owed"
+        );
+    }
+
+    let wanted = request
+        .max_events
+        .unwrap_or(MAX_POLL_EVENTS)
+        .min(MAX_POLL_EVENTS);
+    let Ok(owed) = sets.owed(&id, i64::from(wanted)).await else {
+        return server_error();
+    };
+    let Ok(remaining) = sets.owed_count(&id).await else {
+        return server_error();
+    };
+
+    let mut collected = serde_json::Map::new();
+    for set in &owed {
+        collected.insert(
+            set.jti.clone(),
+            serde_json::Value::String(set.set_jws.clone()),
+        );
+    }
+    // `moreAvailable` COUNTS WHAT IS STILL OWED AFTER THIS PAGE, which is what tells a receiver
+    // to poll again immediately rather than wait out its interval.
+    let more = remaining > i64::try_from(owed.len()).unwrap_or(i64::MAX);
+    let _ = request.return_immediately;
+    json(
+        StatusCode::OK,
+        &serde_json::json!({ "sets": collected, "moreAvailable": more }),
+    )
+}
+
+/// The most SETs one poll returns, and the most `jti`s one may acknowledge.
+///
+/// A receiver may ask for fewer. It may not ask for more: `maxEvents` is receiver-chosen work
+/// on a request path, and a page this size is already far beyond what a receiver polling on any
+/// sane interval accumulates.
+const MAX_POLL_EVENTS: u32 = 100;
+
 /// `GET /.well-known/ssf-configuration/t/{tenant}/e/{environment}`.
 ///
 /// UNAUTHENTICATED, like every other discovery document here: it names endpoints and
@@ -602,12 +745,20 @@ fn render_stream(state: &OidcState, scope: Scope, stream: &SsfStream) -> serde_j
                 serde_json::Value::String(endpoint_url.clone()),
             );
         }
-        // NO ENDPOINT FOR A POLL STREAM. The poll endpoint is the TRANSMITTER's, so this used
-        // to synthesise `{issuer}/ssf/poll` -- a URL nothing serves. A stored poll stream is
-        // unreachable through this surface today (the validator refuses one), so this arm is
-        // for rows an earlier or later build wrote; it names no address rather than inventing
-        // one. The delivery slice fills it in when the route exists.
-        SsfDelivery::Poll => {}
+        // THE POLL ENDPOINT IS THE TRANSMITTER'S, and it is per stream: the receiver proves
+        // which stream it is collecting for by the URL it calls, so one credential holding
+        // several poll streams cannot drain the wrong one by omission. An earlier version
+        // synthesised `{issuer}/ssf/poll`, which named no stream and which nothing served.
+        SsfDelivery::Poll => {
+            delivery.insert(
+                "endpoint_url".to_owned(),
+                serde_json::Value::String(format!(
+                    "{}/ssf/poll/{}",
+                    state.issuers().issuer_for(&scope),
+                    stream.id
+                )),
+            );
+        }
     }
     // THE PUSH CREDENTIAL'S NAME IS NOT ECHOED. The receiver supplied it and can look it up;
     // putting it in a response body only widens where it appears.

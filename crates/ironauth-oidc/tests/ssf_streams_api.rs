@@ -317,9 +317,12 @@ async fn the_delivery_object_is_validated_before_anything_is_written() {
             }),
         ),
         (
-            "poll, which this deployment does not serve yet",
+            "poll carrying an endpoint, which is the transmitter's to publish",
             serde_json::json!({
-                "delivery": { "method": "urn:ietf:rfc:8936" },
+                "delivery": {
+                    "method": "urn:ietf:rfc:8936",
+                    "endpoint_url": "https://receiver.example.com/collect",
+                },
                 "aud": ["https://receiver.example.com"],
             }),
         ),
@@ -512,12 +515,13 @@ async fn discovery_advertises_only_what_is_mounted() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
 
-    // ONLY WHAT IS SERVED. Poll is modelled by 0216 and refused by the create until RFC 8936
-    // is mounted, so advertising it would tell a receiver to configure delivery that never
-    // happens.
+    // ONLY WHAT IS SERVED, and both now are: push through the RFC 8935 worker and poll through
+    // the RFC 8936 endpoint. This list held push alone while poll was modelled and unserved,
+    // and it is the SAME constant the create validator reads, so the advertisement and the
+    // acceptance cannot drift apart.
     assert_eq!(
         doc["delivery_methods_supported"],
-        serde_json::json!(["urn:ietf:rfc:8935"])
+        serde_json::json!(["urn:ietf:rfc:8935", "urn:ietf:rfc:8936"])
     );
     assert!(
         doc["configuration_endpoint"]
