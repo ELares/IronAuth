@@ -91,6 +91,7 @@
 /t/{tenant_id}/e/{environment_id}/recover/idv/callback
 /t/{tenant_id}/e/{environment_id}/recover/idv/initiate
 /t/{tenant_id}/e/{environment_id}/recover/trusted-contact/confirm
+/t/{tenant_id}/e/{environment_id}/risc/events
 /t/{tenant_id}/e/{environment_id}/risk/signals
 /t/{tenant_id}/e/{environment_id}/saml/acs/{connection}
 /t/{tenant_id}/e/{environment_id}/saml/metadata/{connection}

@@ -1622,6 +1622,7 @@ async fn build_oidc_plane(
     .with_org_provisioning(org_provisioning)
     .with_global_token_revocation_enabled(surfaces.global_revocation)
     .with_ssf(&config.ssf)
+    .with_risc_receiver(&config.risc_receiver)
     .with_fedcm_enabled(surfaces.fedcm)
     .with_agent_vault_enabled(surfaces.agent_vault)
     .with_risk_signals_enabled(surfaces.risk_signals)

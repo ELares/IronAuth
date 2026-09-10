@@ -180,6 +180,8 @@ mod response;
 mod revocation;
 /// The RISC vocabulary: this deployment's user lifecycle as Shared Signals states it (#144).
 pub mod risc;
+/// The Google Cross-Account Protection RISC receiver (#144).
+mod risc_receiver;
 mod risk;
 mod risk_signals;
 pub mod routing;
@@ -858,6 +860,16 @@ pub fn oidc_router(state: OidcState) -> Router {
         .route(
             "/t/{tenant_id}/e/{environment_id}/risk/signals",
             post(risk_signals::ingest),
+        )
+        // The Google Cross-Account Protection receiver (issue #144): a signed RISC Security
+        // Event Token pushed by the configured transmitter, authenticated by its SIGNATURE
+        // against that transmitter's registered public keys, deduplicated on `jti`, and
+        // mapped onto the environment's configured protections for the LINKED local user.
+        // The handler fails closed with a 404 when `risc_receiver.enabled` is off, so the
+        // route literal stays UNCONDITIONAL for the RFC 9700 endpoint inventory.
+        .route(
+            "/t/{tenant_id}/e/{environment_id}/risc/events",
+            post(risc_receiver::receive),
         )
         // Advanced recovery modes (issue #82, PR 3, EXPLORATORY): the trusted-contact
         // confirmation surface (a designated contact confirms a recovery out of band with a

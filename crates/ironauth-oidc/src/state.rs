@@ -244,6 +244,12 @@ pub struct OidcState {
     ssf_max_owed_sets_per_stream: u32,
     ssf_min_verification_interval_secs: u32,
     ssf_max_subjects_per_stream: u32,
+    // The Google Cross-Account Protection receiver (issue #144): the registered
+    // transmitter, its keys, the connector its subjects belong to, and which protections a
+    // compromise signal applies. Off by default (the endpoint is a uniform 404). Held whole
+    // rather than split into scalars like the SSF settings above, because the handler reads
+    // most of it on one request and a five-field copy would be five chances to drop one.
+    risc_receiver: ironauth_config::RiscReceiverConfig,
     // Whether the experimental IdP-side FedCM surface (issue #83) is armed. Kept
     // OUTSIDE `Inner` and set through the builder for the SAME anti-bypass reason as
     // global-token-revocation: it is NOT a plain `OidcConfig` toggle an operator can
@@ -1066,6 +1072,7 @@ impl OidcState {
             // FROM THE CONFIG TYPE, not repeated literals. These were `false` and `20` written
             // again here, so a test asserting "off by default" pinned this copy and would have
             // kept passing if `SsfConfig::default()` had changed underneath it.
+            risc_receiver: ironauth_config::RiscReceiverConfig::default(),
             ssf_enabled: ironauth_config::SsfConfig::default().enabled,
             ssf_max_streams_per_client: ironauth_config::SsfConfig::default()
                 .max_streams_per_client,
@@ -1307,6 +1314,17 @@ impl OidcState {
 
     /// Arm (or not) the Shared Signals stream-management surface (issue #143).
     #[must_use]
+    /// Install the Google Cross-Account Protection receiver settings (issue #144).
+    ///
+    /// A builder like [`Self::with_ssf`] rather than a field read off `OidcConfig`,
+    /// because this is a protocol surface a deployment opts into on its own switch, not an
+    /// OIDC tuning knob.
+    #[must_use]
+    pub fn with_risc_receiver(mut self, config: &ironauth_config::RiscReceiverConfig) -> Self {
+        self.risc_receiver = config.clone();
+        self
+    }
+
     pub fn with_ssf(mut self, config: &ironauth_config::SsfConfig) -> Self {
         self.ssf_enabled = config.enabled;
         self.ssf_max_streams_per_client = config.max_streams_per_client;
@@ -2168,6 +2186,13 @@ impl OidcState {
     #[must_use]
     pub(crate) fn risk_config(&self) -> &ironauth_config::RiskConfig {
         &self.inner.risk
+    }
+
+    /// The Google Cross-Account Protection receiver settings (issue #144). Off by default,
+    /// so the receiver endpoint is a uniform 404 and no inbound SET is accepted.
+    #[must_use]
+    pub(crate) fn risc_receiver_config(&self) -> &ironauth_config::RiscReceiverConfig {
+        &self.risc_receiver
     }
 
     /// The registration abuse defenses config (issue #80): the proof-of-work settings, the
